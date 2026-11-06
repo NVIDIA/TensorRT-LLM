@@ -1,0 +1,225 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Fused MQA indexer + exact Top-K ("throwaway Top-K") for DSA prefill chunks.
+
+The kernels never materialize the [Q, K] logits matrix, so a prefill chunk is
+handled by one wrapper call per query tile instead of ``fp8_mqa_logits`` followed by a
+separate Top-K. The wrapper supports one request per call, so only chunks that
+hold a single request (``IndexerPrefillChunkMetadata.kv_prefix_len`` is set)
+are eligible; everything else keeps using the existing path.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Dict, Optional, Tuple
+
+import torch
+
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._utils import maybe_pin_memory
+from tensorrt_llm.logger import logger
+
+THROWAWAY_TOPK_ENV = "TRTLLM_THROWAWAY_TOPK"
+THROWAWAY_MAX_CHUNK_ENV = "TRTLLM_THROWAWAY_TOPK_MAX_CHUNK"
+THROWAWAY_LOGITS_DTYPE_ENV = "TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE"
+
+_HEAD_DIM = 128
+_SUPPORTED_NUM_HEADS = (4, 32, 64)
+_DEFAULT_MAX_CHUNK = 8192
+_LOGITS_DTYPES = {
+    "fp32": torch.float32,
+    "bf16": torch.bfloat16,
+    "fp16": torch.float16,
+}
+
+# Plan tensors per (kv_prefix_len, tile_begin, tile_end); owned by the chunk metadata so
+# they are built once per step and reused by every layer.
+PlanCache = Dict[Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor]]
+
+
+def throwaway_topk_requested() -> bool:
+    """Returns True when the user opted in through ``TRTLLM_THROWAWAY_TOPK=1``."""
+    return os.environ.get(THROWAWAY_TOPK_ENV, "0") == "1"
+
+
+def throwaway_topk_supported(n_heads: int, head_dim: int, use_fp4: bool) -> bool:
+    """Returns True when this indexer configuration can use the fused kernels."""
+    return (
+        IS_CUTLASS_DSL_AVAILABLE
+        and not use_fp4
+        and head_dim == _HEAD_DIM
+        and n_heads in _SUPPORTED_NUM_HEADS
+    )
+
+
+class ThrowawayPrefillTopK:
+    """Runs the fused indexer + Top-K for single-request prefill chunks.
+
+    One instance is shared by all layers of a process. The kernel binds K by device
+    pointer, so gathered keys are copied into one persistent staging buffer and a single
+    binding serves every layer and chunk.
+    """
+
+    def __init__(
+        self,
+        *,
+        n_heads: int,
+        index_topk: int,
+        compress_ratio: int,
+        max_context_length: int,
+        device: torch.device,
+    ):
+        """Builds the wrapper and the K staging buffers.
+
+        Args:
+            n_heads: Number of indexer heads (4, 32 or 64).
+            index_topk: Number of selected keys per query row.
+            compress_ratio: KV compression ratio of the indexer K cache.
+            max_context_length: Longest sequence in original (uncompressed) tokens,
+                including the query rows.
+            device: CUDA device that owns the buffers.
+
+        Raises:
+            ValueError: If the kernels do not support this configuration.
+        """
+        from tensorrt_llm._torch.attention.kernels.blackwell.throwaway_topk.interface import (
+            FP8MQATopKWrapper,
+        )
+
+        self.max_chunk_size = int(os.environ.get(THROWAWAY_MAX_CHUNK_ENV, _DEFAULT_MAX_CHUNK))
+        logits_name = os.environ.get(THROWAWAY_LOGITS_DTYPE_ENV, "fp32")
+        if logits_name not in _LOGITS_DTYPES:
+            raise ValueError(
+                f"{THROWAWAY_LOGITS_DTYPE_ENV} must be one of {sorted(_LOGITS_DTYPES)}, "
+                f"got {logits_name!r}"
+            )
+        self.num_keys = max_context_length // compress_ratio
+        self._wrapper = FP8MQATopKWrapper(
+            max_context_length=max_context_length,
+            max_chunk_size=self.max_chunk_size,
+            max_batch_size=1,
+            device=device,
+            num_heads=n_heads,
+            head_dim=_HEAD_DIM,
+            top_k=index_topk,
+            compression_ratio=compress_ratio,
+            num_keys=self.num_keys,
+            qkv_dtype="fp8",
+            logits_dtype=_LOGITS_DTYPES[logits_name],
+            weights_dtype=torch.float32,
+        )
+        self._k_stage = torch.empty(
+            (self.num_keys, _HEAD_DIM), dtype=torch.float8_e4m3fn, device=device
+        )
+        self._k_scale_stage = torch.empty(self.num_keys, dtype=torch.float32, device=device)
+        self._device = device
+        self._pool_prepared = False
+
+    def can_run(self, num_k_rows: int) -> bool:
+        """Returns True when ``num_k_rows`` compressed keys fit the staging buffer."""
+        return 0 < num_k_rows <= self.num_keys
+
+    def _plan_tensors(
+        self, cache: PlanCache, kv_prefix_len: int, num_q: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns device prefixes ``[0, num_q]`` and ``[0, kv_prefix_len + num_q]``."""
+        key = (kv_prefix_len, num_q)
+        plan = cache.get(key)
+        if plan is None:
+            qo_indptr = torch.tensor([0, num_q], dtype=torch.int32)
+            kv_indptr = torch.tensor([0, kv_prefix_len + num_q], dtype=torch.int32)
+            plan = (
+                maybe_pin_memory(qo_indptr).to(self._device, non_blocking=True),
+                maybe_pin_memory(kv_indptr).to(self._device, non_blocking=True),
+            )
+            cache[key] = plan
+        return plan
+
+    def run_chunk(
+        self,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        k: torch.Tensor,
+        k_scale: torch.Tensor,
+        out: torch.Tensor,
+        *,
+        kv_prefix_len: int,
+        plan_cache: PlanCache,
+    ) -> None:
+        """Selects Top-K indices for consecutive query rows of one request.
+
+        Query row ``i`` attends to keys ``[0, (kv_prefix_len + i + 1) // compress_ratio)``,
+        the same causal window the unfused path derives from ``cu_seqlen_ke``.
+
+        Args:
+            q: FP8 queries, ``[num_q, n_heads, 128]``, float8_e4m3fn.
+            weights: Per-head weights, ``[num_q, n_heads]``, FP32 (BF16 is converted).
+            k: Gathered compressed keys of the request, ``[num_k, 128]``, float8_e4m3fn.
+            k_scale: Per-key FP32 scales, ``[num_k]`` (any shape with ``num_k`` elements).
+            out: INT32 destination, ``[num_q, index_topk]``; receives request-local indices
+                with ``-1`` padding.
+            kv_prefix_len: Original tokens of the request preceding ``q[0]``.
+            plan_cache: Cache of device prefix tensors shared across layers.
+        """
+        num_q = q.shape[0]
+        num_k = k.shape[0]
+        if weights.dtype != torch.float32:
+            weights = weights.float()
+        self._k_stage[:num_k].copy_(k)
+        self._k_scale_stage[:num_k].copy_(k_scale.reshape(-1))
+
+        for begin in range(0, num_q, self.max_chunk_size):
+            end = min(begin + self.max_chunk_size, num_q)
+            qo_indptr, kv_indptr = self._plan_tensors(
+                plan_cache, kv_prefix_len + begin, end - begin
+            )
+            self._wrapper.plan(qo_indptr, kv_indptr, num_query_rows=end - begin)
+            if not self._pool_prepared:
+                self._wrapper.prepare_pool(self._k_stage, k_scale=self._k_scale_stage)
+                self._pool_prepared = True
+            self._wrapper.run(
+                q[begin:end],
+                weights[begin:end],
+                self._k_stage,
+                k_scale=self._k_scale_stage,
+                out=out[begin:end],
+            )
+
+
+def create_throwaway_prefill_topk(
+    *,
+    n_heads: int,
+    index_topk: int,
+    compress_ratio: int,
+    max_context_length: int,
+    device: torch.device,
+) -> Optional[ThrowawayPrefillTopK]:
+    """Builds the shared runner, or returns None (with a warning) if it is unsupported."""
+    try:
+        return ThrowawayPrefillTopK(
+            n_heads=n_heads,
+            index_topk=index_topk,
+            compress_ratio=compress_ratio,
+            max_context_length=max_context_length,
+            device=device,
+        )
+    except (ValueError, ImportError) as error:
+        logger.warning(
+            f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K is unavailable for "
+            f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}: {error}; "
+            "using the unfused indexer + Top-K path"
+        )
+        return None
