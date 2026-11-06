@@ -42,8 +42,8 @@ enum class CudaArch {
   // Blackwell Ultra
   Sm103a,
 #ifdef TLLM_RUBIN_FEATURES
-  // SM107
-  Sm107a,
+  // SM107. The value must match the prebuilt trtllm-gen archives, which use 4 for Sm105a.
+  Sm107a = 5,
 #endif // TLLM_RUBIN_FEATURES
 };
 
