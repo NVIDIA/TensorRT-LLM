@@ -2237,6 +2237,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
 
+                Utils.exec(pipeline, script: "echo \"Script for Slurm profiler environment: \" && cat ${scriptProfilerEnvLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
