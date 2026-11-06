@@ -24,6 +24,7 @@ from torch import nn
 
 from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
 from tensorrt_llm._torch.speculative.spec_tail_kernels import (
     decode_draft_block_table,
     strict_accept,
@@ -153,11 +154,15 @@ def _paged_worker(draft_len, page_size, max_blocks, num_slots, layers, head_dim,
     return worker, storage
 
 
+@pytest.mark.parametrize("helix_rank", [None, 0, 1], ids=["no_helix", "helix_r0", "helix_r1"])
 @pytest.mark.parametrize("side_stream", [False, True])
 @pytest.mark.parametrize("draft_len", [3, 7])
-def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
+def test_paged_latent_prepare_matches_eager(draft_len, side_stream, helix_rank):
     """``side_stream``: the fused path stores the context latents on the
-    worker's side stream and hands the drafter the event to wait on."""
+    worker's side stream and hands the drafter the event to wait on.
+    ``helix_rank``: the pages are sharded over a helix CP group of two (a
+    unified cache shared with a helix target); each rank stores and places only
+    its own positions."""
     vocab, hidden, features, layers, head_dim = 100, 64, 128, 3, 96
     page_size, max_blocks, num_slots, max_ctx = 16, 6, 10, 70
     num_ctx_reqs, num_gens = 1, 6
@@ -168,6 +173,9 @@ def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
         draft_len, page_size, max_blocks, num_slots, layers, head_dim, max_ctx, gen
     )
     drafter = _LatentDrafter(vocab, hidden, features, layers, head_dim, mask_token_id=3)
+    cp_size = 1 if helix_rank is None else 2
+    shard = None if helix_rank is None else HelixDraftShard(cp_size, helix_rank, page_size)
+    worker._ctx_helix = shard
 
     # Rows: an ordinary request, one at the max_ctx ceiling, one whose context
     # outruns its pages, one with no pages, and two padding rows on the dummy slot.
@@ -242,9 +250,12 @@ def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
     counts = worker._ctx_block_counts.tolist()
     for g in range(num_gens):
         row = num_ctx_reqs + g
-        capacity = counts[row] * page_size
+        capacity = counts[row] * page_size * cp_size
         for j in range(width):
             col = max(min(old_len[slots[row].item()] + j, capacity - 1), 0)
+            if (col // page_size) % cp_size != (helix_rank or 0):
+                continue  # another rank's position: left untouched
+            col = (col // page_size // cp_size) * page_size + col % page_size
             page = worker._ctx_block_tables[row, col // page_size].item()
             writers.setdefault((page, col % page_size), []).append((g, j))
     shared = torch.zeros(storage.shape[0], page_size, dtype=torch.bool)
@@ -264,7 +275,7 @@ def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
         assert torch.equal(bits * untouched, init_bits * untouched)
         changed = (bits != init_bits).any(dim=-1).flatten(1, 3).any(dim=1)
         assert bool(changed[written.cuda()].all())
-    assert bool(shared.any()) and bool(untouched.any())
+    assert bool(untouched.any()) and (bool(shared.any()) or helix_rank == 1)
 
     rows = eager["ctx_cache_batch_idx"]
     fixup = _build_mla_block_fixup(
@@ -272,6 +283,7 @@ def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
         worker._ctx_block_tables.index_select(0, rows).long(),
         draft_len,
         page_size,
+        shard,
     )
     placement = fused["block_placement"]
     assert eager["block_placement"] is None
@@ -279,6 +291,10 @@ def test_paged_latent_prepare_matches_eager(draft_len, side_stream):
     assert torch.equal(placement.offsets, fixup.offsets)
     assert torch.equal(placement.seq_lens, fixup.seq_lens_i32)
     assert torch.equal(placement.kv_bounds, fixup.kv_bounds_i32)
+    if shard is None:
+        assert placement.owned is None
+    else:
+        assert torch.equal(placement.owned, fixup.owned)
 
 
 def test_store_context_latents_saturates_into_an_fp8_pool():
@@ -297,7 +313,9 @@ def test_store_context_latents_saturates_into_an_fp8_pool():
     )
     flat = torch.randperm(num_pages * page, device="cuda", generator=gen)[:num_tokens]
     pages, offsets = flat // page, flat % page
-    mask = torch.tensor([1, 1, 0, 1, 1, 1, 1, 0, 1], dtype=torch.int8, device="cuda")
+    # -1: another helix rank's position, left untouched.
+    mask = torch.tensor([1, 1, 0, 1, -1, 1, 1, 0, 1], dtype=torch.int8, device="cuda")
+    stored = mask >= 0
 
     pools = [
         torch.full((num_pages, 1, 1, page, latent_dim), 7.0, device="cuda").to(fp8)
@@ -305,8 +323,8 @@ def test_store_context_latents_saturates_into_an_fp8_pool():
     ]
     expected = [p.view(torch.uint8).clone() for p in pools]
     for layer in range(num_layers):
-        rows = to_draft_fp8(latent[:, layer] * mask.to(torch.bfloat16)[:, None])
-        expected[layer][:, 0, 0][pages, offsets] = rows.view(torch.uint8)
+        rows = to_draft_fp8(latent[:, layer] * (mask > 0).to(torch.bfloat16)[:, None])
+        expected[layer][:, 0, 0][pages[stored], offsets[stored]] = rows[stored].view(torch.uint8)
     ptrs = torch.tensor([p.data_ptr() for p in pools], dtype=torch.int64, device="cuda")
     store_context_latents(latent, pools, ptrs, pages, offsets, mask)
     for layer in range(num_layers):

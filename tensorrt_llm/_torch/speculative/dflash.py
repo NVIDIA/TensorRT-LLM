@@ -1251,10 +1251,12 @@ class DFlashWorker(SpecWorkerBase):
     ) -> None:
         """Raise when a request's drafter block would leave its allocated pages.
 
-        The shared manager sizes the request, so a shortfall there would have the
-        block's scratch write land on the last context position, or on another
-        request's page. Asynchronous, so it adds no host sync and is safe to
-        capture in a CUDA graph; on the device it traps instead of raising.
+        The shared manager sizes the request (``_kv_alloc_extra_tokens`` reserves
+        the block past its history), so a shortfall there would have the block's
+        scratch write land on the last context position, or on another request's
+        page. Asynchronous, so it adds no host sync; on the device it traps
+        instead of raising. Callers run it in eager forwards only, which keeps
+        its kernels out of a captured step.
         """
         torch._assert_async(
             (num_ctx <= allocated_ctx_limit).all(),
@@ -2616,7 +2618,7 @@ class DFlashWorker(SpecWorkerBase):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_positions_per_page, block_size
                 )
-                if self._ctx_unified_cache:
+                if self._ctx_unified_cache and not torch.cuda.is_current_stream_capturing():
                     self._check_block_within_allocation(
                         num_ctx_per_req_t, allocated[gen_rows_out], block_size
                     )
@@ -2666,9 +2668,6 @@ class DFlashWorker(SpecWorkerBase):
         features, drafting from all ``K + 1`` target tokens."""
         return (
             self._paged_latent_prepare
-            # Shared allocations require the generic path's strict capacity
-            # check; the fused preparation silently caps the context length.
-            and not self._ctx_unified_cache
             and spec_metadata.runtime_draft_len + 1 == self._draft_tokens_per_req
             and spec_metadata.captured_hidden_states is not None
         )
@@ -2697,10 +2696,12 @@ class DFlashWorker(SpecWorkerBase):
         num_gens = attn_metadata.num_seqs - num_contexts
         width = self._draft_tokens_per_req
         block_size = self._compute_block_size
+        slots = self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens]
+        helix = self._ctx_helix
         prep = dflash_paged_latent_prepare(
             num_accepted_tokens,
             accepted_tokens,
-            self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens],
+            slots,
             self._ctx_len,
             self._ctx_block_counts,
             self._ctx_block_tables,
@@ -2711,8 +2712,19 @@ class DFlashWorker(SpecWorkerBase):
             self._ctx_page_size,
             block_size,
             width,
+            cp_size=1 if helix is None else helix.cp_size,
+            cp_rank=0 if helix is None else helix.cp_rank,
         )
         attn_metadata._seq_lens[num_contexts : num_contexts + num_gens] = width
+        if self._ctx_unified_cache and not torch.cuda.is_current_stream_capturing():
+            # The kernel caps the advertised length at the allocation; the
+            # shared manager's contract is that the cap never binds.
+            allocated = dflash_allocated_ctx_limit(
+                self._ctx_block_counts[num_contexts : num_contexts + num_gens],
+                self._ctx_positions_per_page,
+                block_size,
+            )
+            self._check_block_within_allocation(self._ctx_len[slots], allocated, block_size)
 
         noise_embedding = dflash_noise_block_embedding(
             draft_model.draft_model_full.model.embed_tokens,
@@ -2764,6 +2776,11 @@ class DFlashWorker(SpecWorkerBase):
             "ctx_kv_cache": self._ctx_kv_buf,
             "ctx_page_table": self._ctx_block_tables,
             "block_placement": DraftBlockPlacement(
-                prep.blk_pages, prep.blk_offsets, prep.blk_seq_lens, prep.blk_kv_bounds, ctx_stored
+                prep.blk_pages,
+                prep.blk_offsets,
+                prep.blk_seq_lens,
+                prep.blk_kv_bounds,
+                ctx_stored,
+                owned=None if helix is None else prep.blk_owned.view(torch.bool).view(-1, 1),
             ),
         }

@@ -4401,7 +4401,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         capacity = ctx_k_cache.shape[2] if not paged else ctx_page_table.shape[1] * page_size
         # Kernel path: index and mask operands are layer-invariant, so build
         # them once here rather than five times inside the decode loop.
-        if shard is not None and (variant != "cute_dsl" or block_placement is not None):
+        if shard is not None and (
+            variant != "cute_dsl" or (block_placement is not None and block_placement.owned is None)
+        ):
             raise NotImplementedError(
                 "A helix-sharded MLA DSpark context needs the CUTEDSL paged decode "
                 f"with a rank-local block placement; got {variant!r}."
@@ -4416,6 +4418,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 page_tables_i32=page_tables,
                 seq_lens_i32=block_placement.seq_lens,
                 kv_bounds_i32=block_placement.kv_bounds,
+                owned=block_placement.owned,
             )
         else:
             fixup = _build_mla_block_fixup(
