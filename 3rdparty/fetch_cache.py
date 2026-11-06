@@ -607,7 +607,7 @@ def _read_src_refs(src_git: str) -> list[tuple[str, str]]:
     :func:`_is_safe_refname`, so surviving entries go onto a
     ``<sha> <refname>`` line verbatim without quoting.
     """
-    pairs: list[tuple[str, str]] = []
+    refs: dict[str, str] = {}
 
     # "^<sha>" peeled lines annotate the preceding annotated-tag entry
     # and carry no refname, so they're skipped here.  (Peeled commit
@@ -623,7 +623,7 @@ def _read_src_refs(src_git: str) -> list[tuple[str, str]]:
                     continue
                 sha, refname = parts
                 if _SHA_RE.match(sha) and _is_safe_refname(refname):
-                    pairs.append((refname, sha))
+                    refs[refname] = sha
     except OSError:
         pass
 
@@ -644,9 +644,10 @@ def _read_src_refs(src_git: str) -> list[tuple[str, str]]:
             except OSError:
                 continue
             if _SHA_RE.match(content):
-                pairs.append((refname, content))
+                # Git's loose ref overrides any packed entry with the same name.
+                refs[refname] = content
 
-    return pairs
+    return list(refs.items())
 
 
 def _safe_fetch_into_cache(bare: str, src_git: str) -> int:
