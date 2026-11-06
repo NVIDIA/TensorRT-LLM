@@ -39,6 +39,7 @@ THROWAWAY_LOGITS_DTYPE_ENV = "TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE"
 _HEAD_DIM = 128
 _SUPPORTED_NUM_HEADS = (4, 32, 64)
 _DEFAULT_MAX_CHUNK = 8192
+_MXFP4_KEY_ALIGNMENT = 256
 _LOGITS_DTYPES = {
     "fp32": torch.float32,
     "bf16": torch.bfloat16,
@@ -55,14 +56,9 @@ def throwaway_topk_requested() -> bool:
     return os.environ.get(THROWAWAY_TOPK_ENV, "0") == "1"
 
 
-def throwaway_topk_supported(n_heads: int, head_dim: int, use_fp4: bool) -> bool:
-    """Returns True when this indexer configuration can use the fused kernels."""
-    return (
-        IS_CUTLASS_DSL_AVAILABLE
-        and not use_fp4
-        and head_dim == _HEAD_DIM
-        and n_heads in _SUPPORTED_NUM_HEADS
-    )
+def throwaway_topk_supported(n_heads: int, head_dim: int) -> bool:
+    """Returns True when this indexer geometry can use the fused kernels (FP8 or MXFP4 K)."""
+    return IS_CUTLASS_DSL_AVAILABLE and head_dim == _HEAD_DIM and n_heads in _SUPPORTED_NUM_HEADS
 
 
 class ThrowawayPrefillTopK:
@@ -82,6 +78,7 @@ class ThrowawayPrefillTopK:
         max_context_length: int,
         device: torch.device,
         logits_dtype: Optional[torch.dtype] = None,
+        qkv_dtype: str = "fp8",
     ):
         """Builds the wrapper and the K staging buffers.
 
@@ -95,10 +92,15 @@ class ThrowawayPrefillTopK:
             logits_dtype: Storage dtype of the scores the kernels select over (float32,
                 bfloat16 or float16). None reads ``TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE``
                 (``fp32``, ``bf16`` or ``fp16``; default fp32).
+            qkv_dtype: ``"fp8"`` for token-scaled FP8 E4M3 queries/keys, or ``"mxfp4"`` for
+                packed E2M1 values with UE8M0 scales per 32 channels (the DSA FP4 indexer).
 
         Raises:
             ValueError: If the kernels do not support this configuration.
         """
+        if qkv_dtype not in ("fp8", "mxfp4"):
+            raise ValueError(f"qkv_dtype must be 'fp8' or 'mxfp4', got {qkv_dtype!r}")
+        self._mxfp4 = qkv_dtype == "mxfp4"
         from tensorrt_llm._torch.attention.kernels.blackwell.throwaway_topk.interface import (
             FP8MQATopKWrapper,
         )
@@ -118,6 +120,9 @@ class ThrowawayPrefillTopK:
             )
         self.logits_dtype = logits_dtype
         self.num_keys = max_context_length // compress_ratio
+        if self._mxfp4:
+            # Block-scaled K storage must hold a multiple of 256 rows; plan() bounds the live part.
+            self.num_keys = -(-self.num_keys // _MXFP4_KEY_ALIGNMENT) * _MXFP4_KEY_ALIGNMENT
         self._wrapper = FP8MQATopKWrapper(
             max_context_length=max_context_length,
             max_chunk_size=self.max_chunk_size,
@@ -128,14 +133,21 @@ class ThrowawayPrefillTopK:
             top_k=index_topk,
             compression_ratio=compress_ratio,
             num_keys=self.num_keys,
-            qkv_dtype="fp8",
+            qkv_dtype=qkv_dtype,
             logits_dtype=logits_dtype,
             weights_dtype=torch.float32,
         )
-        self._k_stage = torch.empty(
-            (self.num_keys, _HEAD_DIM), dtype=torch.float8_e4m3fn, device=device
-        )
-        self._k_scale_stage = torch.empty(self.num_keys, dtype=torch.float32, device=device)
+        if self._mxfp4:
+            # Packed E2M1 bytes [N, D/2] and four UE8M0 scale bytes per key [N, 4].
+            self._k_stage = torch.empty(
+                (self.num_keys, _HEAD_DIM // 2), dtype=torch.uint8, device=device
+            )
+            self._k_scale_stage = torch.empty((self.num_keys, 4), dtype=torch.uint8, device=device)
+        else:
+            self._k_stage = torch.empty(
+                (self.num_keys, _HEAD_DIM), dtype=torch.float8_e4m3fn, device=device
+            )
+            self._k_scale_stage = torch.empty(self.num_keys, dtype=torch.float32, device=device)
         self._device = device
         self._pool_prepared = False
 
@@ -169,6 +181,7 @@ class ThrowawayPrefillTopK:
         *,
         kv_prefix_len: int,
         plan_cache: PlanCache,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """Selects Top-K indices for consecutive query rows of one request.
 
@@ -176,21 +189,36 @@ class ThrowawayPrefillTopK:
         the same causal window the unfused path derives from ``cu_seqlen_ke``.
 
         Args:
-            q: FP8 queries, ``[num_q, n_heads, 128]``, float8_e4m3fn.
+            q: Queries, ``[num_q, n_heads, 128]`` float8_e4m3fn for FP8, or the packed E2M1
+                bytes ``[num_q, n_heads, 64]`` (any one-byte dtype) for MXFP4.
             weights: Per-head weights, ``[num_q, n_heads]``, FP32 (BF16 is converted).
-            k: Gathered compressed keys of the request, ``[num_k, 128]``, float8_e4m3fn.
-            k_scale: Per-key FP32 scales, ``[num_k]`` (any shape with ``num_k`` elements).
+            k: Gathered compressed keys of the request, ``[num_k, 128]`` float8_e4m3fn for FP8
+                or packed bytes ``[num_k, 64]`` for MXFP4.
+            k_scale: FP8: per-key FP32 scales, ``[num_k]`` (any shape with ``num_k`` elements).
+                MXFP4: four UE8M0 bytes per key (any dtype/shape with ``4 * num_k`` bytes).
             out: INT32 destination, ``[num_q, index_topk]``; receives request-local indices
                 with ``-1`` padding.
             kv_prefix_len: Original tokens of the request preceding ``q[0]``.
             plan_cache: Cache of device prefix tensors shared across layers.
+            q_scale: MXFP4 only: four UE8M0 bytes per query row and head (int32 ``[num_q,
+                n_heads]``, or any dtype/shape with ``4 * num_q * n_heads`` bytes).
         """
         num_q = q.shape[0]
         num_k = k.shape[0]
         if weights.dtype != torch.float32:
             weights = weights.float()
-        self._k_stage[:num_k].copy_(k)
-        self._k_scale_stage[:num_k].copy_(k_scale.reshape(-1))
+        if self._mxfp4:
+            if q_scale is None:
+                raise ValueError("MXFP4 queries require q_scale")
+            q = q.view(torch.uint8)
+            q_scale = q_scale.contiguous().view(torch.int32).reshape(num_q, q.shape[1])
+            self._k_stage[:num_k].copy_(k.view(torch.uint8))
+            self._k_scale_stage[:num_k].copy_(k_scale.contiguous().view(torch.uint8).reshape(-1, 4))
+        else:
+            if q_scale is not None:
+                raise ValueError("q_scale is only used with MXFP4")
+            self._k_stage[:num_k].copy_(k)
+            self._k_scale_stage[:num_k].copy_(k_scale.reshape(-1))
 
         for begin in range(0, num_q, self.max_chunk_size):
             end = min(begin + self.max_chunk_size, num_q)
@@ -207,6 +235,7 @@ class ThrowawayPrefillTopK:
                 self._k_stage,
                 k_scale=self._k_scale_stage,
                 out=out[begin:end],
+                q_scale=None if q_scale is None else q_scale[begin:end],
             )
 
 
@@ -217,6 +246,7 @@ def create_throwaway_prefill_topk(
     compress_ratio: int,
     max_context_length: int,
     device: torch.device,
+    qkv_dtype: str = "fp8",
 ) -> Optional[ThrowawayPrefillTopK]:
     """Builds the shared runner, or returns None (with a warning) if it is unsupported."""
     try:
@@ -226,11 +256,13 @@ def create_throwaway_prefill_topk(
             compress_ratio=compress_ratio,
             max_context_length=max_context_length,
             device=device,
+            qkv_dtype=qkv_dtype,
         )
     except (ValueError, ImportError) as error:
         logger.warning(
             f"{THROWAWAY_TOPK_ENV}=1 but the fused throwaway Top-K is unavailable for "
-            f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}: {error}; "
+            f"heads={n_heads}, top_k={index_topk}, compress_ratio={compress_ratio}, "
+            f"qkv_dtype={qkv_dtype}: {error}; "
             "using the unfused indexer + Top-K path"
         )
         return None

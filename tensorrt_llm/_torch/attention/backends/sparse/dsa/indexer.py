@@ -1032,7 +1032,7 @@ class Indexer(nn.Module):
         self._use_throwaway_topk = (
             throwaway_topk_requested()
             and is_sm_100f()
-            and throwaway_topk_supported(self.n_heads, self.head_dim, self.use_fp4)
+            and throwaway_topk_supported(self.n_heads, self.head_dim)
         )
         self._throwaway_topk: Optional[ThrowawayPrefillTopK] = None
         self._throwaway_topk_failed = False
@@ -1694,19 +1694,23 @@ class Indexer(nn.Module):
         q_begin: int,
         q_end: int,
         topk_indices_buffer: torch.Tensor,
+        q_scale: Optional[torch.Tensor] = None,
     ) -> bool:
         """Runs the fused indexer + Top-K on one chunk's query rows when it is eligible.
 
         Args:
             metadata: Attention metadata of the current step.
             chunk: Prefill chunk; only single-request chunks (``kv_prefix_len`` set) qualify.
-            q_fp8: FP8 queries of the whole batch, ``[num_tokens, n_heads, head_dim]``.
+            q_fp8: Queries of the whole batch, ``[num_tokens, n_heads, head_dim]`` (FP8), or the
+                packed FP4 bytes in the same dtype container with half the last dimension.
             weights: Per-head weights of the whole batch, ``[num_tokens, n_heads]``.
-            chunk_k_fp8: Gathered compressed keys of the chunk, ``[num_k, head_dim]``.
+            chunk_k_fp8: Gathered compressed keys of the chunk, ``[num_k, head_dim]`` (FP8) or
+                ``[num_k, head_dim // 2]`` packed FP4 bytes.
             chunk_k_scale: Per-key scales of ``chunk_k_fp8``.
             q_begin: First chunk-local query row handled by this rank.
             q_end: One past the last chunk-local query row handled by this rank.
             topk_indices_buffer: Output indices of the whole batch, ``[num_tokens, index_topk]``.
+            q_scale: Packed UE8M0 query scales of the whole batch; set only for the FP4 indexer.
 
         Returns:
             True if the rows were written; False if the caller must use the unfused path.
@@ -1727,6 +1731,7 @@ class Indexer(nn.Module):
                 compress_ratio=compress_ratio,
                 max_context_length=metadata.kv_cache_manager.max_seq_len,
                 device=q_fp8.device,
+                qkv_dtype="mxfp4" if self.use_fp4 else "fp8",
             )
             self._throwaway_topk_failed = self._throwaway_topk is None
             if self._throwaway_topk_failed:
@@ -1743,6 +1748,7 @@ class Indexer(nn.Module):
             topk_indices_buffer[g_begin:g_end],
             kv_prefix_len=chunk.kv_prefix_len + q_begin,
             plan_cache=chunk.throwaway_plans,
+            q_scale=None if q_scale is None else q_scale[g_begin:g_end],
         )
         return True
 
@@ -2001,6 +2007,7 @@ class Indexer(nn.Module):
                         chunk_q_start,
                         chunk_q_end,
                         topk_indices_buffer,
+                        q_scale=q_scale if self.use_fp4 else None,
                     ):
                         local_q_len = 0  # rows are written; the tile loop below is skipped
                     budget = _INDEXER_MQA_LOGITS_ELEM_BUDGET
