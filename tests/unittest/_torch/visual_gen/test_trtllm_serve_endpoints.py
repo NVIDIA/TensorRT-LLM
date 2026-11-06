@@ -1113,20 +1113,18 @@ class TestImageGeneration:
 class TestImageEdit:
     """``/v1/images/edits`` support is gated by the loaded visual model."""
 
-    def _client(
+    def _generator(
         self,
-        tmp_path,
-        monkeypatch,
         *,
         image_output: Optional[torch.Tensor] = None,
         extra_param_specs: Optional[dict] = None,
         model: str = "Qwen/Qwen-Image-Layered",
         should_fail: bool = False,
         supports_image_edit: bool = True,
-    ):
+    ) -> MockVisualGen:
         from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
 
-        gen = MockVisualGen(
+        return MockVisualGen(
             image_output=image_output if image_output is not None else _make_dummy_image_tensor(),
             extra_param_specs=extra_param_specs,
             model=model,
@@ -1139,6 +1137,25 @@ class TestImageEdit:
                     modality="image", roles=[RoleSpec(role="reference", min=1, max=None)]
                 ),
             },
+        )
+
+    def _client(
+        self,
+        tmp_path,
+        monkeypatch,
+        *,
+        image_output: Optional[torch.Tensor] = None,
+        extra_param_specs: Optional[dict] = None,
+        model: str = "Qwen/Qwen-Image-Layered",
+        should_fail: bool = False,
+        supports_image_edit: bool = True,
+    ):
+        gen = self._generator(
+            image_output=image_output,
+            extra_param_specs=extra_param_specs,
+            model=model,
+            should_fail=should_fail,
+            supports_image_edit=supports_image_edit,
         )
         monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
         return _create_server(gen, model_name=model), gen
@@ -1571,6 +1588,155 @@ class TestImageEdit:
 
         assert resp.status_code == 400
         assert gen.last_params is None
+
+    @pytest.mark.threadleak(enabled=False)  # generate_async runs on a worker thread
+    @pytest.mark.asyncio
+    async def test_image_edit_does_not_block_the_event_loop(self, tmp_path, monkeypatch):
+        """While an edit generates, the loop still answers other requests.
+
+        The handler must submit the edit off the event loop and await the
+        handle, as image generation does; calling the blocking ``generate()``
+        on the loop would serialize every other request of the process
+        (``/health``, video polling, other edits) behind the running edit.
+        """
+        gen = self._generator()
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        entered = threading.Event()
+        release = threading.Event()
+        returned = threading.Event()
+        original = gen.generate_async
+
+        def _blocking_generate_async(inputs=None, params=None):
+            entered.set()
+            try:
+                # Models a long generation; self-releases so a failure cannot
+                # hang the test. 5 s stalls the loop long enough for /health
+                # to observe the block without slowing the passing path.
+                release.wait(timeout=5)
+                return original(inputs=inputs, params=params)
+            finally:
+                returned.set()
+
+        monkeypatch.setattr(gen, "generate_async", _blocking_generate_async)
+
+        client = _create_async_client(gen, model_name="Qwen/Qwen-Image-Layered")
+        try:
+            edit_task = asyncio.create_task(
+                client.post(
+                    "/v1/images/edits",
+                    json={
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                        "response_format": "b64_json",
+                    },
+                )
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 5), (
+                    "the edit request never reached generate_async"
+                )
+                health = await asyncio.wait_for(client.get("/health"), timeout=5)
+                answered_while_generating = not returned.is_set()
+            finally:
+                release.set()  # never leave the generation thread blocked
+                resp = await edit_task
+        finally:
+            await client.aclose()
+
+        assert health.status_code == 200
+        assert resp.status_code == 200
+        assert answered_while_generating, (
+            "GET /health was answered only after the image edit's generation "
+            "returned: openai_image_edit blocks the event loop. Submit with "
+            "await asyncio.to_thread(self.generator.generate_async, ...) and "
+            "await handle.aresult(), as openai_image_generation does."
+        )
+
+    @pytest.mark.threadleak(enabled=False)  # the gated result waits on a worker thread
+    @pytest.mark.asyncio
+    async def test_image_edit_waits_for_its_result_without_blocking_the_event_loop(
+        self, tmp_path, monkeypatch
+    ):
+        """While an edit waits for its result, the loop still answers other requests.
+
+        Submission returns at once here, and the handle resolves only after
+        ``/health`` has been answered. A handler that waits with the blocking
+        ``handle.result()`` (or ``generate()``) on the loop holds the loop
+        until that wait gives up, so ``/health`` is answered only afterwards.
+        """
+        gen = self._generator()
+        monkeypatch.setenv("TRTLLM_MEDIA_STORAGE_PATH", str(tmp_path))
+
+        waiting = threading.Event()
+        health_answered = threading.Event()
+        resolved = threading.Event()
+        original = gen.generate_async
+
+        class _GatedResult:
+            """Result handle whose generation finishes once ``/health`` has answered."""
+
+            def __init__(self, inner: MockVisualGenResult):
+                self.request_id = inner.request_id
+                self._inner = inner
+
+            def __await__(self):
+                return self.aresult().__await__()
+
+            async def aresult(self, timeout=None) -> VisualGenOutput:
+                waiting.set()
+                try:
+                    await asyncio.to_thread(health_answered.wait, 5)
+                    return await self._inner.aresult()
+                finally:
+                    resolved.set()
+
+            def result(self, timeout=None) -> VisualGenOutput:
+                waiting.set()
+                try:
+                    # Self-releases so a handler that blocks the loop here
+                    # cannot hang the test.
+                    health_answered.wait(5)
+                    return self._inner.result()
+                finally:
+                    resolved.set()
+
+        def _gated_generate_async(inputs=None, params=None) -> _GatedResult:
+            return _GatedResult(original(inputs=inputs, params=params))
+
+        monkeypatch.setattr(gen, "generate_async", _gated_generate_async)
+
+        client = _create_async_client(gen, model_name="Qwen/Qwen-Image-Layered")
+        try:
+            edit_task = asyncio.create_task(
+                client.post(
+                    "/v1/images/edits",
+                    json={
+                        "prompt": "split layers",
+                        "image": _b64_white_png_1x1(),
+                        "response_format": "b64_json",
+                    },
+                )
+            )
+            try:
+                assert await asyncio.to_thread(waiting.wait, 5), (
+                    "the edit request never waited for its generation result"
+                )
+                health = await asyncio.wait_for(client.get("/health"), timeout=5)
+                answered_while_waiting = not resolved.is_set() and not edit_task.done()
+            finally:
+                health_answered.set()  # never leave the result wait blocked
+                resp = await edit_task
+        finally:
+            await client.aclose()
+
+        assert health.status_code == 200
+        assert resp.status_code == 200
+        assert answered_while_waiting, (
+            "GET /health was answered only after the image edit's result "
+            "resolved: openai_image_edit waits for generation on the event "
+            "loop. Await handle.aresult() instead of calling handle.result()."
+        )
 
 
 # =========================================================================
