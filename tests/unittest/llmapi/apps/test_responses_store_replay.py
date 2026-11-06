@@ -116,6 +116,41 @@ def test_replay_drops_a_reasoning_only_turn_and_keeps_others_as_stored():
     assert replayed[1:] == [{"role": "user", "content": "hi"}]
 
 
+def test_replay_keeps_the_text_of_a_turn_folded_from_input_items():
+    """A stored request's input holds each assistant turn as one message.
+
+    Reasoning, text and calls share that message, so replay drops the
+    reasoning and keeps the rest.
+    """
+    request = ResponsesRequest(
+        model="m",
+        input=[
+            {"role": "user", "content": "go"},
+            {
+                "type": "reasoning",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "x"}],
+            },
+            {
+                "id": "msg_1",
+                "status": "completed",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Running.", "annotations": []}],
+            },
+            {"type": "function_call", "call_id": "call_1", "name": "exec", "arguments": "{}"},
+            _tool_result_item(),
+        ],
+    )
+    stored = asyncio.run(_create_input_messages(request=request, prev_msgs=[]))
+
+    replayed = _replay(stored)
+    assert [m["role"] for m in replayed] == ["user", "assistant", "tool", "user"]
+    assert all("reasoning" not in m for m in replayed)
+    assert replayed[1]["content"] == "Running."
+    assert [call["id"] for call in replayed[1]["tool_calls"]] == ["call_1"]
+
+
 def test_trimming_a_stored_conversation_leaves_the_callers_messages_whole():
     store = ConversationHistoryStore(resp_capacity=1)
     messages = [{"role": ("user", "assistant")[i % 2], "content": str(i)} for i in range(8)]
