@@ -150,6 +150,7 @@ class PagedKVTables(NamedTuple):
     seq_lens_q: torch.Tensor  # [num_causal_blocks], all causal_block_size
     seq_lens_kv: torch.Tensor  # [num_causal_blocks]
     cu_seqlens_kv: torch.Tensor  # [num_causal_blocks + 1]
+    cu_seqlens_q: torch.Tensor  # [num_causal_blocks + 1], entry i is i * causal_block_size
 
 
 @dataclass
@@ -161,6 +162,7 @@ class _Layout:
     seq_lens_q: torch.Tensor  # [n]
     seq_lens_kv: torch.Tensor  # [n]
     cu_seqlens_kv: torch.Tensor  # [n + 1]
+    cu_seqlens_q: torch.Tensor  # [n + 1]
     # A fixed ``private_slots`` entries per causal block, so the first ``m`` causal blocks'
     # entries are a prefix; see ``_stage_kernel``.
     private_src: torch.Tensor  # [n * private_slots]
@@ -518,6 +520,7 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
             shapes[f"{size}.seq_lens_q"] = (n,)
             shapes[f"{size}.seq_lens_kv"] = (n,)
             shapes[f"{size}.cu_seqlens_kv"] = (n + 1,)
+            shapes[f"{size}.cu_seqlens_q"] = (n + 1,)
             shapes[f"{size}.private_src"] = (n * self.private_slots,)
             shapes[f"{size}.private_dst"] = (n * self.private_slots,)
         # Every view starts on a 128-byte boundary: kernels take them as aligned tensors.
@@ -541,12 +544,14 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
         for size, n in spec.causal_blocks.items():
             for mirror in mirrors:
                 mirror.views[f"{size}.seq_lens_q"][:] = size
+                mirror.views[f"{size}.cu_seqlens_q"][:] = np.arange(n + 1) * size
             layouts[size] = _Layout(
                 num_causal_blocks=n,
                 page_table=views[f"{size}.page_table"],
                 seq_lens_q=views[f"{size}.seq_lens_q"],
                 seq_lens_kv=views[f"{size}.seq_lens_kv"],
                 cu_seqlens_kv=views[f"{size}.cu_seqlens_kv"],
+                cu_seqlens_q=views[f"{size}.cu_seqlens_q"],
                 private_src=views[f"{size}.private_src"],
                 private_dst=views[f"{size}.private_dst"],
                 first_private_page=first_private_page,
@@ -674,6 +679,7 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
             layout.seq_lens_q[:n],
             layout.seq_lens_kv[:n],
             layout.cu_seqlens_kv[: n + 1],
+            layout.cu_seqlens_q[: n + 1],
         )
 
     def write_staged(
