@@ -29,11 +29,12 @@ import socket
 import socketserver
 import struct
 import threading
+import time
 import zlib
 from array import array
-from typing import Any, Optional
+from typing import Optional
 
-from tensorrt_llm.inputs.prefix_token_cache import PrefixTokenCache, RouteFailed
+from tensorrt_llm.inputs.prefix_token_cache import OffsetTokenizer, PrefixTokenCache, RouteFailed
 from tensorrt_llm.logger import logger
 
 SOCKET_NAME = "tokenize-{}.sock"
@@ -58,12 +59,20 @@ def owner_of(key: str, num_frontends: int) -> int:
     return zlib.crc32(key.encode(errors=_TEXT_ERRORS)) % num_frontends
 
 
+class _Connections(threading.local):
+    """This thread's connection to each owner."""
+
+    def __init__(self) -> None:
+        self.by_owner: dict[int, socket.socket] = {}
+
+
 class TokenizationOwners:
     """Route ``cache``'s prompts to the frontend that owns their conversation.
 
     Serves this frontend's ``cache`` to the other frontends and installs
     ``cache.route``. A prompt the owner does not tokenize within ``timeout_s``,
-    for example because it has not started or has died, is tokenized locally.
+    for example because it has not started, has died or has hung, is tokenized
+    locally, and so is every prompt it owns for the next ``retry_after_s``.
     """
 
     def __init__(
@@ -72,15 +81,19 @@ class TokenizationOwners:
         frontend_id: int,
         num_frontends: int,
         cache: PrefixTokenCache,
-        tokenizer: Any,
+        tokenizer: OffsetTokenizer,
         timeout_s: float = 5.0,
+        retry_after_s: float = 30.0,
     ):
         self._ipc_dir = ipc_dir
         self._frontend_id = frontend_id
         self._num_frontends = num_frontends
         self._timeout_s = timeout_s
+        self._retry_after_s = retry_after_s
+        # Monotonic time before which an owner that did not answer is not asked.
+        self._skip_until: dict[int, float] = {}
         # One connection per owner per tokenizing thread.
-        self._connections = threading.local()
+        self._connections = _Connections()
         self._all_connections: set[socket.socket] = set()
         self._lock = threading.Lock()
 
@@ -105,9 +118,12 @@ class TokenizationOwners:
         owner = owner_of(key, self._num_frontends)
         if owner == self._frontend_id:
             return None
+        if time.monotonic() < self._skip_until.get(owner, 0.0):
+            raise RouteFailed(f"frontend {owner} did not answer recently")
         try:
             return self._request(owner, text)
         except OSError as e:
+            self._skip_until[owner] = time.monotonic() + self._retry_after_s
             self._drop(owner)
             raise RouteFailed(f"frontend {owner} did not answer: {e!r}") from e
 
@@ -123,7 +139,7 @@ class TokenizationOwners:
         return ids.tolist()
 
     def _connection(self, owner: int) -> socket.socket:
-        conns = self._connections.__dict__
+        conns = self._connections.by_owner
         conn = conns.get(owner)
         if conn is None:
             conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -139,7 +155,7 @@ class TokenizationOwners:
         return conn
 
     def _drop(self, owner: int) -> None:
-        conn = self._connections.__dict__.pop(owner, None)
+        conn = self._connections.by_owner.pop(owner, None)
         if conn is not None:
             with self._lock:
                 self._all_connections.discard(conn)
@@ -152,7 +168,7 @@ class _Server(socketserver.ThreadingUnixStreamServer):
     # Unix-socket connect to a full backlog fails at once instead of waiting.
     request_queue_size = socket.SOMAXCONN
 
-    def __init__(self, path: str, cache: PrefixTokenCache, tokenizer: Any):
+    def __init__(self, path: str, cache: PrefixTokenCache, tokenizer: OffsetTokenizer):
         self.cache = cache
         self.tokenizer = tokenizer
         # Accepted connections and the threads serving them.

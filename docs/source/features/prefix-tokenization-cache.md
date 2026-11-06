@@ -125,7 +125,8 @@ request arrived at sends the prompt text to the owner over a local Unix socket
 and gets back the token ids; the request itself stays where it arrived. A
 request without a conversation id is tokenized locally, and so is one whose
 owner does not answer within 5 seconds or cannot tokenize the prompt; the
-latter are counted as route failures in the periodic log line. The switch is
+latter are counted as route failures in the periodic log line. An owner that
+did not answer is not asked again for 30 seconds. The switch is
 off by default and has no effect with a single frontend or with the cache
 disabled. On the trace above with 8 frontends, it brought the p90 frontend time
 at one session from about 165 ms to about 58 ms.

@@ -23,7 +23,7 @@ from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
 from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+                    AsyncIterator, Callable, Dict, List, Optional, Tuple, Union)
 
 import msgspec
 import uvicorn
@@ -59,7 +59,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder, SchedulingParams, tracing
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
-from tensorrt_llm.llmapi.llm import LLM, RequestOutput
+from tensorrt_llm.llmapi.llm import LLM, PreprocessedInputs, RequestOutput
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.llmapi.thinking_budget import \
     add_thinking_budget_logits_processor
@@ -169,11 +169,12 @@ if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
 
 
-def _preprocess_in_conversation(routing_id: Optional[str], preprocess_fn,
-                                *args):
+def _preprocess_in_conversation(
+        routing_id: Optional[str],
+        preprocess_fn: Callable[[], PreprocessedInputs]) -> PreprocessedInputs:
     """Run ``preprocess_fn`` with its prompt tagged as conversation ``routing_id``."""
     with tokenization_routing_key(routing_id):
-        return preprocess_fn(*args)
+        return preprocess_fn()
 
 
 def _is_visual_gen_instance(obj) -> bool:
