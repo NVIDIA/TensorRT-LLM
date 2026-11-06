@@ -25,31 +25,38 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 _sym_db = _symbol_database.Default()
 
 
+from . import generation_pb2 as openengine_dot_v1_dot_generation__pb2
 from . import kv_pb2 as openengine_dot_v1_dot_kv__pb2
 from . import server_pb2 as openengine_dot_v1_dot_server__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dopenengine/v1/lifecycle.proto\x12\ropenengine.v1\x1a\x16openengine/v1/kv.proto\x1a\x1aopenengine/v1/server.proto\"h\n\rHealthRequest\x12\x1f\n\x17include_inference_probe\x18\x01 \x01(\x08\x12\r\n\x05model\x18\x02 \x01(\t\x12\'\n\x04role\x18\x03 \x01(\x0e\x32\x19.openengine.v1.EngineRole\"g\n\x0eHealthResponse\x12)\n\x05state\x18\x01 \x01(\x0e\x32\x1a.openengine.v1.HealthState\x12*\n\x06\x63hecks\x18\x02 \x03(\x0b\x32\x1a.openengine.v1.HealthCheck\"W\n\x0bHealthCheck\x12\x0c\n\x04name\x18\x01 \x01(\t\x12)\n\x05state\x18\x02 \x01(\x0e\x32\x1a.openengine.v1.HealthState\x12\x0f\n\x07message\x18\x03 \x01(\t\"\x95\x01\n\x0c\x41\x62ortRequest\x12\x14\n\nrequest_id\x18\x01 \x01(\tH\x00\x12\x31\n\nkv_session\x18\x02 \x01(\x0b\x32\x1b.openengine.v1.KvSessionRefH\x00\x12\x32\n\x0c\x61ll_requests\x18\x03 \x01(\x0b\x32\x1a.openengine.v1.AllRequestsH\x00\x42\x08\n\x06target\"\r\n\x0b\x41llRequests\"L\n\rAbortResponse\x12*\n\x06status\x18\x01 \x01(\x0e\x32\x1a.openengine.v1.AbortStatus\x12\x0f\n\x07message\x18\x02 \x01(\t*\x95\x01\n\x0bHealthState\x12\x1c\n\x18HEALTH_STATE_UNSPECIFIED\x10\x00\x12\x19\n\x15HEALTH_STATE_STARTING\x10\x01\x12\x16\n\x12HEALTH_STATE_READY\x10\x02\x12\x19\n\x15HEALTH_STATE_DEGRADED\x10\x03\x12\x1a\n\x16HEALTH_STATE_NOT_READY\x10\x04*h\n\x0b\x41\x62ortStatus\x12\x1c\n\x18\x41\x42ORT_STATUS_UNSPECIFIED\x10\x00\x12\x18\n\x14\x41\x42ORT_STATUS_ABORTED\x10\x01\x12!\n\x1d\x41\x42ORT_STATUS_ALREADY_FINISHED\x10\x02\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x1dopenengine/v1/lifecycle.proto\x12\ropenengine.v1\x1a\x1eopenengine/v1/generation.proto\x1a\x16openengine/v1/kv.proto\x1a\x1aopenengine/v1/server.proto\"h\n\rHealthRequest\x12\x1f\n\x17include_inference_probe\x18\x01 \x01(\x08\x12\r\n\x05model\x18\x02 \x01(\t\x12\'\n\x04role\x18\x03 \x01(\x0e\x32\x19.openengine.v1.EngineRole\"g\n\x0eHealthResponse\x12)\n\x05state\x18\x01 \x01(\x0e\x32\x1a.openengine.v1.HealthState\x12*\n\x06\x63hecks\x18\x02 \x03(\x0b\x32\x1a.openengine.v1.HealthCheck\"W\n\x0bHealthCheck\x12\x0c\n\x04name\x18\x01 \x01(\t\x12)\n\x05state\x18\x02 \x01(\x0e\x32\x1a.openengine.v1.HealthState\x12\x0f\n\x07message\x18\x03 \x01(\t\"\xce\x01\n\x0c\x41\x62ortRequest\x12\x14\n\nrequest_id\x18\x01 \x01(\tH\x00\x12\x31\n\nkv_session\x18\x02 \x01(\x0b\x32\x1b.openengine.v1.KvSessionRefH\x00\x12\x32\n\x0c\x61ll_requests\x18\x03 \x01(\x0b\x32\x1a.openengine.v1.AllRequestsH\x00\x12\x37\n\rencoder_cache\x18\x04 \x01(\x0b\x32\x1e.openengine.v1.EncoderCacheRefH\x00\x42\x08\n\x06target\"\r\n\x0b\x41llRequests\"L\n\rAbortResponse\x12*\n\x06status\x18\x01 \x01(\x0e\x32\x1a.openengine.v1.AbortStatus\x12\x0f\n\x07message\x18\x02 \x01(\t\"/\n\x0fShutdownRequest\x12\x1c\n\x14\x65xpected_instance_id\x18\x01 \x01(\t\"V\n\x10ShutdownResponse\x12-\n\x06status\x18\x01 \x01(\x0e\x32\x1d.openengine.v1.ShutdownStatus\x12\x13\n\x0binstance_id\x18\x02 \x01(\t*\x95\x01\n\x0bHealthState\x12\x1c\n\x18HEALTH_STATE_UNSPECIFIED\x10\x00\x12\x19\n\x15HEALTH_STATE_STARTING\x10\x01\x12\x16\n\x12HEALTH_STATE_READY\x10\x02\x12\x19\n\x15HEALTH_STATE_DEGRADED\x10\x03\x12\x1a\n\x16HEALTH_STATE_NOT_READY\x10\x04*h\n\x0b\x41\x62ortStatus\x12\x1c\n\x18\x41\x42ORT_STATUS_UNSPECIFIED\x10\x00\x12\x18\n\x14\x41\x42ORT_STATUS_ABORTED\x10\x01\x12!\n\x1d\x41\x42ORT_STATUS_ALREADY_FINISHED\x10\x02*u\n\x0eShutdownStatus\x12\x1f\n\x1bSHUTDOWN_STATUS_UNSPECIFIED\x10\x00\x12\x1c\n\x18SHUTDOWN_STATUS_ACCEPTED\x10\x01\x12$\n SHUTDOWN_STATUS_ALREADY_STOPPING\x10\x02\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'tensorrt_llm.grpc.openengine._generated.lifecycle_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_HEALTHSTATE']._serialized_start=646
-  _globals['_HEALTHSTATE']._serialized_end=795
-  _globals['_ABORTSTATUS']._serialized_start=797
-  _globals['_ABORTSTATUS']._serialized_end=901
-  _globals['_HEALTHREQUEST']._serialized_start=100
-  _globals['_HEALTHREQUEST']._serialized_end=204
-  _globals['_HEALTHRESPONSE']._serialized_start=206
-  _globals['_HEALTHRESPONSE']._serialized_end=309
-  _globals['_HEALTHCHECK']._serialized_start=311
-  _globals['_HEALTHCHECK']._serialized_end=398
-  _globals['_ABORTREQUEST']._serialized_start=401
-  _globals['_ABORTREQUEST']._serialized_end=550
-  _globals['_ALLREQUESTS']._serialized_start=552
-  _globals['_ALLREQUESTS']._serialized_end=565
-  _globals['_ABORTRESPONSE']._serialized_start=567
-  _globals['_ABORTRESPONSE']._serialized_end=643
+  _globals['_HEALTHSTATE']._serialized_start=872
+  _globals['_HEALTHSTATE']._serialized_end=1021
+  _globals['_ABORTSTATUS']._serialized_start=1023
+  _globals['_ABORTSTATUS']._serialized_end=1127
+  _globals['_SHUTDOWNSTATUS']._serialized_start=1129
+  _globals['_SHUTDOWNSTATUS']._serialized_end=1246
+  _globals['_HEALTHREQUEST']._serialized_start=132
+  _globals['_HEALTHREQUEST']._serialized_end=236
+  _globals['_HEALTHRESPONSE']._serialized_start=238
+  _globals['_HEALTHRESPONSE']._serialized_end=341
+  _globals['_HEALTHCHECK']._serialized_start=343
+  _globals['_HEALTHCHECK']._serialized_end=430
+  _globals['_ABORTREQUEST']._serialized_start=433
+  _globals['_ABORTREQUEST']._serialized_end=639
+  _globals['_ALLREQUESTS']._serialized_start=641
+  _globals['_ALLREQUESTS']._serialized_end=654
+  _globals['_ABORTRESPONSE']._serialized_start=656
+  _globals['_ABORTRESPONSE']._serialized_end=732
+  _globals['_SHUTDOWNREQUEST']._serialized_start=734
+  _globals['_SHUTDOWNREQUEST']._serialized_end=781
+  _globals['_SHUTDOWNRESPONSE']._serialized_start=783
+  _globals['_SHUTDOWNRESPONSE']._serialized_end=869
 # @@protoc_insertion_point(module_scope)

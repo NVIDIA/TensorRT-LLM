@@ -74,6 +74,9 @@ For models that do not accept token-ID input, including Whisper, the optional
 applicable. It does not submit inference and does not establish inference liveness;
 the ordinary lifecycle and executor health checks still apply.
 
+`Control.Shutdown` currently returns `UNIMPLEMENTED`. Stop the serving process
+through its supervisor or with SIGTERM to run the normal engine shutdown path.
+
 The `Inference.Generate` RPC loads the selected model through TensorRT-LLM's PyTorch `LLM` API and streams incremental token and text events. It supports text and token-ID inputs, native sampling and stopping options, top-N prompt and output log probabilities, TensorRT-LLM guided-decoding modes, cache salt, trace-context propagation, multiple output sequences, finish reasons, and final usage.
 
 Clients must continuously consume the response stream. If response delivery remains stalled for 30 seconds, the server aborts the engine request and terminates the stream with a retryable overload error.
@@ -335,3 +338,52 @@ For token-only clients, send boolean `extra["detokenize"] = false`. Omitted deto
 Conversation-affinity placement requires `attention_dp_config.kv_cache_routing_conversation_affinity: true` when using attention DP; it is disabled by default. Per-conversation cache retention requires block reuse to be enabled and `kv_cache_config.block_reuse_config.policy: per_conversation` with KV cache manager v2; the default policy is `all_reusable`. Forwarding a conversation ID does not enable either setting. These extensions do not require KV-event discovery, publication, or routing-load snapshots.
 
 For disaggregated subagent context requests, configure `internal_request_auth_key` in the `trtllm-serve` config and use the same key in the Dynamo sidecar's `TRTLLM_SUBAGENT_AFFINITY_AUTH_KEY`. The sidecar sends the parent session as signed `x-trtllm-subagent-affinity-id` and `x-trtllm-subagent-affinity-auth` gRPC metadata. OpenEngine accepts the hint only on `context_only` requests with a stable child `extra["conversation_id"]` and conversation-aware attention DP; it passes the parent to the ADP router without changing the child conversation ID. `ServerInfo.extra.trtllm_supports_subagent_affinity` reports whether the receiving server is configured for this extension. Keep the gRPC listener behind a trusted gateway: the signature authenticates the sidecar-to-engine hop, while the gateway must authorize the parent-child relationship. OpenEngine rejects `openengine-routing-key` and unknown `openengine-*` metadata rather than silently ignoring routing requests.
+
+
+## Encoder-output transport helpers
+
+`encoder.py` and `encoder_nixl.py` implement single-use image encoder-cache
+references for native multimodal disaggregation. They preserve embedding layout,
+image hashes and mRoPE tensors. Consumers validate request and model identity
+before claiming a reference.
+
+The NIXL backend uses TRT-LLM's native transfer agent to WRITE GPU buffers across
+hosts. References contain metadata rather than source pointers. Transfers are
+limited to 64 MiB, with 256 MiB of registered storage per engine. Pending exports
+expire after five minutes when the cache is collected. An uncertain WRITE stops
+admission and retains affected buffers until process exit.
+
+Each send and receive owns a temporary native agent so its metadata cannot contain
+another request's registrations. Peer metadata stays valid through completion;
+network waits do not hold the cache-state lock. Shutdown stops admission and
+drains active operations before closing healthy agents.
+
+`TransferEncoderCache` marks proven pre-WRITE rejections with `INVALID_ARGUMENT`
+and trailing metadata `trtllm-encoder-write: not-started`. Only that combination
+allows the receiver to release its buffers after an RPC failure. Unmarked errors,
+including errors from older peers, remain uncertain. Receiver setup failures
+preserve the source reference after imported peer metadata is invalidated.
+
+The optional safetensors backend uses a private shared directory on one host.
+It applies the same single-use and request-identity checks, with a 64 MiB tensor
+limit and a 256 MiB serialized-cache limit.
+
+The helpers use the encoder-handoff contract proposed in
+[OpenEngine #35](https://github.com/ai-dynamo/openengine/pull/35), pinned to an
+immutable source revision in the vendor lock. It is not in a published BSR
+release. Serving role discovery, request dispatch and lifecycle integration are
+provided by the stacked serving change.
+
+### Encoder transport tests
+
+The CPU CI list collects `test_encoder_nixl.py`, but its two native NIXL/UCX
+transfer tests are opt-in local/QA tests. They require a compatible native runtime
+and are not enabled by the default CPU job. Run them explicitly with:
+
+```bash
+TRTLLM_TEST_NIXL_ENCODER=1 python3 -m pytest tests/unittest/grpc/openengine/test_encoder_nixl.py
+```
+
+These native tests use CPU buffers and exercise registration, WRITE, and
+release, including separate producer/consumer processes. Cross-host CUDA E+PD
+and E/P/D require separate GPU validation.

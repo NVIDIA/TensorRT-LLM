@@ -8,15 +8,24 @@ assertion is about request state, transfer ownership and what the executor
 was asked to do -- not about which internal method was called.
 """
 
-from types import SimpleNamespace
+import weakref
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 from coordinator_harness import CoordinatorHarness as _Harness
 from coordinator_harness import TransferRequest as _Request
 from fake_dist import FakeDistGroup
 
 from tensorrt_llm._torch.disaggregation.orchestration import coordinator as coordinator_module
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.request_utils import RequestBroadcaster
+from tensorrt_llm._torch.pyexecutor.sampler.finish_reasons import (
+    FinishReasonsHandler,
+    _StopWordAllocation,
+)
 from tensorrt_llm.bindings import LlmRequestState
 
 pytestmark = pytest.mark.cpu_only
@@ -837,3 +846,71 @@ def test_pace_idle_sleeps_only_when_a_transfer_can_unblock_the_loop(
     h.coordinator.pace_idle()
 
     assert sleep.called is expect_sleep
+
+
+@pytest.mark.parametrize("single_rank_adp", [False, True])
+def test_native_send_keeps_idle_and_shutdown_polling_until_sampler_release(
+    single_rank_adp: bool,
+) -> None:
+    executor = object.__new__(PyExecutor)
+    executor.active_requests = []
+    executor.model_engine = SimpleNamespace(model=None)
+    executor.dist = SimpleNamespace(rank=0, tp_size=1, world_size=1)
+    executor.waiting_queue = Mock()
+    executor.kv_connector_manager = None
+    executor.enable_attention_dp = single_rank_adp
+    executor.dist.tp_size = 1
+    executor.dist.world_size = 1
+    executor.is_shutdown = False
+    executor.control_requests = []
+    executor._disable_mpi = False
+    executor.request_accumulated = []
+    executor.hang_detector = SimpleNamespace(pause=nullcontext)
+    executor.request_broadcaster = RequestBroadcaster(executor.dist, executor.hang_detector)
+    executor.executor_request_queue = Mock()
+    executor.executor_request_queue.get_from_request_queue.return_value = []
+    executor.waiting_queue.__len__ = Mock(return_value=0)
+    handler = object.__new__(FinishReasonsHandler)
+    handler._stop_word_allocations = {}
+    handler._stop_word_history_slots = set()
+    executor.sampler = SimpleNamespace(release_request=handler.release_request)
+    executor.resource_manager = SimpleNamespace(free_resources=lambda req: None)
+    executor._prefetched_request_ids = set()
+    executor.draft_model_engine = None
+
+    harness = _Harness()
+    executor._disagg_coordinator = harness.coordinator
+    executor.async_transfer_manager = harness.transfers
+    harness.effects.terminate_request = MethodType(PyExecutor._free_request_resources, executor)
+    request = _Request(1, is_finished=True, py_seq_slot=0)
+    request.py_mrope_position_delta = torch.ones((1, 1), dtype=torch.int32)
+    request_ref = weakref.ref(request)
+    tensor_ref = weakref.ref(request.py_mrope_position_delta)
+    handler._stop_word_allocations[0] = _StopWordAllocation(request, torch.zeros(1))
+    handler._stop_word_history_slots.add(0)
+    harness.send(request)
+    harness.kv_cache_manager.reset_mock()
+
+    # No completion yet: neither idle input fetch nor shutdown may strand the send.
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
+    timeout = executor.executor_request_queue.get_from_request_queue.call_args.args[0]
+    assert timeout.total_seconds() == 0
+    executor.is_shutdown = True
+    assert not executor.should_stop_processing
+    executor.disagg.poll_progress_when_idle()
+    assert harness.in_transfer(request)
+    assert 0 in handler._stop_word_allocations
+
+    harness.transceiver.finish_send(request)
+    executor.disagg.poll_progress_when_idle()
+    assert request.state == LlmRequestState.DISAGG_CONTEXT_COMPLETE
+    assert not harness.in_transfer(request)
+    assert handler._stop_word_allocations == {}
+    assert handler._stop_word_history_slots == set()
+    del request
+    assert request_ref() is None
+    assert tensor_ref() is None
+    assert executor.should_stop_processing
+    executor.is_shutdown = False
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, total_num_live_requests=0)
+    executor.executor_request_queue.get_from_request_queue.assert_called_with(None)

@@ -176,6 +176,11 @@ class ControlStub(object):
                 request_serializer=openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.SerializeToString,
                 response_deserializer=openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.FromString,
                 _registered_method=True)
+        self.Shutdown = channel.unary_unary(
+                '/openengine.v1.Control/Shutdown',
+                request_serializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownResponse.FromString,
+                _registered_method=True)
         self.LoadLora = channel.unary_unary(
                 '/openengine.v1.Control/LoadLora',
                 request_serializer=openengine_dot_v1_dot_lora__pb2.LoadLoraRequest.SerializeToString,
@@ -190,6 +195,11 @@ class ControlStub(object):
                 '/openengine.v1.Control/ListLoras',
                 request_serializer=openengine_dot_v1_dot_lora__pb2.ListLorasRequest.SerializeToString,
                 response_deserializer=openengine_dot_v1_dot_lora__pb2.ListLorasResponse.FromString,
+                _registered_method=True)
+        self.TransferEncoderCache = channel.unary_unary(
+                '/openengine.v1.Control/TransferEncoderCache',
+                request_serializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheRequest.SerializeToString,
+                response_deserializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheResponse.FromString,
                 _registered_method=True)
         self.GetKvEventSources = channel.unary_unary(
                 '/openengine.v1.Control/GetKvEventSources',
@@ -238,6 +248,13 @@ class ControlServicer(object):
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def Shutdown(self, request, context):
+        """Identity-fenced, idempotent shutdown of the entire engine serving group.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def LoadLora(self, request, context):
         """LoRA lifecycle.
         """
@@ -253,6 +270,14 @@ class ControlServicer(object):
 
     def ListLoras(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TransferEncoderCache(self, request, context):
+        """Returns only after the encoder backend has completed the data transfer.
+        Single-use handoffs must not be retried after an uncertain outcome.
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -298,6 +323,11 @@ def add_ControlServicer_to_server(servicer, server):
                     request_deserializer=openengine_dot_v1_dot_lifecycle__pb2.AbortRequest.FromString,
                     response_serializer=openengine_dot_v1_dot_lifecycle__pb2.AbortResponse.SerializeToString,
             ),
+            'Shutdown': grpc.unary_unary_rpc_method_handler(
+                    servicer.Shutdown,
+                    request_deserializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_lifecycle__pb2.ShutdownResponse.SerializeToString,
+            ),
             'LoadLora': grpc.unary_unary_rpc_method_handler(
                     servicer.LoadLora,
                     request_deserializer=openengine_dot_v1_dot_lora__pb2.LoadLoraRequest.FromString,
@@ -312,6 +342,11 @@ def add_ControlServicer_to_server(servicer, server):
                     servicer.ListLoras,
                     request_deserializer=openengine_dot_v1_dot_lora__pb2.ListLorasRequest.FromString,
                     response_serializer=openengine_dot_v1_dot_lora__pb2.ListLorasResponse.SerializeToString,
+            ),
+            'TransferEncoderCache': grpc.unary_unary_rpc_method_handler(
+                    servicer.TransferEncoderCache,
+                    request_deserializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheRequest.FromString,
+                    response_serializer=openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheResponse.SerializeToString,
             ),
             'GetKvEventSources': grpc.unary_unary_rpc_method_handler(
                     servicer.GetKvEventSources,
@@ -470,6 +505,33 @@ class Control(object):
             _registered_method=True)
 
     @staticmethod
+    def Shutdown(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Control/Shutdown',
+            openengine_dot_v1_dot_lifecycle__pb2.ShutdownRequest.SerializeToString,
+            openengine_dot_v1_dot_lifecycle__pb2.ShutdownResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def LoadLora(request,
             target,
             options=(),
@@ -540,6 +602,33 @@ class Control(object):
             '/openengine.v1.Control/ListLoras',
             openengine_dot_v1_dot_lora__pb2.ListLorasRequest.SerializeToString,
             openengine_dot_v1_dot_lora__pb2.ListLorasResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TransferEncoderCache(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/openengine.v1.Control/TransferEncoderCache',
+            openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheRequest.SerializeToString,
+            openengine_dot_v1_dot_generation__pb2.TransferEncoderCacheResponse.FromString,
             options,
             channel_credentials,
             insecure,
