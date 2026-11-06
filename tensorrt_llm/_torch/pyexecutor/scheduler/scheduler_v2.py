@@ -189,6 +189,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         enable_recompute_pause: bool = True,
         context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
         context_starvation_iterations: Optional[int] = None,
+        context_append_reserve_tokens: Optional[int] = None,
+        context_append_reserve_adaptive: Optional[bool] = None,
+        context_append_reserve_reprobe_iterations: Optional[int] = None,
     ) -> None:
         self.remote_tail_phase: RemoteTailPhase | None = None
         self._remote_tail_context_ids: frozenset[int] = frozenset()
@@ -346,11 +349,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         # context requests (agentic appends) in the same iteration instead of
         # waiting for the whole long prefill. Generation, encoder and held
         # starvation tokens remain charged. Applies only when max_num_tokens > 2 * R.
-        self._ctx_append_reserve = int(os.environ.get("TLLM_CTX_APPEND_RESERVE", "0") or 0)
+        self._ctx_append_reserve_from_env = context_append_reserve_tokens is None
+        self._ctx_append_reserve = (
+            int(os.environ.get("TLLM_CTX_APPEND_RESERVE", "0") or 0)
+            if self._ctx_append_reserve_from_env
+            else context_append_reserve_tokens
+        )
         if (
             self._ctx_append_reserve > 0
             and max_num_tokens is not None
             and max_num_tokens > 2 * self._ctx_append_reserve
+            and (self._ctx_append_reserve_from_env or self.chunking_enabled)
         ):
             logger.info(
                 f"KVCacheV2Scheduler: context append reserve {self._ctx_append_reserve} tokens "
@@ -364,8 +373,14 @@ class KVCacheV2Scheduler(RequestScheduler):
         # waiting behind the first one, so an idle cold prompt keeps full
         # max_num_tokens chunks. Its chunk sizes then depend on load, which is
         # value-neutral only if the forward is invariant to chunk size.
-        self._ctx_append_reserve_adaptive = self._ctx_append_reserve > 0 and (
-            os.environ.get("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1") == "1"
+        if context_append_reserve_adaptive is None:
+            context_append_reserve_adaptive = (
+                os.environ.get("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1") == "1"
+                if self._ctx_append_reserve_from_env
+                else True
+            )
+        self._ctx_append_reserve_adaptive = (
+            self._ctx_append_reserve > 0 and context_append_reserve_adaptive
         )
         self._ctx_append_reserve_active = True
         if self._ctx_append_reserve_adaptive:
@@ -376,13 +391,19 @@ class KVCacheV2Scheduler(RequestScheduler):
         # long prefill. Like the adaptive reserve, this makes chunk boundaries load-dependent.
         self._ctx_append_reserve_sjf = self._ctx_append_reserve > 0 and (
             os.environ.get("TLLM_CTX_APPEND_RESERVE_SJF", "1") == "1"
+            if self._ctx_append_reserve_from_env
+            else self._ctx_shortest_first
         )
         self._ctx_append_reserve_sjf_logged = 0
         # The sort key is each request's uncached token count, probed against the reuse tree; it is memoized per
         # request and re-probed every TLLM_CTX_APPEND_RESERVE_SJF_REPROBE scheduler passes (it only orders requests).
-        self._ctx_append_reserve_sjf_reprobe = max(
-            1, int(os.environ.get("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "8") or 1)
-        )
+        if context_append_reserve_reprobe_iterations is None:
+            context_append_reserve_reprobe_iterations = (
+                max(1, int(os.environ.get("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "8") or 1))
+                if self._ctx_append_reserve_from_env
+                else 8
+            )
+        self._ctx_append_reserve_sjf_reprobe = context_append_reserve_reprobe_iterations
         self._ctx_append_reserve_sjf_pass = 0
         self._uncached_context_memo: dict[int, tuple[int, int]] = {}
         if self._ctx_append_reserve_sjf:
@@ -803,7 +824,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         ):
             self._order_reserve_shortest_first(pending_ctx)
 
-        if self._ctx_shortest_first and len(pending_ctx) > 1:
+        if (
+            self._ctx_shortest_first
+            and len(pending_ctx) > 1
+            and (self._ctx_append_reserve_from_env or not self._ctx_append_reserve_sjf)
+        ):
             pending_ctx = self._order_ctx_shortest_first(pending_ctx)
         starved_ctx: RequestList = []
         if self._ctx_starvation_iterations is not None:
@@ -1062,7 +1087,13 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Shortest-uncached-first context order ----
 
-    def _uncached_tokens(self, req: LlmRequest) -> int:
+    def _uncached_tokens(
+        self,
+        req: LlmRequest,
+        *,
+        reuse_probe: Optional[Callable[[LlmRequest], Optional[int]]] = None,
+        subtract_position: bool = True,
+    ) -> int:
         """Prompt tokens *req* still has to compute, net of reusable cached blocks.
 
         A first-chunk request has not claimed its reusable prefix yet, so its
@@ -1072,14 +1103,25 @@ class KVCacheV2Scheduler(RequestScheduler):
         remaining = req.context_remaining_length
         if not req.is_first_context_chunk:
             return remaining
-        if req.py_request_id not in self._reuse_probes:
-            self._reuse_probes[req.py_request_id] = self.kv_cache_manager.probe_context_reuse(req)
-        reusable = self._reuse_probes[req.py_request_id]
+        if reuse_probe is None:
+            if req.py_request_id not in self._reuse_probes:
+                self._reuse_probes[req.py_request_id] = self._reuse_claim_limit(
+                    req, target_only=True
+                )
+            reusable = self._reuse_probes[req.py_request_id]
+        else:
+            reusable = reuse_probe(req)
         if reusable is None:
             return remaining
-        return remaining - min(max(reusable - req.context_current_position, 0), remaining)
+        position = req.context_current_position if subtract_position else 0
+        return remaining - min(max(reusable - position, 0), remaining)
 
-    def _order_ctx_shortest_first(self, pending_ctx: RequestList) -> RequestList:
+    def _order_ctx_shortest_first(
+        self,
+        pending_ctx: RequestList,
+        *,
+        uncached_key: Optional[Callable[[LlmRequest], int]] = None,
+    ) -> RequestList:
         """Order context requests by uncached prompt tokens, fewest first.
 
         The sort is stable, so requests with equal counts keep their arrival
@@ -1087,8 +1129,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         if any(req.state_value != self._context_init_state_value for req in pending_ctx):
             return pending_ctx
+        key = self._uncached_tokens if uncached_key is None else uncached_key
         keyed = sorted(
-            ((self._uncached_tokens(req), pos, req) for pos, req in enumerate(pending_ctx)),
+            ((key(req), pos, req) for pos, req in enumerate(pending_ctx)),
             key=lambda item: item[:2],
         )
         return [req for _, _, req in keyed]
@@ -1130,7 +1173,12 @@ class KVCacheV2Scheduler(RequestScheduler):
         shares = []
         left = budget.remaining_tokens
         for req in starved_ctx:
-            uncached = self._uncached_tokens(req)
+            uncached = self._uncached_tokens(
+                req,
+                reuse_probe=self._reuse_claim_limit
+                if self._joint_draft_manager is not None
+                else None,
+            )
             share = max(0, min(uncached, cap, left))
             if share < uncached:
                 share = share // unit * unit
@@ -1526,7 +1574,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         unstarted = [req for req in rest if self._is_unstarted_context(req)]
         started = [req for req in rest if not self._is_unstarted_context(req)]
         if len(unstarted) > 1:
-            unstarted.sort(key=self._uncached_context_tokens)
+            unstarted = self._order_ctx_shortest_first(
+                unstarted, uncached_key=self._uncached_context_tokens
+            )
         pending_ctx[1:] = started + unstarted
         live = {req.py_request_id for req in unstarted}
         for request_id in [rid for rid in self._uncached_context_memo if rid not in live]:
@@ -1551,12 +1601,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             and self._ctx_append_reserve_sjf_pass - memo[1] < self._ctx_append_reserve_sjf_reprobe
         ):
             return memo[0]
-        if self._joint_draft_manager is not None:
-            reuse = self._reuse_claim_limit(req)
-        else:
-            probe = getattr(self.kv_cache_manager, "probe_context_reuse", None)
-            reuse = probe(req) if probe is not None else None
-        uncached = max(0, req.context_remaining_length - (reuse or 0))
+        uncached = self._uncached_tokens(
+            req,
+            reuse_probe=self._reuse_claim_limit,
+            subtract_position=not self._ctx_append_reserve_from_env,
+        )
         self._uncached_context_memo[req.py_request_id] = (
             uncached,
             self._ctx_append_reserve_sjf_pass,
@@ -1805,7 +1854,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             return None
         return point
 
-    def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
+    def _reuse_claim_limit(self, req: LlmRequest, *, target_only: bool = False) -> int | None:
         """Pair the two pools on one depth before either claims.
 
         Each probe matches through the D-token lookahead and applies its backoff
@@ -1815,9 +1864,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         Doing this up front rather than claim-then-reconcile keeps the mismatch
         path (free the draft pages and re-claim shallower) off the common case.
         """
-        draft_manager = self._joint_draft_manager
+        draft_manager = None if target_only else self._joint_draft_manager
         if draft_manager is None:
-            return None
+            return self.kv_cache_manager.probe_context_reuse(req)
         draft_match = draft_manager.probe_context_reuse(req)
         target_match = self.kv_cache_manager.probe_context_reuse(req)
         if draft_match is None or target_match is None:

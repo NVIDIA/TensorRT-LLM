@@ -4755,6 +4755,13 @@ def create_py_executor_resources(
             f"{context_scheduling_policy.value} is ignored: it needs the KV "
             "cache manager V2 scheduler")
 
+    if (not isinstance(kv_cache_manager, KVCacheManagerV2)
+            and scheduler_config is not None and
+            scheduler_config.context_append_reserve_tokens not in (None, 0)):
+        logger.warning(
+            "scheduler_config.context_append_reserve_tokens is ignored: "
+            "it needs the KV cache manager V2 scheduler")
+
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
         draft_kv_cache_manager = resources.get(
@@ -4783,6 +4790,15 @@ def create_py_executor_resources(
             context_scheduling_policy=context_scheduling_policy,
             context_starvation_iterations=scheduler_config.
             context_starvation_iterations
+            if scheduler_config is not None else None,
+            context_append_reserve_tokens=scheduler_config.
+            context_append_reserve_tokens
+            if scheduler_config is not None else None,
+            context_append_reserve_adaptive=scheduler_config.
+            context_append_reserve_adaptive
+            if scheduler_config is not None else None,
+            context_append_reserve_reprobe_iterations=scheduler_config.
+            context_append_reserve_reprobe_iterations
             if scheduler_config is not None else None,
         )
     elif (scheduler_config is not None

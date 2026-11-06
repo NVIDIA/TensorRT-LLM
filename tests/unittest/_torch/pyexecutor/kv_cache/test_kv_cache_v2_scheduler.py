@@ -739,6 +739,9 @@ def make_scheduler(
     enable_recompute_pause: bool = True,
     context_scheduling_policy: ContextSchedulingPolicy = ContextSchedulingPolicy.FCFS,
     context_starvation_iterations: int | None = None,
+    context_append_reserve_tokens: int | None = None,
+    context_append_reserve_adaptive: bool | None = None,
+    context_append_reserve_reprobe_iterations: int | None = None,
 ) -> object:
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
@@ -768,6 +771,9 @@ def make_scheduler(
             enable_recompute_pause=enable_recompute_pause,
             context_scheduling_policy=context_scheduling_policy,
             context_starvation_iterations=context_starvation_iterations,
+            context_append_reserve_tokens=context_append_reserve_tokens,
+            context_append_reserve_adaptive=context_append_reserve_adaptive,
+            context_append_reserve_reprobe_iterations=context_append_reserve_reprobe_iterations,
             **kwargs,
         )
 
@@ -5205,6 +5211,153 @@ def test_replay_only_batch_clears_deferred_generation_overlap_state(
 # ===========================================================================
 # Context append reserve: shortest-first order behind the first request
 # ===========================================================================
+
+
+class TestTypedAppendReserve:
+    @pytest.mark.parametrize("draft_reuse,expected", [(0, 2048), (4000, 1000), (None, 2048)])
+    def test_starvation_share_uses_joint_reuse(
+        self, draft_reuse: int | None, expected: int
+    ) -> None:
+        manager = make_kv_cache_manager(enable_joint_kv_cache_reuse=True)
+        draft_manager = make_kv_cache_manager()
+        for pool, reuse in ((manager, 5000), (draft_manager, draft_reuse)):
+            pool.probe_context_reuse.side_effect = None
+            pool.probe_context_reuse.return_value = reuse
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            draft_kv_cache_manager=draft_manager,
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+            context_starvation_iterations=2,
+            context_append_reserve_tokens=1024,
+        )
+        request = Mock(
+            spec_set=[
+                "py_request_id",
+                "context_remaining_length",
+                "is_first_context_chunk",
+                "context_current_position",
+            ]
+        )
+        request.py_request_id = 1
+        request.context_remaining_length = 5000
+        request.context_current_position = 0
+        request.is_first_context_chunk = True
+        # Sorting may already have cached the optimistic target-only estimate.
+        assert scheduler._uncached_tokens(request) == 0
+        assert scheduler._starved_ctx_shares([request], BudgetTracker(8192, 100)) == [expected]
+
+    def test_modifiers_override_legacy_environment(self, monkeypatch) -> None:
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "1024")
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_ADAPTIVE", "1")
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE_SJF_REPROBE", "8")
+        scheduler = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_adaptive=False,
+            context_append_reserve_reprobe_iterations=2,
+        )
+        assert scheduler._ctx_append_reserve == 1024
+        assert scheduler._ctx_append_reserve_adaptive is False
+        assert scheduler._ctx_append_reserve_sjf_reprobe == 2
+
+    @pytest.mark.parametrize("reserve", [0, 1024])
+    def test_explicit_reserve_overrides_environment(self, monkeypatch, reserve: int) -> None:
+        for name in (
+            "TLLM_CTX_APPEND_RESERVE",
+            "TLLM_CTX_APPEND_RESERVE_ADAPTIVE",
+            "TLLM_CTX_APPEND_RESERVE_SJF",
+            "TLLM_CTX_APPEND_RESERVE_SJF_REPROBE",
+        ):
+            monkeypatch.setenv(name, "invalid")
+        scheduler = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_tokens=reserve,
+            context_scheduling_policy=ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST,
+        )
+        assert scheduler._ctx_append_reserve == reserve
+        assert scheduler._ctx_append_reserve_adaptive is (reserve > 0)
+        assert scheduler._ctx_append_reserve_sjf is (reserve > 0)
+        assert scheduler._ctx_append_reserve_sjf_reprobe == 8
+
+    @pytest.mark.parametrize("chunked,budget", [(False, 8192), (True, 2048), (True, None)])
+    def test_inapplicable_reserve_is_disabled(self, chunked: bool, budget: int | None) -> None:
+        scheduler = make_scheduler(
+            make_kv_cache_manager(),
+            max_num_tokens=budget,
+            ctx_chunk_config=(None, 64) if chunked else None,
+            context_append_reserve_tokens=1024,
+        )
+        assert scheduler._ctx_append_reserve == 0
+
+    @pytest.mark.parametrize("legacy,expected", [(True, 1000), (False, 3000)])
+    def test_first_chunk_with_prepopulated_prefix(
+        self, monkeypatch, legacy: bool, expected: int
+    ) -> None:
+        monkeypatch.setenv("TLLM_CTX_APPEND_RESERVE", "1024")
+        manager = make_kv_cache_manager()
+        manager.probe_context_reuse.side_effect = None
+        manager.probe_context_reuse.return_value = 4000
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_tokens=None if legacy else 1024,
+        )
+        request = Mock(
+            spec_set=[
+                "py_request_id",
+                "context_remaining_length",
+                "is_first_context_chunk",
+                "context_current_position",
+            ]
+        )
+        request.py_request_id = 1
+        request.context_remaining_length = 5000
+        request.context_current_position = 2000
+        request.is_first_context_chunk = True
+        assert scheduler._uncached_context_tokens(request) == expected
+        assert scheduler._uncached_context_tokens(request) == expected
+        manager.probe_context_reuse.assert_called_once_with(request)
+        scheduler._ctx_append_reserve_sjf_pass += scheduler._ctx_append_reserve_sjf_reprobe
+        assert scheduler._uncached_context_tokens(request) == expected
+        assert manager.probe_context_reuse.call_count == 2
+        # The ordinary policy uses cursor-relative depth and its own per-pass cache.
+        assert scheduler._uncached_tokens(request) == 3000
+        assert scheduler._uncached_tokens(request) == 3000
+        assert manager.probe_context_reuse.call_count == 3
+
+    @pytest.mark.parametrize(
+        "policy,expected",
+        [
+            (ContextSchedulingPolicy.FCFS, [0, 1]),
+            (ContextSchedulingPolicy.SHORTEST_UNCACHED_FIRST, [0, 2, 1]),
+        ],
+    )
+    def test_policy_preserves_first_admitted_context(self, policy, expected: list[int]) -> None:
+        manager = make_kv_cache_manager()
+        scheduler = make_scheduler(
+            manager,
+            max_num_tokens=8192,
+            ctx_chunk_config=(None, 64),
+            context_append_reserve_tokens=2048,
+            context_scheduling_policy=policy,
+        )
+        requests = [
+            make_ctx_request(i, length, is_last_context_chunk=i == 2)
+            for i, length in enumerate([20000, 6000, 1000])
+        ]
+        output = scheduler.schedule_request(requests, set())
+        assert sorted(ids(output.context_requests)) == sorted(expected)
+        # Output groups non-final chunks first, after admission has assigned the budget.
+        assert [
+            args[0][0].py_request_id for args in manager.resize_context.call_args_list
+        ] == expected
+        assert requests[0].context_chunk_size == 6144
 
 
 class TestAppendReserveShortestFirst:
