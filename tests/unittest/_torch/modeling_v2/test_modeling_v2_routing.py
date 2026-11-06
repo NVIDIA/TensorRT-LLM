@@ -1526,7 +1526,14 @@ _GLM53_ENGINE = dict(max_batch_size=32)
 
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize(
-    "spec_config", [None, MTPDecodingConfig(max_draft_len=3)], ids=["no-spec", "mtp3"]
+    "spec_config",
+    [
+        None,
+        MTPDecodingConfig(max_draft_len=3),
+        # the served deployment: temperature-only sampling, which the step's own head samples
+        MTPDecodingConfig(max_draft_len=3, advanced_sampling_mode="no_topk_no_topp"),
+    ],
+    ids=["no-spec", "mtp3", "mtp3-temperature-only"],
 )
 @pytest.mark.parametrize("layout", [_GLM53_TP4, _GLM53_TP4_EP4], ids=["tp4", "tp4-ep4"])
 def test_glm53_tp4_matches(mode, spec_config, layout):
@@ -1604,3 +1611,39 @@ def test_glm53_on_other_sms_does_not_match(sm, monkeypatch):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: sm)
     config = _model_config(_glm53_config(), **_GLM53_TP4)
     assert modeling_v2_resolve(config, _llm_args("auto", **_GLM53_ENGINE)) is None
+
+
+@pytest.mark.parametrize(
+    "spec_kwargs, missed",
+    [
+        (dict(use_rejection_sampling=True), "rejection sampling"),
+        (dict(use_relaxed_acceptance_for_thinking=True), "relaxed acceptance"),
+        (dict(enable_penalty=True), "occurrence penalties"),
+        (dict(use_dynamic_tree=True, dynamic_tree_max_topK=2), "a dynamic draft tree"),
+        (dict(draft_len_schedule={4: 3, 16: 1}), "a draft-length schedule"),
+        # speculation off above a batch size is a draft-length schedule too
+        (dict(max_concurrency=8), "a draft-length schedule"),
+        (
+            dict(acceptance_rate_window_size=32, acceptance_rate_threshold=0.2),
+            "an acceptance-rate threshold",
+        ),
+    ],
+    ids=[
+        "rejection-sampling",
+        "relaxed-acceptance",
+        "penalties",
+        "dynamic-tree",
+        "draft-len-schedule",
+        "max-concurrency",
+        "acceptance-gate",
+    ],
+)
+def test_glm53_mtp_features_the_forward_does_not_compute_do_not_match(spec_kwargs, missed):
+    """The forward runs the MTP layer as a linear chain of three drafts with strict acceptance,
+    every step: a feature that changes what a step computes, or how many drafts it runs, routes
+    elsewhere rather than being served as something else."""
+    spec_config = MTPDecodingConfig(max_draft_len=3, **spec_kwargs)
+    config = _model_config(_glm53_config(), spec_config=spec_config, **_GLM53_TP4)
+    assert modeling_v2_resolve(config, _llm_args("auto", **_GLM53_ENGINE)) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require", **_GLM53_ENGINE))

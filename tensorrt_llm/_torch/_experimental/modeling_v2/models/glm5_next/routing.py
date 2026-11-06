@@ -49,6 +49,32 @@ def _quant_algo(pretrained_config: Any) -> str:
     return str(quant.get("quant_algo", "none")).upper()
 
 
+def _speculation_refused(spec_config: MTPDecodingConfig) -> list[str]:
+    """What in a one-model MTP-Eagle ``spec_config`` the target's forward does not compute; empty
+    when it is admitted.
+
+    The forward runs the checkpoint's MTP layer as a linear chain of three drafts every step,
+    with strict acceptance of the head's tokens (the argmax, or a sample from each request's own
+    sampling parameters). Each feature below would change what a step computes, or the number
+    of drafts it runs.
+    """
+    gate = bool(spec_config.acceptance_rate_window_size) and (
+        spec_config.acceptance_rate_threshold is not None
+    )
+    refused = {
+        "a dynamic draft tree": spec_config.use_dynamic_tree,
+        "draft trees": spec_config.max_total_draft_tokens not in (None, spec_config.max_draft_len),
+        "rejection sampling": spec_config.use_rejection_sampling,
+        "relaxed acceptance": spec_config.use_relaxed_acceptance_for_thinking,
+        "occurrence penalties": spec_config.enable_penalty,
+        "sa_config": spec_config.sa_config is not None,
+        "a separate speculative checkpoint": spec_config.speculative_model is not None,
+        "a draft-length schedule": spec_config.draft_len_schedule is not None,
+        "an acceptance-rate threshold": gate,
+    }
+    return [name for name, present in refused.items() if present]
+
+
 @routes("Glm5NextForConditionalGeneration")
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
@@ -132,6 +158,12 @@ def route(
             f"speculative decoding {spec_config.spec_dec_mode.name} with max_draft_len="
             f"{spec_config.max_draft_len}; the glm5_next target implements one-model "
             "MTP-Eagle at max_draft_len=3 or no speculative decoding"
+        )
+    refused = [] if spec_config is None else _speculation_refused(spec_config)
+    if refused:
+        raise NoTarget(
+            f"speculative decoding with {', '.join(refused)}; the glm5_next target runs the MTP "
+            "layer in its forward as a linear chain of three drafts with strict acceptance"
         )
 
     from .glm_5_3_flash_nvfp4__sm_10x__tp4.modeling import ModelingV2Glm53FlashNvfp4Sm10xTp4
