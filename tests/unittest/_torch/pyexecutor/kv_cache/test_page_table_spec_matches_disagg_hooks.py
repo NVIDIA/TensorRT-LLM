@@ -44,6 +44,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.cache_manager impor
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
 )
+from tensorrt_llm._torch.disaggregation.resource.kv_extractor import _compute_global_layer_ids
 from tensorrt_llm._torch.disaggregation.resource.page import MapperKind
 from tensorrt_llm._torch.modules.kimi_kda.cache_manager import KimiK3HybridCacheManager
 from tensorrt_llm._torch.modules.qwen4_exp.cache_manager import (
@@ -84,10 +85,13 @@ def assert_spec_states_every_role(spec: PageTableSpec, roles) -> None:
         assert spec.layout_of(str(role)) is not None, role
 
 
-def assert_spec_matches_disagg_hooks(manager, roles, layer_groups: int = 0) -> PageTableSpec:
+def assert_spec_matches_disagg_hooks(
+    manager, roles, layer_groups: int | None = None
+) -> PageTableSpec:
     """Check that ``manager``'s spec states each of ``roles`` (``assert_spec_states_every_role``),
     lays it out as its disaggregation hooks do, leaves the roles they ignore, and gives the layers
-    of its first ``layer_groups`` layer groups the global layer ids they do; return the spec."""
+    of its first ``layer_groups`` layer groups (all by default) the global layer ids disaggregated
+    transfer gives them (``_compute_global_layer_ids``); return the spec."""
     spec = manager.page_table_spec()
     assert_spec_states_every_role(spec, roles)
     kinds = manager.get_disagg_role_mapper_kinds()
@@ -114,20 +118,29 @@ def assert_spec_matches_disagg_hooks(manager, roles, layer_groups: int = 0) -> P
             assert isinstance(layout, ByHead), role
             assert layout.token_major == (kind == MapperKind.NHD), role
             assert layout.head_bytes == (None if shape is None else shape.bytes_per_head), role
+    if layer_groups is None:
+        layer_groups = len(manager.impl.layer_grouping)
+    # The stubs split no layer, so cache group g holds the layers of layer group g, which the
+    # transfer's names index.
     for group in range(layer_groups):
         layers = manager.impl.buffer_grouping[group]
         internal = list(dict.fromkeys(int(buffer.layer_id) for buffer in layers))
         names = [spec.layer_ids[layer] for layer in internal]
-        assert [g for g, _ in names] == manager.get_disagg_global_layer_ids(group)
+        assert [g for g, _ in names] == _compute_global_layer_ids(manager, group)
     return spec
 
 
 def _stub(manager_cls, **attributes):
     """A manager of ``manager_cls`` holding only ``attributes``, which its spec and hooks read; a
-    K/V cache of FP16 unless they say otherwise."""
+    K/V cache of FP16 over model layer 0 unless they say otherwise."""
     manager = object.__new__(manager_cls)
     manager.dtype = DataType.HALF
     manager.kv_factor = 2
+    manager.pp_layers = [0]
+    manager.impl = SimpleNamespace(
+        layer_grouping=[[LayerId(0)]],
+        buffer_grouping=[[SimpleNamespace(layer_id=LayerId(0), role=Role.KEY)]],
+    )
     for name, value in attributes.items():
         setattr(manager, name, value)
     return manager
@@ -158,7 +171,7 @@ def test_base_manager_splits_kv_by_head(dtype, quant_mode):
 
     assert all(spec.layout_of(str(role)) == ByHead() for role in KV_ROLES)
     assert spec.quant_mode == quant_mode
-    assert spec.layer_ids is None
+    assert dict(spec.layer_ids) == {0: (0, 0)}
 
 
 def test_base_manager_holds_an_mla_cache_s_one_latent_head_on_every_rank():
