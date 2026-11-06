@@ -26,48 +26,20 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
-# This file is copied from the dynamic-kernel-generator repository
-# (mxf8-opt/blackwell-port/source/contiguous_grouped_blockscaled_gemm_fused_fc12.py,
-#  branch user/junliu/mxfp8-fc12-blackwell-port, commit 0ba1daf9c91 plus the
-#  FC2 two-stage accumulator and chunk-start SFA gather that followed it).
-# It is the SM100/SM103 (data-center Blackwell) port of the Rubin fused FC1+FC2
-# MoE kernel (moe/kernels/rubin/...fused_fc12_mxfp8.py): standard SM100
-# block-scaled MMA with a shared-memory SFA repack instead of the Rubin-only
-# 128-datapath SFA descriptor; MXFP8 only; tiles 1CTA 128x128 / 128x256 and
-# 2CTA 256x128 / 256x256 with K tile 128 or 256. Same ``__call__`` ABI as the
-# Rubin kernel; extra constructor knobs (stream_weights, sparse_gather,
-# weight_prefetch_ktiles, fc2_weight_prefetch_ktiles, a_path, fc2_finalize)
-# are tuned by the TensorRT-LLM op runner.
-# Local modifications (kernel logic unchanged):
-#   - intra-package import of ``blackwell_compat`` (vendored next to this file
-#     as ``fused_fc12_mxfp8_blackwell_compat``).
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
-
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# The SM100/SM103 (data-center Blackwell) MXFP8 fused FC1 + SwiGLU + FC2 +
+# finalize persistent MoE kernel, the Blackwell counterpart of
+# moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12_mxfp8.py.
+# This file is the maintained copy. It uses the standard SM100 block-scaled
+# MMA with a shared-memory SFA repack in place of the Rubin-only 128-datapath
+# SFA descriptor, and takes MXFP8 only. Its ``__call__`` ABI matches the
+# Rubin kernel's.
+#
+# ``Sm100Mxfp8FusedFc12MoeRunner`` (custom_ops/cute_dsl_custom_ops.py) drives
+# it with 1CTA 128x128 / 128x256 and 2CTA 256x128 / 256x256 tiles, a K tile of
+# 128, the ``l2_atomic`` or ``static`` scheduler, and tunes ``stream_weights``,
+# ``weight_prefetch_ktiles``, ``fc2_weight_prefetch_ktiles`` and
+# ``sparse_gather``. It leaves ``a_path`` and ``fc2_finalize`` at their
+# defaults.
 
 from dataclasses import dataclass
 from typing import NamedTuple, Optional, Tuple, Type, Union
@@ -3861,6 +3833,11 @@ class Sm100BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     while ready != fc1_ready_expected:
                         nanosleep(cutlass.Int32(32))
                         ready = ld_acquire_gpu(fc1_ready, fc2_m_tile)
+                    # The acquire is a generic-proxy load, while the FC2 A/SFA
+                    # loads below are TMA (async proxy) reads of fc1_c and of
+                    # fc1_sfc, which the epilogue writes with generic stores.
+                    # Order the acquire before those async-proxy reads.
+                    cute.arch.fence_proxy("async.global")
 
                     fc2_a_gmem = tFC2AgA[(None, fc2_m_tile, None, 0)]
                     fc2_sfa_gmem = tFC2AgSFA[(None, fc2_m_tile, None, 0)]
@@ -5168,6 +5145,11 @@ class Sm100BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 self.epilog_sync_barrier.arrive_and_wait()
                 if warp_idx == self.epilog_warp_id[0]:
                     with cute.arch.elect_one():
+                        # fc1_sfc is written with generic stores and read by
+                        # FC2's TMA (async proxy) loads; order those stores
+                        # before the release, as the consumer orders its
+                        # acquire before the loads.
+                        cute.arch.fence_proxy("async.global")
                         red_add_release_gpu(
                             fc1_ready,
                             mma_tile_coord_mnl[0],
