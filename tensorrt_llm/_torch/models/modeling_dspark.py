@@ -3075,6 +3075,42 @@ def _bf16_push_gemm_available() -> bool:
     return True
 
 
+# Split-K tactics ``(mma_m, mma_n, split_k, ab_stages)`` of the low-M BF16 GEMM for the K3 MLA
+# drafter's fused [q_a | kv_a] projection (N 2112, K 7168), by the largest row count each serves:
+# measured in a CUDA graph with PDL over weights rotated beyond L2, cuBLAS (two GEMMs, or one on
+# the fused weight) loses at 7-28 rows (SM107: 6.5-7.2 us -> 4.0-5.0 us per fused call).
+_Q_KV_A_SHAPE = (2112, 7168)
+_Q_KV_A_SPLITK_TACTICS = {
+    107: ((8, (64, 8, 4, 12)), (16, (64, 16, 4, 10)), (32, (64, 32, 4, 8))),
+    100: ((8, (64, 16, 4, 8)), (16, (64, 16, 4, 9)), (32, (64, 16, 2, 11))),
+}
+
+
+@lru_cache(maxsize=None)
+def _q_kv_a_splitk_tactic(rows: int, n: int, k: int):
+    """The split-K tactic of the fused [q_a | kv_a] GEMM at ``rows`` rows, its pipeline depth
+    lowered to what the store kernel fits; None where the table does not cover the shape, rows or
+    architecture (the GEMM then runs on cuBLAS)."""
+    if (n, k) != _Q_KV_A_SHAPE or not is_sm_100f() or not _bf16_push_gemm_available():
+        return None
+    from ..kernels.blackwell.bf16_splitk_push_gemm import validate_push_tactic
+    from ..kernels.blackwell.dense_bf16_gemm_splitk import SplitKTactic
+
+    table = _Q_KV_A_SPLITK_TACTICS[107 if get_sm_version() == 107 else 100]
+    pin = next((tactic for max_rows, tactic in table if 0 < rows <= max_rows), None)
+    if pin is None:
+        return None
+    mma_m, mma_n, split_k, ab_stages = pin
+    for stages in range(ab_stages, 0, -1):
+        tactic = SplitKTactic(mma_m, mma_n, split_k, stages)
+        try:
+            validate_push_tactic(tactic, rows, n, k)
+        except ValueError:
+            continue
+        return tactic
+    return None
+
+
 def _pushed_linear_add_norm(
     linear: Linear, x: torch.Tensor, residual: torch.Tensor, norm: RMSNorm
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
@@ -3161,6 +3197,25 @@ class _PendingDown(NamedTuple):
 
     mlp: GatedMLP
     h2: torch.Tensor
+
+
+def _stack_q_kv_a_weight(attn: nn.Module) -> Optional[torch.Tensor]:
+    """``[q_a_proj; kv_a_proj_with_mqa]`` of an MLA attention as one ``[N, hidden]`` weight, the
+    two modules' weights re-pointed at its row ranges (no memory added); None where either is
+    quantized or biased."""
+    q_a, kv_a = attn.q_a_proj, attn.kv_a_proj_with_mqa
+    if (
+        q_a.has_any_quant
+        or kv_a.has_any_quant
+        or q_a.bias is not None
+        or kv_a.bias is not None
+        or q_a.weight.dtype != kv_a.weight.dtype
+    ):
+        return None
+    weight = torch.cat([q_a.weight.detach(), kv_a.weight.detach()], dim=0).contiguous()
+    q_a.weight.data = weight[: q_a.out_features]
+    kv_a.weight.data = weight[q_a.out_features :]
+    return weight
 
 
 def _block_upper_triangle(block_size: int, device) -> torch.Tensor:
@@ -3577,6 +3632,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # (draft_qhead); the folded weights, built with the fused KV buffers.
     _fused_mla_qhead: bool = False
     _qb_folded: Optional[List[torch.Tensor]] = None
+    # Per layer on the draft_qhead path, ``[q_a; kv_a]`` stacked into one weight (the modules'
+    # weights become row views of it), or None where a projection is quantized or biased.
+    _q_kv_a_weights: Optional[List[Optional[torch.Tensor]]] = None
     # The fused Helix tail of the block decode and the largest token count it serves.
     _helix_tail: Optional[HelixTail] = None
     _helix_tail_max_tokens: int = 0
@@ -4118,6 +4176,23 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self._scratch_index[key] = index
         return index
 
+    def _q_kv_a_projection(self, layer_idx: int, x: torch.Tensor) -> Optional[torch.Tensor]:
+        """``[q_a | kv_a]`` of layer ``layer_idx`` in one GEMM (the pinned split-K kernel where
+        :func:`_q_kv_a_splitk_tactic` covers the rows, else cuBLAS); None where the projections
+        stay separate."""
+        weight = None if self._q_kv_a_weights is None else self._q_kv_a_weights[layer_idx]
+        if weight is None:
+            return None
+        rows = x.shape[0]
+        tactic = _q_kv_a_splitk_tactic(rows, *weight.shape)
+        if tactic is None or not x.is_contiguous() or x.data_ptr() % 32:
+            return F.linear(x, weight)
+        from ..flashinfer_utils import get_env_enable_pdl
+        from ..kernels.blackwell.bf16_splitk_push_gemm import run_gemm
+
+        out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
+        return run_gemm(x.detach(), weight, out, tactic, pdl=get_env_enable_pdl())
+
     def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
 
@@ -4292,6 +4367,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 fold_rmsnorm_weight(a.q_b_proj.weight.detach(), a.q_a_layernorm.weight.detach())
                 for a in layers_attn
             ]
+            self._q_kv_a_weights = [_stack_q_kv_a_weight(a) for a in layers_attn]
 
         logger.debug(
             f"MLA DSpark: fused latent projection built for {self._num_attn_layers} layers "
@@ -4548,7 +4624,12 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 hs_normed, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(batch, block_size, -1)
 
-            q_a = attn.q_a_proj(hs_normed)
+            q_kv_a = None if qb_folded is None else self._q_kv_a_projection(layer_idx, hs_normed)
+            if q_kv_a is not None:
+                # Column views of one GEMM; q_b and draft_qhead read strided rows.
+                q_a = q_kv_a[:, : attn.q_a_proj.out_features]
+            else:
+                q_a = attn.q_a_proj(hs_normed)
             if qb_folded is not None:
                 # q_b of the un-normalized q_a; draft_qhead applies the inverse RMS.
                 folded = qb_folded[layer_idx]
@@ -4567,7 +4648,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             # The block's own latent comes from the draft hidden; the context's
             # from the projected target hidden (precompute_context_kv). That
             # dual-source split is the DFlash contract, not an MLA detail.
-            blk_latent = attn.kv_a_proj_with_mqa(hs_normed)
+            blk_latent = (
+                attn.kv_a_proj_with_mqa(hs_normed)
+                if q_kv_a is None
+                else q_kv_a[:, attn.q_a_proj.out_features :]
+            )
             blk_kv = None
             fp8_query = None
             attn_out = None

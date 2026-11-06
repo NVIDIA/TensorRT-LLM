@@ -414,3 +414,41 @@ def test_store_context_latents_saturates_into_an_fp8_pool():
         assert torch.equal(pools[layer].view(torch.uint8), expected[layer])
     assert pools[0][pages[0], 0, 0, offsets[0], :3].float().tolist() == [448.0, -448.0, 448.0]
     assert int(pools[0].float().isnan().sum()) == 1
+
+
+@pytest.mark.parametrize("rows", [7, 14, 28])
+def test_q_kv_a_projection_is_one_gemm_matching_the_two(rows):
+    """The K3 MLA drafter's [q_a | kv_a] projection: one GEMM (split-K where pinned) whose
+    column ranges match the separate projections up to the GEMM's rounding, with the modules'
+    weights re-pointed at the stacked weight."""
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        MLADSparkForCausalLM,
+        _q_kv_a_splitk_tactic,
+        _stack_q_kv_a_weight,
+    )
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    hidden, q_lora, kv = 7168, 1536, 576
+    attn = SimpleNamespace(
+        q_a_proj=Linear(hidden, q_lora, bias=False, dtype=torch.bfloat16).cuda(),
+        kv_a_proj_with_mqa=Linear(hidden, kv, bias=False, dtype=torch.bfloat16).cuda(),
+    )
+    for linear in (attn.q_a_proj, attn.kv_a_proj_with_mqa):
+        linear.weight.data.copy_(
+            torch.randn(linear.weight.shape, device="cuda", generator=gen).to(torch.bfloat16) * 0.02
+        )
+    q_ref_w = attn.q_a_proj.weight.detach().clone()
+    weight = _stack_q_kv_a_weight(attn)
+    assert weight.shape == (q_lora + kv, hidden)
+    assert attn.q_a_proj.weight.data_ptr() == weight.data_ptr()
+    assert torch.equal(attn.q_a_proj.weight, q_ref_w)
+
+    drafter = object.__new__(MLADSparkForCausalLM)
+    drafter._q_kv_a_weights = [weight]
+    x = torch.randn(rows, hidden, device="cuda", generator=gen).to(torch.bfloat16)
+    out = drafter._q_kv_a_projection(0, x)
+    ref = F.linear(x.float(), weight.float())
+    torch.testing.assert_close(out.float(), ref, rtol=2e-2, atol=2e-2)
+    if _q_kv_a_splitk_tactic(rows, q_lora + kv, hidden) is None:
+        pytest.skip("no pinned split-K tactic on this architecture")
