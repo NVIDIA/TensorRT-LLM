@@ -163,7 +163,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # local_num_mamba_layers == 0 and the truncation above cannot apply to it.
     _supports_draft_reuse_match_backoff = True
     # It still applies to the paired target, which the scheduler caps at the
-    # draft's claim; waive the trim so it cannot leave the snapshot grid.
+    # draft's claim; the trim can be waived so it cannot leave the snapshot grid.
     _drop_advisory_draft_lookahead = True
 
     # Recurrent (conv/SSM) state summarizes the whole matched prefix, so the

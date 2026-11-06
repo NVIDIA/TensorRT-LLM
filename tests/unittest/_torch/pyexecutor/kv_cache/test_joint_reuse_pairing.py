@@ -99,3 +99,28 @@ def test_pairing_is_independent_of_pipeline_parallelism(pairs):
     would only strip the optimization from non-Mamba managers.
     """
     assert _make_creator(KVCacheManagerV2, pp_size=4)._joint_reuse_supported() is True
+
+
+@pytest.mark.parametrize(
+    "manager_cls,is_draft,joint,env,relaxed,expected",
+    [
+        pytest.param(MambaHybridCacheManagerV2, True, True, "1", False, True, id="opted_in"),
+        pytest.param(MambaHybridCacheManagerV2, True, True, None, False, False, id="default"),
+        pytest.param(MambaHybridCacheManagerV2, True, True, "1", True, False, id="relaxed"),
+        pytest.param(MambaHybridCacheManagerV2, True, False, "1", False, False, id="unpaired"),
+        pytest.param(MambaHybridCacheManagerV2, False, True, "1", False, False, id="target"),
+        pytest.param(KVCacheManagerV2, True, True, "1", False, False, id="base"),
+    ],
+)
+def test_draft_reuse_backoff_skip_is_opt_in(
+    monkeypatch, manager_cls, is_draft, joint, env, relaxed, expected
+):
+    """The draft keeps its backoff unless TLLM_DRAFT_REUSE_SKIP_BACKOFF=1 opts out."""
+    if env is None:
+        monkeypatch.delenv("TLLM_DRAFT_REUSE_SKIP_BACKOFF", raising=False)
+    else:
+        monkeypatch.setenv("TLLM_DRAFT_REUSE_SKIP_BACKOFF", env)
+    manager = object.__new__(manager_cls)
+    manager.is_draft = is_draft
+    spec_config = SimpleNamespace(use_relaxed_acceptance_for_thinking=relaxed)
+    assert manager._skips_draft_reuse_backoff(spec_config, joint) is expected
