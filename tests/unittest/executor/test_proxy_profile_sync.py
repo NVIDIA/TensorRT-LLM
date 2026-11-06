@@ -99,7 +99,7 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
             IpcQueue(address, is_server=False, socket_type=zmq.PUSH),
             errors,
             batching=False,
-            recovery_timeout=0.5,
+            connect_timeout=0.5,
         )
         for _ in range(2)
     ]
@@ -113,9 +113,6 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
         for request_id in range(64):
             request = GenerationRequest([1] * (512 * 1024), SamplingParams())
             request.set_id(request_id)
-            # Brief backpressure may pause admission; export must not prevent recovery.
-            with senders[1]._cond:
-                assert senders[1]._cond.wait_for(lambda: senders[1].available, timeout=1)
             senders[1].send(pickle.dumps(request))
         senders[1].send(pickle.dumps(CancellingRequest(7)), control=True)
         assert cancelled.wait(2)
@@ -134,12 +131,18 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
             )
     finally:
         release.set()
-        senders[0].close(timeout=3, send_sentinel=outcome != "fatal")
         senders[1].close(timeout=3)
+        senders[0].close(timeout=3, send_sentinel=outcome != "fatal")
         thread.join(timeout=3)
         ack.close()
     assert not thread.is_alive()
-    assert errors.empty()
+    if outcome == "fatal":
+        # Closing the failed worker's ingress can independently notify both
+        # frontend owners before their orderly cleanup begins.
+        while not errors.empty():
+            assert isinstance(errors.get_nowait(), ConnectionError)
+    else:
+        assert errors.empty()
 
 
 @pytest.fixture
@@ -167,19 +170,39 @@ def bare_proxy():
     # accessing it via getattr() see a sentinel.
     proxy.profile_ack_queue = MagicMock()
     proxy.profile_ack_queue.address = ("unused-profile-ack", b"k" * 32)
+    delivered = queue.Queue()
 
     class Commands:
-        socket = SimpleNamespace(setsockopt=lambda *args: None)
+        socket = SimpleNamespace(
+            setsockopt=lambda *args: None,
+            get_monitor_socket=lambda **kwargs: SimpleNamespace(
+                poll=lambda timeout: False, close=lambda **kwargs: None
+            ),
+            disable_monitor=lambda: None,
+        )
+
+        def setup_lazily(self):
+            pass
 
         def put(self, message, **kwargs):
             if message is not None:
                 for payload in message:
                     proxy.request_queue.put(pickle.loads(payload))
+                    delivered.put(None)
 
         def close(self):
             pass
 
     proxy._request_sender = _RequestSender(Commands(), queue.Queue(), batching=False)
+    original_wait = proxy._wait_profile_ack
+
+    def wait_for_delivered_ack(kind, timeout):
+        # A real worker cannot acknowledge a command before receiving it.
+        # Preserve that causality with asynchronous command submission too.
+        delivered.get(timeout=timeout)
+        return original_wait(kind, timeout)
+
+    proxy._wait_profile_ack = wait_for_delivered_ack
     proxy._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="proxy_profile_control"
     )

@@ -28,6 +28,7 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
+from tensorrt_llm.executor.utils import EngineUnavailableError
 from tensorrt_llm.inputs.media_io import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
@@ -177,6 +178,9 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             raise
         except grpc.aio.AbortError:
             raise
+        except EngineUnavailableError as e:
+            await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
         except ValueError as e:
             logger.warning(f"Invalid request in Generate for {request_id}: {e}")
             await self.request_manager.abort(request_id)

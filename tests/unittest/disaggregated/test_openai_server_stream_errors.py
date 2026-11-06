@@ -32,8 +32,8 @@ from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
-from tensorrt_llm.executor.utils import EngineUnavailableError, ErrorResponse
-from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.executor.utils import EngineDeadError, EngineUnavailableError, ErrorResponse
+from tensorrt_llm.llmapi.llm import LLM, RequestOutput
 from tensorrt_llm.serve.openai_protocol import CompletionRequest
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -120,6 +120,7 @@ async def test_a_failed_request_ends_the_completion_stream_with_an_error_event()
         (True, True, True, False),
         (True, True, True, True),
         (True, True, False, True),
+        ("dead", False, False, False),
     ],
 )
 @pytest.mark.asyncio
@@ -141,8 +142,10 @@ async def test_admission_failure_preserves_retryable_status(
         calls.append(True)
         if partial and len(calls) <= len(accepted):
             return accepted[len(calls) - 1]
+        if temporary == "dead":
+            raise EngineDeadError(RuntimeError("worker exited"))
         if temporary:
-            raise EngineUnavailableError("command connection is recovering")
+            raise EngineUnavailableError("command queue is full")
         raise ValueError("invalid request")
 
     engine.generate_async = reject
@@ -154,3 +157,18 @@ async def test_admission_failure_preserves_retryable_status(
     response = await server.openai_completion(request, raw)
     assert response.status_code == (503 if temporary else 400)
     assert all(promise.abort.call_count == (1 if partial else 0) for promise in accepted)
+
+
+@pytest.mark.parametrize("executor", [None, SimpleNamespace(is_shutdown=lambda: True)])
+@pytest.mark.asyncio
+async def test_llm_shutdown_admission_returns_service_unavailable(executor):
+    engine = _FailingEngine("")
+    stopped = SimpleNamespace(_encode_only=False, _executor=executor)
+    engine.generate_async = lambda *args, **kwargs: LLM.generate_async(stopped, *args, **kwargs)
+    server = _bare_server(engine)
+    raw = SimpleNamespace(state=SimpleNamespace(no_client_connection=True), headers={})
+    response = await server.openai_completion(
+        CompletionRequest(model="test-model", prompt=[1], max_tokens=4), raw
+    )
+    assert response.status_code == 503
+    assert json.loads(response.body)["message"] == "LLM is shutting down"

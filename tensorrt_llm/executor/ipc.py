@@ -57,7 +57,8 @@ class ZeroMqQueue:
                  name: Optional[str] = None,
                  use_hmac_encryption: bool = True,
                  send_hwm: Optional[int] = None,
-                 receive_hwm: Optional[int] = None):
+                 receive_hwm: Optional[int] = None,
+                 ipv6: bool = False):
         '''
         Parameters:
             address (tuple[str, Optional[bytes]], optional): The address (tcp-ip_port, hmac_auth_key) for the IPC. Defaults to None. If hmac_auth_key is None and use_hmac_encryption is False, the queue will not use HMAC encryption.
@@ -66,6 +67,7 @@ class ZeroMqQueue:
             is_async (bool): Whether to use asyncio for the socket. Defaults to False.
             name (str, optional): The name of the queue. Defaults to None.
             use_hmac_encryption (bool): Whether to use HMAC encryption for pickled data. Defaults to True.
+            ipv6 (bool): Enable IPv6 before binding or connecting. Defaults to False.
         '''
 
         if not use_hmac_encryption:
@@ -84,6 +86,8 @@ class ZeroMqQueue:
         self._setup_done = False
         self.name = name
         self.socket = self.context.socket(socket_type)
+        if ipv6:
+            self.socket.setsockopt(zmq.IPV6, 1)
         self.socket.set_hwm(0)
         if send_hwm is not None:
             self.socket.setsockopt(zmq.SNDHWM, send_hwm)

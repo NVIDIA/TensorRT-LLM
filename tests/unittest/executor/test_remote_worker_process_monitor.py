@@ -13,6 +13,7 @@ import threading
 import pytest
 import zmq
 
+from tensorrt_llm._torch.disaggregation.native import utils as network_utils
 from tensorrt_llm.executor import remote_worker_process_monitor as remote
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessMonitor
@@ -39,13 +40,16 @@ def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_p
     # so serving must fail through the independent process monitor instead.
     if lost_process == "worker":
         monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
-        monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.1.1")
+        monkeypatch.setattr(network_utils, "get_local_ip", lambda: "127.0.1.1")
+        monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.2.1")
     else:
         monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.setattr(remote, "_HEARTBEAT_TIMEOUT", 1.5)
     wake = threading.Event()
     monitor = WorkerProcessMonitor()
     endpoint = monitor.start_remote(1, wake)
+    if lost_process == "worker":
+        assert endpoint.address.startswith("tcp://127.0.1.1:")
     worker = subprocess.Popen(
         [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
     )
@@ -83,14 +87,17 @@ def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_p
         worker.stdout.close()
 
 
-def test_remote_readiness_requires_every_rank(monkeypatch):
+def test_remote_readiness_requires_every_rank(monkeypatch, caplog):
     monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
-    monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.1.1")
+    monkeypatch.setattr(network_utils, "get_local_ip", lambda: "127.0.1.1")
     monitor = remote.RemoteWorkerProcessMonitor(2)
     watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
     try:
         assert not monitor.wait_ready(timeout=0.2)
         assert monitor.failure is None
+        assert "MPI ranks [1]" in caplog.text
+        assert monitor.endpoint.address in caplog.text
+        assert "firewall" in caplog.text
     finally:
         monitor.close()
         watch.close()
@@ -100,17 +107,82 @@ def test_remote_readiness_requires_every_rank(monkeypatch):
 def test_unresolvable_watch_host_reports_configuration_error(monkeypatch, override):
     if override is None:
         monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
+        monkeypatch.setattr(network_utils, "get_local_ip", lambda: "missing.invalid")
     else:
         monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", override)
     failure = socket.gaierror("hostname cannot be resolved")
 
-    def resolve(_host):
+    def resolve(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr(remote.socket, "gethostbyname", resolve)
+    monkeypatch.setattr(remote.socket, "getaddrinfo", resolve)
     with pytest.raises(RuntimeError, match="TRTLLM_WORKER_WATCH_HOST") as error:
         remote.RemoteWorkerProcessMonitor(1)
     assert error.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+def test_explicit_watch_host_and_fixed_port_reach_standalone_helper(monkeypatch, host):
+    # Regression: IPv6 overrides used to fail resolution, and clusters could not
+    # allowlist a fixed watch port while retaining independent supervision.
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as reservation:
+        try:
+            reservation.bind((host, 0))
+        except OSError:
+            if family == socket.AF_INET6:
+                pytest.skip("IPv6 loopback is unavailable")
+            raise
+        port = reservation.getsockname()[1]
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", host)
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_PORT", str(port))
+
+    def unexpected_discovery():
+        raise AssertionError("Explicit watch host must take precedence over discovery")
+
+    monkeypatch.setattr(network_utils, "get_local_ip", unexpected_discovery)
+    monitor = remote.RemoteWorkerProcessMonitor(1)
+    advertised_host = f"[{host}]" if family == socket.AF_INET6 else host
+    try:
+        assert monitor.endpoint.address == f"tcp://{advertised_host}:{port}"
+        watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
+        try:
+            assert monitor.wait_ready(timeout=2)
+        finally:
+            watch.close()
+    finally:
+        monitor.close()
+
+
+def test_watch_opt_out_preserves_existing_checks_without_opening_a_listener(monkeypatch, caplog):
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH", "0")
+    # Invalid network config would fail if opt-out still constructed a listener.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "missing.invalid")
+    monitor = WorkerProcessMonitor()
+    try:
+        assert monitor.start_remote(1, threading.Event()) is None
+        assert monitor._remote is None
+        assert monitor.wait_remote_ready()
+        assert monitor.find_dead_worker() is None
+        assert "supervision is disabled" in caplog.text
+        assert "may not detect" in caplog.text
+    finally:
+        monitor.close()
+
+
+def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(monkeypatch):
+    monkeypatch.setattr(remote, "_START_TIMEOUT", 0.1)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        endpoint = remote.ProcessWatchEndpoint(
+            f"tcp://127.0.0.1:{reservation.getsockname()[1]}", b"test-key"
+        )
+        with pytest.raises(RuntimeError) as error:
+            remote.WorkerProcessWatch(endpoint, 7)
+    message = str(error.value)
+    assert "MPI rank 7" in message
+    assert endpoint.address in message
+    assert "TRTLLM_WORKER_WATCH_HOST" in message and "firewall" in message
 
 
 def test_shutdown_before_worker_submission_closes_remote_monitor(monkeypatch):
