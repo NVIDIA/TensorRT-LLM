@@ -49,7 +49,6 @@ This directory contains various test configuration files:
 ### Functional Test Lists
 - `llm_function_core.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
 - `llm_function_multinode.yml` - Multi-node functional test cases with per-case launch parameters
-- `llm_function_multinode.txt` - Compatibility case list for consumers that only read text lists; keep its case IDs in sync with the YAML list
 - `llm_function_rtx6k.txt` - RTX 6000 series specific tests
 - `llm_function_l20.txt` - L20 specific tests, only contains single gpu cases
 
@@ -72,10 +71,10 @@ remain pipeline settings.
 
 The Jenkins consumer must parse this YAML, resolve each entry's launch parameters,
 and generate a temporary single-case text list for the existing test runner.
-Consumers that only read text lists can continue using
-`llm_function_multinode.txt` during migration. Update its case IDs together with
-the YAML list; launch parameters are defined only in YAML. The QA validator
-includes both formats when checking membership against `waives.txt`.
+The QA validator generates temporary text lists from YAML for runtime collection
+and includes those cases when checking membership against `waives.txt`.
+Jenkins consumers that still reference `llm_function_multinode.txt` must migrate
+to the YAML list and generate temporary text lists before invoking the runner.
 
 ### Performance Test Files
 - `llm_perf_full.yml` - Main performance test configuration
