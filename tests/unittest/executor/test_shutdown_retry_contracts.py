@@ -720,8 +720,20 @@ def test_mpi_worker_without_per_layer_eplb_keeps_best_effort_teardown(monkeypatc
     assert worker.doing_shutdown and worker.engine is None
 
 
-def test_mpi_worker_rank_local_teardown_frees_engine_before_empty_cache(monkeypatch):
-    """The rank-local teardown frees the engine before it returns GPU memory.
+@pytest.mark.parametrize(
+    "per_layer_dynamic, expected_calls",
+    [
+        (False, ["shutdown", "local_cleanup"]),
+        (True, ["shutdown", ("terminal_cleanup", True)]),
+    ],
+    ids=["rank_local", "collective"],
+)
+def test_mpi_worker_teardown_frees_engine_before_empty_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    per_layer_dynamic: bool,
+    expected_calls: list[str | tuple[str, bool]],
+) -> None:
+    """The MPI worker teardown frees the engine before it returns GPU memory.
 
     A long-lived MPI worker hosts successive LLMs, so GPU memory that the engine
     still holds when ``empty_cache()`` runs carries into the next LLM.
@@ -731,18 +743,23 @@ def test_mpi_worker_rank_local_teardown_frees_engine_before_empty_cache(monkeypa
         # The self-reference makes the engine collectable only by the garbage
         # collector, as for an executor whose threads and callbacks point back
         # at it.
-        def __init__(self):
-            self.cycle = self
-            self.calls = []
+        shutdown_all_ranks = True
 
-        def can_enqueue_requests(self):
+        def __init__(self) -> None:
+            self.cycle = self
+            self.calls: list[str | tuple[str, bool]] = []
+
+        def can_enqueue_requests(self) -> bool:
             return False
 
-        def shutdown(self):
+        def shutdown(self) -> None:
             self.calls.append("shutdown")
 
-        def local_cleanup(self):
+        def local_cleanup(self) -> None:
             self.calls.append("local_cleanup")
+
+        def terminal_cleanup(self, *, local_safe: bool) -> None:
+            self.calls.append(("terminal_cleanup", local_safe))
 
     engine = CyclicEngine()
     engine_ref = weakref.ref(engine)
@@ -765,8 +782,9 @@ def test_mpi_worker_rank_local_teardown_frees_engine_before_empty_cache(monkeypa
             "uses_collective_shutdown": _uses_collective_shutdown,
             "logger_debug": lambda *args, **kwargs: None,
             "mpi_rank": lambda: 0,
+            "mpi_comm": lambda: SimpleNamespace(allgather=lambda value: [value]),
             "sys": sys,
-            "_MEGA_MOE_DEEPGEMM_MODULE": "missing_rank_local_teardown_megamoe",
+            "_MEGA_MOE_DEEPGEMM_MODULE": "missing_teardown_gc_megamoe",
             "gc": gc,
         },
     )
@@ -775,7 +793,7 @@ def test_mpi_worker_rank_local_teardown_frees_engine_before_empty_cache(monkeypa
     worker.rpc_server = None
     worker.engine = engine
     del engine
-    worker.llm_args = _llm_args(per_layer_dynamic=False, backend="pytorch")
+    worker.llm_args = _llm_args(per_layer_dynamic=per_layer_dynamic, backend="pytorch")
     worker._handle_background_error = lambda: None
 
     # Only the teardown's own collection may free the engine.
@@ -787,7 +805,7 @@ def test_mpi_worker_rank_local_teardown_frees_engine_before_empty_cache(monkeypa
         if gc_was_enabled:
             gc.enable()
 
-    assert engine_calls == ["shutdown", "local_cleanup"]
+    assert engine_calls == expected_calls
     assert engine_alive_at_empty_cache == [False]
     assert worker.engine is None
 

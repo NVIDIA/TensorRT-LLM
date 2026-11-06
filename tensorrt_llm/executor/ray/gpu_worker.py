@@ -513,9 +513,8 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
         if self.engine is not None:
             self.engine.shutdown()
-            local_cleanup = getattr(self.engine, "local_cleanup", None)
-            if local_cleanup is not None:
-                local_cleanup()
+            if getattr(self.engine, "local_cleanup", None) is not None:
+                self.engine.local_cleanup()
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"
