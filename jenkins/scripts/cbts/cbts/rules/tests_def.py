@@ -43,6 +43,7 @@ from ._helpers import (
     iter_diff_post_line_numbers,
     iter_diff_pre_image,
     lookup_paths_into_block_filters,
+    reconstruct_diff_pre_image,
     resolve_affected_stages,
     stages_by_yaml_stem,
 )
@@ -280,7 +281,9 @@ class TestsDefRule(Rule):
         self._acc_class_indexes: Optional[tuple[dict[str, list[str]], dict[str, list[str]]]] = None
         self._acc_source_texts: tuple[str, ...] = ()
 
-    def _compute_anchors(self, git_path: str, yaml_path: str, diff: str) -> list[str]:
+    def _compute_anchors(
+        self, git_path: str, yaml_path: str, diff: str, raw_diff: str | None = None
+    ) -> list[str]:
         """Return lookup anchors for one file.
 
         Python helpers use direct static, L0-covered test importers when safe.
@@ -315,6 +318,37 @@ class TestsDefRule(Rule):
         except (OSError, UnicodeDecodeError):
             return [yaml_path]
         if _diff_has_deletions(diff):
+            # Raw hunks retain the original line counts and deleted blank lines.
+            # Normalized selection diffs cannot reliably reconstruct the source.
+            pre_source = reconstruct_diff_pre_image(content, raw_diff or diff)
+            if pre_source is not None:
+                deleted_lines: set[int] = set()
+                old_line = 0
+                for line in (raw_diff or diff).splitlines():
+                    match = re.match(r"@@ -(\d+)", line)
+                    if match is not None:
+                        old_line = int(match.group(1))
+                    elif line.startswith(("---", "+++")):
+                        continue
+                    elif line.startswith("-"):
+                        if line[1:].strip() and not line[1:].lstrip().startswith("#"):
+                            deleted_lines.add(old_line)
+                        old_line += 1
+                    elif line.startswith(" "):
+                        old_line += 1
+                deleted_scopes = _map_lines_to_pytest_scopes(pre_source, deleted_lines)
+                added_lines = iter_diff_added_post_line_numbers(diff)
+                added_scopes = (
+                    _map_lines_to_pytest_scopes(content, added_lines) if added_lines else set()
+                )
+                if deleted_scopes is None or added_scopes is None:
+                    return [yaml_path]
+                scopes = deleted_scopes | added_scopes
+                return [
+                    f"{yaml_path}::{scope}"
+                    for scope in sorted(scopes)
+                    if "::" not in scope or scope.partition("::")[0] not in scopes
+                ]
             return self._recover_deleted_scope_anchors(yaml_path, content, diff)
         line_numbers = iter_diff_post_line_numbers(diff)
         if not line_numbers:
@@ -327,10 +361,9 @@ class TestsDefRule(Rule):
     def _recover_deleted_scope_anchors(self, yaml_path: str, content: str, diff: str) -> list[str]:
         """Combine post-image scopes for `+` lines with pre-image scopes for `-` lines.
 
-        Removed lines can anchor to the next surviving post-image scope,
-        so every diff with deletions takes this path before accepting
-        post-image mappings. Reading deleted lines from the pre-image
-        avoids attributing them to an adjacent surviving scope.
+        Used when complete pre-image reconstruction is unavailable.
+        Reading deleted lines from hunk-local class context avoids
+        attributing them to an adjacent surviving post-image scope.
         """
         if not _diff_has_deletions(diff):
             return [yaml_path]
@@ -537,7 +570,9 @@ class TestsDefRule(Rule):
                 continue
             handled.add(git_path)
             anchors = (
-                self._compute_anchors(git_path, yaml_path, pr.diffs.get(git_path, ""))
+                self._compute_anchors(
+                    git_path, yaml_path, pr.diffs.get(git_path, ""), pr.raw_diffs.get(git_path)
+                )
                 if yaml_path is not None
                 else []
             )
