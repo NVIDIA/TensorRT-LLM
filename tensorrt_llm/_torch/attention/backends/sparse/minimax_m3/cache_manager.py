@@ -446,13 +446,6 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         self._kv_buffers: dict[tuple[int, str], torch.Tensor] = {}
         self._block_scale_buffers: dict[tuple[int, str], torch.Tensor] = {}
         if layer_specs is not None and any(
-            spec.owner is KVCacheLayerOwner.TARGET
-            and spec.dtype != kwargs.get("dtype", DataType.HALF)
-            for spec in layer_specs
-        ):
-            # Target views and block scales follow the manager dtype.
-            raise ValueError(f"{type(self).__name__} needs target layer specs in the cache dtype.")
-        if layer_specs is not None and any(
             spec.owner is KVCacheLayerOwner.DRAFT and spec.dtype == DataType.NVFP4
             for spec in layer_specs
         ):

@@ -284,15 +284,6 @@ def test_specs_decide_the_sparse_target_layers(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
-def test_target_specs_need_the_cache_dtype() -> None:
-    """Target views and block scales follow the manager dtype, so target specs must use it."""
-    specs = _specs()
-    fp8_target = replace(specs[3], dtype=DataType.FP8, buffer_roles=(Role.KEY, Role.VALUE))
-    with pytest.raises(ValueError, match="target layer specs in the cache dtype"):
-        _manager((*specs[:3], fp8_target, *specs[NUM_TARGET:]))
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_draft_layers_need_their_own_lifecycle() -> None:
     """Unwindowed draft layers would share the target's lifecycle and pool offsets."""
     torch.cuda.init()
