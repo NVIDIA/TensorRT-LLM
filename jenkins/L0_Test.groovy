@@ -591,7 +591,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Pull per-process .cbtscov files into an attempt-specific directory; bounded and non-fatal.
+        // Collect coverage before packaging results.
         if (isCbtsStage(stageName)) {
             try {
                 CloudManager.withSlurmSshCredentials(pipeline, clusterName, cluster) { remote ->
@@ -600,7 +600,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                     def cbtsArchive = "cbts_coverage_${stageName}.tar.gz"
                     sh "mkdir -p ${cbtsLocalDir}"
                     timeout(time: 5, unit: 'MINUTES') {
-                        // Freeze writers, then pack on the login node; an archive with no member is dropped.
+                        // Pack remote coverage and discard empty archives.
                         Utils.exec(
                             pipeline,
                             script: Utils.sshUserCmd(
@@ -619,7 +619,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             numRetries: 3,
                         ) == 0
                         if (gotArchive) {
-                            // Aggregation flattens directories, so retry filenames must also be unique.
+                            // Aggregation flattens directories; tag retry filenames too.
                             def coverageTransformOpt = postTag ? "--transform 's|[.]sqlite\$|${postTag}.sqlite|'" : ""
                             sh "tar xzf ${cbtsLocalDir}/${cbtsArchive} ${coverageTransformOpt} -C ${cbtsLocalDir}/ && rm -f ${cbtsLocalDir}/${cbtsArchive}"
                         } else {
@@ -632,12 +632,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             }
         }
 
-        // Always re-tar the local stage directory and upload it directly, rather
-        // than trusting the last progress snapshot uploaded by
-        // progress_upload_snapshot.sh to still match it (the superseded-file
-        // rename above, or other post-snapshot writes, can leave it stale). Use
-        // --transform so tar contents carry the postTag filename without
-        // touching on-disk results*.xml files.
+        // Archive current results, tagging XML members without renaming local files.
         ensureStageResultNotUploaded("${stageName}${postTag}")
         def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
         sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
