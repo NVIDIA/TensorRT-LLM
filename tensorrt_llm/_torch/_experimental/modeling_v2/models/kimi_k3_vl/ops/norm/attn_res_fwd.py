@@ -19,7 +19,7 @@ class AttnResFwd(OpWrapper):
     per-candidate rsqrt(mean square + eps), softmax probabilities and logits, all newly allocated.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
@@ -76,9 +76,10 @@ class AttnResFwd(OpWrapper):
     and release dependents after the final store. PDL consumers must wait for
     visibility. Online launches and non-PDL consumers use normal stream ordering.
     Shape-only launches can be captured after warm-up and replay eager bits.
-    Kimi K3 uses this unfused path above KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS
-    (default 1) unless persistent topology handles it, and wherever a drafter
-    needs the pre-norm mixture. The fake op reports the same shapes and dtypes.
+    The Kimi K3 targets use this unfused path above
+    KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (their default 1; the built-in model's is
+    64) unless persistent topology handles it, and wherever a drafter needs
+    the pre-norm mixture. The fake op reports the same shapes and dtypes.
     """
 
     def __call__(

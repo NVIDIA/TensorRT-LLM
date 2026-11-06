@@ -575,7 +575,7 @@ def test_shared_expert_finalize_defers_only_when_no_collective_follows(
     # deferring stays sound above TP1.
     block.mapping.tp_size = 2
     block.enable_attention_dp = True
-    monkeypatch.setattr(modeling_qwen3_next, "get_sm_version", lambda: 103)
+    monkeypatch.setattr(modeling_qwen3_next, "is_sm_120f", lambda: False)
     deferred_adp = block(
         hidden_states,
         metadata,
@@ -823,17 +823,17 @@ def test_runtime_config_rejects_unsupported_semantics(
 def test_mapper_normalizes_bf16_and_per_expert_fp8_weights() -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         _normalize_moe_module_weights,
-        _rank_block,
     )
+    from tensorrt_llm._torch.models.modeling_utils import concatenate_weights_by_tp_rank
     from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 
     q = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     z = torch.arange(8, 16, dtype=torch.float32).reshape(4, 2)
-    blocked = _rank_block([q, z], tp_size=2)
+    blocked = concatenate_weights_by_tp_rank([q, z], tp_size=2)
     expected = torch.cat((q[:2], z[:2], q[2:], z[2:]))
     torch.testing.assert_close(blocked, expected)
     with pytest.raises(ValueError, match="not divisible"):
-        _rank_block([torch.empty(3, 2)], tp_size=2)
+        concatenate_weights_by_tp_rank([torch.empty(3, 2)], tp_size=2)
 
     config = SimpleNamespace(hidden_size=4, moe_intermediate_size=3, num_experts=2)
     fused, mode = _normalize_moe_module_weights(

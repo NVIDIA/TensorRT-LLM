@@ -47,9 +47,10 @@ Activation scale factors exist twice, and the counters say which one is meant:
 """
 
 import dataclasses
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Tuple
 
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils
@@ -310,22 +311,16 @@ class GenphaseTokenComm(KernelComponent):
         if self.expert_count > 16384:
             raise NotImplementedError("Genphase token comm supports at most 16384 global experts.")
         if self.topk > self.expert_count:
-            raise ValueError(
-                f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}."
-            )
+            raise ValueError(f"topk must not exceed expert_count, got {self.topk} and {self.expert_count}.")
         if self.max_tokens_per_rank > 1024:
             raise ValueError(
                 f"Genphase token comm requires max_tokens_per_rank <= 1024, got {self.max_tokens_per_rank}."
             )
         if self.topk_index_dtype not in (cutlass.Int32, cutlass.Int64):
-            raise ValueError(
-                f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}."
-            )
+            raise ValueError(f"topk_index_dtype must be Int32 or Int64, got {self.topk_index_dtype}.")
 
         if self.sf_padding_block != 128:
-            raise ValueError(
-                f"sf_padding_block must be the 128-row SF atom, got {self.sf_padding_block}."
-            )
+            raise ValueError(f"sf_padding_block must be the 128-row SF atom, got {self.sf_padding_block}.")
         if self.sf_padding_block % self.token_padding_block != 0:
             raise ValueError("sf_padding_block must be divisible by token_padding_block.")
 
@@ -333,9 +328,7 @@ class GenphaseTokenComm(KernelComponent):
         # four of them along K, so the hidden extent has to fill whole atoms.
         elements_per_sf_atom = self.quant_kind.sf_vec_size * 4
         if self.hidden_size % elements_per_sf_atom != 0:
-            raise ValueError(
-                f"{self.quant_kind} requires hidden_size divisible by {elements_per_sf_atom}."
-            )
+            raise ValueError(f"{self.quant_kind} requires hidden_size divisible by {elements_per_sf_atom}.")
 
         # The caller's top-k plane is exactly `routes_per_rank` elements with no
         # slack, so the bulk copy that stages it has to land on that boundary
@@ -363,9 +356,7 @@ class GenphaseTokenComm(KernelComponent):
             )
         # One thread stages one row of a 128-row block.
         if self.refine_warps_per_group * 32 != 128:
-            raise ValueError(
-                "A refine group must be exactly four warps so one thread owns one row."
-            )
+            raise ValueError("A refine group must be exactly four warps so one thread owns one row.")
         # The staging load reads a run-aligned row straight out of the linear
         # plane, so the plane's row has to be at least that wide. Both extents
         # round the same value up to sixteen, from a payload alignment and from an
@@ -540,9 +531,7 @@ class GenphaseTokenComm(KernelComponent):
         routes_per_source_token = min(self.topk, self.experts_per_rank)
         route_capacity = source_token_capacity * routes_per_source_token
         active_expert_capacity = min(self.experts_per_rank, route_capacity)
-        route_budget_blocks = (
-            active_expert_capacity + (route_capacity - active_expert_capacity) // block
-        )
+        route_budget_blocks = active_expert_capacity + (route_capacity - active_expert_capacity) // block
         expert_bound_blocks = active_expert_capacity * int(ceil_div(source_token_capacity, block))
         return min(route_budget_blocks, expert_bound_blocks) * block
 
@@ -634,23 +623,14 @@ class GenphaseTokenComm(KernelComponent):
                 byte_alignment=16,
             )
         workspace.register(
-            self.topk_ready_region,
-            cutlass.Int32,
-            (self.world_size,),
-            buffer_space="shared",
-            reset="tail_reset",
+            self.topk_ready_region, cutlass.Int32, (self.world_size,), buffer_space="shared", reset="tail_reset"
         )
         # The shape is the logical column extent and the row padding is a stride.
         # Bulk copies move whole padded rows, so the trailing row's padding has to
         # be inside the region even though no index reaches it; the workspace sizes
         # a region by what its strides occupy for exactly this reason.
         for region_name, dtype, columns, row_elements in (
-            (
-                self.plain_activation_region,
-                self.activation_dtype,
-                self.hidden_size,
-                self.plain_activation_row_elements,
-            ),
+            (self.plain_activation_region, self.activation_dtype, self.hidden_size, self.plain_activation_row_elements),
             (
                 self.plain_activation_sf_region,
                 self.activation_sf_dtype,
@@ -667,9 +647,7 @@ class GenphaseTokenComm(KernelComponent):
                 byte_alignment=128,
             )
         for region_name in (self.token_data_ready_region, self.token_sf_plain_ready_region):
-            workspace.register(
-                region_name, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset"
-            )
+            workspace.register(region_name, cutlass.Int32, (1,), buffer_space="shared", reset="tail_reset")
 
     def _register_local_regions(self, workspace: DeviceWorkspace) -> None:
         workspace.register(
@@ -681,11 +659,7 @@ class GenphaseTokenComm(KernelComponent):
             byte_alignment=16,
         )
         workspace.register(
-            self.expert_sizes_region,
-            cutlass.Int32,
-            (self.experts_per_rank,),
-            buffer_space="local",
-            reset="tail_reset",
+            self.expert_sizes_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
         )
         workspace.register(
             self.source_expert_base_region,
@@ -712,17 +686,9 @@ class GenphaseTokenComm(KernelComponent):
         # Sized to the padded bucket count rather than the live expert count: the
         # scan that fills them runs over padded buckets, and letting the tail
         # entries exist removes every boundary special case downstream.
-        for region_name in (
-            self.data_expert_base_region,
-            self.sf_expert_base_region,
-            self.refine_block_base_region,
-        ):
+        for region_name in (self.data_expert_base_region, self.sf_expert_base_region, self.refine_block_base_region):
             workspace.register(
-                region_name,
-                cutlass.Int32,
-                (self.local_expert_bucket_count,),
-                buffer_space="local",
-                byte_alignment=16,
+                region_name, cutlass.Int32, (self.local_expert_bucket_count,), buffer_space="local", byte_alignment=16
             )
         workspace.register(
             self.token_src_metadata_region,
@@ -771,16 +737,10 @@ class GenphaseTokenComm(KernelComponent):
             self.refine_block_total_region,
             self.refine_work_counter_region,
         ):
-            workspace.register(
-                region_name, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset"
-            )
+            workspace.register(region_name, cutlass.Int32, (1,), buffer_space="local", reset="tail_reset")
         # One slot per local expert
         workspace.register(
-            self.fc1_sf_ready_region,
-            cutlass.Int32,
-            (self.experts_per_rank,),
-            buffer_space="local",
-            reset="tail_reset",
+            self.fc1_sf_ready_region, cutlass.Int32, (self.experts_per_rank,), buffer_space="local", reset="tail_reset"
         )
 
     # ------------------------------------------------------------------
@@ -798,9 +758,7 @@ class GenphaseTokenComm(KernelComponent):
         warp_count = self.threads_per_cta // 32
         workspace = SmemWorkspace()
         workspace.register_mbarrier(self.exchange_mbarrier_region, 1)
-        workspace.register_mbarrier(
-            self.pusher_mbarrier_region, warp_count * self.pusher_pipeline_depth
-        )
+        workspace.register_mbarrier(self.pusher_mbarrier_region, warp_count * self.pusher_pipeline_depth)
         workspace.register_mbarrier(self.refine_mbarrier_region, self.refine_participant_groups)
         overlay = workspace.create_overlay("genphase.token_comm.smem.role")
 
@@ -810,37 +768,22 @@ class GenphaseTokenComm(KernelComponent):
         # what the transfer reads.
         exchange = overlay.add_lifetime("exchange")
         exchange.register_tensor(
-            self.exchange_topk_stage_region,
-            self.topk_index_dtype,
-            (self.topk_slab_elements,),
-            byte_alignment=16,
+            self.exchange_topk_stage_region, self.topk_index_dtype, (self.topk_slab_elements,), byte_alignment=16
         )
         if self.apply_topk_at_fc1:
             exchange.register_tensor(
-                self.exchange_score_stage_region,
-                cutlass.Float32,
-                (self.topk_slab_elements,),
-                byte_alignment=16,
+                self.exchange_score_stage_region, cutlass.Float32, (self.topk_slab_elements,), byte_alignment=16
             )
 
         sort = overlay.add_lifetime("sort")
         sort.register_tensor(
-            self.sort_histogram_region,
-            cutlass.Int32,
-            (self.histogram_bucket_count,),
-            byte_alignment=16,
+            self.sort_histogram_region, cutlass.Int32, (self.histogram_bucket_count,), byte_alignment=16
         )
         sort.register_tensor(
-            self.sort_prefix_region,
-            cutlass.Int32,
-            (self.local_expert_bucket_count,),
-            byte_alignment=16,
+            self.sort_prefix_region, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16
         )
         sort.register_tensor(
-            self.sort_warp_totals_region,
-            cutlass.Int32,
-            (self.threads_per_cta // 32,),
-            byte_alignment=16,
+            self.sort_warp_totals_region, cutlass.Int32, (self.threads_per_cta // 32,), byte_alignment=16
         )
 
         helper = overlay.add_lifetime("helper")
@@ -851,44 +794,22 @@ class GenphaseTokenComm(KernelComponent):
             stride=(self.local_expert_bucket_count, 1),
             byte_alignment=16,
         )
-        for region_name in (
-            self.helper_totals_region,
-            self.helper_scan_input_region,
-            self.helper_prefix_region,
-        ):
-            helper.register_tensor(
-                region_name, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16
-            )
+        for region_name in (self.helper_totals_region, self.helper_scan_input_region, self.helper_prefix_region):
+            helper.register_tensor(region_name, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16)
         helper.register_tensor(
-            self.helper_warp_totals_region,
-            cutlass.Int32,
-            (self.threads_per_cta // 32,),
-            byte_alignment=16,
+            self.helper_warp_totals_region, cutlass.Int32, (self.threads_per_cta // 32,), byte_alignment=16
         )
         for region_name in (self.helper_slot_to_expert_region, self.helper_totals_by_slot_region):
-            helper.register_tensor(
-                region_name, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16
-            )
+            helper.register_tensor(region_name, cutlass.Int32, (self.local_expert_bucket_count,), byte_alignment=16)
         if not self.ranks_experts_in_warp:
             helper.register_tensor(
-                self.helper_load_bin_region,
-                cutlass.Int32,
-                (self.load_bin_count,),
-                byte_alignment=16,
+                self.helper_load_bin_region, cutlass.Int32, (self.load_bin_count,), byte_alignment=16
             )
 
         pusher = overlay.add_lifetime("pusher")
         for region_name, dtype, row_elements in (
-            (
-                self.pusher_data_stage_region,
-                self.activation_dtype,
-                self.plain_activation_row_elements,
-            ),
-            (
-                self.pusher_sf_stage_region,
-                self.activation_sf_dtype,
-                self.plain_activation_sf_row_elements,
-            ),
+            (self.pusher_data_stage_region, self.activation_dtype, self.plain_activation_row_elements),
+            (self.pusher_sf_stage_region, self.activation_sf_dtype, self.plain_activation_sf_row_elements),
         ):
             pusher.register_tensor(
                 region_name,
@@ -926,11 +847,7 @@ class GenphaseTokenComm(KernelComponent):
         refine.register_tensor(
             self.refine_output_region,
             self.activation_sf_dtype,
-            (
-                self.refine_participant_groups,
-                self.refine_output_stages,
-                self.refine_output_stage_elements,
-            ),
+            (self.refine_participant_groups, self.refine_output_stages, self.refine_output_stage_elements),
             stride=(
                 self.refine_output_stages * self.refine_output_stage_elements,
                 self.refine_output_stage_elements,
@@ -965,9 +882,7 @@ class GenphaseTokenComm(KernelComponent):
         return device_workspace.tensor(self.topk_score_inbox_region)
 
     @cute.jit
-    def _payload_plane_by_dense_row(
-        self, device_workspace: DeviceWorkspace, region_name: str
-    ) -> cute.Tensor:
+    def _payload_plane_by_dense_row(self, device_workspace: DeviceWorkspace, region_name: str) -> cute.Tensor:
         """``(world * tokens, columns)`` view of a payload plane.
 
         The registered shape keeps the source rank as its own mode, which is how
@@ -982,9 +897,7 @@ class GenphaseTokenComm(KernelComponent):
         row_elements = device_workspace.stride(region_name)[1]
         return cute.make_tensor(
             device_workspace.ptr(region_name),
-            cute.make_layout(
-                (self.world_size * self.max_tokens_per_rank, columns), stride=(row_elements, 1)
-            ),
+            cute.make_layout((self.world_size * self.max_tokens_per_rank, columns), stride=(row_elements, 1)),
         )
 
     @cute.jit
@@ -1010,12 +923,9 @@ class GenphaseTokenComm(KernelComponent):
         ``tile_atom_to_shape_SF`` takes the *data* shape, not the SF shape: the
         broadcast mode it inserts already absorbs ``sf_vec_size``.
         """
-        layout = tile_atom_to_shape_SF(
-            (self.worst_case_sf_rows, self.hidden_size, 1), self.quant_kind.sf_vec_size
-        )
+        layout = tile_atom_to_shape_SF((self.worst_case_sf_rows, self.hidden_size, 1), self.quant_kind.sf_vec_size)
         return cute.make_tensor(
-            device_workspace.ptr(self.canonical_activation_sf_region),
-            cute.select(layout, mode=[0, 1]),
+            device_workspace.ptr(self.canonical_activation_sf_region), cute.select(layout, mode=[0, 1])
         )
 
     @cute.jit
@@ -1077,13 +987,9 @@ class GenphaseTokenComm(KernelComponent):
                 f"topk_indices must be the declared {self.topk_index_dtype}, got {args.topk_indices.element_type}."
             )
         if cutlass.const_expr(args.activation.element_type is not self.activation_dtype):
-            raise TypeError(
-                f"activation must be {self.activation_dtype}, got {args.activation.element_type}."
-            )
+            raise TypeError(f"activation must be {self.activation_dtype}, got {args.activation.element_type}.")
         if cutlass.const_expr(args.activation_sf.element_type is not self.activation_sf_dtype):
-            raise TypeError(
-                f"activation_sf must be {self.activation_sf_dtype}, got {args.activation_sf.element_type}."
-            )
+            raise TypeError(f"activation_sf must be {self.activation_sf_dtype}, got {args.activation_sf.element_type}.")
         # Row addressing uses each plane's own layout, so the padded stride is a
         # requirement rather than something this component can paper over: a whole
         # padded row is bulk-copied, and a tighter caller stride would be read past
@@ -1095,9 +1001,7 @@ class GenphaseTokenComm(KernelComponent):
         ):
             if cutlass.const_expr(isinstance(plane.stride[0], int)):
                 if cutlass.const_expr(plane.stride[0] != row_elements):
-                    raise ValueError(
-                        f"{plane_name} needs the padded row stride {row_elements}, got {plane.stride[0]}."
-                    )
+                    raise ValueError(f"{plane_name} needs the padded row stride {row_elements}, got {plane.stride[0]}.")
 
         self._kernel(
             args.topk_indices,
@@ -1234,19 +1138,10 @@ class GenphaseTokenComm(KernelComponent):
 
         if thread_idx == Int32(0):
             cute.arch.mbarrier_arrive_and_expect_tx(load_mbarrier, Int32(staged_bytes))
-            tma_load_1d(
-                index_stage.iterator, topk_indices.iterator, load_mbarrier, Int32(index_plane_bytes)
-            )
+            tma_load_1d(index_stage.iterator, topk_indices.iterator, load_mbarrier, Int32(index_plane_bytes))
             if cutlass.const_expr(self.apply_topk_at_fc1):
-                score_stage = self._smem_workspace.tensor(
-                    self.exchange_score_stage_region, smem_base
-                )
-                tma_load_1d(
-                    score_stage.iterator,
-                    topk_scores.iterator,
-                    load_mbarrier,
-                    Int32(score_plane_bytes),
-                )
+                score_stage = self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base)
+                tma_load_1d(score_stage.iterator, topk_scores.iterator, load_mbarrier, Int32(score_plane_bytes))
         cute.arch.mbarrier_wait(load_mbarrier, 0)
 
         self._canonicalize_wire_indices(index_stage, thread_idx)
@@ -1265,10 +1160,7 @@ class GenphaseTokenComm(KernelComponent):
         if thread_idx == Int32(0):
             cp_async_bulk_s2g(
                 cute.make_ptr(
-                    cutlass.Int32,
-                    own_index_slab.iterator.toint() + peer_offset,
-                    AddressSpace.gmem,
-                    assumed_align=16,
+                    cutlass.Int32, own_index_slab.iterator.toint() + peer_offset, AddressSpace.gmem, assumed_align=16
                 ),
                 wire_indices.iterator,
                 Int32(self.topk_slab_elements * 4),
@@ -1283,9 +1175,7 @@ class GenphaseTokenComm(KernelComponent):
                         AddressSpace.gmem,
                         assumed_align=16,
                     ),
-                    self._smem_workspace.tensor(
-                        self.exchange_score_stage_region, smem_base
-                    ).iterator,
+                    self._smem_workspace.tensor(self.exchange_score_stage_region, smem_base).iterator,
                     Int32(self.topk_slab_elements * 4),
                 )
             cute.arch.cp_async_bulk_commit_group()
@@ -1311,8 +1201,7 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(self.topk_index_dtype is cutlass.Int32):
             return index_stage
         return cute.make_tensor(
-            cute.recast_ptr(index_stage.iterator, dtype=cutlass.Int32),
-            cute.make_layout((self.topk_slab_elements,)),
+            cute.recast_ptr(index_stage.iterator, dtype=cutlass.Int32), cute.make_layout((self.topk_slab_elements,))
         )
 
     @cute.jit
@@ -1345,9 +1234,7 @@ class GenphaseTokenComm(KernelComponent):
         return cutlass.Uint64(raw_index) >= cutlass.Uint64(self.expert_count)
 
     @cute.jit
-    def _classify_tokens(
-        self, topk_indices: cute.Tensor, global_warp_idx: Int32, lane_idx: Int32
-    ) -> cute.Tensor:
+    def _classify_tokens(self, topk_indices: cute.Tensor, global_warp_idx: Int32, lane_idx: Int32) -> cute.Tensor:
         """One bit per (token, peer): does this warp owe that peer this token?
 
         Both payload passes need the same answer from the same input, so deriving
@@ -1388,13 +1275,9 @@ class GenphaseTokenComm(KernelComponent):
                 if lane_owns_slot:
                     raw_index = topk_indices[token, slot]
                     if not self._is_unowned_expert(raw_index):
-                        lane_rank = cutlass.Uint32(raw_index) // cutlass.Uint32(
-                            self.experts_per_rank
-                        )
+                        lane_rank = cutlass.Uint32(raw_index) // cutlass.Uint32(self.experts_per_rank)
                         if cutlass.const_expr(mask_words == 1):
-                            masks[token_round, 0] = masks[token_round, 0] | (
-                                cutlass.Uint32(1) << lane_rank
-                            )
+                            masks[token_round, 0] = masks[token_round, 0] | (cutlass.Uint32(1) << lane_rank)
                         else:
                             lane_word = lane_rank // cutlass.Uint32(32)
                             lane_bit = cutlass.Uint32(1) << (lane_rank % cutlass.Uint32(32))
@@ -1404,9 +1287,7 @@ class GenphaseTokenComm(KernelComponent):
 
         for token_round in cutlass.range_constexpr(tokens_per_warp):
             for word in cutlass.range_constexpr(mask_words):
-                masks[token_round, word] = cutlass.Uint32(
-                    cute.arch.warp_redux_sync(masks[token_round, word], "or")
-                )
+                masks[token_round, word] = cutlass.Uint32(cute.arch.warp_redux_sync(masks[token_round, word], "or"))
         return masks
 
     @cute.jit
@@ -1451,9 +1332,7 @@ class GenphaseTokenComm(KernelComponent):
         iket.range_push("pusher.classify")
         destination_masks = self._classify_tokens(topk_indices, global_warp_idx, lane_idx)
         iket.range_pop()
-        stage_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, self.pusher_pipeline_depth
-        )
+        stage_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.pusher_pipeline_depth)
 
         iket.range_push("pusher.sf")
         stage_state = self._push_one_plane(
@@ -1538,10 +1417,7 @@ class GenphaseTokenComm(KernelComponent):
                 with cute.arch.elect_one():
                     cute.arch.mbarrier_arrive_and_expect_tx(slot_mbarrier, Int32(row_bytes))
                     tma_load_1d(
-                        slot_stage.iterator,
-                        source_plane[token, None].iterator,
-                        slot_mbarrier,
-                        Int32(row_bytes),
+                        slot_stage.iterator, source_plane[token, None].iterator, slot_mbarrier, Int32(row_bytes)
                     )
                 cute.arch.mbarrier_wait(slot_mbarrier, stage_state.phase)
                 iket.range_pop()
@@ -1550,9 +1426,7 @@ class GenphaseTokenComm(KernelComponent):
                 for destination_rank in cutlass.range_constexpr(self.world_size):
                     mask_word = destination_rank // 32
                     peer_bit = cutlass.Uint32(1 << (destination_rank % 32))
-                    peer_offset = peer_rank_ptr_mapper.map(
-                        Int64(0), Int32(destination_rank), Int64(0)
-                    )
+                    peer_offset = peer_rank_ptr_mapper.map(Int64(0), Int32(destination_rank), Int64(0))
                     destination_row = destination_plane[local_rank, token, None]
                     if (destination_masks[token_round, mask_word] & peer_bit) != cutlass.Uint32(0):
                         with cute.arch.elect_one():
@@ -1575,10 +1449,7 @@ class GenphaseTokenComm(KernelComponent):
 
     @cute.jit
     def _publish_payload_flags(
-        self,
-        device_workspace: DeviceWorkspace,
-        peer_rank_ptr_mapper: SymmetricBufferDevice,
-        thread_idx: Int32,
+        self, device_workspace: DeviceWorkspace, peer_rank_ptr_mapper: SymmetricBufferDevice, thread_idx: Int32
     ) -> None:
         """Drain both payload passes, then tell every peer this pusher is finished.
 
@@ -1599,9 +1470,7 @@ class GenphaseTokenComm(KernelComponent):
         if thread_idx < Int32(self.world_size):
             for region_name in (self.token_sf_plain_ready_region, self.token_data_ready_region):
                 counter_address = device_workspace.ptr(region_name).toint()
-                red_add_relaxed_sys_s32(
-                    peer_rank_ptr_mapper.map(counter_address, thread_idx, Int64(0)), Int32(1)
-                )
+                red_add_relaxed_sys_s32(peer_rank_ptr_mapper.map(counter_address, thread_idx, Int64(0)), Int32(1))
 
     @cute.jit
     def _run_sort(
@@ -1624,9 +1493,7 @@ class GenphaseTokenComm(KernelComponent):
         histogram = self._smem_workspace.tensor(self.sort_histogram_region, smem_base)
         base_row = self._smem_workspace.tensor(self.sort_prefix_region, smem_base)
 
-        for bucket_round in cutlass.range_constexpr(
-            ceil_div(self.histogram_bucket_count, self.threads_per_cta)
-        ):
+        for bucket_round in cutlass.range_constexpr(ceil_div(self.histogram_bucket_count, self.threads_per_cta)):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.histogram_bucket_count):
                 histogram[bucket] = Int32(0)
@@ -1661,25 +1528,18 @@ class GenphaseTokenComm(KernelComponent):
             if route < Int32(self.routes_per_rank):
                 # One unsigned compare covers "not this rank's" and "invalid":
                 # the wire marker and any wild value both land outside the window.
-                local_expert = (
-                    index_slab[route // Int32(self.topk), route % Int32(self.topk)]
-                    - local_expert_begin
-                )
+                local_expert = index_slab[route // Int32(self.topk), route % Int32(self.topk)] - local_expert_begin
                 if cutlass.Uint32(local_expert) < cutlass.Uint32(self.experts_per_rank):
                     buckets[route_round] = local_expert
 
         for route_round in cutlass.range_constexpr(route_rounds):
             offsets[route_round] = Int32(
-                cute.arch.atomic_add(
-                    histogram.iterator + buckets[route_round], Int32(1), sem="relaxed", scope="cta"
-                )
+                cute.arch.atomic_add(histogram.iterator + buckets[route_round], Int32(1), sem="relaxed", scope="cta")
             )
         cute.arch.sync_threads()
 
         expert_counts = device_workspace.tensor(self.expert_counts_by_rank_region)
-        for bucket_round in cutlass.range_constexpr(
-            ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        ):
+        for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
                 expert_counts[source_rank, bucket] = histogram[bucket]
@@ -1688,14 +1548,8 @@ class GenphaseTokenComm(KernelComponent):
 
         iket.range_push("sort.wait_prefix")
         if thread_idx == Int32(0):
-            red_async_add_release_gpu_s32(
-                device_workspace.ptr(self.rank_count_ready_region), Int32(1)
-            )
-            spin_wait(
-                device_workspace.ptr(self.prefix_ready_region),
-                lambda value: value == Int32(1),
-                scope="gpu",
-            )
+            red_async_add_release_gpu_s32(device_workspace.ptr(self.rank_count_ready_region), Int32(1))
+            spin_wait(device_workspace.ptr(self.prefix_ready_region), lambda value: value == Int32(1), scope="gpu")
         cute.arch.sync_threads()
         iket.range_pop()
 
@@ -1703,9 +1557,7 @@ class GenphaseTokenComm(KernelComponent):
         # This source's segment start inside each expert, staged once: every thread
         # needs it for up to `route_rounds` unrelated buckets.
         source_expert_base = device_workspace.tensor(self.source_expert_base_region)
-        for bucket_round in cutlass.range_constexpr(
-            ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        ):
+        for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
                 base_row[bucket] = source_expert_base[source_rank, bucket]
@@ -1715,9 +1567,7 @@ class GenphaseTokenComm(KernelComponent):
         token_metadata = device_workspace.tensor(self.token_src_metadata_region)
         routed_scores = self.fc1_topk_scores_tensor(device_workspace)
         if cutlass.const_expr(self.apply_topk_at_fc1):
-            score_slab = device_workspace.tensor(self.topk_score_inbox_region)[
-                source_rank, None, None
-            ]
+            score_slab = device_workspace.tensor(self.topk_score_inbox_region)[source_rank, None, None]
         dense_row_begin = source_rank * Int32(self.max_tokens_per_rank)
 
         for route_round in cutlass.range_constexpr(route_rounds):
@@ -1735,18 +1585,12 @@ class GenphaseTokenComm(KernelComponent):
 
         cute.arch.sync_threads()
         if thread_idx == Int32(0):
-            red_async_add_release_gpu_s32(
-                device_workspace.ptr(self.metadata_ready_region), Int32(1)
-            )
+            red_async_add_release_gpu_s32(device_workspace.ptr(self.metadata_ready_region), Int32(1))
         iket.range_pop()
 
     @cute.jit
     def _run_helper(
-        self,
-        device_workspace: DeviceWorkspace,
-        local_rank: Int32,
-        smem_base: cute.Pointer,
-        thread_idx: Int32,
+        self, device_workspace: DeviceWorkspace, local_rank: Int32, smem_base: cute.Pointer, thread_idx: Int32
     ) -> None:
         """Fold the W count rows into per-expert sizes and both row-space prefixes.
 
@@ -1814,12 +1658,8 @@ class GenphaseTokenComm(KernelComponent):
         # themselves stay keyed by expert, because every reader of them -- the
         # source segment bases, the refine expert table, and the main kernel's
         # gather -- addresses an expert rather than a slot.
-        loads_in_scan_order = self._smem_workspace.tensor(
-            self.helper_totals_by_slot_region, smem_base
-        )
-        scan_order_experts = self._smem_workspace.tensor(
-            self.helper_slot_to_expert_region, smem_base
-        )
+        loads_in_scan_order = self._smem_workspace.tensor(self.helper_totals_by_slot_region, smem_base)
+        scan_order_experts = self._smem_workspace.tensor(self.helper_slot_to_expert_region, smem_base)
 
         for padding_block, region_name in (
             (self.token_padding_block, self.data_expert_base_region),
@@ -1881,9 +1721,7 @@ class GenphaseTokenComm(KernelComponent):
         if cutlass.const_expr(self.ranks_experts_in_warp):
             self._rank_by_counting_in_warp(device_workspace, smem_base, lane_idx, warp_idx)
         else:
-            self._rank_by_load_histogram(
-                device_workspace, smem_base, thread_idx, lane_idx, warp_idx
-            )
+            self._rank_by_load_histogram(device_workspace, smem_base, thread_idx, lane_idx, warp_idx)
 
     @cute.jit
     def _place_expert_at_slot(
@@ -1907,20 +1745,14 @@ class GenphaseTokenComm(KernelComponent):
         kernel never translates it.
         """
         self._smem_workspace.tensor(self.helper_slot_to_expert_region, smem_base)[slot] = expert
-        self._smem_workspace.tensor(self.helper_totals_by_slot_region, smem_base)[slot] = (
-            routed_count
-        )
+        self._smem_workspace.tensor(self.helper_totals_by_slot_region, smem_base)[slot] = routed_count
         device_workspace.tensor(self.slot_to_expert_region)[slot] = expert
         if slot < Int32(self.experts_per_rank):
             device_workspace.tensor(self.expert_sizes_by_slot_region)[slot] = routed_count
 
     @cute.jit
     def _rank_by_counting_in_warp(
-        self,
-        device_workspace: DeviceWorkspace,
-        smem_base: cute.Pointer,
-        lane_idx: Int32,
-        warp_idx: Int32,
+        self, device_workspace: DeviceWorkspace, smem_base: cute.Pointer, lane_idx: Int32, warp_idx: Int32
     ) -> None:
         """Rank the experts inside one warp by counting how many outrank each.
 
@@ -1993,12 +1825,7 @@ class GenphaseTokenComm(KernelComponent):
                 binade = Int32(32) - Int32(cute.arch.clz(totals[bucket]))
                 keys[bucket_round] = Int32(self.load_bin_count - 1) - binade
                 offsets_in_bin[bucket_round] = Int32(
-                    cute.arch.atomic_add(
-                        load_bins.iterator + keys[bucket_round],
-                        Int32(1),
-                        sem="relaxed",
-                        scope="cta",
-                    )
+                    cute.arch.atomic_add(load_bins.iterator + keys[bucket_round], Int32(1), sem="relaxed", scope="cta")
                 )
         cute.arch.sync_threads()
 
@@ -2015,9 +1842,7 @@ class GenphaseTokenComm(KernelComponent):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
                 slot = load_bins[keys[bucket_round]] + offsets_in_bin[bucket_round]
-                self._place_expert_at_slot(
-                    device_workspace, smem_base, slot, bucket, totals[bucket]
-                )
+                self._place_expert_at_slot(device_workspace, smem_base, slot, bucket, totals[bucket])
         cute.arch.sync_threads()
 
     @cute.jit
@@ -2051,14 +1876,10 @@ class GenphaseTokenComm(KernelComponent):
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             scan_entry = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if scan_entry < Int32(self.local_expert_bucket_count):
-                scan_input[scan_entry] = padded_expert_rows(
-                    loads_in_scan_order[scan_entry], padding_block
-                )
+                scan_input[scan_entry] = padded_expert_rows(loads_in_scan_order[scan_entry], padding_block)
         cute.arch.sync_threads()
 
-        smem_exclusive_prefix(
-            scan_input, prefix, warp_totals, self.threads_per_cta, thread_idx, lane_idx, warp_idx
-        )
+        smem_exclusive_prefix(scan_input, prefix, warp_totals, self.threads_per_cta, thread_idx, lane_idx, warp_idx)
         cute.arch.sync_threads()
 
         destination = device_workspace.tensor(region_name)
@@ -2100,9 +1921,7 @@ class GenphaseTokenComm(KernelComponent):
         for bucket_round in cutlass.range_constexpr(bucket_rounds):
             scan_entry = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if scan_entry < Int32(self.local_expert_bucket_count):
-                scan_input[scan_entry] = ceil_div(
-                    loads_in_scan_order[scan_entry], Int32(self.sf_padding_block)
-                )
+                scan_input[scan_entry] = ceil_div(loads_in_scan_order[scan_entry], Int32(self.sf_padding_block))
         cute.arch.sync_threads()
 
         block_total = smem_exclusive_prefix(
@@ -2121,11 +1940,7 @@ class GenphaseTokenComm(KernelComponent):
 
     @cute.jit
     def _publish_source_segment_bases(
-        self,
-        device_workspace: DeviceWorkspace,
-        count_matrix: cute.Tensor,
-        local_rank: Int32,
-        thread_idx: Int32,
+        self, device_workspace: DeviceWorkspace, count_matrix: cute.Tensor, local_rank: Int32, thread_idx: Int32
     ) -> None:
         """Where each (source rank, expert) segment starts in the data row space.
 
@@ -2136,9 +1951,7 @@ class GenphaseTokenComm(KernelComponent):
         data_expert_base = device_workspace.tensor(self.data_expert_base_region)
         source_expert_base = device_workspace.tensor(self.source_expert_base_region)
 
-        for bucket_round in cutlass.range_constexpr(
-            ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        ):
+        for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
                 segment_begin = data_expert_base[bucket]
@@ -2149,9 +1962,7 @@ class GenphaseTokenComm(KernelComponent):
         cute.arch.sync_threads()
 
     @cute.jit
-    def _run_refine(
-        self, device_workspace: DeviceWorkspace, smem_base: cute.Pointer, thread_idx: Int32
-    ) -> None:
+    def _run_refine(self, device_workspace: DeviceWorkspace, smem_base: cute.Pointer, thread_idx: Int32) -> None:
         """Rewrite the received scale factors into the layout the MMA reads."""
         group_threads = self.refine_warps_per_group * 32
         group_idx = thread_idx // Int32(group_threads)
@@ -2189,21 +2000,12 @@ class GenphaseTokenComm(KernelComponent):
         work_counter = device_workspace.ptr(self.refine_work_counter_region)
         block_total = device_workspace.tensor(self.refine_block_total_region)[0]
 
-        claim_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128
-        )
+        claim_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128)
         claimed = cute.make_rmem_tensor((self.refine_claim_fields,), cutlass.Int32)
 
         fc1_sf_ready = device_workspace.ptr(self.fc1_sf_ready_region)
         owning_expert = self._claim_next_block(
-            claim,
-            expert_table,
-            work_counter,
-            block_total,
-            group_idx,
-            thread_in_group,
-            group_barrier,
-            group_threads,
+            claim, expert_table, work_counter, block_total, group_idx, thread_in_group, group_barrier, group_threads
         )
         cute.copy(claim_atom, claim[group_idx, None], claimed)
 
@@ -2227,14 +2029,7 @@ class GenphaseTokenComm(KernelComponent):
                 red_async_add_release_gpu_s32(fc1_sf_ready + owning_expert, Int32(1))
             iket.range_pop()
             owning_expert = self._claim_next_block(
-                claim,
-                expert_table,
-                work_counter,
-                block_total,
-                group_idx,
-                thread_in_group,
-                group_barrier,
-                group_threads,
+                claim, expert_table, work_counter, block_total, group_idx, thread_in_group, group_barrier, group_threads
             )
             cute.copy(claim_atom, claim[group_idx, None], claimed)
 
@@ -2269,9 +2064,7 @@ class GenphaseTokenComm(KernelComponent):
         if thread_in_group < Int32(32):
             claimed_block = Int32(0)
             if thread_in_group == Int32(0):
-                claimed_block = Int32(
-                    cute.arch.atomic_add(work_counter, Int32(1), sem="relaxed", scope="gpu")
-                )
+                claimed_block = Int32(cute.arch.atomic_add(work_counter, Int32(1), sem="relaxed", scope="gpu"))
             # Broadcast rather than staged through shared memory: the ballot below
             # needs the whole warp to agree on the block, and a shuffle gets it
             # there without a second barrier.
@@ -2284,25 +2077,17 @@ class GenphaseTokenComm(KernelComponent):
             resolved[self.refine_claim_live_rows] = Int32(0)
             if claimed_block < block_total:
                 block_rows = Int32(self.sf_padding_block)
-                owning_expert = self._resolve_block_expert(
-                    expert_table, claimed_block, thread_in_group
-                )
-                rows_before = (
-                    claimed_block - expert_table[self.refine_table_block_base, owning_expert]
-                ) * block_rows
+                owning_expert = self._resolve_block_expert(expert_table, claimed_block, thread_in_group)
+                rows_before = (claimed_block - expert_table[self.refine_table_block_base, owning_expert]) * block_rows
                 expert_size = expert_table[self.refine_table_expert_size, owning_expert]
                 data_base = expert_table[self.refine_table_data_base, owning_expert]
                 sf_base = expert_table[self.refine_table_sf_base, owning_expert]
                 resolved[self.refine_claim_data_row] = data_base + rows_before
                 resolved[self.refine_claim_sf_row] = sf_base + rows_before
-                resolved[self.refine_claim_live_rows] = cutlass.min(
-                    expert_size - rows_before, block_rows
-                )
+                resolved[self.refine_claim_live_rows] = cutlass.min(expert_size - rows_before, block_rows)
 
             if thread_in_group == Int32(0):
-                claim_atom = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128
-                )
+                claim_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.Int32, num_bits_per_copy=128)
                 cute.copy(claim_atom, resolved, claim[group_idx, None])
         cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
         return owning_expert
@@ -2322,9 +2107,7 @@ class GenphaseTokenComm(KernelComponent):
         sf_base = device_workspace.tensor(self.sf_expert_base_region)
         expert_sizes = device_workspace.tensor(self.expert_sizes_region)
 
-        for bucket_round in cutlass.range_constexpr(
-            ceil_div(self.local_expert_bucket_count, self.threads_per_cta)
-        ):
+        for bucket_round in cutlass.range_constexpr(ceil_div(self.local_expert_bucket_count, self.threads_per_cta)):
             bucket = Int32(bucket_round * self.threads_per_cta) + thread_idx
             if bucket < Int32(self.local_expert_bucket_count):
                 expert_table[self.refine_table_block_base, bucket] = block_base[bucket]
@@ -2377,21 +2160,13 @@ class GenphaseTokenComm(KernelComponent):
 
         iket.range_push("refine.out_of_smem")
         self._scatter_block_atoms(
-            device_workspace,
-            smem_base,
-            sf_row_begin,
-            group_idx,
-            thread_in_group,
-            group_barrier,
-            group_threads,
+            device_workspace, smem_base, sf_row_begin, group_idx, thread_in_group, group_barrier, group_threads
         )
         iket.range_pop()
         return stage_state
 
     @cute.jit
-    def _resolve_block_expert(
-        self, expert_table: cute.Tensor, block_index: Int32, lane_idx: Int32
-    ) -> Int32:
+    def _resolve_block_expert(self, expert_table: cute.Tensor, block_index: Int32, lane_idx: Int32) -> Int32:
         """Which local expert owns a linear refine block.
 
         One lane per bucket, so the answer comes out of a ballot rather than a scan
@@ -2411,12 +2186,9 @@ class GenphaseTokenComm(KernelComponent):
             if bucket < Int32(self.local_expert_bucket_count):
                 bucket_base = expert_table[self.refine_table_block_base, bucket]
                 bucket_blocks = ceil_div(
-                    expert_table[self.refine_table_expert_size, bucket],
-                    Int32(self.sf_padding_block),
+                    expert_table[self.refine_table_expert_size, bucket], Int32(self.sf_padding_block)
                 )
-                bucket_owns_block = (bucket_base <= block_index) & (
-                    block_index < bucket_base + bucket_blocks
-                )
+                bucket_owns_block = (bucket_base <= block_index) & (block_index < bucket_base + bucket_blocks)
             owning_lane = _first_matching_lane(bucket_owns_block)
             if owning_lane >= Int32(0):
                 resolved = Int32(bucket_round * 32) + owning_lane
@@ -2507,51 +2279,32 @@ class GenphaseTokenComm(KernelComponent):
         # The runs tile the row exactly: the staging tile's column extent is the
         # run-aligned one, so a partial last run reads columns past `hidden_sf`
         # that belong to this row rather than to the next.
-        staged_runs = cute.zipped_divide(
-            staging[group_idx, thread_in_group, None], (columns_per_run,)
-        )
+        staged_runs = cute.zipped_divide(staging[group_idx, thread_in_group, None], (columns_per_run,))
 
         load_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            self.activation_sf_dtype,
-            num_bits_per_copy=8 * columns_per_run,
+            cute.nvgpu.CopyUniversalOp(), self.activation_sf_dtype, num_bits_per_copy=8 * columns_per_run
         )
-        store_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(), self.activation_sf_dtype, num_bits_per_copy=32
-        )
-        staged_values = cute.make_rmem_tensor(
-            cute.make_layout((columns_per_run,)), self.activation_sf_dtype
-        )
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.activation_sf_dtype, num_bits_per_copy=32)
+        staged_values = cute.make_rmem_tensor(cute.make_layout((columns_per_run,)), self.activation_sf_dtype)
         value_atoms = cute.zipped_divide(staged_values, (4,))
 
         for run in cutlass.range_constexpr(self.refine_run_count):
             stage_slot = run % self.refine_output_stages
-            live_atoms = min(
-                self.refine_atoms_per_stage,
-                self.refine_total_atoms - run * self.refine_atoms_per_stage,
-            )
+            live_atoms = min(self.refine_atoms_per_stage, self.refine_total_atoms - run * self.refine_atoms_per_stage)
             # One run of atoms, addressed the way the MMA reads it: 32 rows by 4
             # row-groups against 4 scale factors by 4 atoms.
             run_output = cute.make_tensor(
                 output[group_idx, stage_slot, None].iterator,
-                cute.make_layout(
-                    ((32, 4), (4, self.refine_atoms_per_stage)), stride=((16, 4), (1, 512))
-                ),
+                cute.make_layout(((32, 4), (4, self.refine_atoms_per_stage)), stride=((16, 4), (1, 512))),
             )
             cute.copy(load_atom, staged_runs[None, run], staged_values)
             for atom in cutlass.range_constexpr(self.refine_atoms_per_stage):
-                cute.copy(
-                    store_atom,
-                    value_atoms[None, atom],
-                    run_output[(atom_row, atom_row_group), (None, atom)],
-                )
+                cute.copy(store_atom, value_atoms[None, atom], run_output[(atom_row, atom_row_group), (None, atom)])
             cute.arch.barrier(barrier_id=group_barrier, number_of_threads=group_threads)
 
             # `sf_row_begin` is atom-aligned and the run starts on an atom
             # boundary, so the tensor's own layout hands back the run base.
-            destination = cute.domain_offset(
-                (sf_row_begin, Int32(run * columns_per_run * sf_vec_size)), canonical
-            )
+            destination = cute.domain_offset((sf_row_begin, Int32(run * columns_per_run * sf_vec_size)), canonical)
             # Elected inside the group's first warp, not in every warp: the stage
             # slot is written cooperatively by all `group_threads` threads, so it
             # leaves as one store. A bare `elect_one` would issue the same address
@@ -2562,9 +2315,7 @@ class GenphaseTokenComm(KernelComponent):
             if thread_in_group // Int32(32) == Int32(0):
                 with cute.arch.elect_one():
                     cp_async_bulk_s2g(
-                        destination.iterator,
-                        output[group_idx, stage_slot, None].iterator,
-                        Int32(live_atoms * 512),
+                        destination.iterator, output[group_idx, stage_slot, None].iterator, Int32(live_atoms * 512)
                     )
             cute.arch.cp_async_bulk_commit_group()
             cute.arch.cp_async_bulk_wait_group(self.refine_output_stages - 1, read=True)
