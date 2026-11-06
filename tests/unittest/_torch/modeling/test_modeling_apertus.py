@@ -266,16 +266,22 @@ class TestApertus(unittest.TestCase):
                 places=5,
             )
             torch.testing.assert_close(
-                layer.attention_layernorm.weight, hf_layer.attention_layernorm.weight
+                layer.attention_layernorm.weight,
+                hf_layer.attention_layernorm.weight,
+                atol=0,
+                rtol=0,
             )
             torch.testing.assert_close(
-                layer.feedforward_layernorm.weight, hf_layer.feedforward_layernorm.weight
+                layer.feedforward_layernorm.weight,
+                hf_layer.feedforward_layernorm.weight,
+                atol=0,
+                rtol=0,
             )
             torch.testing.assert_close(
-                layer.self_attn.q_norm.weight, hf_layer.self_attn.q_norm.weight
+                layer.self_attn.q_norm.weight, hf_layer.self_attn.q_norm.weight, atol=0, rtol=0
             )
             torch.testing.assert_close(
-                layer.self_attn.k_norm.weight, hf_layer.self_attn.k_norm.weight
+                layer.self_attn.k_norm.weight, hf_layer.self_attn.k_norm.weight, atol=0, rtol=0
             )
 
     @parameterized.expand(
