@@ -52,15 +52,17 @@ class RemoteWorkerProcessMonitor:
         self._seen: dict[int, tuple[dict, float]] = {}
         self._failure: dict | None = None
         host_override = os.environ.get("TRTLLM_WORKER_WATCH_HOST")
-        host = socket.gethostbyname(host_override or socket.gethostname())
+        host_error = (
+            "Set TRTLLM_WORKER_WATCH_HOST to a leader address reachable from all MPI workers"
+        )
+        try:
+            host = socket.gethostbyname(host_override or socket.gethostname())
+        except socket.gaierror as error:
+            raise RuntimeError(host_error) from error
         # Reject wildcard advertised addresses; this comparison does not bind.
-        if (
-            host == "0.0.0.0"  # nosec B104
-            or (host.startswith("127.") and not host_override)
-        ):
-            raise RuntimeError(
-                "Set TRTLLM_WORKER_WATCH_HOST to a leader address reachable from all MPI workers"
-            )
+        # Loopback is valid when every rank can report to this endpoint.
+        if host == "0.0.0.0":  # nosec B104
+            raise RuntimeError(host_error)
         self._queue = IpcQueue(
             ("tcp://0.0.0.0:*", None),
             is_server=True,
