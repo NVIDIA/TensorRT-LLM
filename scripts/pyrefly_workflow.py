@@ -85,7 +85,7 @@ def clear_path_module_exclusions(source_path: Path, destination_path: Path) -> N
         section, count = re.subn(
             rf"(?ms)^{re.escape(key)}\s*=\s*\[.*?^\]", f"{key} = []", section, count=1
         )
-        if count != 1:
+        if count != 1 and key != "replace-imports-with-any":
             raise ValueError(f"{source_path} is missing [tool.pyrefly].{key}")
     destination_path.write_text(section)
 
