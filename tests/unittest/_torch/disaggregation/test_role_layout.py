@@ -95,6 +95,11 @@ def test_head_split_resolves_recurrent_state_from_its_heads_on_each_rank():
     assert layout == ByHead(head_bytes=128, total=16, split=("tp", "cp"))
 
 
+def test_head_split_of_attention_without_the_total_of_its_heads_is_the_rank_s_own_share():
+    # One KV head on each of 4 ranks may be 4 heads or one head held 4 times: unknown.
+    assert ByHead().resolve(_site(1024, kv_heads=(1, None), ranks=4)) == Own(("tp",))
+
+
 def test_head_split_resolves_to_the_rank_s_own_share_without_whole_heads():
     assert ByHead().resolve(_site(1000, kv_heads=(3, 6), ranks=2)) == Own(("tp",))
     assert ByHead().resolve(_site(1000, kv_heads=(0, None))) == Own(("tp",))
