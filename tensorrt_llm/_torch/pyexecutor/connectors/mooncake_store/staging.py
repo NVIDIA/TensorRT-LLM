@@ -43,12 +43,7 @@ except ImportError:
 from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
-__all__ = ["MAX_STAGING_BUFFER_BYTES", "HostStagingPool", "plan_slot_geometry", "sync_stream"]
-
-#: Ceiling on the pinned allocation per direction, bounding what a large page
-#: times a large batch could demand. The memory is pinned for the process's
-#: lifetime and comes out of the DRAM the pool segment is charged against.
-MAX_STAGING_BUFFER_BYTES = 1 << 30
+__all__ = ["HostStagingPool", "plan_slot_geometry", "sync_stream"]
 
 #: Stated explicitly rather than inferred from the pointers, which would be
 #: wrong for a host pointer outside the unified address space.
@@ -82,19 +77,22 @@ def sync_stream(stream: int) -> None:
 def plan_slot_geometry(
     max_bytes_per_page: int,
     transfer_batch_size: int,
-    budget_bytes: int = MAX_STAGING_BUFFER_BYTES,
+    budget_bytes: int,
 ) -> Tuple[int, int]:
     """Choose how many pages may be staged at once, and how wide a slot is.
 
-    The geometry follows from the layout rather than from configuration: a slot
-    has to hold the largest page any layer group produces, and there is no
-    point holding more slots than a transfer batch has pages. A budget below
-    one page is raised to one rather than refused.
+    A slot has to hold the largest page any layer group produces, and there is
+    no point holding more slots than a transfer batch has pages. The budget
+    bounds the count, never the width: a budget below one page yields one
+    slot, which pins more than the budget rather than refusing to start.
 
     Args:
         max_bytes_per_page: Largest page payload across layer groups.
         transfer_batch_size: Pages the connector puts in one store call.
-        budget_bytes: Ceiling on this pool's pinned allocation.
+        budget_bytes: Ceiling on this pool's pinned allocation: the configured
+            `staging_buffer_bytes`, or one asynchronous load worker's share of
+            it. The memory is pinned for the process's lifetime and comes out
+            of the DRAM the pool segment is charged against.
 
     Returns:
         Slot width in bytes, and the number of slots.
@@ -112,9 +110,10 @@ def plan_slot_geometry(
 class HostStagingPool:
     """A registered pinned buffer, sliced into per-page slots.
 
-    One pool serves one direction. Loads run on the executor thread and saves
-    on the connector's background thread, so sharing slots would need a lock on
-    the transfer path for no benefit.
+    One pool per user of the slots: the synchronous load path (executor
+    thread, only when `async_load` is off), the save thread, and each
+    asynchronous load worker. Slots are never shared between threads, so no
+    lock sits on the transfer path.
     """
 
     def __init__(
