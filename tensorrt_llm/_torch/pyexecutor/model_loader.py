@@ -1927,6 +1927,15 @@ class ModelLoader:
             return "unknown"
         return mode_name.lower()
 
+    @staticmethod
+    def _draft_checkpoint_load_kwargs(model: torch.nn.Module) -> dict[str, Any]:
+        """Name the checkpoint key prefixes the draft reads, so loaders may skip files without them."""
+        key_prefixes = getattr(getattr(model, "draft_model", None),
+                               "checkpoint_key_prefixes", None)
+        if isinstance(key_prefixes, tuple) and key_prefixes:
+            return {"key_prefixes": key_prefixes}
+        return {}
+
     def _load_separate_draft_weights(
             self, model: DecoderModelForCausalLM,
             checkpoint_loader: BaseCheckpointLoader) -> None:
@@ -1935,7 +1944,7 @@ class ModelLoader:
         Each draft config initializes its own architecture mapper so replacement
         MTP weights use the draft's quantization and MoE backend.
         """
-        draft_load_kwargs = {}
+        draft_load_kwargs = self._draft_checkpoint_load_kwargs(model)
         if checkpoint_loader.checkpoint_format == CheckpointFormat.MX:
             # This loader instance still owns the target model's MX session.
             # Preserve it while the native loader reads the auxiliary draft
@@ -2539,7 +2548,8 @@ class ModelLoader:
                 value,
                 ModelLoaderMetricNames.DRAFT_CHECKPOINT_FINALIZATION_SECONDS.
                 value,
-                mapping=self.mapping) as weights:
+                mapping=self.mapping,
+                **self._draft_checkpoint_load_kwargs(model)) as weights:
             if model.draft_config is not None:
                 draft_model_arch = model.draft_config.pretrained_config.architectures[
                     0]

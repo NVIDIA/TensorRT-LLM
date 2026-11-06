@@ -2352,6 +2352,11 @@ class DSv4DSparkForCausalLM(nn.Module):
     def embed_tokens(self):
         return self.dspark_model.embed_tokens
 
+    @property
+    def checkpoint_key_prefixes(self) -> tuple[str, ...]:
+        """Checkpoint key prefixes that :meth:`load_weights` reads."""
+        return tuple(f"mtp.{stage}." for stage in range(self.num_stages))
+
     def forward(self, main_hidden, bonus_token_ids, start_pos, **kwargs):
         return self.dspark_model.forward(main_hidden, bonus_token_ids, start_pos, **kwargs)
 
