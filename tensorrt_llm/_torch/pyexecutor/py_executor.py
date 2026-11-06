@@ -10213,8 +10213,7 @@ class PyExecutor:
                 HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
                                batch_outputs.get("logits"), beam_width,
-                               num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model())
+                               num_context_logits_prefix_sum)
 
                 HandleAdditionalOutputs()(scheduled_batch.context_requests,
                                           scheduled_batch.generation_requests,
