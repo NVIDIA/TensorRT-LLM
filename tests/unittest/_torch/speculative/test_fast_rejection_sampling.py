@@ -15,8 +15,9 @@
 """Tests of the temperature-only fused rejection-sampling kernels in `fast_rejection_sampling`
 (``TLLM_SPEC_FAST_RS=1``).
 
-The kernels are checked for exactness against flashinfer and float64 models on the same Philox draws,
-for losslessness with chi-square tests, and through the `SpecWorkerBase` entry points and CUDA graphs.
+The kernels are checked for exactness against the reference samplers (flashinfer's draft sampling,
+`chain_speculative_sampling` for the verify) and float64 models on the same Philox draws, for
+losslessness with chi-square tests, and through the `SpecWorkerBase` entry points and CUDA graphs.
 """
 
 import math
@@ -130,30 +131,40 @@ def _token_gap(weights, u, got):
     return _cdf_gap(weights, u, int(got), want) / max(float(np.sum(weights)), 1e-300)
 
 
-def _verify_model(p, q, drafts, seed, offset, b, k):
-    """Request ``b``'s accept position and drawn token weights from float64 target ``p``
-    [k + 1, V] and stored proposals ``q`` [k, V]: (pos, weights, u scaled by their mass)."""
+def _verify_u(seed, offset, draw):
+    """Verify draw ``draw`` of a request: `chain_speculative_sampling`'s stream,
+    ``curand_init(seed, PER_ROW_SUBSEQUENCE_BASE | offset, 0)``."""
+    return curand_uniform(seed, 0, (1 << 63) | (offset & _M64), draw)
+
+
+def _verify_model(p, q, drafts, seed, offset, k):
+    """A request's accept position and drawn token weights from float64 target ``p`` [k + 1, V] and
+    stored proposals ``q`` [k, V]: (pos, weights, the token's threshold on their running mass)."""
     pos = k
     for i in range(k):
         d = int(drafts[i])
-        if not curand_uniform(seed, offset, b, i) * q[i, d] < p[i, d]:
+        if not _verify_u(seed, offset, i) * q[i, d] < p[i, d]:
             pos = i
             break
     w = np.maximum(p[pos] - q[pos], 0.0) if pos < k else p[pos]
-    return pos, w, curand_uniform(seed, offset, b, k) * float(w.sum())
+    if not w.sum() > 0.0:
+        w = p[pos]
+    # The draw after the accept draws, as 1 - u.
+    u = 1.0 - _verify_u(seed, offset, pos + 1 if pos < k else k)
+    return pos, w, u * float(w.sum())
 
 
-def _verify_row_gap(acc_row, num, p, q, drafts, seed, offset, b, k):
+def _verify_row_gap(acc_row, num, p, q, drafts, seed, offset, k):
     """Compare request ``b``'s verify row with the float64 model.
 
     Returns: the decision that differs (``"accept"`` or ``"token"``) and the size of the rounding that
     must explain it (0 when the drawn tokens agree)."""
-    pos_m, w, u = _verify_model(p, q, drafts, seed, offset, b, k)
+    pos_m, w, u = _verify_model(p, q, drafts, seed, offset, k)
     pos = int(num) - 1
     if pos != pos_m:
         i = min(pos, pos_m)
         d = int(drafts[i])
-        u_i = curand_uniform(seed, offset, b, i)
+        u_i = _verify_u(seed, offset, i)
         return "accept", abs(u_i * q[i, d] - p[i, d]) / max(p[i, d], 1e-300)
     row = [int(x) for x in acc_row]
     assert row[:pos] == [int(x) for x in drafts[:pos]]
@@ -208,9 +219,7 @@ def _check_drafts(tokens, stored, seeds, offsets, k, gaps):
 
 def _check_verify(acc, num, p, q, drafts, seeds, offsets, k, gaps):
     for b in range(acc.shape[0]):
-        gaps.add(
-            *_verify_row_gap(acc[b], num[b], p[b], q[b], drafts[b], seeds[b], offsets[b], b, k)
-        )
+        gaps.add(*_verify_row_gap(acc[b], num[b], p[b], q[b], drafts[b], seeds[b], offsets[b], k))
 
 
 @pytest.mark.parametrize("num_gens", [1, 16])
@@ -261,10 +270,10 @@ def test_draft_block_matches_flashinfer(num_gens, temperature):
 
 @pytest.mark.parametrize("num_gens", [1, 16])
 @pytest.mark.parametrize("accept_bias", [0.3, 1.5])
-def test_verify_matches_flashinfer(num_gens, accept_bias):
-    """The verify accept decisions match `chain_speculative_sampling` on the same draws ``0..K-1``, and
-    every row's accept position and drawn token (draw ``K``) match the float64 model. Differences must
-    be explained by rounding."""
+def test_verify_matches_reference(num_gens, accept_bias):
+    """The verify accept decisions match `rejection_sampling_one_model` (`chain_speculative_sampling`)
+    on the same draws, and every row's accept position and drawn token match the float64 model.
+    Differences must be explained by rounding."""
     gen = torch.Generator(device=DEV).manual_seed(101 + num_gens)
     model, decisions = _Gaps(), _Gaps()
     total = 0
@@ -281,19 +290,17 @@ def test_verify_matches_flashinfer(num_gens, accept_bias):
         drafts = frs.fast_rs_draft_block(drf.view(-1, V), temps_req, slots, -1, buf, seeds, offs, 1)
         drafts = drafts.view(num_gens, K).contiguous()
         acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
-        # Accept decisions: chain_speculative_sampling draws the same uniforms 0..K-1 (what
+        # Accept decisions: chain_speculative_sampling draws the same uniforms (what
         # _sample_and_accept_draft_tokens_rejection runs in NO_TOPK_NO_TOPP mode).
         tprobs = compute_probs_from_logits(tgt, temps_tok, None, None).view(num_gens, K + 1, V)
-        _, ref_num = rejection_sampling_one_model(
-            buf[slots], drafts, tprobs, deterministic=True, seed=seeds, offset=offs
-        )
+        _, ref_num = rejection_sampling_one_model(buf[slots], drafts, tprobs, seeds, offs)
         p = _softmax64(tgt, temps_tok).reshape(num_gens, K + 1, V)
         q = buf[slots].double().cpu().numpy()
         dr = drafts.cpu().numpy()
         for b in (num.long() != ref_num.long()).nonzero().flatten().tolist():
             i = min(int(num[b]), int(ref_num[b])) - 1
             d = int(dr[b, i])
-            u = curand_uniform(seed, offset, b, i)
+            u = _verify_u(seed, offset, i)
             decisions.add("accept", abs(u * q[b, i, d] - p[b, i, d]) / max(p[b, i, d], 1e-300))
         # Every row (accept position and drawn token) vs the float64 model.
         _check_verify(
@@ -311,7 +318,7 @@ def test_verify_matches_flashinfer(num_gens, accept_bias):
         for n in num.tolist():
             hist[n - 1] += 1
     print(
-        f"verify G={num_gens} bias={accept_bias}: accept decisions vs flashinfer differ in "
+        f"verify G={num_gens} bias={accept_bias}: accept decisions vs the reference differ in "
         f"{decisions.count}/{total} rows (worst {decisions.worst['accept']:.2e} rel); vs the "
         f"float64 model {model.count}/{total} rows (worst accept {model.worst['accept']:.2e}, "
         f"token {model.worst['token']:.2e}); accepted-length histogram {hist.tolist()}"
@@ -448,9 +455,10 @@ def test_short_draft_and_ragged_vocab():
 
 
 def test_philox_layout_never_reuses_a_draw():
-    """Over consecutive steps whose offsets are only ``K + 1`` words apart (the narrowest spacing;
-    `SpecMetadata._take_rng_window_offsets` spaces them further), no ``(key, subsequence, word)`` is
-    drawn twice, even with every request on one seed."""
+    """Over consecutive steps, with every request on one seed and on its own offset window as
+    `SpecMetadata._take_rng_window_offsets` assigns them (here only ``K + 1`` words wide, the
+    narrowest), no ``(key, subsequence, word)`` is drawn twice: each verify draws from its own
+    subsequence ``PER_ROW_SUBSEQUENCE_BASE | offset``, and the drafts use the draft key."""
     window = K + 1
     seed = 7
     for k in range(1, K + 1):
@@ -458,8 +466,8 @@ def test_philox_layout_never_reuses_a_draw():
             seen = set()
             for step in range(3):
                 for b in range(g):
-                    offset = (b % 3 + step) * window
-                    draws = [(seed, b, offset + i) for i in range(k + 1)]
+                    offset = (step * g + b) * window
+                    draws = [(seed, (1 << 63) | offset, i) for i in range(k + 1)]
                     draws += [(_draft_key(seed), b * k + i, offset + 1) for i in range(k)]
                     for d in draws:
                         assert d not in seen, (k, g, step, b, d)
@@ -548,6 +556,8 @@ def test_worker_paths_fast(monkeypatch):
     assert torch.equal(a0[:nctx, 0], a1[:nctx, 0])  # context rows: the same target sampler
     p = _softmax64(logits[nctx:], torch.ones(ngen * (K + 1), device=DEV)).reshape(ngen, K + 1, V)
     real_gens = slice(nctx, bsz - 1)
+    # Both paths draw the acceptance from the step's acceptance slot.
+    accept_offset = offset + md.rng_accept_slot * itf._RNG_SLOT_SPAN
     _check_verify(
         a1[real_gens].cpu().numpy(),
         n1[real_gens].cpu().numpy(),
@@ -555,11 +565,11 @@ def test_worker_paths_fast(monkeypatch):
         q,
         drafts[: ngen - 1].cpu().numpy(),
         [seed] * ngen,
-        [offset] * ngen,
+        [accept_offset] * ngen,
         K,
         gaps,
     )
-    # The accept decisions draw the reference's uniforms (draws 0..K-1).
+    # The accept decisions draw the reference's uniforms.
     same = int((n0[real_gens] == n1[real_gens]).sum())
     print(
         f"worker: worst {gaps.worst}; accept counts equal to the reference in {same}/{ngen - 1}"
@@ -730,8 +740,8 @@ def _independence_pvalue(pairs):
 def test_consecutive_steps_are_independent():
     """Lossless across steps, not just within one: the token drawn after a rejection at position
     0 must not predict whether the next step (offset advanced by K + 1) accepts its position 0.
-    flashinfer's chain draws that residual with draw K + 1, the next window's draw 0, so on the
-    reference the two are dependent (printed, not asserted)."""
+    Each step's offset selects its own Philox subsequence, so the two draws are independent (the
+    reference's p-value is printed, not asserted)."""
     gen = torch.Generator(device=DEV).manual_seed(31)
     g = 16
     tgt_one = _small_support_logits(K + 1, gen)
@@ -749,9 +759,7 @@ def test_consecutive_steps_are_independent():
         drafts = drafts.view(g, K).contiguous()
         acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
         steps["fused"].append((acc[:, 0].cpu().numpy(), num.cpu().numpy()))
-        acc, num = rejection_sampling_one_model(
-            buf[slots], drafts, tprobs, deterministic=True, seed=seeds, offset=offs
-        )
+        acc, num = rejection_sampling_one_model(buf[slots], drafts, tprobs, seeds, offs)
         steps["reference"].append((acc[:, 0].cpu().numpy(), num.cpu().numpy()))
     p0 = torch.softmax(tgt_one[0].double(), -1).cpu().numpy()
     resid = np.maximum(p0 - buf[0, 0].double().cpu().numpy(), 0.0)
