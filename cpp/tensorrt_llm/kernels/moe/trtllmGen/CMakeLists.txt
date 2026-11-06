@@ -44,6 +44,7 @@ set_property(TARGET trtllm_gen_fp8_block_scale_moe_routing
 set_source_files_properties(
   ${ROUTING_CUSTOM_SRC_CU}
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=1>")
+# Allow NVCC's split pipeline to parallelize the other routing instantiations.
 set_source_files_properties(
   ${ROUTING_OTHER_SRC_CU}
   PROPERTIES COMPILE_OPTIONS "$<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>")
@@ -56,6 +57,3 @@ set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY POSITION_INDEPENDENT_CODE ON)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-# Split-compile to parallelize ptxas for files with many kernel instantiations.
-target_compile_options(trtllm_gen_fp8_block_scale_moe
-                       PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--split-compile=0>)
