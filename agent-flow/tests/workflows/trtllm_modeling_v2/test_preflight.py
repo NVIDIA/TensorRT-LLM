@@ -175,8 +175,8 @@ def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves
     assert booted == [None]
 
 
-def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_runtime(tmp_path):
-    """Sessions and spools are where jobs queue; the pass is keyed on what the boot runs."""
+def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_environment(tmp_path):
+    """Sessions and spools are where jobs queue; every other environment field is the boot's."""
     from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
         resolve_environment,
     )
@@ -202,7 +202,8 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_runtime(t
     perf = [
         {**gates, "name": f"perf{n}", "spool": f"/s/perf{n}", "time_limit": "4h"} for n in (1, 2)
     ]
-    grown = {**block, "sessions": [gates, *perf], "session_wait": "2h"}
+    resized = {**gates, "role": "gates", "nodes": 2, "gpus_per_node": 8, "handover_lead": "30m"}
+    grown = {**block, "sessions": [{**resized, "scheduler": {"default_wall": "3h"}}, *perf]}
     assert substrate_reuse(record, inputs({"dev_spools": ["/s/perf2"]}, **grown), now=60.0)[0]
     for changed in (
         {"container_image": "/images/other.sqsh"},
@@ -210,9 +211,11 @@ def test_a_substrate_pass_stands_for_more_sessions_but_not_for_another_runtime(t
         {"env": {"TMPDIR": _SCRATCH, "NCCL_DEBUG": "INFO"}},
         {"python": "/other/bin/python"},
         {"sessions": [gates, {**gates, "name": "perf1", "setup": ["source /other.sh"]}]},
+        # A field no list names counts too.
+        {"gpu_memory_gib": 80},
     ):
         reusable, why = substrate_reuse(record, inputs(**{**block, **changed}), now=60.0)
-        assert not reusable and why == "the environment differs from the last pass's", changed
+        assert not reusable and "environment" in why, changed
 
 
 def test_multirank_probe_launches_the_run_interpreter_on_claimed_devices():

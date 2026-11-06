@@ -10,11 +10,13 @@ failure stops the run, which stays open for the same command to resume.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -77,40 +79,36 @@ SUBSTRATE_FRESH_S = 12 * 3600.0
 def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) -> dict[str, str]:
     """What a substrate pass proves something about, one digest per part.
 
-    - ``environment``: what the boot runs under -- the kind of launch, the
-      interpreter, the container image and the mounts it sees, the
-      environment variables, the devices and world size, the proxy
-      checkpoint, and the env and setup lines the sessions start their
-      processes with, as a set (a session added like the others adds nothing);
+    - ``environment``: the launch environment as preflight resolved it, and
+      ``spec_environment``, the block it was resolved from, which also names
+      the proxy checkpoint;
     - ``engine``: what the boot's command line is built from -- the
       checkpoint, the parallel segment and the runtime block -- and
       ``options``, the options file it reads, by content;
     - ``checkout``: the checkout it ran in, by path.
 
-    Not by which sessions there are, their spools, sizes and time limits, or
-    the spools the perf block names: where a job queues changes nothing the
-    boot runs. Not by the checkout's content: the tree changes with every
-    integration, and every gate of the run measures it on this same substrate
-    under the tree's own marker.
+    Not by where jobs queue: of the sessions only the env and setup lines
+    their processes start with count, as a set (a session added like the
+    others adds nothing), and not the spools the perf block names. Not by the
+    checkout's content: the tree changes with every integration, and every
+    gate of the run measures it on this same substrate under the tree's own
+    marker.
     """
     accuracy = task_data.get("accuracy") or {}
     options = check_config.resolve_llm_api_options(accuracy, None)
     options_text = None
     if options and Path(str(options)).is_file():
         options_text = Path(str(options)).read_text(encoding="utf-8", errors="replace")
-    block = task_data.get("environment") or {}
-    runtimes = {(tuple(sorted(s.env.items())), tuple(s.setup)) for s in environment.sessions}
+    block = dict(task_data.get("environment") or {})
+    resolved = dataclasses.asdict(dataclasses.replace(environment, sessions=(), dev_spools=()))
     parts: dict[str, Any] = {
         "environment": {
-            "kind": environment.kind,
-            "python": environment.python,
-            "container_image": environment.container_image,
-            "mounts": block.get("mounts"),
-            "env": environment.env,
-            "devices": list(environment.devices),
-            "world_size": environment.world_size,
-            "substrate_checkpoint": block.get("substrate_checkpoint"),
-            "sessions": sorted(runtimes),
+            **resolved,
+            "sessions": _session_runtimes(dataclasses.asdict(s) for s in environment.sessions),
+        },
+        "spec_environment": {
+            **block,
+            "sessions": _session_runtimes(s for s in block.get("sessions") or () if s),
         },
         "engine": {
             "checkpoint_path": task_data.get("checkpoint_path"),
@@ -121,6 +119,16 @@ def substrate_inputs(task_data: Mapping[str, Any], environment: RunEnvironment) 
         "checkout": task_data.get("trtllm_repo_path"),
     }
     return agent_probe.part_digests(parts)
+
+
+def _session_runtimes(sessions: Iterable[Mapping[str, Any]]) -> list[str]:
+    """The distinct env and setup lines ``sessions`` start their processes with."""
+    return sorted(
+        {
+            json.dumps([dict(s.get("env") or {}), list(s.get("setup") or ())], sort_keys=True)
+            for s in sessions
+        }
+    )
 
 
 def substrate_reuse(
