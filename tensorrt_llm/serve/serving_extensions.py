@@ -61,7 +61,7 @@ class ServingExtension:
 
     # Part of the rendering fingerprint: bump it when a revision of the extension changes
     # the prompt it renders, so prepared requests from the older revision are refused.
-    render_version: int = 1
+    render_version: int = 2
 
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
@@ -87,8 +87,18 @@ class ServingExtension:
         return False
 
     def serialize_tool(self, tool) -> Dict[str, Any]:
-        """Dump one request tool into the dict handed to the chat template."""
-        return tool.model_dump()
+        """Dump one request tool into the dict handed to the chat template.
+
+        An optional field the client left unset or ``null`` (``strict``,
+        ``description``) is omitted rather than dumped as ``null``, which a
+        template that prints tools as JSON would show the model. ``parameters``
+        is always there, ``null`` for a tool declared without any: templates
+        read it by name (``tool.function.parameters | tojson``) and fail when
+        it is missing. Every field the client set, such as ``strict``, is kept,
+        and ``parameters`` is passed through as sent.
+        """
+        unset = {name for name, value in tool.function if value is None and name != "parameters"}
+        return tool.model_dump(exclude={"function": unset})
 
     def dynamic_tools(self, messages) -> List[Dict[str, Any]]:
         """Tool declarations carried on messages rather than on the request."""

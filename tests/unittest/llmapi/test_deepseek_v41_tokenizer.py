@@ -497,6 +497,62 @@ def test_server_chat_template_path_uses_v41_custom_tokenizer():
 
 
 # ---------------------------------------------------------------------------
+# Served chat requests: a tool reaches the renderer as the client declared it
+# ---------------------------------------------------------------------------
+
+_READ_PARAMETERS = {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"],
+}
+
+
+def _render_served(body, tokenizer, *, tokenize):
+    """Render a chat request body the way the chat route prepares and renders it."""
+    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+    from tensorrt_llm.serve.render import RenderResources, render_chat
+
+    # The text-only model type selects the same serving extension as the
+    # multimodal one, without importing the vision model.
+    resources = RenderResources.from_parts(
+        tokenizer=tokenizer, model_type="deepseek_v41_text", hf_config=None
+    )
+    return render_chat(ChatCompletionRequest(**body), resources, tokenize=tokenize)
+
+
+def _tool_schema_lines(prompt):
+    block = prompt.split("### Available Tool Schemas\n\n", 1)[1].split("\n\nYou MUST", 1)[0]
+    return block.splitlines()
+
+
+@pytest.mark.parametrize(
+    "function",
+    [
+        pytest.param({"name": "noop"}, id="name_only"),
+        pytest.param(
+            {"name": "read", "description": "Read a file.", "parameters": _READ_PARAMETERS},
+            id="no_strict",
+        ),
+        pytest.param({"name": "read", "parameters": _READ_PARAMETERS, "strict": True}, id="strict"),
+        pytest.param(
+            {"name": "read", "parameters": _READ_PARAMETERS, "strict": False}, id="strict_false"
+        ),
+    ],
+)
+def test_a_served_chat_request_shows_a_tool_as_the_client_declared_it(function):
+    """A field the client left out is not shown as ``null``; one it set is shown."""
+    body = {
+        "model": "m",
+        "messages": [{"role": "user", "content": "hi"}],
+        "tools": [{"type": "function", "function": function}],
+    }
+
+    result = _render_served(body, DeepseekV41Tokenizer(_DummyTokenizer()), tokenize=False)
+
+    assert _tool_schema_lines(result.text) == [json.dumps(function, ensure_ascii=False)]
+
+
+# ---------------------------------------------------------------------------
 # Checkpoint differential: the renderer vs the checkpoint's own encoder
 # ---------------------------------------------------------------------------
 
@@ -519,6 +575,64 @@ def _load_vendor_encoding():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@functools.lru_cache(maxsize=1)
+def _load_checkpoint_tokenizer():
+    """The checkpoint's tokenizer, loaded the way the server loads it."""
+    checkpoint = ENCODING_DIR.parent
+    if not (checkpoint / "tokenizer.json").exists():
+        pytest.skip(
+            f"the DeepSeek-V4.1 checkpoint tokenizer is not available at {checkpoint}; "
+            f"set LLM_MODELS_ROOT to count prompt tokens"
+        )
+    return DeepseekV41Tokenizer.from_pretrained(str(checkpoint))
+
+
+@pytest.mark.parametrize("thinking", [False, True], ids=["chat", "thinking"])
+def test_a_served_chat_request_has_the_checkpoint_encoders_token_count(thinking):
+    """A served tool request costs the tokens the checkpoint's encoder renders for it.
+
+    The encoder is given the client's own tools, so a field the server added to a
+    tool (``"strict": null`` on one the client sent without ``strict``) would show
+    up here as extra prompt tokens.
+    """
+    vendor = _load_vendor_encoding()
+    tokenizer = _load_checkpoint_tokenizer()
+    messages = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "Fix the failing test."},
+    ]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Read a file.",
+                "parameters": _READ_PARAMETERS,
+            },
+        },
+        {
+            "type": "function",
+            "function": {"name": "write", "parameters": _READ_PARAMETERS, "strict": True},
+        },
+    ]
+    body = {
+        "model": "m",
+        "messages": messages,
+        "tools": tools,
+        "chat_template_kwargs": {"thinking": thinking},
+    }
+
+    served = _render_served(body, tokenizer, tokenize=True).token_ids
+    reference = vendor.encode_messages(
+        [{**messages[0], "tools": copy.deepcopy(tools)}, messages[1]],
+        thinking_mode="thinking" if thinking else "chat",
+    )
+    reference_ids = tokenizer.encode(reference, add_special_tokens=False)
+
+    assert len(served) == len(reference_ids)
+    assert served == reference_ids
 
 
 _TOOL_NS = [
