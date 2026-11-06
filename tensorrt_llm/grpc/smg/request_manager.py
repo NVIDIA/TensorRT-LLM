@@ -168,20 +168,25 @@ class GrpcRequestManager:
             if self.llm is None:
                 return False, "LLM not initialized"
 
-            # Check executor health (includes error queue, MPI worker
-            # liveness, and fatal error state — not just doing_shutdown).
-            if hasattr(self.llm, "_executor"):
-                if self.llm._executor is None:
-                    return False, "Executor is not available"
-                if not self.llm._executor.check_health():
-                    error_msg = "Executor is unhealthy"
-                    if self.llm._executor._fatal_error is not None:
-                        exc = self.llm._executor._fatal_error
-                        lines = str(exc).splitlines()
-                        short = (lines[0] if lines else type(exc).__name__)[:200]
-                        error_msg = f"{type(exc).__name__}: {short}"
-                        logger.error(f"Health check fatal error: {repr(exc)}")
-                    return False, error_msg
+            # An encode-only LLM has no generation executor; SMG serves
+            # generate requests only.
+            if self.llm.args.encode_only is True:
+                return False, "Executor is not available"
+            # check_health() drains queued errors and checks MPI worker
+            # liveness and the fatal error state, not just shutdown.
+            if not self.llm.check_health():
+                error_msg = "Executor is unhealthy"
+                exc = self.llm.fatal_error
+                if exc is not None:
+                    lines = str(exc).splitlines()
+                    short = (lines[0] if lines else type(exc).__name__)[:200]
+                    error_msg = f"{type(exc).__name__}: {short}"
+                    logger.error(f"Health check fatal error: {repr(exc)}")
+                elif self.llm.shutdown_started and not self.llm.engine_dead:
+                    # No fatal error and no dead engine: shutdown() released
+                    # (or is releasing) the generation executor.
+                    error_msg = "Executor is not available"
+                return False, error_msg
 
             return True, "OK"
         except Exception as e:

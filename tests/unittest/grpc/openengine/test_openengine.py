@@ -147,6 +147,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
     answering rather than falling through to the generated base.
     """
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(
             max_seq_len=2048,
             max_batch_size=8,
@@ -160,7 +161,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
         ),
         llm_id="test-instance",
         tokenizer=object(),
-        _check_health=lambda: True,
+        check_health=lambda: True,
     )
 
     async def exercise_server() -> None:
@@ -207,10 +208,11 @@ def test_health_and_control_are_reachable_on_pod_address() -> None:
         pytest.skip("No non-loopback IPv4 address is available")
 
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(guided_decoding_backend=None),
         llm_id="test-instance",
         tokenizer=None,
-        _check_health=lambda: True,
+        check_health=lambda: True,
     )
 
     async def exercise_server() -> None:
@@ -241,10 +243,11 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
     engine = {"healthy": False}
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(guided_decoding_backend=None),
         llm_id="test-instance",
         tokenizer=None,
-        _check_health=lambda: engine["healthy"],
+        check_health=lambda: engine["healthy"],
     )
 
     async def exercise_server() -> None:
@@ -311,10 +314,11 @@ def test_standard_grpc_health_check_and_watch(monkeypatch: pytest.MonkeyPatch) -
 def test_standard_grpc_health_watch_reports_shutdown() -> None:
     """Shutdown withdraws inference and finishes watchers without failing liveness."""
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(guided_decoding_backend=None),
         llm_id="test-instance",
         tokenizer=None,
-        _check_health=lambda: True,
+        check_health=lambda: True,
     )
 
     async def exercise_server() -> None:
@@ -366,10 +370,11 @@ def test_inference_health_timeout_does_not_start_overlapping_checks(
         return True
 
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(guided_decoding_backend=None),
         llm_id="test-instance",
         tokenizer=None,
-        _check_health=check_health,
+        check_health=check_health,
     )
 
     async def exercise_server() -> None:
@@ -420,13 +425,22 @@ def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
     monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
     engine = {"healthy": True}
     executor = SimpleNamespace(_fatal_error=None, _engine_dead=False)
-    llm = SimpleNamespace(
-        args=SimpleNamespace(guided_decoding_backend=None),
-        llm_id="test-instance",
-        tokenizer=None,
-        _executor=executor,
-        _check_health=lambda: engine["healthy"] and executor._fatal_error is None,
-    )
+
+    class EngineFailureLLM:
+        """LLM double whose engine_dead derives from the executor's two fatal fields."""
+
+        args = SimpleNamespace(guided_decoding_backend=None)
+        llm_id = "test-instance"
+        tokenizer = None
+
+        def check_health(self) -> bool:
+            return engine["healthy"] and executor._fatal_error is None
+
+        @property
+        def engine_dead(self) -> bool:
+            return executor._fatal_error is not None or bool(executor._engine_dead)
+
+    llm = EngineFailureLLM()
 
     async def exercise_server() -> None:
         server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
@@ -484,6 +498,70 @@ def test_fatal_engine_failure_fails_liveness_after_temporary_unavailability(
     asyncio.run(exercise_server())
 
 
+def test_dead_engine_reported_by_llm_engine_dead_fails_liveness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead engine reported only through BaseLLM.engine_dead fails inference and liveness.
+
+    The LLM and the executor proxy are the real classes: the server polls the
+    real check_health() chain and reads the proxy's worker-death flag through
+    BaseLLM.engine_dead, with no fatal error recorded.
+    """
+    from queue import Queue
+
+    import tensorrt_llm.grpc.openengine.server as oe_server
+    from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+    from tensorrt_llm.llmapi.llm import LLM
+
+    monkeypatch.setattr(oe_server, "_HEALTH_CHECK_INTERVAL_SECONDS", 0.01)
+    # The proxy fields check_health(), engine_dead and shutdown() read, with no workers.
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy._request_sender = None
+    proxy.doing_shutdown = False
+    proxy._error_queue = Queue()
+    proxy._worker_process_monitor = SimpleNamespace(find_dead_worker=lambda: None)
+    proxy._fatal_error = None
+    proxy._engine_dead = False
+    # The LLM fields BaseLLM.__init__ sets that the server reads.
+    llm = object.__new__(LLM)
+    llm.args = SimpleNamespace(guided_decoding_backend=None)
+    llm._llm_id = "test-instance"
+    llm._tokenizer = None
+    llm._encode_only = False
+    llm._executor = proxy
+
+    async def exercise_server() -> None:
+        server = OpenEngineServer("127.0.0.1", 0, llm, "test-model")
+        await server.start()
+        try:
+            async with grpc.aio.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                health = health_pb2_grpc.HealthStub(channel)
+                inference = health_pb2.HealthCheckRequest(service="inference")
+                live_stream = health.Watch(health_pb2.HealthCheckRequest(service="liveness"))
+                try:
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    assert (
+                        await asyncio.wait_for(live_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.SERVING
+                    # A worker died: the sticky flag is set, no fatal error is recorded.
+                    proxy._engine_dead = True
+                    assert (
+                        await asyncio.wait_for(live_stream.read(), 5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                    assert (
+                        await health.Check(inference, timeout=5)
+                    ).status == health_pb2.HealthCheckResponse.NOT_SERVING
+                finally:
+                    live_stream.cancel()
+        finally:
+            await server.stop(grace=0)
+
+    asyncio.run(exercise_server())
+
+
 def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed poll clears readiness and a later successful poll restores it."""
     import tensorrt_llm.grpc.openengine.server as oe_server
@@ -497,10 +575,11 @@ def test_inference_health_recovers_after_monitor_error(monkeypatch: pytest.Monke
         return True
 
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(guided_decoding_backend=None),
         llm_id="test-instance",
         tokenizer=None,
-        _check_health=check_health,
+        check_health=check_health,
     )
 
     async def exercise_server() -> None:
@@ -551,6 +630,7 @@ def test_event_startup_requires_loaded_publisher(publisher_enabled: bool) -> Non
     from tensorrt_llm.grpc.openengine.kv_events import KvEventsUnavailableError
 
     llm = SimpleNamespace(
+        engine_dead=False,
         args=SimpleNamespace(
             guided_decoding_backend=None,
             kv_cache_config=SimpleNamespace(
