@@ -597,6 +597,17 @@ private:
     std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
     KeepCopyStats mKeepCopyStats;
+
+    // ---- Disk write-through (TLLM_KVCM2_DISK_WRITE_THROUGH=1, needs keep-copy). When committed pages are evicted
+    // from GPU to host, also copy them to free disk slots in the background and keep those as retained copies, so a
+    // later host -> disk eviction reuses the copy instead of writing on the restore's critical path. Appended last.
+    void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
+    // Completion event of a write-through still reading this host page, or a null event.
+    [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
+    bool mDiskWriteThrough{false};
+    uint64_t mWriteThroughPages{0};
+    uint64_t mWriteThroughBytes{0};
+    uint64_t mWriteThroughSkipped{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

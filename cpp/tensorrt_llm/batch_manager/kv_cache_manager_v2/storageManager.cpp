@@ -578,8 +578,13 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         {
             mKeepCopyStats.statsSec = std::atoi(sec);
         }
-        std::fprintf(stderr, "[kvcm2-keepcopy] pid=%d enabled=%d (disk level present=%d)\n", static_cast<int>(::getpid()),
-            static_cast<int>(mKeepDiskCopy), static_cast<int>(hasDisk));
+        if (char const* wt = std::getenv("TLLM_KVCM2_DISK_WRITE_THROUGH"); wt != nullptr && std::atoi(wt) != 0)
+        {
+            mDiskWriteThrough = mKeepDiskCopy;
+        }
+        std::fprintf(stderr, "[kvcm2-keepcopy] pid=%d enabled=%d (disk level present=%d) write_through=%d\n",
+            static_cast<int>(::getpid()), static_cast<int>(mKeepDiskCopy), static_cast<int>(hasDisk),
+            static_cast<int>(mDiskWriteThrough));
     }
 }
 
@@ -994,6 +999,16 @@ void StorageManager::onPageDestroyed(Page const& page) noexcept
     KVCM2_POISON_ON_EXCEPT(
         [this, &page]()
         {
+            if (mDiskWriteThrough && page.cacheLevel != kHotLevel && cacheTier(page.cacheLevel) == CacheTier::HOST_MEM)
+            {
+                // The page's host slot is released right after this; it must also wait for a write-through still
+                // reading it.
+                if (auto pending = pendingDiskWrite(page); !pending.isClosed())
+                {
+                    std::vector<CachedCudaEvent> events{page.readyEvent, std::move(pending)};
+                    const_cast<Page&>(page).readyEvent = mergeEvents(events);
+                }
+            }
             auto it = mRetainedByPage.find(&page);
             if (it != mRetainedByPage.end())
             {
@@ -1023,11 +1038,88 @@ void StorageManager::maybePrintKeepCopyStats()
     }
     mKeepCopyStats.lastPrintNs = now;
     std::fprintf(stderr,
-        "[kvcm2-keepcopy] pid=%d retained=%zu created=%llu reused=%llu reused_GiB=%.3f reclaimed=%llu dropped=%llu\n",
+        "[kvcm2-keepcopy] pid=%d retained=%zu created=%llu reused=%llu reused_GiB=%.3f reclaimed=%llu dropped=%llu "
+        "wt_pages=%llu wt_GiB=%.3f wt_skipped=%llu\n",
         static_cast<int>(::getpid()), mRetainedCopies.size(), static_cast<unsigned long long>(mKeepCopyStats.created),
         static_cast<unsigned long long>(mKeepCopyStats.reused), mKeepCopyStats.reusedBytes / double(1ull << 30),
         static_cast<unsigned long long>(mKeepCopyStats.reclaimed),
-        static_cast<unsigned long long>(mKeepCopyStats.dropped));
+        static_cast<unsigned long long>(mKeepCopyStats.dropped), static_cast<unsigned long long>(mWriteThroughPages),
+        mWriteThroughBytes / double(1ull << 30), static_cast<unsigned long long>(mWriteThroughSkipped));
+}
+
+CachedCudaEvent StorageManager::pendingDiskWrite(Page const& page) const
+{
+    // Retained copies only exist on the disk level.
+    auto it = mRetainedByPage.find(&page);
+    if (it != mRetainedByPage.end() && !it->second->slot.readyEvent.isClosed()
+        && !it->second->slot.readyEvent.queryComplete())
+    {
+        return it->second->slot.readyEvent;
+    }
+    return CachedCudaEvent::makeNull();
+}
+
+void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages)
+{
+    CacheLevel const diskLevel = hostLevel + 1;
+    if (diskLevel >= numCacheLevels() || cacheTier(hostLevel) != CacheTier::HOST_MEM
+        || cacheTier(diskLevel) != CacheTier::DISK)
+    {
+        return;
+    }
+    std::map<LayerGroupId, std::vector<SharedPtr<Page>>> batches;
+    for (auto const& page : pages)
+    {
+        if (page->cacheLevel == hostLevel && page->isCommitted() && mRetainedByPage.find(page.get()) == mRetainedByPage.end())
+        {
+            batches[getMigrationBatchingLayerGroupId(diskLevel, hostLevel, page->lifeCycle)].push_back(page);
+        }
+    }
+    for (auto& [batchingLayerGroupId, batch] : batches)
+    {
+        PoolGroupIndex const pgIdx = getPoolGroupIndex(diskLevel, batchingLayerGroupId);
+        SlotCount const wanted = slotCountValueFromSize(batch.size());
+        SlotCount free = poolGroup(diskLevel, pgIdx).numFreeSlots();
+        if (free < wanted)
+        {
+            // Older retained copies are duplicates; recycle them first. Never evict live disk pages for this.
+            releaseRetainedCopies(diskLevel, pgIdx, wanted - free);
+            free = poolGroup(diskLevel, pgIdx).numFreeSlots();
+        }
+        size_t const take = std::min(batch.size(), static_cast<size_t>(std::max<SlotCount>(free, 0)));
+        mWriteThroughSkipped += batch.size() - take;
+        if (take == 0)
+        {
+            continue;
+        }
+        batch.resize(take);
+        // Copy without moving. The page keeps its own ready event, so reads of the host page (e.g. a restore to GPU)
+        // do not wait for this write; the write's completion lives on the retained disk slot, and every release of
+        // the host slot merges it in (see pendingDiskWrite), so the slot is not reused while the write reads it.
+        std::vector<CachedCudaEvent> previousEvents;
+        previousEvents.reserve(take);
+        for (auto const& page : batch)
+        {
+            previousEvents.push_back(page->readyEvent);
+        }
+        auto slots = _batchedMigrate(diskLevel, hostLevel, batch, /*updateSrc=*/false, MigrationRecorder{});
+        for (size_t i = 0; i < take; ++i)
+        {
+            batch[i]->readyEvent = std::move(previousEvents[i]);
+        }
+        TLLM_CHECK(slots.has_value() && slots->size() == take);
+        size_t pageBytes = 0;
+        for (auto const bytes : slotSize(diskLevel, pgIdx))
+        {
+            pageBytes += bytes;
+        }
+        for (size_t i = 0; i < take; ++i)
+        {
+            addRetainedCopy(*batch[i], diskLevel, pgIdx, std::move(slots->at(i)));
+        }
+        mWriteThroughPages += take;
+        mWriteThroughBytes += take * pageBytes;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,6 +1629,10 @@ void StorageManager::_prepareFreeSlots(TypedVec<CacheLevel, TypedVec<PoolGroupIn
         {
             CacheLevel const srcLevel = batchKey.first;
             _batchedMigrate(lvlId, srcLevel, pages, /*updateSrc=*/true, migrationRecorder);
+            if (mDiskWriteThrough && srcLevel == kHotLevel)
+            {
+                writeThroughToDisk(lvlId, pages);
+            }
             for (auto const& page : pages)
             {
                 if (srcLevel == kHotLevel && page->status() == PageStatus::DROPPABLE)
@@ -1735,6 +1831,14 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
                     excludeFromEviction(*srcPages.at(i));
                 // Replace the page's source slot with its destination and release the source slot back to the pool.
                 Slot srcSlot = srcPages.at(i)->exchangeSlot(std::move(dstSlots.at(i)));
+                if (mDiskWriteThrough && cacheTier(srcLevel) == CacheTier::HOST_MEM)
+                {
+                    if (auto pending = pendingDiskWrite(*srcPages.at(i)); !pending.isClosed())
+                    {
+                        std::vector<CachedCudaEvent> events{srcSlot.readyEvent, std::move(pending)};
+                        srcSlot.readyEvent = mergeEvents(events);
+                    }
+                }
                 if (retainSrcCopy && srcPages.at(i)->isCommitted())
                 {
                     // Committed pages are immutable, so the disk data stays valid while the page lives above.
