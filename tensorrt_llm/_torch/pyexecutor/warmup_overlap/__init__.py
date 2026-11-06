@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import threading
 import time
-from typing import Any, Iterator, List
+from typing import Any, Iterator, List, Optional
 
 import torch
 
@@ -32,6 +33,25 @@ __all__ = ["warmup_overlap"]
 _ENV = "TLLM_OVERLAP_PREWARM"
 # Each part's build_groups(model, model_config, llm_args, mapping) returns its builds.
 _PARTS = (steps, linear)
+_PROGRESS_EVERY_S = 60.0
+# How long a failed weight load waits for the builds to stop.
+_STOP_TIMEOUT_S = 30.0
+
+
+def _join(groups: List[BuildGroup], timeout: Optional[float] = None) -> List[threading.Thread]:
+    """Join the groups' threads, logging their progress every minute; give up after
+    ``timeout`` seconds. Returns the threads still running."""
+    t0 = last = time.perf_counter()
+    while alive := [thread for group in groups for thread in group.alive()]:
+        now = time.perf_counter()
+        if timeout is not None and now - t0 >= timeout:
+            return alive
+        if now - last >= _PROGRESS_EVERY_S:
+            busy = ", ".join(group.progress() for group in groups if group.alive())
+            logger.info(f"[warmup] overlap: waiting {now - t0:.0f}s for the builds: {busy}")
+            last = now
+        alive[0].join(timeout=1.0)
+    return []
 
 
 @contextlib.contextmanager
@@ -56,14 +76,24 @@ def warmup_overlap(
             group.start(device)
     try:
         yield groups
-    except BaseException:
-        # Leave the rest to the warmup rather than hold up the error.
+    except BaseException as e:
+        # Leave the rest to the warmup: the builds stop after their current kernel.
         for group in groups:
             group.stop.set()
+        if groups:
+            running = _join(groups, timeout=_STOP_TIMEOUT_S)
+            torch.cuda.empty_cache()
+            if running:
+                names = ", ".join(thread.name for thread in running)
+                logger.warning(f"Overlapped builds still running after the loading failed: {names}")
+            if isinstance(e, torch.cuda.OutOfMemoryError):
+                logger.error(
+                    "The weight loading ran out of device memory next to the overlapped kernel "
+                    "builds; TLLM_OVERLAP_PREWARM_LINEAR=0 leaves the Linear GEMMs to the warmup."
+                )
         raise
     t0 = time.perf_counter()
-    for group in groups:
-        group.join()
+    _join(groups)
     if groups:
         # Return the dummy operands' memory before anything measures free memory.
         torch.cuda.empty_cache()

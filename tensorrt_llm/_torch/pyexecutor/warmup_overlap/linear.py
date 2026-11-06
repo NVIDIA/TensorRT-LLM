@@ -26,8 +26,9 @@ import dataclasses
 import math
 import os
 import sys
+import threading
 from types import ModuleType
-from typing import Any, List, Set, Tuple
+from typing import Any, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
@@ -64,11 +65,16 @@ class Plan:
         )
 
 
-def _tuning_token_counts(llm_args: Any, mapping: Any) -> Tuple[int, ...]:
+def _tuning_token_counts(
+    llm_args: Any, mapping: Any, max_seq_len: Optional[int]
+) -> Tuple[int, ...]:
     """Tokens of the autotuner warmup's forwards, as ``DecoderWarmup._run_autotuner_warmup``
     computes them: one batch of generation requests on a Helix CP generation worker;
-    otherwise max_num_tokens capped by the sequence budget (the KV cache may allow fewer,
-    then some kernels are built that the warmup would not need) and one generation request.
+    otherwise max_num_tokens capped by the sequence budget and, without pipeline parallelism
+    or guided decoding, one generation request. Known only after the weights load, and so
+    not applied here: the KV cache's cap on the context tokens, a max_seq_len the engine
+    infers from the model, and a context-only KV cache, which drops the generation request.
+    The kernels planned beyond them are built for nothing.
     """
     max_num_tokens = llm_args.max_num_tokens or 8192
     max_batch_size = llm_args.max_batch_size or 2048
@@ -84,9 +90,28 @@ def _tuning_token_counts(llm_args: Any, mapping: Any) -> Tuple[int, ...]:
     if mapping.has_cp_helix():
         return (min(max_batch_size, max_num_tokens // per_request) * per_request,)
     tokens = max_num_tokens
-    if llm_args.max_seq_len:
-        tokens = min(tokens, max_batch_size * (llm_args.max_seq_len - 1))
+    if max_seq_len:
+        tokens = min(tokens, max_batch_size * (max_seq_len - 1))
+    if mapping.has_pp() or getattr(llm_args, "guided_decoding_backend", None) is not None:
+        return (tokens,)
     return tokens, per_request
+
+
+def _compiles_all_batches(model: nn.Module, llm_args: Any) -> bool:
+    """Whether torch.compile covers every batch rather than prefill only, as
+    ``apply_torch_compile`` decides."""
+    config = getattr(llm_args, "torch_compile_config", None)
+    if config is None:
+        return False
+    from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+    from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
+
+    prefill_only = (
+        isinstance(model, DecoderModelForCausalLM)
+        and llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE
+        and (config.compile_only_piecewise_graphs or not model.use_fx_for_pcg_fallback)
+    )
+    return not prefill_only
 
 
 def _uses_flashinfer_mxfp8(model: nn.Module, llm_args: Any, methods: List[Any]) -> bool:
@@ -96,9 +121,11 @@ def _uses_flashinfer_mxfp8(model: nn.Module, llm_args: Any, methods: List[Any]) 
     if not any(method.use_cutlass for method in methods):
         return False
     override = mxfp8_gemm_backend_override()
+    # With every batch compiled, MXFP8 GEMMs dispatch natively unless FlashInfer is forced.
+    compile_all = _compiles_all_batches(model, llm_args)
     if override is not None:
-        return override in ("flashinfer", "auto")
-    if getattr(llm_args, "cuda_graph_config", None) is None:
+        return override == "flashinfer" or (override == "auto" and not compile_all)
+    if compile_all or getattr(llm_args, "cuda_graph_config", None) is None:
         return False
     return any(
         getattr(module, "_use_flashinfer_mxfp8_decode_graph_default", False)
@@ -167,6 +194,10 @@ def collect(model: nn.Module, llm_args: Any, mapping: Any) -> Plan:
     from tensorrt_llm._torch.modules.linear import FP8BlockScalesLinearMethod, MXFP8LinearMethod
     from tensorrt_llm._utils import is_sm_100f
 
+    if not getattr(llm_args, "enable_autotuner", True):
+        # The autotuner warmup then runs no tuning forward.
+        return Plan(tuning_m=(), fp8=[], flashinfer_mxfp8=False)
+
     sm100f = is_sm_100f()
     fp8 = _load_time_fp8_shapes(model) if sm100f else set()
     mxfp8_methods = []
@@ -184,7 +215,7 @@ def collect(model: nn.Module, llm_args: Any, mapping: Any) -> Plan:
                 fp8.add(tuple(weight.shape))
         elif isinstance(method, MXFP8LinearMethod):
             mxfp8_methods.append(method)
-    tuning_m = _tuning_token_counts(llm_args, mapping)
+    tuning_m = _tuning_token_counts(llm_args, mapping, getattr(llm_args, "max_seq_len", None))
     # On this thread: the low-M range comes from CuTe DSL host code, which the
     # background threads must not run.
     sweeps = [(n, k, deep_gemm_sweep((n, k), tuning_m)) for n, k in fp8]
@@ -257,23 +288,42 @@ def _deep_gemm_threads(plan: Plan) -> int:
     return max(0, min(threads, (free_bytes - _LOADER_RESERVE_BYTES) // largest))
 
 
-def build_deep_gemm(item: Tuple[int, int, Tuple[int, ...]], device: torch.device) -> int:
+def build_deep_gemm(
+    item: Tuple[int, int, Tuple[int, ...]],
+    device: torch.device,
+    stop: threading.Event,
+    free_samples: List[int],
+) -> int:
     """Run ``fp8_swap_ab_gemm``'s runner at every token count of a plan's sweep
-    ``(N, K, token counts)``. Returns the GEMM launches."""
+    ``(N, K, token counts)``, stopping between counts once ``stop`` is set. Skips the sweep
+    when its dummy operands would leave less than the loader's reserve of free memory,
+    which the loader's own allocations shrink as it goes. Returns the GEMM launches."""
     from tensorrt_llm._torch.custom_ops.torch_custom_ops import fp8SwapABGemmRunner
 
     n, k, sweep = item
+    free_bytes, _ = torch.cuda.mem_get_info()
+    free_samples.append(free_bytes)
+    if free_bytes - deep_gemm_footprint(item) < _LOADER_RESERVE_BYTES:
+        logger.info(
+            f"[warmup] overlap: DeepGEMM {n}x{k} left to the warmup, "
+            f"{free_bytes / (1 << 30):.1f} GiB free"
+        )
+        return 0
     weight, scale = _dummy_fp8_weight(n, k, device)
     x = torch.zeros((max(sweep), k), dtype=torch.bfloat16, device=device)
     # The runner the op builds (fp8_block_scale_ue8m0_gemm: BF16 output, packed UE8M0
     # scale) with the CUDA quantizer; the GEMM kernel does not depend on the quantizer.
     runner = fp8SwapABGemmRunner(torch.bfloat16, True, quant_tactic=0)
+    launches = 0
     for m in sweep:
+        if stop.is_set():
+            break
         runner.forward([x[:m], weight, scale])
-    return len(sweep)
+        launches += 1
+    return launches
 
 
-def build_flashinfer_mxfp8(_item: Any = None) -> int:
+def build_flashinfer_mxfp8(_item: Any = None, _stop: Optional[threading.Event] = None) -> int:
     """Build and load FlashInfer's CUTLASS MXFP8 GEMM module (``mm_mxfp8``)."""
     from flashinfer.gemm.gemm_base import get_gemm_sm100_module_cutlass_mxfp8
 
@@ -293,12 +343,17 @@ def build_groups(
     if plan.fp8 and deep_gemm_threads == 0:
         logger.info("[warmup] overlap: no free memory for DeepGEMM's operands")
     logger.info(f"[warmup] overlap plan: {plan.summary()}")
+    # Free device memory before each DeepGEMM sweep, for the group's final log.
+    free_samples: List[int] = []
     return [
         BuildGroup(
             "deep_gemm",
             plan.fp8 if deep_gemm_threads else [],
-            lambda item: build_deep_gemm(item, device),
+            lambda item, stop: build_deep_gemm(item, device, stop, free_samples),
             deep_gemm_threads,
+            summary=lambda: f"{min(free_samples) / (1 << 30):.1f} GiB free at least"
+            if free_samples
+            else "no sweep started",
         ),
         BuildGroup(
             "flashinfer_mxfp8",

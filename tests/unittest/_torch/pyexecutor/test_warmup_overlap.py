@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Kernel builds next to weight loading (pyexecutor/warmup_overlap)."""
 
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -22,23 +23,30 @@ NO_LOW_M = (32768, 512)
 
 
 class _Mapping:
-    def __init__(self, helix: bool):
-        self.helix = helix
+    def __init__(self, helix: bool, pp: bool = False):
+        self.helix, self.pp = helix, pp
 
     def has_cp_helix(self) -> bool:
         return self.helix
 
+    def has_pp(self) -> bool:
+        return self.pp
 
-def _llm_args(max_num_tokens, max_batch_size, max_seq_len=None, draft=0):
+
+def _llm_args(max_num_tokens, max_batch_size, max_seq_len=None, draft=0, **overrides):
     spec = SimpleNamespace(max_total_draft_tokens=draft, max_draft_len=draft) if draft else None
-    return SimpleNamespace(
+    args = dict(
         max_num_tokens=max_num_tokens,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
         max_beam_width=1,
         speculative_config=spec,
         cuda_graph_config=None,
+        enable_autotuner=True,
+        guided_decoding_backend=None,
+        torch_compile_config=None,
     )
+    return SimpleNamespace(**{**args, **overrides})
 
 
 def _sweep(*token_counts):
@@ -53,11 +61,15 @@ def test_tuning_token_counts():
     # A context forward of max_num_tokens (capped by the sequence budget) and one
     # generation request, as DecoderWarmup._run_autotuner_warmup tunes them.
     tuning_token_counts = overlap_linear._tuning_token_counts
-    assert tuning_token_counts(_llm_args(32768, 16, 996672), _Mapping(False)) == (32768, 1)
-    assert tuning_token_counts(_llm_args(8192, 4, 1025, draft=3), _Mapping(False)) == (4096, 4)
+    assert tuning_token_counts(_llm_args(32768, 16), _Mapping(False), 996672) == (32768, 1)
+    assert tuning_token_counts(_llm_args(8192, 4, draft=3), _Mapping(False), 1025) == (4096, 4)
+    # No generation request under pipeline parallelism or guided decoding.
+    assert tuning_token_counts(_llm_args(8192, 4), _Mapping(False, pp=True), 1025) == (4096,)
+    guided = _llm_args(8192, 4, guided_decoding_backend="xgrammar")
+    assert tuning_token_counts(guided, _Mapping(False), 1025) == (4096,)
     # Helix CP generation workers tune one batch of generation requests.
-    assert tuning_token_counts(_llm_args(14, 2, draft=6), _Mapping(True)) == (14,)
-    assert tuning_token_counts(_llm_args(192, 32, draft=5), _Mapping(True)) == (192,)
+    assert tuning_token_counts(_llm_args(14, 2, draft=6), _Mapping(True), None) == (14,)
+    assert tuning_token_counts(_llm_args(192, 32, draft=5), _Mapping(True), None) == (192,)
 
 
 @pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
@@ -163,3 +175,81 @@ def test_warmup_overlap_is_a_no_op_when_disabled(monkeypatch):
     with warmup_overlap(nn.Module(), None, _llm_args(14, 2), _Mapping(True)) as groups:
         pass
     assert groups == []
+
+
+def _wide_model():
+    with torch.device("meta"):
+        model = nn.Module()
+        model.wide = _fp8_linear(NO_LOW_M[1], NO_LOW_M[0])
+    return model
+
+
+@pytest.fixture
+def overlap_on(monkeypatch):
+    monkeypatch.setenv("TLLM_OVERLAP_PREWARM", "1")
+    monkeypatch.delenv("TLLM_OVERLAP_PREWARM_LINEAR", raising=False)
+    monkeypatch.setattr(sampler_ops, "warmup_sampling_module", lambda: None)
+
+
+def _overlap():
+    """``warmup_overlap`` around a model with one swept FP8 GEMM (14-token Helix steps)."""
+    model_config = SimpleNamespace(pretrained_config=None)
+    return warmup_overlap(_wide_model(), model_config, _llm_args(14, 2, draft=6), _Mapping(True))
+
+
+@pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
+def test_a_failed_build_is_left_to_the_warmup(monkeypatch, overlap_on):
+    def fail(item, device, stop, free_samples):
+        raise RuntimeError("nvcc failed")
+
+    monkeypatch.setattr(overlap_linear, "build_deep_gemm", fail)
+    with _overlap() as groups:
+        pass
+    deep_gemm = next(group for group in groups if group.name == "deep_gemm")
+    assert (deep_gemm.count, deep_gemm.failed, deep_gemm.launches) == (1, 1, 0)
+    assert not any(group.alive() for group in groups)
+
+
+@pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
+def test_no_deep_gemm_threads_without_free_memory(monkeypatch, overlap_on):
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args: (1 << 30, 1 << 40))
+    with _overlap() as groups:
+        pass
+    deep_gemm = next(group for group in groups if group.name == "deep_gemm")
+    assert (deep_gemm.count, deep_gemm.threads) == (0, [])
+
+
+@pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
+def test_a_sweep_is_skipped_without_free_memory(monkeypatch):
+    # The loader may have taken the memory after the threads were sized.
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args: (1 << 30, 1 << 40))
+    free_samples = []
+    item = (*NO_LOW_M, _sweep(14))
+    stop = threading.Event()
+    assert overlap_linear.build_deep_gemm(item, torch.device("cuda"), stop, free_samples) == 0
+    assert free_samples == [1 << 30]
+
+
+@pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
+def test_the_builds_stop_when_the_loading_raises(monkeypatch, overlap_on):
+    started = threading.Event()
+
+    def wait_for_stop(item, device, stop, free_samples):
+        started.set()
+        stop.wait(timeout=30)
+        return 0
+
+    monkeypatch.setattr(overlap_linear, "build_deep_gemm", wait_for_stop)
+    with pytest.raises(RuntimeError, match="loading failed"):
+        with _overlap() as groups:
+            assert started.wait(timeout=30)
+            raise RuntimeError("loading failed")
+    assert all(group.stop.is_set() for group in groups)
+    assert not any(group.alive() for group in groups)
+
+
+@pytest.mark.skipif(not is_sm_100f(), reason="DeepGEMM swap-AB GEMMs run on SM100f")
+def test_no_plan_with_the_autotuner_off():
+    llm_args = _llm_args(8192, 8, enable_autotuner=False)
+    plan = overlap_linear.collect(_wide_model(), llm_args, _Mapping(False))
+    assert (plan.fp8, plan.flashinfer_mxfp8) == ([], False)

@@ -10,6 +10,7 @@ The warmup still makes the same calls, and finds the modules built.
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -64,7 +65,7 @@ def forward_free_steps(
     return steps
 
 
-def _run_step(step: Tuple[str, Callable[[], None]]) -> int:
+def _run_step(step: Tuple[str, Callable[[], None]], stop: threading.Event) -> int:
     name, call = step
     t0 = time.perf_counter()
     call()
