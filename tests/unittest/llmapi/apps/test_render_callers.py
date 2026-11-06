@@ -451,6 +451,35 @@ class TestRouterWriteBack:
         sent = request.model_dump(mode="json", exclude_unset=True)["messages"][1]
         assert [item["id"] for item in sent["tool_calls"]] == ["c1"]
 
+    def test_a_replayed_tool_call_index_is_dropped_and_its_calls_are_forwarded(
+        self, router, tokenizer
+    ) -> None:
+        # A client that rebuilt the assistant turn from a stream keeps the streaming-only `index`
+        # on each tool call. The router renders that turn as it renders the turn without `index`,
+        # and every serialization of the forwarded request carries the calls.
+        self._trust(router, tokenizer)
+        call = {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+
+        def turn(tool_call):
+            return [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": None, "tool_calls": [tool_call]},
+                {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+            ]
+
+        request = chat_request(messages=turn({**call, "index": 0}))
+
+        ids = router._tokenize(request)[0]
+
+        assert ids == self._expected_ids(tokenizer, chat_request(messages=turn(dict(call)))), (
+            "a replayed tool call carrying the streaming-only index must render like the same "
+            "call without it"
+        )
+        assert request.prompt_token_ids == ids
+        sent = [request.model_dump(mode="json", exclude_unset=True) for _ in range(2)]
+        assert sent[0] == sent[1]
+        assert sent[0]["messages"][1]["tool_calls"] == [call]
+
     def test_a_harmony_router_renders_without_loading_a_tokenizer(self) -> None:
         # Harmony renders ids itself. A client that sends the served name, with no tokenizer
         # directory configured, must not make the router try to load a tokenizer for it.
