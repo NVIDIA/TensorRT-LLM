@@ -12,7 +12,7 @@ The routed experts and most linears are NVFP4 (ModelOpt); the modules the checkp
 here so it can be specialized in place: every step runs the generic path below, on stock modules and ops that have
 no catalog entries yet. ``UNCERTIFIED_GENERIC_CALLS`` names the stock code it runs.
 
-**Speculative decoding on the stock framework.** The causal LM is a ``SpecDecOneEngineForCausalLM``: the engine's
+**Split speculative decoding.** The causal LM is a ``SpecDecOneEngineForCausalLM``: the engine's
 speculative worker runs verification, acceptance, the recurrent-state commit and the draft loop. For one-model MTP
 the stock drafter builds this module's MTP layer (``Glm5NextModel.mtp_layer_cls``). Routing admits the modes whose
 worker commits the KDA state for the accepted tokens and that read no captured hidden states; the sibling

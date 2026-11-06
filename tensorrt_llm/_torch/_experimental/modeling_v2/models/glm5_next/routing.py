@@ -13,9 +13,9 @@ speculative decoding runs:
 
 * ``glm_5_3_flash_nvfp4__sm_100__default_mtp_fused`` runs one-model MTP-Eagle
   inside its own forward. It is chosen whenever it supports the deployment.
-* ``glm_5_3_flash_nvfp4__sm_100__default`` runs on the stock speculative
-  framework and takes every other deployment it supports, including no
-  speculative decoding.
+* ``glm_5_3_flash_nvfp4__sm_100__default`` is the split target: the engine's
+  speculative worker runs after its forward. It takes every other deployment it
+  supports, including no speculative decoding.
 
 The checkpoint declares the vision-language wrapper, and the language model's
 shape lives in its ``text_config``, so that is what this tree reads. The
@@ -73,19 +73,17 @@ def _mtp_with_split_head(model_config: ModelConfig, spec_config: Any) -> bool:
     mapping = model_config.mapping
     return (
         isinstance(spec_config, MTPDecodingConfig)
-        and bool(mapping.enable_attention_dp)
-        and bool(getattr(mapping, "enable_lm_head_tp_in_adp", False))
+        and mapping.enable_attention_dp
+        and mapping.enable_lm_head_tp_in_adp
     )
 
 
-def _fused_refused(
-    model_config: ModelConfig, llm_args: TorchLlmArgs, spec_config: Any
-) -> list[str]:
-    """What the MTP-fused target does not compute for this deployment; empty when it is admitted.
+def fused_speculation_refused(spec_config: Any) -> list[str]:
+    """The speculative features the MTP-fused target does not compute; empty when it computes this config.
 
     The target runs the checkpoint's MTP layer as a linear one-model MTP-Eagle chain with strict acceptance (greedy or
-    plain sampling) inside its own forward. Its constructor refuses the same speculative features
-    (``_check_speculation``); routing declines them first, so the stock target takes the deployment instead.
+    plain sampling) inside its own forward. ``route`` declines these features so the split target takes the
+    deployment, and the fused target's constructor refuses them against direct construction.
     """
     if spec_config is None:
         return ["no speculative decoding"]
@@ -93,28 +91,36 @@ def _fused_refused(
         return [f"{type(spec_config).__name__} (only MTP)"]
     refused = {
         "vanilla MTP (only MTP-Eagle)": not spec_config.spec_dec_mode.is_mtp_eagle_one_model(),
-        "a dynamic draft tree": bool(getattr(spec_config, "use_dynamic_tree", False)),
+        "a dynamic draft tree": spec_config.use_dynamic_tree,
         "draft trees": spec_config.max_total_draft_tokens not in (None, spec_config.max_draft_len),
-        "rejection sampling": bool(getattr(spec_config, "use_rejection_sampling", False)),
-        "relaxed acceptance": bool(
-            getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
-        ),
-        "occurrence penalties": bool(getattr(spec_config, "enable_penalty", False)),
-        "sa_config": getattr(spec_config, "sa_config", None) is not None,
-        "a separate speculative checkpoint": getattr(spec_config, "speculative_model", None)
-        is not None,
-        "a draft-length schedule": getattr(spec_config, "draft_len_schedule", None) is not None,
-        # The step runs no guided decoder; the engine would reject guided decoding at start-up.
-        "guided decoding": getattr(llm_args, "guided_decoding_backend", None) is not None,
-        "an LM head split across attention-DP ranks": _mtp_with_split_head(
-            model_config, spec_config
-        ),
+        "rejection sampling": spec_config.use_rejection_sampling,
+        "relaxed acceptance": spec_config.use_relaxed_acceptance_for_thinking,
+        "occurrence penalties": spec_config.enable_penalty,
+        "sa_config": spec_config.sa_config is not None,
+        "a separate speculative checkpoint": spec_config.speculative_model is not None,
+        "a draft-length schedule": spec_config.draft_len_schedule is not None,
     }
     return [name for name, present in refused.items() if present]
 
 
-def _stock_refused(model_config: ModelConfig, spec_config: Any) -> list[str]:
-    """What the stock-framework target does not run for this deployment; empty when it is admitted.
+def _fused_refused(
+    model_config: ModelConfig, llm_args: TorchLlmArgs, spec_config: Any
+) -> list[str]:
+    """What the MTP-fused target does not run for this deployment; empty when it is admitted.
+
+    Its speculative features (:func:`fused_speculation_refused`), plus the engine features the step does not run.
+    """
+    refused = fused_speculation_refused(spec_config)
+    # The step runs no guided decoder; the engine would reject guided decoding at start-up.
+    if llm_args.guided_decoding_backend is not None:
+        refused.append("guided decoding")
+    if _mtp_with_split_head(model_config, spec_config):
+        refused.append("an LM head split across attention-DP ranks")
+    return refused
+
+
+def _split_refused(model_config: ModelConfig, spec_config: Any) -> list[str]:
+    """What the split target does not run for this deployment; empty when it is admitted.
 
     The engine's speculative worker drives the target. A mode is admitted when its worker commits the KDA recurrent
     state for the accepted tokens and it reads no hidden states captured from the decoder layers, which this model
@@ -128,8 +134,7 @@ def _stock_refused(model_config: ModelConfig, spec_config: Any) -> list[str]:
     if not isinstance(spec_config, MTPDecodingConfig):
         return [f"{type(spec_config).__name__} (only MTP or SA)"]
     refused = {
-        "a separate speculative checkpoint": getattr(spec_config, "speculative_model", None)
-        is not None,
+        "a separate speculative checkpoint": spec_config.speculative_model is not None,
         "an LM head split across attention-DP ranks": _mtp_with_split_head(
             model_config, spec_config
         ),
@@ -179,8 +184,8 @@ def route(
 
         return ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused
 
-    stock_refused = _stock_refused(model_config, spec_config)
-    if not stock_refused:
+    split_refused = _split_refused(model_config, spec_config)
+    if not split_refused:
         # fmt: off
         # isort: off
         from .glm_5_3_flash_nvfp4__sm_100__default.modeling import ModelingV2Glm53FlashNvfp4Sm100Default
@@ -190,7 +195,7 @@ def route(
 
     spec = spec_config.spec_dec_mode.name
     raise NoTarget(
-        f"{deployment}, speculative decoding {spec} with {', '.join(stock_refused)}; the glm5_next "
+        f"{deployment}, speculative decoding {spec} with {', '.join(split_refused)}; the glm5_next "
         "targets run one-model MTP (vanilla or MTP-Eagle, from the checkpoint's MTP layer), "
         "suffix-automaton drafting or no speculative decoding"
     )

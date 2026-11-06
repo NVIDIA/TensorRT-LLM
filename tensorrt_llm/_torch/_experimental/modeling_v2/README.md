@@ -296,11 +296,15 @@ mode the target uses.
   reserves per sequence, and leave the rewind of rejected tokens to the
   engine. Update `kv_lens` per draft step: step 0 drops the rejected drafts,
   and each later step adds one.
-* **Attention metadata.** Leave the attention metadata as it was passed in:
-  CUDA graph warmup replays the forward on the same metadata. Save the lengths
-  with `prepare_for_spec_dec` and restore them with `restore_from_spec_dec` in
-  a `finally` block, so a failed step, such as an out-of-memory error during
-  warmup, leaves the metadata unchanged.
+* **Attention metadata.** Restore the attention metadata fields the stock
+  MTP-Eagle worker restores after its draft loop: the sequence lengths, the
+  speculative packed mask, position offsets and generation lengths, and
+  `all_rank_num_tokens`. CUDA graph warmup replays the forward on the same
+  metadata. Save the lengths with `prepare_for_spec_dec` and restore them with
+  `restore_from_spec_dec` in a `finally` block, so a failed step, such as an
+  out-of-memory error during warmup, does not leave them changed. Like the
+  worker, the draft chain leaves `num_contexts`, `host_request_types` and
+  `kv_lens_cuda` changed.
 * **Per-token state.** Commit recurrent, conv or indexer state written per
   token for the accepted tokens only, for example through the cache manager's
   `update_mamba_states`.

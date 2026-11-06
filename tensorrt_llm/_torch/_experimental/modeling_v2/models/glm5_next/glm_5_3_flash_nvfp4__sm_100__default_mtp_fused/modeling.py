@@ -17,8 +17,8 @@ checkpoint's MTP layer with the target's LM head and embedding) and runs the who
 (``Glm5NextMtpStep``): the verify logits, strict acceptance, the KDA state commit and the draft chain. No speculative
 worker is built; the engine keeps what lies outside the forward (input packing, the speculative sampler, the KV
 rewind). It computes what the stock MTP-Eagle worker computes for greedy and plain sampling; every other speculative
-feature, and running without speculation, is served by the sibling ``glm_5_3_flash_nvfp4__sm_100__default`` target
-on the stock speculative framework. Routing declines them here, and the constructor checks again
+feature, and running without speculation, is served by the sibling split target
+``glm_5_3_flash_nvfp4__sm_100__default``. Routing declines them here, and the constructor checks again
 (``_check_speculation``).
 
 ``default`` is the built-in model's parallel coverage: the weight shapes are computed from the engine's ``Mapping``
@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
     from tensorrt_llm._torch.modules.mhc.hyper_connection import mHC
 
+from ..routing import fused_speculation_refused
 from . import weights as _weights
 
 # The GPU architecture this target IS. Routing will not send another one here, but a direct instantiation could,
@@ -300,9 +301,9 @@ def _normalize_glm5_next_top_config(config: PretrainedConfig) -> None:
         config.num_hidden_layers = int(text.num_hidden_layers)
     if getattr(config, "torch_dtype", None) is None:
         config.torch_dtype = getattr(text, "torch_dtype", None) or torch.bfloat16
-    # The one-model MTP drafter (``MTPForCausalLM``) reads the checkpoint's
-    # next-n layer count from the config it is handed, which is this top-level
-    # composite one; the field lives on ``text_config``.
+    # The engine reads the checkpoint's next-n layer count from the top-level
+    # composite config (for example when it resolves the speculative config);
+    # the field lives on ``text_config``.
     if getattr(config, "num_nextn_predict_layers", None) is None:
         config.num_nextn_predict_layers = int(getattr(text, "num_nextn_predict_layers", 0) or 0)
 
@@ -2414,38 +2415,14 @@ _FUSED_MOE_RE = re.compile(
 def _check_speculation(spec_config: Any) -> None:
     """Reject at construction the speculative configurations the in-model MTP step does not compute.
 
-    The step is the checkpoint's MTP layer as a linear MTP-Eagle chain with strict acceptance: the target token is
-    the argmax, or a sample from the request's own sampling parameters, and every draft token is the draft head's
-    argmax. Each feature below would change what a step computes, so it fails here rather than run as something else.
+    Routing declines the same configurations (:func:`fused_speculation_refused`) and sends them to the split target
+    ``glm_5_3_flash_nvfp4__sm_100__default``; this check covers direct construction.
     """
-    if spec_config is None:
+    refused = fused_speculation_refused(spec_config)
+    if refused:
         raise ValueError(
-            "the GLM-5.3-Flash MTP-fused modeling_v2 target runs one-model MTP-Eagle only; without speculative "
-            "decoding the engine routes to glm_5_3_flash_nvfp4__sm_100__default"
-        )
-    mode = spec_config.spec_dec_mode
-    unsupported = {
-        "a speculative mode other than one-model MTP-Eagle": not mode.is_mtp_eagle_one_model(),
-        "a dynamic draft tree": bool(getattr(spec_config, "use_dynamic_tree", False)),
-        "draft trees (max_total_draft_tokens != max_draft_len)": (
-            getattr(spec_config, "max_total_draft_tokens", None)
-            not in (None, spec_config.max_draft_len)
-        ),
-        "rejection sampling": bool(getattr(spec_config, "use_rejection_sampling", False)),
-        "relaxed acceptance for thinking": bool(
-            getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
-        ),
-        "occurrence penalties": bool(getattr(spec_config, "enable_penalty", False)),
-        "suffix-automaton drafts (sa_config)": getattr(spec_config, "sa_config", None) is not None,
-        "a separate speculative checkpoint": getattr(spec_config, "speculative_model", None)
-        is not None,
-        "a draft-length schedule": getattr(spec_config, "draft_len_schedule", None) is not None,
-    }
-    named = [name for name, present in unsupported.items() if present]
-    if named:
-        raise ValueError(
-            "the GLM-5.3-Flash modeling_v2 target runs one-model MTP-Eagle with strict acceptance inside its forward; "
-            f"it does not support {', '.join(named)}"
+            "the GLM-5.3-Flash MTP-fused modeling_v2 target runs linear one-model MTP-Eagle with strict acceptance "
+            f"inside its forward; it does not run {', '.join(refused)}"
         )
 
 

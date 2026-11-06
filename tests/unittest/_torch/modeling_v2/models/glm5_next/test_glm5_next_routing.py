@@ -23,7 +23,7 @@ pytestmark = pytest.mark.cpu_only
 
 _SM100 = (10, 0)
 _DUMMY_MODEL = "/tmp/dummy_model"
-_STOCK = (
+_SPLIT = (
     "models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default.modeling."
     "ModelingV2Glm53FlashNvfp4Sm100Default"
 )
@@ -120,10 +120,10 @@ def test_linear_mtp_eagle_routes_to_the_fused_target(mode, spec_config, mapping_
         "suffix-automaton",
     ],
 )
-def test_other_deployments_route_to_the_stock_target(mode, spec_config, mapping_kwargs, llm_kwargs):
-    """What the fused target does not compute falls to the stock-framework target."""
+def test_other_deployments_route_to_the_split_target(mode, spec_config, mapping_kwargs, llm_kwargs):
+    """What the fused target does not compute falls to the split target."""
     config = _model_config(_flash_config(), spec_config=spec_config, **mapping_kwargs)
-    assert _qualified(modeling_v2_resolve(config, _llm_args(mode, **llm_kwargs))) == _STOCK
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode, **llm_kwargs))) == _SPLIT
 
 
 @pytest.mark.parametrize(
