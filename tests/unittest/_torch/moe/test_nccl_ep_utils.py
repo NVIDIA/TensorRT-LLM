@@ -15,8 +15,8 @@
 """CPU-only tests for the NCCL-EP context bootstrap in ``nccl_ep_utils``.
 
 ``NcclEpContext`` seeds its NCCL communicator from the torch EP process group
-under the Ray orchestrator (``mpi_disabled()``) and from an ``MPI_COMM_WORLD``
-split keyed by pipeline stage otherwise. These tests stub the ``nccl`` namespace
+under the Ray orchestrator (``mpi_disabled()``) and from a split of the session
+MPI comm (``mpi_comm()``) keyed by pipeline stage otherwise. These tests stub the ``nccl`` namespace
 package, ``mpi4py`` and the CUDA allocations, so they run in the CPU-only stage
 and catch a regression that selects the wrong bootstrap, passes the wrong EP
 group, or tears the resources down in the wrong order.
@@ -160,7 +160,7 @@ def _install_fake_nccl(
 
 
 @pytest.fixture
-def bootstrap(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+def nccl_ep_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Patch everything around ``NcclEpContext.__init__`` except the bootstrap branch."""
     torch_group_comm = Mock(name="torch_group_comm")
     mpi_comm_result = Mock(name="mpi_seeded_comm")
@@ -206,27 +206,27 @@ def _create_context(mapping: SimpleNamespace) -> nccl_ep_utils.NcclEpContext:
     )
 
 
-def test_ray_orchestrator_seeds_comm_from_torch_ep_group(bootstrap: SimpleNamespace) -> None:
-    bootstrap.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
+def test_ray_orchestrator_seeds_comm_from_torch_ep_group(nccl_ep_fakes: SimpleNamespace) -> None:
+    nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
     mapping = _make_mapping()
 
     ctx = _create_context(mapping)
 
-    bootstrap.fake.interop_torch.get_nccl_comm_from_group.assert_called_once_with(
+    nccl_ep_fakes.fake.interop_torch.get_nccl_comm_from_group.assert_called_once_with(
         mapping.moe_ep_group_pg
     )
-    bootstrap.mpi_comm.assert_not_called()
-    bootstrap.fake.core.get_unique_id.assert_not_called()
-    bootstrap.fake.core.Communicator.init.assert_not_called()
+    nccl_ep_fakes.mpi_comm.assert_not_called()
+    nccl_ep_fakes.fake.core.get_unique_id.assert_not_called()
+    nccl_ep_fakes.fake.core.Communicator.init.assert_not_called()
     assert ctx._ep_mpi_comm is None
-    assert ctx.comm is bootstrap.torch_group_comm
-    assert ctx.ep_group is bootstrap.ep_group
+    assert ctx.comm is nccl_ep_fakes.torch_group_comm
+    assert ctx.ep_group is nccl_ep_fakes.ep_group
 
     # The group is created from the torch-seeded comm with the LL rank-major budget.
-    create = bootstrap.fake.ep.Group.create
+    create = nccl_ep_fakes.fake.ep.Group.create
     create.assert_called_once()
     comm_arg, cfg = create.call_args.args
-    assert comm_arg is bootstrap.torch_group_comm
+    assert comm_arg is nccl_ep_fakes.torch_group_comm
     assert cfg.kwargs == {
         "algorithm": _Algorithm.LOW_LATENCY,
         "num_experts": _NUM_EXPERTS,
@@ -234,56 +234,56 @@ def test_ray_orchestrator_seeds_comm_from_torch_ep_group(bootstrap: SimpleNamesp
         "max_recv_tokens_per_rank": mapping.moe_ep_size * _MAX_TOKENS_PER_RANK,
         "max_token_bytes": _HIDDEN_SIZE * 2,
     }
-    bootstrap.register.assert_called_once()
-    assert bootstrap.register.call_args.args[0]._group is bootstrap.ep_group
+    nccl_ep_fakes.register.assert_called_once()
+    assert nccl_ep_fakes.register.call_args.args[0]._group is nccl_ep_fakes.ep_group
 
 
 @pytest.mark.parametrize("ep_world_rank", [0, 1])
-def test_mpi_orchestrator_splits_comm_world_by_pipeline_stage(
-    bootstrap: SimpleNamespace, ep_world_rank: int
+def test_mpi_orchestrator_splits_session_comm_by_pipeline_stage(
+    nccl_ep_fakes: SimpleNamespace, ep_world_rank: int
 ) -> None:
-    bootstrap.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
-    bootstrap.sub_comm.Get_rank.return_value = ep_world_rank
+    nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
+    nccl_ep_fakes.sub_comm.Get_rank.return_value = ep_world_rank
     mapping = _make_mapping()
 
     ctx = _create_context(mapping)
 
-    bootstrap.mpi_comm.return_value.Split.assert_called_once_with(
+    nccl_ep_fakes.mpi_comm.return_value.Split.assert_called_once_with(
         mapping.pp_rank, mapping.moe_ep_rank
     )
-    bootstrap.fake.interop_torch.get_nccl_comm_from_group.assert_not_called()
+    nccl_ep_fakes.fake.interop_torch.get_nccl_comm_from_group.assert_not_called()
     if ep_world_rank == 0:
-        bootstrap.fake.core.get_unique_id.assert_called_once_with()
-        bootstrap.sub_comm.bcast.assert_called_once_with(_UNIQUE_ID, root=0)
+        nccl_ep_fakes.fake.core.get_unique_id.assert_called_once_with()
+        nccl_ep_fakes.sub_comm.bcast.assert_called_once_with(_UNIQUE_ID, root=0)
     else:
-        bootstrap.fake.core.get_unique_id.assert_not_called()
-        bootstrap.sub_comm.bcast.assert_called_once_with(None, root=0)
-    bootstrap.fake.core.Communicator.init.assert_called_once_with(
+        nccl_ep_fakes.fake.core.get_unique_id.assert_not_called()
+        nccl_ep_fakes.sub_comm.bcast.assert_called_once_with(None, root=0)
+    nccl_ep_fakes.fake.core.Communicator.init.assert_called_once_with(
         nranks=2, rank=ep_world_rank, unique_id=_UNIQUE_ID
     )
-    assert ctx._ep_mpi_comm is bootstrap.sub_comm
-    assert ctx.comm is bootstrap.mpi_comm_result
-    assert bootstrap.fake.ep.Group.create.call_args.args[0] is bootstrap.mpi_comm_result
+    assert ctx._ep_mpi_comm is nccl_ep_fakes.sub_comm
+    assert ctx.comm is nccl_ep_fakes.mpi_comm_result
+    assert nccl_ep_fakes.fake.ep.Group.create.call_args.args[0] is nccl_ep_fakes.mpi_comm_result
 
 
-@pytest.mark.parametrize("mpi_disabled", [True, False])
+@pytest.mark.parametrize("use_ray", [True, False], ids=["ray", "mpi"])
 def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
-    bootstrap: SimpleNamespace, mpi_disabled: bool
+    nccl_ep_fakes: SimpleNamespace, use_ray: bool
 ) -> None:
-    bootstrap.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: mpi_disabled)
+    nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: use_ray)
     ctx = _create_context(_make_mapping())
     comm = ctx.comm
-    proxy = bootstrap.register.call_args.args[0]
+    proxy = nccl_ep_fakes.register.call_args.args[0]
     order = Mock(name="teardown_order")
-    order.attach_mock(bootstrap.unregister, "unregister")
-    order.attach_mock(bootstrap.ep_group.destroy, "group_destroy")
+    order.attach_mock(nccl_ep_fakes.unregister, "unregister")
+    order.attach_mock(nccl_ep_fakes.ep_group.destroy, "group_destroy")
     order.attach_mock(comm.finalize, "comm_finalize")
     order.attach_mock(comm.destroy, "comm_destroy")
-    order.attach_mock(bootstrap.sub_comm.Free, "mpi_free")
+    order.attach_mock(nccl_ep_fakes.sub_comm.Free, "mpi_free")
 
     ctx.destroy()
 
-    bootstrap.unregister.assert_called_once_with(proxy)
+    nccl_ep_fakes.unregister.assert_called_once_with(proxy)
     # The timeout proxy must be unregistered before the group it points at is destroyed.
     expected = [
         call.unregister(proxy),
@@ -291,7 +291,7 @@ def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
         call.comm_finalize(),
         call.comm_destroy(),
     ]
-    if not mpi_disabled:
+    if not use_ray:
         expected.append(call.mpi_free())
     assert order.mock_calls == expected
     assert ctx.ep_group is None
