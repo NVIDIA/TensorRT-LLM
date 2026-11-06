@@ -42,14 +42,14 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve._telemetry import create_uvicorn_server
-from tensorrt_llm.serve.anthropic_adapter import (AnthropicRequestError,
-                                                  AnthropicResponseError,
-                                                  anthropic_error_response,
-                                                  convert_anthropic_request,
-                                                  convert_chat_response,
-                                                  reframe_openai_stream)
-from tensorrt_llm.serve.anthropic_protocol import (AnthropicCountTokensRequest,
-                                                   AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.anthropic.adapter import (AnthropicRequestError,
+                                                      AnthropicResponseError,
+                                                      anthropic_error_response,
+                                                      convert_anthropic_request,
+                                                      convert_chat_response,
+                                                      reframe_openai_stream)
+from tensorrt_llm.serve.api.anthropic.protocol import (
+    AnthropicCountTokensRequest, AnthropicMessagesRequest)
 from tensorrt_llm.serve.cluster_storage import (
     HttpClusterStorageServer, create_cluster_storage,
     validate_http_cluster_storage_scope)

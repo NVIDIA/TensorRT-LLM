@@ -523,7 +523,7 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
 
 def _batch_client(runner=None):
     """A TestClient over just the batch routes, with a stubbed item runner."""
-    from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
+    from tensorrt_llm.serve.api.anthropic.batches import AnthropicBatchStore
 
     async def ok(request):
         return "succeeded", {"type": "message", "role": "assistant", "content": []}
@@ -630,8 +630,8 @@ def test_results_of_an_unfinished_batch_are_400_not_404():
     still be in flight by the time the second request arrives, and the batch
     would have already ended.
     """
-    from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
-    from tensorrt_llm.serve.anthropic_protocol import AnthropicBatchRequestItem
+    from tensorrt_llm.serve.api.anthropic.batches import AnthropicBatchStore
+    from tensorrt_llm.serve.api.anthropic.protocol import AnthropicBatchRequestItem
 
     async def scenario():
         blocked = asyncio.Event()
@@ -673,8 +673,8 @@ def test_interrupted_batch_still_reports_counts_that_sum():
     end the batch with fewer results than requests - and request_counts is the
     number clients use to decide whether every request was accounted for.
     """
-    from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
-    from tensorrt_llm.serve.anthropic_protocol import AnthropicBatchRequestItem
+    from tensorrt_llm.serve.api.anthropic.batches import AnthropicBatchStore
+    from tensorrt_llm.serve.api.anthropic.protocol import AnthropicBatchRequestItem
 
     async def scenario():
         blocked = asyncio.Event()
@@ -850,7 +850,7 @@ def _anthropic_validation_handler(app):
     """
     from fastapi.exceptions import RequestValidationError
 
-    from tensorrt_llm.serve.anthropic_adapter import anthropic_error_response
+    from tensorrt_llm.serve.api.anthropic.adapter import anthropic_error_response
 
     @app.exception_handler(RequestValidationError)
     async def _handler(request, exc):  # noqa: ANN001
@@ -983,7 +983,7 @@ def _disagg_service(servers, post_json=None):
 
 def test_count_tokens_forwards_to_a_context_worker():
     """The disagg server has no tokenizer, so the count must come from a worker."""
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1004,7 +1004,7 @@ def test_count_tokens_forwards_to_a_context_worker():
 
 def test_count_tokens_spreads_over_context_workers():
     """Round-robin: one worker must not absorb every count."""
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1029,7 +1029,7 @@ def test_count_tokens_without_context_workers_is_an_error_not_a_zero():
     Returning 0 would read as an empty prompt and silently skew a client's
     context budgeting.
     """
-    from tensorrt_llm.serve.anthropic_protocol import AnthropicCountTokensRequest
+    from tensorrt_llm.serve.api.anthropic.protocol import AnthropicCountTokensRequest
 
     service = _disagg_service([])
     request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
@@ -1085,7 +1085,7 @@ def test_post_json_sends_msgpack_the_worker_can_decode():
     """
     import msgspec
 
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1117,7 +1117,7 @@ def test_post_json_raises_on_an_error_status():
     """
     import aiohttp
 
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1195,7 +1195,7 @@ def test_create_batch_at_capacity_is_429_not_400():
     each request runs in its own event loop and a batch's task does not
     survive between them.
     """
-    from tensorrt_llm.serve.anthropic_batches import BatchStoreFullError
+    from tensorrt_llm.serve.api.anthropic.batches import BatchStoreFullError
 
     app = FastAPI()
     server = object.__new__(OpenAIServer)
