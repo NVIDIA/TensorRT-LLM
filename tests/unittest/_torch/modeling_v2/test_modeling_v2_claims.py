@@ -453,7 +453,7 @@ _NO_CI_STAGE = {
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp8/comm": (
         "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
-    "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/comm": (
+    "unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm": (
         "4 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),
 }

@@ -237,6 +237,19 @@ def _validate_dspark_exact_bucket(*, exact_shape, bucket) -> None:
             f"verifier bucket V={expected_bucket}; got {bucket}")
 
 
+def _dspark_tp_shared_ragged_lens(dist, ragged_lens: List[int]) -> List[int]:
+    """Use TP rank 0's verify rows on every rank.
+
+    Without attention DP every TP rank runs one token layout, but each rank
+    ranks rows from its own confidence snapshot, so rank-local choices can
+    differ and the next collective stalls. Every rank holds the same batch,
+    so the vectors have one length.
+    """
+    return [
+        int(value) for value in dist.tp_cp_broadcast_int64(ragged_lens, root=0)
+    ]
+
+
 def _classify_dspark_exact_generation_rows(
     generation_requests: List[LlmRequest],
 ) -> Tuple[Optional[List[LlmRequest]], bool]:
@@ -4804,6 +4817,10 @@ class PyExecutor:
                                 graph_batch_size=common_graph_batch_size,
                                 verifier_budget=selected_verifier_budget,
                             ))
+                        if (is_distributed
+                                and not self.dist.mapping.enable_attention_dp):
+                            ragged_lens = _dspark_tp_shared_ragged_lens(
+                                self.dist, ragged_lens)
                         if exact_local.num_requests == 0:
                             if not exact_zero_real_adp_dummy:
                                 raise RuntimeError(
@@ -10177,7 +10194,8 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # A cp_type takes effect only with context parallelism on.
+        if 'cp_type' in cp_config and self.dist.cp_size > 1:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.HELIX:
                 # Take the usual route with _update_request_states_tp().
