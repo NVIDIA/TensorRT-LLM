@@ -14,20 +14,21 @@
 # limitations under the License.
 """Role layouts: which pieces of a role's byte space each rank's buffer holds."""
 
+import collections
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
 
-from tensorrt_llm._torch.disaggregation.base.role_layout import (
+from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import (
     ByHead,
     Own,
     Piece,
     RankTopology,
     Replicated,
     RingSlots,
-    RoleLayout,
+    RoleLayoutV2,
     Sectioned,
     check_pieces,
     grid_place,
@@ -245,14 +246,14 @@ def test_positional_layout_must_say_where_its_positions_lie():
     with pytest.raises(TypeError, match="holds token positions"):
 
         @dataclass(frozen=True)
-        class Positional(RoleLayout):
+        class Positional(RoleLayoutV2):
             name: ClassVar[str] = "test_positional_without_index"
             positional: ClassVar[bool] = True
 
 
 def test_pieces_that_leave_a_gap_are_refused():
     @dataclass(frozen=True)
-    class Gapped(RoleLayout):
+    class Gapped(RoleLayoutV2):
         name: ClassVar[str] = "test_gapped"
 
         def pieces(self, size, ranks, rank):
@@ -264,6 +265,48 @@ def test_pieces_that_leave_a_gap_are_refused():
 
     with pytest.raises(ValueError, match="back to back"):
         check_pieces(Gapped(), 8, 1, 0)
+
+
+_RANK_COUNTS = (1, 2, 4, 8)
+
+
+def _kv_site(heads, head_bytes, ranks, **kwargs):
+    """An attention buffer of ``heads`` KV heads of ``head_bytes`` bytes over ``ranks`` ranks."""
+    local = max(1, heads // ranks)
+    return _site(local * head_bytes, kv_heads=(local, heads), ranks=ranks, **kwargs)
+
+
+# Each case: ranks -> (the layout a manager's spec states, one rank's buffer's facts).
+_TILING_CASES = {
+    "kv_by_head": lambda n: (ByHead(), _kv_site(8, 64, n)),
+    "kv_token_major": lambda n: (ByHead(token_major=True), _kv_site(8, 64, n, tokens=4)),
+    "kv_heads_held_by_several_ranks": lambda n: (ByHead(), _kv_site(2, 64, n)),
+    "mla_latent": lambda n: (ByHead(total=1), _site(576, kv_heads=(1, None), ranks=n)),
+    "recurrent_state": lambda n: (ByHead(head_bytes=32), _site(8 // n * 32, state=True, ranks=n)),
+    "sections": lambda n: (Sectioned((64 // n, 32 // n, 32 // n)), _site(128 // n, ranks=n)),
+    "replicated": lambda n: (Replicated(), _site(96, ranks=n)),
+    "ring": lambda n: (RingSlots(4), _site(96, ranks=n)),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_TILING_CASES))
+def test_ranks_of_every_topology_together_hold_one_space_whole(case):
+    spaces = set()
+    for ranks in _RANK_COUNTS:
+        layout, site = _TILING_CASES[case](ranks)
+        resolved = layout.resolve(site)
+        resolved.check(site.size)
+        held = collections.Counter()
+        for rank in range(ranks):
+            check_pieces(resolved, site.size, ranks, rank)
+            for piece in resolved.pieces(site.size, ranks, rank):
+                held.update(range(piece.at, piece.at + piece.size))
+        # Every byte of the space from 0 up is held, each by as many ranks as every other.
+        assert sorted(held) == list(range(len(held))), (case, ranks)
+        assert len(set(held.values())) == 1, (case, ranks)
+        spaces.add(resolved.space(site.size, ranks))
+    # Peers of any two of these rank counts lay out the same space, so they correspond.
+    assert len(spaces) == 1, (case, spaces)
 
 
 def test_grid_place_counts_tensor_ranks_outer_to_context_ranks():

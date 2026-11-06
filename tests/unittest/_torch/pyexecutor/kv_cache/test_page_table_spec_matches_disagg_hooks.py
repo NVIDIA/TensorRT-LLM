@@ -75,11 +75,21 @@ KV_ROLES = (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
 STATE_ROLES = (MambaRole.CONV_STATE, MambaRole.SSM_STATE)
 
 
+def assert_spec_states_every_role(spec: PageTableSpec, roles) -> None:
+    """Check what holds of a spec by itself, hooks or not: each of the ``roles`` the manager
+    registers moves by a layout or is listed as never moving, and no role is both untransferred
+    and derived."""
+    assert not spec.untransferred_roles & spec.derived_roles
+    for role in roles:
+        assert spec.layout_of(str(role)) is not None, role
+
+
 def assert_spec_matches_disagg_hooks(manager, roles, layer_groups: int = 0) -> PageTableSpec:
-    """Check that ``manager``'s spec lays out each of ``roles`` as its disaggregation hooks do,
-    leaves the roles they ignore, and gives the layers of its first ``layer_groups`` layer groups
-    the global layer ids they do; return the spec."""
+    """Check that ``manager``'s spec states each of ``roles`` (``assert_spec_states_every_role``),
+    lays it out as its disaggregation hooks do, leaves the roles they ignore, and gives the layers
+    of its first ``layer_groups`` layer groups the global layer ids they do; return the spec."""
     spec = manager.page_table_spec()
+    assert_spec_states_every_role(spec, roles)
     kinds = manager.get_disagg_role_mapper_kinds()
     geometry = manager.get_disagg_role_layouts()
     ignored = {str(role) for role in manager.get_disagg_ignored_roles()}

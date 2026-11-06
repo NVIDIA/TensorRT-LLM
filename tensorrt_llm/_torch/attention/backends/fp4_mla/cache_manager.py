@@ -278,10 +278,10 @@ class Fp4MlaV2CacheLayoutPolicy:
             # composes them with its own roles through the policy's
             # DISAGG_ROLE_MAPPER_KINDS, DISAGG_IGNORED_ROLES,
             # _fp4_mla_disagg_global_layer_id, and _fp4_mla_disagg_role_layouts;
-            # its page table spec composes them through _fp4_mla_page_table_spec.
+            # its page table spec composes them through _fp4_mla_disagg_page_table_spec.
             "_fp4_mla_disagg_global_layer_id",
             "_fp4_mla_disagg_role_layouts",
-            "_fp4_mla_page_table_spec",
+            "_fp4_mla_disagg_page_table_spec",
             "rebuild_disagg_imported_cache",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
@@ -1019,15 +1019,15 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def page_table_spec(self) -> PageTableSpec:
         """Latents token-major by head, as the FP4 MLA kernels write them, and the policy's other
-        roles and layer names (``_fp4_mla_page_table_spec``). The cache is K-only: any other role
-        it registers is a latent cache too."""
+        roles and layer names (``_fp4_mla_disagg_page_table_spec``). The cache is K-only: any other
+        role it registers is a latent cache too."""
         spec = KVCacheManagerV2.page_table_spec(self)
-        return self._fp4_mla_page_table_spec(
+        return self._fp4_mla_disagg_page_table_spec(
             replace(spec, role_layouts={}, default_layout=ByHead(token_major=True, total=1)),
             recurrent=lambda layer: False,
         )
 
-    def _fp4_mla_page_table_spec(
+    def _fp4_mla_disagg_page_table_spec(
         self, spec: PageTableSpec, recurrent: Callable[[int], bool]
     ) -> PageTableSpec:
         """``spec`` with the MLA roles and layer names laid over it.
