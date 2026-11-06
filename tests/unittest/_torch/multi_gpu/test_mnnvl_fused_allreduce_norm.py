@@ -70,14 +70,14 @@ def _check(got, ref, tag, rtol=2e-2):
     )
 
 
-def _mnnvl(tp):
+def _mnnvl(tp, hidden=H):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
     os.environ["TLLM_TEST_MNNVL"] = "1"
     MPI.COMM_WORLD.barrier()
     mapping = Mapping(world_size=tp, tp_size=tp, rank=rank)
-    ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max(ROWS), hidden_size=H)
-    assert MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, H)
+    ar = MNNVLAllReduce(mapping, torch.bfloat16, max_num_tokens=max(ROWS), hidden_size=hidden)
+    assert MnnvlAllReduceNorm.is_supported(mapping, torch.bfloat16, hidden)
     assert ar.fused_norm is not None, "CuTe DSL kernels not built"
     return ar, rank
 
@@ -121,15 +121,48 @@ def _norm_cases(tp):
         _check(norm, ref_norm, ("norm with fp8", m))
         # E4M3 holds 3 mantissa bits: half an ulp is 6.25 % relative.
         _check(fp8.float() * scale, ref_norm.clamp(-448 * 0.05, 448 * 0.05), ("fp8", m), rtol=7e-2)
-    # More rows than two CTAs per SM: the two-shot kernel takes several tokens per CTA.
-    m = 2 * torch.cuda.get_device_properties(rank).multi_processor_count + 8
+    # Exercise two and 28 tokens per CTA, including a partially filled final CTA.
+    wave = 2 * torch.cuda.get_device_properties(rank).multi_processor_count
+    for m in (wave + 8, 27 * wave + 1):
+        assert ar.fused_norm.supports_rows(m), m
+        xs = [_rand((m, H), 100 * m + r) for r in range(tp)]
+        residual = _rand((m, H), 7 * m)
+        ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
+        norm, res = ar.fused_norm(residual, norm_weight, EPS, x=xs[rank])
+        _check(norm, ref_norm, ("kernel norm", m))
+        _check(res, ref_res, ("kernel residual", m))
+
+
+@pytest.mark.parametrize(
+    ("hidden", "tokens_per_cta", "smem_bytes"),
+    [(2048, 28, 115616), (4096, 28, 231200), (8192, 14, 231200)],
+)
+def test_mnnvl_fused_allreduce_norm_shared_memory_limit(
+    hidden: int, tokens_per_cta: int, smem_bytes: int
+) -> None:
+    ar = MnnvlAllReduceNorm.__new__(MnnvlAllReduceNorm)
+    ar.hidden = hidden
+    ar._sms = torch.cuda.get_device_properties(0).multi_processor_count
+    rows = tokens_per_cta * 2 * ar._sms
+    ar._smem_bytes = smem_bytes
+    assert ar.supports_rows(rows)
+    ar._smem_bytes -= 1
+    assert not ar.supports_rows(rows)
+
+
+def _large_hidden_norm_cases(tp: int) -> None:
+    hidden = 8192
+    ar, rank = _mnnvl(tp, hidden)
+    wave = 2 * torch.cuda.get_device_properties(rank).multi_processor_count
+    m = 13 * wave + 1
     assert ar.fused_norm.supports_rows(m), m
-    xs = [_rand((m, H), 100 * m + r) for r in range(tp)]
-    residual = _rand((m, H), 7 * m)
+    norm_weight = _rand((hidden,), 1, 0.1) + 1
+    xs = [_rand((m, hidden), 100 * m + r) for r in range(tp)]
+    residual = _rand((m, hidden), 7 * m)
     ref_norm, ref_res = _ref_norm(sum(x.float() for x in xs), residual, norm_weight)
     norm, res = ar.fused_norm(residual, norm_weight, EPS, x=xs[rank])
-    _check(norm, ref_norm, ("kernel norm", m))
-    _check(res, ref_res, ("kernel residual", m))
+    _check(norm, ref_norm, ("large hidden norm", m))
+    _check(res, ref_res, ("large hidden residual", m))
 
 
 def _moe_fold_cases(tp, top_k=10):
@@ -273,6 +306,7 @@ def _opt_in_cases(tp):
 
 CASES = {
     "norm": _norm_cases,
+    "large_hidden_norm": _large_hidden_norm_cases,
     "moe_fold": _moe_fold_cases,
     "gemm_norm": _gemm_norm_cases,
     "meta_init": _meta_init_cases,

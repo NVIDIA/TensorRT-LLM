@@ -627,7 +627,7 @@ class MnnvlAllReduceNormKernel:
     ) -> None:
         m = cute.size(gRes, mode=[0])
         if const_expr(self.tpc > 1):
-            # smem: the CTA's residual vectors (tpc x H BF16), per-token warp sums, the flags
+            # Infer shared memory from the residual stash, per-token warp sums, and flags.
             self.kernel_mt(
                 gX,
                 gRouted,
@@ -648,7 +648,6 @@ class MnnvlAllReduceNormKernel:
                 grid=[(m + self.tpc - 1) // self.tpc, 1, 1],
                 block=[self.threads, 1, 1],
                 cluster=[1, 1, 1],
-                smem=1024 + self.tpc * self.hidden * 2,
                 stream=stream,
                 use_pdl=self.use_pdl,
                 min_blocks_per_mp=self.min_ctas_per_sm,
