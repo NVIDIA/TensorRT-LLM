@@ -25,7 +25,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 import yaml
 
-from ..infra.compute import placement, spoolctl, waits
+from ..infra.compute import placement, spoolctl
 from ..infra.compute.executor import PERF
 from ..infra.compute.scheduler import (
     RC_LAUNCH_FAILED,
@@ -526,13 +526,17 @@ class SpoolRunner:
 
     A whole-node measurement goes to a session with nothing of ours in flight, an idle node first
     (:meth:`free_spools`); the keep gate's jobs share sessions by device count (:meth:`place`).
-    ``earlier`` names the prefixes earlier attempts of the same work queued under. Each
-    :meth:`poll` tells ``infra/compute/waits.py`` which jobs it still awaits, so a quiet wait on
-    them is journaled.
+    ``earlier`` names the prefixes earlier attempts of the same work queued under. Once a job has
+    been polled for ``spoolctl.WAIT_NOTE_S``, and then at most that often, :meth:`poll` says
+    every such job to ``note`` (:func:`spoolctl.waiting_line`).
     """
 
     def __init__(
-        self, spools: Sequence[str], prefix: str = "tune", earlier: Sequence[str] = ()
+        self,
+        spools: Sequence[str],
+        prefix: str = "tune",
+        earlier: Sequence[str] = (),
+        note: Callable[[str], None] | None = None,
     ) -> None:
         self.spools = list(spools)
         self.prefix = prefix
@@ -547,6 +551,10 @@ class SpoolRunner:
         self.held: dict[str, int] = {}
         #: The last finished job of each label: label -> (spool, job), for :meth:`output`.
         self.finished: dict[str, tuple[str, str]] = {}
+        self.note = note
+        #: When :meth:`poll` first saw each job in flight, and when it last said a long wait.
+        self._since: dict[str, float] = {}
+        self._noted = 0.0
 
     def queued(self, label: str) -> bool:
         """A job of ``label`` is in flight: queued by this process, or adopted."""
@@ -685,7 +693,6 @@ class SpoolRunner:
             if job_label == label:
                 del self.inflight[name]
                 self.held.pop(name, None)
-                waits.stopped_waiting(spool, name)
                 spoolctl.cancel_job(spool, name)
                 return True
         return False
@@ -720,7 +727,6 @@ class SpoolRunner:
                         script.rename(script.with_name(f"{script.name}.lost-{int(time.time())}"))
                 del self.inflight[name]
                 self.held.pop(name, None)
-                waits.stopped_waiting(spool, name)
                 done.append((label, spool, RC_ORPHANED))
                 continue
             if receipt.exists():
@@ -730,10 +736,16 @@ class SpoolRunner:
                     continue
                 del self.inflight[name]
                 self.held.pop(name, None)
-                waits.stopped_waiting(spool, name)
                 self.finished[label] = (spool, name)
                 done.append((label, spool, rc))
-        waits.still_waiting((spool, name) for name, (spool, _) in self.inflight.items())
+        now = time.time()
+        self._since = {name: self._since.get(name, now) for name in self.inflight}
+        due = [n for n, since in self._since.items() if now - since >= spoolctl.WAIT_NOTE_S]
+        if self.note is not None and due and now - self._noted >= spoolctl.WAIT_NOTE_S:
+            lines = [spoolctl.waiting_line(self.inflight[n][0], n, now) for n in due]
+            if any(lines):
+                self.note("; ".join(line for line in lines if line))
+                self._noted = now
         return done
 
 

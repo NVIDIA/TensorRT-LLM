@@ -204,7 +204,12 @@ class TuneStage:
             names = [f"{kind}{run}", *(f"{kind}{run}a{n}" for n in range(2, self.attempt + 1))]
             if runner_factory is not None:
                 return runner_factory(spools, names[-1])
-            runner = SpoolRunner(spools, prefix=names[-1], earlier=names[:-1])
+            runner = SpoolRunner(
+                spools,
+                prefix=names[-1],
+                earlier=names[:-1],
+                note=lambda said: self.log(f"[tune] waiting: {said}"),
+            )
             if "idle_settle_s" in spec.campaign:
                 runner.settle_s = float(spec.campaign["idle_settle_s"])
             return runner

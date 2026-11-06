@@ -45,6 +45,8 @@ EXIT_REFUSED = 64
 
 #: A watcher that has not heart-beat for this long is gone.
 WATCHER_STALE_S = _sched.WATCHER_STALE_S
+#: How long a job is waited on before the wait is said (``note``), and the least time between two.
+WAIT_NOTE_S = 15 * 60.0
 
 
 class SpoolError(RuntimeError):
@@ -144,20 +146,22 @@ def wait_for_job(
     grace_s: float = 300.0,
     unwatched_s: float | None = None,
     submitted_at: float | None = None,
-    on_poll: Callable[[], None] | None = None,
+    note: Callable[[str], None] | None = None,
 ) -> dict:
     """Block until ``name`` has a receipt (matching ``token`` when given) and return its record.
 
     ``timeout_s`` counts from the job's START, and ``grace_s`` past it is the session's to stop the
     job and write the receipt. A spool no watcher ever heart-beat on fails at once, or
     ``unwatched_s`` after submission (a session still starting). A job re-run after a lost
-    allocation is waited for through its re-run. ``on_poll`` is called before each sleep.
+    allocation is waited for through its re-run. Once the job has waited :data:`WAIT_NOTE_S`, and
+    then at most that often, ``note`` gets :func:`waiting_line`.
 
     Raises :class:`SpoolError`, with :data:`EXIT_NO_SESSION` when the session, not the job, ended
     the wait: the watchers stopped heart-beating for ``stale_s``, or none ever watched.
     """
     paths = _sched.SpoolPaths(spool)
     submitted = time.time() if submitted_at is None else submitted_at
+    noted = submitted
     while True:
         receipt = paths.receipt(name)
         if receipt.exists():
@@ -189,9 +193,33 @@ def wait_for_job(
                 f"the session watching {paths.root} stopped heart-beating {age:.0f}s ago",
                 EXIT_NO_SESSION,
             )
-        if on_poll is not None:
-            on_poll()
+        if note is not None and now >= noted + WAIT_NOTE_S:
+            line = waiting_line(paths.root, name, now)
+            if line:
+                note(line)
+                noted = now
         time.sleep(poll_s)
+
+
+def waiting_line(spool: str | Path, name: str, now: float) -> str:
+    """Job ``name`` on ``spool``: queued or running and since when, and the scheduler's hold reason.
+
+    ``""`` when the spool does not say (the job between states, an unreadable record).
+    """
+    paths = _sched.SpoolPaths(spool)
+    try:
+        if (paths.running / f"{name}.sh").exists():
+            meta = _files.read_json(paths.running / f"{name}.json") or {}
+            state, since = "running", float(meta["started_epoch"])
+        else:
+            state, since = "queued", (paths.pending / f"{name}.sh").stat().st_mtime
+        pending = (_files.read_json(paths.snapshot) or {}).get("pending") or ()
+        hold = next((str(job.get("reason") or "") for job in pending if job["name"] == name), "")
+    except (OSError, KeyError, TypeError, ValueError, AttributeError):
+        return ""
+    minutes = (now - since) / 60
+    line = f"{name} on {paths.root} {state} since {_sched.utc_iso(since)} ({minutes:.0f} min)"
+    return line + (f"; held: {hold}" if hold else "")
 
 
 def left_in_spool(spool: str | Path, name: str) -> str:

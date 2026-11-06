@@ -219,6 +219,7 @@ def _run_preflight(
         # The checkout under test: gates run in it and the session refuses
         # a result whose ranks imported the engine from anywhere else.
         tree=workflow.task_data.get("trtllm_repo_path"),
+        note=lambda said: workflow.journal.event("waiting", said),
     )
     if workflow._shell_runner_override is None:
         workflow._shell_runner = shell_runner_for(workflow._command_executor)

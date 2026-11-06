@@ -24,7 +24,6 @@ from agent_flow.workflows.trtllm_modeling_v2.infra.compute import (
     rebuild,
     sessions,
     spoolctl,
-    waits,
 )
 from agent_flow.workflows.trtllm_modeling_v2.infra.compute import (
     scheduler as _spool_scheduler_scheduler,
@@ -406,99 +405,65 @@ def test_a_cancelled_job_measured_nothing_and_says_so(_spool_scheduler_spool, se
     assert result.infrastructure.startswith(CANCELLED)
 
 
-def test_a_quiet_wait_on_spool_jobs_is_journaled_once_per_quiet_period(tmp_path):
-    """A gate an ending session holds, and a measurement queued behind a leftover job.
+def _hold(root: Path, name: str, reason: str) -> None:
+    """``name`` queued on ``root``, held by its scheduler for ``reason`` (its ``status.json``)."""
+    (root / "pending" / f"{name}.sh").write_text("true\n")
+    snapshot = json.loads(SpoolPaths(root).snapshot.read_text())
+    snapshot["pending"] = [{"name": name, "reason": reason}]
+    _spool_sessions_write_json_atomic(SpoolPaths(root).snapshot, snapshot)
 
-    Once both have been awaited for the quiet period with nothing journaled, one line names
-    them, grouped by spool, with why each is held and when the session ends; then nothing until
-    the journal has been quiet that long again, and nothing once the jobs are done.
-    """
-    clock = _spool_scheduler_FakeClock()
-    start = clock.now
-    gates, work = tmp_path / "gates", tmp_path / "work"
+
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_a_long_wait_on_a_gate_job_is_said_once_per_period(tmp_path):
+    """A gate queued past the period says so once, with the session's hold reason."""
+    gates = session(tmp_path, "gates-1")
     hold = "the allocation ends in 4974s, too soon for a job allowed 7200s"
-    for root, pending, running in (
-        (gates, {"gate-core": hold}, []),
-        (work, {"tune-t-sol": "waiting for the whole node to drain"}, ["perf-profile"]),
-    ):
-        SpoolPaths(root).ensure()
-        for name in running:
-            (root / "running" / f"{name}.sh").write_text("")
-        _spool_sessions_write_json_atomic(
-            SpoolPaths(root).snapshot,
-            {
-                "watcher": root.name,
-                "alive_epoch": time.time(),
-                "ends_at_epoch": start + 4974,
-                "pending": [{"name": n, "reason": why} for n, why in pending.items()],
-                "running": [{"name": n, "wall_s": 3600} for n in running],
-            },
-        )
+    _hold(gates, "gate-core", hold)
     lines: list[str] = []
-    journaled = [start]
-    with waits.reported_to(lines.append, lambda: journaled[-1], quiet_s=900, clock=clock):
-        executor = SpoolCommandExecutor(gates, poll_s=0.01)
-        executor._name = lambda: "gate-core"
-        results = []
-        thread = threading.Thread(
-            target=lambda: results.append(
-                executor.execute(CommandSpec(argv="true", timeout_s=7200))
-            ),
-            daemon=True,
-        )
-        thread.start()
-        runner = SpoolRunner([str(work)], prefix="tune")
-        runner.submit(str(work), "t-sol", "true")
-        runner.poll()
-        deadline = time.time() + 10
-        while not (gates / "pending" / "gate-core.sh").exists() and time.time() < deadline:
-            time.sleep(0.01)
-        # The executor's thread registers its wait after it queues the job: wait for that.
-        while (str(gates), "gate-core") not in waits.REPORT._waits and time.time() < deadline:
-            time.sleep(0.01)
-        assert (str(gates), "gate-core") in waits.REPORT._waits
-        counts = []
-        for minute in range(4, 40, 4):
-            clock.advance(240)
-            if minute == 20:
-                journaled.append(clock.now)
-            runner.poll()
-            counts.append(len(lines))
-        # Due at 16m; the next at 31m, but the event journaled at 20m holds it to 35m.
-        assert counts == [0, 0, 0, 1, 1, 1, 1, 1, 2]
-        first = lines[0]
-        assert first.startswith("2 spool jobs awaited up to 16m")
-        assert f"{gates}: gate-core queued since" in first and f'held: "{hold}"' in first
-        assert f"{work}: tune-t-sol queued since" in first and "while perf-profile runs" in first
-        assert 'held: "waiting for the whole node to drain"' in first
-        assert "session ends" in first and "(in 1h06m)" in first
-        (gates / "done" / "gate-core.rc").write_text("0\n")
-        (work / "done" / "tune-t-sol.rc").write_text("0\n")
-        thread.join(timeout=10)
-        assert results[0].returncode == 0
-        assert [label for label, _, _ in runner.poll()] == ["t-sol"]
-        for _ in range(8):
-            clock.advance(240)
-            runner.poll()
-        assert len(lines) == 2
+    waiting = threading.Thread(
+        target=spoolctl.wait_for_job,
+        args=(gates, "gate-core"),
+        kwargs={"poll_s": 0.01, "submitted_at": time.time() - 16 * 60, "note": lines.append},
+        daemon=True,
+    )
+    waiting.start()
+    deadline = time.time() + 10
+    while not lines and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)  # further polls inside the period say nothing more
+    (gates / "done" / "gate-core.rc").write_text("0\n")
+    waiting.join(timeout=10)
+    assert len(lines) == 1
+    assert lines[0].startswith(f"gate-core on {gates} queued since ")
+    assert lines[0].endswith(f"; held: {hold}")
+    # A wait shorter than the period says nothing; a status record that does not read, no line.
+    _hold(gates, "gate-quick", hold)
+    (gates / "done" / "gate-quick.rc").write_text("0\n")
+    spoolctl.wait_for_job(gates, "gate-quick", submitted_at=time.time() - 14 * 60, note=pytest.fail)
+    SpoolPaths(gates).snapshot.write_text('{"pending": [{"reason": "no name"}]}')
+    assert spoolctl.waiting_line(gates, "gate-core", time.time()) == ""
 
 
-def test_a_spool_record_that_does_not_read_leaves_the_wait_it_describes_alone(tmp_path):
-    """A watcher record with a field of the wrong type writes no event and ends no wait."""
-    clock = _spool_scheduler_FakeClock()
-    spool = tmp_path / "spool"
-    SpoolPaths(spool).ensure()
-    for name, alive in (("a", time.time()), ("b", "not a time")):
-        _spool_sessions_write_json_atomic(
-            SpoolPaths(spool).watchers / f"{name}.json", {"watcher": "w", "alive_epoch": alive}
-        )
-    (spool / "pending" / "gate-x.sh").write_text("")
+@pytest.mark.usefixtures("_no_ambient_spool")
+def test_the_tune_runner_says_its_long_waits_at_most_once_per_period(tmp_path, monkeypatch):
+    monkeypatch.setattr(spoolctl, "WAIT_NOTE_S", 0.2)
+    work = session(tmp_path, "work-1")
     lines: list[str] = []
-    with waits.reported_to(lines.append, lambda: None, quiet_s=60, clock=clock):
-        with waits.waiting_on(spool, "gate-x"):
-            clock.advance(120)
-            waits.still_waiting()
+    runner = SpoolRunner([str(work)], prefix="tune", note=lines.append)
+    runner.submit(str(work), "t-sol", "true")
+    _hold(work, "tune-t-sol", "waiting for the whole node to drain")
+    runner.poll()
     assert lines == []
+    time.sleep(0.25)
+    runner.poll()
+    runner.poll()
+    assert len(lines) == 1 and lines[0].startswith(f"tune-t-sol on {work} queued since ")
+    assert lines[0].endswith("; held: waiting for the whole node to drain")
+    (work / "done" / "tune-t-sol.rc").write_text("0\n")
+    assert [label for label, _, _ in runner.poll()] == ["t-sol"]
+    time.sleep(0.25)
+    runner.poll()
+    assert len(lines) == 1
 
 
 def _task(tmp_path):

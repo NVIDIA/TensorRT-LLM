@@ -162,17 +162,28 @@ def max_jobs(timeout_s: float) -> int:
 
 
 class SessionJobs:
-    """A :data:`RunJob` on the run's devices: each job allowed :func:`job_timeout`, or less."""
+    """A :data:`RunJob` on the run's devices: each job allowed :func:`job_timeout`, or less.
 
-    def __init__(self, environment: Any, name: str) -> None:
+    A long wait on a job is said to ``note``.
+    """
+
+    def __init__(
+        self, environment: Any, name: str, note: Callable[[str], None] | None = None
+    ) -> None:
         self.environment = environment
         self.name = name
+        self.note = note
         #: How long one job may run (:func:`job_timeout`).
         self.timeout_s = job_timeout(environment)
 
     def __call__(self, command: str, tree: Path, timeout_s: float | None = None) -> tuple[int, str]:
         executor = select_command_executor(
-            self.environment, name_prefix=self.name, tree=tree, gpus="all", priority=FEATURE
+            self.environment,
+            name_prefix=self.name,
+            tree=tree,
+            gpus="all",
+            priority=FEATURE,
+            note=self.note,
         )
         wall = self.timeout_s if timeout_s is None else min(self.timeout_s, timeout_s)
         done = executor.execute(CommandSpec(argv=command, cwd=str(tree), timeout_s=wall))
@@ -193,7 +204,10 @@ def job_runner(workflow: Any, name: str) -> tuple[TreeAt, RunJob, str]:
         return snapshots.lease(commit) if snapshots is not None else contextlib.nullcontext(repo)
 
     python = str((workflow.task_data.get("environment") or {}).get("python") or "python3")
-    return tree_at, SessionJobs(workflow._gate_env(), name), python
+    jobs = SessionJobs(
+        workflow._gate_env(), name, note=lambda said: workflow.journal.event("waiting", said)
+    )
+    return tree_at, jobs, python
 
 
 def record_at(

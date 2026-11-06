@@ -17,8 +17,8 @@ the gates' policy over the spool:
   :meth:`SpoolCommandExecutor.wait_for_session` waits for one to come back before a re-run.
 - **Nor is a cancelled job**: its ``infrastructure`` begins with :data:`CANCELLED`; the gate it
   ran for has no verdict, and is not re-run at once against whoever cancelled it.
-- **A long wait says what it waits on**: each poll tells :mod:`.waits`, which journals the jobs a
-  quiet run waits on, why the session holds them, and when it ends.
+- **A long wait is said**: a job waited on for ``spoolctl.WAIT_NOTE_S`` is passed to ``note``
+  (the run's journal), whether queued or running and since when, and why the session holds it.
 """
 
 from __future__ import annotations
@@ -30,9 +30,9 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
-from . import placement, spoolctl, waits
+from . import placement, spoolctl
 from .commands import (
     TIMEOUT_RETURNCODE,
     CommandExecutor,
@@ -106,6 +106,7 @@ class SpoolCommandExecutor(CommandExecutor):
         priority: int = 0,
         tree: str | Path | None = None,
         pool: Sequence[str | Path] = (),
+        note: Callable[[str], None] | None = None,
     ) -> None:
         self.root = Path(spool)
         #: Every spool a command may go to, ``spool`` first.
@@ -125,6 +126,8 @@ class SpoolCommandExecutor(CommandExecutor):
         self.tree = str(Path(tree).resolve()) if tree else None
         #: Allowance past a job's own deadline for the session to stop it.
         self.grace_s = 180.0
+        #: Where a long wait on a job is said (``spoolctl.wait_for_job``); nowhere when ``None``.
+        self.note = note
         self._seq = itertools.count(1)
 
     def _name(self) -> str:
@@ -233,18 +236,17 @@ class SpoolCommandExecutor(CommandExecutor):
                 infrastructure=reason,
             )
         try:
-            with waits.waiting_on(root, name):
-                record = spoolctl.wait_for_job(
-                    root,
-                    name,
-                    token=token,
-                    poll_s=self.poll_s,
-                    timeout_s=spec.timeout_s,
-                    grace_s=self.grace_s,
-                    unwatched_s=spec.timeout_s,
-                    submitted_at=submitted,
-                    on_poll=waits.still_waiting,
-                )
+            record = spoolctl.wait_for_job(
+                root,
+                name,
+                token=token,
+                poll_s=self.poll_s,
+                timeout_s=spec.timeout_s,
+                grace_s=self.grace_s,
+                unwatched_s=spec.timeout_s,
+                submitted_at=submitted,
+                note=self.note,
+            )
         except spoolctl.SpoolError as exc:
             reason = str(exc) + self._withdraw(root, name)
             lost = exc.exit_code == spoolctl.EXIT_NO_SESSION
@@ -284,6 +286,7 @@ def select_command_executor(
     gpus: str = "all",
     nodes: int = 1,
     priority: int = 0,
+    note: Callable[[str], None] | None = None,
 ) -> CommandExecutor:
     """The executor this run's commands go through.
 
@@ -291,6 +294,7 @@ def select_command_executor(
     ``PYTHONPATH`` entry, and ``gpus`` (a count, or ``all``) what each job asks for. The spools of
     every session whose role takes gate jobs (:data:`sessions.GATE_ROLES`) form a pool beside
     ``environment.spool``, and each command goes to the live one that would start it soonest.
+    A long wait on a job is said to ``note``.
     """
     if environment.kind == "session_spool" and environment.spool:
         pool = [session.spool for session in environment.sessions if session.role in GATE_ROLES]
@@ -302,6 +306,7 @@ def select_command_executor(
             nodes=nodes,
             priority=priority,
             pool=pool,
+            note=note,
         )
     if nodes > 1:
         raise ValueError("multi-node commands require session_spool gang execution")
