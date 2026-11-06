@@ -308,6 +308,34 @@ def test_only_padding_rows_are_zeroed(rows_per_request):
     assert torch.isnan(logits[n:]).all(), "must not mutate the caller's logits"
 
 
+@pytest.mark.parametrize("rows_per_request", [1, 3])
+@pytest.mark.parametrize("vocab", [V, 2 * 4096 + 7])
+def test_inplace_writes_only_the_padding_rows(rows_per_request, vocab):
+    # The rejection path zeroes its own target logits in place: real rows keep
+    # their bits, padding rows (as wide as a row loop plus a tail) become zero.
+    n = 2 * rows_per_request
+    real = torch.randn(n, vocab, device="cuda")
+    logits = torch.cat([real, torch.full((n, vocab), float("nan"), device="cuda")])
+
+    out = _zero(logits, _pad_meta([0, 1, _PAD_ROW, _PAD_ROW]), 0, 4, rows_per_request, inplace=True)
+
+    assert out is logits
+    assert torch.equal(logits[:n], real)
+    assert torch.all(logits[n:] == 0.0)
+
+
+def test_inplace_padding_rows_on_a_row_slice():
+    # gen_logits is a row slice of the step's logits: rows outside it are untouched.
+    logits = torch.full((5, V), float("nan"), device="cuda")
+    gen = logits[1:5]
+
+    _zero(gen, _pad_meta([9, _PAD_ROW, 3]), 1, 3, 2, inplace=True)
+
+    assert torch.isnan(logits[0]).all()  # the context row
+    assert torch.all(logits[1:3] == 0.0)  # the _PAD_ROW request
+    assert torch.isnan(logits[3:]).all()  # the real request
+
+
 def test_padding_mask_excludes_context_rows():
     # Mixed batch: the first num_contexts requests own one logits row each and
     # are not part of the gen slice this helper is handed.

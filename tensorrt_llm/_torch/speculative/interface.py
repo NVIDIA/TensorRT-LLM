@@ -22,6 +22,8 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, ClassVar, List, Optional, Protocol, Type
 
 import torch
+import triton
+import triton.language as tl
 from packaging.version import Version
 from torch import nn
 
@@ -48,6 +50,34 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+
+
+@triton.jit
+def _zero_masked_rows_kernel(ptr, row_mask_ptr, n_cols, row_stride,
+                             BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    if tl.load(row_mask_ptr + row) != 0:
+        base = ptr + row.to(tl.int64) * row_stride
+        zeros = tl.zeros([BLOCK], dtype=ptr.dtype.element_ty)
+        for start in range(0, n_cols, BLOCK):
+            cols = start + tl.arange(0, BLOCK)
+            tl.store(base + cols, zeros, mask=cols < n_cols)
+
+
+def _zero_masked_rows_(logits: torch.Tensor, row_mask: torch.Tensor) -> None:
+    """Zero, in place, the rows of 2-D ``logits`` where ``row_mask`` is set.
+
+    Writes only the masked rows. Static shapes, no host sync: CUDA-graph safe.
+    """
+    if (not logits.is_cuda or logits.dim() != 2 or logits.stride(-1) != 1
+            or logits.shape[0] == 0):
+        logits.masked_fill_(row_mask.unsqueeze(-1), 0.0)
+        return
+    _zero_masked_rows_kernel[(logits.shape[0], )](logits,
+                                                  row_mask.to(torch.int8),
+                                                  logits.shape[1],
+                                                  logits.stride(0),
+                                                  BLOCK=4096)
 
 
 def rejection_sampling_one_model(
@@ -2367,7 +2397,8 @@ class SpecWorkerBase(nn.Module, ABC):
                            batch_size: int,
                            rows_per_request: int,
                            *,
-                           packed_verify: bool = False) -> torch.Tensor:
+                           packed_verify: bool = False,
+                           inplace: bool = False) -> torch.Tensor:
         """Zero the logits rows belonging to CUDA-graph padding requests.
 
         A padding request decodes from an uninitialized KV/hidden state, so its
@@ -2388,6 +2419,9 @@ class SpecWorkerBase(nn.Module, ABC):
             rows_per_request: logits rows each request contributes.
             packed_verify: use the ragged verification lengths for target logits;
                 draft-step logits retain their uniform layout.
+            inplace: zero the padding rows of ``logits`` itself, writing only
+                those rows, instead of returning a zeroed copy. For a caller
+                that owns ``logits``.
         Returns:
             ``logits`` with the padding requests' rows zeroed.
         """
@@ -2410,6 +2444,9 @@ class SpecWorkerBase(nn.Module, ABC):
             return logits
         elif rows_per_request > 1:
             is_padding = is_padding.repeat_interleave(rows_per_request)
+        if inplace:
+            _zero_masked_rows_(logits, is_padding)
+            return logits
         return logits.masked_fill(is_padding.unsqueeze(-1), 0.0)
 
     def advanced_sample_draft(self,
@@ -2638,12 +2675,15 @@ class SpecWorkerBase(nn.Module, ABC):
             gen_end = num_contexts + num_gen_logits
 
             temperatures = spec_metadata.temperatures[gen_start:gen_end]
+            # Only the CUDA-graph padding requests' rows change, and no request
+            # reads those rows of the step's logits.
             gen_logits = self._zero_padding_rows(gen_logits,
                                                  spec_metadata,
                                                  num_contexts,
                                                  batch_size,
                                                  runtime_draft_len + 1,
-                                                 packed_verify=True)
+                                                 packed_verify=True,
+                                                 inplace=True)
             # The target distribution the acceptance test divides by. It must be
             # filtered exactly as the draft probs were (see advanced_sample_draft),
             # which is why both use the same backend selection on the same mode --
