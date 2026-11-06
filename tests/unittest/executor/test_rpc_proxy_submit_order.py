@@ -18,6 +18,8 @@ from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.rpc_proxy_mixin import RpcExecutorMixin
 from tensorrt_llm.sampling_params import SamplingParams
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FinalResponse:
     """Duck-typed final LlmResponse (is_llm_response keys on has_error)."""
