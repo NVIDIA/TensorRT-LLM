@@ -5937,6 +5937,88 @@ def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -
     assert len(memsets) == (1 if over_limit else 0)
 
 
+def _mxfp8_fused_fc12_op_tensors(tokens: int = 4, hidden: int = 512, top_k: int = 2) -> dict:
+    """The tensors the MXFP8 fused FC12 ops take, on the CPU, valid by default.
+
+    The intermediate size 1408 makes the FC2 scale rows 44 bytes wide, which
+    the swizzled scale layout allows."""
+    experts, intermediate, rows = 2, 1408, 128
+    return {
+        "input": torch.zeros(tokens, hidden, dtype=torch.uint8),
+        "input_scale": torch.zeros(tokens, hidden // 32, dtype=torch.uint8),
+        "fc1_weight": torch.zeros(experts, 2 * intermediate, hidden, dtype=torch.uint8),
+        "fc1_weight_scale": torch.zeros(experts, 2 * intermediate, hidden // 32, dtype=torch.uint8),
+        "fc2_weight": torch.zeros(experts, hidden, intermediate, dtype=torch.uint8),
+        "fc2_weight_scale": torch.zeros(experts, hidden, intermediate // 32, dtype=torch.uint8),
+        "output": torch.zeros(tokens, hidden, dtype=torch.bfloat16),
+        "fc1_alpha": torch.ones(experts),
+        "fc2_alpha": torch.ones(experts),
+        "fc1_norm_const": torch.ones(1),
+        "tile_idx_to_group_idx": torch.zeros(1, dtype=torch.int32),
+        "tile_idx_to_mn_limit": torch.zeros(1, dtype=torch.int32),
+        "permuted_idx_to_expanded_idx": torch.zeros(rows, dtype=torch.int32),
+        "num_non_exiting_tiles": torch.zeros(1, dtype=torch.int32),
+        "token_final_scales": torch.zeros(tokens, top_k),
+    }
+
+
+def _validate_mxfp8_fused_fc12_op_tensors(tensors: dict, top_k: int = 2) -> None:
+    aligned_names = (
+        "input",
+        "input_scale",
+        "fc1_weight",
+        "fc1_weight_scale",
+        "fc2_weight",
+        "fc2_weight_scale",
+        "output",
+    )
+    cute_dsl_custom_ops._validate_mxfp8_fused_fc12_op_inputs(
+        {name: tensors[name] for name in aligned_names},
+        {name: t for name, t in tensors.items() if name not in aligned_names},
+        tensors["input"],
+        tensors["fc1_weight"],
+        tensors["output"],
+        tensors["token_final_scales"],
+        top_k,
+        512,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case, message",
+    [
+        ("strided_routing_scales", "token_final_scales must be contiguous"),
+        ("misaligned_input", "input data pointer must be 16-byte aligned"),
+        ("strided_output", "output must be contiguous"),
+        ("hidden_not_multiple", "hidden size 256 must be a multiple of 512"),
+        ("fp32_output", "output must be bfloat16"),
+        ("routing_scales_shape", "token_final_scales must be float32"),
+    ],
+)
+def test_mxfp8_fused_fc12_op_rejects_inputs_the_kernel_misreads(case: str, message: str) -> None:
+    """The MXFP8 fused FC12 ops build dense layouts from raw pointers, so a
+    strided view, a misaligned slice or a shape mismatch must raise
+    ``ValueError`` (not an ``assert`` that ``python -O`` drops) before any
+    launch. A valid set passes."""
+    _validate_mxfp8_fused_fc12_op_tensors(_mxfp8_fused_fc12_op_tensors())
+    tensors = _mxfp8_fused_fc12_op_tensors()
+    if case == "strided_routing_scales":
+        tensors["token_final_scales"] = torch.zeros(2, 4).t()
+    elif case == "misaligned_input":
+        tensors["input"] = torch.zeros(4 * 512 + 1, dtype=torch.uint8)[1:].view(4, 512)
+    elif case == "strided_output":
+        tensors["output"] = torch.zeros(4, 1024, dtype=torch.bfloat16)[:, :512]
+    elif case == "hidden_not_multiple":
+        tensors = _mxfp8_fused_fc12_op_tensors(hidden=256)
+    elif case == "fp32_output":
+        tensors["output"] = torch.zeros(4, 512)
+    elif case == "routing_scales_shape":
+        tensors["token_final_scales"] = torch.zeros(4, 3)
+    with pytest.raises(ValueError, match=message):
+        _validate_mxfp8_fused_fc12_op_tensors(tensors)
+
+
 @pytest.mark.cpu_only
 def test_mxfp8_input_quantization_tuning_cache_isolation() -> None:
     """Changing activation dtype must not reuse prequantized timing decisions."""
