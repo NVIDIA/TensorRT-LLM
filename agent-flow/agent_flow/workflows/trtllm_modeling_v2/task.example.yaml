@@ -67,12 +67,6 @@ features: []
 # run, or per unit and variant over `default`. A switch the spec sets itself keeps its value.
 # profile: {default: standard, multimodal: smoke}
 
-# The most test files a regression check runs besides the claims gates. When the changes to shared
-# code reach more, an agent picks that many from them by what changed; a pick that is not a subset
-# of at most that many runs them all. The files left out are deferred: the check clears nothing,
-# and delivery runs them, with no cap. Default: every test file the changes reach.
-# regression: {max_files: 40}
-
 # REQUIRED: the checkout the target is built in.
 trtllm_repo_path: /path/to/TensorRT-LLM
 

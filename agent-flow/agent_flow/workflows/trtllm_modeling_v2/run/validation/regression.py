@@ -2,10 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """The regression check: what a batch of changes to shared code did to the package's tests.
 
-No agent turn runs for it, unless the run caps what it runs (below). It runs
-a declared list, every test under the modeling_v2 package's test tree
-(:data:`PACKAGE_TESTS`), through the run's test results
-(``checks/test_results.py``), which hold at the exact commit they ran at:
+No agent turn runs for it. It runs a declared list, every test under the
+modeling_v2 package's test tree (:data:`PACKAGE_TESTS`), through the run's test
+results (``checks/test_results.py``), which hold at the exact commit they ran at:
 
 1. at the commit the checkout is at (the head), every test file with no result
    there yet, in a read-only snapshot of the head (:func:`record_at`);
@@ -28,25 +27,10 @@ reach no further. A change no unit test imports or reads (integration tests and
 their lists, docs, examples) reaches none. With no base to compare with, every
 file runs.
 
-A run may cap that with a curated selection (:data:`SELECTION_ENV`): a list of
-test files, written by an operator or an agent from what the change reaches, that
-the check runs instead (those of them present at the head), with the claims
-gates; a list that names none of them leaves the check INCOMPLETE. Without one, a
-run's ``regression.max_files`` caps it: when the change reaches more test files
-than that, besides the claims gates, an agent picks that many of them from the
-change (:func:`picked_files`), and a pick that is not a subset of at most that
-many runs them all.
-
-A cap defers what it leaves out; it never drops it. A capped check that passes
-clears nothing, so the next check's base stays where the last full check left
-it and the next change reaches those files again; its receipt names the head as
-``deferred``, and delivery runs, with no cap, every file the change since the
-last full check reaches while one is owed (:func:`owed`).
-
 A test that passed at the base and fails now, or a new one that fails, is a
 regression, and so is a test with no result at the head: the check fails,
-naming each. The head a full check found clean is its receipt's ``cleared``,
-the next check's base, whose results this check has already recorded.
+naming each. The head it found clean is its receipt's ``cleared``, the next
+check's base, whose results this check has already recorded.
 """
 
 from __future__ import annotations
@@ -54,7 +38,6 @@ from __future__ import annotations
 import ast
 import contextlib
 import math
-import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -100,9 +83,6 @@ UNREACHED_PREFIXES: tuple[str, ...] = (
     ".github/",
 )
 UNREACHED_SUFFIXES: tuple[str, ...] = (".md", ".rst")
-#: A file listing the test files (one repo-relative path a line, ``#`` comments) a regression
-#: check runs instead of every file the change reaches: a curated selection for a run.
-SELECTION_ENV = "MV2FLOW_REGRESSION_SELECTION"
 #: Test files every check runs: the package's source-level gates read every entry.
 ALWAYS_RUN = re.compile(r"(?:^|/)test_modeling_v2_[a-z_]*claims[a-z_]*\.py$")
 
@@ -113,9 +93,6 @@ ALWAYS_RUN = re.compile(r"(?:^|/)test_modeling_v2_[a-z_]*claims[a-z_]*\.py$")
 RunJob = Callable[..., tuple[int, str]]
 #: A read-only tree at one commit, held for the block.
 TreeAt = Callable[[str], ContextManager[Path]]
-#: Asks an agent for at most ``limit`` of ``files``, given what changed (``summary``):
-#: ``(path, files, limit, summary)``; it writes the paths it picks to ``path``, one a line.
-PickFiles = Callable[[Path, Sequence[str], int, str], None]
 
 
 @dataclass
@@ -134,8 +111,6 @@ class RegressionResult:
     jobs: int = 0
     #: Which test files it ran, and why (:func:`affected_files`).
     scope: str = ""
-    #: Test files the change reaches that a cap left for a later full check or delivery.
-    deferred: int = 0
 
     @property
     def passed(self) -> bool:
@@ -147,12 +122,6 @@ class RegressionResult:
             f"{self.verdict} at {self.head[:10]} against {base}: {self.held} test(s) did not "
             f"fail at the head, {self.jobs} test job(s) run"
             + (f"; {self.scope}" if self.scope else "")
-            + (
-                f"; {self.deferred} reached test file(s) deferred to the next full check or "
-                "delivery"
-                if self.deferred
-                else ""
-            )
         )
 
 
@@ -438,116 +407,6 @@ def _unreached(path: str) -> bool:
     return path.startswith(UNREACHED_PREFIXES) or path.endswith(UNREACHED_SUFFIXES)
 
 
-def _selection_lines(path: str | Path) -> list[str]:
-    """The paths a selection file lists: one a line, ``#`` comments and blank lines aside."""
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
-    return [word for word in (line.split("#", 1)[0].strip() for line in lines) if word]
-
-
-def curated_files(files: Sequence[str]) -> tuple[list[str], str] | None:
-    """The curated selection of :data:`SELECTION_ENV` among ``files``, and why; ``None`` unset.
-
-    The listed files present among ``files``, and the claims gates (:data:`ALWAYS_RUN`), which
-    every check runs. Listed paths that are not among ``files`` are named in the why; a list
-    that names none of them gives the claims gates alone, which :func:`run_regression_check`
-    refuses to take for a check.
-    """
-    path = os.environ.get(SELECTION_ENV, "").strip()
-    if not path:
-        return None
-    try:
-        wanted = _selection_lines(path)
-    except OSError as exc:
-        raise ValueError(f"{SELECTION_ENV}={path} cannot be read: {exc}") from exc
-    known = set(files)
-    named = {w for w in wanted if w in known}
-    picked = sorted(named | {f for f in files if ALWAYS_RUN.search(f)})
-    why = f"{len(named)} curated test files ({path}) of {len(files)}, with the claims gates"
-    absent = sorted({w for w in wanted if w not in known})
-    if absent:
-        shown = ", ".join(absent[:5]) + (f" and {len(absent) - 5} more" if len(absent) > 5 else "")
-        why += f"; not test files at the head: {shown}"
-    return picked, why
-
-
-def picked_files(
-    files: Sequence[str],
-    scope: str,
-    *,
-    limit: int,
-    pick: Callable[[Path, Sequence[str], int], None],
-    path: Path,
-) -> tuple[list[str], str]:
-    """``files`` (and ``scope``, why) capped at ``limit`` by an agent's pick.
-
-    When more than ``limit`` of ``files`` are reached besides :data:`ALWAYS_RUN`, ``pick``
-    writes at most ``limit`` of those others to ``path``, and they run with the claims gates.
-    A pick that names a file not among them, more than ``limit``, or none, or that raised,
-    leaves every one of ``files`` to run.
-    """
-    gates = {f for f in files if ALWAYS_RUN.search(f)}
-    others = [f for f in files if f not in gates]
-    if len(others) <= limit:
-        return list(files), scope
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.unlink(missing_ok=True)
-    try:
-        pick(path, others, limit)
-        wanted = set(_selection_lines(path)) - gates
-    except Exception as exc:  # an agent turn that failed picks nothing: every file runs
-        problem = f"failed: {type(exc).__name__}: {exc}"
-    else:
-        foreign = sorted(wanted - set(others))
-        if foreign:
-            problem = f"names files the change does not reach: {', '.join(foreign[:5])}"
-        elif len(wanted) > limit:
-            problem = f"names {len(wanted)}"
-        else:
-            problem = "" if wanted else "names none"
-    if problem:
-        return list(files), f"{scope}; every one runs, as the pick of at most {limit} {problem}"
-    chosen = sorted(wanted | gates)
-    return chosen, f"{len(chosen)} test files an agent picked ({path}), of {scope}"
-
-
-def _change_summary(
-    repo: str | Path, base: str, head: str, cache_dir: Path, files: Sequence[str]
-) -> str:
-    """What changed from ``base`` to ``head``, for an agent picking among ``files``.
-
-    The commits and the files they changed, and those of ``files`` whose every test failed at
-    the base in the environment last recorded there: a test that failed there cannot regress.
-    """
-    log = (git_output(repo, "log", "--oneline", "--no-decorate", f"{base}..{head}") or "").strip()
-    stat = (git_output(repo, "diff", "--no-renames", "--stat=160", base, head) or "").rstrip()
-    lines = [
-        f"## What changed: `git diff {base[:12]} {head[:12]}`",
-        "",
-        "```",
-        *log.splitlines()[:40],
-        "",
-        *stat.splitlines()[:150],
-        "```",
-    ]
-    at_base = test_results.recorded(cache_dir, base)
-    failing = []
-    for file in files:
-        ids = at_base.test_ids(file) or []
-        ended = [at_base.result(i) for i in ids]
-        if ended and all(r is not None and r.outcome in test_results.FAILING for r in ended):
-            failing.append(file)
-    if failing:
-        lines += [
-            "",
-            "## Test files whose every test failed at the base",
-            "",
-            "None of their tests can regress, unless the change adds one:",
-            "",
-            *[f"- `{f}`" for f in failing],
-        ]
-    return "\n".join(lines)
-
-
 def affected_files(
     repo: str | Path,
     base: str | None,
@@ -647,50 +506,31 @@ def run_regression_check(
     python: str,
     name: str,
     paths: Sequence[str] = PACKAGE_TESTS,
-    max_files: int | None = None,
-    pick: PickFiles | None = None,
-    curate: bool = True,
 ) -> RegressionResult:
     """Run one regression check on ``head``; see the module docstring.
 
     ``repo`` holds both commits; ``tree_at`` gives a read-only tree at one,
     ``run_job`` runs a command line in it on the run's devices, and
     ``python`` is the tree's interpreter. ``name`` keeps this check's
-    selections apart from another's. With a base, ``max_files`` caps the
-    files the change reaches by ``pick``'s choice (:func:`picked_files`).
-    ``curate`` off ignores :data:`SELECTION_ENV`: delivery's check runs
-    every file the change reaches. The result counts what a cap left out
-    (:attr:`RegressionResult.deferred`).
+    selections apart from another's.
     """
     cache_dir = Path(workspace) / test_results.CACHE_DIRNAME
     out = Path(workspace) / SELECTIONS_DIRNAME / name
     job = dict(cache_dir=cache_dir, out=out, tree_at=tree_at, run_job=run_job, python=python)
     base = test_results.default_base(workspace, repo, head)
-    listed = test_results.list_test_files(repo, head, paths)
-    reached, scope = affected_files(repo, base, head, listed, roots=(MODELING_V2_PACKAGE, *paths))
-    files = reached
-    curated = curated_files(listed) if curate else None
-    if curated is not None:
-        files, why = curated
-        scope = f"{why}, instead of {scope}"
-        if all(ALWAYS_RUN.search(f) for f in files):
-            failure = f"{SELECTION_ENV} names none of the {len(listed)} test files at the head"
-            return RegressionResult(head, base, "INCOMPLETE", [failure], 0, 0, scope)
-    elif max_files and pick is not None and base is not None:
-
-        def ask(path: Path, others: Sequence[str], limit: int) -> None:
-            pick(path, others, limit, _change_summary(repo, base, head, cache_dir, others))
-
-        files, scope = picked_files(
-            files, scope, limit=max_files, pick=ask, path=out / f"picked-{head[:12]}.txt"
-        )
-    deferred = len(set(reached) - set(files))
+    files, scope = affected_files(
+        repo,
+        base,
+        head,
+        test_results.list_test_files(repo, head, paths),
+        roots=(MODELING_V2_PACKAGE, *paths),
+    )
     selected = set(files)
     results, ran, code, tail = record_at(head, files, **job)
     if files and not results.env_digest:
         # No session at the head: nothing the jobs ran can be read.
         failure = f"the test job recorded nothing (exit {code}): {tail[-500:]}"
-        return RegressionResult(head, base, "INCOMPLETE", [failure], 0, ran, scope, deferred)
+        return RegressionResult(head, base, "INCOMPLETE", [failure], 0, ran, scope)
     if base is None:
         # Nothing landed before the head to compare with: each failure is the head's own.
         view = test_results.head_results(results, files)
@@ -698,7 +538,7 @@ def run_regression_check(
         failures += [f"{nodeid} (no result at the head)" for nodeid in view.not_run]
         verdict = "REGRESSED" if view.failing else "INCOMPLETE" if failures else "CLEAN"
         held = len(view.passed) + len(view.skipped)
-        return RegressionResult(head, base, verdict, _named(failures), held, ran, scope, deferred)
+        return RegressionResult(head, base, verdict, _named(failures), held, ran, scope)
     base_files = [f for f in test_results.list_test_files(repo, base, paths) if f in selected]
 
     def against_base() -> test_results.CompareReport:
@@ -715,37 +555,7 @@ def run_regression_check(
     failures += [
         f"{c.head.nodeid} (fails at the head; no result at the base)" for c in report.base_unknown
     ]
-    return RegressionResult(
-        head, base, report.verdict, _named(failures), report.passed, ran, scope, deferred
-    )
-
-
-def owed(workspace: str | Path, repo: str | Path, head: str) -> list[str]:
-    """The heads capped checks deferred test files at that no full check has run since.
-
-    A capped check that passed names its head ``deferred`` in its receipt and clears nothing
-    (the module docstring). A full check whose head descends from it ran what it left out: the
-    change from that check's base, which the capped one did not move, reaches them again. Those
-    still owed among ``head``'s ancestors, oldest first, then each receipt that does not read
-    (``unreadable <file>``), which may name one; delivery runs them
-    (``completion.deferred_regression_check``).
-    """
-    base = test_results.default_base(workspace, repo, head)
-    found = []
-    unreadable: list[Path] = []
-    for receipt in test_results.task_receipts(workspace, unreadable):
-        name = str(receipt.get("deferred") or "")
-        if not name:
-            continue
-        commit = git_output(repo, "rev-parse", "--verify", "--quiet", f"{name}^{{commit}}") or ""
-        commit = commit.strip()
-        if not commit or git_output(repo, "merge-base", "--is-ancestor", commit, head) is None:
-            continue
-        if base and git_output(repo, "merge-base", "--is-ancestor", commit, base) is not None:
-            continue
-        found.append((str(receipt.get("written_at") or ""), commit))
-    heads = list(dict.fromkeys(commit for _, commit in sorted(found)))
-    return heads + [f"unreadable {path.name}" for path in unreadable]
+    return RegressionResult(head, base, report.verdict, _named(failures), report.passed, ran, scope)
 
 
 __all__ = [
@@ -754,18 +564,13 @@ __all__ = [
     "PACKAGE_TESTS",
     "PROBE_TIMEOUT_S",
     "SELECTIONS_DIRNAME",
-    "SELECTION_ENV",
     "TEST_BUDGET_S",
-    "PickFiles",
     "RegressionResult",
     "SessionJobs",
     "affected_files",
-    "curated_files",
     "job_runner",
     "job_timeout",
     "max_jobs",
-    "owed",
-    "picked_files",
     "record_at",
     "run_regression_check",
 ]

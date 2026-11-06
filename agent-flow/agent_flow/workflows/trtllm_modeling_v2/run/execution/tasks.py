@@ -25,7 +25,7 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping
 
 import yaml
 from rich.markup import escape as escape_markup
@@ -35,7 +35,6 @@ from agent_flow.console import print_message, print_rule
 from ...agents.decisions import DECISION_REMINDER
 from ...agents.prompts.survey import capture_lists_block
 from ...agents.prompts.tags import tag_section, task_tags
-from ...agents.slots import Priority, turn_priority
 from ...checks import check_config, gate_cli
 from ...infra.compute.scheduler import WATCHER_STALE_S, watcher_records
 from ...infra.git import CommitPolicy
@@ -43,12 +42,7 @@ from ...operators import survey_review
 from ...operators.coverage import QueueItem, VocabularyError, load_vocabulary, queue_item_from_ref
 from ...spec import lint as lint_mod
 from ...spec import variants as variants_mod
-from ...spec.task_schema import (
-    REGRESSION_FIELD,
-    assembly_units,
-    members_for,
-    parse_parallel_segment,
-)
+from ...spec.task_schema import assembly_units, members_for, parse_parallel_segment
 from ...tune import stage as tune_stage
 from .. import graph as graph_mod
 from .. import inbox as inbox_mod
@@ -134,8 +128,6 @@ class ExecutionStage:
         self._turns_by_key = {}
         self._tasks_dispatched = set()
         self._regression_cleared = {}
-        #: Regression checks a cap held to part of what they reach: the head each passed at.
-        self._regression_deferred: dict[str, str] = {}
         self._landed_attempts = {}
         self._merged = {}
         self._tls = workflow._tls
@@ -273,7 +265,6 @@ class ExecutionStage:
         self.workflow._turns.consume([task.id])
         if task.kind == graph_mod.CHECK_KIND and task.status == "done":
             cleared = self._regression_cleared.get(task.id, "")
-            deferred = self._regression_deferred.get(task.id, "")
             if task.regression:
                 note = "the package tests passed after the changes to shared code it covers"
             else:
@@ -287,7 +278,6 @@ class ExecutionStage:
                         result=TaskResult(CHECKED, note),
                         attempt=task.attempts,
                         cleared=cleared,
-                        deferred=deferred,
                     ),
                 )
             except OSError as exc:
@@ -366,22 +356,17 @@ class ExecutionStage:
 
     # ------------------------------------------------------- regression checks
     def _run_regression_check(self, task: graph_mod.Task) -> list[str]:
-        """Run one regression check; what failed, one line each.
+        """Run one regression check, with no agent turn; what failed, one line each.
 
         In a read-only snapshot of the commit the checkout is at, as test jobs
         on the run's devices (``run/validation/regression.py``). The head it finds clean
-        is the receipt's ``cleared``, the next check's base. Past the spec's
-        ``regression.max_files``, the planner picks the files it runs
-        (:meth:`_pick_regression_files`); a check so capped clears nothing, and its
-        receipt names the head ``deferred``: the files it left out run at the next full
-        check or at delivery (``regression.owed``).
+        is the receipt's ``cleared``, the next check's base.
         """
         repo = Path(str(self.workflow.task_data.get("trtllm_repo_path") or ""))
         head = self.workflow._head()
         if not head:
             return [f"{repo} has no commit to check"]
         tree_at, run_job, python = regression_mod.job_runner(self.workflow, f"regression-{task.id}")
-        limit = (self.workflow.task_data.get(REGRESSION_FIELD) or {}).get("max_files")
         result = regression_mod.run_regression_check(
             workspace=self.workflow.workspace,
             repo=repo,
@@ -390,60 +375,12 @@ class ExecutionStage:
             run_job=run_job,
             python=python,
             name=task.id,
-            max_files=int(limit) if limit else None,
-            pick=lambda path, files, most, summary: self._pick_regression_files(
-                task, path, files, most, summary
-            ),
         )
         self.workflow.journal.event("regression", f"{task.id}: {result.summary()}")
         if result.passed:
             with self._turn_lock:
-                if result.deferred:
-                    self._regression_deferred[task.id] = head
-                else:
-                    self._regression_cleared[task.id] = head
+                self._regression_cleared[task.id] = head
         return result.failures
-
-    def _pick_regression_files(
-        self, task: graph_mod.Task, path: Path, files: Sequence[str], limit: int, summary: str
-    ) -> None:
-        """A planner turn that writes to ``path`` at most ``limit`` of ``files`` for ``task`` to run.
-
-        Asked when the changes ``task`` covers reach more than ``regression.max_files`` test
-        files; the check refuses an answer that is not a subset of at most ``limit`` and then
-        runs them all (``regression.picked_files``).
-        """
-        repo = self.workflow.task_data.get("trtllm_repo_path") or ""
-        lines = [
-            f"## Regression check `{task.id}`: pick the test files it runs",
-            "",
-            "This is not a planning turn: write no graph and no decision file. The file named "
-            "below is this turn's only output.",
-            "",
-            f"The changes to shared code this check covers reach {len(files)} test files of the "
-            f"modeling_v2 package, more than the run's `regression.max_files` ({limit}). Pick at "
-            f"most {limit} of them: those most likely to fail if the change broke what it "
-            "touches, first the tests of the code it changed, then those of its closest users. "
-            "The claims gates run anyway: leave them out. The files you leave out are deferred, "
-            "not skipped: this check then clears nothing, and they run at the next full check "
-            "or at delivery.",
-            "",
-            f"Write the paths you pick to `{path}`, one a line, each exactly as listed below "
-            f"(`#` starts a comment). A path not listed, more than {limit} paths, or none is "
-            f"refused, and then all {len(files)} run.",
-            "",
-            f"Repository: `{repo}`.",
-            "",
-            summary,
-            "",
-            "## The test files the changes reach",
-            "",
-            *[f"- `{f}`" for f in files],
-        ]
-        with turn_priority(Priority.PLANNER):
-            self.workflow._run_turn(
-                PLANNER_ROLE, f"{task.id}: pick test files", "\n".join(lines), work=task.id
-            )
 
     # ------------------------------------------------------ worktrees, devices
     def _make_integration(self, state: WorkflowState) -> Integration | None:

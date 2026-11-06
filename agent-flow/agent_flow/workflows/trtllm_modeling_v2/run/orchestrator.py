@@ -192,8 +192,7 @@ class Services:
     #: Whether a verdict recorded on another state of the target holds on it as it
     #: is now: what it read of the tree is unchanged.
     holds: Callable[[contract_mod.Verdict], bool] | None = None
-    #: One regression check (no agent turn, except a pick of files when the spec caps them with
-    #: ``regression.max_files``): run the package tests after its batch of
+    #: One regression check (no agent turn): run the package tests after its batch of
     #: changes to shared code and return what failed, one line each (blocking; on the check
     #: pool). ``None``: a regression check passes with nothing run.
     regression: Callable[[graph_mod.Task], list[str]] | None = None
@@ -1722,7 +1721,7 @@ class GraphOrchestrator:
             )
         )
         self._note(
-            f"the orchestrator added {added.id}, a regression check: once "
+            f"the orchestrator added {added.id}, a regression check with no agent turn: once "
             f"{', '.join(added.depends_on) or 'it can'} land(s), it runs the modeling_v2 package "
             f"tests on the changed shared code; a failure comes back to you",
             added=(added.id,),
