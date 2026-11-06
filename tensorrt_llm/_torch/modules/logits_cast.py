@@ -14,27 +14,18 @@
 # limitations under the License.
 """Widen LM-head logits to float32 with a vectorized Triton kernel.
 
-`LogitsProcessor` calls `widen_logits_to_fp32` when ``TLLM_FAST_LOGITS_CAST=1``.
+`LogitsProcessor` widens every LM-head output with `widen_logits_to_fp32`.
 """
-
-import os
 
 import torch
 import triton
 import triton.language as tl
-
-FAST_LOGITS_CAST_ENV = "TLLM_FAST_LOGITS_CAST"
 
 # Elements and warps per program. With 256 x 163840 logits, 2048/4 takes 25.3 us
 # (75% of the 252 MB byte floor), 4096/8 takes 28.0 us, and 8192/16 and larger
 # are slower.
 _BLOCK = 2048
 _NUM_WARPS = 4
-
-
-def fast_logits_cast_enabled() -> bool:
-    """Whether ``TLLM_FAST_LOGITS_CAST=1`` selects the Triton widening kernel."""
-    return os.environ.get(FAST_LOGITS_CAST_ENV, "0") == "1"
 
 
 @triton.jit
@@ -48,8 +39,10 @@ def _widen_to_fp32_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
 def widen_logits_to_fp32(logits: torch.Tensor) -> torch.Tensor:
     """Return ``logits.float()``, through the vectorized kernel when it applies.
 
-    The kernel applies to a contiguous BF16/FP16 CUDA tensor. Anything else
-    (already float32, strided, CPU, empty) takes ``Tensor.float()``.
+    The kernel applies to a contiguous BF16/FP16 CUDA tensor outside
+    torch.compile. Anything else (already float32, strided, CPU, empty, or
+    traced by torch.compile, where Inductor generates the cast itself) takes
+    ``Tensor.float()``.
 
     ``Tensor.float()`` runs PyTorch's dynamic-casting ``unrolled_elementwise``
     kernel, which reaches about 1/6 of HBM bandwidth on ``[rows, vocab]`` logits
@@ -62,6 +55,7 @@ def widen_logits_to_fp32(logits: torch.Tensor) -> torch.Tensor:
         or not logits.is_cuda
         or not logits.is_contiguous()
         or logits.numel() == 0
+        or torch.compiler.is_compiling()
     ):
         return logits.float()
     out = torch.empty(logits.shape, dtype=torch.float32, device=logits.device)
