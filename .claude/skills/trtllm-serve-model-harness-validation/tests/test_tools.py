@@ -29,9 +29,11 @@ import sys
 import threading
 import time
 import types
+from pathlib import Path
 
 import aiohttp
 import pytest
+import yaml
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
@@ -770,3 +772,22 @@ def test_a_recall_probe_without_a_size_is_refused(sizes):
     with pytest.raises(SystemExit) as stop:
         probe_recall.main(["--base-url", "http://127.0.0.1:9", "--model", "m", "--sizes", sizes])
     assert stop.value.code == 2
+
+
+# --------------------------------------------------------------------------- the Codex pointer
+
+
+def _frontmatter(path):
+    return yaml.safe_load(path.read_text().split("---\n")[1])
+
+
+def test_the_codex_pointer_carries_the_skills_name_and_description():
+    """Codex finds the skill through .codex/skills, whose SKILL.md must stay the skill's own."""
+    skill = Path(SCRIPTS).parent
+    pointer = skill.parents[2] / ".codex" / "skills" / skill.name / "SKILL.md"
+    if not pointer.exists():
+        pytest.skip("no Codex pointer here: a copy of the skill alone")
+    real, mirror = _frontmatter(skill / "SKILL.md"), _frontmatter(pointer)
+    keys = ("name", "description")
+    assert {k: mirror.get(k) for k in keys} == {k: real.get(k) for k in keys}
+    assert f".claude/skills/{skill.name}/SKILL.md" in pointer.read_text()

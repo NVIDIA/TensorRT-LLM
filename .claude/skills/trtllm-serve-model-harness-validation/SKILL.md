@@ -91,7 +91,8 @@ inputs and the right checks. That is what this skill provides:
   Until the thresholds are set, every rate reads BLOCKED, by design.
 - **Any agent can run it.** The procedure needs a shell and Python, nothing of Claude Code's own.
   - Codex 0.155.1 finds skills in `~/.codex/skills` and in the repository's `.codex/skills`, not
-    in `.claude/skills`: point it at this file.
+    in `.claude/skills`. `.codex/skills/<this skill>/SKILL.md` points it here, with this file's
+    `name` and `description` (the tests keep them equal).
   - Where the text names a Claude Code feature (`/loop`), use your agent's own way to wait for
     a job.
   - The validator agent can be a sub-agent, ideally of another vendor's model.
