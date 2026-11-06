@@ -1061,15 +1061,22 @@ class TestPathResponseSwitch:
         )
         return messages
 
-    def test_an_unrecognized_value_warns_and_stays_allowed(self, monkeypatch):
-        """Silently reading a typo as "1" would break working deployments, and
-        silently reading it as "0" would leave one that believes it is locked
-        down wide open. Neither is safe to do quietly."""
+    def test_an_unrecognized_value_keeps_the_server_from_starting(self, monkeypatch):
+        """Reading a value such as ``true`` as "0" would leave a server that is
+        meant to be locked down wide open, so startup refuses it, and a request
+        that still sees it treats path responses as off."""
         monkeypatch.setenv(self._ENV, "true")
-        warnings = self._capture(monkeypatch, "warning")
 
+        with pytest.raises(ValueError, match=f"Unrecognized value for {self._ENV}"):
+            visual_gen_utils.check_path_response_policy()
+        assert visual_gen_utils.path_response_is_disabled() is True
+
+    @pytest.mark.parametrize("value", ["", "0"])
+    def test_the_switch_unset_or_zero_allows_path_responses(self, monkeypatch, value):
+        monkeypatch.setenv(self._ENV, value)
+
+        visual_gen_utils.check_path_response_policy()
         assert visual_gen_utils.path_response_is_disabled() is False
-        assert any(self._ENV in w for w in warnings)
 
     def test_the_former_name_keeps_the_server_from_starting(self, monkeypatch):
         """Silently ignoring the former name would turn path responses back on

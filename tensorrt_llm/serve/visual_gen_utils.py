@@ -128,35 +128,37 @@ def path_response_is_disabled() -> bool:
     A ``path`` response discloses where the server wrote a file: what a
     co-located client wants and what a remote one has no business seeing. The
     code cannot tell the two deployments apart, so it is allowed by default
-    and turned off with ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1``. A ``path``
-    *reference*, which has the server read a file, follows
-    ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` instead (`_reference_transport`).
+    and turned off with ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1``. Any value
+    other than unset, empty or ``0`` counts as off; `check_path_response_policy`
+    refuses one that is not ``1`` at startup. A ``path`` *reference*, which has
+    the server read a file, follows ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR`` instead
+    (`_reference_transport`).
     """
-    raw = os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "0")
-    if raw not in ("0", "1"):
-        logger.warning(
-            f"Unrecognized value for {_PATH_RESPONSE_DISABLED_ENV}: {raw!r}. "
-            "Expected '0' or '1'. Treating as '0' (path responses allowed)."
-        )
-    return raw == "1"
+    return os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "") not in ("", "0")
 
 
 def check_path_response_policy() -> None:
-    """Refuse the switch's former name at server start; log the switch when set.
+    """Refuse the switch's former name or an unrecognized value at server start.
 
     ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` has shipped, so a deployment may still
     set it to keep path responses off. Treating it as an alias would keep an
     outdated name alive, and ignoring it would silently turn path responses
-    back on; failing to start names the variable to set instead. Reading the
-    switch here also surfaces an unrecognized value at startup rather than at
-    the first request that asks for a path response.
+    back on; failing to start names the variable to set instead. An
+    unrecognized value of the switch is refused too, since reading it either
+    way could be wrong.
     """
     if _FORMER_PATH_RESPONSE_DISABLED_ENV in os.environ:
         raise ValueError(
             f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} has been renamed; unset it and "
             f"set {_PATH_RESPONSE_DISABLED_ENV} instead."
         )
-    if path_response_is_disabled():
+    raw = os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "")
+    if raw not in ("", "0", "1"):
+        raise ValueError(
+            f"Unrecognized value for {_PATH_RESPONSE_DISABLED_ENV}: {raw!r}. "
+            "Expected '1' to disable path responses, or '0' or unset to allow them."
+        )
+    if raw == "1":
         logger.info("response_format='path' is disabled (%s=1).", _PATH_RESPONSE_DISABLED_ENV)
 
 
