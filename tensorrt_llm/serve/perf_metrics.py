@@ -47,20 +47,15 @@ Streaming responses carry the same fields in a named SSE event after ``[DONE]``:
     }
 """
 
-import asyncio
 import json
 import math
-import os
-import socket
-import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve._base.jsonl_writer import JsonlRecordWriter
 from tensorrt_llm.serve._perf_metrics_schema import (
     SERVER_TIMING_HEADER,
     DisaggPerfMetricsRecord,
@@ -648,136 +643,28 @@ def _jsonl_record(record: Dict[str, Any]) -> PerfMetricsRecord:
     return disagg_record
 
 
-class PerfMetricsJsonlWriter:
-    """Best-effort bounded JSONL writer shared by both serving apps."""
+class PerfMetricsJsonlWriter(JsonlRecordWriter):
+    """Best-effort bounded JSONL writer shared by both serving apps.
+
+    One ``perf_metrics-<server_kind>-<hostname>-<pid>-<timestamp>.jsonl`` file per server
+    process, each completed request record written in the :mod:`_perf_metrics_schema` shape.
+    """
+
+    # ``_jsonl_record`` raises KeyError for a record without the phases the schema needs.
+    malformed_record_errors = (KeyError, TypeError, ValueError)
 
     def __init__(self, output_dir: Optional[str], server_kind: str):
-        self._output_dir = Path(output_dir) if output_dir else None
-        self._server_kind = server_kind
-        self._queue: asyncio.Queue = asyncio.Queue(maxsize=_WRITER_QUEUE_SIZE)
-        self._task: Optional[asyncio.Task] = None
-        self._path: Optional[Path] = None
-        self.dropped_records = 0
-        self._write_error_count = 0
-        self._unexpected_error_counts: dict[str, int] = {}
+        super().__init__(
+            output_dir,
+            file_stem=f"perf_metrics-{server_kind}",
+            subject="performance metrics",
+            queue_size=_WRITER_QUEUE_SIZE,
+            batch_size=_WRITER_BATCH_SIZE,
+            shutdown_timeout=_WRITER_SHUTDOWN_TIMEOUT_SECONDS,
+        )
 
-    async def start(self) -> None:
-        if self._output_dir is None or self._task is not None:
-            return
-        try:
-            self._output_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            filename = (
-                f"perf_metrics-{self._server_kind}-{socket.gethostname()}-"
-                f"{os.getpid()}-{timestamp}.jsonl"
-            )
-            self._path = self._output_dir / filename
-            self._task = asyncio.create_task(self._run())
-        except OSError as error:
-            logger.error("Disabling performance metrics JSONL output: %s", error)
-            self._output_dir = None
-
-    def submit(self, record: Dict[str, Any]) -> None:
-        if self._task is None:
-            return
-        try:
-            self._queue.put_nowait(record)
-        except asyncio.QueueFull:
-            self.dropped_records += 1
-            if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                logger.warning("Dropped %d performance metrics records", self.dropped_records)
-
-    async def close(self) -> None:
-        if self._task is None:
-            return
-        task = self._task
-        try:
-            await asyncio.wait_for(
-                self._queue.put(None),
-                timeout=_WRITER_SHUTDOWN_TIMEOUT_SECONDS,
-            )
-            await asyncio.wait_for(task, timeout=_WRITER_SHUTDOWN_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            logger.warning(
-                "Timed out flushing performance metrics JSONL; dropping remaining records"
-            )
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        finally:
-            self._task = None
-
-    async def _run(self) -> None:
-        """Drain queued records into the JSONL file until ``close()`` stops the writer.
-
-        This task is the queue's only consumer: if an exception ended it, ``submit()`` would
-        keep accepting records that are never written. A record or batch that fails for an
-        unexpected reason is therefore dropped and logged, and the loop goes on.
-        ``asyncio.CancelledError`` is not an ``Exception``, so ``close()`` can still cancel it.
-        """
-        stop = False
-        while not stop:
-            item = await self._queue.get()
-            if item is None:
-                return
-            records = [item]
-            while len(records) < _WRITER_BATCH_SIZE:
-                try:
-                    item = self._queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                if item is None:
-                    stop = True
-                    break
-                records.append(item)
-            serialized = []
-            for record in records:
-                try:
-                    item = _jsonl_record(record)
-                    serialized.append(
-                        json.dumps(item, separators=(",", ":"), allow_nan=False) + "\n"
-                    )
-                except (KeyError, TypeError, ValueError) as error:
-                    self.dropped_records += 1
-                    if self.dropped_records == 1 or self.dropped_records % 1000 == 0:
-                        logger.warning("Dropped malformed performance metrics record: %s", error)
-                except Exception as error:
-                    self._drop_after_unexpected_error(1, "serialize", error)
-            if not serialized:
-                continue
-            try:
-                data = "".join(serialized)
-                await asyncio.to_thread(self._write, data)
-            except OSError as error:
-                self.dropped_records += len(serialized)
-                self._write_error_count += 1
-                if self._write_error_count == 1:
-                    logger.warning("Failed to write performance metrics JSONL: %s", error)
-            except Exception as error:
-                self._drop_after_unexpected_error(len(serialized), "write", error)
-
-    def _drop_after_unexpected_error(self, num_records: int, stage: str, error: Exception) -> None:
-        """Count records lost to an unexpected exception and log it, rate-limited.
-
-        Each stage has its own rate limit so its first failure is always logged.
-        The message carries the traceback, which shows where serializing or writing failed.
-        """
-        self.dropped_records += num_records
-        count = self._unexpected_error_counts.get(stage, 0) + 1
-        self._unexpected_error_counts[stage] = count
-        if count == 1 or count % 1000 == 0:
-            logger.error(
-                "Dropped %d performance metrics record(s) that failed to %s (%s: %s)\n%s",
-                num_records,
-                stage,
-                type(error).__name__,
-                error,
-                "".join(traceback.format_exception(error)).rstrip(),
-            )
-
-    def _write(self, data: str) -> None:
-        if self._path is not None:
-            with self._path.open("a", encoding="utf-8") as output:
-                output.write(data)
+    def _serialize(self, record: Dict[str, Any]) -> str:
+        return super()._serialize(_jsonl_record(record))
 
 
 def build_metrics_sse_event(headers: Dict[str, str]) -> bytes:
