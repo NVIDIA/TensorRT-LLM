@@ -1914,20 +1914,19 @@ class TestCtxFrontendAffinity:
         assert mock_session.post.call_count == 1
 
     @pytest.mark.parametrize(
-        "server",
+        "server, expected",
         [
-            "localhost:8000/",
-            "http://localhost:8000",
-            "http://localhost:8000/",
-            "https://localhost:8000/",
+            ("localhost:8000/", "localhost:8100"),
+            ("http://localhost:8000", "http://localhost:8100"),
+            ("http://localhost:8000/", "http://localhost:8100"),
+            ("https://localhost:8000/", "https://localhost:8100"),
         ],
     )
     def test_frontend_port_for_scheme_and_trailing_slash_entries(
-        self, mock_router, mock_session, server
+        self, mock_router, mock_session, server, expected
     ):
+        # crc32(b"conv-a") % 4 == 0 picks the first frontend: port 8000 + 100.
         client = self._client(mock_router, mock_session, (4, 100))
-        frontend = zlib.crc32(b"conv-a") % 4
-        expected = f"{server.rstrip('/').rpartition(':')[0]}:{8000 + 100 * (frontend + 1)}"
         assert client._url_server(server, self._request("conv-a")) == expected
 
 

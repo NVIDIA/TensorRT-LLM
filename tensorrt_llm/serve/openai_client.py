@@ -239,6 +239,11 @@ def _server_base_url(server: str) -> str:
     return f"http://{server}".rstrip("/")
 
 
+def _server_netloc(server_or_url: str) -> str:
+    """Return host:port of a router server entry or of a URL built from one."""
+    return urlsplit(_server_base_url(server_or_url)).netloc
+
+
 class OpenAIHttpClient(OpenAIClient):
     def __init__(
         self,
@@ -293,7 +298,7 @@ class OpenAIHttpClient(OpenAIClient):
         self._refused_affinity_ports: dict[str, float] = {}
 
     def _url_server(self, server: str, request: UCompletionRequest) -> str:
-        """host:port to send a request routed to server to.
+        """Server entry to send a request routed to server to, with the scheme of server kept.
 
         With frontend affinity, a request carrying a conversation id goes to
         the affinity port of the frontend picked by crc32(conversation_id) % K;
@@ -311,8 +316,7 @@ class OpenAIHttpClient(OpenAIClient):
         host, _, port = server.rstrip("/").rpartition(":")
         frontend = zlib.crc32(conversation_id.encode()) % num_frontends
         affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
-        # _post_with_retry records a refused port by the netloc of its URL.
-        refused_key = urlsplit(_server_base_url(affinity_server)).netloc
+        refused_key = _server_netloc(affinity_server)
         refused_at = self._refused_affinity_ports.get(refused_key)
         if refused_at is not None:
             if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
@@ -643,7 +647,7 @@ class OpenAIHttpClient(OpenAIClient):
                         f"Context frontend affinity port of {url} refused the connection: "
                         f"{e} - sending to the shared port {fallback_url}"
                     )
-                    self._refused_affinity_ports[urlsplit(url).netloc] = (
+                    self._refused_affinity_ports[_server_netloc(url)] = (
                         get_steady_clock_now_in_seconds()
                     )
                     url, fallback_url = fallback_url, None
