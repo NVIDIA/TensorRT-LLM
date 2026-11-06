@@ -21,11 +21,12 @@ PyTorch launches per step, most of them one CTA per row over the full vocabulary
 GPU nearly idle for hundreds of microseconds at a few rows per step. Here every row is split into
 ``_CHUNK``-wide pieces, so a few rows fill the GPU.
 
-The kernels follow flashinfer's temperature-only path (``AdvancedSamplingMode.NO_TOPK_NO_TOPP``:
-softmax, ``chain_speculative_sampling`` and ``sampling_from_probs``). They have static shapes and
-never sync with the host, so they capture into CUDA graphs. All reductions run in a fixed order (no
-atomics), so every tensor-parallel rank holding the same logits draws the same tokens. Logits of
-``-inf`` (masked tokens) get probability 0, including chunks with no finite logit.
+The kernels follow the reference temperature-only path (``AdvancedSamplingMode.NO_TOPK_NO_TOPP``):
+flashinfer's ``softmax`` and ``sampling_from_probs`` for the drafts, and ``chain_speculative_sampling``
+for the verify. They have static shapes and never sync with the host, so they capture into CUDA
+graphs. All reductions run in a fixed order (no atomics), so every tensor-parallel rank holding the
+same logits draws the same tokens. Logits of ``-inf`` (masked tokens) get probability 0, including
+chunks with no finite logit.
 """
 
 import os
@@ -45,19 +46,19 @@ _NUM_WARPS = 8
 _U32_TO_UNIFORM_SCALE = tl.constexpr(2.3283064365386963e-10)
 _U32_TO_UNIFORM_BIAS = tl.constexpr(1.1641532182693481e-10)
 # Philox layout. The kernels draw cuRAND Philox4x32-10 uniforms (curand_init(seed, subsequence,
-# offset) + curand_uniform) so that no uniform is used twice for one request:
-# - Each request uses its own seed[b] and offset[b]. flashinfer reads element 0 for every row, so
-#   there a request's stream follows whichever request is in row 0 and can revisit words it already
-#   used when that request changes.
-# - The verify of request b uses subsequence b: draw i for accept test i and draw K for the
-#   residual or bonus token (flashinfer uses draw K + 1 for the residual after a rejection). These
-#   K + 1 words sit at the start of the request's per-step offset window, which
-#   SpecMetadata._take_rng_window_offsets makes wider than that.
+# offset) + curand_uniform), with each request's own seed[b] and offset[b]:
+# - The verify of request b draws exactly as chain_speculative_sampling (the reference behind
+#   rejection_sampling_one_model): curand_init(seed[b], PER_ROW_SUBSEQUENCE_BASE | offset[b], 0),
+#   draw i for accept test i up to the first rejected position j, then the next draw (j + 1, or K
+#   when every draft is accepted), as 1 - u, for the replacement or bonus token. The caller passes
+#   the offset of the request's acceptance slot, as the reference does.
 # - Draft position i of request b uses draw 0 of subsequence b * K + i at word offset + 1, keyed
-#   with seed ^ DRAFT_KEY_XOR. With the plain seed it would be accept test 1 of request
-#   b' = b * K + i.
+#   with seed ^ DRAFT_KEY_XOR, so it never reuses a word of a sampler keyed with the plain seed.
 DRAFT_KEY_XOR = 0x3C6EF372FE94F82B
 _DRAFT_KEY_XOR = tl.constexpr(DRAFT_KEY_XOR)
+# kPerRowSubsequenceBase (1 << 63) of the C++ samplers, as the int64 bit pattern.
+PER_ROW_SUBSEQUENCE_BASE = -(1 << 63)
+_PER_ROW_SUBSEQUENCE_BASE = tl.constexpr(PER_ROW_SUBSEQUENCE_BASE)
 
 
 def fast_rs_enabled() -> bool:
@@ -80,6 +81,14 @@ def _curand_uniform(seed, offset, subsequence, draw):
     e = g & 3
     word = tl.where(e == 0, r0, tl.where(e == 1, r1, tl.where(e == 2, r2, r3)))
     return tl.fma(word.to(tl.float32), _U32_TO_UNIFORM_SCALE, _U32_TO_UNIFORM_BIAS)
+
+
+@triton.jit
+def _verify_uniform(seed, offset, draw):
+    """Draw ``draw`` (0-based) of a request's acceptance stream, as chain_speculative_sampling draws
+    it: ``curand_init(seed, PER_ROW_SUBSEQUENCE_BASE | offset, 0)`` + ``curand_uniform``.
+    ``offset - offset`` is an int64 zero, which keeps the counter arithmetic in 64 bits."""
+    return _curand_uniform(seed, offset - offset, offset | _PER_ROW_SUBSEQUENCE_BASE, draw)
 
 
 @triton.jit
@@ -320,7 +329,7 @@ def _rs_accept_pos(
     num_chunks,
     NC_POW2: tl.constexpr,
 ):
-    """flashinfer chain_speculative_sampling accept loop: position i is accepted when
+    """chain_speculative_sampling's accept loop: position i is accepted when
     ``u_i * q_draft(d_i) < p_target(d_i)``; returns the first rejected position (K if none)."""
     pos = num_draft
     for i in range(num_draft):
@@ -334,7 +343,7 @@ def _rs_accept_pos(
         x = tl.where(is_pad, 0.0, x * inv_t)
         p_t = tl.exp(x - big_m) * inv_s
         q_d = tl.load(probs_ptr + slot * stride_slot + i * stride_step + d)
-        u = _curand_uniform(seed, offset, req, i)
+        u = _verify_uniform(seed, offset, i)
         reject = (pos == num_draft) & (~(u * q_d < p_t))
         pos = tl.where(reject, i, pos)
     return pos
@@ -359,6 +368,8 @@ def _rs_verify_resid_kernel(
     pos_ptr,
     rsum_ptr,
     rlast_ptr,
+    tsum_ptr,
+    tlast_ptr,
     vocab,
     num_chunks,
     CHUNK: tl.constexpr,
@@ -408,6 +419,10 @@ def _rs_verify_resid_kernel(
     res = tl.where(mask, tl.maximum(p_t - q_d, 0.0), 0.0)
     tl.store(rsum_ptr + req * num_chunks + ch, tl.sum(res, 0))
     tl.store(rlast_ptr + req * num_chunks + ch, tl.max(tl.where(res > 0.0, offs, -1), 0))
+    # The target alone, which the pick kernel samples when the residual has no mass.
+    p_t = tl.where(mask, p_t, 0.0)
+    tl.store(tsum_ptr + req * num_chunks + ch, tl.sum(p_t, 0))
+    tl.store(tlast_ptr + req * num_chunks + ch, tl.max(tl.where(p_t > 0.0, offs, -1), 0))
     if ch == 0:
         tl.store(pos_ptr + req, pos)
 
@@ -431,6 +446,8 @@ def _rs_verify_pick_kernel(
     pos_ptr,
     rsum_ptr,
     rlast_ptr,
+    tsum_ptr,
+    tlast_ptr,
     out_tokens_ptr,
     out_num_ptr,
     vocab,
@@ -446,14 +463,22 @@ def _rs_verify_pick_kernel(
     is_pad = slot == dummy_row
     pos = tl.load(pos_ptr + req)
     has_draft = pos < num_draft
-    # Draw K, after the accept draws 0..K-1, for the residual and the bonus token alike: the
-    # step then uses K + 1 words of its offset window (see the Philox layout above DRAFT_KEY_XOR).
-    u = _curand_uniform(seed, offset, req, num_draft)
-    total = 0.0
+    # The draw after the accept draws (see the Philox layout above DRAFT_KEY_XOR), as 1 - u in
+    # [0, 1), like chain_speculative_sampling.
+    u = 1.0 - _verify_uniform(seed, offset, tl.where(has_draft, pos + 1, num_draft))
+    r_total = 0.0
+    t_total = 0.0
     for k in range(num_chunks):
-        total = total + tl.load(rsum_ptr + req * num_chunks + k)
-    u = u * total
-    kstar, base, last = _pick_chunk(rsum_ptr, rlast_ptr, req, num_chunks, u)
+        r_total = r_total + tl.load(rsum_ptr + req * num_chunks + k)
+        t_total = t_total + tl.load(tsum_ptr + req * num_chunks + k)
+    # A residual without mass (target == draft) falls back to the target, as the reference does.
+    target_only = (~has_draft) | (~(r_total > 0.0))
+    u = u * tl.where(target_only, t_total, r_total)
+    r_kstar, r_base, r_last = _pick_chunk(rsum_ptr, rlast_ptr, req, num_chunks, u)
+    t_kstar, t_base, t_last = _pick_chunk(tsum_ptr, tlast_ptr, req, num_chunks, u)
+    kstar = tl.where(target_only, t_kstar, r_kstar)
+    base = tl.where(target_only, t_base, r_base)
+    last = tl.where(target_only, t_last, r_last)
     row = req * (num_draft + 1) + pos
     big_m, big_s = _row_max_sum(pmax_ptr, psum_ptr, row, num_chunks, NC_POW2)
     inv_s = tl.math.div_rn(1.0, big_s)
@@ -466,7 +491,7 @@ def _rs_verify_pick_kernel(
     p_t = tl.exp(x - big_m) * inv_s
     q_d = tl.load(
         probs_ptr + slot * stride_slot + tl.minimum(pos, num_draft - 1) * stride_step + offs,
-        mask=mask & has_draft,
+        mask=mask & (~target_only),
         other=0.0,
     )
     res = tl.where(mask, tl.maximum(p_t - q_d, 0.0), 0.0)
@@ -788,11 +813,11 @@ def fast_rs_verify(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Rejection-sample the generation requests' drafts against the target.
 
-    With the same seed and offset, the accept decisions equal flashinfer's
-    ``chain_speculative_sampling``, and every drawn token follows flashinfer's inverse-CDF rule for
-    its draw. The exception is a float sum that lands on the other side of a threshold because it
-    is reduced in another order (per chunk here, per block in flashinfer): the mass sums and the
-    softmax denominator.
+    With the same seed and offset, this draws the same uniforms as ``chain_speculative_sampling``
+    (`rejection_sampling_one_model`) and applies the same accept test and inverse-CDF rule, so the
+    accept decisions and the drawn tokens are the reference's. The exception is a float sum that
+    lands on the other side of a threshold because it is reduced in another order (per chunk here,
+    per CTA in the reference): the mass sums and the softmax denominator.
 
     Args:
         logits: ``[num_gens * (K + 1), vocab]`` fp32 target logits, request-major.
@@ -801,7 +826,8 @@ def fast_rs_verify(
         slot_ids: ``[num_gens]`` int64 ``draft_probs`` slot of each request.
         dummy_row: slot of CUDA-graph padding requests (their logits are treated as zeros).
         draft_probs: ``[slots, >= K, vocab]`` fp32 proposals stored by the previous draft step.
-        seed, offset: ``[num_gens]`` int64 per-request Philox seed and offset.
+        seed, offset: ``[num_gens]`` int64 per-request Philox seed and offset of the acceptance
+            draws (the request draws from subsequence ``PER_ROW_SUBSEQUENCE_BASE | offset``).
     Returns:
         ``accepted_tokens [num_gens, K + 1]`` int32 (accepted drafts, the drawn token, then
         ``-1``) and ``num_accepted [num_gens]`` int32 (accepted drafts + 1).
@@ -825,8 +851,11 @@ def fast_rs_verify(
     pos = _WORKSPACE.get("verify.pos", (num_gens,), torch.int64, device)
     rsum = _WORKSPACE.get("verify.rsum", (num_gens, nc), torch.float32, device)
     rlast = _WORKSPACE.get("verify.rlast", (num_gens, nc), torch.int32, device)
+    tsum = _WORKSPACE.get("verify.tsum", (num_gens, nc), torch.float32, device)
+    tlast = _WORKSPACE.get("verify.tlast", (num_gens, nc), torch.int32, device)
     # Per (request, chunk): the accept loop (u_i * q(d_i) < p(d_i), a few scalar loads), then the
-    # chunk mass of max(p - q, 0) at the first rejected position (p alone for the bonus position).
+    # chunk mass of max(p - q, 0) at the first rejected position (p alone for the bonus position)
+    # and the chunk mass of p.
     _rs_verify_resid_kernel[(num_gens, nc)](
         logits,
         logits.stride(0),
@@ -845,6 +874,8 @@ def fast_rs_verify(
         pos,
         rsum,
         rlast,
+        tsum,
+        tlast,
         vocab,
         nc,
         CHUNK=_CHUNK,
@@ -871,6 +902,8 @@ def fast_rs_verify(
         pos,
         rsum,
         rlast,
+        tsum,
+        tlast,
         accepted,
         num_acc,
         vocab,
