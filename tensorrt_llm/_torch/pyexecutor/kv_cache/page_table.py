@@ -31,8 +31,10 @@ from .role_layout import Sectioned as Sectioned
 
 
 def layer_groups(manager: object) -> list[list[int]]:
-    """Internal layer ids per runtime layer group, in layer-group order, each once in the order of
-    the group's buffers; a layer whose buffers the reuse policies split is in each of its groups."""
+    """Internal layer ids per cache group (``impl.buffer_grouping``), in cache-group order, each
+    once in the order of the group's buffers; a layer whose buffers the reuse policies split is in
+    each of its groups. Cache groups are not the deprecated layer groups (``impl.layer_grouping``)
+    the ``get_disagg_*`` hooks index, which a split layer cannot be listed in."""
     return [
         list(dict.fromkeys(int(buffer.layer_id) for buffer in group))
         for group in manager.impl.buffer_grouping
@@ -63,12 +65,15 @@ class PageTableSpec:
             ``rebuild_disagg_imported_cache`` to rebuild after the import.
         request_rebuilt_roles: Roles the manager, receiving, rebuilds for some requests rather
             than receiving them, so a peer may hold none of them for a model layer it holds.
-        layer_ids: Internal layer id -> (global layer id, model layer); None for those of the
-            manager's model layers (``pp_layers``) or, keeping several caches per model layer,
-            of its (model layer, attention type) map (``_layer_attn_to_layer_id``). Stated under
-            mixed-precision KV, whose high layers take global layers ``2 * L + 1`` and every other
-            layer twice the id it has without; the high layers hold the high type
-            (``mixed_precision``).
+        layer_ids: Internal layer id -> (global layer id, model layer) of every layer the
+            manager's storage holds, as disaggregated transfer names them: a layer's model layer
+            (``pp_layers``) or, keeping several caches per model layer, model layer x attention
+            types + attention type (``_layer_attn_to_layer_id``); under mixed-precision KV, high
+            layers ``2 * L + 1``, holding the high type (``mixed_precision``), and every other
+            layer twice its id; with the FP4 MLA cache layout, a model layer's cache ``2 * m``,
+            its high-precision tail ``2 * m + 1`` and a recurrent layer ``2 * m``. Every
+            manager's spec states it (``_disagg_layer_names``); None only in a spec made without
+            a manager.
         quant_mode: How the manager's own KV data is quantized: None unquantized, else
             ``"fp8"``, ``"nvfp4"`` or ``"fp8_ds_mla"``. Under mixed-precision KV, the layers it
             keeps mixed hold the types ``mixed_precision`` names instead.

@@ -199,8 +199,20 @@ class RoleLayoutV2:
 
     def resolve(self, site: Any) -> RoleLayoutV2:
         """The layout of one buffer, filling what a manager's spec leaves to each buffer from its
-        facts (its size, tokens, heads, and the dimensions its layer group splits over): this
-        layout itself by default."""
+        facts: this layout itself by default.
+
+        ``site`` carries the facts of one rank's buffer of the role:
+
+        - ``size``: the buffer's bytes on this rank.
+        - ``kv_heads``: for attention, ``(the layer's KV heads on this rank, the layer's KV heads
+          over all ranks of the split or None if unknown)``; the total counts each head once,
+          however many ranks hold it.
+        - ``state``: whether the buffer is recurrent state rather than attention.
+        - ``split``: the parallel dimensions the buffer's layer group splits over, outer to
+          inner (``GRID_DIMENSIONS``).
+        - ``ranks``: the ranks of that split, ``grid_place(topology, split)[0]``.
+        - ``tokens``: the token positions of a page.
+        """
         return self
 
     def check(self, size: int) -> None:
