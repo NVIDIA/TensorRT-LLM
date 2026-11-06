@@ -72,6 +72,7 @@ l0_gr100:
   - unittest/_torch/moe/test_mxfp8_moe_partial_refit.py
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_locality_domain_op_matches_full_gpu
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_locality_domain_static_split_rubin
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_locality_domain_refit_under_cuda_graph_rubin
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL and MXFP8 and locality_domain"
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
