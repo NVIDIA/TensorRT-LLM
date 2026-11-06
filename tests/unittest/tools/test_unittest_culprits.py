@@ -22,8 +22,6 @@ from unittest.mock import Mock
 
 import pytest
 
-pytestmark = pytest.mark.cpu_only
-
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MODULE_PATH = _REPO_ROOT / "tests/integration/defs/test_unittests.py"
 
@@ -65,6 +63,7 @@ _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
 
 
+@pytest.mark.cpu_only
 def test_long_selectors_preserve_separate_reports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -105,8 +104,20 @@ def test_long_selectors_preserve_separate_reports(
             str(tmp_path), types.SimpleNamespace(run_cmd=run_cmd), selector, str(tmp_path), request
         )
 
+    for selector in ("x" * 80, "x" * 81, "x" * 81):
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path), types.SimpleNamespace(run_cmd=run_cmd), selector, str(tmp_path), request
+        )
+
     assert reports[0] != reports[1]
-    assert [path.read_text(encoding="utf-8") for path in reports] == ["1", "2"]
+    assert reports[2].name == f"results-sub-unittests-{'x' * 80}.xml"
+    long_name = reports[3].name.removeprefix("results-sub-unittests-").removesuffix(".xml")
+    assert len(long_name) == 80
+    assert reports[2] != reports[3]
+    assert reports[3] == reports[4]
+    assert [path.read_text(encoding="utf-8") for path in reports[:2]] == ["1", "2"]
+    assert reports[2].read_text(encoding="utf-8") == "3"
+    assert reports[4].read_text(encoding="utf-8") == "5"
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
