@@ -26,12 +26,16 @@ cover:
 - Insufficient-KV fail-fast vs transfer-admission backpressure
 """
 
+import datetime
+import threading
 from unittest.mock import Mock, patch
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.scheduler import RequestScheduler, ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.error_classification import ErrorBudget
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from tensorrt_llm._torch.pyexecutor.scheduler import RankState, RequestScheduler, ScheduledRequests
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequestType
 
 pytestmark = pytest.mark.cpu_only
 
@@ -92,10 +96,9 @@ def _make_v2_kv_cache_manager() -> Mock:
 
 
 def _stub_transfer_entry_points(ex) -> None:
-    """Mock the coordinator's transfer polls once the executor builds it.
-
-    The build stays lazy so a test can still swap delegated executor methods
-    (admission, gen init, idle progress) before the first ``ex.disagg`` use.
+    """Mock the coordinator's transfer polls, CP admission alignment and
+    receive start once the executor builds it; the build stays lazy so a test
+    can finish configuring the executor before the first ``ex.disagg`` use.
     """
     build = ex._build_disagg_coordinator
 
@@ -104,9 +107,42 @@ def _stub_transfer_entry_points(ex) -> None:
         coordinator.poll_gen_transfers = Mock()
         coordinator.check_transfer_timeouts = Mock()
         coordinator.reap_context_sends = Mock()
+        coordinator.align_gen_admission_across_cp = Mock(side_effect=lambda admitted: admitted)
+        coordinator.receive_gen_init = Mock()
         return coordinator
 
     ex._build_disagg_coordinator = build_and_stub
+
+
+def _gen_only_request(request_id: int) -> LlmRequest:
+    """Real generation-only request; it arrives in DISAGG_GENERATION_INIT."""
+    return LlmRequest(
+        request_id=request_id,
+        max_new_tokens=8,
+        input_tokens=list(range(8)),
+        sampling_config=SamplingConfig(1),
+        is_streaming=True,
+        draft_tokens=None,
+        llm_request_type=LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
+        client_id=100 + request_id,
+    )
+
+
+class _WaitSignallingCondition(threading.Condition):
+    """Condition that sets ``waiting`` once a waiter has reached ``wait_for``.
+
+    The waiter still holds the lock at that point, so a producer that acquires
+    the lock after ``waiting`` is set runs strictly after the waiter's
+    ``wait()`` released it: the waiter is provably asleep, not merely started.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def wait_for(self, predicate, timeout=None):
+        self.waiting.set()
+        return super().wait_for(predicate, timeout)
 
 
 class MockBenchmarkExecutor:
@@ -703,7 +739,7 @@ class MockPadDummyExecutor:
         expected_num_active_requests: int = 1,
         num_fetch_requests: int = 0,
         benchmark_req_queues_size: int = 8,
-        tp_size: int = 1,
+        tp_size: int = 2,
     ):
         self.is_benchmark_disagg = is_benchmark_disagg
         self._benchmark_fill_phase_active = (
@@ -756,6 +792,8 @@ class MockPadDummyExecutor:
 
         self.resource_manager = Mock()
         self.resource_manager.get_resource_manager.return_value = None
+
+        self.adp_router = Mock(exclude_retiring_requests=True)
 
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor, _ADPForwardIntent
 
@@ -867,6 +905,7 @@ class TestPrepareAndScheduleBatchNoBlock:
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
         ex.active_requests = []
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -876,11 +915,9 @@ class TestPrepareAndScheduleBatchNoBlock:
 
         mock_fetch = Mock(return_value=[])
         ex._fetch_and_activate_new_requests = mock_fetch
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
-        ex._prepare_disagg_gen_init = Mock()
 
         ex._prepare_and_schedule_batch()
 
@@ -910,7 +947,13 @@ class TestBenchmarkFillAdmissionFlowControl:
 
         ex.dist = Mock()
         ex.dist.tp_size = tp_size
+        ex.adp_router = Mock()
         return ex
+
+    @staticmethod
+    def _admitted_cap(ex) -> int:
+        """``max_new_requests`` of the last ``ADPRouter.pop_requests`` call."""
+        return ex.adp_router.pop_requests.call_args.args[2]
 
     @staticmethod
     def _expected_ramp(tp_size: int, total_max: int) -> list:
@@ -925,22 +968,21 @@ class TestBenchmarkFillAdmissionFlowControl:
         return seq
 
     @pytest.mark.parametrize("tp_size", [1, 4, 32])
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_first_iter_caps_at_tp_size(self, mock_get_from_waiting_queue, tp_size):
+    def test_first_iter_caps_at_tp_size(self, tp_size):
         """Iter 0 of the ramp must still cap at tp_size — this is the
         load-bearing iter-0 burst protection (PR #12206 fail-fast)."""
         ex = self._make_executor(tp_size=tp_size)
         waiting_queue = Mock()
-        all_ranks_num_active_requests = [0] * tp_size
+        all_rank_states = [RankState(rank=r) for r in range(tp_size)]
 
         ex._pop_from_waiting_queue(
             waiting_queue,
             total_num_active_requests=0,
-            all_ranks_num_active_requests=all_ranks_num_active_requests,
+            all_rank_states=all_rank_states,
         )
 
-        mock_get_from_waiting_queue.assert_called_once()
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        ex.adp_router.pop_requests.assert_called_once()
+        max_new_requests = self._admitted_cap(ex)
 
         assert max_new_requests == tp_size, (
             "Iter 0 of the benchmark-fill admission ramp must cap at tp_size "
@@ -950,10 +992,7 @@ class TestBenchmarkFillAdmissionFlowControl:
         assert ex._fill_admit_cap == tp_size
 
     @pytest.mark.parametrize("tp_size", [1, 4, 8, 32])
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_ramp_doubles_each_iter_and_saturates_at_total_max(
-        self, mock_get_from_waiting_queue, tp_size
-    ):
+    def test_ramp_doubles_each_iter_and_saturates_at_total_max(self, tp_size):
         """Each subsequent fill-phase iter doubles the admission cap, and the
         cap saturates at `total_max` (never exceeds the global capacity)."""
         ex = self._make_executor(tp_size=tp_size)
@@ -966,9 +1005,9 @@ class TestBenchmarkFillAdmissionFlowControl:
             ex._pop_from_waiting_queue(
                 Mock(),
                 total_num_active_requests=0,
-                all_ranks_num_active_requests=[0] * tp_size,
+                all_rank_states=[RankState(rank=r) for r in range(tp_size)],
             )
-            _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+            max_new_requests = self._admitted_cap(ex)
             observed.append(max_new_requests)
 
         # The ramp matches tp_size, 2*tp_size, ..., total_max.
@@ -982,19 +1021,18 @@ class TestBenchmarkFillAdmissionFlowControl:
         max_iters = (total_max // tp_size).bit_length() + 1
         assert len(expected) <= max_iters
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_no_fill_phase_uses_full_available_capacity(self, mock_get_from_waiting_queue):
+    def test_no_fill_phase_uses_full_available_capacity(self):
         ex = self._make_executor(fill_phase_active=False)
         waiting_queue = Mock()
-        all_ranks_num_active_requests = [0, 0, 0, 0]
+        all_rank_states = [RankState(rank=r) for r in range(4)]
 
         ex._pop_from_waiting_queue(
             waiting_queue,
             total_num_active_requests=0,
-            all_ranks_num_active_requests=all_ranks_num_active_requests,
+            all_rank_states=all_rank_states,
         )
 
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = self._admitted_cap(ex)
 
         assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
         assert ex._fill_admit_cap == 0, (
@@ -1002,8 +1040,7 @@ class TestBenchmarkFillAdmissionFlowControl:
             "untouched so a future fill phase starts the ramp from tp_size."
         )
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_ramp_state_resets_when_fill_phase_ends(self, mock_get_from_waiting_queue):
+    def test_ramp_state_resets_when_fill_phase_ends(self):
         """After the fill gate opens (`_fill_admit_cap` reset to 0 by
         `_check_benchmark_disagg_gate`), a *subsequent* fill phase starts
         the ramp from tp_size again rather than wherever the previous ramp
@@ -1015,7 +1052,7 @@ class TestBenchmarkFillAdmissionFlowControl:
             ex._pop_from_waiting_queue(
                 Mock(),
                 total_num_active_requests=0,
-                all_ranks_num_active_requests=[0] * 4,
+                all_rank_states=[RankState(rank=r) for r in range(4)],
             )
         assert ex._fill_admit_cap > 4
 
@@ -1029,28 +1066,44 @@ class TestBenchmarkFillAdmissionFlowControl:
         ex._pop_from_waiting_queue(
             Mock(),
             total_num_active_requests=0,
-            all_ranks_num_active_requests=[0] * 4,
+            all_rank_states=[RankState(rank=r) for r in range(4)],
         )
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = self._admitted_cap(ex)
         assert max_new_requests == 4
         assert ex._fill_admit_cap == 4
 
-    @patch("tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue")
-    def test_warmup_skips_throttle(self, mock_get_from_waiting_queue):
-        """Warmup must bypass the slow-start ramp so warmup iters are not
-        artificially throttled and `_fill_admit_cap` stays unchanged."""
-        ex = self._make_executor(tp_size=4)
-        # Bypass the is_warmup property setter (which also pokes model_engine,
-        # not present on this stub).
-        ex._is_warmup = True
+    @pytest.mark.parametrize(
+        "fill_phase_active,is_warmup,kv_balance",
+        [(True, False, False), (False, True, False), (False, False, True)],
+    )
+    def test_kv_balanced_admission_is_off_in_fill_phase_and_warmup(
+        self, fill_phase_active, is_warmup, kv_balance
+    ):
+        """KV-balanced admission is off in the fill phase and warmup."""
+        ex = self._make_executor(tp_size=4, fill_phase_active=fill_phase_active)
+        ex._is_warmup = is_warmup
 
         ex._pop_from_waiting_queue(
             Mock(),
             total_num_active_requests=0,
-            all_ranks_num_active_requests=[0] * 4,
+            all_rank_states=[RankState(rank=r) for r in range(4)],
         )
 
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        assert ex.adp_router.pop_requests.call_args.kwargs["kv_balance"] is kv_balance
+
+    def test_warmup_skips_throttle(self):
+        """Warmup must bypass the slow-start ramp so warmup iters are not
+        artificially throttled and `_fill_admit_cap` stays unchanged."""
+        ex = self._make_executor(tp_size=4)
+        ex.is_warmup = True
+
+        ex._pop_from_waiting_queue(
+            Mock(),
+            total_num_active_requests=0,
+            all_rank_states=[RankState(rank=r) for r in range(4)],
+        )
+
+        max_new_requests = self._admitted_cap(ex)
         assert max_new_requests == ex.dist.tp_size * ex.max_num_active_requests
         assert ex._fill_admit_cap == 0
 
@@ -1226,8 +1279,10 @@ class TestFailFastDuringBenchmarkFill:
     return an explicit error instead of hanging.
 
     This covers the CI regression where the fill-phase guard suppressed the
-    fail-fast forever and
-    `test_disaggregated_benchmark_gen_only_insufficient_kv` timed out.
+    fail-fast forever and the gen-only insufficient-KV benchmark hung until
+    its timeout. The real-error-path tests at the end replace that E2E case:
+    the fail-fast has to answer every client through the production error
+    path, not merely be decided.
     """
 
     def _make_executor(
@@ -1237,13 +1292,19 @@ class TestFailFastDuringBenchmarkFill:
         num_init_requests=3,
         num_fetch_requests=8,
         fitting_init_requests=None,
+        stub_error_handling=True,
     ):
         """Build a minimal PyExecutor stub for _prepare_and_schedule_batch."""
         from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
         ex = object.__new__(PyExecutor)
+        ex.sampler = Mock(spec=["release_request"])
         ex.benchmark_req_queues_size = 8
         ex.kv_cache_transceiver = Mock()
+        # The fill-gate requests model "waiting for KV" / "generating", not
+        # mid-transfer; a bare Mock would answer has_inflight_transfer with a
+        # truthy Mock and make the error path defer them as transfer-owned.
+        ex.kv_cache_transceiver.has_inflight_transfer.return_value = False
         ex.kv_cache_manager = _make_v2_kv_cache_manager()
         ex._is_kv_manager_v2 = True
         ex._prefetched_request_ids = set()
@@ -1257,6 +1318,7 @@ class TestFailFastDuringBenchmarkFill:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1269,11 +1331,10 @@ class TestFailFastDuringBenchmarkFill:
         ex.active_requests = init_reqs + ready_reqs
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
-        ex._prepare_disagg_gen_init = Mock()
-        ex._handle_errors = Mock()
+        if stub_error_handling:
+            ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()
         if fitting_init_requests is None:
@@ -1308,20 +1369,20 @@ class TestFailFastDuringBenchmarkFill:
         ex._handle_errors.assert_not_called()
 
     def test_partial_transfer_admission_uses_only_admitted_requests(self) -> None:
-        """The admitted subset is prepared and passed to the idle check."""
+        """Only the admitted subset is prepared for receive; the idle context
+        poll still runs once regardless of the deferred candidates."""
         admitted_req = _make_active_request(in_init=True)
         deferred_req = _make_active_request(in_init=True)
         candidates = [admitted_req, deferred_req]
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=candidates)
-        ex._apply_disagg_transfer_admission = Mock(return_value=([admitted_req], False))
-        ex._check_disagg_transfer_progress_when_idle = Mock()
+        ex.disagg.admit = Mock(return_value=([admitted_req], False))
 
         result, _ = ex._prepare_and_schedule_batch()
 
         assert result is not None
-        ex._apply_disagg_transfer_admission.assert_called_once_with(candidates)
-        ex._prepare_disagg_gen_init.assert_called_once_with([admitted_req])
-        ex._check_disagg_transfer_progress_when_idle.assert_called_once_with()
+        ex.disagg.admit.assert_called_once_with(candidates)
+        ex.disagg.receive_gen_init.assert_called_once_with([admitted_req])
+        ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
     def test_fill_with_no_init_requests_does_not_kill(self):
@@ -1344,7 +1405,7 @@ class TestFailFastDuringBenchmarkFill:
         monkeypatch.delenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", raising=False)
         fitting_req = _make_active_request(in_init=True)
         ex = self._make_executor(fill_phase_active=True, fitting_init_requests=[fitting_req])
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
+        ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1352,8 +1413,8 @@ class TestFailFastDuringBenchmarkFill:
             "Fail-fast should NOT fire when the scheduler fit an INIT request "
             "that transfer admission temporarily deferred"
         )
-        ex._apply_disagg_transfer_admission.assert_called_once_with([fitting_req])
-        ex._prepare_disagg_gen_init.assert_called_once_with([])
+        ex.disagg.admit.assert_called_once_with([fitting_req])
+        ex.disagg.receive_gen_init.assert_called_once_with([])
         ex.disagg.reap_context_sends.assert_called_once_with(0)
         ex._handle_errors.assert_not_called()
 
@@ -1386,8 +1447,7 @@ class TestFailFastDuringBenchmarkFill:
         all_rank_status[-1] = (True, True)
         gather = getattr(ex.dist, gather_name)
         gather.return_value = all_rank_status
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
-        ex._check_disagg_transfer_progress_when_idle = Mock()
+        ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1409,8 +1469,7 @@ class TestFailFastDuringBenchmarkFill:
             (True, False),
             (True, False),
         ]
-        ex._apply_disagg_transfer_admission = Mock(return_value=([], True))
-        ex._check_disagg_transfer_progress_when_idle = Mock()
+        ex.disagg.admit = Mock(return_value=([], True))
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1427,7 +1486,6 @@ class TestFailFastDuringBenchmarkFill:
             (True, True),
             (False, False),
         ]
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1452,7 +1510,6 @@ class TestFailFastDuringBenchmarkFill:
         ex.enable_attention_dp = True
         ex.dist.tp_size = 2
         ex.dist.world_size = 2
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
 
@@ -1487,6 +1544,115 @@ class TestFailFastDuringBenchmarkFill:
                 "SHOULD kill requests (genuine KV insufficiency)"
             )
             ex._handle_errors.assert_called_once()
+
+    # -- through the real error path ----------------------------------------
+
+    def _executor_with_real_error_path(
+        self, monkeypatch, *, num_init_requests=3, num_ready_requests=2
+    ):
+        """Stub executor whose fail-fast runs the production error path over
+        real generation-only requests: the error budget, ``_handle_errors``,
+        the response queue and request termination are all real.
+
+        Returns ``(executor, active_requests)``; the first ``num_init_requests``
+        still wait for KV, the rest are already generating.
+        """
+        monkeypatch.setenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "1")
+        ex = self._make_executor(fill_phase_active=True, stub_error_handling=False)
+        ex._error_budget = ErrorBudget()
+        ex._fatal_error = None
+        ex.gather_all_responses = False
+        ex.dist.mapping.tp_group = [0]
+        ex.response_cv = threading.Condition()
+        ex.responses = {}
+        ex.result_wait_queues = {}
+        ex._pending_transfer_responses = []
+        ex._pending_response_terminations = []
+        ex._disagg_pp_termination_handler = None
+        ex.resource_manager = Mock(spec=["free_resources"])
+        ex.model_engine = None
+        ex.draft_model_engine = None
+        requests = [
+            _gen_only_request(request_id)
+            for request_id in range(1, num_init_requests + num_ready_requests + 1)
+        ]
+        for request in requests[num_init_requests:]:
+            request.state = LlmRequestState.GENERATION_IN_PROGRESS
+        ex.active_requests = requests
+        return ex, requests
+
+    def test_a_stalled_fill_fails_every_active_request_through_the_real_error_path(
+        self, monkeypatch
+    ):
+        """Every active request is answered, whether it still waits for KV or is
+        already generating: one error response naming the KV shortfall, the
+        request finished with its resources freed once, nothing left active and
+        no batch to run. The failure is request-scoped; it does not take the
+        engine down."""
+        ex, requests = self._executor_with_real_error_path(monkeypatch)
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is None
+        assert ex.active_requests == []
+        for request in requests:
+            (response,) = ex.responses[request.py_request_id]
+            assert response.has_error()
+            assert "Insufficient KV cache for gen-only benchmark mode" in response.error_msg
+            assert response.client_id == request.py_client_id
+            assert request.state == LlmRequestState.GENERATION_COMPLETE
+        freed = [call.args[0] for call in ex.resource_manager.free_resources.call_args_list]
+        assert freed == requests
+        released = [call.args[0] for call in ex.sampler.release_request.call_args_list]
+        assert released == requests
+        assert ex._fatal_error is None and not ex.is_shutdown
+
+    def test_a_fitting_init_request_keeps_the_real_error_path_quiet(self, monkeypatch):
+        """Healthy fill on the same harness: no response, no termination."""
+        ex, requests = self._executor_with_real_error_path(monkeypatch)
+        ex._schedule = Mock(return_value=(ScheduledRequests(), [requests[0]], 0))
+
+        result, _ = ex._prepare_and_schedule_batch()
+
+        assert result is not None
+        assert ex.responses == {}
+        assert ex.active_requests == requests
+        ex.resource_manager.free_resources.assert_not_called()
+        ex.sampler.release_request.assert_not_called()
+
+    def test_the_fail_fast_wakes_a_consumer_asleep_in_await_responses(self, monkeypatch):
+        """The error responses are published under the response condition and
+        the waiter is notified: a consumer already asleep in ``await_responses``
+        comes back with all of them long before its own timeout. The lock orders
+        the threads, so the fail-fast publishes only after the consumer's
+        ``wait()`` released the condition; without the notify the consumer
+        would sit out the full timeout and miss the join deadline."""
+        ex, requests = self._executor_with_real_error_path(monkeypatch)
+        ex.response_cv = condition = _WaitSignallingCondition()
+        delivered = []
+        consumer = threading.Thread(
+            target=lambda: delivered.extend(
+                ex.await_responses(timeout=datetime.timedelta(seconds=10))
+            )
+        )
+        consumer.start()
+        try:
+            assert condition.waiting.wait(timeout=5)
+
+            ex._prepare_and_schedule_batch()
+            consumer.join(timeout=2)
+
+            assert not consumer.is_alive(), "consumer not woken; it is sitting out its timeout"
+            assert sorted(response.request_id for response in delivered) == [
+                request.py_request_id for request in requests
+            ]
+            assert all(response.has_error() for response in delivered)
+            assert ex.responses == {}
+        finally:
+            with condition:  # release the consumer on failure; shutdown satisfies its predicate
+                ex.is_shutdown = True
+                condition.notify_all()
+            consumer.join(timeout=10)
 
 
 # ---------------------------------------------------------------------------
@@ -1536,6 +1702,7 @@ class TestFillPhaseEndToEnd:
         ex.is_shutdown = False
         ex._is_warmup = False
         ex.enable_iter_perf_stats = False
+        ex.canceled_req_ids = []
         ex.waiting_queue = []
         ex.expected_num_active_requests = 0
         ex.drafter = None
@@ -1545,10 +1712,8 @@ class TestFillPhaseEndToEnd:
         ex.active_requests = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
-        ex._check_disagg_ctx_schedulable_status = Mock()
         _stub_transfer_entry_points(ex)
         ex._pad_attention_dp_dummy_request = Mock()
-        ex._prepare_disagg_gen_init = Mock()
         ex._handle_errors = Mock()
 
         scheduled = ScheduledRequests()
@@ -1563,16 +1728,14 @@ class TestFillPhaseEndToEnd:
         # Phase 0: Fill-phase admission uses the real waiting-queue path and
         # pulls only tp_size requests per iteration, rather than the full
         # tp_size * max_batch_size queue.
-        with patch(
-            "tensorrt_llm._torch.pyexecutor.py_executor.get_from_waiting_queue"
-        ) as mock_get_from_waiting_queue:
-            ex._pop_from_waiting_queue(
-                waiting_queue=Mock(),
-                total_num_active_requests=0,
-                all_ranks_num_active_requests=[0] * self.TP_SIZE,
-            )
+        ex.adp_router = Mock()
+        ex._pop_from_waiting_queue(
+            waiting_queue=Mock(),
+            total_num_active_requests=0,
+            all_rank_states=[RankState(rank=r) for r in range(self.TP_SIZE)],
+        )
 
-        _, max_new_requests = mock_get_from_waiting_queue.call_args.args[:2]
+        max_new_requests = ex.adp_router.pop_requests.call_args.args[2]
         assert max_new_requests == self.TP_SIZE
 
         # Phase 1: Fetching requests (gate should not open)
@@ -1619,7 +1782,6 @@ class TestFillPhaseEndToEnd:
         ex._schedule = Mock(return_value=(ScheduledRequests(), [], 0))
         ex.active_requests = ready_reqs
         ex.dist.tp_allgather = Mock()
-        ex._check_disagg_transfer_progress_when_idle = Mock()
 
         result, _ = ex._prepare_and_schedule_batch()
         assert result is not None

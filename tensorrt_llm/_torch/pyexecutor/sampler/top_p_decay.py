@@ -20,38 +20,16 @@ through the four lifecycle hooks documented on :class:`TopPDecayStore`.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
 from ..llm_request import LlmRequest, get_draft_token_length
-from .ops.vanilla import Fusions, StrategyMetadata
+from .ops.vanilla import Fusions
 from .sampler_common import _request_get_sampling_params, top_p_decay_active
 
 __all__ = ["TopPDecayHandler", "TopPDecayStore"]
-
-
-@dataclass(kw_only=True)
-class TopPDecayMetadata(StrategyMetadata):
-    """Per-group runtime top-p override for Top-P Decay (attached to the
-    top-p-carrying groups -- top_p, top_k_top_p and min_p -- via the
-    ``StrategyMetadata`` mechanism).
-
-    ``slots`` maps each per-step group row to its sequence slot; the decayed
-    per-row top-p is gathered on-device from the per-slot ``runtime_top_p``
-    store, gated by ``is_decay_slot`` (non-decay rows keep their static top-p).
-    Consumed by the TopP*/TopKTopP*/MinP* strategy impls in ``sample()``. See
-    ``top_p_decay.TopPDecayStore`` for the feature-level semantics.
-    """
-
-    slots: torch.Tensor
-    """Per-step group rows' sequence slots (int64, device)."""
-    runtime_top_p: torch.Tensor
-    """Per-slot runtime (decayed) top-p store (float32, device)."""
-    is_decay_slot: torch.Tensor
-    """Per-slot decay-active gate (bool, device)."""
 
 
 @dataclass(kw_only=True)
@@ -68,9 +46,9 @@ class TopPDecayStore:
     A negative ``reset_ids`` sentinel (-1, "reset disabled") never matches,
     since sampled token ids are non-negative. Decay is active iff
     ``top_p_decay`` is set and < 1.0 (``SamplingParams.
-    params_imply_top_p_decay_active``); an active decay forces a
-    top-p-capable strategy even for an otherwise implicitly-greedy request
-    (initial top-p defaults to 1.0), while explicit greedy controls win.
+    params_imply_top_p_decay_active``); an active decay makes an otherwise
+    implicitly-greedy request sample (initial top-p defaults to 1.0), while
+    explicit greedy controls win.
     Beam search and speculative draft tokens are rejected at admission
     (``TopPDecayHandler.validate_request``); parameter ranges are enforced by
     ``SamplingParams._validate`` / the executor::SamplingConfig constructor.
@@ -85,10 +63,9 @@ class TopPDecayStore:
        and the per-slot buffers are initialized. This clear-then-set also
        covers slot reuse: stale entries from a prior occupant are never
        consumed.
-    2. Pre-sample (``TopPDecayHandler.build_metadata`` -> ``TopPDecayMetadata``
-       -> ``TopPDecayMixin``): the per-row top-p fed to top_p /
-       top_k_top_p / min_p sampling is overridden with the decayed runtime value
-       for decay-active rows (fused gather, ``top_p_decay_gather``).
+    2. Pre-sample (``TopPDecayHandler.override_top_p``): the per-row top-p fed
+       to the fused sampling kernel is overridden with the decayed runtime
+       value for decay-active rows (fused gather, ``top_p_decay_gather``).
     3. Post-sample (``TopPDecayHandler.update_after_sample``): the recurrence
        above is applied in place for the sampled decay-active slots (fused
        update, ``top_p_decay_update``).
@@ -150,6 +127,10 @@ class TopPDecayHandler:
         """Whether any resident request currently uses top-p decay."""
         return bool(self._slots)
 
+    def uses_decay(self, slot: int) -> bool:
+        """Whether the request admitted to ``slot`` uses top-p decay."""
+        return slot in self._slots
+
     @staticmethod
     def validate_request(request: LlmRequest) -> None:
         """Reject unsupported combinations for a top-p-decay-active request.
@@ -175,21 +156,15 @@ class TopPDecayHandler:
         # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
         # SpecSampler and never reaches TorchSampler; the
         # drafter-based modes that DO flow draft tokens through TorchSampler
-        # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
-        # MTP-Eagle) are what can make this length non-zero. top-p decay does not
-        # support these multi-token steps.
+        # (NGram, user-provided) are what can make this length non-zero. top-p
+        # decay does not support these multi-token steps.
         # NB: at admission time the draft tokens of drafter-based modes are
-        # usually not attached yet, so this check is best-effort. Two-model
-        # speculation (the only source of such requests in TorchSampler) is
-        # slated for removal, so in practice no speculative request reaches the
-        # decay path; a debug assert in build_metadata guards the
-        # invariant at sample time.
+        # usually not attached yet, so this check is best-effort.
         if get_draft_token_length(request) > 0:
             raise ValueError(
                 "top_p_decay is not supported for requests carrying speculative "
                 "draft tokens (req_num_steps > 1). This covers the drafter-based "
-                "modes routed through TorchSampler (two-model draft-target, NGram, "
-                "user-provided, two-model Eagle3 / MTP-Eagle); one-model "
+                "modes routed through TorchSampler (NGram, user-provided); one-model "
                 "speculation uses its own sampler and is unaffected."
             )
 
@@ -293,63 +268,20 @@ class TopPDecayHandler:
         # slots in setup_sampler_step just before this call).
         store.is_top_p_decay_slot_cuda.index_fill_(0, slots_cuda, True)
 
-    def build_metadata(
-        self,
-        *,
-        group_req_indices: torch.Tensor,
-        req_num_steps: torch.Tensor,
-        seq_slots: torch.Tensor,
-        seq_slots_cuda: torch.Tensor,
-    ) -> Optional[TopPDecayMetadata]:
-        """Build the Top-P Decay metadata for a top_p / top_k_top_p / min_p group.
+    def override_top_p(self, top_p: torch.Tensor, slots_cuda: torch.Tensor) -> torch.Tensor:
+        """Replace decay-active rows' static top-p with their decayed runtime top-p.
 
-        Lifecycle step 2, see :class:`TopPDecayStore`. Returns None when no request
-        currently uses decay. The metadata's ``slots`` tensor is aligned to the
-        group's per-STEP row order (matching group_strategies_per_step);
-        non-decay rows (possibly multi-step draft rows) are gated out on-device
-        by ``is_decay_slot``, so decay presence in the group is not checked
-        host-side: a group without decay rows samples every row with its static
-        top-p -- same result as returning None.
+        Lifecycle step 2, see :class:`TopPDecayStore`. ``top_p`` and
+        ``slots_cuda`` are per row; non-decay rows are gated out on the device
+        by ``is_decay_slot``, so the batch needs no host-side filtering.
         """
         if not self._slots:
-            return None
-        store = self.store
-        # Fast path (steady-state decoding): if every row in the group is
-        # single-token, the per-STEP row order equals the per-request order, and
-        # (group_req_indices being sorted ascending) a contiguous group's slots
-        # are just a slice of seq_slots_cuda -- no host layout build and no H2D
-        # copy.
-        first_req = int(group_req_indices[0].item())
-        last_req = int(group_req_indices[-1].item())
-        group_steps = req_num_steps[group_req_indices]
-        if last_req - first_req + 1 == group_req_indices.size(0) and (
-            group_steps.max().item() == 1
-        ):
-            per_step_slots_cuda = seq_slots_cuda[first_req : last_req + 1]
-        else:
-            # Build the per-STEP slot layout (each request contributes
-            # req_num_steps rows).
-            group_seq_slots = seq_slots[group_req_indices]
-            if __debug__:
-                # Internal invariant (stripped under python -O): a decay-active
-                # row is always single-token -- the only source of multi-step
-                # rows in TorchSampler is two-model speculation (slated for
-                # removal), and decay + draft tokens is rejected per-request at
-                # admission in validate_request.
-                decay_row_steps = group_steps[
-                    torch.isin(group_seq_slots, torch.tensor(list(self._slots)))
-                ]
-                assert decay_row_steps.numel() == 0 or decay_row_steps.max().item() == 1, (
-                    "top_p_decay row with req_num_steps != 1; decay + draft tokens "
-                    "should have been rejected at admission"
-                )
-            per_step_slots_cuda = torch.repeat_interleave(group_seq_slots.long(), group_steps).to(
-                seq_slots_cuda.device, non_blocking=True
-            )
-        return TopPDecayMetadata(
-            slots=per_step_slots_cuda,
-            runtime_top_p=store.runtime_top_p_decay_cuda,
-            is_decay_slot=store.is_top_p_decay_slot_cuda,
+            return top_p
+        return Fusions.top_p_decay_gather(
+            runtime_top_p=self.store.runtime_top_p_decay_cuda,
+            is_decay_slot=self.store.is_top_p_decay_slot_cuda,
+            static_top_p=top_p,
+            slots=slots_cuda,
         )
 
     def update_after_sample(

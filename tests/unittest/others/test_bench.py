@@ -18,15 +18,21 @@ from unittest import mock
 
 import pytest
 
+from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, ReportUtility, StatsKeeper
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
+from tensorrt_llm.bench.tuning import heuristics
+from tensorrt_llm.bench.tuning.dataclasses import NemotronHybridConfig
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.bench.utils.data import (
     DatasetFormatError,
     create_dataset_from_stream,
     initialize_tokenizer,
 )
+from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+pytestmark = pytest.mark.cpu_only
 
 
 class _FakeTokenizer:
@@ -38,6 +44,43 @@ class _FakeTokenizer:
 
     def encode(self, text, **kwargs):
         return list(range(len(text.split())))
+
+
+def _benchmark_runtime_config(backend: str) -> RuntimeConfig:
+    return RuntimeConfig(
+        model="model",
+        sw_version="test",
+        settings_config={"max_batch_size": 8, "max_num_tokens": 128},
+        mapping={
+            "pp_size": 1,
+            "tp_size": 1,
+            "gpus_per_node": 1,
+            "moe_ep_size": 1,
+            "moe_cluster_size": 1,
+        },
+        decoding_config={},
+        performance_options={
+            "pytorch_config": {
+                "cuda_graph_config": {"batch_sizes": [1, 2]},
+                "disable_overlap_scheduler": True,
+            },
+        },
+        backend=backend,
+    )
+
+
+def test_runtime_config_omits_legacy_trt_args():
+    llm_args = _benchmark_runtime_config("pytorch").get_llm_args()
+
+    assert "extended_runtime_perf_knob_config" not in llm_args
+    assert "batching_type" not in llm_args
+
+
+def test_runtime_config_preserves_pytorch_performance_options():
+    llm_args = _benchmark_runtime_config("pytorch").get_llm_args()
+
+    assert llm_args["cuda_graph_config"] == {"batch_sizes": [1, 2]}
+    assert llm_args["disable_overlap_scheduler"] is True
 
 
 def test_format_startup_metrics() -> None:
@@ -101,9 +144,6 @@ def test_int8_not_offered_as_bench_quant_choice() -> None:
     # INT8 is unsupported by the build path, so it must not be advertised as a
     # trtllm-bench --quantization choice (issue #7091).
     assert f"{QuantAlgo.INT8}" not in get_args(VALID_QUANT_ALGOS)
-
-
-pytestmark = pytest.mark.cpu_only
 
 
 @pytest.mark.parametrize(
@@ -199,3 +239,47 @@ def test_acceptance_length_weighted_by_iterations():
     # (= sum(output_tokens) / total_decoding_iterations). This would fail under
     # output-token weighting.
     assert stats.acceptance_length_percentiles.average == pytest.approx(stats.acceptance_length)
+
+
+def _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype, dtype):
+    """trtllm-bench model config with the NVIDIA-Nemotron-Nano-12B-v2 geometry."""
+    return NemotronHybridConfig(
+        name="nvidia/NVIDIA-Nemotron-Nano-12B-v2",
+        model_type="nemotron_h",
+        param_count=12_310_001_152,
+        hybrid_override_pattern="M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M-",
+        num_hidden_layers=62,
+        num_attention_heads=40,
+        num_key_value_heads=8,
+        hidden_size=5120,
+        head_dim=128,
+        ssm_state_size=128,
+        conv_kernel=4,
+        mamba_num_heads=128,
+        mamba_head_dim=80,
+        n_groups=8,
+        dtype=dtype,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
+    )
+
+
+def test_calc_engine_setting_sizes_unset_ssm_cache_dtype_from_model_dtype(monkeypatch):
+    """An unset mamba_ssm_cache_dtype is sized like the model dtype."""
+    monkeypatch.setattr(heuristics, "get_device_memory", lambda: 80.0)
+
+    def engine_setting(mamba_ssm_cache_dtype, dtype):
+        return heuristics.calc_engine_setting(
+            _nemotron_nano_12b_v2_bench_config(mamba_ssm_cache_dtype, dtype),
+            QuantConfig(),
+            tp_size=1,
+            pp_size=1,
+            target_input_len=128,
+            target_output_len=128,
+        )
+
+    bf16_setting = engine_setting("bfloat16", "bfloat16")
+    fp32_setting = engine_setting("float32", "float32")
+    assert fp32_setting[0] < bf16_setting[0]
+    for unset in (None, "auto"):
+        assert engine_setting(unset, "bfloat16") == bf16_setting
+        assert engine_setting(unset, "float32") == fp32_setting

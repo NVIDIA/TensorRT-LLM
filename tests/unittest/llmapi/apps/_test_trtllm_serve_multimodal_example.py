@@ -24,6 +24,7 @@ from .openai_server import RemoteOpenAIServer
 
 __extra_import_path__ = [".."]
 from test_llm import get_model_path
+from utils.llm_data import llm_models_root
 
 
 @pytest.fixture(scope="module", ids=["Qwen3/Qwen3-VL-2B-Instruct"])
@@ -40,6 +41,7 @@ def temp_extra_llm_api_options_file(request):
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.6,
+                "use_kv_cache_manager_v2": True,
             },
             "max_num_tokens": 16384,  # for pytorch backend
             # NOTE: This is for video support.
@@ -61,8 +63,12 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
-    with RemoteOpenAIServer(model_path, port=8000,
-                            cli_args=args) as remote_server:
+    # The example client sends local paths under the test data root.
+    env = os.environ.copy()
+    env["TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"] = str(llm_models_root() /
+                                                 "multimodals" / "test_data")
+    with RemoteOpenAIServer(model_path, port=8000, cli_args=args,
+                            env=env) as remote_server:
         yield remote_server
 
 

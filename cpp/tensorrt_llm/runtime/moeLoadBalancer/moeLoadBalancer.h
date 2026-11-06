@@ -29,7 +29,7 @@
 #include <vector>
 
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/kernels/moeLoadBalance/moeLoadBalanceCommon.h"
+#include "tensorrt_llm/kernels/moe/loadBalance/moeLoadBalanceCommon.h"
 
 namespace tensorrt_llm::runtime
 {

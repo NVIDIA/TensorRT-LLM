@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import pytest
 import torch
 from utils.llm_data import llm_models_root
@@ -25,7 +28,7 @@ def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
 
 def extract_decode_logprobs(result: RequestOutput,
                             gen_idx: int = 0) -> torch.Tensor:
-    """Shared by test_modeling_nemotron_nano_v2_vl.py."""
+    """Shared by test_modeling_nemotron_h_multimodal.py."""
     token_ids = torch.tensor(result.outputs[gen_idx].token_ids)
     logits = result.outputs[gen_idx].generation_logits
     return get_logprobs(token_ids, logits)
@@ -223,27 +226,33 @@ def test_nemotron_h_chunked_prefill():
 # Breakable prefill CUDA graphs (BCG) on the hybrid path. Under BCG the Mamba2
 # layers run through the eager_on_graph boundary op (mamba2_mixer.py), so this
 # covers the NemotronH-specific bridge rather than the generic BCG runner
-# (which unittest/_torch/executor/test_breakable_cuda_graph.py exercises).
+# (which unittest/_torch/pyexecutor/test_breakable_cuda_graph.py exercises).
 _BCG_MAX_NUM_TOKENS = 256
 _BCG_CAPTURE_NUM_TOKENS = [64, 128, 256]
 # Probability-ratio bound shared with ray_orchestrator/multi_gpu/
 # test_accuracy_with_allreduce_strategy.py::compare_logprobs (e^-2.30 ~ 0.1x).
 _BCG_LOGPROB_TOLERANCE = 2.30
+# Every prompt repeats one trained token. Ids 0-513 of the Nemotron-3 vocab are
+# added control tokens, most of them untrained <SPECIAL_n> placeholders; a prompt
+# built from one (the Qwen3.5 parity test's ids 23 and 31, which are ordinary
+# BPE tokens there) gives a flat next-token distribution whose leading
+# candidates tie within run-to-run noise (https://nvbugs/6777501). Id 17 is the
+# trained </tool_response> token. NemotronH disables KV block reuse by default,
+# so the shared prefix across prompts is never reused.
+_BCG_PROMPT_TOKEN = 17
 # Context batches: an exact capture bucket, one token past a bucket (padded
 # replay), two context requests of unequal length in one batch, and a prompt
 # longer than max_num_tokens (chunked prefill: 256 + 44).
 _BCG_CONTEXT_BATCHES = [
-    [[17] * 128],
-    [[17] * 129],
-    [[17] * 64, [23] * 65],
-    [[31] * 300],
+    [[_BCG_PROMPT_TOKEN] * 128],
+    [[_BCG_PROMPT_TOKEN] * 129],
+    [[_BCG_PROMPT_TOKEN] * 64, [_BCG_PROMPT_TOKEN] * 65],
+    [[_BCG_PROMPT_TOKEN] * 300],
 ]
 # The mixed-batch section adds the streaming decode request and the context
 # request admitted while it decodes.
 _BCG_MIXED_BATCH_REQUESTS = 2
-# Decode length of that streaming request: with EOS ignored this is a ~1 s
-# generation window, orders of magnitude longer than the client-side gap
-# before the second request is submitted.
+# Decode length of the streaming request, with EOS ignored.
 _BCG_STREAM_MAX_TOKENS = 64
 # One (token_ids, logprobs) entry per request from each backend run.
 _BCG_NUM_REQUESTS = (sum(len(batch) for batch in _BCG_CONTEXT_BATCHES) +
@@ -318,11 +327,11 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                 per_request.append((list(output.outputs[0].token_ids),
                                     _first_step_logprobs(output)))
 
-        # Mixed batch: admit a context request while another request is
-        # decoding, so BCG replays a batch that carries both a context chunk
-        # and decode tokens. The overlap is proved afterwards from the two
-        # requests' iteration metrics rather than assumed.
-        decoding = llm.generate_async([17] * 128,
+        # The first prefill fills the token budget, so the second request
+        # must start in a later iteration alongside the first request's decode.
+        # Submit both before waiting for streamed logits: response transport
+        # can otherwise delay admission until the first request has finished.
+        decoding = llm.generate_async([_BCG_PROMPT_TOKEN] * _BCG_MAX_NUM_TOKENS,
                                       sampling_params=SamplingParams(
                                           max_tokens=_BCG_STREAM_MAX_TOKENS,
                                           temperature=0.0,
@@ -330,12 +339,7 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                                           return_generation_logits=True,
                                           return_perf_metrics=True),
                                       streaming=True)
-        # In streaming mode every response carries only the newest step's
-        # logits, so the first-step distribution must be read from the first
-        # streamed response, before the stream moves on.
-        next(decoding)
-        decoding_first_step_logprobs = _first_step_logprobs(decoding)
-        admitted = llm.generate_async([23] * 65,
+        admitted = llm.generate_async([_BCG_PROMPT_TOKEN] * 65,
                                       sampling_params=SamplingParams(
                                           max_tokens=4,
                                           temperature=0.0,
@@ -343,6 +347,9 @@ def _run_nemotron_h_prefill_backend(backend: PrefillCudaGraphBackend,
                                           return_generation_logits=True,
                                           return_perf_metrics=True),
                                       streaming=False)
+        # Each streamed response carries only its newest step's logits.
+        next(decoding)
+        decoding_first_step_logprobs = _first_step_logprobs(decoding)
         decoding_out = decoding.result()
         admitted_out = admitted.result()
         _assert_mixed_batch_overlap(decoding_out, admitted_out)
@@ -367,7 +374,11 @@ def test_nemotron_h_breakable_prefill_cuda_graph(tp_size):
     prefill_cuda_graph_backend DISABLED and BREAKABLE. The first generated
     token is the direct product of the (captured) prefill, so its
     distribution is compared per request within the repo's accepted
-    probability-ratio bound and BCG's greedy pick must be one of eager's top-2.
+    probability-ratio bound, and each arm's greedy pick must lie within that
+    same bound of the other arm's greedy pick under the other arm's
+    distribution. A rank test (BCG's pick in eager's top-2) is not used: the
+    leading candidates can tie within run-to-run noise, which made the rank
+    test a coin flip (https://nvbugs/6777501).
     Full-sequence greedy equality is reported but not required: Nano-30B-A3B
     is MoE and flips greedy tokens under padding-induced numeric drift (see
     the note above test_nemotron_h_sanity). NCCL allreduce is pinned: tp1 has
@@ -384,21 +395,36 @@ def test_nemotron_h_breakable_prefill_cuda_graph(tp_size):
 
     identical = 0
     worst_diff = 0.0
+    worst_margin = 0.0
     for i, ((eager_ids, eager_lp), (bcg_ids,
                                     bcg_lp)) in enumerate(zip(eager, bcg)):
         assert len(bcg_ids) == len(eager_ids) > 0, (
             f"request {i}: BCG produced {len(bcg_ids)} tokens, "
             f"eager {len(eager_ids)}")
         eager_top1 = eager_ids[0]
+        bcg_top1 = bcg_ids[0]
         diff = (eager_lp[eager_top1] - bcg_lp[eager_top1]).abs().item()
         worst_diff = max(worst_diff, diff)
         assert diff < _BCG_LOGPROB_TOLERANCE, (
             f"request {i}: BCG log-prob of eager's first token differs by "
             f"{diff:.3f} nats (bound {_BCG_LOGPROB_TOLERANCE})")
-        eager_top2 = torch.topk(eager_lp, 2).indices.tolist()
-        assert bcg_ids[0] in eager_top2, (
-            f"request {i}: BCG first token {bcg_ids[0]} not in eager top-2 "
-            f"{eager_top2}")
+        # Tie-immune replacement for "BCG's pick is in eager's top-2": each
+        # arm's greedy pick may be at most the bound less likely than the
+        # other arm's own pick, judged by the other arm. When the leading
+        # candidates tie, any of them passes; a genuinely divergent pick does
+        # not.
+        eager_margin = (eager_lp[eager_top1] - eager_lp[bcg_top1]).item()
+        bcg_margin = (bcg_lp[bcg_top1] - bcg_lp[eager_top1]).item()
+        worst_margin = max(worst_margin, eager_margin, bcg_margin)
+        assert eager_margin < _BCG_LOGPROB_TOLERANCE, (
+            f"request {i}: BCG first token {bcg_top1} is {eager_margin:.3f} "
+            f"nats less likely than eager's first token {eager_top1} under "
+            f"eager (bound {_BCG_LOGPROB_TOLERANCE})")
+        assert bcg_margin < _BCG_LOGPROB_TOLERANCE, (
+            f"request {i}: eager first token {eager_top1} is {bcg_margin:.3f} "
+            f"nats less likely than BCG's first token {bcg_top1} under BCG "
+            f"(bound {_BCG_LOGPROB_TOLERANCE})")
         identical += int(bcg_ids == eager_ids)
     print(f"BCG vs eager: {identical}/{len(eager)} sequences identical, "
-          f"worst first-token log-prob diff {worst_diff:.3f} nats")
+          f"worst first-token log-prob diff {worst_diff:.3f} nats, "
+          f"worst greedy-pick margin {worst_margin:.3f} nats")

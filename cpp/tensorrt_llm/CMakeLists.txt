@@ -22,6 +22,55 @@ set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
                     ${API_INCLUDE_DIR})
 
+get_filename_component(TRTLLM_REPO_ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../.."
+                       ABSOLUTE)
+set(TRTLLM_FMHA_PARAMS_GENERATOR
+    "${TRTLLM_REPO_ROOT_DIR}/scripts/generate_fmha_params.py")
+set(TRTLLM_FMHA_PARAMS_SCHEMAS
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/fmha/phased.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/interface.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/trtllm.py"
+    "${TRTLLM_REPO_ROOT_DIR}/tensorrt_llm/_torch/attention/backends/sparse/params.py"
+)
+# The C++ consumer decides which members of the mirrored runtime classes
+# (TrtllmAttention, TrtllmAttentionMetadata) are emitted: a member crosses when
+# these sources read it as attn.<name> / meta.<name>.
+set(TRTLLM_FMHA_PARAMS_USAGE_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionFeature.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionVariant.h"
+    "${CMAKE_CURRENT_SOURCE_DIR}/thop/attentionOp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/nanobind/thop/bindings.cpp")
+set(TRTLLM_FMHA_PARAMS_SCHEMA_ARGS "")
+foreach(_schema ${TRTLLM_FMHA_PARAMS_SCHEMAS})
+  list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --module-path "${_schema}")
+endforeach()
+foreach(_usage ${TRTLLM_FMHA_PARAMS_USAGE_SOURCES})
+  list(APPEND TRTLLM_FMHA_PARAMS_SCHEMA_ARGS --usage-source "${_usage}")
+endforeach()
+set(TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# Generate during configuration so clangd can resolve the headers before a
+# build.
+set_property(
+  DIRECTORY
+  APPEND
+  PROPERTY CMAKE_CONFIGURE_DEPENDS ${TRTLLM_FMHA_PARAMS_GENERATOR}
+           ${TRTLLM_FMHA_PARAMS_SCHEMAS} ${TRTLLM_FMHA_PARAMS_USAGE_SOURCES})
+execute_process(
+  COMMAND
+    "${Python3_EXECUTABLE}" "${TRTLLM_FMHA_PARAMS_GENERATOR}"
+    ${TRTLLM_FMHA_PARAMS_SCHEMA_ARGS} --class-name FmhaParams --out-dir
+    "${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR}/tensorrt_llm/thop"
+  RESULT_VARIABLE TRTLLM_FMHA_PARAMS_RESULT
+  OUTPUT_VARIABLE TRTLLM_FMHA_PARAMS_OUTPUT
+  ERROR_VARIABLE TRTLLM_FMHA_PARAMS_OUTPUT)
+if(NOT TRTLLM_FMHA_PARAMS_RESULT EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Generating native FmhaParams failed:\n${TRTLLM_FMHA_PARAMS_OUTPUT}")
+endif()
+
 set(TARGET_ARCH "unknown")
 
 message(STATUS "CMAKE_SYSTEM_PROCESSOR: ${CMAKE_SYSTEM_PROCESSOR}")
@@ -140,7 +189,14 @@ if(NOT INTERNAL_CUTLASS_KERNELS_PATH)
   endif()
 endif()
 
+find_package(Threads REQUIRED)
 add_subdirectory(common)
+
+add_library(ipc_nvls_memory_src STATIC runtime/ipcNvlsMemory.cu)
+set_target_properties(
+  ipc_nvls_memory_src PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                 CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+
 add_subdirectory(kernels)
 add_subdirectory(runtime)
 
@@ -163,7 +219,6 @@ endif()
 
 add_subdirectory(executor)
 
-find_package(Threads REQUIRED)
 target_link_libraries(${BATCH_MANAGER_TARGET} INTERFACE Threads::Threads)
 target_link_libraries(${EXECUTOR_TARGET} INTERFACE Threads::Threads)
 
@@ -193,11 +248,11 @@ set(TRTLLM_LINK_LIBS
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
-    gemm_swiglu_sm90_src
     cutlass_src
     cute_dsl_src
     runtime_src
     compressorKernels_src
+    fusedSamplingKernels_src
     mhcKernels_src
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
@@ -215,6 +270,8 @@ endif()
 if(USING_OSS_CUTLASS_MOE_GEMM)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_gemm_src)
   message(STATUS "USING_OSS_CUTLASS_MOE_GEMM")
+else()
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_host_src)
 endif()
 
 if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
@@ -247,17 +304,64 @@ add_library(${SHARED_TARGET} SHARED)
 
 set_target_properties(
   ${SHARED_TARGET}
-  PROPERTIES CXX_STANDARD "17" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
+  PROPERTIES CXX_STANDARD "20" CXX_STANDARD_REQUIRED "YES" CXX_EXTENSIONS "NO"
              LINK_FLAGS "${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}")
+
+# Keep statically linked NVRTC symbols local so they cannot be interposed by a
+# dynamic NVRTC loaded elsewhere in the process.
+if(NOT WIN32 AND NOT NVRTC_DYNAMIC_LINKING)
+  target_link_options(
+    ${SHARED_TARGET} PRIVATE
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_LIB}>"
+    "LINKER:--exclude-libs,$<TARGET_FILE_NAME:${NVRTC_BUILTINS_LIB}>")
+endif()
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
 target_link_libraries(
   ${SHARED_TARGET}
-  PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
-          $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+  PRIVATE
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_error,tllm_common_logging,tllm_common_cuda,tllm_executor_types,tllm_executor_serialization,tllm_runtime_memory,tllm_runtime_buffers,tllm_runtime_distributed,tllm_runtime_topology>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_common_environment,tllm_executor_values,tllm_executor_transfer_agent,tllm_kv_cache_host_memory,tllm_kv_cache,tllm_kv_cache_legacy,tllm_batch_scheduler,tllm_kernel_kv_cache_copy>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${EXECUTOR_TARGET}>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,fp8_blockscale_gemm_src>
+    $<LINK_LIBRARY:WHOLE_ARCHIVE,${INTERNAL_CUTLASS_KERNELS_TARGET}>)
+
+foreach(component IN LISTS TLLM_KERNEL_COMPONENT_TARGETS)
+  target_link_libraries(${SHARED_TARGET}
+                        PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${component}>)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
+
+# Components also link each other normally; retain all component exports here.
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_error WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_common_logging WHOLE_ARCHIVE)
+set_property(TARGET ${SHARED_TARGET}
+             PROPERTY LINK_LIBRARY_OVERRIDE_tllm_executor_types WHOLE_ARCHIVE)
+
+foreach(
+  component
+  tllm_common_cuda
+  tllm_runtime_memory
+  tllm_runtime_buffers
+  tllm_runtime_distributed
+  tllm_runtime_topology
+  tllm_executor_serialization
+  tllm_common_environment
+  tllm_executor_values
+  tllm_executor_transfer_agent
+  tllm_kv_cache_host_memory
+  tllm_kv_cache
+  tllm_kv_cache_legacy
+  tllm_batch_scheduler
+  tllm_kernel_kv_cache_copy)
+  set_property(TARGET ${SHARED_TARGET}
+               PROPERTY LINK_LIBRARY_OVERRIDE_${component} WHOLE_ARCHIVE)
+endforeach()
 
 # Link kernel_src and cutlass_src. static internal cutlass lib overridden.
 target_link_libraries(${SHARED_TARGET} PUBLIC kernels_src cutlass_src)
@@ -292,12 +396,18 @@ endif()
 
 if(BUILD_PYT)
   add_subdirectory(thop)
+  # modeling_v2 family libraries: torch-op libraries loaded on demand.
+  add_subdirectory(modeling_v2)
 endif()
 
 add_subdirectory(nanobind)
 
 if(BUILD_DEEP_EP)
   add_subdirectory(deep_ep)
+endif()
+
+if(BUILD_PYT AND BUILD_NCCL_EXTENSIONS)
+  add_subdirectory(nccl_extensions)
 endif()
 
 if(BUILD_DEEP_GEMM)

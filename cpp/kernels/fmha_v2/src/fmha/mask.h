@@ -39,15 +39,9 @@ struct Mask<Traits, Cta_tile, 1>
     using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
 
     // The number of MMAs in each dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -118,15 +112,9 @@ struct Mask<Volta_hmma_fp16_traits, Cta_tile, 1>
     using Mma_tile = typename Traits::Mma_tile<Cta_tile>;
 
     // The number of MMAs in each dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // Ctor.
     template <typename Params, typename Block_info>
@@ -556,33 +544,18 @@ struct Mask<Traits, Cta_tile, 6> : public Mask<Traits, Cta_tile, 3>
     using Mma_tile = typename Base::Mma_tile;
 
     // The number of MMAs in each dimension.
-    enum
-    {
-        MMAS_M = Mma_tile::MMAS_M
-    };
+    static constexpr int MMAS_M = Mma_tile::MMAS_M;
 
-    enum
-    {
-        MMAS_N = Mma_tile::MMAS_N
-    };
+    static constexpr int MMAS_N = Mma_tile::MMAS_N;
 
     // One 32-bit packed mask holds 4 MMAS_N as one group.
-    enum
-    {
-        MMA_GROUPS_N = fmha::Div_up<MMAS_N, 4>::VALUE
-    };
+    static constexpr int MMA_GROUPS_N = fmha::Div_up<MMAS_N, 4>::VALUE;
 
     // The MMAS_N in the group.
-    enum
-    {
-        MMAS_N_IN_GROUP = fmha::Min<MMAS_N, 4>::VALUE
-    };
+    static constexpr int MMAS_N_IN_GROUP = fmha::Min<MMAS_N, 4>::VALUE;
 
     // MMAS_N uses full 32-bit integer packed masks.
-    enum
-    {
-        FULL_PACKED_MASK = (MMAS_N % 4 == 0)
-    };
+    static constexpr int FULL_PACKED_MASK = (MMAS_N % 4 == 0);
 
     // Ctor.
     template <typename Params, typename Block_info>

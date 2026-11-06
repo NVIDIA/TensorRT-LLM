@@ -464,8 +464,7 @@ def generate_llmapi():
         ]
 
         options.append("    :inherited-members:")
-        if cls_name in ["TorchLlmArgs", "TrtLlmArgs"
-                        ] or is_pydantic_model(cls_name):
+        if is_pydantic_model(cls_name):
             # exclude tons of methods from Pydantic
             options.append(
                 f"    :exclude-members: {','.join(get_pydantic_methods())}")

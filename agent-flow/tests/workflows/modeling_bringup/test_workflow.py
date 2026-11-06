@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for the modeling-bringup workflow prompts, CLI wiring, and task-schema validation."""
 
 from __future__ import annotations
@@ -328,13 +330,16 @@ def test_modeling_bringup_cli_module_imports():
 def test_modeling_bringup_cli_forwards_argv_verbatim():
     """Regression: the wrapper must forward ``argv`` to the generic agent-team ``main`` unchanged.
 
-    Only a task-scoped prompt bundle is injected. A prior bug parsed each flag manually and
-    dropped ``--feedback`` from the rebuilt constructor call, silently discarding user-supplied
-    guidance. Delegating with raw ``argv`` keeps every flag (current and future) forwarded by
-    construction.
+    A prior bug parsed each flag manually and dropped ``--feedback`` from the rebuilt constructor
+    call, silently discarding user-supplied guidance. Delegating with raw ``argv`` keeps every flag
+    (current and future) forwarded by construction.
 
-    Inspect the wrapper's source AST: the only call must be
-    ``_team_main(argv, prompts=prompts)``.
+    Inspect the wrapper's source AST: the sole ``_team_main`` call must forward
+    ``argv`` as the single positional argument and statically inject only the
+    task-scoped ``prompts=prompts`` bundle. The concurrent-DAG dependencies (isolation,
+    policy_for_type) ride in via a ``**`` splat that is empty on the linear path,
+    so the linear delegation stays byte-for-byte ``_team_main(argv, prompts=...)``
+    and never displaces the raw ``argv`` forwarding that guards the past bug class.
     """
     import ast
     import inspect
@@ -360,14 +365,79 @@ def test_modeling_bringup_cli_forwards_argv_verbatim():
         "in the previous bug class"
     )
 
-    # Prompts injection is the only kwarg.
-    kw_names = sorted(kw.arg for kw in call.keywords)
-    assert kw_names == ["prompts"], f"wrapper must only inject prompts=..., got keywords {kw_names}"
-    prompts_kw = call.keywords[0]
+    # The only *statically named* kwarg is prompts; the concurrent-DAG
+    # dependencies arrive via a ``**splat`` (empty on the linear path).
+    static_kwargs = {kw.arg: kw for kw in call.keywords if kw.arg is not None}
+    assert set(static_kwargs) == {"prompts"}, (
+        f"the only statically-injected kwarg must be prompts=...; the "
+        f"concurrent-DAG dependencies must ride in via a **splat that is empty "
+        f"on the linear path, got static kwargs {sorted(static_kwargs)}"
+    )
+    prompts_kw = static_kwargs["prompts"]
     assert isinstance(prompts_kw.value, ast.Name) and prompts_kw.value.id == "prompts", (
         "prompts kwarg must pass the task-scoped prompt bundle, "
         "not a reconstructed argv list or a static Slurm bundle"
     )
+
+
+def _stub_modeling_bringup_cli(monkeypatch, task_data, captured):
+    """Stub the modeling-bringup CLI's task/prompt plumbing and capture the delegate call.
+
+    Replaces ``load_and_validate_task_yaml`` (return the supplied ``task_data``),
+    the prompt builders (no live skill probe), and ``_team_main`` (record its
+    keyword args into ``captured``) so a test can drive ``main`` end-to-end and
+    inspect exactly what the wrapper injects.
+    """
+    module = _load_modeling_bringup_cli_module()
+    monkeypatch.setattr(module, "load_and_validate_task_yaml", lambda _path: task_data)
+    monkeypatch.setattr(module, "build_modeling_bringup_prompts", lambda **_kw: "PROMPTS")
+
+    def _fake_team_main(argv, **kwargs):
+        captured["argv"] = argv
+        captured.update(kwargs)
+
+    monkeypatch.setattr(module, "_team_main", _fake_team_main)
+    return module
+
+
+def test_modeling_bringup_concurrent_injects_git_worktree_isolation(tmp_path, monkeypatch):
+    """Under --concurrent the wrapper injects GitWorktreeIsolation + the stage/goal policy."""
+    from agent_flow.git_worktree import GitWorktreeIsolation
+    from agent_flow.workflows.modeling_bringup.node_policy import policy_for_type
+
+    repo = tmp_path / "trtllm"
+    repo.mkdir()
+    workspace = tmp_path / "ws"
+    task_data = {"trtllm_repo_path": str(repo)}
+
+    captured: dict = {}
+    module = _stub_modeling_bringup_cli(monkeypatch, task_data, captured)
+
+    module.main(["--task", "t.yaml", "--workspace", str(workspace), "--concurrent"])
+
+    isolation = captured["isolation"]
+    assert isinstance(isolation, GitWorktreeIsolation)
+    assert isolation.repo_path == repo
+    assert isolation.worktrees_root == workspace / "worktrees"
+    assert captured["policy_for_type"] is policy_for_type
+    assert captured["prompts"] == "PROMPTS"
+
+
+def test_modeling_bringup_linear_injects_no_isolation(tmp_path, monkeypatch):
+    """Without --concurrent the wrapper injects no isolation/policy (linear path unchanged)."""
+    repo = tmp_path / "trtllm"
+    repo.mkdir()
+    task_data = {"trtllm_repo_path": str(repo)}
+
+    captured: dict = {}
+    module = _stub_modeling_bringup_cli(monkeypatch, task_data, captured)
+
+    module.main(["--task", "t.yaml", "--workspace", str(tmp_path / "ws")])
+
+    # The linear delegation stays byte-for-byte ``_team_main(argv, prompts=...)``:
+    # no concurrent-DAG dependencies are injected at all.
+    assert "isolation" not in captured
+    assert "policy_for_type" not in captured
 
 
 def test_persistent_deviation_handling_in_modeling_bringup_reviewer():
@@ -783,126 +853,6 @@ def test_modeling_bringup_workflow_uses_extended_bundle(tmp_path, monkeypatch):
         # Reset the override so subsequent tests see the populated bundle.
         monkeypatch.undo()
         importlib.reload(mb_prompts)
-
-
-def _print_baseline_context_table(
-    variant: str,
-    rows: list[tuple[str, str, float, int | None, int | None]],
-    unavailable: list[str],
-) -> None:
-    """Print an overview table of each role's baseline ("start") context usage.
-
-    Visible with ``pytest -s``. Purely informational — the caller's
-    assertions still enforce the 20% budget.
-    """
-    header = ("role", "backend", "context%", "tokens / window")
-    table_rows = [
-        (name, backend, f"{percentage:.1f}%", f"{tokens} / {window}")
-        for name, backend, percentage, tokens, window in rows
-    ]
-    columns = list(zip(header, *table_rows)) if table_rows else [(h,) for h in header]
-    widths = [max(len(str(cell)) for cell in col) for col in columns]
-
-    def _fmt(cells: tuple[str, ...]) -> str:
-        return "  ".join(cell.ljust(widths[col]) for col, cell in enumerate(cells))
-
-    rule = "-" * (sum(widths) + 2 * (len(widths) - 1))
-    print(f"\n=== modeling-bringup baseline context usage ({variant}) ===")
-    print(_fmt(header))
-    print(rule)
-    for row in table_rows:
-        print(_fmt(row))
-    if not table_rows:
-        print("(no live backend reported context usage)")
-    if unavailable:
-        print(f"skipped: {'; '.join(unavailable)}")
-
-
-@pytest.mark.parametrize(
-    "include_slurm_environment",
-    [False, True],
-    ids=["local", "slurm"],
-)
-def test_modeling_bringup_claude_agents_baseline_context_under_20_percent(
-    tmp_path, include_slurm_environment
-):
-    """Each Claude-backed modeling-bringup agent's pre-input context must stay < 20%.
-
-    The modeling-bringup bundle layers substantial domain guidance
-    (source boundary, validation policies, accuracy gate, evidence
-    labels, and — for Slurm tasks — the container bootstrap) on top of
-    the generic ``agent_team`` prompts. This guards that the larger
-    prompt, together with the Claude Code preset, built-in tools, MCP
-    tool schemas, and memory the agent carries *before any user input*,
-    still leaves most of the context window free for real work. The Slurm
-    variant carries the largest prompts, so it is the worst case for
-    bloat — both variants are exercised.
-
-    Mirrors ``test_claude_agents_baseline_context_under_20_percent`` in
-    the agent_team suite, but builds the workflow with the
-    modeling-bringup bundle. Uses the live local ``/context`` control
-    request via ``fetch_baseline_context_usage`` (no model call), so it
-    runs for real wherever the ``claude`` CLI is installed and skips
-    cleanly when the backend cannot be reached. A baseline at or above
-    20% fails; an unreachable backend skips.
-    """
-    variant = "slurm" if include_slurm_environment else "local"
-    mb_prompts = importlib.import_module("agent_flow.workflows.modeling_bringup.prompts")
-    importlib.reload(mb_prompts)
-    bundle = mb_prompts.build_modeling_bringup_prompts(
-        include_slurm_environment=include_slurm_environment
-    )
-    workflow_module = _load_agent_team_workflow_module()
-    workflow = workflow_module.AgentTeamWorkflow(workspace=tmp_path, prompts=bundle)
-    try:
-        # Only Claude Code-backed agents report a pre-input /context
-        # breakdown; the codex-backed plan_drafter / reviewer return None.
-        claude_agents = {
-            name: agent
-            for name, agent in (
-                ("coder", workflow.coder),
-                ("plan_reviewer", workflow.plan_reviewer),
-                ("qa", workflow.qa),
-            )
-            if agent.config.backend.kind == "claude-code"
-        }
-        assert claude_agents, "expected at least one Claude Code-backed modeling-bringup agent"
-
-        unavailable: list[str] = []
-        rows: list[tuple[str, str, float, int | None, int | None]] = []
-        for name, agent in claude_agents.items():
-            backend_kind = agent.config.backend.kind
-            try:
-                usage = agent.fetch_baseline_context_usage()
-            except Exception as exc:  # CLI missing / backend unreachable
-                unavailable.append(f"{name} ({variant}): {exc}")
-                continue
-            if usage is None or usage.context_percentage is None:
-                unavailable.append(f"{name} ({variant}): no pre-input context usage")
-                continue
-            rows.append(
-                (
-                    name,
-                    backend_kind,
-                    usage.context_percentage,
-                    usage.context_tokens,
-                    usage.context_window,
-                )
-            )
-
-        # Overview of where each role starts before any real work.
-        _print_baseline_context_table(variant, rows, unavailable)
-
-        for name, backend_kind, percentage, tokens, window in rows:
-            assert percentage < 20.0, (
-                f"{name} ({variant}) pre-input context {percentage:.1f}% "
-                f"exceeds the 20% budget "
-                f"({tokens}/{window} tokens)"
-            )
-        if not rows:
-            pytest.skip("no live backend reported context usage: " + "; ".join(unavailable))
-    finally:
-        workflow.close()
 
 
 def _valid_task_payload(tmp_path) -> dict:

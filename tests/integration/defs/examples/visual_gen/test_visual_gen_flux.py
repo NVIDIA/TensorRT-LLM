@@ -33,14 +33,13 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _fixed_nvfp4_quantization_backend,
     _golden_media_path,
     _lpips_deterministic_algorithms,
-    _lpips_model_path,
     _preserve_lpips_candidate_on_failure,
     _run_lpips_eval,
     _run_reusable_image_lpips_eval,
     _run_single_device_feature_generator,
-    _skip_if_missing,
     _validate_single_feature_config,
 )
+from test_common.llm_data import get_checkpoint
 
 FLUX_LPIPS_PROMPT = "a tiny astronaut hatching from an egg on the moon"
 FLUX_LPIPS_HEIGHT = 256
@@ -100,6 +99,30 @@ FLUX_FEATURE_PROFILES = (
     ),
 )
 
+FLUX_STATIC_QUANT_ACCURACY_CASES = (
+    FluxAccuracyCase(
+        id="flux1-nvfp4-static",
+        checkpoint_subdir="FLUX.1-dev-modelopt-NVFP4",
+        golden_file="flux1_nvfp4_static_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="NVFP4",
+            quantization_source="static",
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+    FluxAccuracyCase(
+        id="flux1-nvfp4-static-mha-quantize",
+        checkpoint_subdir="FLUX.1-dev-modelopt-NVFP4",
+        golden_file="flux1_nvfp4_static_mha_quantize_lpips_golden.png",
+        features=FeatureConfigState(
+            quantization="NVFP4",
+            quantization_source="static",
+            mha_quantize=True,
+        ),
+        lpips_threshold=FLUX_FEATURE_LPIPS_THRESHOLD,
+    ),
+)
+
 
 def _build_flux_accuracy_cases():
     cases = []
@@ -123,6 +146,9 @@ def _build_flux_accuracy_cases():
                     id=case_id,
                 )
             )
+    for case in FLUX_STATIC_QUANT_ACCURACY_CASES:
+        _validate_single_feature_config(case.features, FLUX_SUPPORTED_FEATURES, "FLUX")
+        cases.append(pytest.param(case, id=case.id))
     return cases
 
 
@@ -134,7 +160,6 @@ def _generate_flux_lpips_image(model_path, output_path):
     from tensorrt_llm.media.encoding import save_image
     from tensorrt_llm.visual_gen.args import TorchCompileConfig, VisualGenArgs
 
-    _skip_if_missing(model_path, "FLUX checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     with _lpips_deterministic_algorithms():
         args = VisualGenArgs(
@@ -163,8 +188,7 @@ def _generate_flux_image(case, output_path):
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.media.encoding import save_image
 
-    model_path = _lpips_model_path(case.checkpoint_subdir)
-    _skip_if_missing(model_path, f"{case.checkpoint_subdir} checkpoint", is_dir=True)
+    model_path = get_checkpoint(case.checkpoint_subdir)
     _disable_inductor_compile_worker_quiesce()
     pipeline = None
     with _lpips_deterministic_algorithms(), _fixed_nvfp4_quantization_backend(case.features):
@@ -210,7 +234,7 @@ def test_flux1_lpips_against_golden(tmp_path):
     golden_path = _golden_media_path(
         tmp_path, "flux1_lpips_golden.png", "FLUX.1 LPIPS golden image"
     )
-    _generate_flux_lpips_image(_lpips_model_path("FLUX.1-dev"), generated_path)
+    _generate_flux_lpips_image(get_checkpoint("FLUX.1-dev"), generated_path)
     score = _run_lpips_eval(
         tmp_path,
         "flux1",
@@ -228,7 +252,7 @@ def test_flux2_lpips_against_golden(tmp_path):
     golden_path = _golden_media_path(
         tmp_path, "flux2_lpips_golden.png", "FLUX.2 LPIPS golden image"
     )
-    _generate_flux_lpips_image(_lpips_model_path("FLUX.2-dev"), generated_path)
+    _generate_flux_lpips_image(get_checkpoint("FLUX.2-dev"), generated_path)
     score = _run_lpips_eval(
         tmp_path,
         "flux2",
@@ -269,8 +293,7 @@ def test_flux_accuracy_against_golden(request, tmp_path, case, _visual_gen_lpips
 
 def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
     """Run the FLUX.1 example with the supported single-GPU NVFP4 config."""
-    model_path = _lpips_model_path("FLUX.1-dev")
-    _skip_if_missing(model_path, "FLUX.1-dev checkpoint", is_dir=True)
+    model_path = get_checkpoint("FLUX.1-dev")
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux1_example")
     os.makedirs(out_dir, exist_ok=True)
@@ -299,8 +322,7 @@ def test_flux1_example(_visual_gen_deps, llm_root, llm_venv):
 
 def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
     """Run the FLUX.2 example with the supported single-GPU NVFP4 config."""
-    model_path = _lpips_model_path("FLUX.2-dev")
-    _skip_if_missing(model_path, "FLUX.2-dev checkpoint", is_dir=True)
+    model_path = get_checkpoint("FLUX.2-dev")
 
     out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", "flux2_example")
     os.makedirs(out_dir, exist_ok=True)
@@ -329,8 +351,7 @@ def test_flux2_example(_visual_gen_deps, llm_root, llm_venv):
 
 def test_flux2_reference_image_example(_visual_gen_deps, llm_root, llm_venv, tmp_path):
     """Run the FLUX.2 example with the existing reference-image request argument."""
-    model_path = _lpips_model_path("FLUX.2-dev")
-    _skip_if_missing(model_path, "FLUX.2-dev checkpoint", is_dir=True)
+    model_path = get_checkpoint("FLUX.2-dev")
     reference_path = _golden_media_path(
         tmp_path, "flux2_lpips_golden.png", "FLUX.2 reference image"
     )

@@ -12,7 +12,10 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import Consumable
 from tensorrt_llm._torch.models.checkpoints.hf.qwen3_next_weight_mapper import (
     Qwen3NextHfWeightMapper,
 )
-from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.models.modeling_utils import (
+    concatenate_weights_by_tp_rank,
+    register_mapper,
+)
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
 from tensorrt_llm.quantization import QuantAlgo
@@ -20,8 +23,20 @@ from tensorrt_llm.quantization import QuantAlgo
 _FP8_2D_BLOCK_SIZE = 128
 
 
+def _check_packed_int4(
+    tensors: dict[str, torch.Tensor], keys: set[str], rows: tuple[int, ...], prefix: str
+) -> tuple[int, ...]:
+    """Validate packed projection storage and return physical row counts."""
+    if not all(tensors[key].dtype in (torch.uint8, torch.int8) for key in keys):
+        raise ValueError(f"Cannot fuse packed INT4 and unpacked weights for {prefix}")
+    if len({tensors[key].dtype for key in keys}) != 1:
+        raise ValueError(f"Packed INT4 projections must have the same storage dtype for {prefix}")
+    if any(row % 2 != 0 for row in rows):
+        raise ValueError(f"INT4 projection dimensions must be even for {prefix}")
+    return tuple(row // 2 for row in rows)
+
+
 @register_mapper("HF", "Qwen3_5ForConditionalGeneration")
-@register_mapper("HF", "QwenImageBenchForConditionalGeneration")
 @register_mapper("HF", "Qwen3_5MoeForCausalLM")
 @register_mapper("HF", "Qwen3_5MoeForConditionalGeneration")
 @register_mapper("HF", "Qwen3_5ForCausalLM")
@@ -43,11 +58,13 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
        Qwen3Next checkpoints store pre-packed in_proj_qkvz and in_proj_ba
        tensors.  Qwen3.5 checkpoints store them as separate in_proj_qkv + z
        (or fully split q/k/v/z) and b + a tensors.  This mapper packs them
-       into the grouped-interleaved layout that TRT-LLM expects.
+       into the grouped-interleaved layout consumed by the Qwen3Next mapper.
+       INT4 projections are concatenated directly in per-rank dense order,
+       preserving the two output channels stored in each byte.
        For FP8_BLOCK_SCALES checkpoints, the packed qkvz tensor is then
        dequantized to bf16 as a temporary workaround for TP loading
        (handled in _dequantize_linear_attn_fp8_qkvz).  For MIXED_PRECISION
-       checkpoints with per-tensor FP8 in_proj, the projections are
+       checkpoints and global FP8 checkpoints with per-tensor FP8 in_proj, the projections are
        requantized onto one shared scale and kept FP8
        (_requantize_linear_attn_fp8_qkvz), falling back to bf16 dequant
        (_dequantize_linear_attn_fp8_per_tensor) when the fused module has no
@@ -230,9 +247,78 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 for name, value in module_weights.items()
             )
             uses_fused_expert_tensors = has_stacked_expert_tensors and not has_per_expert_tensors
+
+            def _stacked_in_linear_orientation(name: str, value) -> bool:
+                # Qwen3.5 BF16 checkpoints stack experts in nn.Linear
+                # orientation: gate_up_proj [E, 2I, H] ([gate; up] blocked
+                # along dim 1) and down_proj [E, H, I].
+                if getattr(value, "ndim", None) != 3:
+                    return False
+                if name == "gate_up_proj":
+                    return value.shape[-2] == 2 * config.moe_intermediate_size and (
+                        value.shape[-1] == config.hidden_size
+                    )
+                return value.shape[-2] == config.hidden_size and (
+                    value.shape[-1] == config.moe_intermediate_size
+                )
+
+            # nn.Linear-orientation stacks already match the destination
+            # w3_w1/w2 layouts, so unfuse them into zero-copy per-expert views
+            # for the VANILLA loader. The previous FUSED_GATE_UP_PROJ path
+            # materialized a transposed copy of the WHOLE stack here (~97% of
+            # the 397B checkpoint's bytes) only for the loader to transpose
+            # each expert straight back -- a pure round trip. Stacks in any
+            # other orientation (e.g. HF batched-matmul [E, H, 2I]) keep the
+            # FUSED path, which expects that layout natively.
+            # Guard: only unfuse pure weight(+bias) stacks. A hypothetical
+            # stacked QUANTIZED checkpoint would carry scale tensors under the
+            # fused names; unfusing the weights while leaving those stacked
+            # would silently drop the scales in VANILLA mode (which looks up
+            # "{e}.w1.weight_scale" etc.), so keep such inputs on the FUSED
+            # path unchanged. No known Qwen3.5 checkpoint hits this today --
+            # ModelOpt exports are per-expert -- this is purely defensive.
+            has_stacked_scales = any("scale" in name for name in module_weights)
+            unfuse_to_vanilla = (
+                uses_fused_expert_tensors
+                and not has_stacked_scales
+                and all(
+                    _stacked_in_linear_orientation(name, value)
+                    for name, value in module_weights.items()
+                    if name in ("gate_up_proj", "down_proj") and getattr(value, "ndim", None) == 3
+                )
+            )
+
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
                 if has_per_expert_tensors and weight_name in ("gate_up_proj", "down_proj"):
+                    continue
+                if unfuse_to_vanilla and weight_name == "gate_up_proj":
+                    for expert_id in range(weight_value.shape[0]):
+                        gate, up = weight_value[expert_id].chunk(2, dim=0)
+                        updated_module_weights[f"{expert_id}.w1.weight"] = gate
+                        updated_module_weights[f"{expert_id}.w3.weight"] = up
+                    continue
+                if unfuse_to_vanilla and weight_name == "down_proj":
+                    for expert_id in range(weight_value.shape[0]):
+                        updated_module_weights[f"{expert_id}.w2.weight"] = weight_value[expert_id]
+                    continue
+                if (
+                    unfuse_to_vanilla
+                    and weight_name == "gate_up_proj.bias"
+                    and (weight_value.ndim == 2)
+                ):
+                    for expert_id in range(weight_value.shape[0]):
+                        gate_bias, up_bias = weight_value[expert_id].chunk(2, dim=0)
+                        updated_module_weights[f"{expert_id}.w1.bias"] = gate_bias
+                        updated_module_weights[f"{expert_id}.w3.bias"] = up_bias
+                    continue
+                if (
+                    unfuse_to_vanilla
+                    and weight_name == "down_proj.bias"
+                    and (weight_value.ndim == 2)
+                ):
+                    for expert_id in range(weight_value.shape[0]):
+                        updated_module_weights[f"{expert_id}.w2.bias"] = weight_value[expert_id]
                     continue
                 if weight_name == "gate_up_proj" and weight_value.ndim == 3:
                     if weight_value.shape[-2] == 2 * config.moe_intermediate_size and (
@@ -258,9 +344,9 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                     )
                 updated_module_weights[new_weight_name] = weight_value
             module.weight_loading_mode = (
-                MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
-                if uses_fused_expert_tensors
-                else MoEWeightLoadingMode.VANILLA
+                MoEWeightLoadingMode.VANILLA
+                if (unfuse_to_vanilla or not uses_fused_expert_tensors)
+                else MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
             )
             module.load_weights(
                 weights=[updated_module_weights], allow_partial_loading=allow_partial_loading
@@ -339,13 +425,13 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
     def _requantize_linear_attn_fp8_qkvz(self, weights: dict) -> dict:
         """Requantize split per-tensor FP8 in_proj projections onto one scale.
 
-        When _normalize_qwen35_quant_config_dict synthesized an FP8 entry for
-        the fused ``in_proj_qkvz`` module (i.e. the checkpoint quantizes every
-        split projection per-tensor FP8), keep the weights FP8 instead of
-        dequantizing to bf16: rescale each projection onto the max
-        ``weight_scale`` so the packed fused weight shares a single per-tensor
-        scale, drop the per-projection scalar scales (they must not reach
-        _pack_split_projections), and emit fused ``weight_scale`` /
+        When the fused ``in_proj_qkvz`` module uses FP8, either through the
+        global quant config or an entry synthesized by
+        _normalize_qwen35_quant_config_dict, keep the split per-tensor FP8
+        weights instead of dequantizing to bf16: rescale each projection onto
+        the max ``weight_scale`` so the packed fused weight shares a single
+        per-tensor scale, drop the per-projection scalar scales (they must not
+        reach _pack_split_projections), and emit fused ``weight_scale`` /
         ``input_scale`` keys -- the same key set out_proj already loads
         through the per-tensor FP8 Linear path.
 
@@ -365,7 +451,15 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         drop_keys = set()
         for prefix, projs in grouped_names.items():
             fused_cfg = qcd.get(f"{prefix}.in_proj_qkvz")
-            if fused_cfg is None or fused_cfg.quant_algo != QuantAlgo.FP8:
+            globally_quantized = (
+                self.config.quant_config.quant_algo == QuantAlgo.FP8
+                and not self.config.quant_config.is_module_excluded_from_quantization(
+                    f"{prefix}.in_proj_qkvz"
+                )
+            )
+            if not globally_quantized and (
+                fused_cfg is None or fused_cfg.quant_algo != QuantAlgo.FP8
+            ):
                 continue
             weight_scales = {}
             input_scales = []
@@ -475,7 +569,7 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             if name not in drop_keys
         }
 
-    def _pack_split_projections(self, weights: dict) -> dict:
+    def _pack_split_projections(self, weights: dict, dense_layout: bool = False) -> dict:
         config = self.config.pretrained_config
         num_k_groups = config.linear_num_key_heads
         num_v_heads = config.linear_num_value_heads
@@ -483,6 +577,13 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             f"linear_num_value_heads ({num_v_heads}) must be divisible by "
             f"linear_num_key_heads ({num_k_groups})"
         )
+
+        pack_projection_tensor = self._pack_projection_tensor
+        num_groups = num_k_groups
+        if dense_layout:
+            mapping = self.config.mapping
+            num_groups = 1 if mapping.enable_attention_dp else mapping.tp_size
+            pack_projection_tensor = concatenate_weights_by_tp_rank
 
         grouped_weights = defaultdict(dict)
         packed_weights = {}
@@ -500,9 +601,43 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         expected_ba = config.linear_num_value_heads
 
         for (prefix, suffix), tensors in grouped_weights.items():
+            if dense_layout and suffix == "pre_quant_scale":
+                # Input scales are shared by fused projections, not concatenated by output row.
+                for projection, keys in (
+                    ("qkvz", ("qkv", "z") if "qkv" in tensors else ("q", "k", "v", "z")),
+                    ("ba", ("b", "a")),
+                ):
+                    if not set(keys) & tensors.keys():
+                        continue
+                    if missing := set(keys) - tensors.keys():
+                        raise ValueError(
+                            f"Cannot fuse {prefix}.in_proj_{projection}.pre_quant_scale: "
+                            f"missing scales for {sorted(missing)}"
+                        )
+                    scales = [
+                        tensors[key]
+                        if isinstance(tensors[key], torch.Tensor)
+                        else tensors[key][...]
+                        for key in keys
+                    ]
+                    if any(scale.shape != (config.hidden_size,) for scale in scales):
+                        raise ValueError(
+                            f"Expected pre_quant_scale shape ({config.hidden_size},) for {prefix}"
+                        )
+                    if not all(torch.equal(scales[0], scale) for scale in scales[1:]):
+                        raise ValueError(
+                            f"Cannot fuse {prefix}.in_proj_{projection}: pre_quant_scale vectors "
+                            "must be identical; export with shared input scales"
+                        )
+                    packed_name = f"{prefix}.in_proj_{projection}.{suffix}"
+                    if packed_name in packed_weights:
+                        raise ValueError(f"Packed projection {packed_name} already exists")
+                    packed_weights[packed_name] = scales[0]
+                continue
             # `weight_scale_inv` (loaded by FP8BlockScalesLinearMethod) is the
             # only suffix stored in 2D-block format [ceil(out/block_size), ceil(in/block_size)];
-            # weight/bias/weight_scale all keep out_features as their leading dim.
+            # INT4 weights pack two output channels per byte; their scales and
+            # biases retain the logical output dimension.
             if suffix == "weight_scale_inv":
                 row_q = math.ceil(expected_q / _FP8_2D_BLOCK_SIZE)
                 row_v = math.ceil(expected_v / _FP8_2D_BLOCK_SIZE)
@@ -514,13 +649,22 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
 
             qkvz_keys = {"qkv", "q", "k", "v", "z"} & tensors.keys()
             if qkvz_keys:
+                if (
+                    dense_layout
+                    and suffix == "weight"
+                    and any(tensors[key].dtype in (torch.uint8, torch.int8) for key in qkvz_keys)
+                ):
+                    row_q, row_v = _check_packed_int4(tensors, qkvz_keys, (row_q, row_v), prefix)
                 if "qkv" in tensors:
                     missing = {"qkv", "z"} - tensors.keys()
                     assert not missing, (
                         f"Missing split projections {sorted(missing)} for {prefix}.{suffix}"
                     )
+                    split_q, split_v = (
+                        (expected_q, expected_v) if suffix == "weight_scale_inv" else (row_q, row_v)
+                    )
                     q_tensor, k_tensor, v_tensor = split_packed_qkv(
-                        tensors["qkv"], expected_q, expected_v
+                        tensors["qkv"], split_q, split_v
                     )
                 else:
                     missing = {"q", "k", "v", "z"} - tensors.keys()
@@ -540,8 +684,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 assert packed_name not in packed_weights, (
                     f"Packed projection {packed_name} already exists"
                 )
-                packed_weights[packed_name] = self._pack_projection_tensor(
-                    [q_tensor, k_tensor, v_tensor, tensors["z"]], num_k_groups
+                packed_weights[packed_name] = pack_projection_tensor(
+                    [q_tensor, k_tensor, v_tensor, tensors["z"]], num_groups
                 )
 
             ba_keys = {"b", "a"} & tensors.keys()
@@ -552,6 +696,10 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 )
 
                 if suffix == "weight":
+                    if dense_layout and any(
+                        tensors[key].dtype in (torch.uint8, torch.int8) for key in ba_keys
+                    ):
+                        (row_ba,) = _check_packed_int4(tensors, ba_keys, (row_ba,), prefix)
                     assert tensors["b"].shape[0] == row_ba
                     assert tensors["a"].shape[0] == row_ba
 
@@ -559,8 +707,8 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
                 assert packed_name not in packed_weights, (
                     f"Packed projection {packed_name} already exists"
                 )
-                packed_weights[packed_name] = self._pack_projection_tensor(
-                    [tensors["b"], tensors["a"]], num_k_groups
+                packed_weights[packed_name] = pack_projection_tensor(
+                    [tensors["b"], tensors["a"]], num_groups
                 )
 
         return packed_weights
@@ -629,9 +777,14 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         vals = torch.empty((out_features, in_features), dtype=torch.float32)
         vals[:, 0::2] = lut[(weight & 0x0F).long()]
         vals[:, 1::2] = lut[((weight >> 4) & 0x0F).long()]
-        # Per-group (16) scale = block_scale (fp8) * global_scale (fp32).
+        # Per-group scale = block_scale (fp8) * global_scale (fp32); the block
+        # width (16, or 32 for weight-only exports) follows from the scale shape.
+        num_groups = block_scale.shape[-1]
+        assert in_features % num_groups == 0, (
+            f"lm_head weight_scale has {num_groups} groups for {in_features} inputs"
+        )
         scale = (block_scale * global_scale).unsqueeze(-1)
-        vals = vals.view(out_features, in_features // 16, 16) * scale
+        vals = vals.view(out_features, num_groups, in_features // num_groups) * scale
         dequantized = vals.view(out_features, in_features).to(target_dtype).contiguous()
 
         drop = {"lm_head.weight_scale", "lm_head.weight_scale_2", "lm_head.input_scale"}
@@ -667,14 +820,12 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
             normalized_weights, quant_algo
         )
 
-        # ModelOpt MIXED_PRECISION checkpoints quantize the split linear-attn
-        # in_proj to per-tensor FP8.  When the fused in_proj_qkvz module is
-        # FP8 (entry synthesized by _normalize_qwen35_quant_config_dict),
-        # requantize the split projections onto one shared scale and keep them
-        # FP8; whatever remains (in_proj_ba, prefixes without a fused FP8
-        # entry) is dequantized to bf16 so scalar scales don't reach
-        # _pack_split_projections.
-        if quant_algo == QuantAlgo.MIXED_PRECISION:
+        # ModelOpt MIXED_PRECISION and global FP8 checkpoints can store split
+        # linear-attn in_proj weights with per-tensor FP8 scales.  When the
+        # fused in_proj_qkvz module is FP8, requantize the split projections
+        # onto one shared scale; dequantize any remaining FP8 projections to
+        # bf16 so scalar scales don't reach _pack_split_projections.
+        if quant_algo in (QuantAlgo.MIXED_PRECISION, QuantAlgo.FP8):
             normalized_weights = self._requantize_linear_attn_fp8_qkvz(normalized_weights)
             normalized_weights = self._dequantize_linear_attn_fp8_per_tensor(normalized_weights)
 
@@ -683,16 +834,26 @@ class Qwen3_5MoeHfWeightMapper(Qwen3NextHfWeightMapper):
         if quant_algo in (QuantAlgo.MIXED_PRECISION, QuantAlgo.NVFP4):
             normalized_weights = self._dequantize_lm_head_nvfp4(normalized_weights)
 
-        packed_weights = self._pack_split_projections(normalized_weights)
+        dense_layout = quant_algo == QuantAlgo.W4A16_AWQ
+        if dense_layout:
+            # Apply MTP renaming and non-projection transforms while in_proj
+            # tensors are still split. The inherited mapper passes those
+            # through, so the directly fused result is not permuted again.
+            normalized_weights = super().preprocess_weights(
+                normalized_weights, allow_partial_loading=allow_partial_loading
+            )
+        packed_weights = self._pack_split_projections(normalized_weights, dense_layout=dense_layout)
         if quant_algo == QuantAlgo.FP8_BLOCK_SCALES and not is_modelopt_pb_wo:
             packed_weights = self._dequantize_linear_attn_fp8_qkvz(packed_weights)
 
         if not getattr(self.config.pretrained_config, "num_experts", 0):
             packed_weights = self._remap_dense_mlp_weights(packed_weights)
 
-        processed_weights = super().preprocess_weights(
-            packed_weights, allow_partial_loading=allow_partial_loading
-        )
+        processed_weights = packed_weights
+        if not dense_layout:
+            processed_weights = super().preprocess_weights(
+                packed_weights, allow_partial_loading=allow_partial_loading
+            )
         if is_consumable and not isinstance(processed_weights, ConsumableWeightsDict):
             return ConsumableWeightsDict(processed_weights)
         return processed_weights

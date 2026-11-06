@@ -15,7 +15,7 @@
 """Step-pairing tests for speculative-decoding acceptance stats.
 
 py_draft_tokens is not a valid acceptance-rate denominator at response time:
-it is padded to the static max for CUDA graphs (two-model flow), and in the
+it is padded to the static max for CUDA graphs (drafter flow), and in the
 one-model flow SpecSampler.update_requests replaces it with the NEXT
 step's buffer before responses are handled. The samplers therefore write
 py_num_draft_tokens_verified — the real proposal count of the same step the
@@ -105,14 +105,42 @@ class TestAccumulator:
     def test_tree_drafting_clamps_totals_to_max_path_len(self):
         # Tree drafting verifies up to max_total_draft_tokens nodes but can
         # accept at most max_draft_len (the max path length) per step; the
-        # cumulative denominator counts paths, mirroring the C++
-        # updateNumTokensPerIteration clamp. Per-pos arrays keep the
+        # cumulative denominator counts paths. Per-pos arrays keep the
         # unclamped node count.
         request = _fake_request(verified=12, accepted=3, draft_buffer_len=12)
         _accumulate([request], max_draft_len=3)
         assert request.py_total_draft_tokens == 3
         assert request.py_total_accepted_draft_tokens == 3
         assert request.py_per_pos_drafted[:13] == [1] * 12 + [0]
+
+    def test_positions_beyond_initial_capacity_are_not_truncated(self):
+        # max_draft_len can exceed MAX_SPEC_DECODE_POSITIONS with tree drafting
+        # (EAGLE3 dynamic-tree, Medusa). The per-pos arrays start at that size
+        # but must grow rather than clamp, otherwise every position past the
+        # initial capacity is silently dropped and the arrays stop reconciling
+        # with py_total_accepted_draft_tokens -- which is exact.
+        deep = MAX_SPEC_DECODE_POSITIONS + 4
+        request = _fake_request(verified=deep, accepted=deep - 2, draft_buffer_len=deep)
+        _accumulate([request], max_draft_len=deep)
+        assert request.py_per_pos_drafted[:deep] == [1] * deep
+        assert request.py_per_pos_accepted[: deep - 2] == [1] * (deep - 2)
+        # The survival array must sum to the exact accepted total: that identity
+        # is what a consumer derives the acceptance histogram from.
+        assert sum(request.py_per_pos_accepted) == request.py_total_accepted_draft_tokens
+
+    def test_capacity_not_grown_when_within_initial_size(self):
+        # The common case (max_draft_len <= MAX_SPEC_DECODE_POSITIONS) must not
+        # reallocate: growth is a tail path, not per-step overhead. Identity is
+        # what pins that -- a length check alone would still pass against an
+        # implementation that rebuilt a same-sized list on every step, which is
+        # exactly the per-step cost this is meant to rule out.
+        request = _fake_request(verified=4, accepted=3, draft_buffer_len=4)
+        drafted, accepted = request.py_per_pos_drafted, request.py_per_pos_accepted
+        _accumulate([request], max_draft_len=4)
+        assert request.py_per_pos_drafted is drafted
+        assert request.py_per_pos_accepted is accepted
+        assert len(request.py_per_pos_drafted) == MAX_SPEC_DECODE_POSITIONS
+        assert len(request.py_per_pos_accepted) == MAX_SPEC_DECODE_POSITIONS
 
 
 def _make_llm_request(request_id, seq_slot):

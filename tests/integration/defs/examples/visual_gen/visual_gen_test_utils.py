@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 import zipfile
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from typing import Collection, Iterator, Literal
 import pytest
 import torch
 import torch._inductor.config as inductor_config
+import torch.nn.functional as F
 from torch._inductor.async_compile import shutdown_compile_workers
 
 # =============================================================================
@@ -44,12 +46,13 @@ VISUAL_GEN_LPIPS_EVAL_SCRIPT = os.path.join(
     REPO_ROOT, "scripts", "visualgen_eval", "visual_gen_lpips_score_eval.py"
 )
 VISUAL_GEN_LPIPS_GOLDEN_DIR = os.path.join(os.path.dirname(__file__), "golden", "visual_gen_lpips")
-VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP = os.path.join(
-    VISUAL_GEN_LPIPS_GOLDEN_DIR, "visual_gen_lpips_golden_media.zip"
+VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP_TEMPLATE = os.path.join(
+    VISUAL_GEN_LPIPS_GOLDEN_DIR, "visual_gen_lpips_golden_media_{}.zip"
 )
 VISUAL_GEN_OUTPUT_VIDEO = "trtllm_output.mp4"
 
 QuantizationMode = Literal["none", "FP8_BLOCK_SCALES", "NVFP4"]
+QuantizationSource = Literal["dynamic", "static"]
 
 
 @dataclass(frozen=True)
@@ -58,13 +61,27 @@ class FeatureConfigState:
 
     ``quantization="none"`` means the unquantized BF16 VisualGen path. Model
     test modules remain responsible for validating which combinations they
-    support and for mapping this state to ``VisualGenArgs``. ``torch.compile``
-    is intentionally omitted because all feature tests disable it to match the
-    existing upstream LPIPS baseline configuration.
+    support and for mapping this state to ``VisualGenArgs``.
+    ``quantization_source="dynamic"`` quantizes a high-precision checkpoint at
+    load time. ``quantization_source="static"`` preserves the checkpoint's
+    embedded static quantization recipe, including its calibrated activation
+    scales and excluded modules. ``mha_quantize=True`` additionally selects
+    CUTEDSL static E4M3 attention and therefore requires calibrated Q/K/V amax
+    tensors from ModelOpt ``--quantize-mha``. ``torch.compile`` is intentionally
+    omitted because all feature tests disable it to match the existing upstream
+    LPIPS baseline configuration.
     """
 
     quantization: QuantizationMode = "none"
+    quantization_source: QuantizationSource = "dynamic"
+    mha_quantize: bool = False
     cuda_graph: bool = False
+
+    def __post_init__(self):
+        if self.mha_quantize and not (
+            self.quantization == "NVFP4" and self.quantization_source == "static"
+        ):
+            raise ValueError("MHA quantization requires a static NVFP4 checkpoint")
 
 
 def _enabled_feature_ids(features):
@@ -109,18 +126,38 @@ def _build_single_device_feature_args(
         CompilationConfig,
         CudaGraphConfig,
         ParallelConfig,
+        QuantAttentionConfig,
         TorchCompileConfig,
         VisualGenArgs,
     )
 
     if features.quantization == "none":
         quant_config = QuantConfig()
-    else:
+    elif features.quantization_source == "dynamic":
         quant_config = {
             "quant_algo": features.quantization,
             "dynamic": True,
             **(quantization_kwargs or {}),
         }
+    else:
+        if quantization_kwargs:
+            raise ValueError(
+                "Static feature cases must use the checkpoint's embedded quantization config"
+            )
+        quant_config = QuantConfig()
+    attention_config = AttentionConfig(backend="VANILLA")
+    if features.mha_quantize:
+        attention_config = AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="fp8",
+                v_dtype="fp8",
+                q_block_size=0,
+                k_block_size=0,
+                v_block_size=0,
+            ),
+        )
+
     kwargs = dict(
         model=model_path,
         quant_config=quant_config,
@@ -128,7 +165,7 @@ def _build_single_device_feature_args(
             resolutions=[resolution],
             num_frames=[num_frames],
         ),
-        attention_config=AttentionConfig(backend="VANILLA"),
+        attention_config=attention_config,
         parallel_config=ParallelConfig(
             parallel_vae_size=1,
             cfg_size=1,
@@ -139,7 +176,10 @@ def _build_single_device_feature_args(
             tp_size=1,
         ),
         cuda_graph_config=CudaGraphConfig(enable=features.cuda_graph),
-        torch_compile_config=TorchCompileConfig(enable=False),
+        torch_compile_config=TorchCompileConfig(
+            enable=False,
+            enable_autotune=features.quantization_source != "static",
+        ),
     )
     if pipeline_config is not None:
         kwargs["pipeline_config"] = pipeline_config
@@ -163,13 +203,29 @@ def _assert_resolved_single_device_feature_config(
         "NVFP4": QuantAlgo.NVFP4,
     }[features.quantization]
     assert config.quant_config.quant_algo == expected_quant_algo
-    assert config.dynamic_weight_quant is (expected_quant_algo is not None)
+    expected_dynamic_quantization = (
+        expected_quant_algo is not None and features.quantization_source == "dynamic"
+    )
+    assert config.dynamic_weight_quant is expected_dynamic_quantization
     if features.quantization == "NVFP4":
-        assert config.force_dynamic_quantization is True
+        assert config.force_dynamic_quantization is expected_dynamic_quantization
+
+    assert config.torch_compile.enable_autotune is (features.quantization_source != "static")
 
     assert config.cache_backend is None
     assert pipeline.cache_accelerator is None
-    assert config.attention.backend == "VANILLA"
+    expected_attention_backend = "CUTEDSL" if features.mha_quantize else "VANILLA"
+    assert config.attention.backend == expected_attention_backend
+    quant_attention_config = config.attention.quant_attention_config
+    if features.mha_quantize:
+        assert quant_attention_config is not None
+        assert quant_attention_config.qk_dtype == "fp8"
+        assert quant_attention_config.v_dtype == "fp8"
+        assert quant_attention_config.q_block_size == 0
+        assert quant_attention_config.k_block_size == 0
+        assert quant_attention_config.v_block_size == 0
+    else:
+        assert quant_attention_config is None
     assert config.attention.sparse_attention_config is None
 
     assert config.cuda_graph.enable is features.cuda_graph
@@ -190,7 +246,7 @@ def _transformer_components(pipeline):
 
 
 def _assert_feature_quantization_installed(pipeline, features):
-    """Verify that requested dynamic quantization changed real Linear modules."""
+    """Verify that requested quantization configured real Linear modules."""
     from tensorrt_llm._torch.modules.linear import Linear
 
     linears = [
@@ -220,6 +276,24 @@ def _assert_feature_quantization_installed(pipeline, features):
         assert sample.weight.shape[-1] * 2 == sample.in_features
         assert sample.scaling_vector_size == 16
         assert getattr(sample, "weight_scale_2", None) is not None
+        if features.quantization_source == "static":
+            assert sample.input_scale is not None
+            assert sample.pre_quant_scale is None
+            assert sample.force_dynamic_quantization is False
+
+    static_e4m3_attention_modules = [
+        module
+        for component in _transformer_components(pipeline)
+        for module in component.modules()
+        if getattr(module, "requires_static_e4m3_attention", False)
+    ]
+    if features.mha_quantize:
+        assert static_e4m3_attention_modules, "No static E4M3 attention modules were installed"
+        assert all(
+            module.static_e4m3_attention_scales_loaded for module in static_e4m3_attention_modules
+        )
+    else:
+        assert not static_e4m3_attention_modules
 
 
 def _assert_single_device_feature_executed(pipeline, features):
@@ -310,7 +384,14 @@ class ReusableLPIPSScorer:
         batch = batch.permute(0, 3, 1, 2).to(device=self.device, dtype=torch.float32)
         return batch / 127.5 - 1.0
 
-    def score_video(self, reference_path, generated_path):
+    def score_video(
+        self,
+        reference_path,
+        generated_path,
+        *,
+        frame_start=0,
+        frame_stop=None,
+    ):
         reference = self._decode_video_to_lpips_batch(reference_path)
         generated = self._decode_video_to_lpips_batch(generated_path)
         if generated.shape[1:] != reference.shape[1:]:
@@ -319,10 +400,16 @@ class ReusableLPIPSScorer:
                 f"{tuple(generated.shape[1:])} vs {tuple(reference.shape[1:])}."
             )
         paired_frame_count = min(generated.shape[0], reference.shape[0])
+        frame_stop = paired_frame_count if frame_stop is None else frame_stop
+        if frame_start < 0 or frame_start >= frame_stop or frame_stop > paired_frame_count:
+            raise ValueError(
+                f"LPIPS frame window [{frame_start}, {frame_stop}) is outside "
+                f"the {paired_frame_count} paired frames."
+            )
         with torch.no_grad():
             scores = self._get_model()(
-                generated[:paired_frame_count],
-                reference[:paired_frame_count],
+                generated[frame_start:frame_stop],
+                reference[frame_start:frame_stop],
             ).flatten()
         return float(scores.mean().item())
 
@@ -333,6 +420,40 @@ class ReusableLPIPSScorer:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+
+def _multi_resolution_log_stft_distance(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+) -> float:
+    """Mean log1p-magnitude STFT L1 over three FFT sizes; the result is not in dB."""
+    if actual.shape != expected.shape:
+        raise AssertionError(
+            f"Audio shape mismatch: generated {tuple(actual.shape)}, "
+            f"golden {tuple(expected.shape)}."
+        )
+    actual = actual.float().reshape(-1, actual.shape[-1])
+    expected = expected.float().reshape(-1, expected.shape[-1])
+    distances: list[torch.Tensor] = []
+    for n_fft in (512, 1024, 2048):
+        hop_length = n_fft // 4
+        window = torch.hann_window(n_fft)
+        actual_stft = torch.stft(
+            actual,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
+            return_complex=True,
+        ).abs()
+        expected_stft = torch.stft(
+            expected,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            window=window,
+            return_complex=True,
+        ).abs()
+        distances.append(F.l1_loss(torch.log1p(actual_stft), torch.log1p(expected_stft)))
+    return float(torch.stack(distances).mean())
 
 
 def _llm_models_root():
@@ -355,19 +476,41 @@ def _lpips_model_path(*parts):
     return os.path.join(_llm_models_root(), *parts)
 
 
-def _skip_if_missing(path, label, is_dir=False):
+def _require_exists(path, label, is_dir=False):
     exists = os.path.isdir(path) if is_dir else os.path.exists(path)
     if not exists:
-        pytest.skip(f"{label} not found: {path}")
+        raise FileNotFoundError(f"{label} not found: {path}")
 
 
-def _extract_visual_gen_lpips_golden_media(tmp_path):
-    _skip_if_missing(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP, "VisualGen LPIPS golden media zip")
+def _golden_media_family(media_name):
+    if media_name.startswith("cosmos3_"):
+        return "cosmos3"
+    if media_name.startswith(("fastwan_", "wan21_", "wan22_")):
+        return "wan"
+    if media_name.startswith(("flux1_", "flux2_")):
+        return "flux"
+    if media_name.startswith("glm_image_"):
+        return "glm_image"
+    if media_name.startswith("hunyuan_"):
+        return "hunyuan"
+    if media_name.startswith("ltx23_"):
+        return "ltx23"
+    if media_name.startswith("ltx2_"):
+        return "ltx2"
+    if media_name.startswith(("qwenimage_", "qwen_image_layered_")):
+        return "qwen_image"
+    raise ValueError(f"No VisualGen LPIPS golden media zip family for: {media_name}")
+
+
+def _extract_visual_gen_lpips_golden_media(tmp_path, media_name):
     extract_dir = tmp_path / "visual_gen_lpips_golden_media"
-    if extract_dir.exists():
+    if (extract_dir / media_name).exists():
         return extract_dir
 
-    with zipfile.ZipFile(VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP) as archive:
+    family = _golden_media_family(media_name)
+    archive_path = VISUAL_GEN_LPIPS_GOLDEN_MEDIA_ZIP_TEMPLATE.format(family)
+    _require_exists(archive_path, f"VisualGen LPIPS {family} golden media zip")
+    with zipfile.ZipFile(archive_path) as archive:
         for member in archive.namelist():
             if os.path.isabs(member) or ".." in member.split("/"):
                 raise ValueError(f"Unsafe golden media zip member: {member}")
@@ -376,8 +519,8 @@ def _extract_visual_gen_lpips_golden_media(tmp_path):
 
 
 def _golden_media_path(tmp_path, media_name, label):
-    path = _extract_visual_gen_lpips_golden_media(tmp_path) / media_name
-    _skip_if_missing(path, label)
+    path = _extract_visual_gen_lpips_golden_media(tmp_path, media_name) / media_name
+    _require_exists(path, label)
     return path
 
 
@@ -407,6 +550,12 @@ def _cleanup_cuda():
     # torch.compile and unconditional @torch.compile helpers can lazily spawn
     # an Inductor worker pool whose daemon threads otherwise outlive the test.
     shutdown_compile_workers()
+    # shutdown_compile_workers() only asks the pool's health-check thread to
+    # stop; it wakes from its poll interval (2 s in torch 2.14) later. Wait for it so the
+    # thread-leak check does not catch a thread the test already shut down.
+    for thread in threading.enumerate():
+        if thread.name.startswith("InductorSubprocHealth"):
+            thread.join(timeout=10.0)
 
 
 @contextlib.contextmanager
@@ -624,10 +773,23 @@ def _run_reusable_image_lpips_eval(sample_id, reference_path, generated_path, sc
     return score
 
 
-def _run_reusable_video_lpips_eval(sample_id, reference_path, generated_path, scorer):
+def _run_reusable_video_lpips_eval(
+    sample_id,
+    reference_path,
+    generated_path,
+    scorer,
+    *,
+    frame_start=0,
+    frame_stop=None,
+):
     try:
         with _lpips_deterministic_algorithms():
-            score = scorer.score_video(reference_path, generated_path)
+            score = scorer.score_video(
+                reference_path,
+                generated_path,
+                frame_start=frame_start,
+                frame_stop=frame_stop,
+            )
     except Exception as error:
         pytest.fail(f"LPIPS video eval failed for {sample_id}: {error}")
     print(f"\n[E2E {sample_id} LPIPS] score: {score:.6f}")
@@ -745,7 +907,7 @@ def _run_wan_lpips_pipeline(
     from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
     from tensorrt_llm.visual_gen.args import AttentionConfig, TorchCompileConfig, VisualGenArgs
 
-    _skip_if_missing(model_path, "Wan checkpoint", is_dir=True)
+    _require_exists(model_path, "Wan checkpoint", is_dir=True)
     _disable_inductor_compile_worker_quiesce()
     args_kwargs = dict(
         model=model_path,
@@ -757,6 +919,11 @@ def _run_wan_lpips_pipeline(
     with _lpips_deterministic_algorithms(fully_eager=fully_eager):
         args = VisualGenArgs(**args_kwargs)
         pipeline = PipelineLoader(args).load(skip_warmup=True)
+        if args.parallel_config.token_sharded_tp:
+            # Bitwise equal to all-reduce TP at TP2, so LPIPS cannot show the layout engaged.
+            for name in ("transformer", "transformer_2"):
+                transformer = getattr(pipeline, name, None)
+                assert transformer is None or transformer.sharder.token_sharded_tp, name
         try:
             with torch.no_grad():
                 result = pipeline.forward(

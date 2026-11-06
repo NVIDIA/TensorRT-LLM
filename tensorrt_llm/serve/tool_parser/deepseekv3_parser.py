@@ -109,7 +109,7 @@ class DeepSeekV3Parser(BaseToolParser):
                 return StreamingParseResult()
             normal_text = current_text
             self._buffer = ""
-            for e_token in [self.eot_token, "```", "<｜tool▁call▁end｜>"]:
+            for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
                 normal_text = normal_text.replace(e_token, "")
             return StreamingParseResult(normal_text=normal_text)
 

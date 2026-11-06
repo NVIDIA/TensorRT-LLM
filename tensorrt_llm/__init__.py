@@ -23,8 +23,9 @@ import sys
 
 from ._bootstrap import _init, _prepare_environment
 
-# Phase 1: DLL search path, Python-library preload and vendored triton_kernels
-# precedence. Must run before torch and before any TensorRT-LLM shared object.
+# Phase 1: cache environment, DLL search path, Python-library preload and
+# vendored triton_kernels precedence. Must run before torch and before any
+# TensorRT-LLM shared object.
 _prepare_environment()
 
 # The package's public surface is loaded lazily (PEP 562): importing
@@ -52,7 +53,6 @@ if TYPE_CHECKING:
     import tensorrt_llm.runtime as runtime
     import tensorrt_llm.tools as tools
 
-    from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
     from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                          mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                          set_mpi_comm, str_dtype_to_torch)
@@ -74,9 +74,6 @@ _LAZY_ATTRS = {
     'quantization': ('tensorrt_llm.quantization', None),
     'runtime': ('tensorrt_llm.runtime', None),
     'tools': ('tensorrt_llm.tools', None),
-    'MnnvlMemory': ('tensorrt_llm._mnnvl_utils', 'MnnvlMemory'),
-    'MnnvlMoe': ('tensorrt_llm._mnnvl_utils', 'MnnvlMoe'),
-    'MoEAlltoallInfo': ('tensorrt_llm._mnnvl_utils', 'MoEAlltoallInfo'),
     'default_gpus_per_node': ('tensorrt_llm._utils', 'default_gpus_per_node'),
     'local_mpi_rank': ('tensorrt_llm._utils', 'local_mpi_rank'),
     'local_mpi_size': ('tensorrt_llm._utils', 'local_mpi_size'),
@@ -113,7 +110,17 @@ def __getattr__(name):
     entry = _LAZY_ATTRS.get(name)
     if entry is not None:
         module_name, attr = entry
-        module = importlib.import_module(module_name)
+        try:
+            module = importlib.import_module(module_name)
+        except AttributeError as e:
+            # An AttributeError escaping the module is a bug inside it, not a
+            # missing name here. Raised as is, hasattr() and getattr() with a
+            # default would hide it, and ``from ... import`` would run the
+            # module twice (losing the cause unless the name is a submodule).
+            raise ImportError(
+                f"cannot import {name!r} from {__name__!r}: importing "
+                f"{module_name} raised {e!r}",
+                name=__name__) from e
         value = module if attr is None else getattr(module, attr)
         globals()[name] = value  # cache: subsequent access skips __getattr__
         return value
@@ -129,6 +136,12 @@ def __getattr__(name):
             raise
         raise AttributeError(
             f"module {__name__!r} has no attribute {name!r}") from None
+    except AttributeError as e:
+        # Same as above: a bug inside the submodule, not a missing name.
+        raise ImportError(
+            f"cannot import {name!r} from {__name__!r}: importing "
+            f"{__name__}.{name} raised {e!r}",
+            name=__name__) from e
 
 
 def __dir__():
@@ -150,9 +163,6 @@ __all__ = [
     'mpi_world_size',
     'torch_models',
     'Mapping',
-    'MnnvlMemory',
-    'MnnvlMoe',
-    'MoEAlltoallInfo',
     'runtime',
     'models',
     'quantization',

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -36,7 +36,7 @@
 #include "cutlass_extensions/tile_interleaved_layout.h"
 #include "cutlass_extensions/weight_only_quant_op.h"
 
-#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_tma_warp_specialized_traits.h"
+#include "tensorrt_llm/kernels/moe/cutlass/moe_tma_warp_specialized_traits.h"
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <algorithm>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -427,7 +443,6 @@ protected:
         using tensorrt_llm::runtime::BufferManager;
         using tensorrt_llm::runtime::CudaStream;
         using tensorrt_llm::runtime::ITensor;
-        using tensorrt_llm::runtime::bufferCast;
 
         auto dtype = tensorrt_llm::DataType::kHALF;
         if constexpr (std::is_same_v<DataType, float>)
@@ -454,7 +469,7 @@ protected:
                 = tensorrt_llm::runtime::BufferManager::pinned(ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
             this->d_kv_scale_quant_orig = tensorrt_llm::runtime::BufferManager::gpuSync(
                 ITensor::makeShape({1}), tensorrt_llm::DataType::kFLOAT);
-            auto* kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
+            auto* kv_scale_quant_orig_ptr = this->h_kv_scale_quant_orig->template getBufferPtr<float>();
             float kv_scale_orig_quant = 2.0F;
             kv_scale_quant_orig_ptr[0] = 1.0 / kv_scale_orig_quant;
             cudaMemcpy(this->d_kv_scale_quant_orig->data(), this->h_kv_scale_quant_orig->data(),
@@ -476,8 +491,8 @@ protected:
             this->mTotalQLen = 0;
             this->mTotalKVLen = 0;
             // we only initialize cu_seq_lens
-            auto* cu_kv_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_kv_seq_lens));
-            auto* cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_q_seq_lens));
+            auto* cu_kv_seq_lens_ptr = this->h_cu_kv_seq_lens->template getBufferPtr<int64_t>();
+            auto* cu_q_seq_lens_ptr = this->h_cu_q_seq_lens->template getBufferPtr<int64_t>();
             cu_kv_seq_lens_ptr[0] = 0;
             cu_q_seq_lens_ptr[0] = 0;
             for (int i = 0; i < this->mBatchSize; i++)
@@ -548,8 +563,8 @@ protected:
             this->h_compressed_offset_tensor->getShape(), tensorrt_llm::DataType::kINT32);
 
         {
-            auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
-            auto* offset_ptr = bufferCast<int32_t>(*(this->h_compressed_offset_tensor));
+            auto* compressed_kv_cache_ptr = this->h_compressed_kv_cache_tensor->template getBufferPtr<TCache>();
+            auto* offset_ptr = this->h_compressed_offset_tensor->template getBufferPtr<int32_t>();
 
             this->memsetZeroHost(this->h_kv_cache_tensor);
             this->memsetZeroHost(this->h_kv_cache_tensor_ref);
@@ -627,8 +642,8 @@ protected:
             this->m_h_merge_op->getShape(), tensorrt_llm::DataType::kINT64);
 
         {
-            auto* q_ptr = bufferCast<DataType>(*(this->m_h_q_tensor));
-            auto* kv_ptr = bufferCast<DataType>(*(this->m_h_kv_full_tensor));
+            auto* q_ptr = this->m_h_q_tensor->template getBufferPtr<DataType>();
+            auto* kv_ptr = this->m_h_kv_full_tensor->template getBufferPtr<DataType>();
 
             generateRandomData(q_ptr, m_h_q_tensor->getSize());
             generateRandomData(kv_ptr, m_h_kv_full_tensor->getSize());
@@ -662,17 +677,16 @@ protected:
 
     int prepareChunkedPrefillMetaData()
     {
-        using tensorrt_llm::runtime::bufferCast;
         int const total_chunk_size = this->mChunkSize * this->mBatchSize;
         int chunked_loop_num = (this->mTotalKVLen - this->mTotalQLen + total_chunk_size - 1) / total_chunk_size;
 
-        auto* h_merge_op = bufferCast<int64_t>(*(this->m_h_merge_op));             // {chunked_loop_num + 1, batch_size}
-        auto* h_cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_q_seq_lens)); // {batch_size + 1}
-        auto* h_cu_kv_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_kv_seq_lens)); // {batch_size + 1}
+        auto* h_merge_op = this->m_h_merge_op->template getBufferPtr<int64_t>(); // {chunked_loop_num + 1, batch_size}
+        auto* h_cu_q_seq_lens_ptr = this->h_cu_q_seq_lens->template getBufferPtr<int64_t>();   // {batch_size + 1}
+        auto* h_cu_kv_seq_lens_ptr = this->h_cu_kv_seq_lens->template getBufferPtr<int64_t>(); // {batch_size + 1}
         auto* h_cu_chunk_lens_ptr
-            = bufferCast<int64_t>(*(this->h_cu_chunk_lens));            // {chunked_loop_num + 1, batch_size + 1}
+            = this->h_cu_chunk_lens->template getBufferPtr<int64_t>(); // {chunked_loop_num + 1, batch_size + 1}
         auto* h_chunked_ld_global_offset_ptr
-            = bufferCast<int64_t>(*(this->h_chunked_ld_global_offset)); // {chunked_loop_num + 1, batch_size}
+            = this->h_chunked_ld_global_offset->template getBufferPtr<int64_t>(); // {chunked_loop_num + 1, batch_size}
 
         this->max_chunk_len_per_loop.clear();
         std::vector<int64_t> chunked_seq_len_vec((chunked_loop_num + 1) * (this->mBatchSize), 0);
@@ -784,40 +798,36 @@ protected:
 
     void PerformNormalAttention()
     {
-        using tensorrt_llm::runtime::bufferCast;
-
-        auto* q_ptr = bufferCast<DataType>(*(this->m_h_q_tensor));
-        auto* kv_ptr = bufferCast<DataType>(*(this->m_h_kv_full_tensor));
-        auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
-        auto* cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_q_seq_lens));
-        auto* cu_kv_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_kv_seq_lens));
+        auto* q_ptr = this->m_h_q_tensor->template getBufferPtr<DataType>();
+        auto* kv_ptr = this->m_h_kv_full_tensor->template getBufferPtr<DataType>();
+        auto* output_ptr = this->m_h_output_tensor_ref->template getBufferPtr<DataType>();
+        auto* cu_q_seq_lens_ptr = this->h_cu_q_seq_lens->template getBufferPtr<int64_t>();
+        auto* cu_kv_seq_lens_ptr = this->h_cu_kv_seq_lens->template getBufferPtr<int64_t>();
         selfAttentionRef(output_ptr, q_ptr, kv_ptr, this->mBatchSize, this->mNumHeads, cu_q_seq_lens_ptr,
             cu_kv_seq_lens_ptr, this->mNopeSize, false, nullptr, this->mIsCausalMask);
     }
 
     void PerformMergedAttention()
     {
-        using tensorrt_llm::runtime::bufferCast;
-
-        auto* h_q_ptr = bufferCast<DataType>(*(this->m_h_q_tensor));
-        auto* h_kv_ptr = bufferCast<DataType>(*(this->m_h_kv_full_tensor));
-        auto* h_chunked_kv_ptr = bufferCast<DataType>(*(this->m_h_chunked_kv_tensor));
-        auto* h_output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor));
-        auto* h_output_accum_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
-        auto* h_softmax_sum_ptr = bufferCast<float>(*(this->m_h_softmax_sum_tensor));
-        auto* h_softmax_sum_accum_ptr = bufferCast<float>(*(this->m_h_softmax_sum_accum_tensor));
-        auto* h_cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_q_seq_lens));
-        auto* h_cu_kv_seq_lens_ptr = bufferCast<int64_t>(*(this->h_cu_kv_seq_lens));
-        auto* h_cu_chunk_lens_ptr = bufferCast<int64_t>(*(this->h_cu_chunk_lens));
-        auto* h_chunked_ld_global_offset_ptr = bufferCast<int64_t>(*(this->h_chunked_ld_global_offset));
-        auto* d_kv_ptr = bufferCast<DataType>(*(this->m_d_kv_full_tensor));
-        auto* d_chunked_kv_ptr = bufferCast<DataType>(*(this->m_d_chunked_kv_tensor));
-        auto* d_softmax_sum_ptr = bufferCast<float>(*(this->m_d_softmax_sum_tensor));
-        auto* d_softmax_sum_accum_ptr = bufferCast<float>(*(this->m_d_softmax_sum_accum_tensor));
-        auto* d_output_ptr = bufferCast<DataType>(*(this->m_d_output_tensor));
-        auto* d_output_accum_ptr = bufferCast<DataType>(*(this->m_d_output_tensor_accum));
-        auto* d_merge_op = bufferCast<int64_t>(*(this->m_d_merge_op));
-        auto* d_cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->d_cu_q_seq_lens));
+        auto* h_q_ptr = this->m_h_q_tensor->template getBufferPtr<DataType>();
+        auto* h_kv_ptr = this->m_h_kv_full_tensor->template getBufferPtr<DataType>();
+        auto* h_chunked_kv_ptr = this->m_h_chunked_kv_tensor->template getBufferPtr<DataType>();
+        auto* h_output_ptr = this->m_h_output_tensor->template getBufferPtr<DataType>();
+        auto* h_output_accum_ptr = this->m_h_output_tensor_accum->template getBufferPtr<DataType>();
+        auto* h_softmax_sum_ptr = this->m_h_softmax_sum_tensor->template getBufferPtr<float>();
+        auto* h_softmax_sum_accum_ptr = this->m_h_softmax_sum_accum_tensor->template getBufferPtr<float>();
+        auto* h_cu_q_seq_lens_ptr = this->h_cu_q_seq_lens->template getBufferPtr<int64_t>();
+        auto* h_cu_kv_seq_lens_ptr = this->h_cu_kv_seq_lens->template getBufferPtr<int64_t>();
+        auto* h_cu_chunk_lens_ptr = this->h_cu_chunk_lens->template getBufferPtr<int64_t>();
+        auto* h_chunked_ld_global_offset_ptr = this->h_chunked_ld_global_offset->template getBufferPtr<int64_t>();
+        auto* d_kv_ptr = this->m_d_kv_full_tensor->template getBufferPtr<DataType>();
+        auto* d_chunked_kv_ptr = this->m_d_chunked_kv_tensor->template getBufferPtr<DataType>();
+        auto* d_softmax_sum_ptr = this->m_d_softmax_sum_tensor->template getBufferPtr<float>();
+        auto* d_softmax_sum_accum_ptr = this->m_d_softmax_sum_accum_tensor->template getBufferPtr<float>();
+        auto* d_output_ptr = this->m_d_output_tensor->template getBufferPtr<DataType>();
+        auto* d_output_accum_ptr = this->m_d_output_tensor_accum->template getBufferPtr<DataType>();
+        auto* d_merge_op = this->m_d_merge_op->template getBufferPtr<int64_t>();
+        auto* d_cu_q_seq_lens_ptr = this->d_cu_q_seq_lens->template getBufferPtr<int64_t>();
 
         int const total_chunk_size = this->mChunkSize * this->mBatchSize;
         int chunked_loop_num = (this->mTotalKVLen - this->mTotalQLen + total_chunk_size - 1) / total_chunk_size;
@@ -878,19 +888,18 @@ protected:
 
     void PerformLoadChunkedKVRef(int chunk_idx)
     {
-        using tensorrt_llm::runtime::bufferCast;
-
-        auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output_ref));
-        auto* k_pe_output_ptr = bufferCast<DataType>(*(this->h_k_pe_output_ref));
-        auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->h_compressed_kv_cache_tensor));
-        auto* offset_ptr = bufferCast<int32_t>(*(this->h_compressed_offset_tensor));
-        auto* h_cu_chunk_lens_ptr = bufferCast<int64_t>(*(this->h_cu_chunk_lens)) + chunk_idx * (this->mBatchSize + 1);
+        auto* compressed_kv_output_ptr = this->h_compressed_kv_output_ref->template getBufferPtr<DataType>();
+        auto* k_pe_output_ptr = this->h_k_pe_output_ref->template getBufferPtr<DataType>();
+        auto* compressed_kv_cache_ptr = this->h_compressed_kv_cache_tensor->template getBufferPtr<TCache>();
+        auto* offset_ptr = this->h_compressed_offset_tensor->template getBufferPtr<int32_t>();
+        auto* h_cu_chunk_lens_ptr
+            = this->h_cu_chunk_lens->template getBufferPtr<int64_t>() + chunk_idx * (this->mBatchSize + 1);
         auto* h_chunked_ld_global_offset_ptr
-            = bufferCast<int64_t>(*(this->h_chunked_ld_global_offset)) + chunk_idx * this->mBatchSize;
+            = this->h_chunked_ld_global_offset->template getBufferPtr<int64_t>() + chunk_idx * this->mBatchSize;
         float* kv_scale_quant_orig_ptr = nullptr;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
-            kv_scale_quant_orig_ptr = bufferCast<float>(*(this->h_kv_scale_quant_orig));
+            kv_scale_quant_orig_ptr = this->h_kv_scale_quant_orig->template getBufferPtr<float>();
         }
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mBatchSize, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(TCache) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
@@ -903,19 +912,18 @@ protected:
 
     void PreformLoadChunkedKV(int chunk_idx)
     {
-        using tensorrt_llm::runtime::bufferCast;
-
-        auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->d_compressed_kv_output));
-        auto* k_pe_output_ptr = bufferCast<DataType>(*(this->d_k_pe_output));
-        auto* compressed_kv_cache_ptr = bufferCast<TCache>(*(this->d_compressed_kv_cache_tensor));
-        auto* offset_ptr = bufferCast<int32_t>(*(this->d_compressed_offset_tensor));
-        auto* d_cu_chunk_lens_ptr = bufferCast<int64_t>(*(this->d_cu_chunk_lens)) + chunk_idx * (this->mBatchSize + 1);
+        auto* compressed_kv_output_ptr = this->d_compressed_kv_output->template getBufferPtr<DataType>();
+        auto* k_pe_output_ptr = this->d_k_pe_output->template getBufferPtr<DataType>();
+        auto* compressed_kv_cache_ptr = this->d_compressed_kv_cache_tensor->template getBufferPtr<TCache>();
+        auto* offset_ptr = this->d_compressed_offset_tensor->template getBufferPtr<int32_t>();
+        auto* d_cu_chunk_lens_ptr
+            = this->d_cu_chunk_lens->template getBufferPtr<int64_t>() + chunk_idx * (this->mBatchSize + 1);
         auto* d_chunked_ld_global_offset_ptr
-            = bufferCast<int64_t>(*(this->d_chunked_ld_global_offset)) + chunk_idx * this->mBatchSize;
+            = this->d_chunked_ld_global_offset->template getBufferPtr<int64_t>() + chunk_idx * this->mBatchSize;
         float* kv_scale_quant_orig_ptr = nullptr;
         if constexpr (std::is_same_v<TCache, __nv_fp8_e4m3>)
         {
-            kv_scale_quant_orig_ptr = bufferCast<float>(*(this->d_kv_scale_quant_orig));
+            kv_scale_quant_orig_ptr = this->d_kv_scale_quant_orig->template getBufferPtr<float>();
         }
         tensorrt_llm::kernels::KVBlockArray kv_cache(this->mBatchSize, this->mMaxBlockPerSeq, this->mTokensPerBlock,
             sizeof(TCache) * 1 * (this->mLoraSize + this->mRopeSize), 0, 0, 0, 0, compressed_kv_cache_ptr, nullptr,
@@ -944,7 +952,6 @@ TYPED_TEST_SUITE(MlaChunkedPrefillTest, MLATypes);
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillDefault)
 {
-    using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
     using TCache = typename TestFixture::TCache;
     if constexpr (std::is_same_v<DataType, TCache>)
@@ -962,8 +969,8 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillDefault)
         sync_check_cuda_error(this->mStream->get());
 
         // check result
-        auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
-        auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
+        auto* output_ptr = this->m_h_output_tensor_accum->template getBufferPtr<DataType>();
+        auto* output_ref_ptr = this->m_h_output_tensor_ref->template getBufferPtr<DataType>();
         for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
         {
             if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
@@ -982,7 +989,6 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillDefault)
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
 {
-    using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
     using TCache = typename TestFixture::TCache;
     if constexpr (std::is_same_v<DataType, TCache>)
@@ -1001,8 +1007,8 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
         sync_check_cuda_error(this->mStream->get());
 
         // check result
-        auto* output_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_accum));
-        auto* output_ref_ptr = bufferCast<DataType>(*(this->m_h_output_tensor_ref));
+        auto* output_ptr = this->m_h_output_tensor_accum->template getBufferPtr<DataType>();
+        auto* output_ref_ptr = this->m_h_output_tensor_ref->template getBufferPtr<DataType>();
         for (int i = 0; i < this->m_h_output_tensor->getSize(); i++)
         {
             if (std::abs(static_cast<float>(output_ptr[i]) - static_cast<float>(output_ref_ptr[i]))
@@ -1021,7 +1027,6 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedPrefillCausalMask)
 
 TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedLoad)
 {
-    using tensorrt_llm::runtime::bufferCast;
     using DataType = typename TestFixture::DataType;
     this->setDefaultParams();
     this->allocateBuffers();
@@ -1039,10 +1044,10 @@ TYPED_TEST(MlaChunkedPrefillTest, MlaChunkedLoad)
         sync_check_cuda_error(this->mStream->get());
 
         // check result
-        auto* compressed_kv_output_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output_ref));
-        auto* compressed_kv_output_ref_ptr = bufferCast<DataType>(*(this->h_compressed_kv_output));
-        auto* k_pe_output_ptr = bufferCast<DataType>(*(this->h_k_pe_output));
-        auto* k_pe_output_ref_ptr = bufferCast<DataType>(*(this->h_k_pe_output_ref));
+        auto* compressed_kv_output_ptr = this->h_compressed_kv_output_ref->template getBufferPtr<DataType>();
+        auto* compressed_kv_output_ref_ptr = this->h_compressed_kv_output->template getBufferPtr<DataType>();
+        auto* k_pe_output_ptr = this->h_k_pe_output->template getBufferPtr<DataType>();
+        auto* k_pe_output_ref_ptr = this->h_k_pe_output_ref->template getBufferPtr<DataType>();
         // check kv
         for (int i = 0; i < this->h_compressed_kv_output->getSize(); i++)
         {

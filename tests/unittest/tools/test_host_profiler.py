@@ -351,15 +351,15 @@ E2E_PROFILE_TARGETS = [
 
 
 @pytest.fixture
-def tinyllama_path():
-    """Get TinyLlama model path."""
-    model_path = llm_models_root() / "llama-models-v2" / "TinyLlama-1.1B-Chat-v1.0"
+def qwen3_model_path():
+    """Get Qwen3-0.6B model path."""
+    model_path = llm_models_root() / "Qwen3" / "Qwen3-0.6B"
     if not model_path.exists():
-        pytest.skip(f"TinyLlama model not found at {model_path}")
+        pytest.skip(f"Qwen3-0.6B model not found at {model_path}")
     return str(model_path)
 
 
-def test_e2e_profiler_with_model(tinyllama_path, mocker):
+def test_e2e_profiler_with_model(qwen3_model_path, mocker):
     """E2E test: verify profiler works with actual model inference.
 
     Clears default profile targets and adds only specific targets,
@@ -385,7 +385,7 @@ def test_e2e_profiler_with_model(tinyllama_path, mocker):
         )
 
         with LLM(
-            model=tinyllama_path,
+            model=qwen3_model_path,
             kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.3),
         ) as llm:
             # Generate enough tokens to ensure profiled methods are executed

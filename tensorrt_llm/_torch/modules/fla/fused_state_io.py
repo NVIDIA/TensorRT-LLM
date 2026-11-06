@@ -80,6 +80,7 @@ def gather_cast_vk_to_fp32_vk(
     initial_state: torch.Tensor,
     initial_state_indices: Optional[torch.Tensor],
     out_dtype: Optional[torch.dtype] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused ``initial_state[indices].to(out_dtype).contiguous()`` for ``[N, H, V, K]`` state.
 
@@ -88,6 +89,7 @@ def gather_cast_vk_to_fp32_vk(
     reads native bf16/fp16 state and casts to fp32 internally, pass
     ``initial_state.dtype`` to gather without an up-cast (paired with a matching
     scatter that skips the down-cast).
+    ``output`` can be a view into preallocated state workspace.
     """
     assert initial_state.dim() == 4, f"initial_state must be 4D, got {initial_state.shape}"
     n_pool, h, v, k = initial_state.shape
@@ -103,7 +105,11 @@ def gather_cast_vk_to_fp32_vk(
     # smaller tiles improve occupancy at small num_seqs * H.
     if out_dtype is None:
         out_dtype = torch.float32
-    output = torch.empty(num_seqs, h, v, k, dtype=out_dtype, device=initial_state.device)
+    if output is None:
+        output = torch.empty(num_seqs, h, v, k, dtype=out_dtype, device=initial_state.device)
+    else:
+        assert output.shape == (num_seqs, h, v, k)
+        assert output.dtype == out_dtype and output.device == initial_state.device
     block_v = min(v, 128)
     block_k = min(k, 128)
     num_v_blocks = triton.cdiv(v, block_v)

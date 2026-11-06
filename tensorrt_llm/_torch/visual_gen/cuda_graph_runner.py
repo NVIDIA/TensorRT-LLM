@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+import contextlib
+import contextvars
 import functools
 import gc
 from dataclasses import dataclass
@@ -7,7 +12,40 @@ import torch
 
 from tensorrt_llm.logger import logger
 
+from ..nccl_window_graph import nccl_window_graph_capture
+from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..utils import make_weak_ref
+
+# Extra-key values the runner resolved host-side for the call it is currently
+# capturing. CUDA-graph capture forbids device-to-host syncs, so anything a
+# forward would otherwise derive from a CUDA tensor with `.item()` -- the
+# sparse-attention dense-prefix phase, for instance -- must be resolved before
+# capture and read back from here inside it. The runner already computes these
+# values to build the graph key; this just makes them visible to the callee.
+_RESOLVED_EXTRA_KEYS: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
+    "cuda_graph_resolved_extra_keys", default=None
+)
+
+
+def resolved_extra_key(name: str) -> Any:
+    """Return the extra-key value `name` resolved for the call being captured, else None.
+
+    None means "not inside a runner-driven call" (or the key was omitted), and
+    callers must fall back to deriving the value themselves.
+    """
+    resolved = _RESOLVED_EXTRA_KEYS.get()
+    return None if resolved is None else resolved.get(name)
+
+
+@contextlib.contextmanager
+def resolved_extra_keys_scope(values: Dict[str, Any]):
+    """Expose `values` through `resolved_extra_key` for the enclosed block."""
+    token = _RESOLVED_EXTRA_KEYS.set(dict(values))
+    try:
+        yield
+    finally:
+        _RESOLVED_EXTRA_KEYS.reset(token)
+
 
 # One named graph-key component, e.g. ("hidden_states", (1, 4096, 3072)).
 KeyPart: TypeAlias = Tuple[str, Hashable]
@@ -121,6 +159,9 @@ class CUDAGraphRunner:
             value = fn(*args, **kwargs)
             if value is not None:
                 parts.append((name, value))
+        # Remembered so `capture()` can republish them to the callee; this runs
+        # outside capture, where the `.item()` these callbacks need is legal.
+        self._last_resolved_extra_keys = dict(parts)
         return tuple(parts)
 
     def get_graph_key(self, *args, **kwargs) -> KeyType:
@@ -144,20 +185,26 @@ class CUDAGraphRunner:
         }
 
         graph = torch.cuda.CUDAGraph()
-        for _ in range(self.WARMUP_STEPS):
-            fn(*static_args, **static_kwargs)
-            torch.cuda.synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
+        # Warmup and capture both see the host-resolved extra keys, so a
+        # forward that needs the dense-prefix phase reads it from here instead
+        # of syncing a CUDA tensor -- which capture would reject.
+        with resolved_extra_keys_scope(getattr(self, "_last_resolved_extra_keys", {})):
+            for _ in range(self.WARMUP_STEPS):
+                with discard_nccl_window_tensor_outputs((static_args, static_kwargs)):
+                    fn(*static_args, **static_kwargs)
+                torch.cuda.synchronize()
+                gc.collect()
+                torch.cuda.empty_cache()
 
-        with torch.cuda.graph(graph, pool=self._get_pool()):
-            output = fn(*static_args, **static_kwargs)
+            graph_pool = self._get_pool() or torch.cuda.graph_pool_handle()
+            with nccl_window_graph_capture(graph, graph_pool):
+                output = fn(*static_args, **static_kwargs)
 
         self.graphs[key] = graph
         self.static_inputs[key] = (static_args, static_kwargs)
         self._graph_output_refs[key] = output
         self.graph_outputs[key] = make_weak_ref(output)
-        self.memory_pool = graph.pool()
+        self.memory_pool = graph_pool
 
         # Publish pool so other runners sharing the same SharedGraphPool can reuse it
         if self._shared_pool is not None and self._shared_pool.handle is None:

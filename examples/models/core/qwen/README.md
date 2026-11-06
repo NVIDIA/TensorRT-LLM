@@ -48,19 +48,19 @@ python3 examples/llm-api/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_
 1. Evaluate accuracy on the MMLU dataset:
 
 ```bash
-trtllm-eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+trtllm-eval --model=Qwen3-32B/ --tokenizer=Qwen3-32B/ mmlu --dataset_path=./datasets/mmlu/
 [05/01/2025-13:56:15] [TRT-LLM] [I] MMLU weighted average accuracy: 79.09 (14042)
 ```
 
 ```bash
-trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch mmlu --dataset_path=./datasets/mmlu/
+trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ mmlu --dataset_path=./datasets/mmlu/
 [05/05/2025-11:33:02] [TRT-LLM] [I] MMLU weighted average accuracy: 79.44 (14042)
 ```
 
 2. Evaluate accuracy on GSM8K dataset:
 
 ```bash
-trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch gsm8k --dataset_path=./datasets/openai/gsm8k/
+trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ gsm8k --dataset_path=./datasets/openai/gsm8k/
 [05/05/2025-12:05:40] [TRT-LLM] [I] lm-eval gsm8k results (scores normalized to range 0~100):
 |Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
@@ -71,7 +71,7 @@ trtllm-eval --model=Qwen3-30B-A3B/ --tokenizer=Qwen3-30B-A3B/ --backend=pytorch 
 
 ### Model Quantization
 
-To quantize the Qwen3 model for use with the PyTorch backend, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
+To quantize the Qwen3 model, we'll use NVIDIA's Model Optimizer (ModelOpt) tool. Follow these steps:
 
 ```bash
 # Clone the Model Optimizer (ModelOpt)

@@ -71,6 +71,7 @@ Welcome to TensorRT LLM's Documentation!
    features/subagent-routing.md
    features/embeddings.md
    features/kvcache.md
+   features/kv-hints.md
    features/kv-cache-compression.md
    features/long-sequence.md
    features/lora.md
@@ -86,14 +87,14 @@ Welcome to TensorRT LLM's Documentation!
    features/speculative-decoding.md
    features/checkpoint-loading.md
    features/model-express.md
-   features/auto_deploy/auto-deploy.md
-   features/auto_deploy/transforms.rst
+   features/sleep-wakeup.md
    features/ray-orchestrator.md
    features/torch_compile_and_piecewise_cuda_graph.md
    features/helix.md
    features/kv-cache-connector.md
    features/sparse-attention.md
    features/visual-generation.md
+   features/prefix-tokenization-cache.md
 
 
 .. toctree::
@@ -101,8 +102,10 @@ Welcome to TensorRT LLM's Documentation!
    :caption: Developer Guide
 
    developer-guide/overview.md
+   developer-guide/multimodal.md
    developer-guide/perf-analysis.md
    developer-guide/perf-benchmarking.md
+   developer-guide/moe-perf-guide.md
    developer-guide/ci-overview.md
    developer-guide/dev-containers.md
    developer-guide/api-change.md

@@ -49,7 +49,7 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
-from tensorrt_llm.inputs.multimodal import DisaggPrefillMultimodalInputs, MultimodalParams
+from tensorrt_llm.inputs.multimodal import MultimodalItemMetadata, MultimodalParams
 from tensorrt_llm.mapping import Mapping
 
 from ..._utils import prefer_pinned
@@ -372,6 +372,11 @@ def _vision_requires_replication(model_config: ModelConfig, num_heads: int) -> b
     mapping = model_config.mapping
     if mapping.enable_attention_dp:
         return True
+    # Helix carries its parallelism in cp with tp_size=1, so a tp-only test
+    # never trips; the tower has no context-parallel form, so any cp > 1
+    # must replicate.
+    if mapping.cp_size > 1:
+        return True
     return (num_heads % mapping.tp_size) != 0
 
 
@@ -379,12 +384,18 @@ def _get_vision_tp_mapping(model_config: ModelConfig, num_heads: int) -> Mapping
     if not _vision_requires_replication(model_config, num_heads):
         return model_config.mapping
 
+    # Fold every parallel dimension (incl. helix cp) into pp so each rank
+    # runs the tower replicated; without cp the world size collapses below
+    # the rank range under helix.
+    attn_ranks = (
+        model_config.mapping.pp_size * model_config.mapping.tp_size * model_config.mapping.cp_size
+    )
     return Mapping(
-        world_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        world_size=attn_ranks,
         rank=model_config.mapping.rank,
         gpus_per_node=model_config.mapping.gpus_per_node,
         tp_size=1,
-        pp_size=model_config.mapping.pp_size * model_config.mapping.tp_size,
+        pp_size=attn_ranks,
     )
 
 
@@ -1458,18 +1469,20 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
         self,
         inputs: TextPrompt,
         mm_handles: List[Dict[str, Any]],
-    ) -> DisaggPrefillMultimodalInputs:
+        *,
+        mm_hashes: list[list[int]] | None = None,
+    ) -> tuple[list[int], MultimodalParams]:
         """Build disaggregated prefill inputs from multimodal embedding handles.
 
         Args:
             inputs: Text prompt input container.
-            mm_handles: List of multimodal embedding handles from the
-                context phase, each containing ``tensor_size``.
+            mm_handles: List of multimodal embedding handles, each
+                containing ``tensor_size``.
+            mm_hashes: Optional prompt-ordered hashes for KV-cache reuse.
 
         Returns:
-            DisaggPrefillMultimodalInputs containing expanded token IDs,
-            prompt-side MM positions/lengths, exact runs, and encoder-output
-            embedding lengths.
+            Expanded token IDs and common multimodal params containing
+            prompt layout, item metadata, and embedding handles.
         """
         text_prompt = inputs.get("prompt")
         if not text_prompt:
@@ -1517,11 +1530,15 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
                 expanded_ids[write_pos] = input_ids[read_pos]
                 write_pos += 1
 
-        return DisaggPrefillMultimodalInputs(
-            prompt_token_ids=expanded_ids.to(torch.int32).tolist(),
+        return expanded_ids.to(torch.int32).tolist(), MultimodalParams.from_embeddings(
+            mm_handles,
+            MultimodalItemMetadata(
+                [("image", i) for i in range(len(mm_handles))],
+                output_embedding_lengths=[handle["tensor_size"][0] for handle in mm_handles],
+            ),
+            multimodal_hashes=mm_hashes,
             multimodal_lengths=mm_token_length,
             multimodal_positions=mm_token_offsets,
-            multimodal_embedding_lengths=[mm_handle["tensor_size"][0] for mm_handle in mm_handles],
             multimodal_item_run_cu_offsets=list(range(len(mm_token_length) + 1)),
             multimodal_run_positions=mm_token_offsets,
             multimodal_run_lengths=mm_token_length,

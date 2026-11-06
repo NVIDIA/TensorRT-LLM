@@ -19,6 +19,7 @@ This module provides a lightweight periodic JUnit XML reporter that leverages
 pytest's built-in junitxml plugin for simplified test result handling.
 """
 
+import copy
 import faulthandler
 import os
 import platform
@@ -67,7 +68,7 @@ class PeriodicJUnitXML:
                 interval=18000,    # Save every 5 hours
                 batch_size=10,     # Or save every 10 tests
             )
-            reporter.pytest_configure(config)
+            # Registration replays the historic pytest_configure hook.
             config.pluginmanager.register(reporter, 'periodic_junit')
     """
 
@@ -299,7 +300,13 @@ class PeriodicJUnitXML:
         start_time = time.time()
         for report in self.pending_reports:
             if self.logxml:
-                self.logxml.pytest_runtest_logreport(report)
+                xml_report = report
+                if report.outcome == "rerun":
+                    # A rerun is a failed attempt. Keep the shared report intact
+                    # so other plugins still see the retry status.
+                    xml_report = copy.copy(report)
+                    xml_report.outcome = "failed"
+                self.logxml.pytest_runtest_logreport(xml_report)
 
         # Clear processed reports
         self.pending_reports.clear()

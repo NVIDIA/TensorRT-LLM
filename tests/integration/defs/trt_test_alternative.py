@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # An alternative lib to trt_test to let TRT_LLM developer run test using pure pytest command
 import contextlib
 import logging
@@ -8,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import warnings
 from collections.abc import Generator
 from typing import List, Optional
@@ -272,6 +287,51 @@ elif is_windows():
         p.kill()
 
 
+def _append_output(message: str, stdout, stderr):
+    for name, stream in (("stdout", stdout), ("stderr", stderr)):
+        if stream is None:
+            continue
+        if isinstance(stream, bytes):
+            stream = stream.decode(errors="replace")
+        message += f"\n{name}:\n{stream}"
+    return message
+
+
+class CalledProcessErrorWithOutput(subprocess.CalledProcessError):
+    """``CalledProcessError`` whose message includes the captured output."""
+
+    def __str__(self):
+        return _append_output(super().__str__(), self.stdout, self.stderr)
+
+
+class TimeoutExpiredWithOutput(subprocess.TimeoutExpired):
+    """``TimeoutExpired`` whose message includes the captured output."""
+
+    def __str__(self):
+        return _append_output(super().__str__(), self.stdout, self.stderr)
+
+
+# Bounds collecting a killed process's output, in case a process outside the
+# cleaned-up tree still holds its pipes open.
+_OUTPUT_DRAIN_TIMEOUT = 10
+
+
+def _timeout_with_output(p: subprocess.Popen, exc: subprocess.TimeoutExpired):
+    """Returns ``exc`` as a ``TimeoutExpiredWithOutput``.
+
+    The returned exception holds all of ``p``'s output, including what an
+     earlier timed-out ``communicate`` read. ``p`` must already be killed.
+    """
+    try:
+        stdout, stderr = p.communicate(timeout=_OUTPUT_DRAIN_TIMEOUT)
+    except subprocess.TimeoutExpired as drain_exc:
+        stdout, stderr = drain_exc.stdout, drain_exc.stderr
+    return TimeoutExpiredWithOutput(exc.cmd,
+                                    exc.timeout,
+                                    output=stdout,
+                                    stderr=stderr)
+
+
 @contextlib.contextmanager
 def popen(*popenargs,
           start_new_session=True,
@@ -286,13 +346,18 @@ def popen(*popenargs,
             yield p
             if start_new_session:
                 cleanup_process_tree(p, True, True)
-        except Exception as e:
-            cleanup_process_tree(p, start_new_session)
-            if isinstance(e, subprocess.TimeoutExpired):
+        except BaseException as e:
+            try:
+                cleanup_process_tree(p, start_new_session)
+            except Exception as ee:
+                print(
+                    f"cleanup_process_tree failed while handling exception: {''.join(traceback.format_exception(ee))}"
+                )
+            if (isinstance(e, subprocess.TimeoutExpired)
+                    and not isinstance(e, TimeoutExpiredWithOutput)
+                    and e.cmd == p.args):
                 print("Process timed out.")
-                stdout, stderr = p.communicate()
-                e.output = stdout
-                e.stderr = stderr
+                raise _timeout_with_output(p, e) from e
             raise
 
 
@@ -334,7 +399,7 @@ def check_call(*popenargs, **kwargs):
         cmd = kwargs.get("args")
         if cmd is None:
             cmd = popenargs[0]
-        raise subprocess.CalledProcessError(retcode, cmd)
+        raise CalledProcessErrorWithOutput(retcode, cmd)
     return 0
 
 
@@ -349,11 +414,7 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
             stdout, stderr = process.communicate(None, timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             cleanup_process_tree(process, start_new_session)
-            if is_windows():
-                exc.stdout, exc.stderr = process.communicate()
-            else:
-                process.wait()
-            raise
+            raise _timeout_with_output(process, exc) from None
         except:
             cleanup_process_tree(process, start_new_session)
             raise
@@ -361,10 +422,10 @@ def check_output(*popenargs, timeout=None, start_new_session=True, **kwargs):
         if start_new_session:
             cleanup_process_tree(process, True, True)
         if retcode:
-            raise subprocess.CalledProcessError(retcode,
-                                                process.args,
-                                                output=stdout,
-                                                stderr=stderr)
+            raise CalledProcessErrorWithOutput(retcode,
+                                               process.args,
+                                               output=stdout,
+                                               stderr=stderr)
     return stdout.decode()
 
 
@@ -403,20 +464,3 @@ def print_error(message: str) -> None:
     print(f"[ERROR] {message}")
     sys.stdout.flush()
     general_logger.error(message)
-
-
-# custom test checker
-def check_call_negative_test(*popenargs, **kwargs):
-    print(f"Start subprocess with check_call_negative_test("
-          f"{redact_popenargs(popenargs)}, {redact_kwargs(kwargs)})")
-    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
-    if retcode:
-        return 0
-    else:
-        cmd = kwargs.get("args")
-        if cmd is None:
-            cmd = popenargs[0]
-        print(
-            f"Subprocess expected to fail with check_call_negative_test({popenargs}, {kwargs}), but passed."
-        )
-        raise subprocess.CalledProcessError(1, cmd)

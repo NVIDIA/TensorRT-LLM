@@ -776,6 +776,38 @@ def test_sys_path_check_ignores_paths_outside_the_project(sys_path_report, tmp_p
     assert sys_path_report(outside, "/usr/lib/python3", "") == []
 
 
+def test_sys_path_check_ignores_the_environment_running_pytest(sys_path_report, tree, monkeypatch):
+    """The entry script's bin directory and the directories packages append to themselves."""
+    env = tree.project_root / "env"
+    entries = [env / "bin", env / "lib" / "site-packages" / "dsl"]
+    for entry in entries:
+        entry.mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(env))
+
+    assert sys_path_report(*entries) == []
+
+
+def test_sys_path_check_does_not_exempt_a_prefix_that_is_the_project_root(
+    sys_path_report, tree, monkeypatch
+):
+    (tree.project_root / "bin").mkdir()
+    monkeypatch.setattr(sys, "prefix", str(tree.project_root))
+
+    assert sys_path_report(tree.project_root / "bin") == ["bin"]
+
+
+def test_sys_path_check_skips_only_relative_entries_that_name_no_directory(
+    sys_path_report, tree, monkeypatch
+):
+    """An editable install registers a marker, not a path; a removed path is still a leak."""
+    monkeypatch.chdir(tree.project_root)
+    removed = tree.project_root / "tests" / "removed"
+
+    assert sys_path_report("__editable__.pkg.finder.__path_hook__", removed) == [
+        os.path.join("tests", "removed")
+    ]
+
+
 @pytest.mark.parametrize("ignored_tree", _NON_TEST_TREES)
 def test_sys_path_check_ignores_every_non_test_tree(sys_path_report, tree, ignored_tree):
     """Entries the product or a vendored package adds when imported.

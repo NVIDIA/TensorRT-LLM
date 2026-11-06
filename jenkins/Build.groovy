@@ -18,6 +18,7 @@
 
 import java.lang.InterruptedException
 import groovy.transform.Field
+import com.nvidia.bloom.FailureEvidenceCollector
 import trtllm.FailureClassifier
 import trtllm.exceptions.InfraFailure
 
@@ -29,6 +30,66 @@ LLM_ROOT = "llm"
 
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
+
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+// localRepo is the local repository that the copy API works on, and credential is the identity
+// that publishes to the location.
+LLM_ARTIFACTS_LOCATIONS = [
+    aws: [root: "https://artifactory.nvidia.com/artifactory", repo: "sw-tensorrt-llm-generic-local",
+          localRepo: "sw-tensorrt-llm-generic-local", credential: "aws-artifactory-credentials"],
+    urm: [root: "https://urm.nvidia.com/artifactory", repo: "sw-tensorrt-generic",
+          localRepo: "sw-tensorrt-generic-local", credential: "urm-artifactory-creds"],
+]
+
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+def llmArtifactsSecondary(String primary)
+{
+    return primary == "aws" ? "urm" : "aws"
+}
+
+def llmArtifactsLayoutPath(String legacyPath)
+{
+    def layoutPath = legacyPath.replaceFirst(/^sw-tensorrt-generic(-local)?\//, "")
+    if (!layoutPath.startsWith("llm-artifacts/")) {
+        error("Not an llm-artifacts path: ${legacyPath}")
+    }
+    return layoutPath
+}
+
+def llmArtifactsRepoPath(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].repo}/${llmArtifactsLayoutPath(legacyPath)}"
+}
+
+def llmArtifactsUrl(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].root}/${llmArtifactsRepoPath(location, legacyPath)}"
+}
+
+def llmArtifactsLocalRepoPath(String location, String legacyPath)
+{
+    return "${LLM_ARTIFACTS_LOCATIONS[location].localRepo}/${llmArtifactsLayoutPath(legacyPath)}"
+}
+
+// The host name of a location, as a netrc machine entry and curl name it.
+def llmArtifactsHost(String location)
+{
+    return LLM_ARTIFACTS_LOCATIONS[location].root.replaceFirst(/^[a-z]+:\/\//, "").replaceFirst(/[:\/].*$/, "")
+}
 
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
@@ -70,6 +131,23 @@ ENABLE_INFRA_SCOPED_FAILFAST = env.ENABLE_INFRA_SCOPED_FAILFAST ? env.ENABLE_INF
 // must be declared there as a boolean parameter defaulting to false. Until it is,
 // the parameter is simply absent and this stays false.
 BOLT_CONSUME_ENABLED = (params.boltConsume ?: env.boltConsume ?: env.BOLT_CONSUME ?: "false").toString() == "true"
+// Publish the BOLTed build BESIDE an untouched canonical tarball instead of
+// replacing canonical with it. Set by the post-merge launch, where canonical is
+// BoltProfileGen's input and must stay un-BOLTed. Same resolution order as above.
+BOLT_PUBLISH_VARIANT = (params.boltPublishVariant ?: env.boltPublishVariant ?: "false").toString() == "true"
+// The profile bundle this pipeline pinned, or "" for whatever `latest` is now.
+// A BINDING variable, not a local: `globalVars` is a parameter of launchStages and
+// is not in scope inside applyLatestBolt, so the value is hoisted here the same way
+// BOLT_CONSUME_ENABLED is.
+BOLT_PINNED_REF = (params.boltProfileRef ?: env.boltProfileRef ?: "").toString()
+// The branch the pin was resolved against. Only ever set together with the ref,
+// and authoritative when set -- see the hoist in launchStages.
+BOLT_PINNED_BRANCH = ""
+// The triples BOLT consume applies to, comma separated, hoisted from globalVars
+// in launchStages. This job runs for both architectures, so the scope has to be
+// stated rather than inferred; see applyLatestBolt. Empty means unrestricted,
+// which is the behaviour for a job run directly instead of from the pipeline.
+BOLT_CONSUME_TRIPLES = ""
 
 // Literals for easier access.
 @Field
@@ -107,28 +185,28 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_X86_64_VANILLA) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_X86_64_SINGLE_DEVICE) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=0 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_UCX=0 --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks",
     (TARNAME) : "single-device-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_X86_64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON --micro_benchmarks -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM.tar.gz",
-    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "80;86;89;90;100;103;107;120",
   ],
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --extra-cmake-vars MOONCAKE_ROOT=/usr/local/Mooncake --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "90;100;103;107;120;121",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
   (CONFIG_LINUX_AARCH64_LLVM) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CUDA_HOST_COMPILER=clang -DCMAKE_LINKER_TYPE=LLD",
     (TARNAME) : "llvm-TensorRT-LLM-GH200.tar.gz",
-    (WHEEL_ARCHS): "90-real;100-real;103-real;120-real",
+    (WHEEL_ARCHS): "90;100;103;107;120;121",
     (BUILD_JOBS_FOR_CONFIG): "8", // TODO: Remove after fix the build OOM issue on SBSA
   ],
 ]
@@ -143,6 +221,16 @@ def ACTION_INFO = "action_info"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PUBLISH_VARIANT_KEY = "bolt_publish_variant"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def BOLT_CONSUME_TRIPLES_KEY = "bolt_consume_triples"
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -152,6 +240,17 @@ def globalVars = [
     // that helper only updates keys already present in the target map, so a key that
     // is absent here (like this one previously) is silently dropped during the merge.
     (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT_KEY): false,
+    (BOLT_PROFILE_BRANCH): "",
+    (BOLT_CONSUME_TRIPLES_KEY): "",
+    // Pre-declared so updateMapWithJson() populates it from the parent (see
+    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
+    (LLM_ARTIFACTS_PRIMARY_KEY): "",
 ]
 
 // TODO: Move common variables to an unified location
@@ -160,6 +259,13 @@ BUILD_CORES_LIMIT = "8"
 BUILD_MEMORY_REQUEST = "48Gi"
 BUILD_MEMORY_LIMIT = "96Gi"
 BUILD_JOBS = "8"
+
+// FailureClassifier catalog ids that make a failed wheel build worth retrying.
+// Add an id here to retry on that failure. Each retry halves -j (down to
+// BUILD_RETRY_MIN_JOBS), which is what helps the memory-exhaustion ids.
+BUILD_RETRY_QUERY_IDS = ["build-oom"]
+BUILD_RETRY_MAX_RETRIES = 2
+BUILD_RETRY_MIN_JOBS = 2
 
 TESTER_CORES = "12"
 TESTER_MEMORY = "96Gi"
@@ -223,12 +329,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
         nodeLabelPrefix = "cpu"
         break
     }
-    // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
-                                operator: NotIn
-                                values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -265,7 +365,6 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -304,56 +403,179 @@ def echoNodeAndGpuInfo(pipeline, stageName)
     pipeline.echo "HOST_NODE_NAME = ${hostNodeName} ; GPU_UUIDS = ${gpuUuids} ; STAGE_NAME = ${stageName}"
 }
 
-def downloadArtifacts(stageName, reuseArtifactPath, artifacts, serverId = 'Artifactory')
+// Adds the publishing credential of a location to the netrc file at netrcPath, which only its
+// owner can read. The shell expands the secret, so it never appears in a Groovy string or a
+// command line.
+def writeArtifactoryNetrc(String netrcPath, String location)
 {
-    def reused = true
-    stage(stageName) {
-        for (downit in artifacts) {
-            def uploadpath = downit.key
-            try {
-                rtDownload(
-                    failNoOp: true,
-                    serverId: serverId,
-                    spec: """{
-                        "files": [
-                            {
-                            "pattern": "${reuseArtifactPath}/${uploadpath}"
-                            }
-                        ]
-                    }""",
-                )
-            } catch (Exception e) {
-                echo "failed downloading ${reuseArtifactPath}/${uploadpath}, need rebuild."
-                reused = false
-                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') { throw e }
-            }
+    withCredentials([usernamePassword(credentialsId: LLM_ARTIFACTS_LOCATIONS[location].credential,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        withEnv(["ARTIFACTORY_NETRC=${netrcPath}", "ARTIFACTORY_HOST=${llmArtifactsHost(location)}"]) {
+            sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine %s login %s password %s\\n' "$ARTIFACTORY_HOST" "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" >> "$ARTIFACTORY_NETRC"
+            ''')
         }
-
-        if (!reused) {
-            return null
-        }
-
-        reuseArtifactPath = reuseArtifactPath.substring(reuseArtifactPath.indexOf('/')+1)
-        def newArtifacts = [:]
-        for (reuseit in artifacts) {
-            def uploadpath = reuseit.key
-            newArtifacts[reuseit.key] = "${reuseArtifactPath}/${uploadpath}"
-        }
-
-        return newArtifacts
     }
 }
 
+// Sends a HEAD or POST request and returns its HTTP status, or "000" when no response arrived.
+// curl takes the credentials for the request's host from netrcPath when one is given, and sends
+// none otherwise. HEAD asks Artifactory to answer itself rather than redirect to a CDN.
+def artifactoryRequestStatus(String method, String url, String netrcPath)
+{
+    def status = ""
+    withEnv([
+        "ARTIFACTORY_REQUEST_METHOD=${method}",
+        "ARTIFACTORY_REQUEST_URL=${url}",
+        "ARTIFACTORY_REQUEST_NETRC=${netrcPath}",
+    ]) {
+        status = sh(label: "Artifactory ${method}", returnStdout: true, script: '''
+            set +x
+            set -- -sS -o /dev/null -w '%{http_code}' --max-time 300
+            if [ -n "$ARTIFACTORY_REQUEST_NETRC" ]; then
+                set -- "$@" --netrc-file "$ARTIFACTORY_REQUEST_NETRC"
+            fi
+            if [ "$ARTIFACTORY_REQUEST_METHOD" = HEAD ]; then
+                set -- "$@" --head -H 'X-JFrog-Download-Redirect-To: None'
+            else
+                set -- "$@" --request "$ARTIFACTORY_REQUEST_METHOD"
+            fi
+            curl "$@" "$ARTIFACTORY_REQUEST_URL" || true
+        ''').trim()
+    }
+    return status
+}
+
+// Describes a failed Artifactory request. status is the HTTP status, or "000" when no response
+// arrived. A 401 or 403 names the credential that was sent, if any, and the permission that the
+// request needs ("read" or "deploy").
+def artifactoryFailureMessage(String location, String path, String status, boolean sentCredentials, String permission)
+{
+    def host = llmArtifactsHost(location)
+    if (status in ["401", "403"]) {
+        if (!sentCredentials) {
+            return "${host} rejected the anonymous request for ${path} (HTTP ${status})."
+        }
+        def credential = LLM_ARTIFACTS_LOCATIONS[location].credential
+        def localRepo = LLM_ARTIFACTS_LOCATIONS[location].localRepo
+        return "${host} rejected the credentials for ${path} (HTTP ${status}): the Artifactory " +
+            "access token in credential '${credential}' needs renewal or lacks ${permission} permission on ${localRepo}."
+    }
+    if (!status || status == "000") {
+        return "No response from ${host} for ${path}."
+    }
+    return "${host} answered HTTP status ${status} for ${path}."
+}
+
+// Whether a file of an earlier build is on a location: true on HTTP 200, false on 404. Any other
+// answer raises an error. aws is read with the publishing credential in netrcPath, and urm
+// anonymously, as every other reader of urm does.
+def cachedArtifactExists(String location, String legacyPath, String netrcPath)
+{
+    def sendCredentials = (location == "aws")
+    def url = llmArtifactsUrl(location, legacyPath)
+    def status = artifactoryRequestStatus("HEAD", url, sendCredentials ? netrcPath : "")
+    echo "Cached artifact ${url}: HTTP status ${status}"
+    if (status == "200") {
+        return true
+    }
+    if (status == "404") {
+        return false
+    }
+    error(artifactoryFailureMessage(location, llmArtifactsRepoPath(location, legacyPath), status, sendCredentials, "read"))
+}
+
+// Copies an earlier build's packaged builds into this run's directory on the primary location,
+// with the copy API of that instance. When the primary lacks them and the secondary holds them,
+// the run rebuilds instead, because a copy cannot cross instances.
+def copyCachedArtifacts(stageName, reuseArtifactPath, artifacts)
+{
+    def reused = false
+    stage(stageName) {
+        def primary = llmArtifactsPrimary()
+        def secondary = llmArtifactsSecondary(primary)
+        def sourceRoot = reuseArtifactPath
+        def sourceOnSecondary = false
+        def netrcPath = ""
+        try {
+            catchError(
+                buildResult: 'SUCCESS',
+                stageResult: 'UNSTABLE',
+                catchInterruptions: false) {
+                sourceRoot = llmArtifactsLocalRepoPath(primary, reuseArtifactPath)
+                def targetRoot = llmArtifactsLocalRepoPath(primary, UPLOAD_PATH)
+                // The primary's credential copies.
+                netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+                writeArtifactoryNetrc(netrcPath, primary)
+                def missing = []
+                for (artifact in artifacts) {
+                    def legacyPath = "${reuseArtifactPath}/${artifact.key}"
+                    if (!cachedArtifactExists(primary, legacyPath, netrcPath)) {
+                        missing.add(legacyPath)
+                    }
+                }
+                if (missing) {
+                    // Reading aws as the secondary needs its credential too.
+                    if (secondary == "aws") {
+                        writeArtifactoryNetrc(netrcPath, "aws")
+                    }
+                    def absent = []
+                    for (legacyPath in missing) {
+                        if (!cachedArtifactExists(secondary, legacyPath, netrcPath)) {
+                            absent.add(legacyPath)
+                        }
+                    }
+                    if (absent) {
+                        error("Cached artifacts are on neither ${primary} nor ${secondary}: ${absent.join(', ')}")
+                    }
+                    sourceOnSecondary = true
+                } else {
+                    def copyApi = "${LLM_ARTIFACTS_LOCATIONS[primary].root}/api/copy"
+                    for (artifact in artifacts) {
+                        def sourcePath = "${sourceRoot}/${artifact.key}"
+                        def targetPath = "${targetRoot}/${artifact.key}"
+                        echo "Copying cached artifact ${sourcePath} to ${targetPath}"
+                        def status = artifactoryRequestStatus(
+                            "POST", "${copyApi}/${sourcePath}?to=/${targetPath}", netrcPath)
+                        if (!(status ==~ /2\d\d/)) {
+                            error(artifactoryFailureMessage(primary, targetPath, status, true, "deploy"))
+                        }
+                    }
+                    reused = true
+                }
+            }
+        } finally {
+            if (netrcPath) {
+                sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
+            }
+        }
+        if (sourceOnSecondary) {
+            echo "reuse source is on ${secondary}; rebuilding"
+        } else if (!reused) {
+            echo "Failed to copy cached artifacts from ${sourceRoot}; need rebuild."
+        }
+    }
+    return reused
+}
+
+// artifacts maps an upload name to either a local path, or a Map of
+// [path: <local path>, props: <"k=v;k=v" or null>] when the object needs
+// Artifactory properties attached. Properties are set in the same request as the
+// upload, so metadata and bytes cannot disagree.
 def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 'Artifactory')
 {
     for (it in artifacts) {
         def uploadpath = it.key
-        def filepath = it.value
+        def filepath = it.value instanceof Map ? it.value.path : it.value
+        def props = it.value instanceof Map ? it.value.props : null
+        def propsField = props ? ",\n                        \"props\": \"${props}\"" : ""
         def spec = """{
                     "files": [
                         {
                         "pattern": "${filepath}",
-                        "target": "${prefix}/${uploadpath}"
+                        "target": "${prefix}/${uploadpath}"${propsField}
                         }
                     ]
                 }"""
@@ -367,14 +589,32 @@ def uploadArtifacts(artifacts, prefix = UPLOAD_PATH, retryTimes = 2, serverId = 
     }
 }
 
+// Publishes the packaged builds to the primary location: UPLOAD_PATH through server
+// 'Artifactory' on urm, or the same layout path in sw-tensorrt-llm-generic-local through
+// 'ArtifactoryAws' on aws. Both servers must be defined first.
+def uploadToPrimary(artifacts)
+{
+    def primary = llmArtifactsPrimary()
+    if (primary == "urm") {
+        uploadArtifacts(artifacts)
+        return
+    }
+    try {
+        uploadArtifacts(artifacts, llmArtifactsRepoPath("aws", UPLOAD_PATH), 2, 'ArtifactoryAws')
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        // The plugin reports an HTTP 401 or 403 only in its own log, so name the credential here.
+        echo "Upload to artifactory.nvidia.com failed using credential 'aws-artifactory-credentials'. If the upload log above reports HTTP 401 or 403, the Artifactory access token in that credential needs renewal or lacks deploy permission on sw-tensorrt-llm-generic-local."
+        throw e
+    }
+}
+
 def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, runner)
 {
     if (reuseArtifactPath) {
         stage(key) {
-            def newArtifacts = downloadArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)
-            if (newArtifacts != null) {
-                uploadArtifacts(newArtifacts)
-            } else {
+            if (!copyCachedArtifacts("[${key}] Reuse", reuseArtifactPath, artifacts)) {
                 reuseArtifactPath = null
             }
         }
@@ -400,7 +640,14 @@ def buildOrCache(pipeline, key, reuseArtifactPath, artifacts, image, k8s_cpu, ru
                     // The default value (if not configured) is 300 seconds:
                     timeout: 300
                 )
-                uploadArtifacts(artifacts)
+                rtServer (
+                    id: 'ArtifactoryAws',
+                    url: 'https://artifactory.nvidia.com/artifactory',
+                    credentialsId: 'aws-artifactory-credentials',
+                    bypassProxy: true,
+                    timeout: 300
+                )
+                uploadToPrimary(artifacts)
             }
         }
     })
@@ -425,6 +672,17 @@ def prepareLLMBuild(pipeline, config, versionOverride)
 
 }
 
+// Returns the id of the BUILD_RETRY_QUERY_IDS signature the failed build attempt
+// matched in its step log, or null if it should not be retried. User aborts never
+// reach here (runLLMBuild rethrows InterruptedException first).
+def matchRetryableBuildFailure(pipeline, Throwable e)
+{
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.K8S).findAll { it.id in BUILD_RETRY_QUERY_IDS }
+    def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, queries)
+    def classified = FailureClassifier.classify(e, InfraFailure.K8S, evidence)
+    return classified instanceof InfraFailure ? evidence?.matchedQueryId : null
+}
+
 def runLLMBuild(
     pipeline, buildFlags, tarName, is_linux_x86_64, versionOverride, typeCheck=false, artifacts=null)
 {
@@ -435,9 +693,6 @@ def runLLMBuild(
     sh "rm -rf **/*.xml *.tar.gz"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-    if (env.alternativeTRT) {
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
 
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
@@ -464,33 +719,59 @@ def runLLMBuild(
     // install python package
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install -r requirements-dev.txt ${pipArgs}")
 
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, "cp312")
-    }
-
-    def buildJobs = buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS
+    int buildJobs = (buildFlags[BUILD_JOBS_FOR_CONFIG] ?: BUILD_JOBS) as int
 
     withEnv([
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-            sh "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+        int buildRetries = 0
+        while (true) {
+            try {
+                // cmake will download third-party sources, so we add retry.
+                trtllm_utils.llmExecStepWithRetry(
+                    pipeline,
+                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+                )
+                break
+            } catch (InterruptedException e) {
+                // User abort / pipeline timeout (FlowInterruptedException): never retry.
+                throw e
+            } catch (Exception e) {
+                def retryReason = null
+                if (buildRetries >= BUILD_RETRY_MAX_RETRIES ||
+                    buildJobs <= BUILD_RETRY_MIN_JOBS ||
+                    (retryReason = matchRetryableBuildFailure(pipeline, e)) == null) {
+                    throw e
+                }
+                buildRetries++
+                int newJobs = Math.max(BUILD_RETRY_MIN_JOBS, (int) (buildJobs / 2))
+                echo "Wheel build failed (${retryReason}); retrying with -j ${newJobs} (was ${buildJobs}), retry ${buildRetries}/${BUILD_RETRY_MAX_RETRIES}."
+                buildJobs = newJobs
+            }
         }
     }
 
     // Type-check with the compiled bindings that build_wheel.py just produced in
-    // place. Runs mypy directly (not via pre-commit) so this step does zero
-    // network: the pre-commit orchestrator clones every remote hook repo from
-    // github up front, which flakes on nodes without github access. mypy and its
+    // place. Runs mypy directly (not via pre-commit) so this step does not clone
+    // anything from github: the pre-commit orchestrator clones every remote hook
+    // repo up front, which flakes on nodes without github access. mypy and its
     // config come from requirements-dev.txt (installed above) via the internal
     // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
     // bindings can't be imported, rather than silently degrading to the
     // lightweight (no-bindings) check.
+    //
+    // The step still talks to the network: [tool.mypy] sets install_types, so
+    // mypy pip-installs the missing stub packages from the internal PyPI mirror
+    // before checking.
     if (typeCheck) {
         echo "-- Running mypy type check with compiled bindings..."
         withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-            sh "cd ${LLM_ROOT} && bash scripts/run_mypy.sh"
+            trtllm_utils.llmExecStepWithRetry(
+                pipeline,
+                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh",
+                shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
+            )
         }
     }
 
@@ -545,10 +826,36 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
     // forwards neither of these, so a build launched by L0_MergeRequest.groovy lands
     // on "main" -- the only branch with a promoted bundle. Revisit together with the
     // parent's main-only gate if either name starts being forwarded.
-    def branch = env.gitlabTargetBranch ?: env.branch_name ?: "main"
+    // The pinned branch wins when there is one: the pin names an object under
+    // exactly that branch's promote directory, and the expression below is not
+    // the one the pin was resolved with, so re-deriving could look in the wrong
+    // place and find nothing.
+    def branch = BOLT_PINNED_BRANCH ?: (env.gitlabTargetBranch ?: env.branch_name ?: "main")
     def triple = is_linux_x86_64 ? "x86_64-linux-gnu" : "aarch64-linux-gnu"
+    // An architecture outside the parent's consume scope has nothing to apply, so
+    // stop before staging llvm-bolt and discovering that over a retried 404. Only
+    // aarch64 has a profile producer today, and this job runs for both.
+    //
+    // The scope is its own fact, not something read off the pin: an unresolvable
+    // pin is deliberately non-fatal, so deciding the architecture from the pin
+    // meant x86_64 skipped cheaply when the pin resolved and did minutes of
+    // pointless work when it did not. Same outcome either way -- there is no
+    // x86_64 bundle to apply -- but the cost and the log differed for a reason
+    // that has nothing to do with architecture.
+    //
+    // Empty means unrestricted, so a job run directly keeps today's behaviour of
+    // attempting and skipping gracefully.
+    def scopedTriples = BOLT_CONSUME_TRIPLES.split(",").collect { it.trim() }.findAll { it }
+    if (scopedTriples && !(triple in scopedTriples)) {
+        echo "[bolt-consume] consume is scoped to ${scopedTriples.join(', ')}; " +
+             "skipping ${triple} (build stays un-BOLTed)"
+        return
+    }
+    // The bundle this pipeline pinned, or "" to take whatever `latest` is now.
+    // Exported to apply_latest.sh, which passes it to artifactory.sh; also stamped
+    // onto the published artifact so a consumer can verify what it received.
+    def boltRef = BOLT_PINNED_REF
     def llvmArch = is_linux_x86_64 ? "X64" : "ARM64"
-    def llvmVer = "21.1.5"   // keep in sync with scripts/bolt internal/slurm_*.sh
     stage("BOLT consume") {
         // apply_latest.sh exit codes: 3 = no promoted bundle for branch/triple,
         // 2 = apply error, 0 = applied. Capture the code so a MISSING bundle (e.g.
@@ -558,17 +865,31 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
             set -e
             export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
             if ! command -v llvm-bolt >/dev/null 2>&1; then
-                echo '[bolt-consume] staging llvm-bolt ${llvmVer}'
-                tb=LLVM-${llvmVer}-Linux-${llvmArch}.tar.xz
+                . ${LLM_ROOT}/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-consume] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
                 mkdir -p .bolt-llvm
                 curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
-                     -o /tmp/\$tb https://github.com/llvm/llvm-project/releases/download/llvmorg-${llvmVer}/\$tb
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
                 tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
                 rm -f /tmp/\$tb
             fi
+            export BOLT_PROFILE_REF='${boltRef}'
             bash ${LLM_ROOT}/scripts/bolt/internal/apply_latest.sh \
                  ${branch} ${triple} ${tarName} bolted-${tarName}
         """)
+        if (rc == 3 && boltRef) {
+            // rc=3 means apply_latest.sh could not pull a bundle. Unpinned that
+            // legitimately means "this branch has nothing promoted" -- true for
+            // x86_64 today -- and skipping is right. Pinned it cannot mean that:
+            // the pipeline read this exact ref minutes ago, so absence is a real
+            // failure. Skipping would leave bolted-${tarName} unpublished, and
+            // the test stages fetch it by name, so an Artifactory blip here would
+            // surface as a pile of unexplained 404s in a different job.
+            error("[bolt-consume] pinned BOLT bundle ${boltRef} not found under ${branch}/${triple}. " +
+                  "The pipeline pinned a bundle this build cannot fetch; refusing to silently produce " +
+                  "an un-BOLTed build that downstream stages expect to be optimized.")
+        }
         if (rc == 3) {
             echo "[bolt-consume] no promoted bundle for ${branch}/${triple}; skipping (build stays un-BOLTed)"
             return
@@ -576,28 +897,52 @@ def applyLatestBolt(pipeline, tarName, is_linux_x86_64, artifacts=null)
         if (rc != 0) {
             error("[bolt-consume] apply_latest.sh failed (rc=${rc}) for ${branch}/${triple}")
         }
-        // Applied: preserve the un-BOLTed original as unbolted-<tarName> and promote
-        // the BOLTed build to the canonical name. Matches the postmerge
-        // publishBoltedCanonical convention (canonical = BOLTed).
-        sh """
-            set -e
-            cp -f ${tarName} unbolted-${tarName}
-            mv -f bolted-${tarName} ${tarName}
-            echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
-        """
-        // Register the unbolted- variant for upload via the caller's artifacts map,
-        // so it is pushed by buildOrCache OUTSIDE the build container (where the
-        // JFrog 'Artifactory' server resolves). Uploading here with rtUpload fails
-        // with "Couldn't find JFrog Instance ID: Artifactory" -- the server is not
-        // available inside the container context. Added only on a successful apply,
-        // so a skipped arch never references a nonexistent file.
-        if (artifacts != null) {
-            artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+        // Applied. Which name the BOLTed build takes depends on who consumes this
+        // build, and the two cases are opposites:
+        //
+        //   pre-merge  -- BOLTed becomes canonical, original kept as unbolted-.
+        //                 Every downstream consumer should exercise the optimized
+        //                 build, and canonical is what they all fetch.
+        //   post-merge -- canonical stays UN-BOLTed and the optimized build is
+        //                 published beside it as bolted-<tarName>. Canonical is
+        //                 BoltProfileGen's input; replacing it would generate the
+        //                 next bundle from already-optimized binaries.
+        //
+        // Both register the second variant through the caller's artifacts map, so
+        // it is pushed by buildOrCache OUTSIDE the build container -- rtUpload here
+        // fails with "Couldn't find JFrog Instance ID: Artifactory", the server not
+        // being resolvable in the container context. Added only on a successful
+        // apply, so a skipped arch never references a nonexistent file.
+        if (BOLT_PUBLISH_VARIANT) {
+            sh """
+                set -e
+                echo '[bolt-consume] ${tarName} left un-BOLTed (BoltProfileGen input); optimized build published as bolted-${tarName}'
+            """
+            if (artifacts != null) {
+                // bolt.ref records WHICH bundle produced it, so a consumer can
+                // assert it matches the pin rather than trusting the filename, and
+                // an A/B job can tell the two sides apart by property rather than
+                // by a name that means the opposite thing pre-merge.
+                artifacts["bolted-${tarName}"] = [
+                    path: "bolted-${tarName}",
+                    props: boltRef ? "bolt.ref=${boltRef}" : null,
+                ]
+            }
+        } else {
+            sh """
+                set -e
+                cp -f ${tarName} unbolted-${tarName}
+                mv -f bolted-${tarName} ${tarName}
+                echo '[bolt-consume] ${tarName} is now BOLTed; original preserved as unbolted-${tarName}'
+            """
+            if (artifacts != null) {
+                artifacts["unbolted-${tarName}"] = "unbolted-${tarName}"
+            }
         }
     }
 }
 
-def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, cpver="312", extra_args="")
+def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=false, pre_cxx11abi=false, extra_args="", reconfigure=false)
 {
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
@@ -608,18 +953,14 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
 
     // Step 1: cloning tekit source code
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     // Step 2: building libs in container
     sh "bash -c 'pip3 show tensorrt || true'"
 
     if (extra_args == "") {
         if (triple == AARCH64_TRIPLE) {
-            extra_args = "-a '90-real;100-real;103-real;120-real'"
+            extra_args = "-a '90;100;103;107;120;121'"
         } else {
-            extra_args = "-a '80-real;86-real;89-real;90-real;100-real;103-real;120-real'"
+            extra_args = "-a '80;86;89;90;100;103;107;120'"
         }
     }
     if (pre_cxx11abi) {
@@ -634,8 +975,13 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     }
     sh "bash -c 'git config --global --add safe.directory \"*\"'"
     // Because different architectures involve different macros, a comprehensive test is conducted here.
-    withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}\"")
+    def buildCommand = "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${extra_args}"
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c \"${buildCommand}\"")
+    if (reconfigure) {
+        // Verify that reconfiguration works.
+        // Configure the built tree again with identical arguments and rebuild it incrementally,
+        // so CMake logic that only breaks once the cache and fetched dependencies exist fails CI.
+        sh "bash -c \"${buildCommand} --configure_cmake --skip_building_wheel\""
     }
 }
 
@@ -646,13 +992,16 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         echo "dockerImage: ${env.dockerImage}"
         echo "gitlabSourceRepoHttpUrl: ${env.gitlabSourceRepoHttpUrl}"
         echo "gitlabCommit: ${env.gitlabCommit}"
-        echo "alternativeTRT: ${env.alternativeTRT}"
         echo "Using GitLab repo: ${LLM_REPO}. Commit: ${env.gitlabCommit}"
 
         echo "env.globalVars is: ${env.globalVars}"
         globalVars = trtllm_utils.updateMapWithJson(pipeline, globalVars, env.globalVars, "globalVars")
         globalVars = trtllm_utils.initializeCiBudget(pipeline, globalVars, 24, 'HOURS', "Build-${cpu_arch}")
         globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(pipeline, globalVars[ACTION_INFO])
+        if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+            LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+            echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+        }
         // BOLT consume flag: source it from globalVars (set by L0_MergeRequest as
         // bolt_consume_build), which is reliably propagated. The standalone
         // boltConsume job parameter is NOT registered on the remote build jobs, so
@@ -663,11 +1012,28 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
             BOLT_CONSUME_ENABLED = true
             echo "[bolt-consume] enabled via globalVars.bolt_consume_build"
         }
-    }
-
-    def wheelDockerImage = env.wheelDockerImagePy310
-    if (!wheelDockerImage && cpu_arch == AARCH64_TRIPLE) {
-        wheelDockerImage = env.dockerImage
+        if (globalVars[BOLT_PROFILE_REF]) {
+            BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF].toString()
+            BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            echo "[bolt-consume] pinned to profile bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+        }
+        // Which architectures consume BOLT, independent of whether a pin resolved.
+        if (globalVars[BOLT_CONSUME_TRIPLES_KEY]) {
+            BOLT_CONSUME_TRIPLES = globalVars[BOLT_CONSUME_TRIPLES_KEY].toString()
+            echo "[bolt-consume] scoped to ${BOLT_CONSUME_TRIPLES}"
+        }
+        // Same reason as boltConsume directly above: boltPublishVariant is not
+        // registered on the remote build jobs, so the Parameterized Remote
+        // Trigger drops it and the param resolution at the top of this file
+        // leaves it false. Post-merge that is the worst possible default --
+        // consume is on (it comes through globalVars and survives), so
+        // applyLatestBolt would take the else branch and REPLACE canonical,
+        // feeding already-BOLTed binaries to BoltProfileGen, while the test
+        // stages fetch a bolted- variant that was never uploaded.
+        if (globalVars[BOLT_PUBLISH_VARIANT_KEY]?.toString() == "true") {
+            BOLT_PUBLISH_VARIANT = true
+            echo "[bolt-consume] publishing bolted- variant via globalVars.bolt_publish_variant"
+        }
     }
 
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
@@ -701,7 +1067,30 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         // The default value (if not configured) is 300 seconds:
         timeout: 300
     )
+    rtServer (
+        id: 'ArtifactoryAws',
+        url: 'https://artifactory.nvidia.com/artifactory',
+        credentialsId: 'aws-artifactory-credentials',
+        bypassProxy: true,
+        timeout: 300
+    )
     def reuseArtifactPath = env.reuseArtifactPath
+    // copyCachedArtifacts walks the artifact map as it stands BEFORE the build
+    // runs, and bolted-<tarName> is added to that map by applyLatestBolt during
+    // the build. So a cache hit would copy canonical only, report success, and
+    // leave the test stages fetching a variant that was never published.
+    //
+    // Pre-declaring the variant in the map instead would break the builds where
+    // it is legitimately absent (x86_64 is outside the consume scope), so the
+    // reuse is dropped rather than taught about an artifact it cannot predict.
+    // reuse_build is a manual `/bot run` opt-in, never a default, and asking to
+    // skip the build on a run whose purpose is to produce these binaries is
+    // already contradictory.
+    if (reuseArtifactPath && BOLT_PUBLISH_VARIANT) {
+        echo "[bolt-consume] ignoring reuseArtifactPath: this run publishes " +
+             "bolted- variants, which a cached build has no way to supply"
+        reuseArtifactPath = null
+    }
 
     def k8s_cpu = "amd64"
     if (cpu_arch == AARCH64_TRIPLE) {
@@ -723,7 +1112,7 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
                     stage(key) {
                         stage("[${key}] Run") {
                             echoNodeAndGpuInfo(pipeline, key)
-                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "cp312", "-a '90-real' -b Debug --micro_benchmarks")
+                            buildWheelInContainer(pipeline, [], X86_64_TRIPLE, false, false, "-a '90' -b Debug --micro_benchmarks", true)
                         }
                     }
                 })
@@ -741,7 +1130,8 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         // ENABLE_INFRA_SCOPED_FAILFAST; off = plain failFast + parallel, as before.
         trtllm_utils.runBranchesWithInfraDefer(pipeline, parallelJobs, enableFailFast,
                 ENABLE_INFRA_SCOPED_FAILFAST) { e, stageName ->
-            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S)
+            def evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, e, FailureClassifier.failureEvidenceQueries(InfraFailure.K8S))
+            FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S, evidence)
         }
     } // Build stage
 }
@@ -763,7 +1153,7 @@ pipeline {
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
         GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
     }

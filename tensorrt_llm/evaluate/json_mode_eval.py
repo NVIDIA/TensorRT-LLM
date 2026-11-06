@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,7 +14,7 @@
 # limitations under the License.
 import json
 import os
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, Union
 
 import click
 import datasets
@@ -26,6 +26,12 @@ from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .interface import Evaluator
+
+# A Harmony (gpt-oss) generation prompt stops at the assistant role: the model
+# writes the channel header itself, and its answer is the message body of the
+# final channel.
+_HARMONY_ASSISTANT_START = "<|start|>assistant"
+_HARMONY_FINAL_MESSAGE_START = "<|channel|>final<|message|>"
 
 
 class JsonModeEval(Evaluator):
@@ -54,6 +60,16 @@ class JsonModeEval(Evaluator):
             self.num_samples = self.data.num_rows
         else:
             self.num_samples = min(num_samples, self.data.num_rows)
+
+    def do_apply_chat_template(self, llm: Any,
+                               prompt: Union[str, List[dict]]) -> str:
+        prompt = super().do_apply_chat_template(llm, prompt)
+        # The JSON guide binds the completion from its first token. Open the
+        # Harmony final channel in the prompt so that the guide constrains the
+        # answer instead of the message header.
+        if prompt.endswith(_HARMONY_ASSISTANT_START):
+            prompt += _HARMONY_FINAL_MESSAGE_START
+        return prompt
 
     def generate_samples(self) -> Iterable[tuple]:
         for i, sample in enumerate(self.data):

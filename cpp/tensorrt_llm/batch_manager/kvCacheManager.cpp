@@ -3356,8 +3356,8 @@ void KVCacheManager::allocatePools(bool useUvm)
     mBlockScalePoolPointers
         = BufferManager::cpu(ITensor::makeShape({numBlockScalePools, 2}), TRTDataType<void*>::value);
 
-    auto poolPtrsRange = BufferRange<void*>(*mBlockPoolPointers);
-    auto blockScalePtrsRange = BufferRange<void*>(*mBlockScalePoolPointers);
+    auto poolPtrsRange = mBlockPoolPointers->getBufferRange<void*>();
+    std::span<void*> blockScalePtrsRange = mBlockScalePoolPointers->getBufferRange<void*>();
     SizeType32 kvPoolIdx = 0;
     SizeType32 blockScalePoolIdx = 0;
 
@@ -3380,7 +3380,7 @@ void KVCacheManager::allocatePools(bool useUvm)
 
     auto const numLayers = mBlockManager.getNumLayers();
     mLayerToPoolMapping = BufferManager::cpu(ITensor::makeShape({numLayers, 2}), TRTDataType<SizeType32>::value);
-    auto poolMappingRange = BufferRange<SizeType32>(*mLayerToPoolMapping);
+    auto poolMappingRange = mLayerToPoolMapping->getBufferRange<SizeType32>();
     for (SizeType32 layerIdx = 0; layerIdx < numLayers; layerIdx++)
     {
         auto const indexOfPool = mBlockManager.getLayerPoolIdx(layerIdx);
@@ -3609,7 +3609,7 @@ void BlockManager::updateSequenceCacheBlockOffsets(GenerationRequest& sequence, 
     auto& cacheBlocksTensor = sequence.getCacheBlockIndices(windowSize);
     auto const beamWidth = sequence.getBeamWidth();
 
-    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
+    auto* offsetsPtr = cacheBlocksTensor.getBufferPtr<tk::KVCacheIndex>();
     auto const& offsetsShape = cacheBlocksTensor.getShape();
 
     for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
@@ -3629,7 +3629,7 @@ void WindowBlockManager::updateLastCacheBlockOffsets(GenerationRequest& sequence
     auto& cacheBlocksTensor = sequence.getCacheBlockIndices(mWindowSize);
     auto const beamWidth = sequence.getBeamWidth();
 
-    auto* offsetsPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
+    auto* offsetsPtr = cacheBlocksTensor.getBufferPtr<tk::KVCacheIndex>();
     auto const& offsetsShape = cacheBlocksTensor.getShape();
 
     for (SizeType32 beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
@@ -3986,7 +3986,7 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
     auto const& sequence = getSequence(requestId);
     auto const beamWidth = sequence.getBeamWidth();
 
-    auto* dstPtr = bufferCast<tk::KVCacheIndex>(output);
+    auto* dstPtr = output.getBufferPtr<tk::KVCacheIndex>();
     auto const& dstShape = output.getShape();
 
     SizeType32 constexpr kIdx = 0;
@@ -3999,7 +3999,7 @@ SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSl
     for (auto const [ws, metadata] : mBlockManager.getWindowSizesMetadata())
     {
         auto const& cacheBlocksTensor = sequence.getCacheBlockIndices(ws);
-        auto const* srcPtr = bufferCast<tk::KVCacheIndex>(cacheBlocksTensor);
+        auto const* srcPtr = cacheBlocksTensor.getBufferPtr<tk::KVCacheIndex>();
         auto const& srcShape = cacheBlocksTensor.getShape();
         auto const& cacheBlockIds = sequence.getCacheBlockIds(ws);
         for (SizeType32 poolIdx = 0; poolIdx < metadata.numPools; poolIdx++, absolutePoolIdx++)

@@ -70,9 +70,10 @@ struct MlaParams
     // Separate tensor K for context MLA, contiguous. Pre-process kernel will apply RoPE and modify it in-place.
     // shape: [total_kv_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
     T* k_buf = nullptr;
-    // Separate tensor V for context MLA, NOT contiguous,
-    // shape: [total_kv_len, h * d_v], stride: [h * (d_nope + d_v), 1]
+    // Separate tensor V for context MLA, shape [total_kv_len, h * d_v] with unit feature stride.
     T const* v_buf = nullptr;
+    // Physical V token stride in elements; zero uses the packed [K_nope | V] layout.
+    int64_t v_token_stride_elements = 0;
     // Tensor quantized Q for both context and generation MLA.
     // For context MLA, shape: [total_q_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
     void* quant_q_buf = nullptr;
@@ -145,6 +146,9 @@ struct MlaParams
     // `latent_cache` row stride in elements; the fused path passes a slice of
     // kv_a_proj, so rows are wider than packed. 0 means packed.
     int latent_row_stride = 0;
+    // The caller has already applied Q RoPE and written the complete FP8 Q to
+    // `quant_q_buf`. Context preprocessing must still rotate/cache K.
+    bool q_rope_applied = false;
 
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
     Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
@@ -155,6 +159,13 @@ struct MlaParams
     // for Helix parallelism: whether the current rank is inactive, shape [b]
     // (the current query tokens are not appended to this rank's KV cache)
     bool const* helix_is_inactive_rank{nullptr};
+
+    // for Helix parallelism with speculative verify groups: per-token
+    // rank-local KV write slot, shape [num_tokens]; -1 means another CP rank
+    // owns the token's global position. Non-null supersedes the per-sequence
+    // helix_is_inactive_rank gate (a 1 + draft_len group can straddle a
+    // ledger-page boundary, splitting ownership between two ranks).
+    int32_t const* helix_local_slots{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -180,7 +191,13 @@ template <typename T, typename TCache>
 void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, KVBlockArray& kv_scale_cache, T* q_ptr,
     T* latent_cache_ptr, int const num_requests, int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens,
     int const max_input_uncached_seq_len, float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size,
-    int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+    int lora_size, KvCacheDataType cache_type, float const* kv_scale_orig_quant_ptr, int32_t const* kvCacheLocalSlots,
+    cudaStream_t stream);
+
+template <typename T>
+void invokeReorderHelixMlaKV(T const* gathered, T* compressedKv, T* kPe, int64_t const* cuGlobal,
+    int64_t const* globalOffsets, int64_t const* cuLocal, int64_t const* localOffsets, int64_t const* rankOffsets,
+    int numTokens, int numContexts, int cpSize, int tokensPerBlock, int loraSize, int ropeSize, cudaStream_t stream);
 
 // Apply neox-style RoPE in-place to only the last rope_dim elements of each head,
 // leaving the first nope_dim elements untouched.

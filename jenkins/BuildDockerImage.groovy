@@ -33,6 +33,36 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent. This job reads
+// packaged builds with jenkins/scripts/fetch_build_artifact.sh, which maps the legacy paths above.
+
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+// Credential with which the read helper reads packaged builds on artifactory.nvidia.com: the
+// publishing credential, the one the pipelines publish build artifacts with. Image pushes also
+// use it.
+LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
+
+// Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
+// names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
+// that they match.
+FETCH_ABSENT = 2
+FETCH_REJECTED = 3
+FETCH_TRANSFER_FAILED = 4
+
 LLM_ROOT = "llm"
 
 LLM_BRANCH = env.gitlabBranch ?: params.branch
@@ -58,6 +88,19 @@ BOLT_OVERLAY_ENABLED = (params.boltOverlayEnabled ?: env.boltOverlayEnabled ?: "
 // carries profiles). Left false until the enable PR wires it true for the
 // release/nightly path; premerge/new-branch stays lenient (retag plain build).
 BOLT_PROFILES_REQUIRED = (params.boltProfilesRequired ?: env.boltProfilesRequired ?: "false").toString() == "true"
+// Separate from the two above: those govern the profile BUNDLE baked in as a
+// thin layer (Dockerfile.bolt), which documents how to reproduce a BOLTed build
+// but does NOT optimize the binaries the image actually installs. This one
+// governs the INSTALLED wheel -- when true, the wheel unpacked from the build
+// tarball is BOLT-optimized in the image build, before the release stage pip
+// installs it. Kept independent so it can be rolled back on its own.
+BOLT_OPTIMIZE_WHEEL = (params.boltOptimizeWheel ?: env.boltOptimizeWheel ?: "false").toString() == "true"
+// The bundle this pipeline pinned, hoisted out of globalVars in launchBuildJobs
+// because overlayBoltBundle runs well below the scope globalVars is passed into.
+// Empty means unpinned, i.e. take whatever `latest` is.
+BOLT_PINNED_REF = ""
+// The branch that pin lives under. Set only together with the ref.
+BOLT_PINNED_BRANCH = ""
 // <<< BOLT profile-bundle overlay <<<
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
@@ -80,12 +123,34 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
+@Field
+def TRTLLM_RELEASE_REPO = "TRTLLM_RELEASE_REPO"
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): null,
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PROFILE_BRANCH): "",
+    // Pre-declared so updateMapWithJson() populates it from the parent (see
+    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
+    (LLM_ARTIFACTS_PRIMARY_KEY): "",
+    // Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+    (TRTLLM_RELEASE_REPO): null,
 ]
 
 @Field
@@ -101,66 +166,6 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
                   kubernetes.io/os: linux
                   kubernetes.io/arch: ${arch}"""
 
-    if (build_wheel && arch == "arm64") {
-        // For aarch64, we need to use hostname to fix the ucxx issue when building wheels
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: In
-                                      values:
-                                        - "rl300-0008.ipp2u1.colossus"
-                                        - "rl300-0014.ipp2u1.colossus"
-                                        - "rl300-0023.ipp2u1.colossus"
-                                        - "rl300-0024.ipp2u1.colossus"
-                                        - "rl300-0030.ipp2u1.colossus"
-                                        - "rl300-0040.ipp2u1.colossus"
-                                        - "rl300-0041.ipp2u1.colossus"
-                                        - "rl300-0042.ipp2u1.colossus"
-                                        - "rl300-0043.ipp2u1.colossus"
-                                        - "rl300-0044.ipp2u1.colossus"
-                                        - "rl300-0045.ipp2u1.colossus"
-                                        - "rl300-0046.ipp2u1.colossus"
-                                        - "rl300-0047.ipp2u1.colossus"
-        """
-    } else if (arch == "arm64") {
-        // Temporarily avoid an arm64 builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: NotIn
-                                      values:
-                                        - "rl300-0021.ipp2a1.colossus"
-        """
-    }
-
-    if (arch == "amd64") {
-        // For x86_64, we block some nodes to avoid unstable network access.
-        selectors += """
-                affinity:
-                    nodeAffinity:
-                        requiredDuringSchedulingIgnoredDuringExecution:
-                            nodeSelectorTerms:
-                                - matchExpressions:
-                                    - key: "kubernetes.io/hostname"
-                                      operator: NotIn
-                                      values:
-                                        - "sc-ipp-blossom-prod-k8w-105"
-                                        - "sc-ipp-blossom-prod-k8w-114"
-                                        - "sc-ipp-blossom-prod-k8w-115"
-                                        - "sc-ipp-blossom-prod-k8w-121"
-                                        - "sc-ipp-blossom-prod-k8w-123"
-                                        - "sc-ipp-blossom-prod-k8w-124"
-        """
-    }
-
     def archSuffix = arch == "arm64" ? "arm" : "amd"
     def jnlpImage = "artifactory.pdx.nvidia.com/sw-ipp-blossom-sre-docker-local/lambda/custom_jnlp_images_${archSuffix}_linux:jdk17"
 
@@ -169,7 +174,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     case "agent":
         containerConfig = """
                   - name: python3
-                    image: urm.nvidia.com/docker/python:3.12-slim
+                    image: artifactory.pdx.nvidia.com/docker-remote/python:3.12-slim
                     command: ['cat']
                     tty: true
                     resources:
@@ -264,15 +269,66 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 }
 
 
-def prepareWheelFromBuildStage(dockerfileStage, arch) {
-    if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
-        echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
-        return ""
+// Writes a netrc for LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its owner, to netrcPath
+// for jenkins/scripts/fetch_build_artifact.sh. Callers put it under pwd(tmp: true), outside the
+// source tree and any docker build context, and remove it in a finally block.
+def writeArtifactoryNetrc(String netrcPath)
+{
+    withCredentials([usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
+            sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+            ''')
+        }
     }
+}
 
-    if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
-        echo "Trigger type does not use the build stage wheel"
-        return ""
+
+def prepareWheelFromBuildStage(dockerfileStage, arch) {
+    // Whether THIS image has to ship a BOLT-optimized wheel. Answered before the
+    // gates below, and deliberately not subject to them.
+    //
+    // Optimizing the installed wheel is only possible on this path: the wheel is
+    // BOLTed by get_wheel_from_package.py as it is unpacked from the build
+    // tarball, so an image that compiles its own wheel in-container has nothing
+    // to optimize. That makes the two gates below load-bearing for BOLT, and
+    // both are unreliable for reasons that have nothing to do with BOLT:
+    //
+    //   useWheelFromBuildStage -- a kill switch added for nvbug 5433581 in Aug
+    //       2025 and never reverted. It was also read without being declared, so
+    //       it was not merely false but incapable of being true.
+    //   triggerType -- read from env and not a declared parameter of this job,
+    //       so whether it survives the launch is a property of job registration
+    //       rather than of this repo. When it does not, TRIGGER_TYPE is "manual"
+    //       and this returns early no matter what the caller asked for.
+    //
+    // boltOptimizeWheel, by contrast, IS declared, so it reliably arrives. Key
+    // off it and let a BOLT request carry itself past both gates. The bypass is
+    // limited to SBSA release images that request BOLT optimization.
+    def isReleaseStage = dockerfileStage in ["release", "tritonrelease"]
+    def boltWheelRequired = BOLT_OPTIMIZE_WHEEL && arch == "sbsa" && isReleaseStage
+
+    if (!boltWheelRequired) {
+        if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
+            echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
+            return ""
+        }
+
+        if (!(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+            echo "Trigger type does not use the build stage wheel"
+            return ""
+        }
+    } else if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE ||
+               !(TRIGGER_TYPE in ["post-merge", "nightly-release"])) {
+        // Say so rather than doing it quietly: this is the one place the image
+        // build departs from what its parameters literally asked for.
+        echo "[BOLT] boltOptimizeWheel is set for the ${arch} release image, so the " +
+             "build-stage wheel path runs even though useWheelFromBuildStage=" +
+             "${ENABLE_USE_WHEEL_FROM_BUILD_STAGE} and triggerType=${TRIGGER_TYPE} would " +
+             "otherwise skip it. Optimizing the installed wheel is not possible any other way."
     }
 
     if (!dockerfileStage || !arch) {
@@ -280,14 +336,53 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
         return ""
     }
 
-    if (dockerfileStage != "release") {
-        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not release"
+    if (!isReleaseStage) {
+        echo "prepareWheelFromBuildStage: ${dockerfileStage} is not a release image stage"
         return ""
     }
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
-    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path " + env.uploadPath
+    // UPLOAD_PATH, not env.uploadPath: they agree whenever the parent passed the
+    // parameter, but an unset env leaves the raw reference interpolating to
+    // "null" and the download then polls .../null/<tarball> until it times out.
+    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path ${UPLOAD_PATH}"
+
+    // Only aarch64 has a promoted profile bundle, so only the SBSA image has
+    // anything to apply; x86 installs the wheel as built.
+    if (BOLT_OPTIMIZE_WHEEL && arch == "sbsa") {
+        // The branch whose promoted bundle to apply, resolved the same way the
+        // image overlay resolves it: an explicit override, else this build's own
+        // branch, else main. Deliberately NOT this run's own profiles -- those
+        // are not published until BoltProfileGen finishes, hours after this
+        // build starts, and waiting on them would serialize every release
+        // behind a multi-hour GPU job. get_wheel_from_package.py tries these in
+        // order and fails if none has a bundle.
+        def branches = [params.boltProfileBranch, LLM_BRANCH, "main"]
+            .collect { it?.toString()?.trim() }
+            .findAll { it }
+            .unique()
+        // Pinned, the candidate list collapses to the branch the pin came from:
+        // the ref names one immutable bundle under one promote directory, so
+        // falling through to another branch would optimize the image's wheel
+        // with different profiles than the release wheel and the tested build.
+        if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+            branches = [BOLT_PINNED_BRANCH]
+            wheelArgs += " --bolt-profile-ref ${BOLT_PINNED_REF}"
+            echo "Release image for ${arch} is pinned to BOLT bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+        }
+        echo "Release image for ${arch} will BOLT-optimize its wheel using profiles from: ${branches.join(', ')}"
+        wheelArgs += " --bolt-branch ${branches.join(',')}"
+    }
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
+}
+
+// Whether a docker build that failed WITH the downloaded-wheel args may be
+// retried without them. The retry rebuilds the wheel from source in-container,
+// which is a fine recovery for an ordinary build but silently defeats the point
+// when that build was also responsible for optimizing the wheel -- the retry
+// would produce an unoptimized release image that looks identical.
+def mayRetryWithoutBuildStageWheel(arch) {
+    return !(BOLT_OPTIMIZE_WHEEL && arch == "sbsa")
 }
 
 // Produce each CANONICAL image from its raw `-noprofiles` build by
@@ -339,10 +434,21 @@ def overlayBoltBundle(pairs, arch, action) {
     //    (manifest + >=1 profile) so "pulled but empty" is not accepted. First hit wins.
     def haveBundle = false
     def branch = null
+    // The overlay is a consumer like any other, so it takes the pipeline's pin
+    // rather than resolving `latest` when it happens to run. Without this the
+    // released image could carry a profile bundle that no other artifact in the
+    // run was built from. Empty means unpinned and pull-latest behaves exactly
+    // as before; pinned, the pin supplies its own branch and the candidate walk
+    // collapses to it, because the ref names one object under one directory.
+    if (BOLT_PINNED_REF && BOLT_PINNED_BRANCH) {
+        candidates = [BOLT_PINNED_BRANCH]
+        echo "[BOLT] overlay pinned to bundle ${BOLT_PINNED_REF} on ${BOLT_PINNED_BRANCH}"
+    }
     for (cand in candidates) {
         for (int attempt = 1; attempt <= 3 && !haveBundle; attempt++) {
             def rc = sh(script: """
                 rm -rf ${ctxDir} && mkdir -p ${ctxDir}/${bundleSub} && \
+                export BOLT_PROFILE_REF='${BOLT_PINNED_REF}' && \
                 cd ${LLM_ROOT} && bash scripts/bolt/internal/artifactory.sh pull-latest ${cand} ${triple} ${ctxDir}/${bundleSub}
             """, returnStatus: true)
             if (rc == 0) {
@@ -567,54 +673,76 @@ def buildImage(config, imageKeyToTag, versionOverride)
                 build_jobs = BUILD_JOBS_RELEASE_SBSA
             }
         }
-        stage ("make ${target}_${action} (${arch})") {
-            sh "env | sort"
-            def randomSleep = (Math.random() * 600 + 600).toInteger()
-            trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            try {
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawImageTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
-            } catch (InterruptedException ex) {
-                throw ex
-            } catch (Exception ex) {
-                if (buildWheelArgs.trim().isEmpty()) {
+        // With buildWheelArgs, the image build takes its wheel from the packaged build, which
+        // jenkins/scripts/fetch_build_artifact.sh reads with this netrc. docker/Makefile
+        // hands the netrc to `docker buildx build` as a BuildKit secret, never a build argument;
+        // it is written outside the build context (${LLM_ROOT}) and removed after the builds below.
+        def wheelNetrcPath = buildWheelArgs.trim() ? "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}" : ""
+        try {
+            if (wheelNetrcPath) {
+                def primary = llmArtifactsPrimary()
+                writeArtifactoryNetrc(wheelNetrcPath)
+                buildWheelArgs += " ARTIFACTORY_NETRC='${wheelNetrcPath}' LLM_ARTIFACTS_PRIMARY=${primary}" +
+                    " ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}"
+            }
+            stage ("make ${target}_${action} (${arch})") {
+                sh "env | sort"
+                def randomSleep = (Math.random() * 600 + 600).toInteger()
+                trtllm_utils.llmExecStepWithRetry(this, script: "docker pull ${TRITON_IMAGE}:${TRITON_BASE_TAG}", sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                try {
+                    trtllm_utils.llmExecStepWithRetry(this, script: """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawImageTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                } catch (InterruptedException ex) {
                     throw ex
+                } catch (Exception ex) {
+                    if (buildWheelArgs.trim().isEmpty()) {
+                        throw ex
+                    }
+                    if (!mayRetryWithoutBuildStageWheel(arch)) {
+                        echo "Build failed with wheel arguments and the BOLT-optimized wheel is required for ${arch}; " +
+                             "NOT retrying from source (that would publish an unoptimized release image)"
+                        throw ex
+                    }
+                    echo "Build failed with wheel arguments, retrying without them"
+                    buildWheelArgs = ""
+                    trtllm_utils.llmExecStepWithRetry(this, script: """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawImageTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
                 }
-                echo "Build failed with wheel arguments, retrying without them"
-                buildWheelArgs = ""
-                trtllm_utils.llmExecStepWithRetry(this, script: """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawImageTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """, sleepInSecs: randomSleep, numRetries: 6, shortCommondRunTimeMax: 7200)
+                if (target == "ngc-release") {
+                    imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+                }
             }
-            if (target == "ngc-release") {
-                imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
-            }
-        }
 
-        if (customTag) {
-            stage ("Custom Tag: ${customTag} (${arch})") {
-                sh """
-                cd ${LLM_ROOT} && make -C docker ${target}_${action} \
-                BASE_IMAGE=${BASE_IMAGE} \
-                TRITON_IMAGE=${TRITON_IMAGE} \
-                TORCH_INSTALL_TYPE=${torchInstallType} \
-                IMAGE_WITH_TAG=${rawCustomTag} \
-                STAGE=${dockerfileStage} \
-                BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
-                """
+            if (customTag) {
+                stage ("Custom Tag: ${customTag} (${arch})") {
+                    sh """
+                    cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
+                    TORCH_INSTALL_TYPE=${torchInstallType} \
+                    IMAGE_WITH_TAG=${rawCustomTag} \
+                    STAGE=${dockerfileStage} \
+                    BUILD_WHEEL_OPTS='-j ${build_jobs}' ${args} ${buildWheelArgs}
+                    """
+                }
+            }
+        } finally {
+            if (wheelNetrcPath) {
+                sh(label: "Remove Artifactory netrc", script: "rm -f '${wheelNetrcPath}'")
             }
         }
 
@@ -645,6 +773,8 @@ def buildImage(config, imageKeyToTag, versionOverride)
 
 def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_PINNED_BRANCH = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
     def defaultBuildConfig = [
         target: "tritondevel",
         action: params.action,
@@ -676,7 +806,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             action: release_action,
             customTag: LLM_BRANCH_TAG + "-x86_64",
             build_wheel: true,
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         (stageNames.internalReleaseSBSA): [
             target: "trtllm",
@@ -684,7 +814,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
             customTag: LLM_BRANCH_TAG + "-sbsa",
             build_wheel: true,
             arch: "arm64",
-            dockerfileStage: "release",
+            dockerfileStage: "tritonrelease",
         ],
         (stageNames.ciImageX86): [:],
         (stageNames.ciImageSBSA): [
@@ -758,7 +888,7 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
         enabledStages += [stageNames.internalReleaseX86, stageNames.internalReleaseSBSA]
     }
     if (buildCiImage) {
-        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312, stageNames.ciImageSBSAUbuntu]
+        enabledStages += [stageNames.ciImageX86, stageNames.ciImageSBSA, stageNames.ciImageSBSAUbuntu, stageNames.ciImageRockyPy310, stageNames.ciImageRockyPy312]
     }
     if (buildNgcRelease) {
         enabledStages += [stageNames.ngcReleaseX86, stageNames.ngcReleaseSBSA]
@@ -859,6 +989,16 @@ pipeline {
             defaultValue: false,
             description: "When boltOverlayEnabled is true, treat a missing/empty BOLT bundle as a FATAL error instead of retagging the plain build as canonical. Enable for the release/nightly path to guarantee canonical images carry profiles."
         )
+        booleanParam(
+            name: "useWheelFromBuildStage",
+            defaultValue: false,
+            description: "Install the build-stage wheel instead of compiling inside the image. The declared job default is false; the nightly release caller explicitly enables this option. SBSA release images with boltOptimizeWheel enabled require the build-stage wheel independently of this flag."
+        )
+        booleanParam(
+            name: "boltOptimizeWheel",
+            defaultValue: false,
+            description: "BOLT-optimize the wheel the SBSA release image installs, applying the branch's latest promoted profile bundle during the image build, and fail if no bundle can be applied. Independent of boltOverlayEnabled, which only bakes the bundle in as a layer and leaves the installed binaries unoptimized. Uses the last promoted bundle rather than this run's, so the image build never waits on BoltProfileGen. Ignored on x86_64, which has no promoted bundle."
+        )
         string(
             name: "boltProfileBranch",
             defaultValue: "",
@@ -875,7 +1015,7 @@ pipeline {
     }
     environment {
         CCACHE_DIR="${CCACHE_DIR}"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // Picked up by docker/Makefile and handed to `docker buildx build` as a
         // BuildKit secret, which authenticates the github.com clones inside the
         // image build (docker/common/github_auth.sh).
@@ -896,6 +1036,10 @@ pipeline {
                     sh "env | sort"
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
+                    if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+                    }
                 }
             }
         }
@@ -927,11 +1071,17 @@ pipeline {
                 script {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
-                            // Install wget
-                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget")
+                            // git for checkoutFile, curl for jenkins/scripts/fetch_build_artifact.sh
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get install -y wget git curl")
+
+                            // The read helper from this run's commit looks for each file on the
+                            // primary location first; it needs a netrc for artifactory.nvidia.com.
+                            def helperDir = "${pwd(tmp: true)}/fetch-build-artifact"
+                            trtllm_utils.checkoutFile(LLM_REPO, LLM_COMMIT_OR_BRANCH, "jenkins/scripts/fetch_build_artifact.sh", helperDir)
+                            def helperPath = "${helperDir}/fetch_build_artifact.sh"
+                            def primary = llmArtifactsPrimary()
 
                             // Poll for build artifacts
-                            def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
                             def requiredFiles = [
                                 "TensorRT-LLM-GH200.tar.gz",
                                 "TensorRT-LLM.tar.gz"
@@ -945,34 +1095,57 @@ pipeline {
                             def startTime = System.currentTimeMillis()
                             def maxWaitMs = maxWaitMinutes * 60 * 1000
 
-                            while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
-                                def missingFiles = []
+                            def netrcPath = "${pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+                            try {
+                                writeArtifactoryNetrc(netrcPath)
+                                withEnv([
+                                    "LLM_ARTIFACTS_PRIMARY=${primary}",
+                                    "ARTIFACTORY_NETRC=${netrcPath}",
+                                    "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+                                ]) {
+                                    while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                                        def missingFiles = []
 
-                                for (file in requiredFiles) {
-                                    def fileUrl = "${artifactBaseUrl}${file}"
-                                    def exitCode = sh(
-                                        script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
-                                        returnStatus: true
-                                    )
+                                        for (file in requiredFiles) {
+                                            // FETCH_ABSENT: not published yet. FETCH_TRANSFER_FAILED: the check
+                                            // failed after the helper's own retries. Both are checked again on
+                                            // the next poll.
+                                            def exitCode = sh(
+                                                script: "bash '${helperPath}' --exists '${UPLOAD_PATH}/${file}' > /dev/null",
+                                                returnStatus: true
+                                            )
 
-                                    if (exitCode != 0) {
-                                        missingFiles.add(file)
+                                            if (exitCode == FETCH_REJECTED) {
+                                                // The helper has printed which request was rejected and why.
+                                                error(primary == "aws" ?
+                                                    "Credential '${LLM_ARTIFACTS_CREDENTIALS_ID}' was rejected while checking for ${file}: its Artifactory access token needs renewal or lacks read permission on sw-tensorrt-llm-generic-local" :
+                                                    "urm rejected the anonymous request while checking for ${file}")
+                                            }
+                                            if (!(exitCode in [0, FETCH_ABSENT, FETCH_TRANSFER_FAILED])) {
+                                                error "fetch_build_artifact.sh exited with ${exitCode} while checking for ${file}"
+                                            }
+                                            if (exitCode != 0) {
+                                                missingFiles.add(file)
+                                            }
+                                        }
+
+                                        if (missingFiles.isEmpty()) {
+                                            echo "All build artifacts are ready!"
+                                            return
+                                        }
+
+                                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                        echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                                        echo "Missing files: ${missingFiles}"
+                                        sleep(pollIntervalSeconds)
                                     }
-                                }
 
-                                if (missingFiles.isEmpty()) {
-                                    echo "All build artifacts are ready!"
-                                    return
+                                    def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                    error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                                 }
-
-                                def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                                echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
-                                echo "Missing files: ${missingFiles}"
-                                sleep(pollIntervalSeconds)
+                            } finally {
+                                sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}'")
                             }
-
-                            def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                            error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                         }
                     }
                 }
@@ -988,6 +1161,7 @@ pipeline {
                 script {
                     catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                        globalVars[LLM_ARTIFACTS_PRIMARY_KEY] = llmArtifactsPrimary()
                         String globalVarsJson = writeJSON returnText: true, json: globalVars
                         def parameters = getCommonParameters()
                         parameters += [
@@ -1017,7 +1191,7 @@ pipeline {
         stage("Register NGC Image For Security Check") {
             when {
                 expression {
-                    return params.nspect_id && params.action == "push"
+                    return params.nspect_id && params.action == "push" && params.register_images
                 }
             }
             steps {
@@ -1026,15 +1200,11 @@ pipeline {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install 'requests>=2.32.4,<3'")
-                            def nspect_commit = "5dcee25cfa2c55249ce390a9f78e1b5dac42fa44"
-                            def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
-                            if (override_commit) {
-                                echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
-                            nspect_commit = override_commit
+                            def releaseRepo = globalVars[TRTLLM_RELEASE_REPO]
+                            if (!releaseRepo?.url || !releaseRepo?.commit) {
+                                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
                             }
-                            withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
-                                trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
-                            }
+                            trtllm_utils.checkoutSource(releaseRepo.url, releaseRepo.commit, "nspect")
                             def nspect_env = params.nspect_env ? params.nspect_env : "prod"
                             def nspectReleaseVersion = params.program_version_name ?: "PostMerge"
                             def cmd = """./nspect/nspect.py \
@@ -1042,29 +1212,30 @@ pipeline {
                                 --nspect_id ${params.nspect_id} \
                                 --program_version_name '${nspectReleaseVersion}' \
                                 """
-                            if (params.register_images) {
-                                cmd += "--add_version "
-                                if (params.release_type_id) {
-                                    cmd += "--release_type_id ${params.release_type_id} "
-                                }
-                            }
-                            if (params.osrb_ticket) {
-                                cmd += "--osrb_ticket ${params.osrb_ticket} "
-                            }
+                            def imageArgs = "--image " + imageKeyToTag.values().join(" ")
+                            def registrationCmd = cmd + "--add_version " +
+                                "--release_type_id ${params.release_type_id ?: 1} "
                             if (params.export_compliance_bug) {
-                                cmd += "--export_compliance_bug '${params.export_compliance_bug}' "
+                                registrationCmd += "--export_compliance_bug '${params.export_compliance_bug}' "
                             }
-                            if (params.wait_success_seconds) {
-                                cmd += "--check_launch_api "
-                                cmd += "--wait_success ${params.wait_success_seconds} "
-                            }
-                            cmd += "--image "
-                            cmd += imageKeyToTag.values().join(" ")
+                            registrationCmd += "--check_launch_api --criteria container-registration --wait_success 180 " + imageArgs
                             withCredentials([
                                 usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET'),
                                 usernamePassword(credentialsId: "aws-artifactory-credentials", usernameVariable: 'ARTIFACTORY_USERNAME', passwordVariable: 'ARTIFACTORY_PASSWORD')
                             ]) {
-                                trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                                catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE', catchInterruptions: false) {
+                                    retry(3) {
+                                        sh(label: 'Register images to nSpect', script: registrationCmd)
+                                        if (params.osrb_ticket) {
+                                            sh(label: 'Associate images with OSRB in nSpect',
+                                                script: cmd + "--osrb_ticket ${params.osrb_ticket} " + imageArgs)
+                                        }
+                                    }
+                                }
+                                if (params.wait_success_seconds) {
+                                    def launchCheckCmd = cmd + "--check_launch_api --wait_success ${params.wait_success_seconds} " + imageArgs
+                                    trtllm_utils.llmExecStepWithRetry(this, script: launchCheckCmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                                }
                             }
                         }
                     }

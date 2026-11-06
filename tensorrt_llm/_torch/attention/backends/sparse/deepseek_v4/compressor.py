@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
@@ -13,6 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+from ..mixed_precision_high_rows import store_mixed_precision_high_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -44,6 +46,7 @@ class KVCacheDtype(IntEnum):
     FP8_PERTENSOR = 1  # FP8 E4M3 with implicit scale=1
     FP8_BLOCKWISE = 2  # FP8 E4M3 with per-128 fp32 scales
     MXFP4_BLOCKWISE = 3  # packed FP4 E2M1 with per-32 UE8M0 scales
+    NVFP4_BLOCKWISE = 4  # packed FP4 E2M1 with per-16 E4M3 scales
 
 
 _KV_CACHE_DTYPE_MAP = {
@@ -52,7 +55,17 @@ _KV_CACHE_DTYPE_MAP = {
     "fp8_pertensor": KVCacheDtype.FP8_PERTENSOR,
     "fp8_blockwise": KVCacheDtype.FP8_BLOCKWISE,
     "mxfp4": KVCacheDtype.MXFP4_BLOCKWISE,
+    "nvfp4": KVCacheDtype.NVFP4_BLOCKWISE,
 }
+
+NVFP4_COMPRESS_RESIDUAL_DIM = 64
+
+
+def get_nvfp4_compress_residual_dim() -> int:
+    """Resolve the NVFP4 COMPRESS layout from the MLA residual startup switch."""
+    if os.environ.get("TRTLLM_NVFP4_MLA_RESIDUAL_QUANTIZATION", "1") == "1":
+        return NVFP4_COMPRESS_RESIDUAL_DIM
+    return 0
 
 
 def resolve_kv_cache_dtype(kv_cache_dtype: Union[str, KVCacheDtype]) -> KVCacheDtype:
@@ -74,6 +87,7 @@ class Compressor(nn.Module):
         dtype: Data type for computation
         kv_cache_dtype: Cache preset string or KVCacheDtype.
         rotate_activation: Whether to apply Hadamard transform in postprocessing (False to skip)
+        nvfp4_global_scale: Second-level scale used for NVFP4 cache quantization.
     """
 
     def __init__(
@@ -88,6 +102,7 @@ class Compressor(nn.Module):
         kv_cache_dtype: Union[str, KVCacheDtype] = KVCacheDtype.NONE,
         is_indexer: bool = False,
         rotate_activation: bool = False,
+        nvfp4_global_scale: float = 1.0,
     ):
         super().__init__()
         # Dimensions
@@ -104,6 +119,18 @@ class Compressor(nn.Module):
         # Cache config
         self.layer_idx = layer_idx
         self.kv_cache_dtype: KVCacheDtype = resolve_kv_cache_dtype(kv_cache_dtype)
+        self.nvfp4_residual_dim = (
+            self.rope_head_dim
+            if self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE
+            and get_nvfp4_compress_residual_dim() > 0
+            else 0
+        )
+        if self.nvfp4_residual_dim != 0 and self.nvfp4_residual_dim != NVFP4_COMPRESS_RESIDUAL_DIM:
+            raise ValueError(
+                "DeepSeek-V4 NVFP4 COMPRESS residual quantization requires "
+                f"rope_head_dim={NVFP4_COMPRESS_RESIDUAL_DIM}, got {self.rope_head_dim}."
+            )
+        self.nvfp4_global_scale = nvfp4_global_scale
         self.is_indexer = is_indexer
         self.rotate_activation = rotate_activation
         # The C++ scatter does not write FlashInfer's footer-scale layout.
@@ -166,6 +193,11 @@ class Compressor(nn.Module):
 
         # Get cache buffers
         kv_cache = metadata.kv_cache_manager.get_buffers(self.layer_idx, compress_type)
+        kv_cache_scale = (
+            metadata.kv_cache_manager.get_compress_scale_buffers(self.layer_idx)
+            if not self.is_indexer and self.kv_cache_dtype == KVCacheDtype.NVFP4_BLOCKWISE
+            else None
+        )
         paged_kv_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_type)
         paged_score_state = metadata.kv_cache_manager.get_buffers(self.layer_idx, score_type)
 
@@ -222,7 +254,12 @@ class Compressor(nn.Module):
 
         if num_generations > 0:
             gen_kv_lens = kv_lens[num_contexts:]
+            # Uniform batches: every request appended next_n tokens. Ragged
+            # batches: next_n is only the batch maximum (the kernel's loop
+            # bound) and the real per-request counts come through
+            # new_tokens_per_seq.
             next_n = metadata.num_gen_tokens_per_seq
+            new_tokens_per_seq = metadata.gen_new_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
             torch.ops.trtllm.compressor_paged_kv_compress(
@@ -241,6 +278,7 @@ class Compressor(nn.Module):
                 self.head_dim,
                 self.compress_ratio,
                 next_n,
+                new_tokens_per_seq,
             )
 
         # Scatter to cache with appropriate quantization (all modes fused)
@@ -300,6 +338,7 @@ class Compressor(nn.Module):
             self.nope_head_dim,
             self.rope_head_dim,
             kv_cache,
+            kv_cache_scale,
             num_comp_tokens,
             cu_new_comp_kv,
             start_pos,
@@ -307,11 +346,26 @@ class Compressor(nn.Module):
             compressed_mask,
             compress_tokens_per_block,
             int(self.kv_cache_dtype),
+            self.nvfp4_global_scale,
+            self.nvfp4_residual_dim,
             self.rotate_activation,
             quant_output,
             scale_output,
         )
 
+        # Write the mixed-precision high layer with the same scatter.
+        if not self.is_indexer and metadata.has_mixed_precision_high_rows:
+            store_mixed_precision_high_compressed_rows(
+                self,
+                metadata,
+                kv_comp,
+                position_ids,
+                num_comp_tokens,
+                cu_new_comp_kv,
+                start_pos,
+                compressed_mask,
+                bsz,
+            )
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
                 return quant_output.view(torch.float4_e2m1fn_x2), scale_output

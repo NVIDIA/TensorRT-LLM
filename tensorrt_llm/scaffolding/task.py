@@ -445,10 +445,13 @@ class DropKVCacheTask(Task):
         self.messages_to_retain = []
         self.chat_task = chat_task
 
-        self.messages_to_retain = [
-            message for message in chat_task.messages
-            if message.role in ("system", "user")
-        ]
+        # Only the leading system prompt is reusable across agent tasks.
+        # The engine uses its token count as a prefix boundary, so do not
+        # collect system messages occurring after task-specific context.
+        for message in chat_task.messages:
+            if message.role != "system":
+                break
+            self.messages_to_retain.append(message)
 
 
 @dataclass

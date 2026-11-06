@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -207,8 +207,8 @@ void saveNpy(BufferManager const& manager, ITensor const& tensor, std::string co
     {
         TLLM_CHECK(where == MemoryType::kGPU);
         auto tensorFp32 = manager.gpu(shape, tensorrt_llm::DataType::kFLOAT);
-        auto dataFp32 = bufferCast<float>(*tensorFp32);
-        auto dataBf16 = bufferCast<__nv_bfloat16 const>(tensor);
+        auto dataFp32 = tensorFp32->getBufferPtr<float>();
+        auto dataBf16 = tensor.getBufferPtr<__nv_bfloat16 const>();
         tc::invokeCudaD2DcpyConvert(dataFp32, dataBf16, tensorSize);
         saveNpy(manager, *tensorFp32, filename);
         return;

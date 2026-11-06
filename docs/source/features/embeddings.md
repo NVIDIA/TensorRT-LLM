@@ -163,3 +163,125 @@ The server reuses the existing Python `llm.encode()` API
 (`LLM(..., encode_only=True)`) under the hood; the only addition is the async
 coalescing layer plus the HTTP surface. The synchronous `llm.encode()` API continues
 to work unchanged for direct Python callers.
+
+## Encoder CUDA graphs
+
+Encoder CUDA graphs capture the encoder forward pass once per input shape at startup
+and replay it for each batch, removing the per-kernel launch overhead of eager
+execution. The gain is largest for small encoders and small batches, where launching
+kernels, not running them, dominates the latency.
+
+Enable them with an `EncodeCudaGraphConfig` on an `encode_only=True` LLM:
+
+```python
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+
+llm = LLM(
+    model="<model>",
+    encode_only=True,
+    cuda_graph_config=EncodeCudaGraphConfig(
+        batch_sizes=[1, 2, 4, 8],
+        num_tokens=[128, 256, 512, 1024],
+        seq_lens=[64, 128],
+        enable_padding=True,
+    ),
+)
+outputs = llm.encode(["hello world", "foo bar"])
+```
+
+For `trtllm-serve embeddings`, put the same settings in the `--config` YAML:
+
+```yaml
+cuda_graph_config:
+  batch_sizes: [1, 2, 4, 8]
+  num_tokens: [128, 256, 512, 1024]
+  seq_lens: [64, 128]
+  enable_padding: true
+```
+
+| Field | Meaning |
+|---|---|
+| `batch_sizes` | Number of requests per batch to capture graphs for. |
+| `num_tokens` | Total token counts per batch (all requests' tokens, packed) to capture graphs for. |
+| `seq_lens` | Longest-request lengths to capture graphs for. |
+| `enable_padding` | Round each batch up to the nearest captured shape. Recommended; without it only exact matches use a graph. |
+| `max_num_token` / `max_seq_len` | Alternative to listing `num_tokens` / `seq_lens`: the buckets are generated up to this value. |
+
+A graph is captured at startup for every feasible combination of these buckets. At
+runtime a batch uses the graph for its (batch size, total tokens, longest request)
+shape, after rounding up if `enable_padding` is set. A batch with no matching graph,
+such as one larger than the largest bucket, runs eagerly: the result is the same, just
+not accelerated. More buckets cover more traffic at the cost of startup time and graph
+memory.
+
+Encoder CUDA graphs require the `TRTLLM` attention backend; with other backends every
+batch runs eagerly. Multi-item scoring batches also run eagerly. For encoder-decoder
+models, see `encoder_cuda_graph_config` in
+[Use encoder-decoder models with the PyTorch backend](../models/encoder-decoder.md).
+
+### Extra model inputs
+
+`llm.encode()` passes extra keyword arguments through to the model's `forward()`, for
+example `token_type_ids` for BERT. With encoder CUDA graphs, declare each tensor
+argument in `extra_model_inputs` so the graph is captured with it:
+
+```python
+import torch
+from transformers import AutoTokenizer
+
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
+
+llm = LLM(
+    model="<bert_model>",
+    encode_only=True,
+    cuda_graph_config=EncodeCudaGraphConfig(
+        batch_sizes=[1, 2, 4, 8],
+        num_tokens=[128, 256, 512, 1024],
+        seq_lens=[64, 128],
+        enable_padding=True,
+        extra_model_inputs=[
+            EncodeExtraInputSpec(name="token_type_ids", shape=("num_tokens",), dtype="int32"),
+        ],
+    ),
+)
+
+# Sentence pairs: the tokenizer marks the second sentence of each pair as segment 1.
+pairs = [("What is TensorRT-LLM?", "An inference library."),
+         ("Is it fast?", "Yes.")]
+tokenizer = AutoTokenizer.from_pretrained("<bert_model>")
+encoded = tokenizer([q for q, _ in pairs], [a for _, a in pairs])
+
+prompts = [{"prompt_token_ids": ids} for ids in encoded["input_ids"]]
+# Packed: every prompt's values concatenated in prompt order, no padding.
+token_type_ids = torch.tensor(
+    [t for row in encoded["token_type_ids"] for t in row], dtype=torch.int32)
+
+outputs = llm.encode(prompts, token_type_ids=token_type_ids)
+```
+
+Each `EncodeExtraInputSpec` has a `name` (the `forward()` argument), a `dtype`, and a
+`shape` with exactly one symbolic dimension; the other dimensions are fixed integers:
+
+| Symbolic dimension | Size at call time | Example |
+|---|---|---|
+| `"num_tokens"` | Total tokens in the batch, packed in prompt order | `token_type_ids`: `shape=("num_tokens",)` |
+| `"batch_size"` | Number of prompts, one row each | per-request features: `shape=("batch_size", 40)` |
+
+Rules:
+
+- Every tensor argument passed to `llm.encode()` must be declared; an undeclared tensor
+  raises `ValueError`. A non-tensor argument is allowed but runs that call eagerly.
+- Every declared input must be passed on every call, with the declared dtype and shape.
+  To omit one, pass zeros.
+- These checks apply only to calls that can use a graph. Multi-item scoring batches
+  and non-`TRTLLM` attention backends always run eagerly, so their arguments pass
+  through unchecked.
+- Pass tensors where they already live, on the host or on the device.
+- `input_ids`, `position_ids`, `seq_lens`, `multi_item_part_lens`, `attn_metadata` and
+  `return_context_logits` are managed by the runtime and cannot be declared.
+- Extra model inputs are available through the Python `llm.encode()` API only.
+  `trtllm-serve embeddings` does not support them yet and rejects a `--config` that
+  declares `extra_model_inputs` at startup. They are also not supported for
+  encoder-decoder models or encoders that take fixed-shape feature tensors.

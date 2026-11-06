@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -12,9 +12,9 @@ from tensorrt_llm._torch.attention.backends.fmha import (
 from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import CuteDslMlaFmha
 from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
     FlashInferTrtllmGenFmha,
-    _get_multi_ctas_kv_counter_size,
 )
 from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     AttentionInputType,
@@ -102,13 +102,13 @@ def test_multi_ctas_kv_counter_size_covers_beam_expanded_batch() -> None:
     # product clears the multi-processor floor, so pick a case that does.
     num_heads, batch, beam, sm_count = 6, 16, 2, 148
     needed = num_heads * batch * beam * torch.int32.itemsize
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) < needed
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch * beam, sm_count) >= needed
+    assert get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) < needed
+    assert get_multi_ctas_kv_counter_size(num_heads, batch * beam, sm_count) >= needed
 
 
 def test_multi_ctas_kv_counter_size_keeps_multi_processor_floor() -> None:
     num_heads, batch, sm_count = 6, 1, 148
-    assert _get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) >= (
+    assert get_multi_ctas_kv_counter_size(num_heads, batch, sm_count) >= (
         sm_count * torch.int32.itemsize
     )
 
@@ -133,7 +133,7 @@ def test_prepare_workspace_sizes_counter_for_max_num_sequences(
 
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen."
-        "_get_multi_ctas_kv_counter_size",
+        "get_multi_ctas_kv_counter_size",
         check_counter_size_args,
     )
 
@@ -231,7 +231,7 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         fwd=forward_args,
         workspace=torch.empty(0, dtype=torch.uint8),
         qkv_input=torch.empty((batch_size, 2, 4)),
-        context_buf=output,
+        output=output,
         sequence_lengths=torch.ones(batch_size, dtype=torch.int32),
         input_seq_length=1,
         num_tokens=batch_size,
@@ -251,6 +251,10 @@ def test_flashinfer_generation_uses_phase_batch_size_for_padded_cross_batch(
         _use_fp8_context_fmha=lambda _output, _input_type: False,
         _get_multi_ctas_kv_counter_buffer=lambda: None,
     )
+    fmha._run_generation_preprocess = MethodType(
+        FlashInferTrtllmGenFmha._run_generation_preprocess, fmha
+    )
+    fmha._run_generation_decode = MethodType(FlashInferTrtllmGenFmha._run_generation_decode, fmha)
 
     FlashInferTrtllmGenFmha.run_generation(fmha, params)
 
@@ -287,6 +291,10 @@ def _cute_dsl_mla_helix_support(
         is_spec_dec_tree=False,
         is_spec_dec_dynamic_tree=False,
         helix_position_offsets=torch.zeros(batch_size, dtype=torch.int32),
+        # Multi-token decode under helix is admitted only when the speculative
+        # verify-group buffers are armed; unarmed is what this contract test
+        # exercises.
+        _helix_spec_tokens_valid=False,
         kv_cache_manager=SimpleNamespace(
             get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
         ),
@@ -310,6 +318,43 @@ def _cute_dsl_mla_helix_support(
     )
     fmha = object.__new__(CuteDslMlaFmha)
     return fmha._is_supported_with_reason(q, attn, metadata, forward_args)
+
+
+def test_cute_dsl_mla_rejects_h96_mixed_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The generation slice of a mixed H96 batch must decline CuTe DSL."""
+    q = torch.empty((1, 96 * 576), dtype=torch.bfloat16)
+    attn = SimpleNamespace(
+        num_heads=96,
+        has_fp8_kv_cache=False,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_idx=0,
+    )
+    metadata = SimpleNamespace(
+        num_contexts=1,
+        num_generations=1,
+        beam_width=1,
+        helix_position_offsets=None,
+        tokens_per_block=64,
+        kv_cache_manager=SimpleNamespace(
+            get_buffers=lambda _layer_idx: torch.empty(0, dtype=torch.bfloat16)
+        ),
+    )
+    forward_args = AttentionForwardArgs(
+        output=torch.empty((1, 96 * 512), dtype=torch.bfloat16),
+        attention_input_type=AttentionInputType.generation_only,
+    )
+    monkeypatch.setattr(
+        AutoTuner, "get", classmethod(lambda _cls: SimpleNamespace(is_tuning_mode=False))
+    )
+    monkeypatch.setattr(
+        CuteDslMlaFmha, "_kernel_can_implement", staticmethod(lambda *_args: (True, ""))
+    )
+    fmha = object.__new__(CuteDslMlaFmha)
+    supported, reason = fmha._is_supported_with_reason(q, attn, metadata, forward_args)
+
+    assert not supported
+    assert reason == "CuTe DSL MLA FMHA only supports decode-only batches."
 
 
 def test_cute_dsl_mla_accepts_single_token_helix(
@@ -362,6 +407,7 @@ def test_mla_generation_declines_slower_trtllm_gen_decode_kernel() -> None:
     # backend must decline and let selection fall through.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=32,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
@@ -379,7 +425,38 @@ def test_mla_generation_gate_is_scoped_to_one_page_size(tokens_per_block: int) -
     # served by this backend. Real configs run tokens_per_block=64.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=576,
+        num_heads=128,
         tokens_per_block=tokens_per_block,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert supported, reason
+    assert reason == ""
+
+
+@pytest.mark.parametrize("tokens_per_block", [32, 64])
+@pytest.mark.parametrize("num_heads", [80, 96])
+def test_mla_generation_declines_unsupported_head_range_for_flashinfer_trtllm_gen(
+    tokens_per_block: int,
+    num_heads: int,
+) -> None:
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        num_heads=num_heads,
+        tokens_per_block=tokens_per_block,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert not supported
+    assert f"num_heads={num_heads}" in reason
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_mla_generation_allows_head_range_boundaries(num_heads: int) -> None:
+    supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
+        head_size=576,
+        num_heads=num_heads,
+        tokens_per_block=64,
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
@@ -391,6 +468,7 @@ def test_mla_generation_allows_other_supported_head_dims() -> None:
     # (320, 256) is unaffected at every page size.
     supported, reason = FlashInferTrtllmGenFmha._check_mla_generation_support(
         head_size=320,
+        num_heads=128,
         tokens_per_block=32,
         kv_lora_rank=256,
         qk_rope_head_dim=64,

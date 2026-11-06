@@ -20,8 +20,10 @@ import asyncio
 import base64
 import json
 import os
+import tempfile
 import threading
 import time
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
@@ -671,6 +673,92 @@ def test_response_format_path_rejected_when_disabled(tmp_path, monkeypatch, endp
     body = resp.json()
     _assert_llm_envelope(body, code=400)
     assert "path" in body["message"] and "disabled" in body["message"]
+
+
+def test_the_default_media_storage_path_is_timestamped(tmp_path, monkeypatch):
+    """Without ``TRTLLM_MEDIA_STORAGE_PATH`` each server gets its own
+    timestamped directory under the working directory, so servers running side
+    by side do not write their media into a shared one."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    # The default is relative to the working directory, so move off the
+    # checkout rather than leaving a directory in it on every run.
+    monkeypatch.chdir(tmp_path)
+    with patch(
+        "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+        return_value=True,
+    ):
+        server = OpenAIServer(
+            generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+            model="test-model",
+            tool_parser=None,
+            server_role=ServerRole.VISUAL_GEN,
+            metadata_server_cfg=None,
+        )
+
+    assert server.media_storage_path.parent == Path.cwd() / "trtllm_generated"
+    # Raises if the directory name is not a yymmdd-hhmmss stamp.
+    datetime.strptime(server.media_storage_path.name, "%y%m%d-%H%M%S")
+
+
+def test_a_server_starts_from_a_working_directory_it_cannot_write_to(tmp_path, monkeypatch):
+    """Some deployments start the server from a read-only directory. Media has
+    to land somewhere else rather than the server failing to come up, since the
+    caller may never ask for any."""
+    from tensorrt_llm.llmapi.disagg_utils import ServerRole
+    from tensorrt_llm.serve.openai_server import OpenAIServer
+
+    if os.geteuid() == 0:
+        # root writes through the mode bits, so the directory this test needs
+        # cannot exist.
+        pytest.skip("cannot make a directory unwritable for root")
+
+    monkeypatch.delenv("TRTLLM_MEDIA_STORAGE_PATH", raising=False)
+    # The fallback creates a real directory, so point it inside tmp_path for
+    # pytest to remove. Setting TMPDIR would not reach it: tempfile caches the
+    # directory on first use, and this process has already used it.
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    read_only = tmp_path / "read_only"
+    read_only.mkdir()
+    read_only.chmod(0o555)
+    monkeypatch.chdir(read_only)
+    try:
+        with patch(
+            "tensorrt_llm.serve.openai_server._is_visual_gen_instance",
+            return_value=True,
+        ):
+            server = OpenAIServer(
+                generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+                model="test-model",
+                tool_parser=None,
+                server_role=ServerRole.VISUAL_GEN,
+                metadata_server_cfg=None,
+            )
+        resolved = server.media_storage_path
+    finally:
+        read_only.chmod(0o755)
+
+    assert resolved.is_dir()
+    assert resolved.parent == Path(tempfile.gettempdir())
+    assert resolved.name.startswith("trtllm_generated-")
+    assert list(read_only.iterdir()) == []
+
+
+def test_servers_starting_in_the_same_second_get_separate_directories(tmp_path):
+    """The stamp has one-second resolution, so two servers that start together
+    would otherwise share a directory and interleave their media."""
+    from tensorrt_llm.serve.openai_server import _new_media_dir
+
+    with patch("tensorrt_llm.serve.openai_server.datetime") as clock:
+        clock.now.return_value = datetime(2026, 9, 15, 7, 12, 38)
+        first = _new_media_dir(tmp_path)
+        second = _new_media_dir(tmp_path)
+
+    assert first.name == "260915-071238"
+    assert second.name == "260915-071238-2"
+    assert first.is_dir() and second.is_dir()
 
 
 # =========================================================================
@@ -1952,6 +2040,70 @@ class TestVideoGenerationAsync:
         assert observed == "postprocessing", (
             f"GET never observed 'postprocessing' (saw {observed!r})"
         )
+
+    @pytest.mark.threadleak(enabled=False)  # offloaded encode uses a worker thread
+    @pytest.mark.asyncio
+    async def test_delete_during_encode_leaves_no_output_behind(
+        self, async_video_client, tmp_path, monkeypatch
+    ):
+        """DELETE issued mid-encode leaves nothing on disk.
+
+        Cancelling the task does not stop a callable the executor has already
+        started, so the delete has to outwait it: ``output_paths`` is still
+        unset at that point and the route's cleanup would find nothing.
+        """
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        wrote = threading.Event()
+        original_save = VisualGenOutput.save
+
+        def _blocking_save(self, *args, **kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            try:
+                return original_save(self, *args, **kwargs)
+            finally:
+                wrote.set()
+
+        seen = []
+        original_upsert = VIDEO_STORE.upsert
+
+        async def _spy_upsert(video_id, job):
+            seen.append(job.status)
+            return await original_upsert(video_id, job)
+
+        monkeypatch.setattr(VisualGenOutput, "save", _blocking_save)
+        monkeypatch.setattr(VIDEO_STORE, "upsert", _spy_upsert)
+
+        resp = await async_video_client.post(
+            "/v1/videos",
+            json={
+                "prompt": "delete during encode",
+                "size": "32x32",
+                "seconds": 1.0,
+                "fps": 8,
+                "format": "auto",
+            },
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 202
+        video_id = resp.json()["id"]
+
+        # The thread has to be inside the save already: a cancel that lands
+        # before the executor picks the callable up writes nothing at all, and
+        # the closing assertion would then hold without the cleanup running.
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        deleting = asyncio.ensure_future(async_video_client.delete(f"/v1/videos/{video_id}"))
+        await asyncio.sleep(0.05)  # let DELETE reach the cancel while the save is held
+        release.set()
+        assert (await deleting).status_code == 200
+
+        assert await asyncio.to_thread(wrote.wait, 5)
+        assert "completed" not in seen  # the delete cancelled the encode
+        assert list(tmp_path.glob(f"{video_id}*")) == []
 
     def test_async_video_multipart(self, video_client, tmp_path):
         """Multipart async request with a real ``image_reference`` file."""
@@ -3299,3 +3451,166 @@ class TestTensorOnlyFormatRule:
         specs = self._specs(action_mode=True)
         with pytest.raises(ValueError, match="action_mode"):
             _resolve_tensor_only_format("mp4", {"action_mode": "policy"}, specs)
+
+
+@pytest.fixture
+def omni_references():
+    """Real media containers to exercise resolution of every input modality."""
+    import wave
+
+    audio = BytesIO()
+    with wave.open(audio, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x00\x00" * 160)
+    return {
+        "image_reference": ("ref.png", base64.b64decode(_b64_white_png_1x1()), "image/png"),
+        "video_reference": ("ref.mp4", _V2V_FIXTURE_MP4.read_bytes(), "video/mp4"),
+        "audio_reference": ("ref.wav", audio.getvalue(), "audio/wav"),
+    }
+
+
+@pytest.fixture(params=["minimax-h3-ref2va", "generic-omni"])
+def omni_generator(request):
+    """Use H3's actual Ref2VA contract, plus an independently declared model."""
+    from tensorrt_llm._torch.visual_gen.pipeline import RefSlotSpec, RoleSpec
+
+    if request.param == "minimax-h3-ref2va":
+        from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (
+            MiniMaxH3Pipeline,
+        )
+
+        pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
+        pipeline.workflow = "ref2va"
+        slots = pipeline.ref_slot_specs
+        extras = pipeline.extra_param_specs
+    else:
+        slots = {
+            f"{kind}_reference": RefSlotSpec(
+                modality=kind, roles=[RoleSpec(role="reference", min=0, max=2)]
+            )
+            for kind in ("image", "video", "audio")
+        }
+        extras = None
+    return MockVisualGen(
+        video_output=_make_dummy_video_tensor(),
+        ref_slot_specs=slots,
+        extra_param_specs=extras,
+        model=request.param,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+@pytest.mark.parametrize(
+    "transport", ["json", "multipart", "multipart_repeated", "multipart_mixed"]
+)
+async def test_video_omni_inputs(endpoint, transport, omni_generator, omni_references):
+    """Prompt and all three media slots survive both routes and transports."""
+    prompt = "Animate the subject using the reference motion and sound."
+    body = {"prompt": prompt}
+    expected = {field: [media[1]] for field, media in omni_references.items()}
+    objects = {
+        field: {"content": base64.b64encode(media[1]).decode(), "format": "base64"}
+        for field, media in omni_references.items()
+    }
+    if transport == "json":
+        body.update(objects)
+        kwargs = {"json": body}
+    else:
+        files = list(omni_references.items())
+        if transport == "multipart_repeated":
+            files += list(omni_references.items())
+            for field, media in omni_references.items():
+                expected[field].append(media[1])
+        if transport == "multipart_mixed":
+            # A repeated field can mix uploads and JSON lists without losing
+            # earlier parts. Distinct image bytes also expose ordering bugs.
+            image = BytesIO()
+            Image.new("RGB", (2, 2), (0, 0, 0)).save(image, format="PNG")
+            objects["image_reference"]["content"] = base64.b64encode(image.getvalue()).decode()
+            for field, obj in objects.items():
+                files.append((field, (None, json.dumps([obj]), "application/json")))
+                expected[field].append(base64.b64decode(obj["content"]))
+        kwargs = {"data": body, "files": files}
+    if omni_generator._model == "minimax-h3-ref2va":
+        order = ["audio:0", "video:0", "image:0"]
+        if transport in ("multipart_mixed", "multipart_repeated"):
+            order += ["image:1", "audio:1", "video:1"]
+        extra_params = {"reference_order": order}
+        body["extra_params"] = extra_params if transport == "json" else json.dumps(extra_params)
+    if endpoint == "/v1/videos/sync":
+        # FileResponse uses AnyIO threads; this client closes its request portal
+        # and joins those threads before the call-phase leak check runs.
+        client = _create_server(omni_generator, model_name=omni_generator._model)
+        try:
+            resp = client.post(endpoint, **kwargs)
+            assert resp.status_code == 200, resp.text
+        finally:
+            client.close()
+    else:
+        async with _create_async_client(omni_generator, model_name=omni_generator._model) as client:
+            resp = await client.post(endpoint, **kwargs)
+            assert resp.status_code == 202, resp.text
+            assert await _adrive_job_to_completion(client, resp.json()["id"]) == "completed"
+    assert omni_generator.last_inputs == prompt
+    assert omni_generator.last_ref_bytes == expected
+    if omni_generator._model == "minimax-h3-ref2va":
+        assert omni_generator.last_params.extra_params["reference_order"] == order
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["image_reference", "video_reference", "audio_reference"])
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+async def test_video_omni_repeated_upload_limits(
+    field, endpoint, omni_generator, omni_references, monkeypatch
+):
+    """Reject excessive counts before materializing any reference payload."""
+
+    def reject_materialization(_ref):
+        pytest.fail("An over-limit request must not read reference payloads")
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.visual_gen_utils._reference_transport", reject_materialization
+    )
+    limit = omni_generator.executor.ref_slot_specs[field].roles[0].max
+    files = list(omni_references.items()) + [(field, omni_references[field])] * limit
+    async with _create_async_client(omni_generator) as client:
+        resp = await client.post(endpoint, data={"prompt": "All modalities"}, files=files)
+    assert resp.status_code == 400, resp.text
+    assert field in resp.json()["message"]
+    assert omni_generator.last_inputs is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["/v1/videos/sync", "/v1/videos"])
+async def test_video_omni_unsupported_audio(endpoint, omni_references, monkeypatch):
+    def reject_materialization(_ref):
+        pytest.fail("An unsupported slot must be rejected before reading any reference payload")
+
+    monkeypatch.setattr(
+        "tensorrt_llm.serve.visual_gen_utils._reference_transport", reject_materialization
+    )
+    generator = MockVisualGen(video_output=_make_dummy_video_tensor())
+    async with _create_async_client(generator) as client:
+        resp = await client.post(
+            endpoint, data={"prompt": "All modalities"}, files=list(omni_references.items())
+        )
+    assert resp.status_code == 400, resp.text
+    assert "audio_reference" in resp.json()["message"]
+    assert generator.last_inputs is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value,status", [("[null]", 422), ("not-json", 400)])
+@pytest.mark.parametrize("repeat", [False, True])
+async def test_video_omni_invalid_reference_part(value, status, repeat, omni_references):
+    generator = MockVisualGen(video_output=_make_dummy_video_tensor())
+    files = [("image_reference", (None, value, "application/json"))]
+    if repeat:
+        files.append(("image_reference", omni_references["image_reference"]))
+    async with _create_async_client(generator) as client:
+        resp = await client.post("/v1/videos", data={"prompt": "Invalid reference"}, files=files)
+    assert resp.status_code == status, resp.text
+    assert generator.last_inputs is None

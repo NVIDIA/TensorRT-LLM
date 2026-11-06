@@ -13,16 +13,10 @@ Models:
 Run:
     pytest tests/unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py -v -s -k 1_3b
     pytest tests/unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py -v -s -k 14b
-
-Override checkpoint paths:
-    DIFFUSION_MODEL_PATH_WAN21_1_3B=/path/to/1.3b \\
-    DIFFUSION_MODEL_PATH_WAN21_14B=/path/to/14b \\
-        pytest tests/unittest/_torch/visual_gen/test_wan21_t2v_pipeline.py -v -s
 """
 
 import gc
 import os
-from pathlib import Path
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
@@ -31,6 +25,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from diffusers import DiffusionPipeline
+from utils.llm_data import get_checkpoint
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineComponent, PipelineLoader
@@ -47,31 +42,6 @@ def _cleanup_mpi_env():
     yield
     os.environ.pop("TLLM_DISABLE_MPI", None)
 
-
-# ============================================================================
-# Path helpers
-# ============================================================================
-
-
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path if set in env, assert when it's set but not a valid path."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
-    return str(root)
-
-
-def _checkpoint(env_var: str, default_name: str) -> str:
-    return os.environ.get(env_var) or os.path.join(_llm_models_root(), default_name)
-
-
-WAN21_1_3B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_1_3B", "Wan2.1-T2V-1.3B-Diffusers")
-WAN21_14B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN21_14B", "Wan2.1-T2V-14B-Diffusers")
 
 # ============================================================================
 # Test constants
@@ -91,8 +61,6 @@ COS_SIM_THRESHOLD = 0.99
 
 def _load_trtllm_pipeline(checkpoint_path: str):
     """Load TRTLLM WanPipeline without torch.compile or warmup."""
-    if not os.path.exists(checkpoint_path):
-        pytest.skip(f"Checkpoint not found: {checkpoint_path}")
     args = VisualGenArgs(
         model=checkpoint_path,
         torch_compile_config=TorchCompileConfig(enable=False),
@@ -246,7 +214,7 @@ class TestWan21_1_3B_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_pipeline_matches_hf(
-            checkpoint_path=WAN21_1_3B_PATH,
+            checkpoint_path=get_checkpoint("Wan2.1-T2V-1.3B-Diffusers"),
             height=480,
             width=832,
             num_frames=9,
@@ -262,7 +230,7 @@ class TestWan21_14B_PipelineCorrectness:
 
     def test_cosine_similarity(self):
         _assert_pipeline_matches_hf(
-            checkpoint_path=WAN21_14B_PATH,
+            checkpoint_path=get_checkpoint("Wan2.1-T2V-14B-Diffusers"),
             height=720,
             width=1280,
             num_frames=9,
@@ -286,11 +254,8 @@ class TestWanBatchGeneration:
     @pytest.fixture(scope="class")
     def wan21_full_pipeline(self):
         """Load full Wan 2.1 pipeline (all components) for batch tests."""
-        if not WAN21_1_3B_PATH or not os.path.exists(WAN21_1_3B_PATH):
-            pytest.skip("Checkpoint not available. Set DIFFUSION_MODEL_PATH_WAN21_1_3B.")
-
         args = VisualGenArgs(
-            model=WAN21_1_3B_PATH,
+            model=get_checkpoint("Wan2.1-T2V-1.3B-Diffusers"),
             torch_compile_config=TorchCompileConfig(enable=False),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
@@ -347,10 +312,8 @@ class TestWan21T2VCombinedOptimizations:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_fp8_teacache_trtllm(self):
-        if not os.path.exists(WAN21_1_3B_PATH):
-            pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
         args = VisualGenArgs(
-            model=WAN21_1_3B_PATH,
+            model=get_checkpoint("Wan2.1-T2V-1.3B-Diffusers"),
             torch_compile_config=TorchCompileConfig(enable=False),
             quant_config={"quant_algo": "FP8", "dynamic": True},
             attention_config=AttentionConfig(backend="TRTLLM"),
@@ -397,10 +360,8 @@ _SKIP_AUX = [
 
 
 def _make_wan21_t2v(quant_config=None):
-    if not os.path.exists(WAN21_1_3B_PATH):
-        pytest.skip(f"Checkpoint not found: {WAN21_1_3B_PATH}")
     kwargs = dict(
-        model=WAN21_1_3B_PATH,
+        model=get_checkpoint("Wan2.1-T2V-1.3B-Diffusers"),
         torch_compile_config=TorchCompileConfig(enable=False),
     )
     if quant_config is not None:
@@ -499,11 +460,11 @@ class TestWan21T2VPipelineFeatures:
         """FP8 transformer blocks have float8_e4m3fn weights and weight_scale."""
         try:
             if not hasattr(torch.ops, "tensorrt_llm"):
-                pytest.skip("tensorrt_llm torch ops not available")
+                pytest.fail("tensorrt_llm torch ops not available")
             _ = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor
             _ = torch.ops.tensorrt_llm.quantize_e4m3_activation
         except (AttributeError, RuntimeError) as e:
-            pytest.skip(f"FP8 quantization ops not available: {e}")
+            pytest.fail(f"FP8 quantization ops not available: {e}")
         for name, module in wan21_t2v_fp8.transformer.named_modules():
             if isinstance(module, Linear) and "blocks." in name:
                 assert module.weight.dtype == torch.float8_e4m3fn, (
@@ -517,11 +478,11 @@ class TestWan21T2VPipelineFeatures:
         """FP8_BLOCK_SCALES transformer blocks have float8_e4m3fn weights and weight_scale."""
         try:
             if not hasattr(torch.ops, "tensorrt_llm"):
-                pytest.skip("tensorrt_llm torch ops not available")
+                pytest.fail("tensorrt_llm torch ops not available")
             _ = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor
             _ = torch.ops.tensorrt_llm.quantize_e4m3_activation
         except (AttributeError, RuntimeError) as e:
-            pytest.skip(f"FP8 quantization ops not available: {e}")
+            pytest.fail(f"FP8 quantization ops not available: {e}")
         for name, module in wan21_t2v_fp8_block.transformer.named_modules():
             if isinstance(module, Linear) and "blocks." in name:
                 assert module.weight.dtype == torch.float8_e4m3fn, (
@@ -538,7 +499,7 @@ class TestWan21T2VPipelineFeatures:
         try:
             _ = torch.ops.trtllm.fp4_quantize
         except (AttributeError, RuntimeError) as e:
-            pytest.skip(f"fp4_quantize op not available: {e}")
+            pytest.fail(f"fp4_quantize op not available: {e}")
         from tensorrt_llm.quantization.utils import fp4_utils
 
         for name, module in wan21_t2v_nvfp4.transformer.named_modules():
@@ -648,7 +609,7 @@ class TestWan21T2VPipelineFeatures:
         try:
             _ = torch.ops.trtllm.fp4_quantize
         except (AttributeError, RuntimeError) as e:
-            pytest.skip(f"fp4_quantize op not available: {e}")
+            pytest.fail(f"fp4_quantize op not available: {e}")
 
         hs, ts, enc = _transformer_inputs()
 

@@ -16,14 +16,12 @@
  */
 
 #include "request.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
-#include "tensorrt_llm/runtime/cudaStream.h"
+#include "tensorrt_llm/nanobind/common/tokenIds.h"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
@@ -35,10 +33,11 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
-#include <sstream>
 
 #include <cstring>
+#include <memory>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 namespace nb = nanobind;
@@ -247,25 +246,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("additional_model_outputs", &tle::OutputConfig::additionalModelOutputs)
         .def("__getstate__", outputConfigGetstate)
         .def("__setstate__", outputConfigSetstate);
-
-    auto promptTuningConfigGetstate = [](tle::PromptTuningConfig const& self)
-    { return nb::make_tuple(self.getEmbeddingTable(), self.getInputTokenExtraIds()); };
-    auto promptTuningConfigSetstate = [](tle::PromptTuningConfig& promptTuningConfig, nb::tuple const& state)
-    {
-        if (state.size() != 2)
-        {
-            throw std::runtime_error("Invalid PromptTuningConfig state!");
-        }
-        new (&promptTuningConfig)
-            tle::PromptTuningConfig(nb::cast<Tensor>(state[0]), nb::cast<std::optional<VecTokenExtraIds>>(state[1]));
-    };
-    nb::class_<tle::PromptTuningConfig>(m, "PromptTuningConfig")
-        .def(nb::init<Tensor, std::optional<VecTokenExtraIds>>(), nb::arg("embedding_table"),
-            nb::arg("input_token_extra_ids") = nb::none())
-        .def_prop_ro("embedding_table", &tle::PromptTuningConfig::getEmbeddingTable)
-        .def_prop_ro("input_token_extra_ids", &tle::PromptTuningConfig::getInputTokenExtraIds)
-        .def("__getstate__", promptTuningConfigGetstate)
-        .def("__setstate__", promptTuningConfigSetstate);
 
     auto loraConfigGetstate = [](tle::LoraConfig const& self)
     { return nb::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig()); };
@@ -568,19 +548,17 @@ void initRequestBindings(nb::module_& m)
         auto inputTokenIdsBytes = nb::bytes(
             reinterpret_cast<char const*>(inputTokenIds.data()), inputTokenIds.size() * sizeof(VecTokens::value_type));
         return nb::make_tuple(std::move(inputTokenIdsBytes), self.getMaxTokens(), self.getStreaming(),
-            self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPadId(), self.getPositionIds(),
-            self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getPromptTuningConfig(),
-            self.getMultimodalInput(), self.getMultimodalEmbedding(), self.getMropeConfig(), self.getLoraConfig(),
-            self.getLookaheadConfig(), self.getKvCacheRetentionConfig(), self.getLogitsPostProcessorName(),
-            self.getLogitsPostProcessor(), self.getEncoderInputTokenIds(), self.getClientId(),
-            self.getReturnAllGeneratedTokens(), self.getPriority(), self.getRequestType(), self.getContextPhaseParams(),
-            self.getEncoderInputFeatures(), self.getEncoderOutputLength(), self.getCrossAttentionMask(),
-            self.getSkipCrossAttnBlocks(), self.getGuidedDecodingParams(), self.getDisaggRequestId(),
+            self.getSamplingConfig(), self.getOutputConfig(), self.getEndId(), self.getPositionIds(),
+            self.getBadWords(), self.getStopWords(), self.getEmbeddingBias(), self.getMultimodalInput(),
+            self.getMropeConfig(), self.getLoraConfig(), self.getKvCacheRetentionConfig(),
+            self.getEncoderInputTokenIds(), self.getClientId(), self.getReturnAllGeneratedTokens(), self.getPriority(),
+            self.getRequestType(), self.getContextPhaseParams(), self.getEncoderInputFeatures(),
+            self.getEncoderOutputLength(), self.getGuidedDecodingParams(), self.getDisaggRequestId(),
             self.getCacheSalt());
     };
     auto requestSetstate = [](tle::Request& self, nb::tuple const& state)
     {
-        if (state.size() != 33)
+        if (state.size() != 25)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -599,86 +577,48 @@ void initRequestBindings(nb::module_& m)
         }
         new (&self) tle::Request(std::move(inputTokenIds), nb::cast<SizeType32>(state[1]), nb::cast<bool>(state[2]),
             nb::cast<tle::SamplingConfig>(state[3]), nb::cast<tle::OutputConfig>(state[4]),
-            nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<SizeType32>>(state[6]),
-            nb::cast<std::optional<std::vector<SizeType32>>>(state[7]),
-            nb::cast<std::optional<std::list<VecTokens>>>(state[8]),
-            nb::cast<std::optional<std::list<VecTokens>>>(state[9]), nb::cast<std::optional<Tensor>>(state[10]),
-            nb::cast<std::optional<tle::PromptTuningConfig>>(state[11]),
-            nb::cast<std::optional<tle::MultimodalInput>>(state[12]), nb::cast<std::optional<Tensor>>(state[13]),
-            nb::cast<std::optional<tle::MropeConfig>>(state[14]), nb::cast<std::optional<tle::LoraConfig>>(state[15]),
-            nb::cast<std::optional<tle::LookaheadDecodingConfig>>(state[16]),
-            nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[17]),
-            nb::cast<std::optional<std::string>>(state[18]),
-            nb::cast<std::optional<tle::LogitsPostProcessor>>(state[19]), nb::cast<std::optional<VecTokens>>(state[20]),
-            nb::cast<std::optional<IdType>>(state[21]), nb::cast<bool>(state[22]),
-            nb::cast<tle::PriorityType>(state[23]), nb::cast<tle::RequestType>(state[24]),
-            nb::cast<std::optional<tle::ContextPhaseParams>>(state[25]),
-            nb::cast<std::optional<tle::Tensor>>(state[26]), nb::cast<std::optional<SizeType32>>(state[27]),
-            nb::cast<std::optional<tle::Tensor>>(state[28]), 1, nb::cast<std::optional<tle::Tensor>>(state[29]),
-            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[30]), std::nullopt, std::nullopt,
-            nb::cast<std::optional<tle::IdType>>(state[31]), nb::cast<std::optional<std::string>>(state[32]));
-    };
-
-    // Convert input_token_ids to VecTokens. Fast path: a 1-D contiguous int32
-    // ndarray is memcpy'd into the vector (no per-element PyLong cast, which is
-    // O(ISL) on the GIL-held submit path). Anything else (list[int], etc.) falls
-    // back to the default nanobind sequence cast, so this is fully back-compatible.
-    // This complements PR #15134 (which bytes-encodes Request *pickling*); here we
-    // target Request *construction* on the RpcWorker.submit / _enqueue_request path.
-    auto toVecTokens = [](nb::handle ids) -> tle::VecTokens
-    {
-        nb::ndarray<int32_t const, nb::ndim<1>, nb::c_contig> arr;
-        if (nb::try_cast(ids, arr, /*convert=*/false))
-        {
-            tle::VecTokens out(arr.shape(0));
-            if (arr.shape(0) > 0)
-            {
-                std::memcpy(out.data(), arr.data(), arr.shape(0) * sizeof(int32_t));
-            }
-            return out;
-        }
-        return nb::cast<tle::VecTokens>(ids);
+            nb::cast<std::optional<SizeType32>>(state[5]), nb::cast<std::optional<std::vector<SizeType32>>>(state[6]),
+            nb::cast<std::optional<std::list<VecTokens>>>(state[7]),
+            nb::cast<std::optional<std::list<VecTokens>>>(state[8]), nb::cast<std::optional<Tensor>>(state[9]),
+            nb::cast<std::optional<tle::MultimodalInput>>(state[10]),
+            nb::cast<std::optional<tle::MropeConfig>>(state[11]), nb::cast<std::optional<tle::LoraConfig>>(state[12]),
+            nb::cast<std::optional<tle::KvCacheRetentionConfig>>(state[13]),
+            nb::cast<std::optional<VecTokens>>(state[14]), nb::cast<std::optional<IdType>>(state[15]),
+            nb::cast<bool>(state[16]), nb::cast<tle::PriorityType>(state[17]), nb::cast<tle::RequestType>(state[18]),
+            nb::cast<std::optional<tle::ContextPhaseParams>>(state[19]),
+            nb::cast<std::optional<tle::Tensor>>(state[20]), nb::cast<std::optional<SizeType32>>(state[21]),
+            nb::cast<std::optional<tle::GuidedDecodingParams>>(state[22]), std::nullopt,
+            nb::cast<std::optional<tle::IdType>>(state[23]), nb::cast<std::optional<std::string>>(state[24]));
     };
 
     nb::class_<tle::Request> request(m, "Request", nb::dynamic_attr());
     request
         .def(
             "__init__",
-            [toVecTokens](tle::Request* self,
+            [](tle::Request* self,
                 nb::handle input_token_ids, // list[int] or int32 ndarray
                 tle::SizeType32 max_tokens, bool streaming, tle::SamplingConfig const& sampling_config,
                 tle::OutputConfig const& output_config, std::optional<tle::SizeType32> const& end_id,
-                std::optional<tle::SizeType32> const& pad_id, std::optional<std::vector<SizeType32>> position_ids,
-                std::optional<std::list<tle::VecTokens>> bad_words, std::optional<std::list<tle::VecTokens>> stop_words,
-                std::optional<tle::Tensor> embedding_bias, std::optional<tle::PromptTuningConfig> prompt_tuning_config,
-                std::optional<tle::MultimodalInput> multimodal_input, std::optional<tle::Tensor> multimodal_embedding,
-                std::optional<tle::MropeConfig> mrope_config, std::optional<tle::LoraConfig> lora_config,
-                std::optional<tle::LookaheadDecodingConfig> lookahead_config,
+                std::optional<std::vector<SizeType32>> position_ids, std::optional<std::list<tle::VecTokens>> bad_words,
+                std::optional<std::list<tle::VecTokens>> stop_words, std::optional<tle::Tensor> embedding_bias,
+                std::optional<tle::MultimodalInput> multimodal_input, std::optional<tle::MropeConfig> mrope_config,
+                std::optional<tle::LoraConfig> lora_config,
                 std::optional<tle::KvCacheRetentionConfig> kv_cache_retention_config,
-                std::optional<std::string> logits_post_processor_name,
-                std::optional<tle::LogitsPostProcessor> logits_post_processor,
                 std::optional<tle::VecTokens> encoder_input_token_ids, std::optional<tle::IdType> client_id,
                 bool return_all_generated_tokens, tle::PriorityType priority, tle::RequestType type,
                 std::optional<tle::ContextPhaseParams> context_phase_params,
                 std::optional<tle::Tensor> encoder_input_features, std::optional<tle::SizeType32> encoder_output_length,
-                std::optional<tle::Tensor> cross_attention_mask, SizeType32 num_return_sequences,
-                std::optional<tle::Tensor> skip_cross_attn_blocks,
                 std::optional<tle::GuidedDecodingParams> guided_decoding_params,
-                std::optional<tle::SizeType32> language_adapter_uid,
                 std::optional<tle::MillisecondsType> allotted_time_ms, std::optional<tle::IdType> disagg_request_id,
                 std::optional<std::string> cache_salt)
             {
-                new (self) tle::Request(toVecTokens(input_token_ids), max_tokens, streaming, sampling_config,
-                    output_config, end_id, pad_id, std::move(position_ids), std::move(bad_words), std::move(stop_words),
-                    std::move(embedding_bias), std::move(prompt_tuning_config), std::move(multimodal_input),
-                    std::move(multimodal_embedding), std::move(mrope_config), std::move(lora_config),
-                    std::move(lookahead_config), std::move(kv_cache_retention_config),
-                    std::move(logits_post_processor_name), std::move(logits_post_processor),
+                new (self) tle::Request(NanobindUtils::toVecTokens(input_token_ids), max_tokens, streaming,
+                    sampling_config, output_config, end_id, std::move(position_ids), std::move(bad_words),
+                    std::move(stop_words), std::move(embedding_bias), std::move(multimodal_input),
+                    std::move(mrope_config), std::move(lora_config), std::move(kv_cache_retention_config),
                     std::move(encoder_input_token_ids), client_id, return_all_generated_tokens, priority, type,
                     std::move(context_phase_params), std::move(encoder_input_features), encoder_output_length,
-                    std::move(cross_attention_mask), num_return_sequences, std::move(skip_cross_attn_blocks),
-                    std::move(guided_decoding_params), language_adapter_uid, allotted_time_ms, disagg_request_id,
-                    std::move(cache_salt));
+                    std::move(guided_decoding_params), allotted_time_ms, disagg_request_id, std::move(cache_salt));
             },
             // clang-format off
         nb::arg("input_token_ids"),
@@ -688,20 +628,14 @@ void initRequestBindings(nb::module_& m)
         nb::arg("sampling_config") = tle::SamplingConfig(),
         nb::arg("output_config") = tle::OutputConfig(),
         nb::arg("end_id") = nb::none(),
-        nb::arg("pad_id") = nb::none(),
         nb::arg("position_ids") = nb::none(),
         nb::arg("bad_words") = nb::none(),
         nb::arg("stop_words") = nb::none(),
         nb::arg("embedding_bias") = nb::none(),
-        nb::arg("prompt_tuning_config") = nb::none(),
         nb::arg("multimodal_input") = nb::none(),
-        nb::arg("multimodal_embedding") = nb::none(),
         nb::arg("mrope_config") = nb::none(),
         nb::arg("lora_config") = nb::none(),
-        nb::arg("lookahead_config") = nb::none(),
         nb::arg("kv_cache_retention_config") = nb::none(),
-        nb::arg("logits_post_processor_name") = nb::none(),
-        nb::arg("logits_post_processor") = nb::none(),
         nb::arg("encoder_input_token_ids") = nb::none(),
         nb::arg("client_id") = nb::none(),
         nb::arg("return_all_generated_tokens") = false,
@@ -710,40 +644,40 @@ void initRequestBindings(nb::module_& m)
         nb::arg("context_phase_params") = nb::none(),
         nb::arg("encoder_input_features") = nb::none(),
         nb::arg("encoder_output_length") = nb::none(),
-        nb::arg("cross_attention_mask") = nb::none(),
-        nb::arg("num_return_sequences") = 1,
-        nb::arg("skip_cross_attn_blocks") = nb::none(),
         nb::arg("guided_decoding_params") = nb::none(),
-        nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
         nb::arg("disagg_request_id") = nb::none(),
         nb::arg("cache_salt") = nb::none()
     ) // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)
+        // The prompt as an int32 numpy array that owns a copy of the tokens: one memcpy
+        // instead of the per-token PyLong conversion of input_token_ids.
+        .def("get_input_token_ids_array",
+            [](tle::Request const& self)
+            {
+                auto tokens = std::make_unique<tle::VecTokens>(self.getInputTokenIds());
+                auto* data = tokens->data();
+                size_t const size = tokens->size();
+                nb::capsule owner(tokens.get(), [](void* p) noexcept { delete static_cast<tle::VecTokens*>(p); });
+                // The capsule owns the tokens from here on.
+                tokens.release();
+                return nb::ndarray<nb::numpy, tle::TokenIdType, nb::ndim<1>, nb::c_contig>(data, {size}, owner);
+            })
         .def_prop_ro("num_input_tokens", &tle::Request::getNumInputTokens)
         .def_prop_ro("max_tokens", &tle::Request::getMaxTokens)
         .def_prop_rw("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
         .def_prop_rw("sampling_config", &tle::Request::getSamplingConfig, &tle::Request::setSamplingConfig)
         .def_prop_rw("output_config", &tle::Request::getOutputConfig, &tle::Request::setOutputConfig)
         .def_prop_rw("end_id", &tle::Request::getEndId, &tle::Request::setEndId)
-        .def_prop_rw("pad_id", &tle::Request::getPadId, &tle::Request::setPadId)
         .def_prop_rw("position_ids", &tle::Request::getPositionIds, &tle::Request::setPositionIds)
         .def_prop_rw("bad_words", &tle::Request::getBadWords, &tle::Request::setBadWords)
         .def_prop_rw("stop_words", &tle::Request::getStopWords, &tle::Request::setStopWords)
         .def_prop_rw("embedding_bias", &tle::Request::getEmbeddingBias, &tle::Request::setEmbeddingBias)
-        .def_prop_rw("prompt_tuning_config", &tle::Request::getPromptTuningConfig, &tle::Request::setPromptTuningConfig)
         .def_prop_rw("multimodal_input", &tle::Request::getMultimodalInput, &tle::Request::setMultimodalInput)
-        .def_prop_rw(
-            "multimodal_embedding", &tle::Request::getMultimodalEmbedding, &tle::Request::setMultimodalEmbedding)
         .def_prop_rw("mrope_config", &tle::Request::getMropeConfig, &tle::Request::setMropeConfig)
         .def_prop_rw("lora_config", &tle::Request::getLoraConfig, &tle::Request::setLoraConfig)
-        .def_prop_rw("lookahead_config", &tle::Request::getLookaheadConfig, &tle::Request::setLookaheadConfig)
         .def_prop_rw("kv_cache_retention_config", &tle::Request::getKvCacheRetentionConfig,
             &tle::Request::setKvCacheRetentionConfig)
-        .def_prop_rw("logits_post_processor_name", &tle::Request::getLogitsPostProcessorName,
-            &tle::Request::setLogitsPostProcessorName)
-        .def_prop_rw(
-            "logits_post_processor", &tle::Request::getLogitsPostProcessor, &tle::Request::setLogitsPostProcessor)
         .def_prop_rw(
             "encoder_input_token_ids", &tle::Request::getEncoderInputTokenIds, &tle::Request::setEncoderInputTokenIds)
         .def_prop_rw("client_id", &tle::Request::getClientId, &tle::Request::setClientId)
@@ -752,9 +686,7 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("request_type", &tle::Request::getRequestType, &tle::Request::setRequestType)
         .def_prop_rw(
             "encoder_input_features", &tle::Request::getEncoderInputFeatures, &tle::Request::setEncoderInputFeatures)
-        .def_prop_rw("cross_attention_mask", &tle::Request::getCrossAttentionMask, &tle::Request::setCrossAttentionMask)
-        .def_prop_rw(
-            "skip_cross_attn_blocks", &tle::Request::getSkipCrossAttnBlocks, &tle::Request::setSkipCrossAttnBlocks)
+        .def_prop_ro("encoder_output_length", &tle::Request::getEncoderOutputLength)
         .def_prop_rw(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_prop_rw("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
@@ -764,12 +696,6 @@ void initRequestBindings(nb::module_& m)
         .def_prop_rw("priority", &tle::Request::getPriority, &tle::Request::setPriority)
         .def("__getstate__", requestGetstate)
         .def("__setstate__", requestSetstate);
-    request.attr("BATCHED_POST_PROCESSOR_NAME") = tle::Request::kBatchedPostProcessorName;
-
-    nb::class_<tle::SpeculativeDecodingFastLogitsInfo>(m, "SpeculativeDecodingFastLogitsInfo")
-        .def(nb::init<>())
-        .def_rw("draft_request_id", &tle::SpeculativeDecodingFastLogitsInfo::draftRequestId)
-        .def_rw("draft_participant_id", &tle::SpeculativeDecodingFastLogitsInfo::draftParticipantId);
 
     auto requestPerfMetrics = nb::class_<tle::RequestPerfMetrics>(m, "RequestPerfMetrics");
 
@@ -882,53 +808,36 @@ void initRequestBindings(nb::module_& m)
         .def("__getstate__", requestPerfMetricsGetstate)
         .def("__setstate__", requestPerfMetricsSetstate);
 
-    nb::class_<tle::AdditionalOutput>(m, "AdditionalOutput")
-        .def(nb::init<std::string, tle::Tensor>(), nb::arg("name"), nb::arg("output"))
-        .def_rw("name", &tle::AdditionalOutput::name)
-        .def_rw("output", &tle::AdditionalOutput::output);
-
     auto resultSetstate = [](tle::Result& self, nb::tuple const& state)
     {
-        if (state.size() != 14)
+        if (state.size() != 9)
         {
-            throw std::runtime_error("Invalid Request state!");
+            throw std::runtime_error("Invalid Result state!");
         }
         tle::Result result;
         result.isFinal = nb::cast<bool>(state[0]);
         result.outputTokenIds = nb::cast<std::vector<VecTokens>>(state[1]);
-        result.cumLogProbs = nb::cast<std::optional<std::vector<float>>>(state[2]);
-        result.logProbs = nb::cast<std::optional<std::vector<std::vector<float>>>>(state[3]);
-        result.contextLogits = nb::cast<std::optional<Tensor>>(state[4]);
-        result.generationLogits = nb::cast<std::optional<Tensor>>(state[5]);
-        result.encoderOutput = nb::cast<std::optional<Tensor>>(state[6]);
-        result.finishReasons = nb::cast<std::vector<tle::FinishReason>>(state[7]);
-        result.sequenceIndex = nb::cast<SizeType32>(state[8]);
-        result.isSequenceFinal = nb::cast<bool>(state[9]);
-        result.decodingIter = nb::cast<SizeType32>(state[10]);
-        result.avgDecodedTokensPerIter = nb::cast<float>(state[11]);
-        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[12]);
-        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[13]);
+        result.finishReasons = nb::cast<std::vector<tle::FinishReason>>(state[2]);
+        result.sequenceIndex = nb::cast<SizeType32>(state[3]);
+        result.isSequenceFinal = nb::cast<bool>(state[4]);
+        result.decodingIter = nb::cast<SizeType32>(state[5]);
+        result.avgDecodedTokensPerIter = nb::cast<float>(state[6]);
+        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[7]);
+        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[8]);
         new (&self) tle::Result(result);
     };
 
     auto resultGetstate = [](tle::Result const& self)
     {
-        return nb::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
-            self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
-            self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams, self.requestPerfMetrics);
+        return nb::make_tuple(self.isFinal, self.outputTokenIds, self.finishReasons, self.sequenceIndex,
+            self.isSequenceFinal, self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams,
+            self.requestPerfMetrics);
     };
 
     nb::class_<tle::Result>(m, "Result")
         .def(nb::init<>())
         .def_rw("is_final", &tle::Result::isFinal)
         .def_rw("output_token_ids", &tle::Result::outputTokenIds)
-        .def_rw("cum_log_probs", &tle::Result::cumLogProbs, nb::arg("cum_log_probs").none())
-        .def_rw("log_probs", &tle::Result::logProbs, nb::arg("log_probs").none())
-        .def_rw("context_logits", &tle::Result::contextLogits, nb::arg("context_logits").none())
-        .def_rw("generation_logits", &tle::Result::generationLogits, nb::arg("generation_logits").none())
-        .def_rw("spec_dec_fast_logits_info", &tle::Result::specDecFastLogitsInfo,
-            nb::arg("spec_dec_fast_logits_info").none())
-        .def_rw("encoder_output", &tle::Result::encoderOutput, nb::arg("encoder_output").none())
         .def_rw("finish_reasons", &tle::Result::finishReasons)
         .def_rw("sequence_index", &tle::Result::sequenceIndex)
         .def_rw("is_sequence_final", &tle::Result::isSequenceFinal)
@@ -936,7 +845,6 @@ void initRequestBindings(nb::module_& m)
         .def_rw("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
         .def_rw("context_phase_params", &tle::Result::contextPhaseParams, nb::arg("context_phase_params").none())
         .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics, nb::arg("request_perf_metrics").none())
-        .def_rw("additional_outputs", &tle::Result::additionalOutputs)
         .def("__getstate__", resultGetstate)
         .def("__setstate__", resultSetstate);
 
@@ -971,24 +879,6 @@ void initRequestBindings(nb::module_& m)
         .def("has_error", &tle::Response::hasError)
         .def_prop_ro("error_msg", &tle::Response::getErrorMsg)
         .def_prop_ro("result", &tle::Response::getResult)
-        .def("clear_context_logits",
-            [](tle::Response& self)
-            {
-                if (!self.hasError())
-                {
-                    auto& result = const_cast<tle::Result&>(self.getResult());
-                    result.contextLogits.reset();
-                }
-            })
-        .def("clear_generation_logits",
-            [](tle::Response& self)
-            {
-                if (!self.hasError())
-                {
-                    auto& result = const_cast<tle::Result&>(self.getResult());
-                    result.generationLogits.reset();
-                }
-            })
         .def("__getstate__", responseGetstate)
         .def("__setstate__", responseSetstate);
 }

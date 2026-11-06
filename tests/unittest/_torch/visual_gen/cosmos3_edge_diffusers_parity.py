@@ -1,11 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Per-step Edge transformer parity: TRT-LLM vs diffusers main.
+"""Per-step Edge transformer parity against installed Diffusers.
 
-Not a pytest module — run as a subprocess by test_cosmos3_edge.py, because
-diffusers main (>= 0.40, first with the Edge classes) cannot be imported into
-a process that already imported the pinned diffusers.
-Usage: DIFFUSERS_MAIN_PATH=/path/to/diffusers python cosmos3_edge_diffusers_parity.py <ckpt>
+Not a pytest module — test_cosmos3_edge.py runs it as a subprocess to isolate
+the heavyweight reference and TRT-LLM pipelines from the pytest process.
+Usage: python cosmos3_edge_diffusers_parity.py <ckpt>
 
 Runs the diffusers Cosmos3OmniPipeline for 2 steps (guidance off, fixed
 latents), captures each transformer call's (latent, timestep, velocity),
@@ -16,7 +15,6 @@ compares velocities.
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.environ["DIFFUSERS_MAIN_PATH"], "src"))
 os.environ.setdefault("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "1")
 
 CKPT = sys.argv[1]
@@ -29,8 +27,6 @@ def main():
     import diffusers
     import torch
 
-    expected_root = os.path.realpath(os.environ["DIFFUSERS_MAIN_PATH"])
-    assert os.path.realpath(diffusers.__file__).startswith(expected_root), diffusers.__file__
     print("diffusers:", diffusers.__version__)
     from diffusers import Cosmos3OmniPipeline
 

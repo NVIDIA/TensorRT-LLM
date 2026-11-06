@@ -72,3 +72,10 @@ moonshotai/Kimi-K2.5:
 # quant_algo=None.
 moonshotai/Kimi-K3:
   - accuracy: 84.89
+# GLM-5.3-Flash (glm5_next VLM: 24-block BF16 vision tower + KDA/sparse-MLA
+# hybrid FP8 decoder). B200 TP4/EP4, thinking model scored through
+# strip_thinking_and_extract_mmmu_answer with a 4096-token output budget and
+# reasoning_effort=max; single-run reference (lm-eval stderr +/-1.34 at n=900).
+zai-org/GLM-5.3-Flash:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 77.22

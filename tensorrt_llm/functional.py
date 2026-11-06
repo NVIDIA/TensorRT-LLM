@@ -145,6 +145,7 @@ class AllReduceParams:
         eps: float = 1e-06,
         enable_allreduce: bool = True,
         trigger_completion_at_end: bool = True,
+        fp8_payload: bool = False,
     ):
         self.strategy = strategy
         self.fusion_op = fusion_op
@@ -157,6 +158,9 @@ class AllReduceParams:
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
         self.trigger_completion_at_end = trigger_completion_at_end
+        # Torch MNNVL path only (lossy): two-shot calls fused with a residual RMSNorm exchange E4M3 values
+        # with one FP32 scale per 256 elements instead of BF16 (see MNNVLAllReduce.supports_fp8_payload).
+        self.fp8_payload = fp8_payload
         assert fusion_op in (AllReduceFusionOp.NONE.value,
                              AllReduceFusionOp.RMS_NORM.value) or (residual
                                                                    is not None)
@@ -187,8 +191,11 @@ class MoEAllReduceParams(AllReduceParams):
         eps: float = 1e-06,
         enable_allreduce: bool = True,
         is_cutlass_min_latency: bool = False,
+        shared_expert_gate: Optional[Tensor] = None,
+        fusion_op: AllReduceFusionOp = AllReduceFusionOp.NONE,
     ):
         super().__init__(
+            fusion_op=fusion_op,
             bias=bias,
             residual=residual,
             norm_weight=norm_weight,
@@ -201,6 +208,8 @@ class MoEAllReduceParams(AllReduceParams):
         self.expert_scale_factor = expert_scale_factor
         self.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
         self.shared_expert_output = shared_expert_output
+        # Torch MNNVL path only: logits of the shared-expert gate; the shared output is scaled by their sigmoid.
+        self.shared_expert_gate = shared_expert_gate
         self.is_cutlass_min_latency = is_cutlass_min_latency
 
     def is_valid(self):
@@ -264,8 +273,16 @@ class RopeEmbeddingUtils:
         # Other scaling configs that only used by certain scaling types.
         rope_scaling_config: dict = None,
         duplicate_data: bool = False,
-        dtype=np.float32,
     ):
+        # The rotary table dtype is pinned to fp32 and is intentionally not a caller
+        # argument. inv_freq and the positions are built at this dtype, so the stored
+        # angle (position * inv_freq) accumulates the fp32 rounding of inv_freq -- an
+        # error that is invisible in short contexts but grows ~linearly with position
+        # (about a milliradian at 32k). Reference implementations also round inv_freq
+        # to fp32, and building in fp64 was measured and deliberately not adopted (it
+        # removes one side of a two-sided rounding difference rather than improving
+        # agreement). Change this only with a re-measurement.
+        dtype = np.float32
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
         if scale_type == RotaryScalingType.llama3:

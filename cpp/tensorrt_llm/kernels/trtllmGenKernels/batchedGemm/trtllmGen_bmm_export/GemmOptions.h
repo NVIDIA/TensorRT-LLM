@@ -1189,6 +1189,16 @@ inline bool checkAndUpdateGemmOptions(
     if (options.mMmaKind == tg::MmaKind::Fp8Fp6Fp4)
     {
         int mmaK = isSparseA ? 64 : 32;
+        // SM107 supports 2x-mmaK for FP8.
+        if (options.mMmaK == (isSparseA ? 128 : 64))
+        {
+            TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                "MmaK == 64 (/128 sparse) is only supported on SM 107a for ", gemm::toString(options.mMmaKind));
+            TLLM_CHECK_ERROR(options.mMmaM % 128 == 0,
+                "MmaM must be a multiple of 128 for MmaK == 64 (/128 sparse) and ", gemm::toString(options.mMmaKind),
+                ". Got mmaM == ", options.mMmaM);
+            mmaK = isSparseA ? 128 : 64;
+        }
 
         if (options.mMmaK != mmaK)
         {
@@ -1281,10 +1291,28 @@ inline bool checkAndUpdateGemmOptions(
         if (options.mMmaKind == tg::MmaKind::MxFp4NvFp4)
         {
             mmaK = isSparseA ? 128 : 64;
+            // SM107 supports 2x-mmaK for FP4.
+            if (options.mMmaK == 128 && !isSparseA)
+            {
+                TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                    "MmaK == 128 dense is only supported on SM 107a for ", gemm::toString(options.mMmaKind));
+                // The SF layout for k=128 depends on whether mmaN is <= or > 128; keep TileN == MmaN so the
+                // smem -> tmem path sees a single layout per tileN.
+                TLLM_CHECK_ERROR(
+                    options.mTileN == options.mMmaN, "When mmaK == 128 dense, TileN must be equal to MmaN.");
+                mmaK = 128;
+            }
             if (options.mMmaK == 96 && !isSparseA)
             {
                 mmaK = 96;
             }
+        }
+        // SM107 supports 2x-mmaK for MxFP8.
+        if (options.mMmaKind == tg::MmaKind::MxFp8Fp6Fp4 && options.mMmaK == (isSparseA ? 128 : 64))
+        {
+            TLLM_CHECK_ERROR(cudaArch == tg::CudaArch::Sm107a,
+                "MmaK == 64 (/128 sparse) is only supported on SM 107a for ", gemm::toString(options.mMmaKind));
+            mmaK = isSparseA ? 128 : 64;
         }
         if (options.mMmaK != mmaK)
         {

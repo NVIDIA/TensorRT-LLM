@@ -1,3 +1,6 @@
+.. SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+.. SPDX-License-Identifier: Apache-2.0
+
 trtllm-serve
 ============
 
@@ -19,8 +22,9 @@ The server also supports the following endpoints:
 - ``/version``
 - ``/start_profile`` (prototype)
 - ``/stop_profile`` (prototype)
+- ``/v1/chat/completions/render`` and ``/v1/completions/render`` (prototype, enabled with ``TRTLLM_ENABLE_RENDER_ENDPOINTS=1``)
 
-The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below.
+The ``metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details. The ``start_profile`` and ``stop_profile`` endpoints control iteration-scoped profiling of the backend engine; see :ref:`runtime-profiling-endpoints` below. The render endpoints return the prompt token ids that the server would use for a request, without running the model; see :doc:`render-endpoints`.
 
 For encoder-only models (BERT-style classifiers, reward models, text-embedding models), the ``trtllm-serve embeddings`` subcommand starts a server that exposes an OpenAI-compatible ``/v1/embeddings`` endpoint with native dynamic batching. See :doc:`Embeddings <../../features/embeddings>` for details.
 
@@ -34,6 +38,59 @@ The following abbreviated command syntax shows the commonly used arguments to st
    trtllm-serve <model> [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
+
+.. _tool-parser-selection:
+
+Tool-call Parser Selection
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Select ``--tool_parser`` to match the tool-call syntax specified by the checkpoint's
+chat template. Models from different families can share a parser when they emit
+the same format.
+
+The ``qwen3_coder`` parser handles the following function/parameter format, shared
+by Qwen3-Coder, Nemotron 3 Nano, Nemotron 3 Super, Nemotron 3 Ultra, and
+Nemotron 3.5 Super VL:
+
+.. code-block:: text
+
+   <tool_call>
+   <function=get_weather>
+   <parameter=city>
+   Taipei
+   </parameter>
+   </function>
+   </tool_call>
+
+The official chat templates specify this syntax and use it to serialize previous
+assistant tool calls:
+
+* `Qwen3-Coder <https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Nano <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Super <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/blob/main/chat_template.jinja>`__
+* `Nemotron 3 Ultra <https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-NVFP4/blob/main/chat_template.jinja>`__
+* `Nemotron 3.5 Super VL <https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16/blob/main/chat_template.jinja>`__
+
+Among these Nemotron models, ``--tool_parser auto`` selects ``qwen3_coder`` only
+for Nemotron 3.5 Super VL (``nemotron_h_omni``). For Nemotron 3 Nano, Super, and
+Ultra (``nemotron_h``), specify ``--tool_parser qwen3_coder`` explicitly.
+
+The module ``tensorrt_llm/serve/tool_parser/qwen3_coder_parser.py`` implements this
+shared format. ``--reasoning_parser`` separately controls reasoning extraction;
+``nemotron-v3`` and ``nano-v3`` are aliases for the same Nemotron reasoning parser.
+
+Multiple HTTP Frontends
+-----------------------
+
+At high concurrency a single serving process is host-bound: one asyncio event loop parses every request and writes every streamed chunk, and queuing on that loop rather than GPU time starts to dominate first-token latency. ``trtllm-serve`` therefore runs **8 HTTP frontend processes** against one executor by default (``--num_serve_frontends``, beta). The launcher process owns the engine; the other frontends attach to it and share the serving port via ``SO_REUSEPORT``, so clients still see a single URL.
+
+.. note::
+
+   * Pass ``--num_serve_frontends 1`` (or set ``num_serve_frontends: 1`` in the ``--config`` YAML) to run a single frontend.
+   * The default applies to the OpenAI HTTP server on the default executor path on a fixed port. With ``--port 0`` / ``--report_addr``, ``orchestrator_type`` (``rpc`` / ``ray``), ``enable_resource_governor`` or ``--enable_sleep_mode`` it falls back to one frontend and logs why; an explicit ``--num_serve_frontends`` greater than 1 fails instead. ``--grpc`` also keeps one frontend unless ``--num_serve_frontends`` is given (only ``--grpc-protocol openengine`` supports more).
+   * Each request is handled entirely by the frontend that accepted its connection. Server-wide state lives in the launcher: the other frontends forward ``/metrics``, ``/kv_cache_events``, profiling and the Anthropic batches API to it, and ``/prometheus/metrics`` covers every frontend. Per-process state is not shared: the stateful Responses API store (``store`` / ``previous_response_id``) is disabled, ``/health`` describes the frontend that answered, and each frontend writes its own per-request perf metrics file.
+   * ``SO_REUSEPORT`` would also let a second server of the same user join the port and take part of its traffic, so the launcher refuses a port that another server already uses.
+   * Every extra frontend is a full Python process that imports TensorRT LLM and loads the tokenizer, so budget host memory accordingly.
 
 Inference Endpoints
 -------------------
@@ -94,7 +151,7 @@ Multimodal Serving
 For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:
 
 * TRT-LLM multimodal is currently not compatible with ``kv_cache_reuse``
-* Multimodal models require ``chat_template``, so only the Chat API is supported
+* Multimodal models require ``chat_template``, so only the Chat API and the Responses API are supported
 
 To set up multimodal models:
 
@@ -117,9 +174,9 @@ Then, start the server with the configuration file:
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
 
-You can query Completions API with any http clients, a typical example is OpenAI Python client:
+You can query the Chat Completions API with any HTTP client. A typical example uses the OpenAI Python client:
 
-.. literalinclude:: ../../../../examples/serve/openai_completion_client_for_multimodal.py
+.. literalinclude:: ../../../../examples/serve/openai_chat_client_for_multimodal.py
     :language: python
     :linenos:
 
@@ -128,6 +185,20 @@ Another example uses ``curl``:
 .. literalinclude:: ../../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
+
+Multimodal Responses API
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Responses API takes an image as an ``input_image`` content part whose ``image_url`` is the image URL or a base64 data URL:
+
+.. code-block:: json
+
+   {"role": "user", "content": [
+       {"type": "input_text", "text": "What's in this image?"},
+       {"type": "input_image", "image_url": "data:image/jpeg;base64,{image_base64}"}
+   ]}
+
+Images referenced by ``file_id`` and ``input_file`` content are not supported; a request that carries them is rejected with a 400 error.
 
 Multimodal Modality Coverage
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -167,6 +238,16 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
          {"type": "text", "text": "What's in this image?"},
          {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_base64}"}}
      ]}
+
+.. note::
+   Media URLs may be ``http(s)`` URLs or base64 ``data:`` URLs. A ``file://``
+   URI or a bare filesystem path is read from the server's own filesystem, so it
+   is refused unless the server is started with
+   ``TRTLLM_MEDIA_ALLOWED_LOCAL_PATH=<directory>``; then only regular files whose
+   resolved path is inside that directory are read. This applies to
+   ``image_url``, ``video_url`` and ``audio_url`` parts. A deployment whose
+   clients send local paths today must set the variable to the directory
+   that holds those files.
 
 .. note::
    To convert images to base64-encoded format, use the utility function
@@ -242,6 +323,27 @@ For checkpoints that support both LLM and Visual Generation, such as Cosmos3, pa
 
 For full details, see the :doc:`../../models/visual-generation.md` feature documentation. Example client scripts are available in the `examples/visual_gen/serve/ <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen/serve>`_ directory.
 
+Render Endpoints
+----------------
+
+The render endpoints accept the same request body as ``/v1/chat/completions`` and ``/v1/completions`` and return the
+prompt token ids that a ``trtllm-serve`` server would build from it, including its chat template, tool and reasoning
+handling, and tokenization. They do not run the model. The response is a *rendered request*: the ``token_ids`` plus
+the original request body.
+
+Typical uses:
+
+- **Routing.** A KV-cache-aware router or gateway, such as Dynamo's endpoint picker, calls a render endpoint to get
+  exactly the token ids the server will see. It hashes them to find the server with the longest cached prefix, then
+  forwards the original request to that server.
+- **Skipping rendering on the server.** A client can send the ids to a server's chat or completions endpoint, so the
+  server does not apply the chat template and tokenize again.
+
+The render endpoints are a prototype and are not registered with ``trtllm-serve`` by default. Set
+``TRTLLM_ENABLE_RENDER_ENDPOINTS=1`` to register them on a ``trtllm-serve`` server, or run the standalone, CPU-only
+``trtllm-render`` next to your servers. See :doc:`render-endpoints` for the response format and for how to send a
+rendered request to the chat and completions endpoints.
+
 Multi-node Serving with Slurm
 -----------------------------
 
@@ -267,11 +369,9 @@ Metrics Endpoint
 
 .. note::
 
-   The metrics endpoint for the default PyTorch backend are in beta and are not as comprehensive as those for the TensorRT backend.
+   The metrics endpoint is in beta. Some fields, such as CPU memory usage, are not yet available.
 
-   Some fields, such as CPU memory usage, are not yet available for the PyTorch backend.
-
-   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration.
+   Enabling ``enable_iter_perf_stats`` in the PyTorch backend can slightly impact performance, depending on the serving configuration. Setting ``iter_perf_stats_interval: N`` builds the statistics only every N iterations, which reduces this overhead.
 
 The ``/metrics`` endpoint provides runtime iteration statistics such as GPU memory usage and KV cache details.
 
@@ -290,6 +390,7 @@ Start the server and specify the ``--config`` argument with the path to the YAML
 
 After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint.
 Since the statistics are stored in an internal queue and removed once retrieved, it's recommended to poll the endpoint shortly after each request and store the results if needed.
+Each statistic is returned to only one caller, so poll the endpoint from a single client: when several clients poll at once, one of them may receive an empty list.
 
 .. code-block:: bash
 
@@ -320,6 +421,48 @@ Example output:
         }
     ]
 
+Attention-DP statistics
+~~~~~~~~~~~~~~~~~~~~~~~
+
+With attention data parallelism enabled, ``attentionDpRank`` identifies the rank
+that produced each row's scheduled-work and KV-cache measurements. KV snapshots
+are captured with the corresponding iteration and include that rank's capacity,
+occupancy, allocation and reuse counters, and cache hit rate. An idle rank can
+retain cached blocks even when it schedules no requests. If a rank did not
+measure KV statistics for an iteration, its JSON row has ``kvCacheStats: null``;
+absence does not mean an empty cache. ``TLLM_METRICS_ALL_RANKS`` is not required for this
+attention-DP fanout.
+
+The shared Prometheus collector uses ``dp_rank`` on KV-cache and rank-local
+inflight-batching metrics. It takes the rank from ``attentionDpRank``, falls back
+to ``rank`` for all-rank statistics, and uses ``"0"`` for rows without either
+field. These metric families also have ``dp_rank="0"`` in single-rank serving.
+Request metrics and configuration-info metrics retain their existing labels.
+
+KV gauges retain each rank's last measurement until another measured snapshot
+arrives. Used-block counts, utilization, and cache-hit rate can remain stale
+throughout periods without fresh snapshots, including idle periods. Zero
+scheduled requests alone does not imply a missing KV measurement.
+
+Cumulative reused/missed-block counters keep independent baselines per rank
+across absent snapshots. Rows must arrive in producer order for each rank; interleaving
+different ranks is supported. A decrease in a rank's cumulative counter emits a
+warning and updates the baseline without incrementing the counter. This does not
+make stale or reordered rows safe. Repeated cumulative values add no work.
+Per-iteration delta counters are incremented directly and must be delivered once
+per iteration.
+
+Top-level request counts, queue, memory, iteration latency, batch configuration,
+average decoded tokens, and speculative-decoding measurements remain owned by
+rank 0 in the collector. They are not sums of rank-local measurements. The
+separate ``kvCacheIterationStats`` deltas retain their producer ownership and
+are attached only to rank 0 by attention-DP fanout.
+
+When updating dashboards, retain ``dp_rank`` to inspect individual ranks or
+aggregate it explicitly. Used/free block counts can be summed across ranks;
+the maximum utilization identifies the fullest rank. Do not sum utilization or
+cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.
+
 .. _runtime-profiling-endpoints:
 
 Runtime Profiling Endpoints
@@ -327,7 +470,7 @@ Runtime Profiling Endpoints
 
 .. note::
 
-   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). They are no-ops on the TensorRT backend. APIs, parameters, and behaviour may change in future releases.
+   The ``/start_profile`` and ``/stop_profile`` endpoints are **prototype** and only apply to the default PyTorch backend (``PyExecutor``). APIs, parameters, and behaviour may change in future releases.
 
 The server exposes two HTTP endpoints that control iteration-scoped profiling of the backend engine at runtime, without restarting ``trtllm-serve`` and without setting ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``. Under TP/PP > 1, both endpoints broadcast the window to every rank, so each rank writes its own chrome trace (distinguished by a ``rank-<N>`` suffix in the filename) and all ranks profile the same iterations in lockstep.
 
@@ -391,27 +534,141 @@ For a full benchmarking + profiling workflow (including multi-cycle capture unde
 
 .. _configuring-with-yaml-files:
 
-Configuring with YAML Files
-----------------------------
+Configuring with YAML Files and ``--set``
+------------------------------------------
 
-You can configure various options of ``trtllm-serve`` using YAML files by setting the ``--config`` option to the path of a YAML file. Explicit CLI flags take precedence over values in the YAML; un-set CLI flags fall back to the YAML.
+Pass a YAML file with ``--config``. Explicit CLI flags override conflicting
+YAML values; otherwise, YAML values override the defaults.
 
 .. include:: ../../_includes/note_sections.rst
    :start-after: .. start-note-config-flag-alias
    :end-before: .. end-note-config-flag-alias
 
-The yaml file is configuration of `tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_, the class has multiple levels of hierarchy, to configure the top level arguments like ``max_batch_size``, the yaml file should be like:
+The file configures
+`tensorrt_llm.llmapi.LlmArgs <https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs>`_.
+For example, set a top-level field as follows:
 
 .. code-block:: yaml
 
    max_batch_size: 8
 
-To configure the nested level arguments like ``moe_config.backend``, the yaml file should be like:
+Use YAML mappings for nested fields:
 
 .. code-block:: yaml
 
    moe_config:
        backend: CUTLASS
+
+Use repeatable ``--set PATH=YAML_VALUE`` options to override individual fields.
+Paths use exact, case-sensitive ``LlmArgs`` field names and dots for nesting:
+
+.. code-block:: bash
+
+   trtllm-serve MODEL \
+       --config base.yaml \
+       --video_pruning_rate 0.4 \
+       --set multimodal_config.video_pruning_rate=0.6 \
+       --set 'cuda_graph_config.batch_sizes=[1, 2, 4]'
+
+Precedence is fixed, regardless of command-line order:
+
+.. code-block:: text
+
+   LlmArgs defaults < --config < dedicated CLI flags < --set
+
+Values use YAML syntax and support ``null``, booleans, finite numbers, strings,
+lists, and string-keyed mappings. Quote arguments containing spaces or shell
+characters. An assignment replaces exactly the addressed value; assigning a
+mapping or list replaces it entirely. The last duplicate path wins, while
+conflicting parent and child paths are rejected.
+
+``--set`` supports public, YAML-serializable fields in ``TorchLlmArgs``, with
+the following exceptions:
+
+* ``model`` and ``backend``: use ``MODEL`` and ``--backend``.
+* ``telemetry_config``: use ``--telemetry`` or ``--no-telemetry``.
+* ``env_overrides`` and ``internal_request_auth_key``: use the YAML file.
+* ``allow_request_chat_template``: use ``--allow_request_chat_template``.
+* ``disagg_cluster``: use ``--disagg_cluster_uri`` or the YAML file.
+* ``batched_logits_processor``, ``checkpoint_loader``, ``mpi_session``,
+  ``ray_placement_config.placement_groups``,
+  ``speculative_config.drafter``, and
+  ``speculative_config.resource_manager``: use the Python LLM API.
+
+Assigning a whole parent mapping does not bypass these exclusions; a mapping
+that contains one of the excluded descendant paths is rejected.
+
+``--set`` is available only for normal LLM serving. It is unavailable for
+VisualGen and the ``embeddings``, ``mm_embedding_serve``, ``disaggregated``,
+and ``disaggregated_mpi_worker`` subcommands. Server-only YAML keys, list
+indexes, escaped dots, and Hydra/OmegaConf interpolation are also unsupported.
+Replace an enclosing mapping to set free-form keys that cannot be expressed as
+a path.
+
+Do not pass secrets through ``--set`` because arguments may appear in shell
+history, process listings, or logs. Eligible configuration fields may also be
+included in usage telemetry; use ``--no-telemetry`` to opt out. See
+:doc:`../../developer-guide/telemetry`.
+
+Editor Validation of YAML Files
+-------------------------------
+
+In VS Code, install `YAML by Red Hat <https://marketplace.visualstudio.com/items?itemName=redhat.vscode-yaml>`_
+and add this comment to a serving config to enable validation, completion, and hover documentation:
+
+.. code-block:: yaml
+
+   # yaml-language-server: $schema=https://nvidia.github.io/TensorRT-LLM/latest/_static/schemas/trtllm-serve-config.schema.json
+   max_batch_size: 8
+
+Other YAML language-server clients can use the same schema. The editor downloads
+the schema; it does not need a local TensorRT-LLM installation or a running server.
+Replace ``latest`` with the docs version matching your installation, once that
+release publishes schemas. Existing releases are not retroactively updated.
+
+Use ``trtllm-serve-disagg-config.schema.json`` for ``disaggregated --config`` and
+``trtllm-serve-visual-gen-config.schema.json`` for ``--visual_gen_args``, in the same
+schema directory. These describe YAML files, not CLI flags or ``--set`` assignments.
+
+View or download the JSON schemas for this documentation version:
+
+* `Serving schema <../../_static/schemas/trtllm-serve-config.schema.json>`_
+* `Disaggregated serving schema <../../_static/schemas/trtllm-serve-disagg-config.schema.json>`_
+* `VisualGen schema <../../_static/schemas/trtllm-serve-visual-gen-config.schema.json>`_
+
+To save a schema, right-click its link and select **Save link as**.
+
+Schemas check field names, nested structure, types, and declarative constraints.
+Runtime checks still determine model/GPU compatibility, file existence, and
+cross-field validity. Custom Python validators, free-form mappings, and the
+deprecated ``decoding_config`` have limited static validation; live Python
+objects are not configurable in YAML.
+
+For offline use, set ``$schema`` to a local JSON file (an absolute path or a path
+relative to your YAML file):
+
+* Source checkouts include the schemas in ``tensorrt_llm/schemas/``; no build is needed to use them.
+* Release containers expose them at ``/app/tensorrt_llm/schemas/``. The editor must be
+  attached to the container, or otherwise able to access those files.
+* Wheels include the same schemas. To locate them without importing TensorRT-LLM:
+
+.. code-block:: bash
+
+   python3 -c 'from importlib.metadata import distribution; print(distribution("tensorrt_llm").locate_file("tensorrt_llm/schemas"))'
+
+When changing configuration definitions or bumping the package version in
+``tensorrt_llm/version.py``, regenerate and commit the snapshots using a
+TensorRT-LLM build and dependencies matching the checkout. Each schema's ``$id``
+and ``title`` include the package version.
+
+.. code-block:: bash
+
+   python3 scripts/generate_trtllm_serve_schemas.py
+   python3 scripts/generate_trtllm_serve_schemas.py --check
+
+The CPU schema tests reject stale snapshots. Wheel and HTML docs builds publish
+the checked-in files without importing configuration classes. ``--output-dir``
+can be used to generate a separate local preview.
 
 .. _syntax:
 

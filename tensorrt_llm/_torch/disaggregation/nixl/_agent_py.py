@@ -21,7 +21,13 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
 # Import base classes for type compatibility
-from ..base.agent import BaseTransferAgent, RegMemoryDescs, TransferRequest, TransferStatus
+from ..base.agent import (
+    BaseTransferAgent,
+    MemoryDescs,
+    RegMemoryDescs,
+    TransferRequest,
+    TransferStatus,
+)
 
 # The PyPI ``nixl`` meta-package provides a top-level ``nixl`` shim that
 # redirects to ``nixl_cu13`` or ``nixl_cu12``. When only ``nixl-cu13`` (or
@@ -91,6 +97,8 @@ class NixlTransferAgent(BaseTransferAgent):
         num_threads: int = 1,
         rank: int | None = None,
         world_size: int | None = None,
+        agent_buffer_size_mb: int = 0,
+        agent_bounce_params: dict[str, str] | None = None,
         **kwargs,
     ):
         """
@@ -100,7 +108,17 @@ class NixlTransferAgent(BaseTransferAgent):
         :param num_workers: Specify number of threads for the supported multi-threaded backends.
         :param rank: Process rank, used only to keep the shared agent interface consistent.
         :param world_size: Process count, used only to keep the shared agent interface consistent.
+        :param agent_buffer_size_mb: Accepted for interface consistency; this agent has no
+            transfer-agent bounce buffer, so a positive size is ignored with a warning.
+        :param agent_bounce_params: Accepted for interface consistency; ignored alongside
+            agent_buffer_size_mb.
         """
+        if agent_buffer_size_mb > 0:
+            logger.warning(
+                "kv_cache_bounce_size_mb > 0 requests the transfer-agent bounce buffer, which "
+                "the pure-Python NIXL agent does not implement; ignoring it and any "
+                "agent_bounce_params (standard NIXL transfers are used)"
+            )
         if (rank is None) != (world_size is None):
             raise ValueError("rank and world_size must be specified together")
         if rank is not None:
@@ -155,8 +173,13 @@ class NixlTransferAgent(BaseTransferAgent):
     def invalidate_remote_agent(self, name: str):
         self.agent.remove_remote_agent(name)
 
-    def check_remote_descs(self, name: str, memory_descs: list[int]) -> bool:
-        raise NotImplementedError
+    def check_remote_descs(self, name: str, memory_descs: MemoryDescs) -> bool:
+        if len(memory_descs.descs) == 0:
+            return self.agent.check_remote_metadata(name)
+        descs = self.agent.get_xfer_descs(memory_descs.descs, memory_descs.type)
+        if descs is None:
+            raise RuntimeError("nixl get_xfer_descs returned None for remote descriptors")
+        return self.agent.check_remote_metadata(name, descs)
 
     def notify_sync_message(self, name: str, sync_message: str):
         raise NotImplementedError

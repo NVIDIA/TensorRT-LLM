@@ -27,11 +27,11 @@ import diffusers
 import lpips as lpips_package
 import pytest
 import torch
-import torch.nn.functional as F
 from defs.examples.visual_gen.visual_gen_test_utils import (
     _cleanup_cuda,
     _disable_inductor_compile_worker_quiesce,
     _llm_models_root,
+    _multi_resolution_log_stft_distance,
 )
 from diffusers import ModularPipeline
 from PIL import Image
@@ -130,57 +130,29 @@ def _minimax_h3_checkpoint_path() -> str:
     return path
 
 
-def _multi_resolution_log_stft_distance(
-    actual: torch.Tensor,
-    expected: torch.Tensor,
-) -> float:
-    if actual.shape != expected.shape:
-        raise AssertionError(
-            f"Audio shape mismatch: generated {tuple(actual.shape)}, "
-            f"golden {tuple(expected.shape)}."
-        )
-    actual = actual.float().reshape(-1, actual.shape[-1])
-    expected = expected.float().reshape(-1, expected.shape[-1])
-    distances: list[torch.Tensor] = []
-    for n_fft in (512, 1024, 2048):
-        hop_length = n_fft // 4
-        window = torch.hann_window(n_fft)
-        actual_stft = torch.stft(
-            actual,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window=window,
-            return_complex=True,
-        ).abs()
-        expected_stft = torch.stft(
-            expected,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            window=window,
-            return_complex=True,
-        ).abs()
-        distances.append(F.l1_loss(torch.log1p(actual_stft), torch.log1p(expected_stft)))
-    return float(torch.stack(distances).mean())
-
-
 def _generate_diffusers_reference(
     checkpoint_path: str,
     keyframes: list[Image.Image],
+    references: list | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate a fresh reference with the installed, repository-pinned Diffusers."""
     pipeline = ModularPipeline.from_pretrained(
         checkpoint_path,
-        workflow="fl2va" if keyframes else "t2va",
+        workflow="ref2va" if references else ("fl2va" if keyframes else "t2va"),
         local_files_only=True,
     )
     pipeline.load_components(
-        dtype=torch.bfloat16,
+        dtype={"default": torch.bfloat16, "vae": torch.float32, "audio_vae": torch.float32}
+        if references
+        else torch.bfloat16,
         pretrained_model_name_or_path=checkpoint_path,
         local_files_only=True,
     )
     pipeline.to("cuda")
     try:
         keyframe_inputs = {"image": keyframes[0], "last_image": keyframes[1]} if keyframes else {}
+        if references:
+            keyframe_inputs = {"references": references}
         reference = pipeline(
             prompt=MINIMAX_H3_PROMPT,
             height=MINIMAX_H3_QUALITY_HEIGHT,
@@ -497,8 +469,8 @@ def test_minimax_h3_public_visual_gen_api_smoke() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
     ("task", "quant_algo"),
-    [("t2va", None), ("fl2va", None), ("t2va", "FP8_BLOCK_SCALES")],
-    ids=["t2va", "fl2va", "t2va-fp8-blockwise"],
+    [("t2va", None), ("fl2va", None), ("t2va", "FP8_BLOCK_SCALES"), ("ref2va", None)],
+    ids=["t2va", "fl2va", "t2va-fp8-blockwise", "ref2va"],
 )
 def test_minimax_h3_diffusers_lpips_and_audio_reference(
     task: str, quant_algo: str | None, tmp_path: Path, _full_cuda_memory_budget: None
@@ -511,11 +483,27 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
         if task == "fl2va"
         else []
     )
-    golden_video, golden_audio = _generate_diffusers_reference(checkpoint_path, keyframes)
+    references = None
+    if task == "ref2va":
+        from diffusers.modular_pipelines.minimax_h3.references import (
+            MiniMaxH3AudioReference,
+            MiniMaxH3ImageReference,
+        )
+
+        # Exercise both frozen conditioning prefixes against a fresh reference.
+        waveform = 0.1 * torch.sin(torch.arange(64000) * (2 * torch.pi * 440 / 32000))
+        references = [
+            MiniMaxH3ImageReference(Image.new("RGB", (128, 128), "navy")),
+            MiniMaxH3AudioReference(waveform.repeat(2, 1), sample_rate=32000),
+        ]
+    golden_video, golden_audio = _generate_diffusers_reference(
+        checkpoint_path, keyframes, references
+    )
 
     pipeline = PipelineLoader(
         VisualGenArgs(
             model=checkpoint_path,
+            pipeline_config={"workflow": "ref2va"} if references else {},
             quant_config={"quant_algo": quant_algo, "dynamic": True} if quant_algo else None,
             torch_compile_config=TorchCompileConfig(enable=True),
         )
@@ -524,6 +512,7 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
         output = pipeline.forward(
             prompt=MINIMAX_H3_PROMPT,
             keyframes=keyframes,
+            references=references,
             keyframe_anchors=("first", "last") if keyframes else (),
             seed=MINIMAX_H3_SEED,
             height=MINIMAX_H3_QUALITY_HEIGHT,

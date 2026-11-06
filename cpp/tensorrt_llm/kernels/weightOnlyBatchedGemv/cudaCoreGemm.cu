@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,8 +32,8 @@ __device__ void cudaCoreGemmImpl(InputType const* __restrict__ act, InputType co
     using VecType = int4;
     static constexpr SizeType32 kStepK = static_cast<SizeType32>(128 / (8 * sizeof(InputType)));
     static constexpr SizeType32 kTileK = kStepK * BLOCK_SIZE;
-    auto tileIdM = static_cast<SizeType32>(blockIdx.x * TILE_M);
-    auto tileIdN = static_cast<SizeType32>(blockIdx.y * TILE_N);
+    auto tileIdM = static_cast<SizeType32>(blockIdx.y * TILE_M);
+    auto tileIdN = static_cast<SizeType32>(blockIdx.x * TILE_N);
     auto tid = static_cast<SizeType32>(threadIdx.x);
     float tile_a[kStepK], tile_w[TILE_N * kStepK];
     float acc[TILE_M * TILE_N];
@@ -152,7 +152,7 @@ template <typename InputType, typename OutputType, SizeType32 TILE_M, SizeType32
 void cudaCoreGemmKernel(Params const& params, cudaStream_t stream)
 {
     dim3 block(BLOCK_SIZE);
-    dim3 grid(params.m / TILE_M, params.n / TILE_N);
+    dim3 grid(params.n / TILE_N, params.m / TILE_M);
 
     if (tensorrt_llm::common::getEnvEnablePDL())
     {

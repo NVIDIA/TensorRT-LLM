@@ -697,6 +697,7 @@ DeepGEMM-related behavior can be controlled by the following environment variabl
 | `TRTLLM_DG_JIT_DEBUG` | When set to `1`, enable JIT debugging. |
 | `TRTLLM_DG_JIT_USE_NVCC` | When set to `1`, use NVCC instead of NVRTC to compile the kernel, which has slightly better performance but requires CUDA Toolkit (>=12.3) and longer compilation time.|
 | `TRTLLM_DG_JIT_DUMP_CUBIN` | When set to `1`, dump the cubin file. This is only effective with NVRTC since NVCC will always dump the cubin file. NVRTC-based JIT will store the generated kernels in memory by default. If you want to persist the kernels across multiple runs, you can either use this variable or use NVCC. |
+| `TRTLLM_DG_CACHE_DIR` | Sets the root directory for TensorRT-LLM DeepGEMM JIT artifacts. Temporary files are stored under `tmp/`, and compiled kernels are stored under `cache/` when `TRTLLM_DG_JIT_DUMP_CUBIN=1` or NVCC is used. |
 
 #### MOE GEMM Optimization
 
@@ -864,10 +865,10 @@ echo "All processes completed!"
 The converted checkpoint could be used as `<YOUR_MODEL_DIR>` and consumed by other commands.
 
 ### KV Cache Reuse
-KV cache reuse is supported for MLA on SM90, SM100, SM103, SM120 and SM121. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
+KV cache reuse is supported for MLA on SM90, SM100, SM103, SM107, SM120 and SM121. It is enabled by default. Due to extra operations like memcpy and GEMMs, GPU memory consumption may be higher and the E2E performance may have regression in some cases. Users could pass `KvCacheConfig(enable_block_reuse=False)` to LLM API to disable it.
 
 ### Chunked Prefill
-Chunked Prefill is supported for MLA on SM90, SM100, SM103 and SM120. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
+Chunked Prefill is supported for MLA on SM90, SM100, SM103, SM107 and SM120. You should add `--enable_chunked_prefill` to enable it. The GPU memory consumption is highly correlated with `max_num_tokens` and `max_batch_size`. If encountering out-of-memory errors, you may make these values smaller. (`max_num_tokens` must be divisible by kv cache's `tokens_per_block`)
 
 More specifically, we can imitate what we did in the [Quick Start](#quick-start):
 

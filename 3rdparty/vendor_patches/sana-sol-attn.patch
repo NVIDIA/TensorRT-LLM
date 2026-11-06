@@ -1,0 +1,474 @@
+diff --git a/sol_attn/THIRD_PARTY_NOTICES.md b/sol_attn/THIRD_PARTY_NOTICES.md
+index d3755083d1e7622ff509351594157dd879865e56..b226f77f96bc2316e902ddf91765b35c915a8a6c 100644
+--- a/sol_attn/THIRD_PARTY_NOTICES.md
++++ b/sol_attn/THIRD_PARTY_NOTICES.md
+@@ -1,15 +1,49 @@
+ # Third-party notices
+ 
+-The files under `sol_attn/_vendor/flash_attn/cute/` and portions of the SM89,
+-SM90, and SM100 design scaffold derive from the FlashAttention project. Its
+-BSD-3-Clause license is included at
+-`sol_attn/sm100/LICENSE.flash-attention`.
++This package is vendored from
++[`github.com/NVlabs/Sana`](https://github.com/NVlabs/Sana), branch
++[`sol-engine`](https://github.com/NVlabs/Sana/tree/sol-engine), at commit
++[`5fe5feb`](https://github.com/NVlabs/Sana/commit/5fe5feb) (2026-08-17).
++Checked against the branch tip
++([`83e54df`](https://github.com/NVlabs/Sana/commit/83e54df), 2026-08-20) on
++2026-08-27.
+ 
+-The runtime also depends on NVIDIA CUTLASS / CuTe DSL, cuda-python, PyTorch,
+-and Triton. Those dependencies are not redistributed by this repository and
+-remain subject to their respective licenses.
++## Scope of the vendored subset
++
++Only the pieces needed for the architectures TensorRT-LLM ships are carried:
++
++| Carried | Not carried |
++|---|---|
++| `interface.py`, `preprocess.py`, `common/` | `sm89/`, `sm90/` (incl. `sm90/_compat/`) |
++| `sm100/` — serves SM100 (B200/GB200) and SM103 (B300/GB300) | `triton_ref/` Triton reference attention |
++| | `sm120/` (RTX Blackwell) |
++| | `_vendor/flash_attn/` (see below) |
++
++`../sol_attn_backend.py` is not part of the vendored package but is a
++derivative work of upstream's
++`techniques/sparse_backends/sol_attn_backend.py` (same branch and commit).
++Only the kernel-wrapper subset is carried; upstream's model-integration half
++(diffusers dispatch hook, HunyuanVideo MMDiT padding, model-level Morton
++ordering) is not.
++
++Implementation divergences from upstream are documented in the source itself,
++in the module docstrings of `../sol_attn_backend.py` and
++`attention_backend/cute_dsl/sol_attn.py`.
+ 
+-The SM120 warp-MMA/TMA execution skeleton and online-softmax helpers are
+-adapted from NVIDIA cuDNN Frontend's block-sparse-attention reference at commit
+-`74785165de2da954a2c879a5e3e6f95411c2292d`. That source is licensed under the
+-Apache License 2.0; adapted files retain the corresponding SPDX header.
++## Licensing
++
++The upstream package vendored a copy of FlashAttention's CuTe DSL helpers
++under `sol_attn/_vendor/flash_attn/cute/`. That copy is **not** carried here:
++TensorRT-LLM already depends on
++[`flash-attn-4`](https://github.com/Dao-AILab/flash-attention) (pinned in
++`requirements.txt`), which provides the same `flash_attn.cute` modules, and
++the SM100 kernels import them from that dependency directly. FlashAttention's
++BSD-3-Clause license is retained at `sol_attn/sm100/LICENSE.flash-attention`
++because portions of the SM100 design scaffold still derive from that project.
++
++`preprocess.py` implements the routing/threshold stage in Triton, so Triton is
++a required runtime dependency on every Sol-Attn path, not only a fallback.
++
++The runtime also depends on NVIDIA CUTLASS / CuTe DSL, cuda-python, and
++PyTorch. Those dependencies are not redistributed by this repository and
++remain subject to their respective licenses.
+diff --git a/sol_attn/interface.py b/sol_attn/interface.py
+index 43e9267b931c4f87620739182e596f1fe63b2475..2da4ea383947f5cd25bea439d7748d8ab5e4f28c 100644
+--- a/sol_attn/interface.py
++++ b/sol_attn/interface.py
+@@ -7,11 +7,12 @@ import functools
+ import torch
+ 
+ BLOCK_SIZE = 64
++# TensorRT-LLM ships the SM100 kernel only. It serves both datacenter Blackwell
++# steppings: the CuTe DSL JIT targets the device it compiles on and the kernel
++# body uses no SM100-exclusive construct (measured identical on B200 and B300).
+ _CUTE_BACKENDS = {
+-    (8, 9): "cute_sm89",
+-    (9, 0): "cute_sm90",
+-    (10, 0): "cute_sm100",
+-    (12, 0): "cute_sm120",
++    (10, 0): "cute_sm100",  # B200 / GB200
++    (10, 3): "cute_sm100",  # B300 / GB300
+ }
+ _compiled = {}
+ 
+@@ -68,23 +69,30 @@ def _backend_for_arch(
+     *,
+     cute_available: bool | None = None,
+ ) -> str:
+-    """Select CuTe when specialized and available, otherwise Triton."""
++    """Select the CuTe kernel for ``arch``, or raise if there is none.
+ 
+-    if arch[0] < 8:
++    TensorRT-LLM raises instead of falling back to the Triton reference so a
++    missing kernel is visible; the caller decides what to do about it.
++    """
++
++    cute_backend = _CUTE_BACKENDS.get(arch)
++    if cute_backend is None:
+         raise RuntimeError(
+-            "Sol-Attn requires an NVIDIA GPU with compute capability >= 8.0; "
+-            f"got SM{arch[0]}{arch[1]}"
++            f"Sol-Attn has no kernel for SM{arch[0]}{arch[1]}; supported "
++            f"architectures are "
++            f"{', '.join(f'SM{a}{b}' for a, b in sorted(_CUTE_BACKENDS))}."
+         )
+-    cute_backend = _CUTE_BACKENDS.get(arch)
+-    if cute_backend is not None:
+-        available = (
+-            _cute_runtime_available()
+-            if cute_available is None
+-            else cute_available
++    available = (
++        _cute_runtime_available()
++        if cute_available is None
++        else cute_available
++    )
++    if not available:
++        raise RuntimeError(
++            "Sol-Attn requires the CuTe DSL runtime (cutlass.cute and "
++            "cuda.bindings.driver); neither could be imported."
+         )
+-        if available:
+-            return cute_backend
+-    return "triton"
++    return cute_backend
+ 
+ 
+ def get_sol_attn_backend(device: torch.device | str | int | None = None) -> str:
+@@ -96,8 +104,11 @@ def get_sol_attn_backend(device: torch.device | str | int | None = None) -> str:
+ 
+ 
+ def _validate_cute(arch, tokens, kv_splits):
+-    if arch != (9, 0) and kv_splits != 1:
+-        raise ValueError("kv_splits=2/4 is currently available on SM90 only")
++    if kv_splits != 1:
++        raise ValueError(
++            "kv_splits=2/4 was an SM90-only path; this build ships the SM100 "
++            "kernel only, so kv_splits must be 1."
++        )
+     route_groups = ((tokens + 63) // 64 + 63) // 64
+     if kv_splits > route_groups:
+         raise ValueError("each KV split must contain at least one N64 route group")
+@@ -126,60 +137,6 @@ def _sink_block_range(tokens, sink_start, sink_tokens):
+     )
+ 
+ 
+-def _compile_sm90(
+-    key,
+-    tensors,
+-    scale,
+-    tokens,
+-    kv_splits,
+-    sink_range,
+-    stream,
+-):
+-    import cutlass.cute as cute
+-
+-    from .sm90 import make_kernel
+-
+-    operator = make_kernel(tokens, kv_splits)
+-    args = _to_cute_tensors(tensors)
+-    compiled = cute.compile(
+-        operator,
+-        *args,
+-        scale,
+-        sink_range,
+-        stream=stream,
+-        options="--enable-tvm-ffi",
+-    )
+-    _compiled[key] = compiled
+-    return compiled, args
+-
+-
+-def _compile_sm89(
+-    key,
+-    tensors,
+-    scale,
+-    sink_start_block,
+-    sink_end_block,
+-    stream,
+-):
+-    import cutlass.cute as cute
+-
+-    from .sm89 import make_kernel
+-
+-    operator = make_kernel()
+-    args = _to_cute_tensors(tensors)
+-    compiled = cute.compile(
+-        operator,
+-        *args,
+-        scale,
+-        sink_start_block,
+-        sink_end_block,
+-        stream=stream,
+-        options="--enable-tvm-ffi",
+-    )
+-    _compiled[key] = compiled
+-    return compiled, args
+-
+-
+ def _compile_sm100(
+     key,
+     tensors,
+@@ -206,33 +163,6 @@ def _compile_sm100(
+     return compiled, args
+ 
+ 
+-def _compile_sm120(
+-    key,
+-    tensors,
+-    scale,
+-    sink_start_block,
+-    sink_end_block,
+-    stream,
+-):
+-    import cutlass.cute as cute
+-
+-    from .sm120 import make_kernel
+-
+-    operator = make_kernel()
+-    args = _to_cute_tensors(tensors)
+-    compiled = cute.compile(
+-        operator,
+-        *args,
+-        scale,
+-        sink_start_block,
+-        sink_end_block,
+-        stream=stream,
+-        options="--enable-tvm-ffi",
+-    )
+-    _compiled[key] = compiled
+-    return compiled, args
+-
+-
+ def _sol_attn_cute(
+     q,
+     k,
+@@ -268,129 +198,36 @@ def _sol_attn_cute(
+         stream = _stream(q.device)
+         key = (q.device.index, arch, batch, tokens, heads, kv_splits)
+ 
+-        if arch == (8, 9):
+-            sink_start_block, sink_end_block = _sink_block_range(
+-                tokens,
+-                sink_start,
+-                sink_tokens,
+-            )
+-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+-            compiled = _compiled.get(key)
+-            if compiled is None:
+-                compiled, args = _compile_sm89(
+-                    key,
+-                    tensors,
+-                    scale,
+-                    sink_start_block,
+-                    sink_end_block,
+-                    stream,
+-                )
+-            else:
+-                args = _to_cute_tensors(tensors)
+-            compiled(
+-                *args,
+-                scale,
+-                sink_start_block,
+-                sink_end_block,
+-                stream=stream,
+-            )
+-        elif arch == (9, 0):
+-            if sink_tokens:
+-                sink_start_block, sink_end_block = _sink_block_range(
+-                    tokens,
+-                    sink_start,
+-                    sink_tokens,
+-                )
+-                sink_range = sink_start_block | (sink_end_block << 16)
+-            else:
+-                sink_range = 0
+-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+-            if kv_splits > 1:
+-                tensors.extend(
+-                    [
+-                        torch.empty(
+-                            (batch, tokens, kv_splits * heads, 128),
+-                            device=q.device,
+-                            dtype=torch.bfloat16,
+-                        ),
+-                        torch.empty(
+-                            (batch, tokens, kv_splits * heads),
+-                            device=q.device,
+-                            dtype=torch.float32,
+-                        ),
+-                    ]
+-                )
+-            compiled = _compiled.get(key)
+-            if compiled is None:
+-                compiled, args = _compile_sm90(
+-                    key,
+-                    tensors,
+-                    scale,
+-                    tokens,
+-                    kv_splits,
+-                    sink_range,
+-                    stream,
+-                )
+-            else:
+-                args = _to_cute_tensors(tensors)
+-            compiled(
+-                *args,
+-                scale,
+-                sink_range,
+-                stream=stream,
+-            )
+-        elif arch == (10, 0):
+-            sink_start_block, sink_end_block = _sink_block_range(
+-                tokens,
+-                sink_start,
+-                sink_tokens,
+-            )
+-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+-            compiled = _compiled.get(key)
+-            if compiled is None:
+-                compiled, args = _compile_sm100(
+-                    key,
+-                    tensors,
+-                    scale,
+-                    sink_start_block,
+-                    sink_end_block,
+-                    stream,
+-                )
+-            else:
+-                args = _to_cute_tensors(tensors)
+-            compiled(
+-                *args,
++        if arch not in _CUTE_BACKENDS:
++            # Unreachable via sol_attn(): _backend_for_arch raises first. Kept
++            # explicit so a missed guard cannot return the uninitialised
++            # `output` buffer. Keyed off _CUTE_BACKENDS, not a literal.
++            raise ValueError(f"no Sol-Attn CuTe kernel for SM{arch[0]}{arch[1]}")
++        sink_start_block, sink_end_block = _sink_block_range(
++            tokens,
++            sink_start,
++            sink_tokens,
++        )
++        tensors = [q, k, v, output, kc, vc, threshold, lse]
++        compiled = _compiled.get(key)
++        if compiled is None:
++            compiled, args = _compile_sm100(
++                key,
++                tensors,
+                 scale,
+                 sink_start_block,
+                 sink_end_block,
+-                stream=stream,
++                stream,
+             )
+         else:
+-            sink_start_block, sink_end_block = _sink_block_range(
+-                tokens,
+-                sink_start,
+-                sink_tokens,
+-            )
+-            tensors = [q, k, v, output, kc, vc, threshold, lse]
+-            compiled = _compiled.get(key)
+-            if compiled is None:
+-                compiled, args = _compile_sm120(
+-                    key,
+-                    tensors,
+-                    scale,
+-                    sink_start_block,
+-                    sink_end_block,
+-                    stream,
+-                )
+-            else:
+-                args = _to_cute_tensors(tensors)
+-            compiled(
+-                *args,
+-                scale,
+-                sink_start_block,
+-                sink_end_block,
+-                stream=stream,
+-            )
++            args = _to_cute_tensors(tensors)
++        compiled(
++            *args,
++            scale,
++            sink_start_block,
++            sink_end_block,
++            stream=stream,
++        )
+     return output
+ 
+ 
+@@ -421,28 +258,15 @@ def sol_attn(
+         sink_tokens,
+         sink_start,
+     )
+-    if kv_splits not in (1, 2, 4):
+-        raise ValueError("kv_splits must be 1, 2, or 4")
+-    backend = _backend_for_arch(arch)
++    if kv_splits != 1:
++        raise ValueError(
++            "kv_splits must be 1; the 2/4 path was SM90-only and this build "
++            "ships SM100 kernels only."
++        )
++    _backend_for_arch(arch)  # raises on an architecture with no kernel
+     scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+     tau = float(tau)
+ 
+-    if backend == "triton":
+-        if kv_splits != 1:
+-            raise ValueError("kv_splits=2/4 is currently available on SM90 only")
+-        from .triton_ref import sol_attn as triton_sol_attn
+-
+-        return triton_sol_attn(
+-            q,
+-            k,
+-            v,
+-            scale=scale,
+-            tau=tau,
+-            thresh_type=thresh_type,
+-            sink_tokens=sink_tokens,
+-            sink_start=sink_start,
+-        )
+-
+     _validate_cute(arch, q.shape[1], kv_splits)
+     return _sol_attn_cute(
+         q,
+diff --git a/sol_attn/sm100/mainloop.py b/sol_attn/sm100/mainloop.py
+index 36b3ad9d1450c836f7acdc80bbed1382eac4d3a9..24dee1cb0233ebc5ecaabed21eab3c7fe12e86ba 100644
+--- a/sol_attn/sm100/mainloop.py
++++ b/sol_attn/sm100/mainloop.py
+@@ -12,13 +12,13 @@ import cutlass.cute as cute
+ import cutlass.pipeline as pipeline
+ import cutlass.utils as utils
+ import cutlass.utils.blackwell_helpers as sm100_utils
+-import sol_attn._vendor.flash_attn.cute.pipeline as fa_pipeline
+-import sol_attn._vendor.flash_attn.cute.utils as fa_utils
++import flash_attn.cute.pipeline as fa_pipeline
++import flash_attn.cute.utils as fa_utils
+ from cutlass import BFloat16, Float32, Int32
+ from cutlass._mlir.dialects import llvm
+ from cutlass.cute.nvgpu import cpasync, tcgen05
+ from cutlass.cutlass_dsl import T, dsl_user_op
+-from sol_attn._vendor.flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
++from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+ 
+ from .softmax import (
+     _load_m64_n128_score as _load_pair_score,
+@@ -27,8 +27,8 @@ from .softmax import (
+ )
+ from . import math as mma_utils
+ 
+-from sol_attn.common import layout_utils
+-from sol_attn.common.selector import (
++from ..common import layout_utils
++from ..common.selector import (
+     sol_attn_popc_b32,
+     sol_attn_route_is_exact,
+ )
+diff --git a/sol_attn/sm100/softmax.py b/sol_attn/sm100/softmax.py
+index 876ef8007e12eb855cdaee1f1ee40c18775ae143..71b11f0e6ece8cabd7d6182bd1759e091c7c57db 100644
+--- a/sol_attn/sm100/softmax.py
++++ b/sol_attn/sm100/softmax.py
+@@ -7,7 +7,7 @@ import cutlass.cute as cute
+ from cutlass import Float32, Int32
+ from cutlass.cute.nvgpu import tcgen05
+ 
+-from sol_attn._vendor.flash_attn.cute import utils as fa_utils
++from flash_attn.cute import utils as fa_utils
+ 
+ from .tmem import (
+     _add_physical_tmem_base,

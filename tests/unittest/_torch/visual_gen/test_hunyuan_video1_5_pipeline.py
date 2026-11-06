@@ -365,11 +365,11 @@ def _assert_nvfp4_blocks_quantized(pipe) -> None:
 def _skip_if_no_fp8_ops() -> None:
     try:
         if not hasattr(torch.ops, "tensorrt_llm"):
-            pytest.skip("tensorrt_llm torch ops not available")
+            pytest.fail("tensorrt_llm torch ops not available")
         _ = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor
         _ = torch.ops.tensorrt_llm.quantize_e4m3_activation
     except (AttributeError, RuntimeError) as e:
-        pytest.skip(f"FP8 quantization ops not available: {e}")
+        pytest.fail(f"FP8 quantization ops not available: {e}")
 
 
 def _skip_if_no_nvfp4_ops() -> None:
@@ -378,7 +378,7 @@ def _skip_if_no_nvfp4_ops() -> None:
     try:
         _ = torch.ops.trtllm.fp4_quantize
     except (AttributeError, RuntimeError) as e:
-        pytest.skip(f"fp4_quantize op not available: {e}")
+        pytest.fail(f"fp4_quantize op not available: {e}")
 
 
 def _transformer_inputs(transformer, device: str = "cuda", dtype=torch.bfloat16, seed: int = 42):

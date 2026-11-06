@@ -1102,3 +1102,9 @@ def test_profile_ranks_note_states_the_duty_for_each_shape():
     # Degrades where the topology cannot deliver per-rank traces.
     assert "spawn-launched `trtllm-serve` cannot" in several
     assert "make no imbalance claim" in several
+
+
+def test_casebook_control_adds_an_explicit_override():
+    bundle = build_perf_analyze_prompts(include_casebook=False)
+    assert "This run intentionally disables `perf-optimization-casebook`" in bundle.benchmarker
+    assert "This run intentionally disables `perf-optimization-casebook`" in bundle.analyzer

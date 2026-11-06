@@ -7,8 +7,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from openengine.v1 import error_pb2, generation_pb2
-
+from .bindings import error_pb2, generation_pb2
 from .disagg import prefill_ready_response
 from .formatting import (
     _MAX_PROMPT_LOGPROB_ENTRIES,
@@ -36,6 +35,7 @@ class _OpenEngineFormatState:
     sampling_params: Any = None
     is_context_only: bool = False
     kv_transfer_backend: str = ""
+    decode_preparation: str | None = None
     # None until first use: _token_holdback needs sampling_params._stop_word_ids,
     # which generate_async only populates after the request is submitted, so it is
     # computed lazily on the first _format_result call (inline or in a worker).
@@ -164,10 +164,24 @@ def _format_result(
                         out_disagg,
                         args.kv_transfer_backend,
                         usage=_usage(result),
+                        decode_preparation=args.decode_preparation,
                     )
                 )
 
-        if output.finish_reason and output.index not in args.finished_indices:
+        # Context compute can report its finish reason before the asynchronous
+        # KV handoff makes the engine result final. PrefillReady, not this
+        # intermediate finish reason, terminates a successful context stream.
+        handoff_pending = (
+            args.is_context_only
+            and output.finish_reason is not None
+            and output.index not in args.prefill_ready_sent
+            and not result.finished
+        )
+        if (
+            output.finish_reason
+            and output.index not in args.finished_indices
+            and not handoff_pending
+        ):
             args.finished_indices.add(output.index)
             newly_finished.append(output)
 

@@ -97,7 +97,7 @@ _ROPE_SPATIAL_SCALE = 32
 
 @dataclass
 class MiniMaxH3PackedSequence:
-    """Structural description of one packed FL2VA transformer sequence."""
+    """Structural description of one packed MiniMax-H3 transformer sequence."""
 
     sequence_length: int
     position_ids: torch.Tensor
@@ -255,6 +255,8 @@ def build_packed_sequence(
     num_audio_latents: int,
     patch_size: tuple[int, int, int],
     keyframe_anchors: tuple[str, ...] = (),
+    *,
+    rotary_time_origin: float | None = None,
 ) -> MiniMaxH3PackedSequence:
     """Build the packed FL2VA layout, indices, modality tags, and 3-D positions."""
     patch_t, patch_h, patch_w = patch_size
@@ -265,6 +267,9 @@ def build_packed_sequence(
     if text_token_tags.ndim != 1:
         raise ValueError("`text_token_tags` must be one-dimensional.")
 
+    rotary_origin = (
+        float(text_token_tags.shape[0]) if rotary_time_origin is None else rotary_time_origin
+    )
     rows_per_frame = (latent_height // patch_h) * (latent_width // patch_w)
     num_text_tokens = text_token_tags.shape[0]
     num_condition_rows = len(keyframe_anchors) * rows_per_frame
@@ -292,12 +297,10 @@ def build_packed_sequence(
 
     for index, anchor in enumerate(keyframe_anchors):
         if anchor == "first":
-            anchor_time = float(num_text_tokens)
+            anchor_time = rotary_origin
         elif anchor == "last":
             anchor_time = (
-                float(num_text_tokens)
-                + _temporal_position_span(num_latent_frames)
-                - _ROPE_FRAME_RESCALE
+                rotary_origin + _temporal_position_span(num_latent_frames) - _ROPE_FRAME_RESCALE
             )
         else:
             raise ValueError(f"A keyframe anchor must be 'first' or 'last', got {anchor!r}.")
@@ -308,7 +311,7 @@ def build_packed_sequence(
         position_ids[rows, 0] = anchor_time
         position_ids[rows, 1:] = frame_grid
 
-    audio_time = float(num_text_tokens) + torch.arange(
+    audio_time = rotary_origin + torch.arange(
         num_audio_latents,
         dtype=torch.float64,
     )
@@ -336,7 +339,7 @@ def build_packed_sequence(
     )
     video_position_ids[:, :, 0] = _temporal_position_grid(
         num_latent_frames,
-        float(num_text_tokens),
+        rotary_origin,
     )[:, None]
     video_position_ids[:, :, 1:] = frame_grid[None]
     position_ids[video_start:] = video_position_ids.reshape(-1, 3)
@@ -416,3 +419,112 @@ def keyframe_condition_noise(
             dtype=dtype,
         )
     return torch.cat(rows)
+
+
+def build_reference_sequence(
+    text_token_tags: torch.Tensor,
+    reference_kinds: list[tuple[str, bool]],
+    visual_shapes: list[tuple[int, int, int]],
+    audio_row_counts: list[int],
+    num_latent_frames: int,
+    latent_height: int,
+    latent_width: int,
+    num_audio_latents: int,
+    patch_size: tuple[int, int, int],
+) -> MiniMaxH3PackedSequence:
+    """Prefix the shared H3 target layout with ordered, frozen reference rows.
+
+    Visual shapes are (T, H, W) latent dimensions; audio counts include both
+    stereo channels. Both lists follow request order within their modality.
+    """
+    patch_t, patch_h, patch_w = patch_size
+    if patch_t != 1 or any(h % patch_h or w % patch_w for _, h, w in visual_shapes):
+        raise ValueError("Reference geometry must be divisible by H3's spatial patch size.")
+    if any(count % MINIMAX_H3_AUDIO_CHANNELS for count in audio_row_counts):
+        raise ValueError("Reference audio rows must contain both stereo channels.")
+    shapes, counts = iter(visual_shapes), iter(audio_row_counts)
+    positions, tags = [], []
+    origin = float(text_token_tags.numel())
+
+    def frame_grid(height: int, width: int) -> tuple[torch.Tensor, torch.Tensor]:
+        area = np.sqrt(height * width)
+        hg = _spatial_position_grid(height, patch_h, area)
+        wg = _spatial_position_grid(width, patch_w, area)
+        grid = torch.stack([g.reshape(-1) for g in torch.meshgrid(hg, wg, indexing="ij")], dim=-1)
+        return grid, wg
+
+    def append_audio(count: int, width_grid: torch.Tensor) -> None:
+        frames = count // MINIMAX_H3_AUDIO_CHANNELS
+        pos = torch.zeros(count, 3, dtype=torch.float64)
+        pos[:, 0] = (origin + torch.arange(frames, dtype=torch.float64)).repeat(
+            MINIMAX_H3_AUDIO_CHANNELS
+        )
+        pos[:frames, 2] = width_grid[0]
+        pos[frames:, 2] = width_grid[-1]
+        positions.append(pos)
+        tags.append(torch.full((count,), MINIMAX_H3_AUDIO_TAG, dtype=torch.long))
+
+    _, target_width_grid = frame_grid(latent_height, latent_width)
+    for kind, has_audio in reference_kinds:
+        if kind == "audio":
+            count = next(counts)
+            append_audio(count, target_width_grid)
+            origin += count // MINIMAX_H3_AUDIO_CHANNELS
+            continue
+        if kind not in ("image", "video"):
+            raise ValueError(f"Unknown H3 reference kind: {kind!r}.")
+        frames, height, width = next(shapes)
+        grid, width_grid = frame_grid(height, width)
+        count = next(counts) if has_audio else 0
+        if has_audio:
+            append_audio(count, width_grid)
+        pos = torch.empty(frames * grid.shape[0], 3, dtype=torch.float64)
+        times = (
+            torch.tensor([origin], dtype=torch.float64)
+            if kind == "image"
+            else _temporal_position_grid(frames, origin)
+        )
+        pos[:, 0] = times.repeat_interleave(grid.shape[0])
+        pos[:, 1:] = grid.repeat(frames, 1)
+        positions.append(pos)
+        tags.append(torch.full((pos.shape[0],), MINIMAX_H3_VIDEO_TAG, dtype=torch.long))
+        # Reference video spans use sequential addition, unlike the pairwise
+        # sum used for last-keyframe anchors. Preserve that FP64 distinction.
+        span = (
+            1.0
+            if kind == "image"
+            else sum(
+                _ROPE_FRAME_RESCALE * _ROPE_FRAMES_PER_LATENT[i % len(_ROPE_FRAMES_PER_LATENT)]
+                for i in range(frames)
+            )
+        )
+        origin += max(count / MINIMAX_H3_AUDIO_CHANNELS, span)
+
+    target = build_packed_sequence(
+        text_token_tags,
+        num_latent_frames,
+        latent_height,
+        latent_width,
+        num_audio_latents,
+        patch_size,
+        rotary_time_origin=origin,
+    )
+    text_rows = text_token_tags.numel()
+    reference_tags = torch.cat(tags) if tags else torch.empty(0, dtype=torch.long)
+    target.position_ids = torch.cat(
+        [target.position_ids[:text_rows], *positions, target.position_ids[text_rows:]]
+    )
+    target.token_tags = torch.cat(
+        [target.token_tags[:text_rows], reference_tags, target.token_tags[text_rows:]]
+    )
+    indices = torch.arange(target.token_tags.numel())
+    target.video_indices = indices[
+        (target.token_tags == MINIMAX_H3_VIDEO_TAG) & (indices >= text_rows)
+    ]
+    target.audio_indices = indices[
+        (target.token_tags == MINIMAX_H3_AUDIO_TAG) & (indices >= text_rows)
+    ]
+    target.num_condition_video_rows = int((reference_tags == MINIMAX_H3_VIDEO_TAG).sum())
+    target.num_condition_audio_rows = int((reference_tags == MINIMAX_H3_AUDIO_TAG).sum())
+    target.sequence_length = target.token_tags.numel()
+    return target

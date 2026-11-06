@@ -51,4 +51,35 @@ inline KVCacheManagerConfig makeTieredConfig()
     return config;
 }
 
+//! Attention and SSM life cycles side by side, over a GPU and a host tier.
+//!
+//! Life cycles are registered in layer order, so the attention layer is LifeCycleId{0} and
+//! the SSM layer is LifeCycleId{1}. The buffer sizes differ so per-life-cycle byte counters
+//! identify which life cycle they came from.
+//!
+//! The quotas give attention 4 GPU and 2 host slots of 1 MiB, and SSM 1 GPU and 1 host slot
+//! of 2 MiB. A three-block sequence therefore fits on the GPU but a second sequence evicts
+//! it, and a second eviction round overflows the host pools.
+inline KVCacheManagerConfig makeHybridTieredConfig()
+{
+    KVCacheManagerConfig config;
+    config.tokensPerBlock = 4;
+    config.cacheTiers.emplace_back(GpuCacheTierConfig{6UL << 20});
+    config.cacheTiers.emplace_back(HostCacheTierConfig{4UL << 20});
+
+    AttentionLayerConfig attention;
+    attention.layerId = 0;
+    attention.buffers.push_back(BufferConfig{"key", 1UL << 20, std::nullopt});
+    config.layers.emplace_back(std::move(attention));
+
+    SsmLayerConfig ssm;
+    ssm.layerId = 1;
+    ssm.buffers.push_back(BufferConfig{"ssm_state", 2UL << 20, std::nullopt});
+    config.layers.emplace_back(std::move(ssm));
+
+    // KVCacheManagerConfig::validate() rejects an SSM layer without this.
+    config.commitMinSnapshot = true;
+    return config;
+}
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2::test

@@ -12,6 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ipaddress
+import socket
+
 import numpy as np
 import pytest
 
@@ -27,6 +30,20 @@ except ImportError:
     HAS_TRANSFER_AGENT = False
     HAS_NIXL = False
     HAS_MOONCAKE = False
+
+
+def _host_has_routable_ipv4():
+    """Whether this host has an IPv4 address that is not loopback.
+
+    Without one there is nothing for the agent to prefer, and the IPv6 fallback
+    is the correct answer rather than a regression.
+    """
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("10.255.255.255", 1))
+            return not probe.getsockname()[0].startswith("127.")
+    except OSError:
+        return False
 
 
 def _is_mooncake_runtime_available():
@@ -447,6 +464,35 @@ class TestNixlTransferAgent:
         ]
         for method in required_methods:
             assert hasattr(tab.NixlTransferAgent, method), f"Missing method: {method}"
+
+    def test_listening_agent_advertises_ipv4(self):
+        """The advertised address must be IPv4 whenever the host has one.
+
+        A listening agent advertises whatever getLocalIp picked, and that address
+        goes straight into a UCX TCP bind. An IPv6 address a NIC merely carries
+        is not necessarily bindable -- a ULA with no scope id fails with "Cannot
+        assign requested address" and takes the UCX backend down -- so IPv4 must
+        win on any host that has one.
+        """
+        if not _host_has_routable_ipv4():
+            pytest.skip("host has no routable IPv4 address")
+
+        config = tab.BaseAgentConfig(
+            name="agent_ipv4_pref",
+            use_prog_thread=False,
+            use_listen_thread=True,
+        )
+        agent = tab.NixlTransferAgent(config)
+        try:
+            connection_info = agent.get_local_connection_info()
+        finally:
+            agent.shutdown()
+
+        assert connection_info, "a listening agent must advertise an address"
+        # getLocalIp brackets IPv6 literals, so anything bracketed is IPv6.
+        host = connection_info.rsplit(":", 1)[0]
+        assert not host.startswith("["), f"expected an IPv4 address, got IPv6 {connection_info!r}"
+        ipaddress.IPv4Address(host)
 
 
 # =============================================================================

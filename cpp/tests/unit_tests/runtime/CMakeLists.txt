@@ -13,29 +13,139 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(bufferManagerTest bufferManagerTest.cpp)
-add_gtest(cudaMemPoolTest cudaMemPoolTest.cpp)
-add_gtest(gdrcopyTest gdrcopyTest.cpp)
-add_gtest(hostAccessibleDeviceAllocatorTest
-          hostAccessibleDeviceAllocatorTest.cu)
-add_gtest(iBufferTest iBufferTest.cpp)
-add_gtest(ipcNvlsMemoryTest ipcNvlsMemoryTest.cpp)
-add_gtest(iTensorTest iTensorTest.cpp)
-add_gtest(loraCacheTest loraCacheTest.cpp)
-add_gtest(loraUtilsTest loraUtilsTest.cpp)
-add_gtest(moeLoadBalancerTest moeLoadBalancerTest.cpp)
-add_gtest(runtimeMpiUtilsTest mpiUtilsTest.cpp)
-add_gtest(localizationTest localizationTest.cu)
-add_gtest(localityDomainPublicConfigTest localityDomainPublicConfigTest.cpp)
-add_gtest(sanitizerTest sanitizerTest.cpp)
-add_gtest(tllmBuffersTest tllmBuffersTest.cpp)
-add_gtest(transposeKVKernelTest transposeKVKernelTest.cpp)
-add_gtest(utilsTest utilsTest.cpp)
-add_gtest(virtualMemoryTest virtualMemoryTest.cpp)
-add_gtest(workerPoolTest workerPoolTest.cpp)
-add_gtest(worldConfigTest worldConfigTest.cpp)
+add_tllm_gtest(
+  bufferManagerTest
+  OWNER
+  runtime
+  SOURCES
+  bufferManagerTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  cudaMemPoolTest
+  OWNER
+  runtime
+  SOURCES
+  cudaMemPoolTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_memory
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(gdrcopyTest SOURCES gdrcopyTest.cpp FULL_STACK LABELS
+               "unit;full-stack;gpu")
+add_tllm_gtest(
+  hostAccessibleDeviceAllocatorTest SOURCES
+  hostAccessibleDeviceAllocatorTest.cu FULL_STACK LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  iBufferTest
+  OWNER
+  runtime
+  SOURCES
+  iBufferTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;host")
+add_tllm_gtest(ipcNvlsMemoryTest SOURCES ipcNvlsMemoryTest.cpp FULL_STACK
+               LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  iTensorTest
+  OWNER
+  runtime
+  SOURCES
+  iTensorTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;host")
+add_tllm_gtest(loraCacheTest SOURCES loraCacheTest.cpp FULL_STACK LABELS
+               "unit;full-stack;gpu")
+add_tllm_gtest(loraUtilsTest SOURCES loraUtilsTest.cpp FULL_STACK LABELS
+               "unit;full-stack;gpu")
+add_tllm_gtest(moeLoadBalancerTest SOURCES moeLoadBalancerTest.cpp FULL_STACK
+               LABELS "unit;full-stack;gpu")
+add_tllm_gtest(
+  runtimeMpiUtilsTest
+  OWNER
+  runtime
+  SOURCES
+  mpiUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_distributed
+  LABELS
+  "unit;runtime;host")
+add_tllm_gtest(localizationTest SOURCES localizationTest.cu FULL_STACK LABELS
+               "unit;full-stack;gpu")
+add_tllm_gtest(
+  localityDomainPublicConfigTest
+  OWNER
+  runtime
+  SOURCES
+  localityDomainPublicConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::common_headers
+  CUDA::toolkit
+  LABELS
+  "unit;runtime;host")
+add_tllm_gtest(
+  sanitizerTest
+  OWNER
+  runtime
+  SOURCES
+  sanitizerTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(
+  tllmBuffersTest
+  OWNER
+  runtime
+  SOURCES
+  tllmBuffersTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(transposeKVKernelTest SOURCES transposeKVKernelTest.cpp
+               FULL_STACK LABELS "unit;full-stack;gpu")
+add_tllm_gtest(utilsTest SOURCES utilsTest.cpp FULL_STACK LABELS
+               "unit;full-stack;gpu")
+add_tllm_gtest(
+  virtualMemoryTest
+  OWNER
+  runtime
+  SOURCES
+  virtualMemoryTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_buffers
+  LABELS
+  "unit;runtime;gpu")
+add_tllm_gtest(workerPoolTest SOURCES workerPoolTest.cpp FULL_STACK LABELS
+               "unit;full-stack;host")
+add_tllm_gtest(
+  worldConfigTest
+  OWNER
+  runtime
+  SOURCES
+  worldConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::runtime_distributed
+  LABELS
+  "unit;runtime;host")
 
 if(${BUILD_PYT})
-  add_gtest(torchTest torchTest.cpp)
-  target_link_libraries(torchTest PUBLIC ${TORCH_LIBRARIES})
+  add_tllm_gtest(
+    torchTest
+    OWNER
+    runtime
+    SOURCES
+    torchTest.cpp
+    LINK_LIBRARIES
+    tllm::runtime_buffers
+    LABELS
+    "unit;runtime;gpu")
+  target_link_libraries(torchTest PRIVATE ${TORCH_LIBRARIES})
 endif()

@@ -4,6 +4,53 @@
 
 All published functionality in the Release Notes has been fully tested and verified with known limitations documented. To share feedback about this release, access our [NVIDIA Developer Forum](https://forums.developer.nvidia.com/).
 
+## TensorRT-LLM Release 1.4
+
+### Key Features and Enhancements
+
+- **DeepSeek-V4 generation on B200/GB200 (SM100) now runs on the PrimTS native sparse MLA FMHA by default.** The new `prims_ts_sparse_mla` FMHA library (a CuTe DSL kernel vendored from FlashInfer) serves the DeepSeek-V4 sparse MLA generation phase ahead of the TRTLLM-Gen path on SM100; it covers BF16 and FP8 KV caches, the fused inverse-RoPE + FP8 output epilogue, speculative decoding (MTP) rows and CUDA graph replay. SM103 (GB300), `fp8_ds_mla` and NVFP4 KV caches keep the TRTLLM-Gen path. Opt out with `TLLM_FMHA_LIBS=-prims_ts_sparse_mla`.
+  - **First-launch compile cost.** The kernels are JIT-compiled by the CuTe DSL and cached on disk under the FlashInfer workspace. The first start on a host (or after a FlashInfer / CuTe DSL upgrade) compiles the kernel variants the deployment's generation row counts select during `LLM()` startup, about 5 to 10 minutes on B200 for DeepSeek-V4; later starts load the cache. Under `trtllm-llmapi-launch` and the default `LLM()` MPI session every rank has its own FlashInfer workspace (`TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=1`), so each rank compiles its own copy; set `TRTLLM_FLASHINFER_WORKSPACE_PER_PROCESS=0` to share one cache between the ranks of a host.
+  - **Warm-up controls.** `TLLM_PRIMTS_WARM_WORKERS` sets the compile subprocesses per rank (default 4, reduced so that the ranks on a host, counted from the model's parallel mapping, start at most 16 together; `0` compiles in-process), `TLLM_PRIMTS_WARM_TIMEOUT` bounds the wait for them (default 1800 s), and `TLLM_PRIMTS_WARM_STRICT=1` turns a worker failure into an error instead of an in-process retry. Each worker imports torch and the CuTe DSL and opens a CUDA context, so lower the worker count on nodes with little host memory.
+  - **`FLASHINFER_DISABLE_JIT=1`** now also refuses to compile these kernels (with the on-disk CuTe DSL cache enabled, its default): startup then fails on a variant missing from the cache instead of falling back to TRTLLM-Gen, so a deployment that sets it must pre-populate the cache (one start without the variable) or opt out of the library.
+- Disaggregated serving supports the Responses API: `trtllm-serve disaggregated` serves `/v1/responses` with context-first and generation-first scheduling, and `/v1/models`. `previous_response_id` is rejected and `store` is ignored there, since no response history is kept. See [Disaggregated Serving](features/disagg-serving.md#responses-api).
+
+### Infrastructure Changes
+
+### API Changes
+
+- `/v1/responses`: a response cut short by `max_output_tokens` now reports `incomplete_details.reason` `max_output_tokens`, and when streamed it ends with `response.incomplete` instead of `response.completed`, as in the OpenAI API.
+- <span style="color: red">**[BREAKING CHANGE] Removed obsolete C++ executor orchestration helpers.**</span> The internal `RequestWithId` type, its `serializeReqWithIds` / `deserializeReqWithIds` functions, all production `insertRequestInOrder` overloads, and the unused `requestUtils.h` and `orchestratorUtils.h` helpers have been removed. These helpers belonged to the retired C++ executor orchestration path; downstream code linking their exported symbols must stop using them and rebuild. The current `Request` / `Response` interfaces and serialization remain available. Executor factory and worker constructors no longer accept the unused `engine` and `batched_logits_processor` arguments; callers should omit them and continue passing model configuration through `llm_args` and `hf_model_dir`. Unused decoder, request-cancellation, executor, legacy-model, orchestration, and speculative-decoding MPI tag names have also been removed; values 1–23, 127–129, and 1023–1025 are retired. The default, KV-cache event, and context-transfer tags retain their existing values. Internal `LogprobParams` and `LogProbsResult` tuples now contain only prompt-logprob fields; generation logprobs remain supplied by the sampler. The unused `TLLM_EXECUTOR_PERIODICAL_RESP_IN_AWAIT` environment variable has been removed.
+- <span style="color: red">**[BREAKING CHANGE] Unified multimodal processor metadata.**</span>
+  Multimodal processor extensions now use `get_mm_item_metadata()` and
+  `MultimodalItemMetadata`, replacing `get_mm_encoder_item_metadata()` and
+  `MultimodalEncoderItemMetadata`. The removed `DisaggPrefillMultimodalInputs`
+  result is replaced by `(prompt_token_ids, MultimodalParams)` from
+  `build_disagg_prefill_multimodal_inputs()`, which also accepts the keyword-only
+  `mm_hashes` argument. Custom processors must migrate these hooks; processors
+  defining the removed metadata hook now fail at wrapper creation.
+  Also removed: `MultimodalParams(mm_item_order=...)`, the
+  `multimodal_embedding_lengths` and `layout_metadata` keys in `multimodal_data`,
+  `registry.get_multimodal_encoder_item_metadata`, and `LlmRequest.py_mm_item_order`.
+  Read item order and output lengths through `MultimodalParams.item_metadata`.
+  Grouped encoders must also include item metadata with exact output row counts
+  in `get_dummy_mm_data()` results used for startup profiling. See the
+  [multimodal developer guide](developer-guide/multimodal.md).
+- **[DEPRECATION]** KV cache manager V1 (`kv_cache_config.use_kv_cache_manager_v2=False`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. KV cache manager V2 is the default (`use_kv_cache_manager_v2=True`). During the migration period V1 keeps working and logs a one-time warning when it is constructed, including when `use_kv_cache_manager_v2="auto"` resolves to it and when sleep mode (`sleep_config`), which V2 does not support yet, falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+- **[DEPRECATION]** The C++ cache transceiver (`cache_transceiver_config.transceiver_runtime="CPP"`, or `None`) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. The Python transceiver is the default (`transceiver_runtime="PYTHON"`); it runs on the NIXL backend with KV cache manager V2, so deployments on the UCX, MPI or MOONCAKE backend must move to NIXL. The C++ NIXL transfer agent that the Python transceiver uses is not affected. During the migration period the C++ transceiver keeps working and logs a one-time warning when it is constructed, including when `transceiver_runtime="auto"` resolves or falls back to it. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+- **Migration prerequisites:** Sleep mode, RocketKV, and skip-softmax still require KV cache manager V1. Experimental in-flight cancellation (`TRTLLM_DISAGG_ENABLE_INFLIGHT_CANCEL=1`) still requires a supported C++ transceiver configuration. Keep those implementations for these features during migration.
+
+### Fixed Issues
+
+### Known Issues
+
+## TensorRT-LLM Release 1.3
+
+### API Changes
+
+- NVFP4 cold-page compression remains opt-in and disabled by default. When enabled for DeepSeek-V4, NoPE uses NVFP4 and RoPE now defaults to 2FP4 (`nvfp4_residual_dim=64`). Set `skip_rope_quantization=True` to keep RoPE at its original precision, as before, or `nvfp4_residual_dim=0` to use single NVFP4. The active GPU KV-cache dtype is unchanged. See the [NVFP4 cold-page compression example](source:examples/kv_cache_compression/nvfp4_cold_page.md#deepseek-v4).
+
+- **[DEPRECATION]** The TRITON MoE backend (`TritonFusedMoE`, `moe_config.backend="TRITON"`) is deprecated as of TensorRT-LLM 1.3 (2026-09) and will be removed after the 3-month migration period. Its only remaining role is a modest performance edge for GPT-OSS on Hopper with `W4A16_MXFP4` — the single configuration `AUTO` resolves to TRITON, and the format an MXFP4 GPT-OSS checkpoint takes on SM90. As the model set and the supported platforms keep growing, a single-scenario MoE path is no longer worth its maintenance cost. `moe_config.backend="CUTLASS"` replaces it functionally on Hopper: it serves `W4A16_MXFP4` on SM90 along with the unquantized BF16 and FP8 per-tensor paths, and MoE backend resolution already degrades to it automatically when TRITON declines a layer. During the migration period TRITON keeps working and logs a one-time warning. See the [deprecation policy](https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy).
+
 ## TensorRT-LLM Release 1.2
 
 ### Key Features and Enhancements
@@ -85,7 +132,7 @@ All published functionality in the Release Notes has been fully tested and verif
     - **Scaffolding:** Added benchmark support for scaffolding examples.
 - **Documentation**
   - **Deployment Guides:** Added comprehensive deployment guides for GPT-OSS, DeepSeek-R1, and VDR 1.0.
-  - **Feature Documentation:** Created new documentation for KV Cache Connector, LoRA feature usage, and AutoDeploy.
+  - **Feature Documentation:** Created new documentation for KV Cache Connector and LoRA feature usage.
   - **Tech Blogs:** Published blogs on "[Combining Guided Decoding and Speculative Decoding](./blogs/tech_blog/blog12_Combining_Guided_Decoding_and_Speculative_Decoding.md)" and "[ADP Balance Strategy](./blogs/tech_blog/blog10_ADP_Balance_Strategy.md)".
   - **Quick Start:** Refined Quick Start guides with new links to ModelOpt checkpoints and updated installation steps (Linux/Windows).
   - **API Reference:** Enhanced LLM API documentation by explicitly labeling stable vs. unstable APIs.
@@ -366,7 +413,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - The dependent NCCL version is updated to 2.27.5.
 
 ### API Changes
-- Set _AutoDeployLlmArgs as primary config object
 - Removed decoder request from decoder interface
 - Enhanced the torch_compile_config in llm args
 - Removed the redundant use_kv_cache field from PytorchConfig
@@ -449,7 +495,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### API Changes
 - [BREAKING CHANGE] Enable scheduling overlap by default
 - Remove deprecated GptSession/V1 from TRT workflow
-- Set _AutoDeployLlmArgs as primary config object
 - Allow overriding CLI arguments with YAML file in trtllm-serve
 - Introduced multimodal embedding field in LlmRequest
 
@@ -500,10 +545,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
     - Added support for enabling MTP with CUDA graph padding.
     - Added initial EAGLE-3 implementation.
     - Added support for FP8 MLA on NVIDIA Hopper and Blackwell GPUs.
-  - **AutoDeploy for PyTorch workflow**.
-    - The AutoDeploy for PyTorch workflow is an **experimental** feature in `tensorrt_llm._torch.auto_deploy`.
-    - AutoDeploy provides an automated path from off-the-shelf models to optimized deployment in the TensorRT-LLM runtime.
-    - Check out `examples/auto_deploy/README.md` for more details.
   - LLM API
     - [BREAKING CHANGE] Added dynamic logits processor support, and deprecated static logits processor.
     - Added batched logits processor support.
@@ -1048,7 +1089,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Supported phi 3 vision multimodal.
 
 ### Fixed Issues
-- Fixed brokens outputs for the cases when batch size is larger than 1. (#1539)
+- Fixed broken outputs for the cases when batch size is larger than 1. (#1539)
 - Fixed `top_k` type in `executor.py`, thanks to the contribution from @vonjackustc in #1329.
 - Fixed stop and bad word list pointer offset in Python runtime, thanks to the contribution from @fjosw in #1486.
 - Fixed some typos for Whisper model, thanks to the contribution from @Pzzzzz5142 in #1328.

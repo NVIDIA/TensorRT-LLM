@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 from pathlib import Path
 from typing import Optional, Type
@@ -7,6 +10,7 @@ from .deepseekv3_parser import DeepSeekV3Parser
 from .deepseekv4_parser import DeepSeekV4Parser
 from .deepseekv31_parser import DeepSeekV31Parser
 from .deepseekv32_parser import DeepSeekV32Parser
+from .deepseekv41_parser import DeepSeekV41Parser
 from .gemma4_parser import Gemma4ToolParser
 from .glm4_parser import Glm4ToolParser
 from .glm47_parser import Glm47ToolParser
@@ -28,6 +32,8 @@ MODEL_TYPE_TO_TOOL_PARSER: dict[str, str] = {
     "deepseek_v3": "deepseek_v3",
     "deepseek_v32": "deepseek_v32",
     "deepseek_v4": "deepseek_v4",
+    "deepseek_v41": "deepseek_v41",
+    "deepseek_v41_text": "deepseek_v41",
     "kimi_k2": "kimi_k2",
     "kimi_k25": "kimi_k2",
     "kimi_k3": "kimi_k3",
@@ -69,6 +75,7 @@ class ToolParserFactory:
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
         "deepseek_v4": DeepSeekV4Parser,
+        "deepseek_v41": DeepSeekV41Parser,
         "gemma4": Gemma4ToolParser,
         "glm4": Glm4ToolParser,
         "glm47": Glm47ToolParser,
@@ -78,12 +85,16 @@ class ToolParserFactory:
     }
 
     @staticmethod
-    def create_tool_parser(tool_parser: str) -> BaseToolParser:
+    def create_tool_parser(
+        tool_parser: str, *, grammar_constrained: bool = False
+    ) -> BaseToolParser:
         try:
             tool_parser_class = ToolParserFactory.parsers[tool_parser.lower()]
-            return tool_parser_class()
         except KeyError as e:
             raise ValueError(
                 f"Invalid tool_parser: {tool_parser}\n"
                 f"Supported parsers: {list(ToolParserFactory.parsers.keys())}"
             ) from e
+        parser = tool_parser_class()
+        parser.grammar_constrained = grammar_constrained
+        return parser

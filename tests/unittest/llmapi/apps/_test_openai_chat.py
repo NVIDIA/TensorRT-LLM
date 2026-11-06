@@ -17,9 +17,9 @@ from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
+@pytest.fixture(scope="module", ids=["Qwen3-0.6B"])
 def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B"
 
 
 @pytest.fixture(scope="module", params=["pytorch"])
@@ -70,6 +70,11 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
     args = ["--backend", f"{backend}"]
     args.extend(["--kv_cache_free_gpu_memory_fraction",
                  "0.2"])  # for co-existence with other servers
+    # Requests in this module don't all set an explicit max_tokens; without a
+    # cap here, the server deduces max_new_tokens from Qwen3's long default
+    # context length (tens of thousands of tokens), which can exceed the
+    # available KV cache on smaller GPUs.
+    args.extend(["--max_seq_len", "2048"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -87,6 +92,7 @@ def server_with_beam_search(model_name: str, backend: str,
     args = ["--backend", f"{backend}"]
     args.extend(["--kv_cache_free_gpu_memory_fraction",
                  "0.2"])  # for co-existence with other servers
+    args.extend(["--max_seq_len", "2048"])
     args.extend(["--max_beam_width", "2"])
     if extra_llm_api_options:
         args.extend(

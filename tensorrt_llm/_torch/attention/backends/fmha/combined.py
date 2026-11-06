@@ -43,6 +43,10 @@ class CombinedFmha(PhasedFmha):
     ) -> None:
         self._context_impl = context_impl
         self._generation_impl = generation_impl
+        self.supports_workspace_reclamation = (
+            context_impl.supports_workspace_reclamation
+            and generation_impl.supports_workspace_reclamation
+        )
 
     def _get_context_impl(self) -> PhasedFmha:
         if self._context_impl is None:

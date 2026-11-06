@@ -26,8 +26,6 @@
 #include <cuda_runtime.h>
 #include <type_traits>
 
-#include <cooperative_groups.h>
-
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 
 TRTLLM_NAMESPACE_BEGIN
@@ -196,6 +194,7 @@ struct LamportBufferLayout
                 (lamportIndex * numStages + stageIndex) * static_cast<size_t>(bytesPerBuffer / numStages)));
     }
 };
+
 // Current Index
 // Dirty Index
 // bytes_per_buffer
@@ -203,10 +202,8 @@ struct LamportBufferLayout
 // Dirty bytes_to_clear = {stage0, stage1, stage2, stage3}  # We fix this to 4 stages
 // offset_access_ptr
 
-namespace cg = cooperative_groups;
-
 // PackedType is the one used in kernel for Lamport buffer (LDG.128 or LDG.64)
-template <typename PackedType = float4, bool UseCGA = false>
+template <typename PackedType = float4>
 struct __attribute__((aligned(32))) LamportFlags
 {
 public:
@@ -258,63 +255,28 @@ public:
 
     __device__ void ctaArrive()
     {
-        if constexpr (UseCGA)
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
+        uint32_t const barrierThreads
+            = ((static_cast<uint32_t>(blockDim.x) + kWARP_SIZE - 1U) / kWARP_SIZE) * kWARP_SIZE;
+        if (threadIdx.x < kWARP_SIZE)
         {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-            cg::cluster_group cluster = cg::this_cluster();
-            __cluster_barrier_arrive();
-            if (cluster.block_rank() == 0 && threadIdx.x < kWARP_SIZE)
-            {
-                __cluster_barrier_wait();
-                arriveCounter(threadIdx.x);
-            }
-#else
-            __syncthreads();
+            asm volatile("barrier.cta.sync 1, %0;" ::"r"(barrierThreads) : "memory");
             arriveCounter(threadIdx.x);
-#endif
         }
         else
         {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 700))
-            uint32_t const barrierThreads
-                = ((static_cast<uint32_t>(blockDim.x) + kWARP_SIZE - 1U) / kWARP_SIZE) * kWARP_SIZE;
-            if (threadIdx.x < kWARP_SIZE)
-            {
-                asm volatile("barrier.cta.sync 1, %0;" ::"r"(barrierThreads) : "memory");
-                arriveCounter(threadIdx.x);
-            }
-            else
-            {
-                asm volatile("barrier.cta.arrive 1, %0;" ::"r"(barrierThreads) : "memory");
-            }
-#else
-            __syncthreads();
-            arriveCounter(threadIdx.x);
-#endif
+            asm volatile("barrier.cta.arrive 1, %0;" ::"r"(barrierThreads) : "memory");
         }
+#else
+        __syncthreads();
+        arriveCounter(threadIdx.x);
+#endif
     }
 
     __device__ void waitAndUpdate(uint4 bytesToClearPerStage)
     {
-        bool isLastCtaT0{false};
-        int targetCount{0};
-        if constexpr (UseCGA)
-        {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-            cg::grid_group grid = cg::this_grid();
-            // Use the first thread instead of the last thread as the last thread may exit early.
-            isLastCtaT0 = grid.thread_rank() == 0;
-            targetCount = grid.num_clusters();
-#else
-            isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
-            targetCount = gridDim.x * gridDim.y * gridDim.z;
-#endif
-        }
-        else
-        {
-            isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
-            targetCount = gridDim.x * gridDim.y * gridDim.z;
-        }
+        bool const isLastCtaT0 = threadIdx.x == 0 && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
+        int const targetCount = gridDim.x * gridDim.y * gridDim.z;
         if (isLastCtaT0)
         {
             uint4* flagPtr = reinterpret_cast<uint4*>(mBufferFlagsPtr);

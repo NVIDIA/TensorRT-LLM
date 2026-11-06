@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
-
 import pytest
 import torch
 
@@ -87,9 +85,6 @@ def test_stats_delta_arithmetic() -> None:
 
 
 def test_cpp_stats_types_are_native() -> None:
-    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
-        pytest.skip("C++ backend only")
-
     from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
 
     assert KVCacheStatsDelta is cpp.KVCacheStatsDelta
@@ -108,9 +103,6 @@ def test_cpp_stats_types_are_native() -> None:
 
 
 def test_native_cold_page_codec_is_consumed_after_failure() -> None:
-    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
-        pytest.skip("C++ backend only")
-
     from tensorrt_llm.bindings.internal.batch_manager import kv_cache_manager_v2 as cpp
     from tensorrt_llm.runtime.kv_cache_manager_v2 import create_default_kv_cache_cold_page_codec
 
@@ -127,9 +119,6 @@ def test_native_cold_page_codec_is_consumed_after_failure() -> None:
 
 
 def test_native_cold_page_codec_rejects_wrong_type() -> None:
-    if os.environ.get("TLLM_KV_CACHE_MANAGER_V2_BACKEND", "cpp").lower() != "cpp":
-        pytest.skip("C++ backend only")
-
     with pytest.raises(TypeError, match="IKvCacheColdPageCodec instance or None"):
         KVCacheManager(_make_config(), cold_page_codec=5)
 
@@ -200,6 +189,43 @@ def test_manager_stats_config_and_api(enable_stats: bool) -> None:
             assert request_stats == KVCacheStatsDelta()
             assert committed == KVCacheStatsDelta()
             assert iteration == {}
+        stream.synchronize()
+    finally:
+        if cache is not None:
+            cache.close()
+        manager.shutdown()
+
+
+def test_connector_reuse_is_committed_as_reused() -> None:
+    manager = KVCacheManager(_make_config())
+    cache = None
+    try:
+        cache = manager.create_kv_cache(id=17, expected_prompt_length=16)
+        stream = torch.cuda.Stream()
+        assert cache.resume(stream.cuda_stream)
+        assert cache.resize(12)
+        cache.record_connector_reuse(0, 8)
+
+        request_stats = cache.commit_pending_stats()
+        assert request_stats == KVCacheStatsDelta(
+            alloc_total_blocks=3, alloc_new_blocks=3, reused_blocks=2, missed_blocks=1
+        )
+        assert manager.get_committed_stats() == request_stats
+        (iteration,) = manager.get_and_reset_iteration_stats().values()
+        assert iteration.iter_reused_blocks == 2
+        assert iteration.iter_full_reused_blocks == 2
+        assert iteration.iter_missed_blocks == 1
+        assert list(manager.get_and_reset_iteration_connector_reused_blocks().values()) == [2]
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 8
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 0
+
+        # Once committed, the allocation is no longer pending and stays a miss. The tokens still
+        # count as connector cached tokens.
+        cache.record_connector_reuse(8, 12)
+        assert cache.commit_pending_stats() == KVCacheStatsDelta()
+        assert manager.get_and_reset_iteration_connector_reused_blocks() == {}
+        assert manager.get_and_reset_iteration_connector_cached_tokens() == 4
         stream.synchronize()
     finally:
         if cache is not None:

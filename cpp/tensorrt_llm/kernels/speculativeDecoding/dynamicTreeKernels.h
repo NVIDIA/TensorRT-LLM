@@ -97,8 +97,9 @@ void invokeVerifyDynamicTreeGreedyPacked(int32_t* acceptIndex, int32_t* acceptTo
 //! \param numDraftTokens runtime::SizeType32. Total tree nodes per request (including root).
 //! \param numSpecStep    runtime::SizeType32. Second dim of acceptIndex/acceptToken.
 //! \param vocabSize      runtime::SizeType32. Vocabulary size.
-//! \param seed           [1] int64 on GPU. Philox RNG seed.
-//! \param offset         [1] int64 on GPU. Philox RNG offset.
+//! \param seed           [batchSize] int64 on GPU. Philox RNG seed per request.
+//! \param offset         [batchSize] int64 on GPU. Philox RNG offset per request; it names the request's
+//!                       own subsequence.
 //! \param stream         cudaStream_t.
 void invokeVerifyDynamicTreeRejection(int64_t* acceptIndex, int64_t* acceptTokenNum, int64_t* acceptToken,
     int64_t const* draftTokens, float const* targetProbs, int32_t const* retrieveNextToken,

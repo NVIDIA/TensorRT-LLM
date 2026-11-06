@@ -23,16 +23,23 @@ through its shared load-strategy chain.
 import logging
 import os
 from importlib import import_module
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm._torch.models.modeling_utils import register_checkpoint_loader
-from tensorrt_llm._torch.weight_sharing import SOURCE_IDENTITY_FORMAT_VERSION, SourceIdentity
+from tensorrt_llm._torch.weight_sharing import (
+    SOURCE_IDENTITY_FORMAT_VERSION,
+    SourceIdentity,
+    maybe_write_weight_manifest,
+)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+if TYPE_CHECKING:
+    from torch import nn
 
 
 def _enable_mx_transfer_logging() -> None:
@@ -43,6 +50,21 @@ def _enable_mx_transfer_logging() -> None:
     mx_logger = logging.getLogger("modelexpress")
     if mx_logger.getEffectiveLevel() > logging.INFO:
         mx_logger.setLevel(logging.INFO)
+
+
+def _maybe_write_mx_transfer_manifest(model: "nn.Module", *, rank: int, boundary: str) -> None:
+    """Fingerprint the bytes at an MX transfer boundary when `MX_WEIGHT_MANIFEST_DIR` is set.
+
+    `build_weight_manifest` synchronizes every CUDA device it hashes, so no
+    device synchronization is added here; without the environment gate this
+    is a no-op for production loads.
+    """
+    maybe_write_weight_manifest(
+        model,
+        family="transfer",
+        rank=rank,
+        context={"boundary": boundary, "checkpoint_format": "MX"},
+    )
 
 
 @register_checkpoint_loader("MX")
@@ -255,6 +277,12 @@ class MXCheckpointLoader(HfCheckpointLoader):
                 )
             self._post_transform_weights_preloaded = post_transform_compatible
             self._source_identity_compatible_for_last_load = post_transform_compatible
+            if self._p2p_succeeded:
+                # The receiver's transfer-boundary fingerprint: the complete
+                # shard as ModelExpress wrote it, before TRT-LLM finalization.
+                _maybe_write_mx_transfer_manifest(
+                    model, rank=mapping.rank, boundary="receiver_p2p_success"
+                )
             return weights
         except Exception:
             self._p2p_succeeded = False
@@ -273,12 +301,25 @@ class MXCheckpointLoader(HfCheckpointLoader):
     ) -> None:
         """Publish through the active MX session.
 
-        ``checkpoint_dir`` and ``source_identity`` are retained only for the
+        `checkpoint_dir` and `source_identity` are retained only for the
         common checkpoint-loader hook signature; the session captured both at
-        load time.
+        load time. With weight-manifest capture enabled, a natively loaded
+        donor fingerprints its bytes right before publication.
         """
-        if self._mx_loader is not None:
-            self._mx_loader.publish_model(model)
+        if self._mx_loader is None:
+            return
+        if not self._p2p_succeeded:
+            # A receiver republishes the shard it already fingerprinted at P2P
+            # success, so only a native-loaded donor writes a manifest here.
+            # It runs before publication on purpose: a manifest problem must
+            # surface instead of being masked by the publish path.
+            identity = (
+                source_identity if source_identity is not None else self._local_source_identity
+            )
+            if identity is None:
+                raise RuntimeError("MX publish requires the SourceIdentity captured at load time")
+            _maybe_write_mx_transfer_manifest(model, rank=identity.rank, boundary="donor_publish")
+        self._mx_loader.publish_model(model)
 
     def post_load_publish(
         self,

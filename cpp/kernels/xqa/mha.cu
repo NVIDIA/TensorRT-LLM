@@ -1586,6 +1586,21 @@ CUBIN_EXPORT __global__
     assert(warpIdx.x < ctaShapeInWarps.x && warpIdx.y < ctaShapeInWarps.y && warpIdx.z < ctaShapeInWarps.z);
     uint32_t const flatWarpIdPerRow = warpIdx.z * ctaShapeInWarps.x + warpIdx.x; // per ctaShapeInWarps.y value
 
+    // Include the sink in both GEMMs' initial maxima before computing softmax weights.
+    auto initialRowMax = ThrdRegRowMax::filled(safeInitRowMax);
+    if (attentionSinks != nullptr)
+    {
+        for (uint32_t i = 0; i < initialRowMax.size; i++)
+        {
+            uint32_t const rowOffset = warp_size * i + laneId();
+            if (rowOffset < (SPEC_DEC ? warpTile.y : headGrpSize))
+            {
+                uint32_t const srcOffset = SPEC_DEC ? rowOffset % headGrpSize : rowOffset;
+                initialRowMax[i] = fmaxf(initialRowMax[i], attentionSinks[headGrpSize * idxHeadGrp + srcOffset]);
+            }
+        }
+    }
+
     // initialize shared memory
     static_assert(persistentQ && ctaShapeInWarps.y == 1);
     if (ctaThrdId < ctaShapeInWarps.y)
@@ -2059,6 +2074,7 @@ CUBIN_EXPORT __global__
 #endif
 
             // find max and update acc into exp(acc-max).
+            initRowMaxQuad = fmaxf(initRowMaxQuad, replicateForQuad(warp, initialRowMax));
             QuadRegRowMax const regRowMax = warpTileOnlineSoftmax(warp, initRowMaxQuad, acc);
 
             // store result and max to shared memory.
@@ -2319,8 +2335,7 @@ CUBIN_EXPORT __global__
         ParityOrNone<grpLoadV> vBarParity{};
         // @fixme: do prefetch for next iter tile if last part
 
-        ThrdRegRowMax globalRowMax;
-        globalRowMax.fill(safeInitRowMax);
+        ThrdRegRowMax globalRowMax = initialRowMax;
         ThrdRegRowMax globalRowSum;
         globalRowSum.fill(0);
         // the accumulator
@@ -2528,14 +2543,20 @@ CUBIN_EXPORT __global__
 
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
         if (seqIterInit < nbSeqIters)
-        { // otherwise rcpRowSum will be NAN.
+        {
             // In multi-block mode, assign the virtual sink token to exactly one partial CTA.
             if ((!isMultiBlock || idxSubSeqInSeq == 0) && attentionSinks != nullptr)
             {
                 // Attention sinks are per head.
                 addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
             }
-            ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
+            // Fully masked partial rows have zero weight and must contribute zero when merged.
+            ThrdRegRowMax rcpRowSum;
+#pragma unroll
+            for (uint32_t i = 0; i < globalRowSum.size; i++)
+            {
+                rcpRowSum[i] = globalRowSum[i] == 0.F ? 0.F : __frcp_rn(globalRowSum[i]);
+            }
 #if LOW_PREC_OUTPUT
             voScale *= rcpOutScale[0];
 #endif

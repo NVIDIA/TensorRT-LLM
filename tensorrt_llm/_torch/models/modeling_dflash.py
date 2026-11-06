@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
+import math
 from dataclasses import replace
 from typing import Dict, Optional
 
@@ -9,24 +10,35 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm.llmapi.llm_args import is_dflash2_checkpoint, is_lilicorr_checkpoint
 from tensorrt_llm.logger import logger
 
-from ...functional import RotaryScalingType
+from ...functional import AllReduceFusionOp, AllReduceParams, RotaryScalingType
 from ..attention.rotary_embedding import RotaryEmbedding
 
 try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..distributed import AllReduce
+from ..modules.logits_processor import scale_and_soft_cap_logits
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
+    DFLASH_CONTEXT_LOWERING,
+    dflash_trtllm_gen_unavailability_reason,
     get_dflash_fa4_fwd,
     get_dflash_flash_attention,
     get_dflash_paged_append,
     get_dflash_trtllm_gen_ops,
 )
 from ..speculative.interface import SpeculativeDecodingMode
-from .modeling_utils import get_model_architecture, register_draft_model
+from ..speculative.spec_tail_kernels import DraftBlockPlacement
+from .modeling_utils import FUSED_MODULE_COMPONENTS, get_model_architecture, register_draft_model
+
+# trtllm-gen reports the log-sum-exp in base 2; the merge and the MLA fixup
+# (modeling_dspark) multiply by this to get the natural-log LSE flashinfer's
+# merge expects. One constant, so a flashinfer convention change is fixed once.
+TRTLLM_GEN_LSE_LN2 = math.log(2.0)
 
 
 def dspark_layer_window_size(
@@ -49,16 +61,425 @@ def dspark_layer_window_size(
     draft queries to the most recent ``swa_window`` context tokens plus the
     (nearby) draft block. Full-attention layers and drafters that do not enable
     the window keep flash-attn's default ``(-1, -1)`` (no window).
+
+    A drafter that sets `use_swa` but declares no sliding layer is windowed on
+    every layer: some DFlash 2 drafters are exported with all `full_attention`
+    layer types and the window only in `dflash_config`, and other serving
+    stacks window every layer of such a drafter. The per-layer filter applies
+    only when the layer types tell sliding layers from full ones, and it reads
+    them with `_is_sliding_attention_layer`, as the attention mask does.
     """
     if not use_swa:
         return (-1, -1)
+    any_sliding = layer_types is not None and any(
+        _is_sliding_attention_layer(layer_type) for layer_type in layer_types
+    )
     if (
-        layer_types is not None
+        any_sliding
         and layer_idx < len(layer_types)
-        and layer_types[layer_idx] != "sliding_attention"
+        and not _is_sliding_attention_layer(layer_types[layer_idx])
     ):
         return (-1, -1)
     return (swa_window - 1, swa_window - 1)
+
+
+def dflash_merge_future_block_attention(
+    out_causal: torch.Tensor,
+    lse_causal: torch.Tensor,
+    query: torch.Tensor,
+    block_key: torch.Tensor,
+    block_value: torch.Tensor,
+    scale: float,
+    window_right: int,
+) -> torch.Tensor:
+    """Extend a causal block attention to a non-causal one, exactly.
+
+    A non-causal block query ``j`` attends the keys a causal one does (context
+    within the left window, block keys ``<= j``) plus the block keys after it,
+    ``j < k <= j + window_right``. Given the causal output and its natural-log
+    log-sum-exp, this adds that second key set's softmax mass and renormalizes:
+    the result is the non-causal attention up to rounding. It is how the TRTLLM
+    backend serves a non-causal sliding-window layer, which the trtllm-gen
+    context kernel rejects while its causal decode kernel windows natively.
+
+    Args:
+        out_causal: [B * blk, Hq, D] causal attention output.
+        lse_causal: [B * blk, Hq] float32 log-sum-exp of the scaled causal logits.
+        query: [B, blk, Hq, D] block queries, as the kernel saw them.
+        block_key / block_value: [B, blk, Hkv, D] block K/V, as appended to the cache.
+        scale: softmax scale the kernel applied to ``q @ k``.
+        window_right: inclusive right window in tokens; -1 means unbounded.
+    Returns:
+        [B * blk, Hq, D] in ``out_causal.dtype``.
+    """
+    B, blk, num_heads, head_dim = query.shape
+    num_kv_heads = block_key.shape[2]
+    group = num_heads // num_kv_heads
+    q = query.float().reshape(B, blk, num_kv_heads, group, head_dim)
+    logits = torch.einsum("bjhgd,bkhd->bhgjk", q, block_key.float()) * scale
+    offsets = torch.arange(blk, device=query.device)
+    distance = offsets.view(1, -1) - offsets.view(-1, 1)  # [j, k] = k - j
+    future = distance > 0
+    if window_right >= 0:
+        future &= distance <= window_right
+    logits = logits.masked_fill(~future, float("-inf"))
+    lse_future = torch.logsumexp(logits, dim=-1)  # [B, Hkv, g, blk], -inf for no future keys
+    lse_future_finite = torch.where(
+        torch.isfinite(lse_future), lse_future, torch.zeros_like(lse_future)
+    )
+    probs = torch.exp(logits - lse_future_finite.unsqueeze(-1))
+    out_future = torch.einsum("bhgjk,bkhd->bjhgd", probs, block_value.float())
+    out_future = out_future.reshape(B * blk, num_heads, head_dim)
+    lse_future = lse_future.permute(0, 3, 1, 2).reshape(B * blk, num_heads)
+
+    lse_total = torch.logaddexp(lse_causal, lse_future)
+    weight_causal = torch.exp(lse_causal - lse_total).unsqueeze(-1)
+    weight_future = torch.exp(lse_future - lse_total).unsqueeze(-1)
+    merged = weight_causal * out_causal.float() + weight_future * out_future
+    return merged.to(out_causal.dtype)
+
+
+def dflash_trtllm_windowed_block_attention(
+    trtllm_gen_ops,
+    query: torch.Tensor,
+    block_key: torch.Tensor,
+    block_value: torch.Tensor,
+    layer_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    causal: bool,
+    window_size: tuple[int, int],
+    workspace: torch.Tensor,
+    counters: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Block attention through the trtllm-gen decode kernel, into ``out``.
+
+    Serves a causal layer (windowed or not) and a non-causal windowed one; a
+    non-causal unwindowed layer takes the context kernel instead. trtllm-gen
+    windows only causal attention, so the non-causal windowed case runs the
+    causal decode with its log-sum-exp and then adds the block keys after each
+    query (:func:`dflash_merge_future_block_attention`).
+
+    Args:
+        query: [B, blk, Hq, D] block queries.
+        block_key / block_value: [B, blk, Hkv, D], already appended to ``layer_cache``.
+        layer_cache: [pages, 2, Hkv, page_size, D] HND pages of this layer.
+        seq_lens: [B] context plus block tokens per request.
+        window_size: (left, right) inclusive token bounds, -1 for none.
+        out: [B * blk, Hq, D] output.
+    """
+    B, block_size, num_heads, head_dim = query.shape
+    window_left, window_right = window_size
+    merge_future = not causal and window_left >= 0
+    decoded = trtllm_gen_ops.batch_decode_with_kv_cache(
+        query=query.reshape(-1, num_heads, head_dim),
+        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=max_seq_len,
+        bmm1_scale=head_dim**-0.5,
+        bmm2_scale=1.0,
+        window_left=window_left,
+        out=out,
+        sinks=None,
+        enable_pdl=False,
+        kv_layout="HND",
+        backend="trtllm-gen",
+        q_len_per_req=block_size,
+        max_q_len=None,
+        cum_seq_lens_q=None,
+        kv_cache_sf=None,
+        uses_shared_paged_kv_idx=True,
+        bmm1_scale_log2=None,
+        return_lse=merge_future,
+        multi_ctas_kv_counter_buffer=counters,
+    )
+    if merge_future:
+        lse = decoded[1] * TRTLLM_GEN_LSE_LN2
+        out.copy_(
+            dflash_merge_future_block_attention(
+                out, lse, query, block_key, block_value, head_dim**-0.5, window_right
+            )
+        )
+
+
+def declares_lilicorr(config: PretrainedConfig) -> bool:
+    """Whether the checkpoint requires the LiLiCorr candidate scorer."""
+    return is_lilicorr_checkpoint(
+        getattr(config, "architectures", None), getattr(config, "dflash_config", None) or {}
+    )
+
+
+def dflash2_grouped_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base_kernel: torch.Tensor,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Short dynamic depthwise convolution across one drafted block.
+
+    ``Conv(x)_t = sum_i k_{t,i} * x_{t-i}``, with ``k_{t,i} = base_kernel[i] +
+    delta[t, i]`` (a per-position correction shared by every ``group_size``
+    channels). Taps reaching past a block's start contribute nothing.
+
+    Args:
+        hidden_states: ``[B * block_size, hidden_size]``, request-major.
+        delta: ``[B * block_size, taps, hidden_size // group_size]``.
+        base_kernel: ``[taps, hidden_size]``.
+    Returns:
+        ``[B * block_size, hidden_size]``
+    """
+    taps, hidden_size = base_kernel.shape
+    num_groups = hidden_size // group_size
+    blocks = hidden_states.unflatten(-1, (num_groups, group_size))
+    coefficients = base_kernel.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
+    output = coefficients[:, 0] * blocks
+    if taps > 1:
+        position = torch.arange(hidden_states.shape[0], device=hidden_states.device) % block_size
+        for tap in range(1, taps):
+            shifted = F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+            output += coefficients[:, tap] * shifted * (position >= tap).view(-1, 1, 1)
+    return output.flatten(-2)
+
+
+def dflash2_score_edges(
+    predecessor_codebook: torch.Tensor,
+    successor_codebook: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    unary_logits: torch.Tensor,
+    gate: torch.Tensor,
+    anchor_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Score every adjacent candidate pair in a drafted block at once.
+
+    ``S_t(a, b) = U_t(b) + <A(a) * H(h_t), B(b)>``: the drafter's logit for
+    ``b`` plus a low-rank bilinear match between predecessor ``a`` and
+    successor ``b``. Position 0's predecessor is the anchor token.
+
+    Accumulated in fp32; bf16 rounding moves candidate argmaxes often enough to
+    change the walk's path.
+
+    Args:
+        predecessor_codebook / successor_codebook: ``[vocab_size, rank]``.
+        candidate_ids: ``[B, K, top_k]`` per-position candidate token ids.
+        unary_logits: ``[B, K, top_k]`` drafter logits for those candidates.
+        gate: ``[B, K, rank]`` projected hidden state per block position.
+        anchor_token_ids: ``[B]``.
+    Returns:
+        ``[B, K, top_k, top_k]`` fp32 scores indexed
+        ``[batch, position, predecessor, candidate]``.
+    """
+    top_k = candidate_ids.shape[-1]
+    successors = successor_codebook[candidate_ids].float()
+    predecessor_ids = torch.cat(
+        (anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]), dim=1
+    )
+    predecessors = predecessor_codebook[predecessor_ids].float()
+    return unary_logits.float()[:, :, None] + torch.einsum(
+        "blpr,blcr->blpc", predecessors * gate.float()[:, :, None], successors
+    )
+
+
+def dflash2_walk_candidate_paths(
+    candidate_ids: torch.Tensor,
+    edge_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Walk the scored lattice and return the realized score row per position.
+
+    Starting from the anchor, each step keeps the highest-scoring successor and
+    conditions the next step on it. Sequential, but only over precomputed
+    scores: ``top_k`` values per step, no vocabulary work.
+
+    Args:
+        candidate_ids: ``[B, K, top_k]``.
+        edge_scores: ``[B, K, top_k, top_k]`` from :func:`dflash2_score_edges`.
+    Returns:
+        ``[B, K, top_k]`` scores of each position's candidates under the
+        predecessor the walk settled on.
+    """
+    batch, num_steps, top_k, _ = edge_scores.shape
+    realized = edge_scores.new_empty(batch, num_steps, top_k)
+    # Step 0 replicates the anchor across the predecessor axis, so any row works.
+    predecessor = torch.zeros(batch, 1, 1, dtype=torch.long, device=edge_scores.device)
+    for step in range(num_steps):
+        scores = edge_scores[:, step].gather(1, predecessor.expand(-1, 1, top_k)).squeeze(1)
+        realized[:, step] = scores
+        predecessor = scores.argmax(-1).view(batch, 1, 1)
+    return realized
+
+
+class DFlash2BlockConv(nn.Module):
+    """Two-tap dynamic depthwise convolutions wrapped around one sublayer.
+
+    DFlash 2 (https://inco.ai/blog/dflash2/) moves the within-block mixing into
+    a short convolution. ``prepare`` convolves the sublayer's input and
+    ``finish`` its output; a single projection of the *input* drives both, so
+    ``finish`` takes the coefficients ``prepare`` hands back.
+    """
+
+    def __init__(
+        self,
+        base_kernel: torch.Tensor,
+        kernel_projection_weight: torch.Tensor,
+        taps: int,
+        group_size: int,
+        hidden_size: int,
+    ):
+        super().__init__()
+        # Side 0 wraps the sublayer input, side 1 its output.
+        if tuple(base_kernel.shape) != (2, taps, hidden_size):
+            raise ValueError(
+                f"DFlash2 conv base_kernel has shape "
+                f"{tuple(base_kernel.shape)}, expected [2, conv_kernel_size, "
+                f"hidden_size] = {(2, taps, hidden_size)}."
+            )
+        if hidden_size % group_size:
+            raise ValueError(
+                f"DFlash2 conv_group_size={group_size} must divide hidden_size={hidden_size}."
+            )
+        self.taps = taps
+        self.group_size = group_size
+        self.num_groups = hidden_size // group_size
+        expected = (2 * taps * self.num_groups, hidden_size)
+        if tuple(kernel_projection_weight.shape) != expected:
+            raise ValueError(
+                f"DFlash2 conv kernel_projection has shape "
+                f"{tuple(kernel_projection_weight.shape)}, expected "
+                f"[2 * conv_kernel_size * hidden_size / conv_group_size, "
+                f"hidden_size] = {expected}."
+            )
+        self.base_kernel = nn.Parameter(base_kernel, requires_grad=False)
+        self.kernel_projection = nn.Linear(
+            hidden_size,
+            expected[0],
+            bias=False,
+            device=kernel_projection_weight.device,
+            dtype=kernel_projection_weight.dtype,
+        )
+        self.kernel_projection.weight.data.copy_(kernel_projection_weight)
+
+    def _convolve(
+        self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int, block_size: int
+    ) -> torch.Tensor:
+        return dflash2_grouped_conv(
+            hidden_states, delta, self.base_kernel[side], block_size, self.group_size
+        )
+
+    def prepare(
+        self, hidden_states: torch.Tensor, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convolve the sublayer input; also return ``finish``'s coefficients."""
+        coefficients = self.kernel_projection(hidden_states).view(
+            hidden_states.shape[0], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[:, 0], 0, block_size),
+            coefficients[:, 1],
+        )
+
+    def finish(
+        self, hidden_states: torch.Tensor, coefficients: torch.Tensor, block_size: int
+    ) -> torch.Tensor:
+        """Convolve the sublayer output with the coefficients from ``prepare``."""
+        return self._convolve(hidden_states, coefficients, 1, block_size)
+
+
+class DFlash2CandidateSelector(nn.Module):
+    """Pairwise path selector over a DFlash block's top-k candidates.
+
+    Independent per-position picks leave the right token in the candidate list
+    far more often than in first place, so DFlash 2 keeps the top
+    ``selector_top_k`` per position and scores every adjacent pair (see
+    :func:`dflash2_score_edges`) in one shot for the whole block.
+    """
+
+    def __init__(
+        self,
+        predecessor_codebook: torch.Tensor,
+        successor_codebook: torch.Tensor,
+        hidden_projection_weight: torch.Tensor,
+        top_k: int,
+        vocab_size: int,
+        rank: int,
+    ):
+        super().__init__()
+        for name, table in (
+            ("predecessor_codebook", predecessor_codebook),
+            ("successor_codebook", successor_codebook),
+        ):
+            if tuple(table.shape) != (vocab_size, rank):
+                raise ValueError(
+                    f"DFlash2 {name} has shape {tuple(table.shape)}, expected "
+                    f"[vocab_size, selector_rank] = ({vocab_size}, {rank})."
+                )
+        if tuple(hidden_projection_weight.shape)[0] != rank:
+            raise ValueError(
+                "DFlash2 candidate_selector.hidden_projection has shape "
+                f"{tuple(hidden_projection_weight.shape)}, expected "
+                f"selector_rank={rank} output features."
+            )
+        self.top_k = top_k
+        self.predecessor_codebook = nn.Parameter(predecessor_codebook, requires_grad=False)
+        self.successor_codebook = nn.Parameter(successor_codebook, requires_grad=False)
+        self.hidden_projection = nn.Linear(
+            hidden_projection_weight.shape[1],
+            rank,
+            bias=False,
+            device=hidden_projection_weight.device,
+            dtype=hidden_projection_weight.dtype,
+        )
+        self.hidden_projection.weight.data.copy_(hidden_projection_weight)
+
+    def forward(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score all adjacent candidate pairs; see :func:`dflash2_score_edges`."""
+        gate = self.hidden_projection(hidden_states.to(self.hidden_projection.weight.dtype))
+        return dflash2_score_edges(
+            self.predecessor_codebook,
+            self.successor_codebook,
+            candidate_ids,
+            unary_logits,
+            gate,
+            anchor_token_ids,
+        )
+
+
+def resolve_draft_logit_transform(dflash_config: Dict) -> tuple[float, Optional[float]]:
+    """The `(multiplier, softcap)` a drafter's `dflash_config` declares.
+
+    A DFlash drafter scores tokens through the target's LM head. When the
+    target scales and soft-caps its own logits (`output_multiplier`, then
+    `final_logit_softcapping`), its drafters are trained on logits transformed
+    the same way, and their `dflash_config` repeats the two values. `(1.0,
+    None)` means no transform; a softcap of 0 means none.
+
+    Raises `ValueError` for a multiplier that is not positive and finite, or a
+    softcap that is negative or not finite: such a value only lowers acceptance
+    without failing, and a negative multiplier also reverses the argmax that
+    the vocabulary-parallel draft path takes without the transform.
+    """
+    multiplier = dflash_config.get("output_multiplier")
+    multiplier = 1.0 if multiplier is None else float(multiplier)
+    if not (math.isfinite(multiplier) and multiplier > 0):
+        raise ValueError(
+            f"dflash_config.output_multiplier must be positive and finite, got {multiplier}"
+        )
+    softcap = dflash_config.get("final_logit_softcapping")
+    softcap = 0.0 if softcap is None else float(softcap)
+    if not (math.isfinite(softcap) and softcap >= 0):
+        raise ValueError(
+            f"dflash_config.final_logit_softcapping must be non-negative and finite, got {softcap}"
+        )
+    return multiplier, softcap or None
 
 
 class DFlashForCausalLM(nn.Module):
@@ -71,7 +492,103 @@ class DFlashForCausalLM(nn.Module):
     Reference: https://arxiv.org/pdf/2602.06036
     """
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    # Whether ``dflash_attention_backend`` drives this drafter's block decode.
+    # Subclasses that bring their own attention set this False: neither backend
+    # can express every drafter shape, the ops behind them are optional
+    # dependencies, and the worker's per-backend shape checks do not apply.
+    _uses_worker_attention_backend = True
+
+    # What ``attention_backend="AUTO"`` resolves to, and what the field may say
+    # at all. Per drafter family, because the fastest kernel that can express
+    # the shape differs: GQA DFlash cross-attention is what the two worker op
+    # sets were built for, while an MLA drafter runs its own block decode and
+    # has a third implementation they cannot express.
+    _default_attention_backend = "VANILLA"
+    _uses_lilicorr = False
+    _supported_attention_backends = ("VANILLA", "TRTLLM", "FA4")
+    # Where AUTO lands when the preferred backend cannot run. None means AUTO
+    # propagates the reason instead: a family whose only deployable target can
+    # run the fast kernel gains nothing from a silently slower path.
+    _auto_fallback_attention_backend = "VANILLA"
+
+    # Whether the drafter's context KV lives in the draft KV cache manager's
+    # paged pool rather than a private arena dense in max_seq_len. Orthogonal
+    # to the attention backend: paging is about where the KV lives, the backend
+    # is about which kernel reads it.
+    _paged_ctx_cache = False
+
+    # Whether the drafter runs its TP fusions under plain TP (tp > 1, no
+    # attention DP): fc keeps only this rank's input features and one
+    # all-reduce sums the partial projections with hidden_norm fused in, and
+    # the drafter's own block decode may fuse its all-reduces with the residual
+    # add and the RMSNorm after them. They change the drafter's rounding, so a
+    # family declares this once its acceptance length has been measured with
+    # them; the others keep the unsplit fc and the unfused norms.
+    _tp_fusions = False
+
+    # Positions the worker will actually serve, published once by
+    # DFlashDrafter._lazy_init_ctx_buffers before the first forward. A drafter
+    # that sizes an absolute-position table reads it in place of its
+    # config-derived cap; None means no worker has run (direct construction in
+    # tests), so the config cap stands.
+    _runtime_position_ceiling = None
+
+    @classmethod
+    def _resolve_auto_attention_backend(cls) -> str:
+        """Turn ``AUTO`` into a concrete backend for this drafter family."""
+        want = cls._default_attention_backend
+        reason = cls._attention_backend_unavailability_reason(want)
+        if reason is None:
+            return want
+        fallback = cls._auto_fallback_attention_backend
+        if fallback is None:
+            raise ValueError(
+                f"{cls.__name__} has no usable attention backend: its default "
+                f"{want!r} is unavailable ({reason}) and this family does not "
+                f"degrade."
+            )
+        logger.info_once(
+            f"{cls.__name__} prefers the {want} attention backend but it is "
+            f"unavailable ({reason}); falling back to {fallback}.",
+            key=f"dflash_auto_backend_fallback_{cls.__name__}",
+        )
+        return fallback
+
+    @classmethod
+    def _attention_backend_unavailability_reason(cls, backend: str) -> Optional[str]:
+        """Why this build cannot run ``backend``, or None. Overridden per family.
+
+        The same backend NAME resolves to different kernels per drafter family
+        -- GQA TRTLLM is the trtllm-gen FMHA op set, MLA TRTLLM is flashinfer's
+        absorbed-MLA paged decode -- so the probe belongs to the class rather
+        than to the resolver, which only knows the name.
+        """
+        if backend == "TRTLLM":
+            return dflash_trtllm_gen_unavailability_reason()
+        return None
+
+    @classmethod
+    def check_valid_attention_backend(cls, backend: str) -> None:
+        """Raise unless this build can actually run ``backend``.
+
+        Both halves are fatal on an EXPLICIT request: a typo, and a backend the
+        build cannot serve. Silently running something else is what this
+        replaces -- the MLA drafter used to fall through to its eager reference,
+        correct but orders slower, with nothing raised.
+        """
+        if backend not in cls._supported_attention_backends:
+            raise ValueError(
+                f"{cls.__name__} attention backend must be one of "
+                f"{list(cls._supported_attention_backends)}, got {backend!r}."
+            )
+        reason = cls._attention_backend_unavailability_reason(backend)
+        if reason is not None:
+            raise ValueError(
+                f"attention_backend={backend!r} was requested but it is "
+                f"unavailable for {cls.__name__}: {reason}."
+            )
+
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Build the draft model, resolving its architecture from the draft config
         (falling back to a model_type-derived name when the checkpoint uses a
         custom DFlash architecture label)."""
@@ -96,6 +613,9 @@ class DFlashForCausalLM(nn.Module):
 
         # Remove spec_config to prevent recursive spec-dec initialization
         draft_config_no_spec = replace(draft_config, spec_config=None, lm_head_gather_output=False)
+        # ModelConfig.extra_attrs is init=False, so dataclasses.replace() does
+        # not preserve the shared custom-op registries.
+        draft_config_no_spec.extra_attrs = draft_config.extra_attrs
 
         # Weights will be loaded later by ModelLoader.load_draft_weights()
         self.draft_model_full = DraftModelClass(draft_config_no_spec)
@@ -108,23 +628,38 @@ class DFlashForCausalLM(nn.Module):
 
         # Get mask_token_id from dflash_config
         pretrained_config = draft_config.pretrained_config
-        dflash_config = getattr(pretrained_config, "dflash_config", {})
+        dflash_config = getattr(pretrained_config, "dflash_config", None) or {}
         self.mask_token_id = dflash_config.get(
             "mask_token_id",
             getattr(pretrained_config, "mask_token_id", pretrained_config.vocab_size),
         )
 
         self.target_layer_ids = dflash_config.get("target_layer_ids", None)
+        # Upstream keeps the dflash_config override; rubin-advance dropped it.
         self.block_size = dflash_config.get(
             "block_size", getattr(pretrained_config, "block_size", None)
         )
+        self.logit_multiplier, self.logit_softcap = resolve_draft_logit_transform(dflash_config)
+        if dflash_attention_backend == "AUTO":
+            dflash_attention_backend = self._resolve_auto_attention_backend()
         self.dflash_attention_backend = dflash_attention_backend
+        self.check_valid_attention_backend(self.dflash_attention_backend)
         # Each backend loads only its own ops; the rest stay None so the
         # shared paged prologue can read them unconditionally.
+        self._dflash_flash_attention = None
         self._dflash_trtllm_gen_ops = None
         self._dflash_fa4_fwd = None
         self._dflash_paged_append = None
-        if self.dflash_attention_backend == "VANILLA":
+        if not self._uses_worker_attention_backend:
+            # Still validated above so a typo fails here rather than silently,
+            # but no op set is loaded: this drafter calls none of them.
+            logger.info_once(
+                f"{type(self).__name__} brings its own block decode; "
+                f"attention_backend={self.dflash_attention_backend!r} selects "
+                f"among its implementations, not the shared DFlash op sets.",
+                key=f"dflash_own_attention_{type(self).__name__}",
+            )
+        elif self.dflash_attention_backend == "VANILLA":
             self._dflash_flash_attention = get_dflash_flash_attention()
         elif self.dflash_attention_backend == "TRTLLM":
             self._dflash_trtllm_gen_ops = get_dflash_trtllm_gen_ops()
@@ -132,9 +667,14 @@ class DFlashForCausalLM(nn.Module):
             self._dflash_fa4_fwd = get_dflash_fa4_fwd()
             self._dflash_paged_append = get_dflash_paged_append()
         else:
+            # Not the user's typo -- check_valid_attention_backend rejected
+            # those above. This is a subclass that widened
+            # _supported_attention_backends without adding the branch that
+            # loads the ops, which a bare else would answer by silently
+            # handing it FA4's.
             raise ValueError(
-                "DFlash attention backend must be VANILLA, TRTLLM or FA4, got "
-                f"{self.dflash_attention_backend!r}."
+                f"{type(self).__name__} allows attention_backend="
+                f"{self.dflash_attention_backend!r} but loads no op set for it."
             )
         self._dflash_trtllm_gen_workspace = None
         self._dflash_trtllm_gen_counters = None
@@ -145,7 +685,8 @@ class DFlashForCausalLM(nn.Module):
         logger.info(
             f"DFlash draft model initialized with mask_token_id: {self.mask_token_id}, "
             f"target_layer_ids: {self.target_layer_ids}, block_size: {self.block_size}, "
-            f"attention_backend: {self.dflash_attention_backend}"
+            f"attention_backend: {self.dflash_attention_backend}, "
+            f"logit_multiplier: {self.logit_multiplier}, logit_softcap: {self.logit_softcap}"
         )
 
         # Sliding-window block decode (use_swa / swa_window_size). Kept in the
@@ -167,6 +708,39 @@ class DFlashForCausalLM(nn.Module):
             dspark_layer_window_size(self._use_swa, self._swa_window, layer_types, i)
             for i in range(num_draft_layers)
         ]
+        # A wrong resolution costs acceptance without raising, and the inputs
+        # come from three config fields, so log what was resolved.
+        logger.info(
+            f"DFlash draft attention windows: use_swa={self._use_swa}, "
+            f"swa_window_size={self._swa_window}, layer_types={layer_types}, "
+            f"window_size per layer: {self._layer_windows}"
+        )
+
+        # DFlash 2 (https://inco.ai/blog/dflash2/) keeps the DFlash block decode
+        # and adds per-sublayer convolutions plus a pairwise candidate selector.
+        # Both are keyed off the draft checkpoint rather than a separate
+        # decoding_type, matching how SGLang and vLLM serve DFlash 2 drafters.
+        self._dflash2_conv_taps = int(dflash_config.get("conv_kernel_size", 0) or 0)
+        self._dflash2_conv_group_size = int(dflash_config.get("conv_group_size", 0) or 0)
+        self._dflash2_selector_rank = int(dflash_config.get("selector_rank", 0) or 0)
+        self._dflash2_selector_top_k = int(dflash_config.get("selector_top_k", 0) or 0)
+        # LiLiCorr supplies its own scorer and permits convolution-free checkpoints.
+        self._is_dflash2 = not self._uses_lilicorr and is_dflash2_checkpoint(
+            getattr(pretrained_config, "architectures", None), dflash_config
+        )
+        if self._is_dflash2:
+            self._validate_dflash2_config()
+            logger.info(
+                "DFlash 2 drafter: conv_kernel_size="
+                f"{self._dflash2_conv_taps}, conv_group_size="
+                f"{self._dflash2_conv_group_size}, selector_rank="
+                f"{self._dflash2_selector_rank}, selector_top_k="
+                f"{self._dflash2_selector_top_k}"
+            )
+        # Built in load_weights() from the checkpoint, like fc / hidden_norm.
+        self.attention_convs = None
+        self.mlp_convs = None
+        self.candidate_selector = None
 
         self.logits_processor = None  # Set by caller after construction
 
@@ -187,6 +761,24 @@ class DFlashForCausalLM(nn.Module):
         self._num_heads = 0
         self._head_dim = 0
         self._num_kv_heads = 0
+        # Cache halves per token per layer: K and V for a GQA drafter, one MLA
+        # latent (and no V) for an MLA one. The worker sizes its context arena
+        # and validates the managed pool against this, so a drafter that stores
+        # a single tensor must override it (see MLADSparkForCausalLM).
+        self._kv_factor = 2
+        # The drafter's TP fusions (see _tp_fusions) run under plain
+        # TP: fc keeps only this rank's input features (_project_features),
+        # and a drafter's block decode may fuse its all-reduces with the
+        # residual add and the following RMSNorm.
+        mapping = self.model_config.mapping
+        self._tp_split = (
+            self._tp_fusions and mapping.tp_size > 1 and not mapping.enable_attention_dp
+        )
+        # This rank's input features of fc and the all-reduce that sums the
+        # partial projections, set by _load_target_projection under _tp_split
+        # when the fc input width splits over tp_size.
+        self._fc_input_slice: Optional[slice] = None
+        self._fc_all_reduce: Optional[AllReduce] = None
         self._has_qk_norm = False
         self._use_fused_qk_norm_rope = False
         # Laguna-specific draft-layer behaviors, disabled by default so generic
@@ -318,8 +910,103 @@ class DFlashForCausalLM(nn.Module):
         Generic DFlash: fc then hidden_norm. Subclasses (e.g. Laguna) may
         normalize the per-aux features first by overriding this method.
         """
-        hidden_states = hidden_states.to(self.fc.weight.dtype)
-        return self.hidden_norm(self.fc(hidden_states))
+        return self._project_features(hidden_states.to(self.fc.weight.dtype))
+
+    def _project_features(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``hidden_norm(fc(hidden_states))`` for ``[N, in_features]`` features.
+
+        With the TP fusions (``_tp_split``) every rank holds the same features,
+        so each multiplies its slice of them by its slice of the ``fc`` columns
+        and one all-reduce sums the partials with ``hidden_norm`` fused in:
+        every rank reads ``1 / tp`` of the ``fc`` weight.
+        """
+        if self._fc_input_slice is None:
+            return self.hidden_norm(self.fc(hidden_states))
+        partial = self.fc(hidden_states[:, self._fc_input_slice])
+        return self._fc_all_reduce(
+            partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.hidden_norm.weight,
+                eps=self.hidden_norm.eps,
+            ),
+        )
+
+    def _validate_dflash2_config(self) -> None:
+        """Require the full DFlash 2 recipe; a partial one would silently
+        degrade to DFlash 1 acceptance instead of failing."""
+        required = {
+            "conv_kernel_size": self._dflash2_conv_taps,
+            "conv_group_size": self._dflash2_conv_group_size,
+            "selector_rank": self._dflash2_selector_rank,
+            "selector_top_k": self._dflash2_selector_top_k,
+        }
+        missing = sorted(name for name, value in required.items() if value < 1)
+        if missing:
+            raise ValueError(
+                "DFlash 2 drafter is missing required dflash_config entries "
+                f"{missing}; got {required}."
+            )
+        if self._dflash2_selector_top_k < 2:
+            raise ValueError(
+                f"DFlash 2 selector_top_k={self._dflash2_selector_top_k} leaves "
+                "no candidates to choose between; it must be at least 2."
+            )
+
+    @property
+    def is_dflash2(self) -> bool:
+        return self._is_dflash2
+
+    @property
+    def has_block_conv(self) -> bool:
+        return self.attention_convs is not None
+
+    @property
+    def has_candidate_selector(self) -> bool:
+        return self.candidate_selector is not None
+
+    def apply_draft_logit_transform(self, logits: torch.Tensor) -> torch.Tensor:
+        """Scale and soft-cap draft logits the way the drafter was trained.
+
+        The target's epilogue (`scale_and_soft_cap_logits`), in FP32 and in
+        place. Neither step changes a position's argmax, but the DFlash 2
+        selector adds these logits to its pairwise scores and draft sampling
+        reads them as a distribution, so both depend on the scale.
+        """
+        if self.logit_multiplier == 1.0 and self.logit_softcap is None:
+            return logits
+        return scale_and_soft_cap_logits(logits, self.logit_multiplier, self.logit_softcap)
+
+    def select_candidate_path(
+        self,
+        block_logits: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        block_hidden_states: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Restrict each block position's logits to the selector's chosen path.
+
+        Writes ``-inf`` into ``block_logits`` everywhere except each position's
+        candidates, which carry the score row the walk realized. Argmax
+        therefore reproduces the walk, and sampling a row samples the
+        selector's own proposal distribution.
+
+        Args:
+            block_logits: ``[B, K, vocab_size]`` full-vocab destination.
+            candidate_ids: ``[B, K, top_k]`` full-vocab candidate token ids.
+            unary_logits: ``[B, K, top_k]`` drafter logits for those candidates.
+            block_hidden_states: ``[B, K, hidden_size]`` at the drafted
+                positions, after the drafter's final norm.
+            anchor_token_ids: ``[B]`` last accepted token per request.
+        """
+        edge_scores = self.candidate_selector(
+            candidate_ids, unary_logits, block_hidden_states, anchor_token_ids
+        )
+        realized_scores = dflash2_walk_candidate_paths(candidate_ids, edge_scores)
+        block_logits.fill_(float("-inf"))
+        block_logits.scatter_(-1, candidate_ids, realized_scores.to(block_logits.dtype))
+        return block_logits
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Hook applied to the block-attention output before o_proj.
@@ -367,10 +1054,15 @@ class DFlashForCausalLM(nn.Module):
                     split[k] = v
             weights = split
 
+        # Taken before the backbone remap, which would prefix these with
+        # 'model.' and then silently drop them under allow_partial_loading.
+        if self._is_dflash2:
+            weights = self._load_dflash2_weights(weights)
+
         # Remap: add 'model.' prefix where needed, and extract DFlash-specific weights
         remapped = {}
         for key, value in weights.items():
-            if key in ("fc.weight", "hidden_norm.weight"):
+            if key.startswith("fc.") or key == "hidden_norm.weight":
                 # DFlash-specific projection weights - store directly
                 remapped[key] = value
             elif key == "norm.weight":
@@ -380,17 +1072,19 @@ class DFlashForCausalLM(nn.Module):
             else:
                 remapped[key] = value
 
-        # Load DFlash-specific weights directly
-        if "fc.weight" in remapped:
-            self.fc = nn.Linear(
-                remapped["fc.weight"].shape[1],
-                remapped["fc.weight"].shape[0],
-                bias=False,
-                device="cuda",
-                dtype=remapped["fc.weight"].dtype,
+        # Wrapper-owned and built FROM the checkpoint, so they are never in
+        # draft_model_full's module tree for _assert_backbone_complete to walk.
+        # Without fc the drafter has no capture projection and drafts from an
+        # empty context forever.
+        wrapper_missing = [k for k in self.WRAPPER_OWNED_WEIGHTS if k not in remapped]
+        if wrapper_missing:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint is missing {wrapper_missing}, "
+                "which this wrapper owns and builds from the checkpoint."
             )
-            self.fc.weight.data.copy_(remapped["fc.weight"])
-            del remapped["fc.weight"]
+
+        # Load DFlash-specific weights directly
+        self._load_target_projection(remapped)
 
         if "hidden_norm.weight" in remapped:
             rms_norm_eps = getattr(self.config, "rms_norm_eps", 1e-6)
@@ -404,12 +1098,149 @@ class DFlashForCausalLM(nn.Module):
             self.hidden_norm.weight.data.copy_(remapped["hidden_norm.weight"])
             del remapped["hidden_norm.weight"]
 
-        # Load remaining weights into the draft model.
-        # DFlash checkpoints don't include embed_tokens or lm_head, so allow partial loading
-        # since those modules won't find matching weights.
+        # allow_partial_loading is what lets the shared modules below be absent.
+        # It is also why a truncated checkpoint loads clean, so gate it on the
+        # subclass's own declaration of what may legitimately be missing.
+        self._assert_backbone_complete(remapped, weight_mapper)
         self.draft_model_full.load_weights(
             weights=remapped, weight_mapper=weight_mapper, allow_partial_loading=True
         )
+
+    def _load_target_projection(self, weights: Dict) -> None:
+        if "fc.weight" not in weights:
+            return
+        weight = weights.pop("fc.weight")
+        # A drafter with the TP fusions keeps only its rank's slice of the
+        # input features (see _project_features); a width that does not split
+        # over tp_size keeps the whole fc.
+        mapping = self.model_config.mapping
+        if self._tp_split and weight.shape[1] % mapping.tp_size != 0:
+            logger.info(
+                f"{type(self).__name__}: fc input width {weight.shape[1]} does not split "
+                f"over tp_size={mapping.tp_size}; keeping the unsplit context projection."
+            )
+        elif self._tp_split:
+            width = weight.shape[1] // mapping.tp_size
+            self._fc_input_slice = slice(mapping.tp_rank * width, (mapping.tp_rank + 1) * width)
+            self._fc_all_reduce = AllReduce(
+                mapping, strategy=self.model_config.allreduce_strategy, dtype=weight.dtype
+            )
+            weight = weight[:, self._fc_input_slice]
+        self.fc = nn.Linear(
+            weight.shape[1], weight.shape[0], bias=False, device="cuda", dtype=weight.dtype
+        )
+        self.fc.weight.data.copy_(weight)
+
+    def _load_dflash2_weights(self, weights: Dict, *, load_selector: bool = True) -> Dict:
+        """Build the DFlash 2 convolutions and candidate selector.
+
+        Returns ``weights`` minus the keys consumed here.
+        """
+        consumed = set()
+
+        def take(key: str) -> torch.Tensor:
+            if key not in weights:
+                raise ValueError(
+                    f"DFlash 2 drafter is missing checkpoint weight '{key}'. "
+                    "The draft checkpoint declares DFlash 2 in its config but "
+                    "does not ship the corresponding weights."
+                )
+            consumed.add(key)
+            return weights[key].to("cuda")
+
+        hidden_size = self.config.hidden_size
+        attention_convs = nn.ModuleList()
+        mlp_convs = nn.ModuleList()
+        for layer_idx in range(len(self.model.layers)):
+            for name, convs in (("attention_conv", attention_convs), ("mlp_conv", mlp_convs)):
+                prefix = f"layers.{layer_idx}.{name}."
+                convs.append(
+                    DFlash2BlockConv(
+                        base_kernel=take(prefix + "base_kernel"),
+                        kernel_projection_weight=take(prefix + "kernel_projection.weight"),
+                        taps=self._dflash2_conv_taps,
+                        group_size=self._dflash2_conv_group_size,
+                        hidden_size=hidden_size,
+                    )
+                )
+
+        self.attention_convs = attention_convs
+        self.mlp_convs = mlp_convs
+        if load_selector:
+            self.candidate_selector = DFlash2CandidateSelector(
+                predecessor_codebook=take("candidate_selector.predecessor_codebook"),
+                successor_codebook=take("candidate_selector.successor_codebook"),
+                hidden_projection_weight=take("candidate_selector.hidden_projection.weight"),
+                top_k=self._dflash2_selector_top_k,
+                vocab_size=self.config.vocab_size,
+                rank=self._dflash2_selector_rank,
+            )
+        return {k: v for k, v in weights.items() if k not in consumed}
+
+    #: Tensors the wrapper itself owns: not in draft_model_full, built from the
+    #: checkpoint in load_weights, and required.
+    WRAPPER_OWNED_WEIGHTS = ("fc.weight", "hidden_norm.weight")
+
+    #: Parameter-name prefixes this drafter takes from the target instead of its
+    #: own checkpoint. Everything else in ``draft_model_full`` must be provided.
+    #: GQA DFlash checkpoints ship neither embedding nor head; an MLA drafter
+    #: ships its own embedding and overrides this.
+    WEIGHTS_SHARED_WITH_TARGET = ("embed_tokens", "lm_head")
+
+    def _assert_backbone_complete(self, weights: Dict, weight_mapper=None) -> None:
+        """Fail on a checkpoint missing weights the drafter does not share.
+
+        The truth is the constructed module tree, not a hand-kept list that
+        rots as the backbone changes.
+
+        Module granularity. A PLAIN module is the hole `allow_partial_loading`
+        cannot close -- the loader skips one whose subtree filters to nothing
+        (modeling_utils.py `if module_weights:`). A FUSED module would be caught by
+        `allow_partial_loading=False`, but the flag must stay True for the
+        target-shared modules, so this requires every component rather than any.
+
+        Missing parameters INSIDE a present component stay tolerated: all three
+        weights but only `q_proj.bias` leaves the rest at `torch.empty`.
+        """
+        provided = set(weights)
+
+        # Whichever fusion table the load below uses, not a third copy:
+        # _load_weights_impl_v2 takes the mapper's, _load_weights_impl takes
+        # FUSED_MODULE_COMPONENTS. An empty mapping means the mapper has none yet.
+        fusion = dict(getattr(weight_mapper, "mapping", None) or FUSED_MODULE_COMPONENTS)
+
+        def _has(prefix: str) -> bool:
+            return any(k == prefix or k.startswith(prefix + ".") for k in provided)
+
+        def _supplied(module_name: str) -> bool:
+            # A fused module is named once here and stored unfused in the
+            # checkpoint. ALL components must be present, not any: the fused
+            # load path is happy with a subset under allow_partial_loading
+            # (linear.py load_weights_fused_qkv_helper) and leaves the absent
+            # shards at torch.empty -- uninitialised device memory, not zeros.
+            if _has(module_name):
+                return True
+            for fused, parts in fusion.items():
+                if fused in module_name:
+                    return all(_has(module_name.replace(fused, p)) for p in parts)
+            return False
+
+        missing = sorted(
+            {
+                name.rsplit(".", 1)[0]
+                for name, _ in self.draft_model_full.named_parameters()
+                if not any(part in name for part in self.WEIGHTS_SHARED_WITH_TARGET)
+                and not _supplied(name.rsplit(".", 1)[0])
+            }
+        )
+        if missing:
+            raise ValueError(
+                f"{type(self).__name__}: checkpoint provides no weights for "
+                f"{missing[:8]}{' ...' if len(missing) > 8 else ''}. These are "
+                f"not in WEIGHTS_SHARED_WITH_TARGET "
+                f"({', '.join(self.WEIGHTS_SHARED_WITH_TARGET)}), so loading "
+                "would leave them randomly initialized."
+            )
 
     def load_weights_from_target_model(self, target_model: torch.nn.Module) -> None:
         """Share embed_tokens and lm_head from the target model."""
@@ -690,16 +1521,74 @@ class DFlashForCausalLM(nn.Module):
 
         sliding_window = get_layer_attention_window(self.config, layer_idx)
         is_sliding_layer = is_sliding_layer or sliding_window is not None
-        if not is_sliding_layer:
-            return False, (-1, -1)
 
-        causal = self._sliding_layers_causal or sliding_window is not None
+        # LiLiCorr uses non-causal block attention with symmetric sliding windows.
+        # DFlash 2 honors explicit is_causal metadata when present; otherwise,
+        # causality follows the layer-type default.
+        explicit_causal = getattr(self.config, "is_causal", None) if self._is_dflash2 else None
+        if self._uses_lilicorr:
+            causal = False
+        elif explicit_causal is not None:
+            causal = bool(explicit_causal)
+        elif not is_sliding_layer:
+            return False, (-1, -1)
+        else:
+            causal = self._sliding_layers_causal or sliding_window is not None
+
         if sliding_window is None:
             # Legacy drafters without an explicit window preserve their prior
             # non-windowed behavior.
             return causal, (-1, -1)
         # FlashAttention's bounds are inclusive: W tokens are current + W-1 left.
-        return causal, (sliding_window - 1, 0)
+        # A non-causal sliding layer windows both sides, matching the HF flash
+        # path these drafters are trained under (see dspark_layer_window_size).
+        if not causal:
+            return False, (sliding_window - 1, sliding_window - 1)
+        return True, (sliding_window - 1, 0)
+
+    def _resolve_block_attention(self, layer_idx: int) -> tuple[bool, tuple[int, int]]:
+        causal, window_size = self._get_attention_mask_args(layer_idx)
+        swa_window = (
+            self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
+        )
+        if swa_window != (-1, -1):
+            window_size = swa_window
+        return causal, window_size
+
+    def validate_block_attention_windows(self) -> list[str]:
+        """Report how the TRTLLM block decode serves each draft layer's mask.
+
+        TRTLLM-Gen only implements sliding windows for causal masks: flashinfer
+        rejects ``causal=False`` with any finite ``window_left``. A non-causal
+        windowed layer runs the causal windowed decode plus the block keys
+        after each query (``dflash_merge_future_block_attention``), which is
+        the same attention up to rounding.
+
+        Returns:
+            The lowering per draft layer; empty for the other backends, which
+            take both window bounds directly.
+        """
+        if self.dflash_attention_backend != "TRTLLM":
+            return []
+        num_layers = getattr(self.config, "num_hidden_layers", None)
+        if num_layers is None:
+            num_layers = len(self.model.layers)
+        lowerings = []
+        for layer_idx in range(num_layers):
+            causal, window_size = self._resolve_block_attention(layer_idx)
+            if causal:
+                lowering = "causal decode"
+            elif window_size[0] >= 0:
+                lowering = "causal decode + future-block merge"
+            else:
+                lowering = DFLASH_CONTEXT_LOWERING
+            logger.info_once(
+                f"DFlash draft layer {layer_idx}: causal={causal}, "
+                f"window={window_size}, TRTLLM lowering: {lowering}.",
+                key=f"dflash_block_attention_{id(self)}_{layer_idx}",
+            )
+            lowerings.append(lowering)
+        return lowerings
 
     def _prepare_dflash_trtllm_gen_buffers(
         self,
@@ -826,6 +1715,7 @@ class DFlashForCausalLM(nn.Module):
         ctx_cache_batch_idx: torch.Tensor,
         ctx_kv_cache: Optional[torch.Tensor] = None,
         ctx_page_table: Optional[torch.Tensor] = None,
+        block_placement: Optional[DraftBlockPlacement] = None,
     ) -> torch.Tensor:
         """DFlash draft forward with cross-attention over a pooled K/V buffer.
 
@@ -838,6 +1728,9 @@ class DFlashForCausalLM(nn.Module):
             ctx_k_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_v_cache: [pool_batch, L, max_ctx+block_size, nkv, hd]
             ctx_cache_batch_idx: [B] — slot index into the pool per batch entry
+            block_placement: where the block's own positions sit in the
+                context pages, from the worker's paged single-latent
+                preparation; a drafter that appends the block itself ignores it
         Returns:
             [B * block_size, hidden_size]
         """
@@ -951,6 +1844,7 @@ class DFlashForCausalLM(nn.Module):
         query_positions_flat_i32 = query_positions.reshape(-1).to(torch.int32)
 
         residual = None
+        has_block_conv = self.has_block_conv
 
         for layer_idx, layer in enumerate(self.model.layers):
             attn_mod = layer.self_attn
@@ -964,6 +1858,15 @@ class DFlashForCausalLM(nn.Module):
                 res_flat = residual.reshape(-1, residual.shape[-1])
                 hs_normed_flat, res_flat = layer.input_layernorm(hs_flat, res_flat)
                 residual = res_flat.reshape(B, block_size, -1)
+
+            # DFlash 2 wraps each sublayer in a block-local convolution; both
+            # sides share one projection of the input, hence the coefficients
+            # handed forward to finish().
+            attn_conv_coefficients = None
+            if has_block_conv:
+                hs_normed_flat, attn_conv_coefficients = self.attention_convs[layer_idx].prepare(
+                    hs_normed_flat, block_size
+                )
 
             # QKV projection on normed query tokens (2D)
             qkv_query = attn_mod.qkv_proj(hs_normed_flat)  # [B*blk, qkv_size]
@@ -1037,12 +1940,7 @@ class DFlashForCausalLM(nn.Module):
                 v_noise_bshd = v_noise_all.reshape(B, block_size, num_kv_heads_per_rank, head_dim)
 
             # Per-layer view into the pooled ctx cache.
-            causal, window_size = self._get_attention_mask_args(layer_idx)
-            swa_window = (
-                self._layer_windows[layer_idx] if layer_idx < len(self._layer_windows) else (-1, -1)
-            )
-            if swa_window != (-1, -1):
-                window_size = swa_window
+            causal, window_size = self._resolve_block_attention(layer_idx)
             if self.dflash_attention_backend == "TRTLLM":
                 layer_cache = ctx_kv_cache[layer_idx]
                 trtllm_gen_ops.append_paged_kv_cache(
@@ -1064,29 +1962,21 @@ class DFlashForCausalLM(nn.Module):
                 q_flat = Q_bshd.reshape(-1, num_heads_per_rank, head_dim)
                 out_flat = out.reshape(-1, num_heads_per_rank, head_dim)
                 window_left = window_size[0]
-                if causal:
-                    trtllm_gen_ops.batch_decode_with_kv_cache(
-                        query=q_flat,
-                        kv_cache=(layer_cache[:, 0], layer_cache[:, 1]),
-                        workspace_buffer=self._dflash_trtllm_gen_workspace,
-                        block_tables=block_tables,
-                        seq_lens=seq_lens_after,
-                        max_seq_len=pages_per_slot * page_size,
-                        bmm1_scale=head_dim**-0.5,
-                        bmm2_scale=1.0,
-                        window_left=window_left,
-                        out=out_flat,
-                        sinks=None,
-                        enable_pdl=False,
-                        kv_layout="HND",
-                        backend="trtllm-gen",
-                        q_len_per_req=block_size,
-                        max_q_len=None,
-                        cum_seq_lens_q=None,
-                        kv_cache_sf=None,
-                        uses_shared_paged_kv_idx=True,
-                        bmm1_scale_log2=None,
-                        multi_ctas_kv_counter_buffer=self._dflash_trtllm_gen_counters,
+                if causal or window_left >= 0:
+                    dflash_trtllm_windowed_block_attention(
+                        trtllm_gen_ops,
+                        Q_bshd,
+                        k_noise_bshd,
+                        v_noise_bshd,
+                        layer_cache,
+                        block_tables,
+                        seq_lens_after,
+                        pages_per_slot * page_size,
+                        causal,
+                        window_size,
+                        self._dflash_trtllm_gen_workspace,
+                        self._dflash_trtllm_gen_counters,
+                        out_flat,
                     )
                 else:
                     cum_seq_lens_q = torch.arange(
@@ -1219,11 +2109,23 @@ class DFlashForCausalLM(nn.Module):
 
             # o_proj (flat 2D, handles all-reduce internally)
             hidden_out = attn_mod.o_proj(attn_output)
+            if has_block_conv:
+                hidden_out = self.attention_convs[layer_idx].finish(
+                    hidden_out, attn_conv_coefficients, block_size
+                )
 
             # Post-attention layernorm + MLP (flat 2D)
             res_flat = residual.reshape(-1, residual.shape[-1])
             hidden_out, res_flat = layer.post_attention_layernorm(hidden_out, res_flat)
+            if has_block_conv:
+                hidden_out, mlp_conv_coefficients = self.mlp_convs[layer_idx].prepare(
+                    hidden_out, block_size
+                )
             hidden_out = layer.mlp(hidden_out)
+            if has_block_conv:
+                hidden_out = self.mlp_convs[layer_idx].finish(
+                    hidden_out, mlp_conv_coefficients, block_size
+                )
 
             hidden_states = hidden_out.reshape(B, block_size, -1)
             residual = res_flat.reshape(B, block_size, -1)
@@ -1276,11 +2178,11 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         if getattr(config, "mlp_layer_types", None) is None:
             config.mlp_layer_types = ["dense"] * config.num_hidden_layers
         if getattr(config, "block_size", None) is None:
-            dflash_config = getattr(config, "dflash_config", {})
+            dflash_config = getattr(config, "dflash_config", None) or {}
             if isinstance(dflash_config, dict):
                 config.block_size = dflash_config.get("block_size", None)
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "VANILLA"):
+    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
         """Pin the Laguna draft-layer class and enable Laguna-specific behaviors
         (context input_layernorm, causal sliding blocks); reject non-per-head
         gating."""
@@ -1330,7 +2232,7 @@ class DFlashLagunaForCausalLM(DFlashForCausalLM):
         if fc_norm is not None:
             chunks = hidden_states.chunk(len(fc_norm), dim=-1)
             hidden_states = torch.cat([norm(chunk) for norm, chunk in zip(fc_norm, chunks)], dim=-1)
-        return self.hidden_norm(self.fc(hidden_states))
+        return self._project_features(hidden_states)
 
     def _post_attention_gate(self, attn_output, gate_input, attn_mod, num_heads, head_dim):
         """Apply Laguna's per-head softplus output gate (``g_proj``) to the
@@ -1411,6 +2313,15 @@ def _build_dflash_draft(model_config, draft_config, lm_head, model):
         )
     draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
     dflash_attention_backend = model_config.spec_config.attention_backend
+    if declares_lilicorr(draft_config.pretrained_config):
+        if any("Laguna" in arch for arch in draft_arches):
+            raise NotImplementedError(
+                "LiLiCorr currently requires the generic GQA DFlash backbone; "
+                "Laguna's draft-layer specialization is not supported."
+            )
+        from .modeling_lilicorr import LiLiCorrForCausalLM
+
+        return LiLiCorrForCausalLM(draft_config, dflash_attention_backend=dflash_attention_backend)
     if any("Laguna" in arch for arch in draft_arches):
         return DFlashLagunaForCausalLM(
             draft_config,

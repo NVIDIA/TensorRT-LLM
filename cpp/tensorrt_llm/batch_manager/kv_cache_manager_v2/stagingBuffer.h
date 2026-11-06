@@ -19,7 +19,7 @@
 
 #include "kv_cache_manager_v2/common.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
-#include "kv_cache_manager_v2/utils/hostMem.h"
+#include "kv_cache_manager_v2/utils/staticHostMem.h"
 
 #include <cstddef>
 #include <cuda.h>
@@ -41,10 +41,24 @@ enum class StagingBufferMemory
 
 struct DeviceDeleter
 {
-    void operator()(std::byte* ptr) const noexcept;
+    void operator()(void* ptr) const noexcept;
 };
 
-using CudaUniqPtr = std::unique_ptr<std::byte, DeviceDeleter>;
+template <typename T = std::byte>
+using CudaUniqPtr = std::unique_ptr<T, DeviceDeleter>;
+
+template <typename T = std::byte>
+CudaUniqPtr<T> allocateDeviceMemory(size_t size)
+{
+    // Null for an empty request, which cuMemAlloc refuses: a caller whose size is a
+    // computed extent can then allocate unconditionally and hold null for "none".
+    CUdeviceptr ptr = 0;
+    if (size != 0)
+    {
+        cuCheck(cuMemAlloc(&ptr, sizeof(T) * size));
+    }
+    return CudaUniqPtr<T>{reinterpret_cast<T*>(ptr)};
+}
 
 struct StagingBufferRange;
 
@@ -92,6 +106,11 @@ private:
 //! acquire(..., stream) inserts waits for prior users on stream and returns without host synchronization.
 //! acquire(..., nullopt) synchronizes prior users before returning. The returned StagingBuffer retains the same
 //! optional stream and uses it to protect the range when the lease is retired.
+//!
+//! Not thread-safe, by design. Every instance is owned by a single KvCacheManager and is reached
+//! only through that manager's migration paths, which run under its exclusive lock; the class
+//! therefore does no locking of its own. A caller that reaches acquire() while holding only a
+//! shared lock races silently — there is no internal lock to deadlock against.
 class StagingBufferManager
 {
 public:
@@ -103,7 +122,7 @@ public:
     StagingBufferManager(StagingBufferManager&&) = delete;
     StagingBufferManager& operator=(StagingBufferManager&&) = delete;
 
-    //! Acquires a staging slice. The owning KVCM serializes access.
+    //! Acquires a staging slice. Callers must serialize; see the class comment.
     //! \param minSize Minimum required bytes.
     //! \param maxSize Best-effort upper bound.
     //! \param sizeGranularity Required positive size multiple in bytes.
@@ -120,11 +139,6 @@ public:
 
     [[nodiscard]] StagingBufferMemory memory() const noexcept;
 
-    [[nodiscard]] HostMem const* hostMem() const noexcept
-    {
-        return std::get_if<HostMem>(&mMemoryOwner);
-    }
-
 private:
     friend class StagingBuffer;
 
@@ -133,7 +147,7 @@ private:
     void retire(StagingBufferRange* range, CachedCudaEvent readyEvent) noexcept;
 
     size_t mSize;
-    std::variant<HostMem, CudaUniqPtr> mMemoryOwner;
+    std::variant<StaticHostMem, CudaUniqPtr<std::byte>> mMemoryOwner;
     // Full spatial partition; retired fragments retain their previous temporal owner event.
     std::list<StagingBufferRange> mRanges;
     std::list<StagingBufferRange>::iterator mHead;

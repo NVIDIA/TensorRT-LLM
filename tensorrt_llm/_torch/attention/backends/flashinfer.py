@@ -37,7 +37,7 @@ from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.runtime.kv_cache_manager_v2._common import BAD_PAGE_INDEX
+from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ...metadata import KVCacheParams
 from ...utils import get_global_attrs, get_model_extra_attrs, torch_multi_arange
@@ -45,6 +45,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         AttentionInputType, AttentionMetadata,
                         CustomAttentionMask, MLAParams, PredefinedAttentionMask,
                         merge_attention_forward_args)
+from .utils import check_page_table, log_attention_failure_context
 
 # Guard on a visible GPU: with CUDA_VISIBLE_DEVICES="" (pure client) the
 # check would force a CUDA context at import time.
@@ -173,6 +174,28 @@ def _append_paged_kv_cache(
         )
 
 
+# Perf knob for the FlashInfer decode wrapper's kernel choice; see
+# ``FlashInferAttentionMetadata._use_tensor_cores``. "auto" (default) keeps
+# FlashInfer's GQA-ratio heuristic, "0" forces the split-K decode kernel, "1"
+# forces the tensor-core (paged-prefill) one. It never applies where only the
+# tensor-core kernel exists.
+FI_DECODE_TENSOR_CORES_ENV = "TRTLLM_FI_DECODE_TENSOR_CORES"
+
+_TENSOR_CORE_OVERRIDES = {"0": False, "1": True}
+
+
+def decode_tensor_cores_override() -> Optional[bool]:
+    """Read ``TRTLLM_FI_DECODE_TENSOR_CORES``; ``None`` means keep the heuristic."""
+    value = os.environ.get(FI_DECODE_TENSOR_CORES_ENV, "").strip().lower()
+    if value in ("", "auto"):
+        return None
+    if value not in _TENSOR_CORE_OVERRIDES:
+        raise ValueError(
+            f"{FI_DECODE_TENSOR_CORES_ENV} must be one of 0/1/auto, got "
+            f"{value!r}")
+    return _TENSOR_CORE_OVERRIDES[value]
+
+
 @dataclass(kw_only=True, frozen=True)
 class FlashInferMultiItemParams:
     """Multi-item scoring related parameters for FlashInfer APIs.
@@ -276,8 +299,19 @@ class FlashInferWrappers:
     decode_block_table_active_width: int = field(default=0, repr=False)
 
 
+# Environment variable arming the host-side page-table check, and how many
+# reports one run may emit before it goes quiet.
+_PAGE_TABLE_CHECK_ENV = "TRTLLM_FI_PAGE_TABLE_CHECK"
+_PAGE_TABLE_CHECK_REPORTS = 20
+
+
 @dataclass(kw_only=True)
 class FlashInferAttentionMetadata(AttentionMetadata):
+    # Report budget for the page-table check. A class attribute, because it
+    # bounds a run's log rather than a batch's, and deliberately unannotated so
+    # that @dataclass does not turn it into a field.
+    _page_table_check_budget = _PAGE_TABLE_CHECK_REPORTS
+
     workspace_buffer: Optional[torch.Tensor] = None
 
     paged_kv_indptr_decode: torch.Tensor = field(init=False)
@@ -737,6 +771,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             raise RuntimeError(
                 "FlashInfer metadata cannot mix shared and separate draft KV "
                 "views.")
+        if not uses_shared_kv_cache:
+            # The separate view runs on the target's staging copy of the draft manager.
+            self.sync_draft_mixed_precision_staging()
         return self._draft_metadata
 
     def _sync_draft_view(self, target: "FlashInferAttentionMetadata") -> None:
@@ -757,6 +794,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.seq_lens_kv = None
             self.num_contexts = target.num_contexts
             self._uses_full_draft_page_table = False
+            # Reuse the target's staging copy of a mixed-precision draft manager.
+            self.mixed_precision_staging = target.draft_mixed_precision_staging
+            self.draft_mixed_precision_staging = None
             self.prepare()
             torch.add(
                 target._cached_token_lens[:num_seqs],
@@ -894,6 +934,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self._logical_kv_lens[row_slice].add_(runtime_offsets, alpha=direction)
         token_offsets = runtime_offsets.repeat_interleave(tokens_per_generation)
         self._positions[token_slice].add_(token_offsets, alpha=direction)
+        view = self.mixed_precision_staging
+        if view is not None and view.manager is self.kv_cache_manager:
+            # Keep the staging lengths in step with the KV lengths.
+            view.lengths[:, row_slice].add_(runtime_offsets, alpha=direction)
 
         for wrappers in self._plan_params_to_wrappers.values():
             self._publish_decode_wrapper_kv_lens(wrappers.decode_wrapper)
@@ -918,6 +962,64 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self.seq_lens_kv_cuda[start:end],
             out=kv_lens_buffer[:self.num_generations],
         )
+
+    def _debug_validate_page_table(self, kv_lens_host, logical_num_blocks,
+                                   num_blocks) -> None:
+        """Diagnostic: check the page table handed to FlashInfer is well formed.
+
+        Every structural claim the kernel relies on is already on the host by
+        the time this runs -- the index mirrors, the indptr host copies and the
+        length arrays are all numpy or CPU tensors -- so the check costs no GPU
+        work and no synchronization, which is what makes it usable on a path
+        where a synchronization can hide the fault being chased.
+
+        Off unless ``TRTLLM_FI_PAGE_TABLE_CHECK`` is set. Reports are bounded,
+        because a malformed row repeats on every step of the request that owns
+        it, and one line is printed when the check is armed and finds nothing,
+        so that a clean run is distinguishable from a run the environment
+        variable never reached.
+        """
+        if not os.environ.get(_PAGE_TABLE_CHECK_ENV, "").strip():
+            return
+        cls = FlashInferAttentionMetadata
+        if cls._page_table_check_budget <= 0:
+            return
+        pool_size = getattr(self.kv_cache_manager, 'blocks_in_primary_pool',
+                            None)
+        pools = getattr(self, '_host_pool_indices', None) or {
+            0: getattr(self, '_host_paged_kv_indices', None)
+        }
+        host_pools = {
+            pool_id:
+            (indices.cpu().numpy() if torch.is_tensor(indices) else indices)
+            for pool_id, indices in pools.items()
+        }
+        try:
+            problems = check_page_table(
+                host_pools,
+                num_blocks,
+                logical_num_blocks,
+                kv_lens_host,
+                self.page_size,
+                pool_size=pool_size,
+            )
+        except Exception as exc:  # pragma: no cover - a diagnostic must not break a run
+            cls._page_table_check_budget -= 1
+            logger.warning(
+                f"[flashinfer] page table check failed to run: {exc}")
+            return
+        if problems:
+            cls._page_table_check_budget -= 1
+            logger.warning(
+                f"[flashinfer] page table check, {self.num_contexts} context / "
+                f"{self.num_generations} generation rows: " +
+                "; ".join(problems))
+        elif cls._page_table_check_budget == _PAGE_TABLE_CHECK_REPORTS:
+            cls._page_table_check_budget -= 1
+            logger.info(
+                f"[flashinfer] page table check armed and clean on a batch of "
+                f"{self.num_contexts} context / {self.num_generations} "
+                f"generation rows, pool size {pool_size}")
 
     def _prepare_full_draft_page_table(self) -> None:
         """Expose every allocated draft page and use device KV lengths."""
@@ -997,9 +1099,18 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # Note: even though flashinfer only recommends 128 MB, we have to push it
             # a bit higher to cover all possible CUDA graph cases. If it's too small,
             # warmup will crash.
+            # FlashInfer's split-KV decode plan sizes its temp buffers proportionally to
+            # SM count; 320 MB was tuned for a 148-SM baseline, so scale up (never down)
+            # on GPUs with more SMs.
+            baseline_sms = 148
+            baseline_bytes = 320 * 1024 * 1024
+            num_sms = torch.cuda.get_device_properties(
+                torch.cuda.current_device()).multi_processor_count
+            workspace_bytes = max(baseline_bytes,
+                                  baseline_bytes * num_sms // baseline_sms)
             self.workspace_buffer = self.get_empty(
                 buffers,
-                (320 * 1024 * 1024, ),
+                (workspace_bytes, ),
                 dtype=torch.uint8,
                 cache_name="workspace_buffer",
                 capture_graph=capture_graph,
@@ -1094,6 +1205,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 layer_buffer = self.kv_cache_manager.get_buffers(layer_idx)
                 if layer_buffer is not None:
                     max_num_blocks = max(max_num_blocks, layer_buffer.shape[0])
+            if self._has_mixed_precision_staging():
+                # The staging page space spans every sequence slot.
+                max_num_blocks = max(
+                    max_num_blocks,
+                    (self.max_num_sequences or self.max_num_requests) *
+                    self.kv_cache_manager.max_blocks_per_seq)
             self._paged_kv_indices = self.get_empty(
                 buffers,
                 (max_num_blocks, ),
@@ -1104,20 +1221,26 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._max_num_blocks_per_seq = self.kv_cache_manager.max_blocks_per_seq
 
             # Layers may share one page-index list only when they are in the
-            # same pool AND have the same page-index scale: VSWA splits pools,
+            # same pool, page-index scale, and KV factor: VSWA splits pools,
             # and per-layer geometry (e.g. Gemma4 sliding/global head_dim)
             # splits scales even when all windows collapse to max_seq_len and
-            # is_vswa is False. Guarded on V2-specific attributes (V1 managers
-            # lack the per-pool infrastructure).
+            # is_vswa is False. Mixed K-only/KV layers can use different view
+            # indices even with the same physical scale. Guarded on V2-specific
+            # attributes (V1 managers lack the per-pool infrastructure).
             mgr = self.kv_cache_manager
             get_scale = getattr(mgr, 'get_layer_page_index_scale', None)
+            get_kv_factor = getattr(mgr, 'get_layer_kv_factor', None)
             layer_space: Dict[int, int] = {}
             if hasattr(mgr, 'layer_to_pool_mapping_dict') and get_scale:
                 space_ids = {}
                 for layer_idx in attention_layer_indices:
                     layer_offset = mgr.layer_offsets[layer_idx]
                     key = (mgr.layer_to_pool_mapping_dict[layer_offset],
-                           get_scale(layer_idx))
+                           get_scale(layer_idx),
+                           get_kv_factor(layer_idx) if get_kv_factor else None)
+                    if (self._has_mixed_precision_staging() and layer_offset
+                            in mgr.mixed_precision_high_layers):
+                        key = ("mixed_precision_staging", )
                     space_ids.setdefault(key, len(space_ids))
                     layer_space[layer_idx] = space_ids[key]
             if layer_space:
@@ -1242,15 +1365,6 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             # key_value_indptr is query_output_indptr
             max_query_tokens_per_sequence = cast(int,
                                                  q_and_kv_seqlens.max().item())
-
-            if flashinfer_backend == "cudnn":
-                # cuDNN ragged prefill uses *element* offsets in qo/kv indptr, not token indptr.
-                key_value_indptr = key_value_indptr.clone(
-                )  # unalias query_output_indptr
-                query_output_indptr[1:].mul_(num_query_output_heads *
-                                             attention_head_dim)
-                key_value_indptr[1:].mul_(num_key_value_heads *
-                                          attention_head_dim)
 
         if (multi_item_params := plan_params.multi_item_params) is not None:
             if flashinfer_backend not in ["fa2", "fa3"]:
@@ -1626,10 +1740,15 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         self.num_context_blocks = sum(self.num_blocks[:self.num_contexts])
         self.num_generation_blocks = sum(self.num_blocks[self.num_contexts:])
 
+        if self._has_mixed_precision_staging():
+            self.prepare_mixed_precision_kv(
+                self.kv_layout, self.kv_cache_manager.tokens_per_block)
+
         # indices of used cache blocks for each sequence
         primary_layer_idx = self._primary_kv_layer_idx
-
-        paged_kv_indices = self.kv_cache_manager.get_batch_cache_indices_flat(
+        kv_cache_manager = (self.get_mixed_precision_kv_view(primary_layer_idx)
+                            or self.kv_cache_manager)
+        paged_kv_indices = kv_cache_manager.get_batch_cache_indices_flat(
             self.request_ids, self.num_blocks, layer_idx=primary_layer_idx)
         if primary_layer_idx is not None:
             self._sanitize_swa_page_indices(paged_kv_indices, primary_layer_idx)
@@ -1665,8 +1784,10 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                 if pool_id == primary_pool_id:
                     continue
                 rep_layer = self._vswa_pool_to_rep_layer[pool_id]
+                kv_cache_manager = (self.get_mixed_precision_kv_view(rep_layer)
+                                    or self.kv_cache_manager)
                 pool_indices = \
-                    self.kv_cache_manager.get_batch_cache_indices_flat(
+                    kv_cache_manager.get_batch_cache_indices_flat(
                         self.request_ids, self.num_blocks, layer_idx=rep_layer)
                 self._sanitize_swa_page_indices(pool_indices, rep_layer)
                 buf = getattr(self, f'_vswa_pool_buf_{pool_id}')
@@ -1793,6 +1914,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
             self._vswa_active_pool_id = primary_pool_id
             self._host_paged_kv_indices = \
                 self._host_pool_indices[primary_pool_id]
+
+        self._debug_validate_page_table(kv_lens_host, logical_num_blocks,
+                                        num_blocks)
 
         # CUDA graph + trtllm-gen: update _block_tables and _kv_lens_buffer
         # so the trtllm-gen decode kernel uses current page indices.
@@ -1947,10 +2071,65 @@ class FlashInferAttentionMetadata(AttentionMetadata):
         )
         return self._plan_with_params(plan_params, flashinfer_backend)
 
-    def _use_tensor_cores(self, plan_params: PlanParams):
-        return plan_params.kv_dtype in [
+    def _use_tensor_cores(self, plan_params: PlanParams,
+                          flashinfer_backend: str,
+                          use_graph_tensor_cores: bool):
+        # FlashInfer's BatchDecodeWithPagedKVCacheWrapper with tensor cores on
+        # plans and runs the paged-*prefill* kernel against a synthetic
+        # qo_indptr instead of the split-K decode kernel. FP8 KV needs it, and
+        # so does a >= 4 query-to-KV head ratio by FlashInfer's own perf
+        # heuristic -- which is a preference, not a requirement, and is worth
+        # measuring per model.
+        needs_tensor_cores = plan_params.kv_dtype in [
             torch.float8_e4m3fn, torch.float8_e5m2
-        ] or (plan_params.num_heads // plan_params.num_kv_heads >= 4)
+        ]
+        heuristic = needs_tensor_cores or (plan_params.num_heads //
+                                           plan_params.num_kv_heads >= 4)
+        override = decode_tensor_cores_override()
+        # Multi-token queries (speculative decode) have no split-K decode
+        # kernel either, so the knob only applies where both kernels exist.
+        #
+        # Those two are the exemptions this function owns; flashinfer 0.6.18
+        # enforces a third. Passing a fixed_split_size raises "fixed_split_size
+        # is only supported by tensor core decode for now" (decode.py:1136).
+        # Nothing in this repo passes one, so it is always None here and that
+        # guard cannot fire -- but if it ever starts being passed, an off
+        # override would show up as a ValueError from inside plan() rather than
+        # as a kernel choice, and this needs a third exemption.
+        #
+        # Two facts checked against the installed wheel rather than assumed,
+        # because an A/B between these kernels depends on both. The
+        # non-tensor-core module is selected with use_sliding_window =
+        # (window_left != -1) and is passed window_left, so it serves
+        # sliding-window layers too. And the CUDA-graph split-K replan
+        # bookkeeping keys on the wrapper's backend, not on the tensor-core
+        # choice, so replay stays correct either way.
+        if (override is None or needs_tensor_cores
+                or plan_params.q_len_per_req > 1):
+            use_tensor_cores = heuristic
+        else:
+            use_tensor_cores = override
+
+        # Warn when a requirement overrides TRTLLM_FI_DECODE_TENSOR_CORES=0.
+        # CUDA graphs with head_dim > 128 and the trtllm-gen backend are
+        # requirements, not preferences, so they correctly outrank an "off"
+        # override -- but not silently: the override names an A/B leg, and a
+        # leg that is quietly the other leg gets recorded as "no difference",
+        # the one outcome worse than an error (it costs a measurement and reads
+        # as a finding). Same reason a misspelled value raises above instead of
+        # falling back to the default. ``use_graph_tensor_cores`` is passed in
+        # because the caller also needs it for the wrapper's own flag.
+        if ((use_graph_tensor_cores or flashinfer_backend == "trtllm-gen")
+                and not use_tensor_cores and override is False):
+            reason = ("CUDA graph with head_dim > 128"
+                      if use_graph_tensor_cores else "the trtllm-gen backend")
+            logger.warning_once(
+                f"{FI_DECODE_TENSOR_CORES_ENV}=0 ignored: {reason} requires "
+                "the tensor-core decode wrapper. This plan runs WITH tensor "
+                "cores, so it is not the split-K arm.",
+                key="fi_decode_tensor_cores_override_forced_on")
+
+        return use_tensor_cores
 
     @staticmethod
     @functools.wraps(flashinfer.BatchPrefillWithPagedKVCacheWrapper)
@@ -2082,7 +2261,9 @@ class FlashInferAttentionMetadata(AttentionMetadata):
 
         use_graph_tensor_cores = self.is_cuda_graph and plan_params.head_dim > 128
         if wrappers.decode_wrapper is None:
-            use_tensor_cores = self._use_tensor_cores(plan_params)
+            use_tensor_cores = self._use_tensor_cores(plan_params,
+                                                      flashinfer_backend,
+                                                      use_graph_tensor_cores)
             # Gemma4's H256/H512 plans need a tensor-core wrapper with a stable
             # CUDA Graph launch layout. prepare() may refresh its split-K
             # schedule in the wrapper's fixed workspace as KV pages change.
@@ -2233,6 +2414,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         """
         # NHD layout: [num_pages, kv_factor=1, page_size, num_kv_heads=1, head_dim]
         kv_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx)
+        # Mixed precision gives MLA layers a second page space (the staging
+        # copy), so select this layer's page indices. Other MLA models keep
+        # their existing single-page-space behavior.
+        if metadata.mixed_precision_staging is not None:
+            metadata.swap_paged_kv_indices_for_layer(self.layer_idx)
         # [num_pages, page_size, kv_lora_rank + qk_rope_head_dim]
         combined = kv_buf.squeeze(1).squeeze(2)
         if self.has_fp8_kv_cache:
@@ -2734,16 +2920,24 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if attention_window_size is not None:
             attention_window_size = attention_window_size - 1
 
-        self.forward_impl(
-            q=q,
-            k=k,
-            v=v,
-            metadata=metadata,
-            attention_mask_type=attention_mask_type,
-            attention_mask_data=attention_mask_data,
-            attention_window_size=attention_window_size,
-            output=output,
-            latent_cache=latent_cache,
-            attention_input_type=forward_args.attention_input_type,
-        )
+        try:
+            self.forward_impl(
+                q=q,
+                k=k,
+                v=v,
+                metadata=metadata,
+                attention_mask_type=attention_mask_type,
+                attention_mask_data=attention_mask_data,
+                attention_window_size=attention_window_size,
+                output=output,
+                latent_cache=latent_cache,
+                attention_input_type=forward_args.attention_input_type,
+            )
+        except RuntimeError as exc:
+            # Report the TRTLLM-convention (exclusive) window, not the
+            # decremented FlashInfer one, so both backends log the same number.
+            log_attention_failure_context(
+                type(self).__name__, self.layer_idx, metadata,
+                forward_args.attention_window_size, exc)
+            raise
         return output

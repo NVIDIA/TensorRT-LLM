@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 360" width="1000" height="360">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="360" fill="#f5f5f5"/>
+<text x="70.0" y="34.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Qwen3-8B on one B200 · aggregate output throughput per GPU (tok/s) vs batch size</text>
+<text x="70.0" y="52.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="start">input 1,024 · output 16,384 tokens · CUDA graphs and overlap scheduler on · three fresh-process runs per point, same GPU</text>
+<rect x="70" y="62" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
+<text x="86.0" y="71.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">dense KV cache</text>
+<rect x="285" y="62" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
+<text x="301.0" y="71.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">TriAttention, budget 4,096</text>
+<rect x="500" y="62" width="11" height="11" fill="#76B900" stroke="#76B900"/>
+<text x="516.0" y="71.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">TriAttention, budget 2,048</text>
+<line x1="70" y1="288.0" x2="950" y2="288.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="62.0" y="291.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="70" y1="218.0" x2="950" y2="218.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="221.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">3,000</text>
+<line x1="70" y1="148.0" x2="950" y2="148.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="151.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">6,000</text>
+<line x1="70" y1="78.0" x2="950" y2="78.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="81.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">9,000</text>
+<rect x="86.0" y="253.9" width="44" height="34.1" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="108.0" y="248.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">1,460</text>
+<rect x="136.0" y="250.1" width="44" height="37.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="158.0" y="245.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">1,626</text>
+<rect x="186.0" y="247.2" width="44" height="40.8" fill="#76B900" stroke="#76B900" stroke-width="1"/>
+<text x="208.0" y="242.2" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">1,747</text>
+<text x="158.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 8</text>
+<text x="158.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#76B900" text-anchor="middle">+20% at budget 2,048</text>
+<rect x="262.0" y="235.4" width="44" height="52.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="284.0" y="230.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">2,254</text>
+<rect x="312.0" y="225.6" width="44" height="62.4" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="334.0" y="220.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">2,675</text>
+<rect x="362.0" y="215.7" width="44" height="72.3" fill="#76B900" stroke="#76B900" stroke-width="1"/>
+<text x="384.0" y="210.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">3,098</text>
+<text x="334.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 16</text>
+<text x="334.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#76B900" text-anchor="middle">+37% at budget 2,048</text>
+<rect x="438.0" y="217.4" width="44" height="70.6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="460.0" y="212.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">3,026</text>
+<rect x="488.0" y="198.1" width="44" height="89.9" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="510.0" y="193.1" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">3,853</text>
+<rect x="538.0" y="175.0" width="44" height="113.0" fill="#76B900" stroke="#76B900" stroke-width="1"/>
+<text x="560.0" y="170.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">4,842</text>
+<text x="510.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 32</text>
+<text x="510.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="600" fill="#76B900" text-anchor="middle">+60% at budget 2,048</text>
+<rect x="614.0" y="266" width="44" height="22" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="636.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle"></text>
+<rect x="664.0" y="173.4" width="44" height="114.6" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="686.0" y="168.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">4,911</text>
+<rect x="714.0" y="132.4" width="44" height="155.6" fill="#76B900" stroke="#76B900" stroke-width="1"/>
+<text x="736.0" y="127.4" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">6,670</text>
+<text x="686.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 64</text>
+<text x="686.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">dense out of memory</text>
+<rect x="790.0" y="266" width="44" height="22" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="812.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle"></text>
+<rect x="840.0" y="266" width="44" height="22" fill="none" stroke="#bfc0c0" stroke-width="1" stroke-dasharray="3,3"/>
+<text x="862.0" y="280.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">not run</text>
+<rect x="890.0" y="96.7" width="44" height="191.3" fill="#76B900" stroke="#76B900" stroke-width="1"/>
+<text x="912.0" y="91.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8" font-weight="600" fill="#2d3142" text-anchor="middle">8,198</text>
+<text x="862.0" y="304.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">batch 128</text>
+<text x="862.0" y="318.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="8.5" font-weight="500" fill="#7a8399" text-anchor="middle">dense out of memory</text>
+<text x="500.0" y="350.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">a compacted cache decodes faster at the same batch size and keeps scaling after the dense cache runs out of memory</text>
+</svg>

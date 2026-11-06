@@ -101,11 +101,11 @@ class RocketKVCacheManager(KVCacheManager):
         self.num_blocks = self.blocks_in_primary_pool
         self.kt_cache_pool_per_layer = [
             torch.empty(
-                (self.num_blocks, self.kt_tokens_per_block, num_kv_heads, head_dim * 2),
+                (self.num_blocks, self.kt_tokens_per_block, local_kv_heads, head_dim * 2),
                 device="cuda",
                 dtype=self.kt_cache_dtype,
             )
-            for _ in range(self.num_local_layers)
+            for local_kv_heads in self.num_kv_heads_per_layer
         ]
         self.max_kt_blocks_per_seq = self.num_blocks
 
@@ -118,7 +118,6 @@ class RocketKVCacheManager(KVCacheManager):
         request_ids: List[int],
         token_nums: Optional[List[int]] = None,
         is_gen: bool = False,
-        prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         kv_reserve_draft_tokens: Optional[int] = None,
         use_mrope: bool = False,
@@ -131,7 +130,6 @@ class RocketKVCacheManager(KVCacheManager):
             request_ids=request_ids,
             token_nums=token_nums,
             is_gen=is_gen,
-            prepare_resource=prepare_resource,
             max_num_draft_tokens=max_num_draft_tokens,
             kv_reserve_draft_tokens=kv_reserve_draft_tokens,
             use_mrope=use_mrope,
@@ -140,11 +138,12 @@ class RocketKVCacheManager(KVCacheManager):
             draft_kv_cache_manager=draft_kv_cache_manager,
             capture_sampling_params=capture_sampling_params,
         )
-        if prepare_resource:
-            for req in requests:
-                request_id = req.py_request_id
-                kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
-                self.kt_cache_manager.add_tokens(request_id, kt_token_num)
+        if requests is None:
+            return None
+        for req in requests:
+            request_id = req.py_request_id
+            kt_token_num = math.ceil(req.max_beam_num_tokens / self.page_size)
+            self.kt_cache_manager.add_tokens(request_id, kt_token_num)
         return requests
 
     def get_kt_buffers(self, layer_idx: int):

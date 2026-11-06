@@ -9,13 +9,28 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.peft.lora.config import LoraConfig
 from tensorrt_llm._torch.peft.lora.cuda_graph_lora_manager import CudaGraphLoraManager
 from tensorrt_llm._torch.peft.lora.manager import LoraModelConfig
+from tensorrt_llm._torch.peft.lora.ownership import DecoderLoraOwner
+from tensorrt_llm._torch.peft.lora.ownership import resolve as resolve_owner
 from tensorrt_llm._utils import torch_dtype_to_str
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
+from tensorrt_llm.inputs.registry import InputProcessor
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 
 from ..resource_manager import PeftCacheManager
 from ..scheduler import ScheduledRequests
+from .multimodal import is_multimodal
+
+
+def resolve_lora_owner(
+    model: nn.Module, input_processor: InputProcessor
+) -> tuple[DecoderLoraOwner, nn.Module]:
+    """Bind the declared decoder owner before loading any adapters.
+
+    Multimodal models must select a decoder submodule. Undeclared text-only
+    models own adapters at the model root.
+    """
+    return resolve_owner(model, require_submodule=is_multimodal(model, input_processor))
 
 
 def make_lora_model_config(
@@ -23,6 +38,8 @@ def make_lora_model_config(
     lora_target_modules: list[str],
     trtllm_modules_to_hf_modules: dict[str, str],
     swap_gate_up_proj_lora_b_weight: bool = True,
+    *,
+    owner: DecoderLoraOwner,
 ) -> LoraModelConfig:
     """Describe the model to the LoRA stack, for the engine to record."""
     return LoraModelConfig(
@@ -31,6 +48,7 @@ def make_lora_model_config(
         hidden_size=model.config.hidden_size,
         dtype=torch_dtype_to_str(model.config.torch_dtype),
         swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight,
+        owner=owner,
     )
 
 
@@ -42,7 +60,7 @@ def make_cuda_graph_lora_manager(
     max_tokens_per_seq: int,
     max_num_tokens: int,
 ) -> CudaGraphLoraManager:
-    """Build the CUDA-graph LoRA manager. Only call this when graphs are enabled."""
+    """Build a graph manager from the decoder module selected during initialization."""
     max_lora_size = lora_config.max_loras or 8  # Default fallback
     manager = CudaGraphLoraManager(
         max_lora_size=max_lora_size,
@@ -64,32 +82,33 @@ def make_cuda_graph_lora_manager(
 
 
 class LoraParamBuilder:
-    """Builds the per-iteration ``lora_params`` dict for the model forward.
+    """Own LoRA preparation state and build per-iteration model parameters.
 
-    Holds no model, no CUDA-graph manager and no device buffers -- only the two
-    construction-time values the token-count logic needs. The engine passes
-    everything else in on each :meth:`build` call.
-
-    Latching those two is safe: the engine assigns each exactly once, before it
-    constructs the builder. The state that capture and warmup rewrite between
-    forwards -- ``enable_spec_decode`` and ``runtime_draft_len`` -- is what
-    :meth:`build` takes per call instead.
+    ``model_config`` is set once LoRA adapters are configured. The optional
+    graph manager is replaced whenever executor resources are rebuilt; None
+    selects eager preparation only. Graph selection and parameter preparation
+    use the same manager. Speculative execution decisions remain per-call inputs.
     """
 
     def __init__(
-        self, *, spec_config: DecodingBaseConfig | None, attn_backend: type[AttentionMetadata]
+        self,
+        *,
+        attn_backend: type[AttentionMetadata],
+        cuda_graph_manager: CudaGraphLoraManager | None,
+        spec_config: DecodingBaseConfig | None = None,
     ) -> None:
         self._spec_config = spec_config
         self._attn_backend = attn_backend
+        self.cuda_graph_manager = cuda_graph_manager
+        self.model_config: LoraModelConfig | None = None
 
     def build(
         self,
         scheduled_requests: ScheduledRequests,
         attn_metadata: AttentionMetadata,
         *,
-        cuda_graph_lora_manager: CudaGraphLoraManager | None,
-        enable_spec_decode: bool,
-        runtime_draft_len: int,
+        enable_spec_decode: bool = False,
+        runtime_draft_len: int = 0,
         peft_cache_manager: PeftCacheManager | None = None,
         maybe_graph: bool = False,
         use_lora_graph: bool = False,
@@ -101,6 +120,7 @@ class LoraParamBuilder:
         Returns:
             Dictionary containing LoRA parameters, or None if no LoRA requests
         """
+        cuda_graph_lora_manager = self.cuda_graph_manager
         use_cuda_graph_mode = cuda_graph_lora_manager is not None and maybe_graph
 
         if use_cuda_graph_mode:

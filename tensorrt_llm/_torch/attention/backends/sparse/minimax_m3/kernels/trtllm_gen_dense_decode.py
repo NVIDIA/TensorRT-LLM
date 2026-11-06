@@ -25,7 +25,12 @@ from typing import NamedTuple, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.paged_cache import (
+    fp8_e4m3_saturate,
+)
 from tensorrt_llm._torch.memory_buffer_utils import get_memory_buffers
+
+from .msa_utils import check_decode_span_shape
 
 
 @functools.lru_cache(maxsize=None)
@@ -37,12 +42,10 @@ def _counter_size(num_heads: int, max_num_requests: int, device_index: int) -> i
     run, while computing it reaches C++ through a deferred import and a
     device-properties query on every dense layer of every step.
     """
-    from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
-        _get_multi_ctas_kv_counter_size,
-    )
+    from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_ctas_kv_counter_size
 
     multi_processor_count = torch.cuda.get_device_properties(device_index).multi_processor_count
-    return int(_get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
+    return int(get_multi_ctas_kv_counter_size(num_heads, max_num_requests, multi_processor_count))
 
 
 def _device_index(device: torch.device) -> int:
@@ -216,7 +219,15 @@ def uniform_subpages_per_slot(kv_cache_manager) -> int:
     layer_offsets = getattr(kv_cache_manager, "layer_offsets", None)
     if get_pool is None or not layer_offsets:
         return 0
-    factors = {int(get_pool(layer_idx, "HND")[1]) for layer_idx in layer_offsets}
+    is_nvfp4 = getattr(kv_cache_manager, "is_nvfp4_layer", lambda _: False)
+    is_hybrid_draft = getattr(kv_cache_manager, "is_hybrid_draft_layer", lambda _: False)
+    # NVFP4 sparse layers and the hybrid draft layer (read through its own view)
+    # never read the staged table and may sit in pools with another factor.
+    factors = {
+        int(get_pool(layer_idx, "HND")[1])
+        for layer_idx in layer_offsets
+        if not is_nvfp4(layer_idx) and not is_hybrid_draft(layer_idx)
+    }
     return factors.pop() if len(factors) == 1 else 0
 
 
@@ -252,6 +263,15 @@ def minimax_m3_trtllm_gen_dense_decode(
     """
     import flashinfer
 
+    # The multi-CTA KV counters are sized against max_num_requests, so a batch
+    # read out of a longer q would undersize them.
+    check_decode_span_shape(
+        "MiniMax-M3 trtllm-gen dense decode",
+        int(q.shape[0]),
+        int(seq_lens.shape[0]),
+        decode_query_len,
+    )
+
     kv_pool, subpages_per_slot = kv_cache_manager.get_kv_subpage_pool(layer_idx, "HND")
     num_heads = int(q.shape[1])
 
@@ -259,7 +279,7 @@ def minimax_m3_trtllm_gen_dense_decode(
     # q/k/v, so an FP8 pool needs FP8 Q. M3 stores unscaled E4M3, so this is a
     # plain cast and a no-op when the fused producer already emitted FP8.
     if kv_pool.dtype == torch.float8_e4m3fn and q.dtype != torch.float8_e4m3fn:
-        q = q.to(torch.float8_e4m3fn)
+        q = fp8_e4m3_saturate(q)
 
     reserve = torch.cuda.is_current_stream_capturing()
     workspace_size = _workspace(q.dtype, num_heads, int(q.shape[2]), int(kv_pool.shape[1]))

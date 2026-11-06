@@ -47,7 +47,7 @@ Declaring a path
 
 Assign a list of paths at module level::
 
-    __extra_import_path__ = [".", "..", "~/examples/auto_deploy"]
+    __extra_import_path__ = [".", ".."]
 
 Each entry is one of the following:
 

@@ -17,10 +17,13 @@
 import logging
 import sys
 from dataclasses import replace
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
+from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
@@ -35,8 +38,11 @@ from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
+    WEIGHT_MANIFEST_DIR_ENV,
+    WEIGHT_MANIFEST_ROLE_ENV,
     ArtifactIdentity,
     SourceIdentity,
+    load_weight_manifest,
 )
 
 pytestmark = pytest.mark.cpu_only
@@ -117,6 +123,28 @@ def _install_fake_mx(
     module.MxModelLoader = MxModelLoader
     monkeypatch.setitem(sys.modules, module.__name__, module)
     return instances
+
+
+class _TinyModule(nn.Module):
+    """Two parameters and a buffer with deterministic CPU values."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+        self.bias = nn.Parameter(torch.ones(2))
+        self.register_buffer("scale", torch.tensor([0.5, 0.25]))
+
+
+def _enable_manifests(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, role: str) -> None:
+    monkeypatch.setenv(WEIGHT_MANIFEST_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(WEIGHT_MANIFEST_ROLE_ENV, role)
+
+
+def _manifest_load_kwargs(**overrides):
+    """`_load_kwargs` with a real module and an integer rank, as the manifest needs."""
+    values = {"model": _TinyModule(), "mapping": MagicMock(name="mapping", rank=0)}
+    values.update(overrides)
+    return _load_kwargs(**values)
 
 
 def test_construction_preserves_checkpoint_loader_contract():
@@ -625,3 +653,194 @@ def test_cleanup_continues_when_mx_cleanup_fails(monkeypatch):
     warning.assert_called_once_with(
         f"Failed to clean up ModelExpress loader {instances[0]!r}: {cleanup_error!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Weight manifests at the MX transfer boundaries
+# ---------------------------------------------------------------------------
+
+
+def test_p2p_success_writes_receiver_transfer_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "receiver")
+    _install_fake_mx(monkeypatch, p2p_succeeded=True, value={})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    assert loader.load_weights("checkpoint", **_manifest_load_kwargs()) == {}
+
+    files = sorted(path.name for path in tmp_path.iterdir())
+    assert files == ["manifest.transfer.receiver.rank0.json"]
+    manifest = load_weight_manifest(tmp_path / files[0])
+    assert manifest.context["boundary"] == "receiver_p2p_success"
+    assert manifest.context["checkpoint_format"] == "MX"
+    assert manifest.context["role"] == "receiver"
+    assert manifest.context["rank"] == 0
+    assert [entry.fqn for entry in manifest.entries] == ["bias", "scale", "weight"]
+    assert loader.is_weights_preloaded()
+
+
+def test_receiver_transfer_manifest_uses_mapping_rank(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "receiver")
+    _install_fake_mx(monkeypatch, p2p_succeeded=True, value={})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    loader.load_weights("checkpoint", **_manifest_load_kwargs(mapping=MagicMock(rank=1)))
+
+    manifest = load_weight_manifest(tmp_path / "manifest.transfer.receiver.rank1.json")
+    assert manifest.context["rank"] == 1
+
+
+def test_native_fallback_writes_no_transfer_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "receiver")
+    native_weights = {"disk": object()}
+    _install_fake_mx(monkeypatch, p2p_succeeded=False, value=native_weights)
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    assert loader.load_weights("checkpoint", **_manifest_load_kwargs()) is native_weights
+
+    assert not loader.is_weights_preloaded()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_incompatible_transfer_protocol_writes_no_transfer_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "receiver")
+    _install_fake_mx(monkeypatch, p2p_succeeded=True, value={}, transform_protocol_version=2)
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    with pytest.raises(RuntimeError, match="compatible TRT-LLM transform protocol"):
+        loader.load_weights("checkpoint", **_manifest_load_kwargs())
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_receiver_manifest_problem_fails_the_load(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "bad role")
+    instances = _install_fake_mx(monkeypatch, p2p_succeeded=True, value={})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+
+    with pytest.raises(ValueError, match="role"):
+        loader.load_weights("checkpoint", **_manifest_load_kwargs())
+
+    assert not loader.is_weights_preloaded()
+    instances[0].cleanup.assert_called_once_with()
+    assert loader._mx_loader is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_native_donor_writes_transfer_manifest_before_publish(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "donor")
+    instances = _install_fake_mx(monkeypatch, p2p_succeeded=False, value={"disk": object()})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _manifest_load_kwargs()
+    loader.load_weights("checkpoint", **kwargs)
+    expected = tmp_path / "manifest.transfer.donor.rank0.json"
+    seen_at_publish: list[bool] = []
+    instances[0].publish_model.side_effect = lambda _model: seen_at_publish.append(
+        expected.exists()
+    )
+
+    loader.post_load_publish(
+        kwargs["model"],
+        checkpoint_dir="checkpoint",
+        weights_preloaded=False,
+        source_identity=kwargs["source_identity"],
+    )
+
+    instances[0].publish_model.assert_called_once_with(kwargs["model"])
+    assert seen_at_publish == [True]
+    manifest = load_weight_manifest(expected)
+    assert manifest.context["boundary"] == "donor_publish"
+    assert manifest.context["checkpoint_format"] == "MX"
+    assert manifest.context["role"] == "donor"
+    assert manifest.context["rank"] == kwargs["source_identity"].rank
+    assert [entry.fqn for entry in manifest.entries] == ["bias", "scale", "weight"]
+
+
+def test_donor_publish_rank_falls_back_to_load_time_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "donor")
+    _install_fake_mx(monkeypatch, p2p_succeeded=False, value={"disk": object()})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _manifest_load_kwargs(source_identity=replace(_source_identity(), rank=1))
+    loader.load_weights("checkpoint", **kwargs)
+
+    loader.post_load_publish(kwargs["model"], checkpoint_dir="checkpoint", weights_preloaded=False)
+
+    manifest = load_weight_manifest(tmp_path / "manifest.transfer.donor.rank1.json")
+    assert manifest.context["rank"] == 1
+
+
+def test_receiver_republish_writes_no_second_transfer_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable_manifests(monkeypatch, tmp_path, "receiver")
+    instances = _install_fake_mx(monkeypatch, p2p_succeeded=True, value={})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _manifest_load_kwargs()
+    loader.load_weights("checkpoint", **kwargs)
+
+    loader.post_load_publish(
+        kwargs["model"],
+        checkpoint_dir="checkpoint",
+        weights_preloaded=True,
+        source_identity=kwargs["source_identity"],
+    )
+
+    instances[0].publish_model.assert_called_once_with(kwargs["model"])
+    files = sorted(path.name for path in tmp_path.iterdir())
+    assert files == ["manifest.transfer.receiver.rank0.json"]
+    assert load_weight_manifest(tmp_path / files[0]).context["boundary"] == "receiver_p2p_success"
+
+
+def test_donor_manifest_problem_is_not_swallowed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The manifest runs before the publish call on purpose; a bad role must escape.
+    _enable_manifests(monkeypatch, tmp_path, "bad role")
+    instances = _install_fake_mx(monkeypatch, p2p_succeeded=False, value={"disk": object()})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _manifest_load_kwargs()
+    loader.load_weights("checkpoint", **kwargs)
+
+    with pytest.raises(ValueError, match="role"):
+        loader.post_load_publish(
+            kwargs["model"],
+            checkpoint_dir="checkpoint",
+            weights_preloaded=False,
+            source_identity=kwargs["source_identity"],
+        )
+
+    instances[0].publish_model.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_publish_without_manifest_env_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv(WEIGHT_MANIFEST_DIR_ENV, raising=False)
+    instances = _install_fake_mx(monkeypatch, p2p_succeeded=False, value={"disk": object()})
+    loader, _, _ = _loader(mx_server_url="mx:8001")
+    kwargs = _manifest_load_kwargs()
+    loader.load_weights("checkpoint", **kwargs)
+
+    loader.post_load_publish(
+        kwargs["model"],
+        checkpoint_dir="checkpoint",
+        weights_preloaded=False,
+        source_identity=kwargs["source_identity"],
+    )
+
+    instances[0].publish_model.assert_called_once_with(kwargs["model"])
+    assert list(tmp_path.iterdir()) == []
