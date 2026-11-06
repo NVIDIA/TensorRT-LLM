@@ -83,6 +83,7 @@ Welcome to TensorRT LLM's Documentation!
    features/parallel-strategy.md
    features/quantization.md
    features/sampling.md
+   features/sampling-shared-prefix-attention.md
    features/watermarking.md
    features/beam-search-shared-prefix-attention.md
    features/additional-outputs.md
