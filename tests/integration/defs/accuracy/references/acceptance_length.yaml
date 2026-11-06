@@ -233,13 +233,14 @@ ModelingV2Qwen38FlashNextNvfp4Sm103Default::tp1_mtp7_nvfp4_kv_bf16_state_long_co
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3:
   ref_al: 3.689
   min_al: 3.50
-# Read by test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable]: tp4 over NVFP4 KV with the
-# breakable prefill graph. Measured and floored as the mtp3 entry.
+# Read by test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] (tp4 over NVFP4 KV with the
+# breakable prefill graph, where it was measured) and [tep4_nvfp4_kv_no_reuse]. Floored as the
+# mtp3 entry.
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_nvfp4_kv:
   ref_al: 3.535
   min_al: 3.36
-# Read by test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv]: dep4 (MTP under attention DP) over FP8 KV.
-# Measured and floored as the mtp3 entry.
+# Read by test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] (dep4, MTP under attention DP, over FP8 KV,
+# where it was measured) and [tep4_fp8_kv_flashinfer_ring]. Floored as the mtp3 entry.
 ModelingV2Qwen38FlashNextNvfp4Sm103Default::mtp3_fp8_kv:
   ref_al: 3.512
   min_al: 3.34
