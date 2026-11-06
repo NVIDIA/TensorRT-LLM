@@ -45,7 +45,7 @@ def _make_stub_executor(rank=0, queued_items=None):
     stub.executor_request_queue.get_from_request_queue = Mock(return_value=list(queued_items))
     stub.request_broadcaster = Mock()
     # Echo rank 0's requests back, mirroring a world broadcast.
-    stub.request_broadcaster.broadcast = Mock(side_effect=lambda reqs, **kw: (list(reqs), None))
+    stub.request_broadcaster.broadcast = Mock(side_effect=lambda reqs, **kw: list(reqs))
     stub._handle_special_queue_items = Mock(side_effect=lambda reqs: reqs)
     # No KV-cache transceiver: the idle wait is unbounded (MPI) or the Ray
     # heartbeat; tests for the transfer-bounded idle wait set these.
