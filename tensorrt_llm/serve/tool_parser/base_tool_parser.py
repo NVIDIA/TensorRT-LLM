@@ -239,9 +239,28 @@ class BaseToolParser(ABC):
         - Tool call is Pythonic style
 
         For incompatible formats, detectors should override this method with custom logic.
+
+        Every call whose JSON is complete by the end of an increment is
+        released in full by that increment, since it may be the last one of
+        the stream.
         """
-        # Append new text to buffer
         self._buffer += new_text
+        normal_text = ""
+        calls: List[ToolCallItem] = []
+        # A pass over the buffer completes at most one call. When it consumes
+        # text, what is left may already hold the next call, so parse again.
+        while True:
+            buffered = self._buffer
+            result = self._parse_buffered_tool_call(tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+            if self._buffer == buffered:
+                return StreamingParseResult(normal_text=normal_text,
+                                            calls=calls)
+
+    def _parse_buffered_tool_call(self,
+                                  tools: List[Tool]) -> StreamingParseResult:
+        """Make one pass of ``parse_streaming_increment`` over the buffer."""
         current_text = self._buffer
 
         # The current_text has tool_call if it is the start of a new tool call sequence
@@ -327,6 +346,16 @@ class BaseToolParser(ABC):
                         )
                     ], )
                     self.current_tool_name_sent = True
+
+                    # A call that is already complete sends its arguments in
+                    # the same item: left to a later increment, they would be
+                    # lost when this increment is the last of the stream.
+                    # Missing or falsy arguments become {}, as in
+                    # parse_base_json.
+                    if is_current_complete:
+                        res.calls[0].parameters = json.dumps(
+                            current_tool_call.get("arguments") or {})
+                        self._complete_current_tool(start_idx + end_idx)
                 else:
                     res = StreamingParseResult()
 
@@ -336,13 +365,14 @@ class BaseToolParser(ABC):
                 cur_arguments = current_tool_call.get("arguments")
                 res = StreamingParseResult()
 
-                # A finished call may carry no "arguments" key at all, or an
-                # explicit null. Both mean "no arguments" and are normalized to
-                # {} so the call still completes, matching what parse_base_json
-                # returns on the non-streaming path. While the JSON is still
-                # partial a missing key only means "not streamed yet", so it is
-                # left alone and the elif prev_arguments branch keeps handling it.
-                if is_current_complete and cur_arguments is None:
+                # A finished call may carry no "arguments" key at all, or a
+                # falsy value such as null, [] or "". All of them mean "no
+                # arguments" and are normalized to {} so the call still
+                # completes, matching what parse_base_json returns on the
+                # non-streaming path. While the JSON is still partial a missing
+                # key only means "not streamed yet" and a falsy value may still
+                # grow, so neither is normalized before the call is complete.
+                if is_current_complete and not cur_arguments:
                     cur_arguments = {}
 
                 # An empty argument object is falsy but still has to be streamed and
@@ -368,14 +398,7 @@ class BaseToolParser(ABC):
                         )  # Save the ID of the tool that's completing
 
                         # Only remove the processed portion, keep unprocessed content
-                        self._buffer = current_text[start_idx + end_idx:]
-
-                        if self.current_tool_id < len(self.prev_tool_call_arr):
-                            self.prev_tool_call_arr[
-                                self.current_tool_id].clear()
-                        self.current_tool_name_sent = False
-                        self.streamed_args_for_tool[self.current_tool_id] = ""
-                        self.current_tool_id += 1
+                        self._complete_current_tool(start_idx + end_idx)
 
                     # If the tool is still being parsed, send incremental changes
                     elif prev_arguments:
@@ -414,6 +437,15 @@ class BaseToolParser(ABC):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult()
+
+    def _complete_current_tool(self, call_end: int) -> None:
+        """Close the current tool call, whose text ends at ``call_end``."""
+        self._buffer = self._buffer[call_end:]
+        if self.current_tool_id < len(self.prev_tool_call_arr):
+            self.prev_tool_call_arr[self.current_tool_id].clear()
+        self.current_tool_name_sent = False
+        self.streamed_args_for_tool[self.current_tool_id] = ""
+        self.current_tool_id += 1
 
     @abstractmethod
     def has_tool_call(self, text: str) -> bool:
