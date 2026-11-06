@@ -33,9 +33,12 @@ the answers into clear, checkable sentences.
 - End each part with a recap of what goes into the YAML, in the same
   field-by-value form, and ask for corrections before moving on.
 - Write only what this skill lists. Do not add environment variables
-  (PATH, PYTHONPATH, HOME, HF offline, MPI/UCX), build-artifact symlinks, or
-  `gpu_pool`. If the user volunteers such details, copy them verbatim into
+  (PATH, PYTHONPATH, HOME, HF offline, MPI/UCX) or build-artifact symlinks.
+  If the user volunteers such details, copy them verbatim into
   `implements_tips`.
+- Check paths and settings once, at Finish, with the workflow's own check;
+  do not re-implement its checks in the conversation. A problem it reports
+  goes back to the user.
 
 ## Forms for Parts 1 and 2
 
@@ -50,33 +53,27 @@ with its source (e.g. "from your message", "from nvidia-smi", "found in the
 checkpoint directory"); leave the rest blank. In Part 2's form, the Slurm
 fields are answered only if the user answers yes to "use Slurm?".
 
-When the reply arrives, run that part's checks (and, in Part 1, the
-checkpoint inspection), then send one recap: a table of every field, its
-value, its source, and its check result (Part 1 adds the checkpoint facts).
-Ask about blanks, failed checks and conflicting values; otherwise ask the
-user to confirm the table.
+When the reply arrives (and, in Part 1, after the checkpoint inspection),
+send one recap: a table of every field, its value and its source (Part 1
+adds the checkpoint facts). Ask about blanks and conflicting values;
+otherwise ask the user to confirm the table.
 
 If the user points to an earlier task.yaml, take from it only the fields
-this skill writes. Map `slurm-environment.slurm_partition` and
-`docker_image` directly, and `gpu_pool.account` / `qos` /
-`container_mounts` to the same names under `slurm-environment`. When the
-file holds two values for one field (e.g. `slurm_partition` and
-`gpu_pool.partition`), show both and ask. Its other content (environment
+this skill writes, and propose them as values with that file as their
+source. When the file holds two values for one field (e.g. `slurm_partition`
+and `gpu_pool.partition`), show both and ask. Its other content (environment
 variables, other tips) is not carried over unless the user asks for it.
 
 ## Part 1 — Basic configuration
 
 Items and checks:
 
-| Item | Goes to | Check |
+| Item | Goes to | Notes |
 |---|---|---|
-| `reference_code_path` (HF `modeling_*.py`) | top level | exists |
-| `checkpoint_path` (HF checkpoint dir) | top level | exists, has `config.json` |
-| `trtllm_repo_path` | top level | exists, is a git checkout (`git -C <path> rev-parse`) |
+| `reference_code_path` (HF `modeling_*.py`) | top level | — |
+| `checkpoint_path` (HF checkpoint dir) | top level | — |
+| `trtllm_repo_path` | top level | a clean checkout; modeling-v2-onboard commits its result there |
 | Target GPU (e.g. GB300 / sm_103) | `implements_tips` | if `nvidia-smi` works here, propose its GPU and confirm; otherwise ask — never guess the model from a partition name. You may fill in the SM from the GPU name; show it for confirmation |
-| `LLM_MODELS_ROOT` | `implements_tips` | directory exists; `datasets/openai/gsm8k` exists and is non-empty — warn if missing |
-
-A path that does not exist goes back to the user; never write it.
 
 Inspect the checkpoint with:
 
@@ -93,23 +90,54 @@ these facts.
 Whether the run uses Slurm:
 
 - **No:** omit `slurm-environment` entirely.
-- **Yes:** these five go under `slurm-environment`
-  (never under `gpu_pool`, which starts a node pool in modeling-v2-onboard).
-  The agents read this whole section.
+- **Yes:** ask for `slurm_partition` and `docker_image` (both required,
+  under `slurm-environment`), and — only when the user's agent-flow has
+  `agent_flow/workflows/modeling_v2_onboard/` — whether the run uses a
+  **GPU pool**: a set of whole nodes the run holds from its start and
+  shares among its workers, instead of each worker submitting its own jobs.
 
-  | Field | Required | Check |
-  |---|---|---|
-  | `slurm_partition` | yes | — |
-  | `docker_image` | yes | the `.sqsh` exists |
-  | `account` | no — omit if the user has none | — |
-  | `qos` | no — omit if the user has none | — |
-  | `container_mounts` | no — a list of paths | each path exists; together they cover `trtllm_repo_path`, `checkpoint_path`, `reference_code_path` and `LLM_MODELS_ROOT` — name any path left uncovered and ask whether to add a mount |
+**Without a pool**, these optional fields also go directly under
+`slurm-environment`; the agents read them:
+
+| Field | Value |
+|---|---|
+| `account` | omit if the user has none |
+| `qos` | omit if the user has none |
+| `container_mounts` | a list of paths; together with the checkout they cover `checkpoint_path` and `reference_code_path` |
+
+**With a pool**, they go under `slurm-environment.gpu_pool` instead, never
+in both places. The user gives only `nodes` (holder jobs submitted at the
+start) and `max_nodes` (the most the planner may grow it to; omit for the
+worker count). Fill in the rest yourself from this environment, Slurm
+(`sacctmgr`, `sinfo`), an earlier task.yaml or your memory, and show each
+with its source for confirmation:
+
+| Field | Value |
+|---|---|
+| `account` | required |
+| `qos` | omit if the user's association has none to pick |
+| `gpus_per_node` | the partition's GPUs per node |
+| `hours` | a holder job's time limit: 24, or less if the partition or QOS allows less |
+| `container_mounts` | the fewest existing directories that hold `checkpoint_path`, `reference_code_path` and any local dataset path (Part 3); the workspace and the checkout are mounted without being listed |
+
+Say the defaults you leave out: `partition` is `slurm_partition`, and
+`reserve` keeps 2 free GPUs from perf work.
 
 ## Part 3 — Accuracy
 
 **End-to-end accuracy.** Default: GSM8K via `trtllm-eval`, within 1 point
 (absolute) of the reference score. The user may change the dataset or the
-tolerance. Ask whether they already have a reference score. If not, decide
+tolerance.
+
+Ask where the dataset comes from:
+
+- **A local copy:** ask for its path. If it is missing or empty, tell the
+  user and ask again or switch to downloading; do not stop on it. On Slurm,
+  the path must be under a container mount: if it is not, propose adding its
+  directory to `container_mounts` and show the updated list.
+- **Download:** the agent finds and downloads the dataset itself.
+
+Then ask about the reference score. Ask whether they already have a reference score. If not, decide
 whether HF can run the checkpoint (below), tell the user the verdict and
 why, and ask them to confirm it.
 
@@ -165,9 +193,8 @@ Ask with one multi-select question:
 - **Disagg** gets its own criterion: `trtllm-eval` runs the model
   in-process and cannot drive a disaggregated server.
 - **Multimodal chosen:** add MMMU with the same rules as GSM8K (reference
-  score or measured or required baseline, same tolerance, same feature set).
-  Check now that `LLM_MODELS_ROOT/datasets/MMMU` exists and is non-empty,
-  and warn if not.
+  score or measured or required baseline, same tolerance, same feature set),
+  and ask where its data comes from as for GSM8K.
   **Multimodal model but not chosen:** add the text-only tip.
 
 ## Finish
@@ -176,16 +203,28 @@ Ask with one multi-select question:
 2. Ask for the workspace directory; write `<workspace>/task.yaml`. If the
    directory does not exist, say so and create it once the user agrees. If
    the file exists, ask before overwriting.
-3. Validate with agent-flow's own schema, fix, and re-run until it passes:
-   ```bash
-   python3 .claude/skills/modeling-task-yaml/scripts/validate_task_yaml.py <workspace>/task.yaml
-   ```
-4. Give the run command:
+3. Check it with the workflow's own check, take each problem back to the
+   user, fix, and re-run until it passes:
+   - when the user's agent-flow has `agent_flow/workflows/modeling_v2_onboard/`:
+     `modeling-v2-onboard --task <workspace>/task.yaml --workspace <workspace> --check`.
+     It checks the schema, the checkout, the workspace, the checkpoint, the
+     image, the mounts and the GPU pool. It does not create the workspace's
+     run state.
+   - otherwise: `python3 .claude/skills/modeling-task-yaml/scripts/validate_task_yaml.py <workspace>/task.yaml`
+     (the schema only).
+
+   If the command is not on PATH, install agent-flow first:
+   `pip install -e <trtllm_repo_path>/agent-flow`.
+4. **Slurm with modeling-v2-onboard only:** ask whether to run the runtime
+   check now. It submits one short Slurm job that starts the container and
+   shows the GPUs, the mounted paths and CUDA PyTorch, but it waits for a
+   node. Skipping it starts the run sooner: the run's environment task makes
+   the same checks once the planner has started. If the user wants it, add
+   `--smoke` to the check command and report its result.
+5. Give the run command:
    `modeling-bringup --task <workspace>/task.yaml --workspace <workspace>`.
-   If `modeling-bringup` is not on PATH, add the install step
-   `pip install -e <trtllm_repo_path>/agent-flow`. Mention
-   `modeling-v2-onboard` (same arguments) only when the user's agent-flow
-   has `agent_flow/workflows/modeling_v2_onboard/`.
+   Mention `modeling-v2-onboard` (same arguments) only when the user's
+   agent-flow has `agent_flow/workflows/modeling_v2_onboard/`.
 
 ## Sentence library
 
@@ -203,7 +242,8 @@ Fill the `<...>` slots; keep the wording.
 `implements_tips`:
 
 - `"Target GPU: <GPU> (<SM>)."`
-- `"LLM_MODELS_ROOT=<PATH>; GSM8K is under datasets/openai/gsm8k<; MMMU under datasets/MMMU>."`
+- Local dataset: `"<DATASET> data: <PATH> (pass it to trtllm-eval with --dataset_path)."`
+- Downloaded dataset: `"<DATASET> data: no local copy; find and download it yourself, where the evaluation runs can reach it."`
 - Chat template: `"The checkpoint ships a chat template (<FILE>); decide whether evaluation must apply it and use the same choice for the reference."`
 - Spec/disagg notes: `"<Speculative decoding|Disaggregated serving>: <USER NOTES>."`
 - Spec/disagg, no notes: `"<Speculative decoding|Disaggregated serving>: the algorithm and configuration are left to the planner to infer from the checkpoint and the codebase."`
@@ -220,10 +260,21 @@ trtllm_repo_path:    /path/to/TensorRT-LLM
 slurm-environment:            # only when the user runs on Slurm
   slurm_partition: <partition>
   docker_image: /path/to/image.sqsh
+  # without a GPU pool:
   account: <account>
   qos: <qos>
   container_mounts:
     - /path/to/mount
+  # with a GPU pool, instead of the three above:
+  gpu_pool:
+    nodes: <N>
+    max_nodes: <M>
+    account: <account>
+    qos: <qos>
+    gpus_per_node: <G>
+    hours: <H>
+    container_mounts:
+      - /path/to/mount
 
 completion_criteria:
   - "<e2e criterion per dataset>"
@@ -233,7 +284,7 @@ completion_criteria:
 
 implements_tips:
   - "<target GPU>"
-  - "<LLM_MODELS_ROOT>"
+  - "<dataset tip per dataset>"
   - "<other tips from the library>"
 ```
 
@@ -246,5 +297,7 @@ implements_tips:
 | "Slurm config inferred and verified, please confirm" with no values shown | List every field with its value, source and check result |
 | Folding disagg into the `trtllm-eval` feature criterion | Disagg gets its own criterion |
 | "Agent measures the HF reference" for an NVFP4 / oversized checkpoint | Require a score or another baseline |
-| Putting account / qos / mounts under `gpu_pool` | Directly under `slurm-environment` |
-| Importing `agent_flow` to validate | Use `scripts/validate_task_yaml.py` |
+| Account / qos / mounts both under `slurm-environment` and under `gpu_pool` | Under `gpu_pool` with a pool, directly under `slurm-environment` without |
+| Asking the user for pool fields Slurm or the environment can answer | Ask only `nodes` and `max_nodes`; infer the rest and confirm it |
+| Checking paths, image or mounts by hand during the conversation | Run the workflow's check at Finish |
+| Running `--smoke` without asking | It waits for a Slurm node; ask first |
