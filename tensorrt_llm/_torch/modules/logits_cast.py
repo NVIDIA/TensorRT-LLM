@@ -39,10 +39,10 @@ def _widen_to_fp32_kernel(src_ptr, dst_ptr, numel, BLOCK: tl.constexpr):
 def widen_logits_to_fp32(logits: torch.Tensor) -> torch.Tensor:
     """Return ``logits.float()``, through the vectorized kernel when it applies.
 
-    The kernel applies to a contiguous BF16/FP16 CUDA tensor outside
-    torch.compile. Anything else (already float32, strided, CPU, empty, or
-    traced by torch.compile, where Inductor generates the cast itself) takes
-    ``Tensor.float()``.
+    The kernel applies to a contiguous BF16/FP16 CUDA tensor that autograd
+    does not track, outside torch.compile. Anything else (already float32,
+    strided, CPU, empty, tracked by autograd, or traced by torch.compile, where
+    Inductor generates the cast itself) takes ``Tensor.float()``.
 
     ``Tensor.float()`` runs PyTorch's dynamic-casting ``unrolled_elementwise``
     kernel, which reaches about 1/6 of HBM bandwidth on ``[rows, vocab]`` logits
@@ -55,6 +55,7 @@ def widen_logits_to_fp32(logits: torch.Tensor) -> torch.Tensor:
         or not logits.is_cuda
         or not logits.is_contiguous()
         or logits.numel() == 0
+        or (torch.is_grad_enabled() and logits.requires_grad)
         or torch.compiler.is_compiling()
     ):
         return logits.float()
