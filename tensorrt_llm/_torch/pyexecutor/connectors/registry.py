@@ -26,7 +26,7 @@ if TYPE_CHECKING:
 
 CONNECTOR_REGISTRY: dict[str, dict[str, str]] = {
     "lmcache": {
-        "connector_module": "lmcache.integration.tensorrt_llm.tensorrt_adapter",
+        "connector_module": "lmcache.inprocess.integration.tensorrt_llm.tensorrt_adapter",
         "connector_scheduler_class": "LMCacheKvConnectorScheduler",
         "connector_worker_class": "LMCacheKvConnectorWorker",
     },
