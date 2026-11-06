@@ -32,6 +32,7 @@ import torch
 from cuda.bindings import driver
 
 import tensorrt_llm
+from tensorrt_llm import _deep_gemm_jit_share as deep_gemm_jit_share
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.nccl_window_graph import (
     abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
@@ -146,6 +147,12 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
+        share_jit_builds (bool): For a runner with one tactic whose first call per shape
+            builds a DeepGEMM kernel. When the processes of the launch share DeepGEMM's
+            builds (TLLM_DEEP_GEMM_JIT_SHARE_DIR, see tensorrt_llm._deep_gemm_jit_share),
+            they split the profiles not yet tuned through claims in that directory: each
+            rank runs the profiles it claims first, setting aside one whose kernel another
+            rank is building, then the profiles other ranks claimed once those have run.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -155,6 +162,7 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+    share_jit_builds: bool = False
 
 
 @dataclass(unsafe_hash=True)
@@ -1222,24 +1230,40 @@ class AutoTuner:
         # Synchronize ranks before profiling
         if self._should_current_rank_tune(
                 tuning_config.distributed_tuning_strategy):
+
+            def profile_one(p: OptimizationProfile) -> None:
+                nonlocal new_tuning_failure_occurred
+                tensors = self._prepare_input_tensors(p, inputs)
+                is_cache_hit, *_ = self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )
+                if not is_cache_hit:
+                    # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                    with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
+                        *_, has_tuning_failure_occurred = self._profile_runners(
+                            custom_op, runners, tensors, p, tuning_config,
+                            **kwargs)
+                    new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
+
             with self._shared_profile_graph_pool():
-                for p in profiles:
-                    tensors = self._prepare_input_tensors(p, inputs)
-                    is_cache_hit, *_ = self.profiling_cache.search_cache(
-                        custom_op,
-                        runners,
-                        p.get_opt_shapes(),
-                        tuning_config,
-                        apply_map_to_tuning_buckets=False,
-                    )
-                    if not is_cache_hit:
-                        # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                        with nvtx_range(
-                                f"{custom_op}, shape {p.get_opt_shapes()}"):
-                            best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
-                                custom_op, runners, tensors, p, tuning_config,
-                                **kwargs)
-                        new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
+                if (tuning_config.share_jit_builds
+                        and deep_gemm_jit_share.enabled()):
+                    self._profile_sharing_jit_builds(
+                        custom_op, profiles, profile_one,
+                        lambda p: not self.profiling_cache.search_cache(
+                            custom_op,
+                            runners,
+                            p.get_opt_shapes(),
+                            tuning_config,
+                            apply_map_to_tuning_buckets=False,
+                        )[0])
+                else:
+                    for p in profiles:
+                        profile_one(p)
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
@@ -1267,6 +1291,66 @@ class AutoTuner:
             custom_op] = self.stats.tuned_op_time_cost.get(
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
+
+    def _profile_sharing_jit_builds(
+            self, custom_op: str, profiles: List[OptimizationProfile],
+            profile_one: Callable[[OptimizationProfile], None],
+            is_pending: Callable[[OptimizationProfile], bool]) -> None:
+        """Run ``profile_one`` over ``profiles`` while the processes share DeepGEMM's builds.
+
+        The processes split the not yet tuned profiles: each claims profiles from an
+        offset of its own (claims in the shared directory) and runs them first. It sets
+        aside a claimed profile whose kernel another process is building, so that it
+        goes on to kernels nobody has claimed, and runs the set-aside profiles after
+        the others. Last, it runs the profiles other processes claimed, each once that
+        process has run it, when the profile's kernel is in DeepGEMM's shared cache.
+        """
+        profiles = list(profiles)
+        pending = [i for i, p in enumerate(profiles) if is_pending(p)]
+        if not pending:
+            for p in profiles:
+                profile_one(p)
+            return
+        sweep = deep_gemm_jit_share.SharedSweep(
+            repr((custom_op, [profiles[i].get_opt_shapes() for i in pending])))
+        start = int(deep_gemm_jit_share.start_fraction() * len(pending))
+        claimed, set_aside, others = [], [], []
+        begin = time.perf_counter()
+        with deep_gemm_jit_share.defer_busy_builds():
+            for i in pending[start:] + pending[:start]:
+                if not sweep.claim(i):
+                    others.append(i)
+                    continue
+                try:
+                    profile_one(profiles[i])
+                except Exception as e:
+                    if not deep_gemm_jit_share.is_busy(e):
+                        sweep.done(i)
+                        raise
+                    set_aside.append(i)
+                    continue
+                claimed.append(i)
+                sweep.done(i)
+        aside_begin = time.perf_counter()
+        for i in set_aside:
+            try:
+                profile_one(profiles[i])
+            finally:
+                sweep.done(i)
+        others_begin = time.perf_counter()
+        for i in others:
+            sweep.wait_done(i)
+            profile_one(profiles[i])
+        pending_set = set(pending)
+        for i, p in enumerate(profiles):
+            if i not in pending_set:
+                profile_one(p)
+        self._debug_logger(
+            f"[Autotuner] {custom_op}: shared JIT builds over {len(pending)} profiles: "
+            f"ran {len(claimed) + len(set_aside)} claimed in {others_begin - begin:.1f}s "
+            f"({len(set_aside)} set aside while another process built their kernel, "
+            f"{others_begin - aside_begin:.1f}s), then {len(others)} claimed elsewhere in "
+            f"{time.perf_counter() - others_begin:.1f}s")
 
     def _prime_cached_tactics(
         self,
@@ -1421,6 +1505,8 @@ class AutoTuner:
                 # timing.
                 min_time = 0.0
             except Exception as e:
+                if deep_gemm_jit_share.is_busy(e):
+                    raise  # Not a failure: the caller runs this profile later.
                 shapes = self._get_input_sizes(input_tensors)
                 logger.warning_once(
                     f"[Autotuner] Single-pair run failed for custom_op={custom_op}, runner={runner}, tactic={tac}, shapes={shapes}. Error: {e}",
