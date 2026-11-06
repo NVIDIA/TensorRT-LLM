@@ -1533,6 +1533,11 @@ def prepare_union_runner(
         raise ValueError("block_table must be a contiguous 2-D int32 tensor")
     if req_ids.dtype != torch.int32 or req_ids.numel() < total_q:
         raise ValueError("req_ids must be int32 with one entry per query row")
+    # The grid's z extent is cu_q_seqlens' length - 1 and each z reads sequence_length[z].
+    if int(cu_q_seqlens.numel()) != batch + 1:
+        raise ValueError(f"cu_q_seqlens must have {batch + 1} entries, got {cu_q_seqlens.numel()}")
+    if not output.is_contiguous():
+        raise ValueError("output must be contiguous (the kernel writes it in place)")
     groups = (int(max_sq) + rows_per_group - 1) // rows_per_group
     spec = UnionSpecialization(
         rows_per_group=int(rows_per_group),
@@ -1541,7 +1546,7 @@ def prepare_union_runner(
     )
     compiled = compile_union(spec, _base._device_index(quant_q_buffer))
     stream = None if refresh_stream else _base._current_stream(_base._device_index(quant_q_buffer))
-    del pool_rows, batch
+    del pool_rows
     return PreparedUnionRunner(
         compiled=compiled,
         args=(
@@ -1550,7 +1555,7 @@ def prepare_union_runner(
             topk_positions,
             block_table,
             req_ids,
-            output.reshape(total_q, NUM_HEADS, L),
+            output.view(total_q, NUM_HEADS, L),
             cu_q_seqlens,
             sequence_length,
             int(layer_offset),

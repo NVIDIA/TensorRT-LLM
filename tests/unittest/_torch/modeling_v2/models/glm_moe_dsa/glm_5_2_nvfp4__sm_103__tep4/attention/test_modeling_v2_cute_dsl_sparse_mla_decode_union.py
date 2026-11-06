@@ -291,6 +291,28 @@ def test_union_kernel_refuses_four_row_groups_on_one_chunk() -> None:
         entry._union_kernel.UnionSpecialization(rows_per_group=4, num_chunks=1).validate()
 
 
+def test_union_launcher_refuses_padded_cu_q_seqlens_and_strided_output() -> None:
+    """The grid's z extent comes from `cu_q_seqlens`, so a padded one would read
+    `sequence_length` past its end; a non-contiguous `output` would be written through a copy."""
+    args, _ = _build_union(dict(p=4, lens=[3, 2050], layer=0), 5)
+    names = ("quant_q_buffer", "kv_pool_view", "topk_positions", "block_table", "req_idx")
+    head = [args[n] for n in names]
+    out, cu, lens = args["output"], args["cu_q_seqlens"], args["sequence_length"]
+    kw = dict(
+        layer_offset=0,
+        stride_factor=args["stride_factor"],
+        max_sq=4,
+        rows_per_group=2,
+        num_chunks=2,
+    )
+    padded = torch.cat([cu, cu[-1:]])
+    with pytest.raises(ValueError, match="cu_q_seqlens must have 3 entries"):
+        entry._union_kernel.prepare_union_runner(*head, out, padded, lens, **kw)
+    strided = torch.empty(out.shape[::-1], dtype=out.dtype, device=out.device).t()
+    with pytest.raises(ValueError, match="output must be contiguous"):
+        entry._union_kernel.prepare_union_runner(*head, strided, cu, lens, **kw)
+
+
 @pytest.mark.parametrize("batch", list(range(12, 33)) + [1, 3])
 def test_union_mtp3_every_batch(batch, compiled_union) -> None:
     """MTP3 at 1, 3 and 12..32 sequences on the handle's plan for that batch (the served ones

@@ -151,10 +151,3 @@ def test_concurrent_writers_give_the_serial_bytes(new, gen) -> None:
         assert torch.equal(sf, want_sf), (
             f"rep {rep}: {int((sf != want_sf).sum())} scale bytes differ from the serial order"
         )
-
-
-if __name__ == "__main__":  # the serving container has no pytest
-    for new, gen in CASES:
-        test_concurrent_writers_give_the_serial_bytes(new, gen)
-        print(f"OK tc={sum(new)} (tc % 128 = {sum(new) % 128}) gen={gen} reps={REPS}", flush=True)
-    print("GEN_SIDE_QUANT_TEST PASS")

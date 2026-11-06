@@ -1669,6 +1669,11 @@ class FusedMultiHeadAttentionPrefillD256:
                 raise testing.CantImplementError("This kernel only supports d=256")
             if h_q % h_k != 0:
                 raise testing.CantImplementError("h_q must be divisible by h_k")
+            # Bottom-right aligned windows give the first q tiles no K/V tile once
+            # s_q - s_k reaches a tile; the correction warp would then wait on a softmax
+            # step that never runs.
+            if self.mask_type is fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE and s_q > s_k:
+                raise testing.CantImplementError("WINDOW_MASK_INFERENCE requires s_q <= s_k")
         except testing.CantImplementError:
             return False
         return True

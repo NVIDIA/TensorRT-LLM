@@ -163,6 +163,16 @@ def _write_maps(maps: dict, ref: dict) -> None:
         t[: ref[k].numel()].copy_(ref[k])
 
 
+def _assert_dyn_counters_reset(compiled) -> None:
+    """Every dynamic-FC2 slot's counter is back to zero after a launch: its last CTA resets
+    both words, so the next launch on the slot (every layer's, every step) starts at tile 0.
+    A missed reset would make that launch skip tiles."""
+    ctr = getattr(compiled, "dyn_ctr", None)
+    if ctr is not None:
+        torch.cuda.synchronize()
+        assert not bool(ctr.any()), f"dynamic FC2 counters not reset: {ctr[:, :2].tolist()}"
+
+
 def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
     """The two sides share every rounding but three, so the band is set by those.
 
@@ -257,6 +267,7 @@ def test_certified_cells(cell) -> None:
             norm_const, alpha1, alpha2, out, c, sfc, join, compiled, spec.get("dyn_slot"),
         )  # fmt: skip
     assert result is out, "the op accumulates into `out` and returns it"
+    _assert_dyn_counters_reset(compiled)
     # `reference` reads `out` as the value FC2 accumulates onto: the value before the call.
     ref = op.reference(
         xq, xsf, maps, topk_w, fc1_w, fc1_s, fc2_w, fc2_s,
@@ -395,6 +406,7 @@ def _fc2_outputs(
         out, b["pc"] if pair else b["c"], b["sfc"], None, compiled, dyn_slot,
     )  # fmt: skip
     torch.cuda.synchronize()
+    _assert_dyn_counters_reset(compiled)
     return out.clone()
 
 

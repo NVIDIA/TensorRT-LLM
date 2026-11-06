@@ -22,10 +22,10 @@ One cluster of ``_CTAS_PER_ROW`` CTAs per row, each CTA scanning one
 contiguous segment.  Each thread streams 16-byte vectors (four FP32) with
 ``_VECTORS_IN_FLIGHT`` loads issued before any compare and keeps its own best
 pair; a butterfly warp reduction and a shared-memory pass across warps give the
-CTA's pair, which it stores into cluster rank 0's shared memory (DSMEM); one
-cluster barrier, then rank 0 reduces the segment pairs and writes the token.  ``M`` is
-symbolic; the logits must be contiguous rows of
-``VOCAB`` elements on 16-byte-aligned storage.
+CTA's pair, which it stores into cluster rank 0's shared memory (DSMEM) once
+every CTA of the cluster has started; one more cluster barrier, then rank 0
+reduces the segment pairs and writes the token.  ``M`` is symbolic; the logits
+must be contiguous rows of ``VOCAB`` elements on 16-byte-aligned storage.
 
 """
 
@@ -120,6 +120,9 @@ def _argmax_rows_kernel(
         alignment=_ALIGNMENT_BYTES,
     )
 
+    # Every CTA of the cluster must have started before another one stores into its
+    # shared memory: arrive now, wait right before the DSMEM stores below.
+    prims.barrier_cluster_arrive_relaxed()
     if cutlass.const_expr(use_pdl):
         cute.arch.griddepcontrol_wait()
 
@@ -169,6 +172,7 @@ def _argmax_rows_kernel(
         warp_idxs[warp] = best_idx
     cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS)
 
+    prims.barrier_cluster_wait()
     # This CTA's best pair -> its slot in cluster rank 0's shared memory.
     if tidx == 0:
         cta_key = warp_keys[0]
