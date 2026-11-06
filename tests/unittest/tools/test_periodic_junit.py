@@ -324,7 +324,7 @@ def test_failed_cleanup_retries_after_successful_publication(
 
 
 def test_invalid_utf8_cleanup_keeps_published_xml(
-    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path, capsys: pytest.CaptureFixture
+    unfinished_reporter: PeriodicJUnitXML, tmp_path: Path, capfd: pytest.CaptureFixture
 ) -> None:
     reporter = unfinished_reporter
     nodeid = "test_example.py::test_completed"
@@ -339,7 +339,7 @@ def test_invalid_utf8_cleanup_keeps_published_xml(
     assert ET.parse(reporter.xmlpath).find(".//testcase") is not None
     assert unfinished.read_bytes() == damaged
     assert reporter._completed_unfinished_tests == {nodeid}
-    output = capsys.readouterr().out
+    output = capfd.readouterr().out
     assert "Error clearing saved tests" in output
     assert "Error in report generation" not in output
 
