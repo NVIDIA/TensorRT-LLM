@@ -2864,14 +2864,18 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     if len(page_sizes) > 1 and not page_sizes <= {16, 32, 64}:
         return ("kv_cache_config.tokens_per_block to be equal in both "
                 "sections, or 16, 32, or 64 in both")
-    # A hosting manager's gate also checks the pool ratio's arity.
-    pool_ratios = {
-        tuple((cfg.other_args.get("kv_cache_config") or {}).get("pool_ratio")
-              or ())
-        for cfg in server_configs
-    }
-    if len(pool_ratios) > 1:
-        return "the same kv_cache_config.pool_ratio in both sections"
+    # Only a manager hosting draft layers shares draft KV on other pages; its
+    # gate also reads the pool ratio and the sequence limit (against the draft
+    # window), so they must agree for both workers to decide alike.
+    hosting_gate_inputs = set()
+    for cfg in server_configs:
+        kv_cache = cfg.other_args.get("kv_cache_config") or {}
+        hosting_gate_inputs.add(
+            (tuple(kv_cache.get("pool_ratio")
+                   or ()), cfg.other_args.get("max_seq_len")))
+    if not page_sizes <= {16, 32, 64} and len(hosting_gate_inputs) > 1:
+        return ("the same kv_cache_config.pool_ratio and max_seq_len in both "
+                "sections for pages other than 16, 32, or 64 tokens")
     return None
 
 

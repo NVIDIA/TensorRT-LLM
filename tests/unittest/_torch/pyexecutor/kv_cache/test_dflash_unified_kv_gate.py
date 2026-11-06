@@ -664,17 +664,43 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
         assert not creator._should_unify_dflash_kv_cache()
 
 
-def test_launcher_requires_one_pool_ratio(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Peers with different pool ratios could get different hosting-manager gate decisions."""
+@pytest.mark.parametrize(
+    ("tokens_per_block", "context_overrides", "shared"),
+    [
+        (128, {"kv_cache_config": {"pool_ratio": [1.0]}}, False),
+        (128, {"max_seq_len": 2048}, False),
+        (32, {"kv_cache_config": {"pool_ratio": [0.8, 0.2]}}, True),
+        (32, {"max_seq_len": 2048}, True),
+    ],
+    ids=["pool-ratio-128", "max-seq-len-128", "pool-ratio-32", "max-seq-len-32"],
+)
+def test_launcher_requires_matching_hosting_gate_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    tokens_per_block: int,
+    context_overrides: dict,
+    shared: bool,
+) -> None:
+    """Off 16/32/64-token pages, peers whose pool ratio or max_seq_len differ keep separate pools.
+
+    A hosting manager's gate reads both, so peers could otherwise decide apart. On 16/32/64-token
+    pages the launcher decides as before.
+    """
     spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
-    page = {"tokens_per_block": 128}
-    servers = (
-        {"speculative_config": spec, "kv_cache_config": {**page, "pool_ratio": [1.0]}},
-        {"speculative_config": spec, "kv_cache_config": page},
-    )
-    with pytest.raises(click.UsageError, match="the same kv_cache_config.pool_ratio"):
-        _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+    servers = [
+        {
+            "speculative_config": spec,
+            "max_seq_len": 32768,
+            "kv_cache_config": {"tokens_per_block": tokens_per_block, "pool_ratio": [0.9, 0.1]},
+        }
+        for _ in range(2)
+    ]
+    for key, value in context_overrides.items():
+        if key == "kv_cache_config":
+            servers[0]["kv_cache_config"] = {**servers[0]["kv_cache_config"], **value}
+        else:
+            servers[0][key] = value
     monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
     with pytest.raises(_StopLauncher):
         _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
-    assert os.environ[_SHARED_DRAFT_KV_ENV] == "0"
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("auto" if shared else "0")
