@@ -570,6 +570,7 @@ def test_encoder_warmup_runs_nested_output_models_eagerly(nested: bool) -> None:
     runner._capture_encoder_cuda_graphs = Mock()
 
     with (
+        patch.object(encoder_module.AutoTuner, "get"),
         patch("torch.cuda.empty_cache"),
         patch("torch.cuda.synchronize"),
         patch.object(encoder_module.logger, "warning") as warning,
