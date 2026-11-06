@@ -15,7 +15,7 @@ For AST-based validation (no pytest or model weights needed):
 
 Options:
 --l0:       Check only the L0 tests located in $LLM_ROOT/tests/integration/test_list/test_db/*.yml.
---qa:       Check only the QA tests under $LLM_ROOT/tests/integration/test_list/*.txt.
+--qa:       Check QA text lists and YAML case lists under tests/integration/test_lists/qa/.
 --waive:    Check only the tests in $LLM_ROOT/tests/integration/test_list/waives.txt.
 --validate: Run AST-based validation of test list entries against source files.
 --report-unverifiable [PATH]: With --validate, write the list of active entries
@@ -1057,18 +1057,33 @@ def verify_qa_test_lists(llm_src):
         pass
     # Remove dynamically generated perf tests
     subprocess.run(f"rm -f {test_qa_path}/*perf*", shell=True, check=True)
-    test_def_files = subprocess.check_output(
-        f"ls -d {test_qa_path}/*.txt", shell=True).decode().strip().split('\n')
-    for test_def_file in test_def_files:
-        _run_collection_pytest(llm_src, test_def_file)
-        # append all the test_def_file to qa_test.txt
-        with open(f"{llm_src}/qa_test.txt", "a") as f:
+    test_def_files = sorted(
+        glob.glob(f"{test_qa_path}/*.txt") + glob.glob(f"{test_qa_path}/*.yml"))
+    with tempfile.TemporaryDirectory(
+            prefix="trtllm-qa-lists-") as text_lists_dir:
+        for test_def_file in test_def_files:
             with open(test_def_file, "r") as test_file:
-                lines = test_file.readlines()
+                if test_def_file.endswith(".yml"):
+                    import yaml
+
+                    data = yaml.safe_load(test_file)
+                    if not isinstance(data, dict) or "tests" not in data:
+                        continue
+                    lines = [entry["case"] for entry in data["tests"]]
+                    collection_list = os.path.join(
+                        text_lists_dir,
+                        Path(test_def_file).stem + ".txt")
+                    with open(collection_list, "w") as converted:
+                        converted.write("\n".join(lines) + "\n")
+                else:
+                    lines = test_file.readlines()
+                    collection_list = test_def_file
+            _run_collection_pytest(llm_src, collection_list)
+            with open(f"{llm_src}/qa_test.txt", "a") as f:
                 for line in lines:
-                    # Remove 'TIMEOUT' marker and strip spaces
+                    # Remove 'TIMEOUT' marker and strip spaces.
                     cleaned_line = line.split(" TIMEOUT ", 1)[0].strip()
-                    if cleaned_line:
+                    if cleaned_line and not cleaned_line.startswith("#"):
                         f.write(f"{cleaned_line}\n")
 
 
