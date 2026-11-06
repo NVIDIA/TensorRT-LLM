@@ -257,15 +257,36 @@ class _CapacityStepInputs:
             (self.kv_indptr[: kv_indptr.numel()], kv_indptr),
         )
 
+    def _owner_ranges(self):
+        """(byte range, data_ptr) of every staging buffer.
+
+        The staging buffers are allocated once, so their ranges are computed once and reused
+        until the set of buffers (identity or storage) changes.
+        """
+        from ._topk_runtime import _byte_range
+
+        owners = tuple(self.input_buffers().values())
+        key = tuple((id(owner), owner.data_ptr()) for owner in owners)
+        cached = getattr(self, "_owner_range_cache", None)
+        if cached is None or cached[0] != key:
+            ranges = tuple((_byte_range(owner), owner.data_ptr()) for owner in owners)
+            cached = (key, ranges)
+            self._owner_range_cache = cached
+        return cached[1]
+
     def _copy_inputs(self, copies) -> None:
         """Reject all cross-aliases before enqueuing the first staging copy."""
         from ._topk_runtime import _byte_range, _overlap
 
+        owners = self._owner_ranges()
         # A staging copy cannot overwrite another source before it is consumed.
         for destination, source in copies:
-            for owner in self.input_buffers().values():
-                if _overlap(_byte_range(source), _byte_range(owner)) and not (
-                    owner.data_ptr() == destination.data_ptr() == source.data_ptr()
+            source_range = _byte_range(source)
+            source_ptr = source.data_ptr()
+            destination_ptr = destination.data_ptr()
+            for owner_range, owner_ptr in owners:
+                if _overlap(source_range, owner_range) and not (
+                    owner_ptr == destination_ptr == source_ptr
                 ):
                     raise ValueError("step inputs must not cross-alias staging buffers")
         # All host metadata/alias checks precede every copy.
