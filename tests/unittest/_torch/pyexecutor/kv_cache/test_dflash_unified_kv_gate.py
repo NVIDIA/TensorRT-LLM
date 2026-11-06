@@ -669,10 +669,11 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
     [
         (128, {"kv_cache_config": {"pool_ratio": [1.0]}}, False),
         (128, {"max_seq_len": 2048}, False),
-        (32, {"kv_cache_config": {"pool_ratio": [0.8, 0.2]}}, True),
-        (32, {"max_seq_len": 2048}, True),
+        (32, {"kv_cache_config": {"pool_ratio": [1.0]}}, False),
+        (32, {"max_seq_len": 2048}, False),
+        (128, {}, True),
     ],
-    ids=["pool-ratio-128", "max-seq-len-128", "pool-ratio-32", "max-seq-len-32"],
+    ids=["pool-ratio-128", "max-seq-len-128", "pool-ratio-32", "max-seq-len-32", "same-128"],
 )
 def test_launcher_requires_matching_hosting_gate_inputs(
     monkeypatch: pytest.MonkeyPatch,
@@ -681,10 +682,10 @@ def test_launcher_requires_matching_hosting_gate_inputs(
     context_overrides: dict,
     shared: bool,
 ) -> None:
-    """Off 16/32/64-token pages, peers whose pool ratio or max_seq_len differ keep separate pools.
+    """Peers whose pool ratio or max_seq_len differ keep separate pools.
 
-    A hosting manager's gate reads both, so peers could otherwise decide apart. On 16/32/64-token
-    pages the launcher decides as before.
+    A hosting manager's gate reads both at any page size (MSA workers use 128-token pages whatever
+    the YAML says), so peers could otherwise decide apart.
     """
     spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
     servers = [
