@@ -113,6 +113,9 @@ def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
         for request_id in range(64):
             request = GenerationRequest([1] * (512 * 1024), SamplingParams())
             request.set_id(request_id)
+            # Brief backpressure may pause admission; export must not prevent recovery.
+            with senders[1]._cond:
+                assert senders[1]._cond.wait_for(lambda: senders[1].available, timeout=1)
             senders[1].send(pickle.dumps(request))
         senders[1].send(pickle.dumps(CancellingRequest(7)), control=True)
         assert cancelled.wait(2)
