@@ -31,14 +31,15 @@ all-reduce over NVLink peer memory fused into the next mHC boundary (decode-size
 reduce-scattered with the boundary run on each rank's quarter of the rows (sequence-parallel
 prefill steps, whose MLA layers attend their quarter with all 64 heads).
 
-MTP (one-model MTP-Eagle, 3 drafts): the draft loop belongs to the target (`MTPStepWorker`).
-One step-program call verifies the step's drafts (the head's token at every sampled row, strict
-acceptance, or the forced acceptance of TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS), runs the
-MTP layer over the step's tokens and its two chained passes from each sequence's last accepted
-row, and leaves the accepted tokens and the next drafts in its buffers, which the worker hands
-the sampler. The head samples greedy batches by argmax and temperature-only batches
-(advanced_sampling_mode no_topk_no_topp) by Gumbel-max over the vocabulary shards; other
-sampling modes take the runtime's sampler over gathered logits before the draft passes.
+MTP (one-model MTP-Eagle, 3 drafts) runs in the forward; the target builds no speculative
+worker. One step-program call verifies the step's drafts (the head's token at every sampled row,
+strict acceptance, or the forced acceptance of TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS), runs
+the MTP layer over the step's tokens and its two chained passes from each sequence's last
+accepted row, and leaves the accepted tokens and the next drafts in its buffers, which the
+forward returns to the runtime's speculative sampler. The head samples greedy batches by argmax
+and temperature-only batches (advanced_sampling_mode no_topk_no_topp) by Gumbel-max over the
+vocabulary shards; other sampling modes take the runtime's sampling ops over gathered logits
+before the draft passes. Speculative features the step does not compute are declined by routing.
 
 What this target sets in the runtime (read by the KV cache creator off the built model):
 - the latent pool is BF16, the layout the kernels read; the checkpoint declares an FP8 KV cache
@@ -69,8 +70,12 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModel, DecoderModelForCausalLM
 from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KimiK3MambaMetadata
 from tensorrt_llm._torch.pyexecutor.config_utils import unwrap_glm5_next_text_config
-from tensorrt_llm._torch.speculative import MTPEagleWorker
-from tensorrt_llm._torch.speculative.interface import INVALID_PROMPT_LOOKAHEAD_TOKEN
+from tensorrt_llm._torch.pyexecutor.sampler.ops import custom as fused_sampling
+from tensorrt_llm._torch.pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
+from tensorrt_llm._torch.speculative.interface import (
+    INVALID_PROMPT_LOOKAHEAD_TOKEN,
+    get_force_num_accepted_tokens_float,
+)
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.llmapi.llm_args import AdvancedSamplingMode
 from tensorrt_llm.logger import logger
@@ -235,7 +240,7 @@ class _Pools:
             *strides,
         )  # fmt: skip
         # (the runtime's accepted-draft count of each slot: a strided view into its state buffers;
-        # the worker writes it after every step as the runtime's KDA-replay update_mamba_states
+        # spec_step writes it after every step as the runtime's KDA-replay update_mamba_states
         # would, leaving the slots of the batch rows it flags as CUDA-graph padding as they are)
         self.prev_accepted = (
             mgr.mamba_layer_cache(kda_layers[0]).prev_num_accepted_tokens if spec else None
@@ -416,7 +421,7 @@ class Glm5NextTp4ModelingV2(DecoderModel):
         if self.mtp_enabled:
             self.out_drafts = _view(drafts, i32, [MAX_BATCH + 1, MTP_DRAFTS])
             self.out_accepted = _view(accepted, i32, [MAX_BATCH + 1])
-            # what the worker hands the runtime (spec_accept): each sequence's head tokens, their
+            # what the forward hands the runtime (spec_accept): each sequence's head tokens, their
             # count to keep (accepted + 1) and the next step's input tokens
             self.spec_new = torch.zeros(MAX_BATCH + 1, MTP_DRAFTS + 1, dtype=i32, device=dev)
             self.spec_lens = torch.zeros(MAX_BATCH + 1, dtype=i32, device=dev)
@@ -748,9 +753,10 @@ class Glm5NextTp4ModelingV2(DecoderModel):
     ):
         """With MTP: one step of verification and drafting. head 0 / 1: the step program's
         greedy / temperature head; -1: `sample(head rows) -> tokens` (the runtime's sampler over
-        gathered logits) between the decoder layers and the draft passes. Returns (the head's
-        tokens [rows], the drafts [sequences, 3], the accepted drafts [sequences], the first
-        sampled row of each sequence [sequences] or None when it is 4 b)."""
+        gathered logits) between the decoder layers and the draft passes. Returns, per sequence,
+        what the runtime's speculative sampler reads: the head's tokens [B, 4], how many of them
+        to keep (accepted drafts + 1) [B], the next step's input tokens [B, 4] and the drafts
+        [B, 3]."""
         s, S, row0 = self._select_target(md).spec_in(md, input_ids, position_ids, spec_metadata)
         B = s.B
         s.S, s.Bs, s.head, s.force_accept = S, B, head, force
@@ -774,7 +780,7 @@ class Glm5NextTp4ModelingV2(DecoderModel):
         if head < 0:
             self.out_tokens[:S].copy_(sample(self.head_rows[:S]))
             self.step.mtp(s)
-        # the worker's outputs, and the generation rows' KDA replay record (update_mamba_states)
+        # the forward's outputs, and the generation rows' KDA replay record (update_mamba_states)
         pools = self._pools_of(md.kv_cache_manager)
         bi = spec_metadata.batch_indices_cuda
         assert bi.dtype == torch.int32 and pools.dummy is not None
@@ -931,70 +937,24 @@ class DecodeTarget:
         return s, s.T, None
 
 
-class MTPStepWorker(MTPEagleWorker):
-    """The one-model MTP-Eagle worker of this target: verification, acceptance and the draft
-    chain are one call of the step program (`Glm5NextTp4ModelingV2.spec_step`), whose buffers
-    give the four tensors the sampler reads. The forced acceptance follows the built-in worker's
-    (`_apply_force_accepted_tokens`): none during eager CUDA-graph warm-up."""
-
-    def __init__(self, spec_config, model_config: ModelConfig, mapping, *, step, lm_head):
-        super().__init__(spec_config, model_config, False, mapping=mapping)
-        # The core's step and the LM head with its logits processor (bound methods / a tuple
-        # rather than the modules, which belong to the shell and are no submodules of this
-        # worker).
-        self._step = step
-        self._lm_head = lm_head
-        mode = getattr(spec_config, "advanced_sampling_mode", None)
-        self._temperature_only = mode == AdvancedSamplingMode.NO_TOPK_NO_TOPP
-
-    def _forward_impl(
-        self,
-        input_ids,
-        position_ids,
-        hidden_states,
-        logits,
-        attn_metadata,
-        spec_metadata,
-        draft_model,
-        resource_manager=None,
-    ):
-        assert spec_metadata.runtime_draft_len == MTP_DRAFTS, (
-            f"the MTP draft chain drafts {MTP_DRAFTS} tokens every step"
+def _sample_rows(logits: torch.Tensor, spec_metadata) -> torch.Tensor:
+    """The runtime's token at every row of the gathered `logits`, from that row's own sampling
+    parameters (temperature, top-k, top-p, min-p) and Philox stream: the batches whose sampling
+    the step program's head does not compute (some request samples, and the deployment's
+    advanced_sampling_mode filters by top-k or top-p)."""
+    n = logits.shape[0]
+    temperatures = spec_metadata.temperatures[:n]
+    top_ks, top_ps = spec_metadata.top_ks[:n], spec_metadata.top_ps[:n]
+    seed, offset = spec_metadata.seeds[:n], spec_metadata.offsets[:n]
+    mode = spec_metadata.advanced_sampling_mode
+    if mode.is_fused:
+        return fused_sampling.fused_sample_from_logits(
+            logits, temperatures, top_ks, top_ps, spec_metadata.min_ps[:n], seed=seed, offset=offset
         )
-        assert self.guided_decoder is None and self.sa_enhancer is None
-        assert not spec_metadata.is_ragged_verify
-        B = attn_metadata.num_seqs
-        nctx = attn_metadata.num_contexts
-        warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
-        force = self.force_num_accepted_tokens
-        force = force if force != 0.0 and not warmup else -1.0
-        if spec_metadata.is_all_greedy_sample:
-            head = 0
-        elif self._temperature_only:
-            head = 1
-        else:
-            head = -1
-
-        def sample(rows: torch.Tensor) -> torch.Tensor:
-            lm_head, logits_processor = self._lm_head
-            gathered = logits_processor.forward(rows, lm_head, attn_metadata, True)
-            return self._sample_tokens_for_batch(gathered, spec_metadata, nctx, B).to(torch.int32)
-
-        # (one step-program call and one kernel after it: the runtime's update_mamba_states (the
-        # KDA replay record) and _prepare_next_new_tokens are part of spec_accept)
-        new_tokens, new_tokens_lens, next_new_tokens, drafts = self._step(
-            attn_metadata, input_ids, position_ids, spec_metadata, head, force, sample
-        )
-        attn_metadata.use_spec_decoding = True
-        return {
-            # (no logits: the head samples on the vocabulary shards; the runtime reads them only
-            # for requests that return logits)
-            "logits": torch.empty(max(int(input_ids.numel()), 1), 0, device=new_tokens.device),
-            "new_tokens": new_tokens,
-            "new_tokens_lens": new_tokens_lens,
-            "next_draft_tokens": drafts,
-            "next_new_tokens": next_new_tokens,
-        }
+    top_ks, top_ps = flashinfer_sampling.resolve_advanced_sampling_filters(mode, top_ks, top_ps)
+    return flashinfer_sampling.sample_from_logits_op(
+        logits, temperatures, top_ks, top_ps, seed=seed, offset=offset
+    )
 
 
 class _SlotTablesMetadata(Glm5NextMamba2Metadata):
@@ -1118,18 +1078,25 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
             vocab_size=cfg.vocab_size,
         )
         self.spec_config = getattr(model_config, "spec_config", None)
-        self.draft_model = None
+        # MTP runs in the forward, on the core's MTP layer (in the target's checkpoint and cache
+        # manager): the runtime finds no speculative worker and no separate draft model
         self.spec_worker = None
+        self.draft_model = None
         if self.spec_config is not None:
             mode = self.spec_config.spec_dec_mode
             assert mode.is_mtp_eagle_one_model(), f"one-model MTP-Eagle expected, got {mode!r}"
-            self.spec_worker = MTPStepWorker(
-                self.spec_config,
-                model_config,
-                model_config.mapping,
-                step=self.model.spec_step,
-                lm_head=(self.lm_head, self.logits_processor),
-            )
+            sampling = getattr(self.spec_config, "advanced_sampling_mode", None)
+            self._temperature_only = sampling == AdvancedSamplingMode.NO_TOPK_NO_TOPP
+            # TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS, read once as the runtime's workers do
+            self._force_accept = get_force_num_accepted_tokens_float()
+
+    def set_guided_decoder(self, guided_decoder) -> bool:
+        """The engine's hook for a guided decoder inside one-model speculative decoding: refused,
+        so the engine rejects guided decoding with MTP at startup (the step's head samples without
+        a grammar's bitmask). Without MTP the engine's own guided decoder edits the logits the
+        forward returns and never calls this."""
+        del guided_decoder
+        return False
 
     def validate_request(self, request) -> None:
         """Admission check, run by the executor on every new request: what the step cannot serve
@@ -1138,11 +1105,11 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
 
         Refused:
         - with MTP, logits post-processors (`thinking_token_budget`, a request's `logits_processor`):
-          the worker's head samples on the vocabulary shards and returns no logits for them to edit;
+          the step's head samples on the vocabulary shards and returns no logits for them to edit;
         - without MTP, context logits (`return_context_logits`, `prompt_logprobs`): the forward
           computes the logits of each sequence's last token only. With MTP the sampler refuses them.
         """
-        if self.spec_worker is not None:
+        if self.spec_config is not None:
             if getattr(request, "py_logits_post_processors", None):
                 raise ValueError(
                     "Logits post-processors (thinking_token_budget, logits_processor) are not "
@@ -1169,8 +1136,10 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
         **kwargs,
     ):
         """One runtime step: the step program, then without MTP the LM head over each sequence's
-        last token (the sampler's logits), with MTP the worker's outputs."""
-        if self.spec_worker is None:
+        last token (the sampler's logits). With MTP, verification, acceptance and the draft chain
+        are one call of the step program (`Glm5NextTp4ModelingV2.spec_step`), whose buffers give
+        the tensors the speculative sampler reads."""
+        if self.spec_config is None:
             assert spec_metadata is None and not return_context_logits
             rows = self.model(
                 attn_metadata=attn_metadata,
@@ -1181,16 +1150,42 @@ class ModelingV2Glm53FlashNvfp4Sm10xTp4(
             )
             return self.logits_processor.forward(rows, self.lm_head, attn_metadata, True)
         assert spec_metadata is not None and inputs_embeds is None and lora_params is None
-        return self.spec_worker(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            hidden_states=None,
-            logits=None,
-            attn_metadata=attn_metadata,
-            spec_metadata=spec_metadata,
-            draft_model=None,
-            resource_manager=kwargs.get("resource_manager"),
+        assert spec_metadata.runtime_draft_len == MTP_DRAFTS, (
+            f"the MTP draft chain drafts {MTP_DRAFTS} tokens every step"
         )
+        assert not spec_metadata.is_ragged_verify
+        # The forced acceptance follows the runtime's one-model workers
+        # (`_apply_force_accepted_tokens`): none during eager CUDA-graph warm-up.
+        warmup = spec_metadata.is_cuda_graph and not torch.cuda.is_current_stream_capturing()
+        force = self._force_accept if self._force_accept != 0.0 and not warmup else -1.0
+        if spec_metadata.is_all_greedy_sample:
+            head = 0
+        elif self._temperature_only:
+            head = 1
+        else:
+            head = -1
+
+        def sample(rows: torch.Tensor) -> torch.Tensor:
+            logits = self.logits_processor.forward(rows, self.lm_head, attn_metadata, True)
+            return _sample_rows(logits, spec_metadata).to(torch.int32)
+
+        # (one step-program call and one kernel after it: the runtime's update_mamba_states (the
+        # KDA replay record) and _prepare_next_new_tokens are part of spec_accept. The step never
+        # saves the attention metadata's spec-dec state (prepare_for_spec_dec), so a failed step
+        # leaves nothing to restore.)
+        new_tokens, new_tokens_lens, next_new_tokens, drafts = self.model.spec_step(
+            attn_metadata, input_ids, position_ids, spec_metadata, head, force, sample
+        )
+        attn_metadata.use_spec_decoding = True
+        return {
+            # (no logits: the head samples on the vocabulary shards; the runtime reads them only
+            # for requests that return logits)
+            "logits": torch.empty(max(int(input_ids.numel()), 1), 0, device=new_tokens.device),
+            "new_tokens": new_tokens,
+            "new_tokens_lens": new_tokens_lens,
+            "next_draft_tokens": drafts,
+            "next_new_tokens": next_new_tokens,
+        }
 
     def load_weights(self, weights, *args, **kwargs):
         _weights.load(self.model, weights)

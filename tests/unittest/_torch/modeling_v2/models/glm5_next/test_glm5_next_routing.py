@@ -288,6 +288,61 @@ def test_what_the_tp4_target_declines_goes_to_the_default_targets(
         modeling_v2_resolve(config, _llm_args("require", **engine))
 
 
+@pytest.mark.parametrize(
+    "spec_kwargs, engine, on_sm100, missed",
+    [
+        (dict(use_rejection_sampling=True), {}, _SPLIT, "rejection sampling"),
+        (dict(use_relaxed_acceptance_for_thinking=True), {}, _SPLIT, "relaxed acceptance"),
+        (dict(enable_penalty=True), {}, _SPLIT, "occurrence penalties"),
+        (
+            dict(use_dynamic_tree=True, dynamic_tree_max_topK=2),
+            {},
+            _SPLIT,
+            "a dynamic draft tree",
+        ),
+        (dict(draft_len_schedule={4: 3, 16: 1}), {}, _SPLIT, "a draft-length schedule"),
+        # speculation off above a batch size is a draft-length schedule too
+        (dict(max_concurrency=8), {}, _SPLIT, "a draft-length schedule"),
+        (
+            dict(acceptance_rate_window_size=32, acceptance_rate_threshold=0.2),
+            {},
+            _FUSED,
+            "an acceptance-rate threshold",
+        ),
+        # the step's head samples without a grammar's bitmask
+        ({}, dict(guided_decoding_backend="xgrammar"), _SPLIT, "guided decoding"),
+    ],
+    ids=[
+        "rejection-sampling",
+        "relaxed-acceptance",
+        "penalties",
+        "dynamic-tree",
+        "draft-len-schedule",
+        "max-concurrency",
+        "acceptance-gate",
+        "guided-decoding",
+    ],
+)
+def test_mtp_features_the_tp4_forward_does_not_compute_go_to_the_default_targets(
+    spec_kwargs, engine, on_sm100, missed, monkeypatch
+):
+    """The tp4 forward runs the MTP layer as a linear chain of three drafts with strict acceptance, every step.
+
+    A feature that changes what a step computes, or how many drafts it runs, routes elsewhere rather than being
+    served as something else.
+    """
+    spec_config = MTPDecodingConfig(max_draft_len=3, **spec_kwargs)
+    config = _model_config(_flash_config(), spec_config=spec_config, **_TP4)
+    engine = _tp4_engine(**engine)
+    for mode in ("auto", "require"):
+        assert _qualified(modeling_v2_resolve(config, _llm_args(mode, **engine))) == on_sm100
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 3))
+    assert modeling_v2_resolve(config, _llm_args("auto", **engine)) is None
+    with pytest.raises(ValueError, match=missed):
+        modeling_v2_resolve(config, _llm_args("require", **engine))
+
+
 @pytest.mark.parametrize("sm", [(9, 0), (12, 0)], ids=["sm90", "sm120"])
 def test_flash_on_other_sms_does_not_match(sm, monkeypatch):
     """Every target's kernels are sm_10x code."""

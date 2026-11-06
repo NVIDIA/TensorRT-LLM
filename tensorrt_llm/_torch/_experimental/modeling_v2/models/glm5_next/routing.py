@@ -110,6 +110,30 @@ def _mtp_with_split_head(model_config: ModelConfig, spec_config: Any) -> bool:
     )
 
 
+def _tp4_speculation_refused(spec_config: MTPDecodingConfig) -> list[str]:
+    """What in a one-model MTP-Eagle ``spec_config`` the tp4 target's forward does not compute; empty when admitted.
+
+    The forward runs the checkpoint's MTP layer as a linear chain of three drafts every step, with strict acceptance
+    of the head's tokens (the argmax, or a sample from each request's own sampling parameters). Each feature below
+    would change what a step computes, or the number of drafts it runs.
+    """
+    gate = bool(spec_config.acceptance_rate_window_size) and (
+        spec_config.acceptance_rate_threshold is not None
+    )
+    refused = {
+        "a dynamic draft tree": spec_config.use_dynamic_tree,
+        "draft trees": spec_config.max_total_draft_tokens not in (None, spec_config.max_draft_len),
+        "rejection sampling": spec_config.use_rejection_sampling,
+        "relaxed acceptance": spec_config.use_relaxed_acceptance_for_thinking,
+        "occurrence penalties": spec_config.enable_penalty,
+        "sa_config": spec_config.sa_config is not None,
+        "a separate speculative checkpoint": spec_config.speculative_model is not None,
+        "a draft-length schedule": spec_config.draft_len_schedule is not None,
+        "an acceptance-rate threshold": gate,
+    }
+    return [name for name, present in refused.items() if present]
+
+
 def _tp4_refused(model_config: ModelConfig, llm_args: TorchLlmArgs, spec_config: Any) -> list[str]:
     """What the tp4 target does not run for this deployment; empty when it is admitted.
 
@@ -155,9 +179,11 @@ def _tp4_refused(model_config: ModelConfig, llm_args: TorchLlmArgs, spec_config:
             f"max_num_tokens {llm_args.max_num_tokens} (it splits a step's rows over its 4 "
             "ranks: a multiple of 4)"
         )
-    # The checkpoint's MTP module driven by the one-model MTP-Eagle loop at three drafts, or no
-    # speculation.
-    if spec_config is not None and not (
+    # The checkpoint's MTP module run in the forward as the one-model MTP-Eagle loop at three
+    # drafts, or no speculation.
+    if spec_config is None:
+        return refused
+    if not (
         isinstance(spec_config, MTPDecodingConfig)
         and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
         and spec_config.max_draft_len == _TP4_DRAFTS
@@ -167,6 +193,15 @@ def _tp4_refused(model_config: ModelConfig, llm_args: TorchLlmArgs, spec_config:
             f"{spec_config.max_draft_len} (it implements one-model MTP-Eagle at max_draft_len="
             f"{_TP4_DRAFTS} or no speculative decoding)"
         )
+        return refused
+    refused.extend(
+        f"speculative decoding with {name}" for name in _tp4_speculation_refused(spec_config)
+    )
+    # With MTP the step's head samples without a grammar's bitmask; the engine would reject guided
+    # decoding at start-up. Without MTP the engine's guided decoder edits the logits the forward
+    # returns.
+    if llm_args.guided_decoding_backend is not None:
+        refused.append("guided decoding with speculative decoding")
     return refused
 
 
