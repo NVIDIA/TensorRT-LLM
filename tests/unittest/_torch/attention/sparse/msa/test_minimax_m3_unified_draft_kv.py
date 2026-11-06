@@ -212,6 +212,25 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_warmup_scrub_clears_every_slot() -> None:
+    """The post-warmup NaN/Inf scrub zeroes every slot of target and draft layers alike."""
+    torch.cuda.init()
+    manager = _manager(_specs())
+    try:
+        for layer in manager.pp_layers:
+            view = manager.get_buffers(layer)
+            if view.dtype.is_floating_point:
+                view.fill_(float("nan"))
+        assert manager.check_invalid_values_in_kv_cache(fill_with_zero=True)
+        for layer in manager.pp_layers:
+            view = manager.get_buffers(layer)
+            if view.dtype.is_floating_point:
+                assert not view.float().isnan().any(), layer
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
 def test_nvfp4_draft_layers_are_rejected() -> None:
     """Block scales belong to the sparse target layers, so an NVFP4 drafter cannot join."""
     specs = _specs()

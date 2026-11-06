@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -768,6 +768,20 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
                 f"(flat_page_bound={self._draft_kv_cache_view.blocks_in_primary_pool})"
             )
         return self._draft_kv_cache_view
+
+    def _iter_cache_buffers_for_invalid_check(self) -> Iterator[Tuple[int, torch.Tensor]]:
+        """Scan target layers through their slot-indexed views, which cover only that layer.
+
+        The base class's explicit-spec path selects rows of a base view, which only draft layers
+        keep here.
+        """
+        for layer_id, buffer in super()._iter_cache_buffers_for_invalid_check():
+            if self.layer_specs is None or (
+                self.get_layer_owner(layer_id) is KVCacheLayerOwner.DRAFT
+            ):
+                yield layer_id, buffer
+            else:
+                yield layer_id, self.get_buffers(layer_id)
 
     def add_dummy_requests(self, *args: Any, **kwargs: Any) -> Optional[List[LlmRequest]]:
         """Drop the draft KV cache view before delegating.
