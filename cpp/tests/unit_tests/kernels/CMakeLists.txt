@@ -42,7 +42,7 @@ add_tllm_gtest(
   cascadeAttentionNumericsTest.cu
   LINK_LIBRARIES
   tllm::kernel_cascade_attention
-  tllm::kernel_attention_decode
+  tllm::kernel_mmha
   LABELS
   "unit;kernels;cascade-attention;gpu")
 
@@ -160,7 +160,7 @@ add_tllm_gtest(
   moe/routing/routingCustomTest.cpp
   moe/routing/routingDeepSeekTest.cpp
   LINK_LIBRARIES
-  tllm::kernel_moe_routing
+  tllm::kernel_trtllm_gen_moe_routing
   tllm::runtime_buffers
   Python3::Python
   LABELS

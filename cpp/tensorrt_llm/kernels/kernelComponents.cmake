@@ -151,16 +151,16 @@ set_property(TARGET tllm_kernel_cascade_attention
              PROPERTY CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
 if(WIN32)
-  set(mmha_targets tllm_mmha)
-  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS tllm_mmha)
+  set(mmha_targets tllm::kernel_mmha_instantiations)
+  list(APPEND TLLM_KERNEL_COMPONENT_TARGETS tllm_kernel_mmha_instantiations)
 else()
   # Cascade is owned by decoder_attention_0, which exports it to consumers.
   list(REMOVE_ITEM TLLM_KERNEL_COMPONENT_TARGETS tllm_kernel_cascade_attention)
   set(mmha_targets ${DECODER_SHARED_TARGET_0} ${DECODER_SHARED_TARGET_1})
 endif()
 add_tllm_kernel_library(
-  tllm_kernel_attention_decode SOURCES decoderMaskedMultiheadAttention.cu
-  LINK_LIBRARIES ${mmha_targets})
+  tllm_kernel_mmha SOURCES decoderMaskedMultiheadAttention.cu LINK_LIBRARIES
+  ${mmha_targets})
 
 list(APPEND TLLM_KERNEL_COMPONENT_TARGETS trtllm_gen_fmha)
 

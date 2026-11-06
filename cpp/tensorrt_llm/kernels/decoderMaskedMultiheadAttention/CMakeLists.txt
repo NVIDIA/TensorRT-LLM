@@ -84,12 +84,17 @@ if(NOT WIN32)
                         PRIVATE tllm::kernel_cascade_attention)
 else()
   target_sources(decoder_attention_src PRIVATE ${SRC_CPP})
-  add_library(tllm_mmha STATIC ${SRC_CU} ${SRC_CU_EXTRA})
-  target_link_libraries(tllm_mmha PUBLIC tllm::common_environment
-                                         tllm::kernel_cascade_attention)
-  set_target_properties(tllm_mmha PROPERTIES POSITION_INDEPENDENT_CODE ON
-                                             CUDA_RESOLVE_DEVICE_SYMBOLS ON)
-  target_link_libraries(decoder_attention_src PUBLIC tllm_mmha)
+  add_library(tllm_kernel_mmha_instantiations STATIC ${SRC_CU} ${SRC_CU_EXTRA})
+  add_library(tllm::kernel_mmha_instantiations ALIAS
+              tllm_kernel_mmha_instantiations)
+  target_link_libraries(
+    tllm_kernel_mmha_instantiations PUBLIC tllm::common_environment
+                                           tllm::kernel_cascade_attention)
+  set_target_properties(
+    tllm_kernel_mmha_instantiations PROPERTIES POSITION_INDEPENDENT_CODE ON
+                                               CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+  target_link_libraries(decoder_attention_src
+                        PUBLIC tllm::kernel_mmha_instantiations)
 endif()
 
 target_link_libraries(decoder_attention_src PUBLIC nvrtc_wrapper_src

@@ -31,7 +31,7 @@ set(ROUTING_SRC_CU ${ROUTING_CUSTOM_SRC_CU} ${ROUTING_OTHER_SRC_CU})
 # Custom routing uses one translation unit per kernel family and disables NVCC's
 # internal split pipeline so ptxas can process the families in parallel.
 add_library(trtllm_gen_fp8_block_scale_moe_routing STATIC ${ROUTING_SRC_CU})
-add_library(tllm::kernel_moe_routing ALIAS
+add_library(tllm::kernel_trtllm_gen_moe_routing ALIAS
             trtllm_gen_fp8_block_scale_moe_routing)
 target_link_libraries(trtllm_gen_fp8_block_scale_moe_routing
                       PUBLIC tllm::kernel_cutlass_headers)
@@ -50,7 +50,7 @@ set_source_files_properties(
 
 add_library(trtllm_gen_fp8_block_scale_moe OBJECT runner.cu)
 target_link_libraries(
-  trtllm_gen_fp8_block_scale_moe PUBLIC tllm::kernel_moe_routing
+  trtllm_gen_fp8_block_scale_moe PUBLIC tllm::kernel_trtllm_gen_moe_routing
                                         tllm::kernel_moe_block_scale)
 set_property(TARGET trtllm_gen_fp8_block_scale_moe
              PROPERTY POSITION_INDEPENDENT_CODE ON)
