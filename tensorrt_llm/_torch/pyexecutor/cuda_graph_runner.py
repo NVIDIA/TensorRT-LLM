@@ -926,11 +926,10 @@ class CUDAGraphRunner:
             num_sequences_in_batch, False, key.draft_len,
             self.cuda_graph_meta_buffers)
         if key.kv_regime is not None:
-            # The FP4 MLA decode dispatcher decides on the regime ceiling, an
-            # upper bound of the live KV, instead of the page-table capacity.
-            fp4_mla_state = getattr(graph_attn_metadata, "fp4_mla_state", None)
-            if fp4_mla_state is not None:
-                fp4_mla_state.kv_regime_max_kv = key.kv_regime
+            # The decode captured in this graph chooses its kernels on the
+            # regime ceiling, an upper bound of the live KV, instead of the
+            # page-table capacity.
+            graph_attn_metadata.set_decode_kv_regime(key.kv_regime)
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(
@@ -1332,12 +1331,11 @@ class CUDAGraphRunner:
         """Assert the stored attention metadata carries the key's KV regime, if strict checking is enabled."""
         if not _STRICT_BUFFER_CHECK or key.kv_regime is None:
             return
-        fp4_mla_state = getattr(stored_meta["attn_metadata"], "fp4_mla_state",
-                                None)
-        assert (fp4_mla_state is None
-                or fp4_mla_state.kv_regime_max_kv == key.kv_regime), (
-                    f"CUDA graph {key} replays attention metadata of KV "
-                    f"regime {fp4_mla_state.kv_regime_max_kv}")
+        # None: the backend's decode does not depend on the KV length.
+        stored_kv_regime = stored_meta["attn_metadata"].decode_kv_regime
+        assert stored_kv_regime in (None, key.kv_regime), (
+            f"CUDA graph {key} replays attention metadata of KV "
+            f"regime {stored_kv_regime}")
 
     def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
         """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
