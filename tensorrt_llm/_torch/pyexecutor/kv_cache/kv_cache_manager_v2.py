@@ -492,6 +492,18 @@ def _estimate_full_attn_size_per_token(
     )
 
 
+def _skips_auto_host_tier(has_cp_helix: bool, is_disagg: bool, spec_config) -> bool:
+    """Whether to leave out the automatic host tier.
+
+    Suspending a DSpark request under aggregated helix is not validated yet, so
+    that combination keeps a GPU-only pool, where recompute-pause reclaims
+    pages. An explicit ``host_cache_size`` still provisions a tier.
+    """
+    return (
+        has_cp_helix and not is_disagg and getattr(spec_config, "decoding_type", None) == "DSpark"
+    )
+
+
 def _compute_auto_host_tier_quota(
     quota: int,
     local_ranks: int,
@@ -645,10 +657,49 @@ def _estimate_swa_cache_size(
     return size_per_token, size_per_request
 
 
-def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, int]:
-    """Return draft-token reserve and total capacity headroom over history."""
+def _get_shared_draft_block_width(
+    spec_config, layer_specs, shared_draft_block_width: Optional[int] = None
+) -> int:
+    """Block width of the drafter whose layers share this manager, else 0.
+
+    The creator supplies the checkpoint-resolved width when available.
+    """
+    from tensorrt_llm._torch.speculative import get_draft_block_width
+
+    if layer_specs is not None and any(
+        layer.owner is KVCacheLayerOwner.DRAFT for layer in layer_specs
+    ):
+        if shared_draft_block_width is not None:
+            return shared_draft_block_width
+        return get_draft_block_width(spec_config)
+    return 0
+
+
+def _get_kv_alloc_extra_tokens(
+    spec_config, layer_specs, shared_draft_block_width: Optional[int] = None
+) -> int:
+    """Tokens each request is allocated beyond its history, for spec decoding.
+
+    ``get_num_extra_kv_tokens`` is the position-side count. When the drafter's
+    layers share this manager, the drafter appends its whole block after the
+    request's context, so that block must also fit in the allocation.
+    """
     from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens
 
+    return max(
+        get_num_extra_kv_tokens(spec_config),
+        _get_shared_draft_block_width(spec_config, layer_specs, shared_draft_block_width),
+    )
+
+
+def _get_generation_kv_capacity(
+    spec_config,
+    *,
+    is_draft: bool,
+    layer_specs=None,
+    shared_draft_block_width: Optional[int] = None,
+) -> tuple[int, int]:
+    """Return draft-token reserve and total capacity headroom over history."""
     if spec_config is None:
         return 0, BASE_GENERATION_TOKEN_COUNT
     reserve = spec_config.max_total_draft_tokens
@@ -661,7 +712,9 @@ def _get_generation_kv_capacity(spec_config, *, is_draft: bool) -> tuple[int, in
         reserve = max(reserve, draft_loop_tokens)
     dynamic_reserve = reserve - spec_config.max_total_draft_tokens
     headroom = (
-        get_num_extra_kv_tokens(spec_config) + spec_config.tokens_per_gen_step + dynamic_reserve
+        _get_kv_alloc_extra_tokens(spec_config, layer_specs, shared_draft_block_width)
+        + spec_config.tokens_per_gen_step
+        + dynamic_reserve
     )
     return reserve, headroom
 
@@ -1800,6 +1853,18 @@ class KVCacheManagerV2(BaseResourceManager):
     # Staging rows per batch for recurrent-state snapshots taken inside the
     # forward (MambaHybridCacheManagerV2); 0 = none.
     inforward_snapshot_rows: int = 0
+    # Block width of a drafter whose layers share this manager, else 0.
+    _shared_draft_block_width: int = 0
+
+    @property
+    def _kv_alloc_extra_tokens(self) -> int:
+        """Tokens a request is allocated beyond its history for spec decoding.
+
+        ``num_extra_kv_tokens`` is the position-side count; a shared drafter's
+        block must also fit in the allocation.
+        """
+        return max(self.num_extra_kv_tokens, self._shared_draft_block_width)
+
     # Mixed-precision state as seen by instances built without __init__;
     # _init_mixed_precision assigns fresh per-instance values.
     mixed_precision_low_dtype: DataType | None = None
@@ -1872,6 +1937,7 @@ class KVCacheManagerV2(BaseResourceManager):
         joint_kv_cache_reuse: bool = False,
         max_cuda_graph_batch_size: Optional[int] = None,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -2059,15 +2125,12 @@ class KVCacheManagerV2(BaseResourceManager):
                     "kv_cache_config.enable_kv_pool_rebalance=False."
                 )
             if not is_disagg:
-                if (kv_cache_config.host_cache_size or 0) > 0 or (
-                    kv_cache_config.disk_cache_size or 0
-                ) > 0:
+                if (kv_cache_config.disk_cache_size or 0) > 0:
                     raise ValueError(
-                        "KVCacheManagerV2 does not support cache tiers below "
-                        "GPU with aggregated helix context parallelism: "
-                        "suspending to a lower tier is not validated to make "
-                        "the same decisions on every CP rank. Set "
-                        "kv_cache_config.host_cache_size=0 and "
+                        "KVCacheManagerV2 does not support a disk cache tier "
+                        "with aggregated helix context parallelism: suspending "
+                        "to disk is not validated to make the same decisions "
+                        "on every CP rank. Set "
                         "kv_cache_config.disk_cache_size=0."
                     )
                 if kv_connector_manager is not None:
@@ -2086,6 +2149,9 @@ class KVCacheManagerV2(BaseResourceManager):
         from tensorrt_llm._torch.speculative import draft_prompt_lookahead, get_num_extra_kv_tokens
 
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
+        self._shared_draft_block_width = _get_shared_draft_block_width(
+            spec_config, self.layer_specs, shared_draft_block_width
+        )
         # The draft request view (LlmRequest.use_draft_model) reads the context
         # position and chunk a separate draft engine advances for its own
         # prefill; a one-engine external drafter (DFlash, DSpark, PARD,
@@ -2128,7 +2194,12 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         # Mirror V1's KV reserve sizing (see V1 __init__ for rationale).
         self._kv_reserve_draft_tokens, self._generation_kv_capacity_headroom = (
-            _get_generation_kv_capacity(spec_config, is_draft=self.is_draft)
+            _get_generation_kv_capacity(
+                spec_config,
+                is_draft=self.is_draft,
+                layer_specs=self.layer_specs,
+                shared_draft_block_width=self._shared_draft_block_width,
+            )
         )
 
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
@@ -2346,16 +2417,7 @@ class KVCacheManagerV2(BaseResourceManager):
             kv_connector_manager is not None and not kv_connector_manager.capacity_only
         )
         host_cache_size = kv_cache_config.host_cache_size
-        if self._has_cp_helix and not is_disagg:
-            # Aggregated helix runs GPU-only (lower tiers are rejected above),
-            # so pool pressure is relieved by preemption, as in the connector
-            # case.
-            host_quota = 0
-            logger.info(
-                "KV cache manager v2 host tier disabled: aggregated helix runs "
-                "GPU-only and relieves KV pressure by recompute pause."
-            )
-        elif connector_registers_pages and host_cache_size is None:
+        if connector_registers_pages and host_cache_size is None:
             # A connector holds device addresses for its pages, and evicting a
             # page to another tier reassigns its GPU slot underneath it. The
             # automatic host tier only exists to give MAX_UTILIZATION somewhere
@@ -2372,6 +2434,12 @@ class KVCacheManagerV2(BaseResourceManager):
             not self.is_estimating_kv_cache and host_cache_size is not None and host_cache_size >= 0
         ):
             host_quota = host_cache_size
+        elif _skips_auto_host_tier(self._has_cp_helix, is_disagg, spec_config):
+            host_quota = 0
+            logger.info(
+                "KV cache manager v2 automatic host tier disabled under aggregated "
+                "helix with DSpark; set kv_cache_config.host_cache_size to enable one."
+            )
         else:
             # The V2 MAX_UTILIZATION scheduler relies on suspend/resume to
             # evict and later restore KV cache pages. Without a secondary
@@ -2472,8 +2540,8 @@ class KVCacheManagerV2(BaseResourceManager):
             if isinstance(self.event_manager, StreamingKVCacheEventManager)
             else self.event_manager
         )
-        # Aggregated helix runs GPU-only but its CP ranks still need a common
-        # verdict: a rank that fails to allocate would otherwise leave its peers
+        # Aggregated helix CP ranks need a common verdict even without a host
+        # tier: a rank that fails to allocate would otherwise leave its peers
         # waiting in the first collective.
         sync_init_status = has_host_cache_tier or (self._has_cp_helix and not is_disagg)
         if not sync_init_status:
@@ -2821,7 +2889,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # Never committed, so the reuse tree can never hand this page to a
         # request as a matched prefix.
         kv_cache.stop_committing()
-        if not kv_cache.resize(1 + self.num_extra_kv_tokens):
+        if not kv_cache.resize(1 + self._kv_alloc_extra_tokens):
             logger.warning("KVCacheManagerV2: could not size the guard page")
             self.kv_cache_map.pop(_GUARD_PAGE_REQUEST_ID, None)
             kv_cache.close()
@@ -3464,14 +3532,19 @@ class KVCacheManagerV2(BaseResourceManager):
         Capacity grows monotonically within a request, so the condition below
         fires at most once per request per pool without extra bookkeeping.
 
-        Debug level only, and the guard runs before any of the strings or the
-        page-index scan are built, so a default run does no additional work.
+        Debug level only. This runs for every request on every step, so the
+        integer crossing test comes first and the logger is consulted only for
+        an actual crossing: ``is_debug_enabled`` resolves the caller's module
+        from the stack, which at a 1024-request batch costs more per step than
+        the allocation it follows.
         """
-        if new_capacity <= pre_capacity or not logger.is_debug_enabled():
+        if new_capacity <= pre_capacity:
             return
         for layer_group_id, window_size in self._get_windowed_layer_group_sizes().items():
             if not (pre_capacity <= window_size < new_capacity):
                 continue
+            if not logger.is_debug_enabled():
+                return
             logger.debug(
                 f"[KVCacheManagerV2] request {req.py_request_id} crossed the sliding window "
                 f"during {phase}: layer_group_id={layer_group_id}, window={window_size}, "
@@ -3811,7 +3884,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 generation_request_capacity = self._get_generation_request_capacity()
                 context_capacity = (
                     self.max_num_tokens if self.max_num_tokens is not None else typical_seq_len
-                ) + self.num_extra_kv_tokens
+                ) + self._kv_alloc_extra_tokens
                 generation_history_length = max(0, typical_seq_len - self.max_draft_len - 1)
                 typical_step = BatchDesc(
                     [KVCacheDesc(capacity=context_capacity, history_length=0)]
@@ -3832,7 +3905,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         BatchDesc(
                             [
                                 KVCacheDesc(
-                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    capacity=self.max_num_tokens + self._kv_alloc_extra_tokens,
                                     history_length=0,
                                 )
                             ]
@@ -4744,7 +4817,7 @@ class KVCacheManagerV2(BaseResourceManager):
         replicates all tokens on every rank, so both bounds constrain the
         same request-length variable.
         """
-        extra_tokens = self.num_extra_kv_tokens + max_num_draft_tokens
+        extra_tokens = self._kv_alloc_extra_tokens + max_num_draft_tokens
         # Token num upper bound is the maximum number of tokens that can be allocated in the kv cache manager.
         # We need to add extra tokens to the token num upper bound to account for the extra tokens.
         clamped = (
@@ -5252,6 +5325,10 @@ class KVCacheManagerV2(BaseResourceManager):
         config = req.kv_cache_retention_config
         if config is None or not self._has_cp_helix:
             return config
+        if not self.is_disagg:
+            # Aggregated helix holds the full prompt on every rank, so the
+            # ranges are already in global tokens, the ledger's units.
+            return config
         # Retention ranges use rank-local physical tokens; native ordinals use CP super-blocks.
         prompt_blocks = (req.prompt_len + self.tokens_per_block - 1) // self.tokens_per_block
         prompt_end = prompt_blocks * self.tokens_per_block
@@ -5427,7 +5504,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None:
             return False
 
-        target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
+        target = req.context_current_position + num_tokens + self._kv_alloc_extra_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
@@ -5467,7 +5544,7 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache is None or not self._resume_and_restore(req.py_request_id, kv_cache):
             return False
 
-        target = req.context_current_position + num_tokens + self.num_extra_kv_tokens
+        target = req.context_current_position + num_tokens + self._kv_alloc_extra_tokens
         return kv_cache.resize(max(kv_cache.capacity, target))
 
     def prepare_disagg_gen_init(self, req: LlmRequest) -> bool:
@@ -5504,7 +5581,7 @@ class KVCacheManagerV2(BaseResourceManager):
             else (req.total_input_len_cp if self._has_cp_helix else req.prompt_len)
         )
         prompt_len = req.total_input_len_cp if self._has_cp_helix else req.prompt_len
-        target = prompt_len + get_draft_token_length(req) + self.num_extra_kv_tokens
+        target = prompt_len + get_draft_token_length(req) + self._kv_alloc_extra_tokens
         capacity = max(kv_cache.capacity, target)
         pre_cap = kv_cache.capacity
 
@@ -6090,7 +6167,7 @@ class KVCacheManagerV2(BaseResourceManager):
         sliding-window layer group. When the capacity is unchanged the call
         cannot fail, since no new slot is requested.
         """
-        target = end + self.num_extra_kv_tokens
+        target = end + self._kv_alloc_extra_tokens
         if end >= req.prompt_len:
             target += get_draft_token_length(req)
         pre_cap = kv_cache.capacity
@@ -6249,7 +6326,7 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.context_current_position
                     + req.context_chunk_size
                     + draft_len
-                    + self.num_extra_kv_tokens
+                    + self._kv_alloc_extra_tokens
                 )
                 # None keeps the cache's current history, as every drafter
                 # that reads the draft request view (MTP, Eagle, two-engine)
@@ -7170,7 +7247,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if not success:
                 release_resources(req)
                 return None
-            dummy_capacity = token_num + self.num_extra_kv_tokens
+            dummy_capacity = token_num + self._kv_alloc_extra_tokens
             if is_gen and not materialize_history:
                 kv_cache.enable_swa_scratch_reuse = False
             # Need to hint the committed history to activate stale-block
@@ -7776,6 +7853,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ):
         if layer_specs is not None:
@@ -7818,7 +7896,10 @@ class KVCacheManagerV2(BaseResourceManager):
             max_seq_len,
         )
         _, generation_capacity_headroom = _get_generation_kv_capacity(
-            spec_config, is_draft=is_draft
+            spec_config,
+            is_draft=is_draft,
+            layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         (
             context_size_per_token,
@@ -7901,6 +7982,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
     ) -> Optional[tuple[List[tuple[int, int, int]], int]]:
         """Per-local-layer ``(layer_size, retained_tokens, intercept_tokens)``
         plus the block-rounded full-sequence token count.
@@ -8012,7 +8094,10 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             retained_windows = list(covered_windows)
         _, generation_capacity_headroom = _get_generation_kv_capacity(
-            spec_config, is_draft=is_draft
+            spec_config,
+            is_draft=is_draft,
+            layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         full_tokens = (
             math.ceil((max_seq_len + generation_capacity_headroom) / tokens_per_block)
@@ -8057,6 +8142,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> Optional[int]:
         """Slope-funded pool bytes ONE max-length request pins in this manager.
@@ -8090,6 +8176,7 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             is_draft=is_draft,
             layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         if layer_tokens is None:
             return None
@@ -8119,6 +8206,7 @@ class KVCacheManagerV2(BaseResourceManager):
         spec_config=None,
         is_draft: bool = False,
         layer_specs: Optional[Sequence[KVCacheLayerSpec]] = None,
+        shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> Optional[int]:
         """Allocator quota ONE max-length request makes this manager insist on.
@@ -8154,6 +8242,7 @@ class KVCacheManagerV2(BaseResourceManager):
             spec_config=spec_config,
             is_draft=is_draft,
             layer_specs=layer_specs,
+            shared_draft_block_width=shared_draft_block_width,
         )
         if layer_tokens is None:
             return None

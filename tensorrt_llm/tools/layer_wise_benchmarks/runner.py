@@ -531,8 +531,14 @@ class Runner:
             block_residual = residual
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
+                # As in KimiLinearModel.forward: a MoE layer may leave its residual update to the
+                # next layer's attention-residual mix; the last one returns it applied.
                 hidden_states, num_snapshots = layer(
-                    hidden_states, block_residual, num_snapshots, attn_metadata
+                    hidden_states,
+                    block_residual,
+                    num_snapshots,
+                    attn_metadata,
+                    defer_moe_residual=layer_idx != layer_indices[-1],
                 )
             return hidden_states, block_residual
 
@@ -907,6 +913,11 @@ class Runner:
                 dp_rank,
                 self.model_config.mapping.moe_ep_size,
             )
+            # A backend that routes through `routing_method.apply_with_sort` (the kernels
+            # that write the moe_sort tables) would bypass the replacement above: make it
+            # decline, so the scheduler falls back to the replaced `apply`.
+            apply_with_sort_orig = moe_module.routing_method.apply_with_sort
+            moe_module.routing_method.apply_with_sort = lambda *args, **kwargs: None
 
             # Replace `run_moe` for TRTLLMGenFusedMoE TEP because it does not call `routing_method.apply`
             if isinstance(moe_module, TRTLLMGenFusedMoE):
@@ -929,14 +940,20 @@ class Runner:
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
 
-            original_methods.append((apply_method_orig, run_moe_orig, forward_impl_orig))
+            original_methods.append(
+                (apply_method_orig, apply_with_sort_orig, run_moe_orig, forward_impl_orig)
+            )
         try:
             yield
         finally:
-            for moe_module, (apply_method_orig, run_moe_orig, forward_impl_orig) in zip(
-                moe_modules, original_methods
-            ):
+            for moe_module, (
+                apply_method_orig,
+                apply_with_sort_orig,
+                run_moe_orig,
+                forward_impl_orig,
+            ) in zip(moe_modules, original_methods):
                 moe_module.routing_method.apply = apply_method_orig
+                moe_module.routing_method.apply_with_sort = apply_with_sort_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
                 moe_module.forward_impl = forward_impl_orig

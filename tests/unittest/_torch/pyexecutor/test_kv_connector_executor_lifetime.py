@@ -426,7 +426,7 @@ def test_empty_iteration_keeps_request_broadcast_fast_path() -> None:
     broadcaster = RequestBroadcaster(dist, SimpleNamespace(pause=nullcontext))
     broadcaster._broadcast_requests = Mock(side_effect=AssertionError("Unexpected payload"))
 
-    assert broadcaster.broadcast([]) == ([], None)
+    assert broadcaster.broadcast([]) == []
 
 
 def test_completion_envelope_reaches_every_rank_without_a_compute_batch() -> None:
@@ -526,6 +526,7 @@ def _preemption_executor() -> PyExecutor:
     # Wide enough that a mid-stream request emits nothing of its own, so any
     # response seen below came from the finish path rather than from streaming.
     executor.stream_interval = 100
+    executor.first_content_emit_iters = 1
     return executor
 
 
@@ -798,6 +799,7 @@ def test_shutdown_drains_the_connector_before_the_pools_it_reads_are_freed() -> 
     executor.virtual_memory_pools = None
     executor.sampler = Mock()
     executor.dwdp_manager = None
+    executor.dense_dwdp_manager = None
 
     executor.shutdown()
 
