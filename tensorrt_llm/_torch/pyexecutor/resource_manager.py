@@ -1732,7 +1732,7 @@ class KVCacheManager(BaseResourceManager):
             head_dim = getattr(config, "head_dim", None)
             if not isinstance(head_dim, int):
                 head_dim = config.hidden_size // config.num_attention_heads
-            head_dim = head_dim * num_key_value_heads // tp_size
+            head_dim *= math.ceil(num_key_value_heads / tp_size)
             kv_factor = 2
 
         num_attention_layers = KVCacheManager._resolve_num_attention_layers(

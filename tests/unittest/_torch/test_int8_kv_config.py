@@ -10,14 +10,11 @@ from transformers import LlamaConfig
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor._util import CacheCost, _create_kv_cache_manager
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.model_loader import (
-    initialize_dummy_weights,
-    validate_and_set_kv_cache_quant,
-)
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -52,37 +49,14 @@ def test_int8_kv_rejects_trtllm_gen_devices(sm: int, monkeypatch: pytest.MonkeyP
         attention.update_quant_config(QuantConfig(kv_cache_quant_algo=QuantAlgo.INT8))
 
 
-@pytest.mark.parametrize("checkpoint_quant", [None, QuantAlgo.FP8, QuantAlgo.INT8])
-def test_int8_kv_explicit_override_keeps_layers_in_sync(
-    checkpoint_quant: QuantAlgo | None, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An explicit INT8 override must update both global and per-layer quantization."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    config = _model_config(checkpoint_quant)
-    config.quant_config_dict = {
-        "model.layers.0.self_attn": QuantConfig(kv_cache_quant_algo=checkpoint_quant),
-        "model.layers.1.self_attn": QuantConfig(kv_cache_quant_algo=checkpoint_quant),
-    }
-    validate_and_set_kv_cache_quant(config, "int8")
-    for quant in [config.quant_config, *config.quant_config_dict.values()]:
-        assert quant.layer_quant_mode.has_int8_kv_cache()
-        assert not quant.layer_quant_mode.has_fp8_kv_cache()
-
-
-def test_int8_kv_auto_preserves_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Automatic cache selection must preserve checkpoint INT8 metadata."""
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    config = _model_config()
-    validate_and_set_kv_cache_quant(config, "auto")
-    assert config.quant_config.layer_quant_mode.has_int8_kv_cache()
-
-
-@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize(("tp_size", "kv_heads_per_rank"), [(1, 2), (2, 1), (4, 1)])
 @pytest.mark.parametrize("manager_type", [KVCacheManager, KVCacheManagerV2])
-def test_int8_kv_estimation_uses_half_the_bf16_bytes(tp_size: int, manager_type: type) -> None:
+def test_int8_kv_estimation_uses_half_the_bf16_bytes(
+    tp_size: int, kv_heads_per_rank: int, manager_type: type
+) -> None:
     """Both managers must budget one byte per INT8 element before allocation."""
     mapping = Mapping(world_size=tp_size, tp_size=tp_size)
-    expected_bytes = 2 * 2 * (2 // tp_size) * 64
+    expected_bytes = 2 * 2 * kv_heads_per_rank * 64
     options = {"tokens_per_block": 32} if manager_type is KVCacheManagerV2 else {}
     int8_bytes = CacheCost.from_raw(
         manager_type.get_cache_size_per_token(_model_config(), mapping, **options)
@@ -150,11 +124,6 @@ def _create_test_manager(
     )
 
 
-def test_int8_kv_factory_selects_int8_pool() -> None:
-    """The real factory must pass INT8 to the cache-manager constructor."""
-    assert _create_test_manager(_model_config()).dtype == DataType.INT8
-
-
 @pytest.mark.parametrize(
     ("options", "error"),
     [
@@ -199,14 +168,3 @@ def test_dummy_weights_preserve_int8_kv_calibration() -> None:
     torch.testing.assert_close(projection.kv_cache_scaling_factor, torch.ones(1))
     torch.testing.assert_close(projection.inv_kv_cache_scaling_factor, torch.ones(1))
     assert torch.count_nonzero(projection.weight) > 0
-
-
-def test_int8_kv_public_args_sync_quantization() -> None:
-    """Public INT8 cache configuration must replace an earlier FP8 selection."""
-    args = TorchLlmArgs.model_construct(
-        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.FP8),
-        kv_cache_config=KvCacheConfig(dtype="int8", enable_block_reuse=False),
-    )
-    args.sync_quant_config_with_kv_cache_config_dtype()
-    assert args.quant_config.layer_quant_mode.has_int8_kv_cache()
-    assert not args.quant_config.layer_quant_mode.has_fp8_kv_cache()

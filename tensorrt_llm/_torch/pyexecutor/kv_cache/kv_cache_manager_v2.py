@@ -718,7 +718,7 @@ def _get_static_cache_size_layer_components(
         head_dim = getattr(config, "head_dim", None)
         if not isinstance(head_dim, int):
             head_dim = config.hidden_size // config.num_attention_heads
-        head_dim = head_dim * num_key_value_heads // tp_size
+        head_dim *= math.ceil(num_key_value_heads / tp_size)
         cache_sizes_per_token = [2 * head_dim]
         layer_indices = None
 
