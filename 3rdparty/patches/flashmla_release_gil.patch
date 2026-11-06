@@ -1,0 +1,17 @@
+--- a/csrc/api/api.cpp
++++ b/csrc/api/api.cpp
+@@ -7,9 +7,9 @@
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.doc() = "FlashMLA";
+-    m.def("sparse_decode_fwd", &sparse_attn_decode_interface);
+-    m.def("dense_decode_fwd", &dense_attn_decode_interface);
+-    m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface);
+-    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun);
+-    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun);
++    m.def("sparse_decode_fwd", &sparse_attn_decode_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("dense_decode_fwd", &dense_attn_decode_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("sparse_prefill_fwd", &sparse_attn_prefill_interface, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("dense_prefill_fwd", &FMHACutlassSM100FwdRun, pybind11::call_guard<pybind11::gil_scoped_release>());
++    m.def("dense_prefill_bwd", &FMHACutlassSM100BwdRun, pybind11::call_guard<pybind11::gil_scoped_release>());
+ }
