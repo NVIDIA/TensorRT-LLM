@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """What a ``KVCacheManagerV2`` says of its pages that its runtime config and storage do not: its
-``PageTableSpec``, such as how each role's bytes spread over ranks (``RoleLayout``)."""
+``PageTableSpec``, such as how each role's bytes spread over ranks (``RoleLayoutV2``)."""
 
 from __future__ import annotations
 
@@ -21,14 +21,13 @@ import types
 from dataclasses import dataclass, field
 from typing import Mapping
 
-# The role layouts a manager's spec names (disaggregation.base.role_layout), for managers to
-# import from here.
-from ...disaggregation.base.role_layout import ByHead as ByHead
-from ...disaggregation.base.role_layout import Own as Own
-from ...disaggregation.base.role_layout import Replicated as Replicated
-from ...disaggregation.base.role_layout import RingSlots as RingSlots
-from ...disaggregation.base.role_layout import RoleLayout as RoleLayout
-from ...disaggregation.base.role_layout import Sectioned as Sectioned
+# The role layouts a manager's spec names (role_layout), for managers to import from here.
+from .role_layout import ByHead as ByHead
+from .role_layout import Own as Own
+from .role_layout import Replicated as Replicated
+from .role_layout import RingSlots as RingSlots
+from .role_layout import RoleLayoutV2 as RoleLayoutV2
+from .role_layout import Sectioned as Sectioned
 
 
 def layer_groups(manager: object) -> list[list[int]]:
@@ -83,8 +82,8 @@ class PageTableSpec:
         ValueError: If mixed_precision does not name two types.
     """
 
-    role_layouts: Mapping[str, RoleLayout] = field(default_factory=dict)
-    default_layout: RoleLayout | None = None
+    role_layouts: Mapping[str, RoleLayoutV2] = field(default_factory=dict)
+    default_layout: RoleLayoutV2 | None = None
     untransferred_roles: frozenset[str] = frozenset()
     derived_roles: frozenset[str] = frozenset()
     request_rebuilt_roles: frozenset[str] = frozenset()
@@ -106,7 +105,7 @@ class PageTableSpec:
                 raise ValueError(f"mixed precision names a low and a high type, not {names}")
             object.__setattr__(self, "mixed_precision", names)
 
-    def layout_of(self, role: str) -> RoleLayout | None:
+    def layout_of(self, role: str) -> RoleLayoutV2 | None:
         """The layout of ``role``: this rank's own share for a role that never moves (untransferred
         or derived), whatever the spec lays out otherwise, else its own, else the default; None for
         a role that moves and that the spec does not lay out. A transfer leaves the roles that
