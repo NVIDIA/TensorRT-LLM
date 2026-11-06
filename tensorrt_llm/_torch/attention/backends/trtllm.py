@@ -1228,8 +1228,18 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
     @property
     def has_mixed_precision_high_rows(self) -> bool:
-        """Whether this batch writes and reads a mixed-precision high pool through page tables."""
-        return self.mixed_precision_high_block_table is not None
+        """Sparse backends only: the selected rows a mixed-precision high layer holds are read
+        from and written to its rows through the high page table. Dense attention with the
+        cold-page first/last-N mixed precision reaches the high blocks through its redirected
+        block offsets instead (redirects_mixed_precision_block_offsets)."""
+        return (self.mixed_precision_high_block_table is not None
+                and not self.mixed_precision_block_offsets_redirect)
+
+    @property
+    def redirects_mixed_precision_block_offsets(self) -> bool:
+        """Dense attention: the block offsets of held blocks point at the high layer's blocks."""
+        return (self.mixed_precision_high_block_table is not None
+                and self.mixed_precision_block_offsets_redirect)
 
     def _create_mixed_precision_high_block_tables(self, buffers,
                                                   capture_graph: bool) -> None:
@@ -1355,13 +1365,23 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         super()._restore_mixed_precision_kv(saved[:2])
         self.kv_cache_block_offsets = saved[2]
 
+    def _layer_takes_mixed_precision(self, layer_idx: int) -> bool:
+        """Whether this attention layer has a mixed-precision high layer in the current manager."""
+        manager = self.kv_cache_manager
+        return manager.layer_offsets[
+            layer_idx] in manager.mixed_precision_high_layers
+
     @contextlib.contextmanager
     def mixed_precision_kv_staging(self, layer_idx: int):
-        """Cold-page window: read through the redirected block offsets, then copy the new rows back."""
-        if (self.mixed_precision_high_block_table is None
-                or not self.mixed_precision_block_offsets_redirect):
+        """Cold-page first/last-N mixed precision: a layer that takes it reads through its
+        redirected block offsets and copies the step's new rows back afterwards; a layer that
+        does not (a sliding-window layer, for example) runs untouched."""
+        if not self.redirects_mixed_precision_block_offsets:
             with super().mixed_precision_kv_staging(layer_idx):
                 yield
+            return
+        if not self._layer_takes_mixed_precision(layer_idx):
+            yield
             return
         yield
         store_mixed_precision_low_rows(self, layer_idx)
