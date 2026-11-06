@@ -358,6 +358,27 @@ _HEAD_SPLIT_ROLES = frozenset(
 )
 
 
+def _unmixed_layer_names(manager) -> dict[int, tuple[int, int]]:
+    """Internal layer id -> (global layer id, model layer) of every layer of ``manager`` as
+    disaggregated transfer names it without mixed-precision KV (``_compute_global_layer_ids``):
+    by its model layer (``pp_layers``) or, keeping several caches per model layer, by model layer
+    x attention types + attention type (``_layer_attn_to_layer_id``), a cache several model layers
+    share named by the first, which owns it. The names are collision-free and the same on every
+    pipeline rank."""
+    names = {}
+    virtual = getattr(manager, "_layer_attn_to_layer_id", None)
+    if virtual:
+        # The full attention-type enum, so that every pipeline rank encodes alike.
+        num_types = max(member.value for member in type(next(iter(virtual))[1])) + 1
+        for (model_layer, attn_type), layer_id in virtual.items():
+            own = int(model_layer) * num_types + attn_type.value
+            names.setdefault(int(layer_id), (own, int(model_layer)))
+    else:
+        for local, model_layer in enumerate(manager.pp_layers):
+            names[local] = (int(model_layer), int(model_layer))
+    return names
+
+
 class BlockReusePolicy(StrEnum):
     ALL_REUSABLE = "all_reusable"
     PER_REQUEST = "per_request"
@@ -5054,22 +5075,14 @@ class KVCacheManagerV2(BaseResourceManager):
         KV.
 
         A mixed-precision high layer of global model layer L gets 2L + 1 and every other layer
-        gets twice the id it has without mixed-precision KV, so the ids are collision-free and the
-        same on every pipeline rank. A layer's id is its own, whichever layer group holds it; a
-        high layer's model layer is that of the local layer it belongs to.
+        gets twice the id it has without mixed-precision KV (``_unmixed_layer_names``), so the ids
+        are collision-free and the same on every pipeline rank. A layer's id is its own, whichever
+        layer group holds it; a high layer's model layer is that of the local layer it belongs to.
         """
-        names = {}
-        virtual = getattr(self, "_layer_attn_to_layer_id", None)
-        if virtual:
-            # The disaggregation extractor's encoding: model layer x attention types + attention type.
-            num_types = max(member.value for member in type(next(iter(virtual))[1])) + 1
-            for (model_layer, attn_type), layer_id in virtual.items():
-                own = int(model_layer) * num_types + attn_type.value
-                names.setdefault(int(layer_id), (2 * own, int(model_layer)))
-        else:
-            # By model layer, as the hybrid manager names them too (it has no FP4 MLA layout here).
-            for local, model_layer in enumerate(self.pp_layers):
-                names[local] = (2 * int(model_layer), int(model_layer))
+        names = {
+            layer: (2 * global_layer, model_layer)
+            for layer, (global_layer, model_layer) in _unmixed_layer_names(self).items()
+        }
         for local, high_layer in self.mixed_precision_high_layers.items():
             model_layer = int(self.pp_layers[local])
             names[int(high_layer)] = (2 * model_layer + 1, model_layer)
@@ -5206,16 +5219,16 @@ class KVCacheManagerV2(BaseResourceManager):
         split by KV head, head-major (HND), as the TRTLLM attention kernels write them; a K-only
         (MLA) cache holds one latent head, which every tensor rank holds whole. The cache type is
         the manager's (``kv_factor``); layers that differ in it (``layer_specs`` mixing K-only and
-        K/V caches) are not laid out apart. Under mixed-precision KV it names its layers as
-        ``get_disagg_global_layer_ids`` then does. A manager registering other roles
-        (``Role.INDEX_KEY`` included) or laying these out otherwise returns its own, usually this
-        one with some fields replaced (``dataclasses.replace``). A role that moves and that its
-        spec does not lay out has no layout (``PageTableSpec.layout_of``)."""
+        K/V caches) are not laid out apart. It names every layer its storage holds
+        (``_disagg_layer_names``). A manager registering other roles (``Role.INDEX_KEY``
+        included) or laying these out otherwise returns its own, usually this one with some fields
+        replaced (``dataclasses.replace``). A role that moves and that its spec does not lay out
+        has no layout (``PageTableSpec.layout_of``)."""
         head_split = ByHead(total=1) if self.kv_factor == 1 else ByHead()
-        layer_ids = mixed_precision = None
+        names = self._disagg_layer_names()
+        layer_ids = {layer: names[layer] for layers in layer_groups(self) for layer in layers}
+        mixed_precision = None
         if self.mixed_precision_low_dtype is not None:
-            names = self._mixed_precision_layer_names()
-            layer_ids = {layer: names[layer] for layers in layer_groups(self) for layer in layers}
             mixed_precision = (
                 str(self.mixed_precision_low_dtype.name).lower(),
                 str(self.mixed_precision_high_dtype.name).lower(),
@@ -5226,6 +5239,15 @@ class KVCacheManagerV2(BaseResourceManager):
             quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
             mixed_precision=mixed_precision,
         )
+
+    def _disagg_layer_names(self) -> dict[int, tuple[int, int]]:
+        """Internal layer id -> (global layer id, model layer) of every layer: the names
+        disaggregated transfer gives the manager's layers (``_unmixed_layer_names``, or
+        ``_mixed_precision_layer_names`` under mixed-precision KV). A manager naming its layers
+        otherwise, as the FP4 MLA cache layout does, overrides this."""
+        if self.mixed_precision_low_dtype is not None:
+            return self._mixed_precision_layer_names()
+        return _unmixed_layer_names(self)
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.

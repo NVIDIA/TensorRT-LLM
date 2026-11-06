@@ -617,8 +617,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         each split by byte over the ranks recurrent state splits over. SSM
         state is split by head. Both name their element types, which their
         dtypes configure apart from the KV cache's. With the FP4 MLA cache
-        layout, the policy lays its attention roles and layer names over them
-        (``_fp4_mla_disagg_page_table_spec``), recurrent layers named ``2 * L``.
+        layout, the policy lays its attention roles over them
+        (``_fp4_mla_disagg_page_table_spec``) and names the layers
+        (``_disagg_layer_names``).
         """
         spec = super().page_table_spec()
         if self.local_num_mamba_layers > 0:
@@ -642,8 +643,16 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 },
             )
         if self._attention_cache_layout_policy is not None:
-            spec = self._fp4_mla_disagg_page_table_spec(spec, recurrent=self._is_local_mamba_layer)
+            spec = self._fp4_mla_disagg_page_table_spec(spec)
         return spec
+
+    def _disagg_layer_names(self) -> dict[int, tuple[int, int]]:
+        """With the FP4 MLA cache layout, the policy's names, recurrent layers ``2 * L`` beside
+        the MLA layers' ``2 * L`` and ``2 * L + 1`` (``_fp4_mla_disagg_layer_names``); else the
+        base manager's."""
+        if self._attention_cache_layout_policy is not None:
+            return self._fp4_mla_disagg_layer_names(recurrent=self._is_local_mamba_layer)
+        return super()._disagg_layer_names()
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:

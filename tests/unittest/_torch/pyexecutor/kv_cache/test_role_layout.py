@@ -113,7 +113,7 @@ def test_head_split_of_its_own_heads_states_their_total_for_attention():
 
 def test_head_split_keeps_a_total_its_spec_states():
     # MLA's one latent head, which every rank of TP4 holds whole.
-    layout = ByHead(total=1).resolve(_site(576, kv_heads=(1, 4), ranks=4))
+    layout = ByHead(total=1).resolve(_site(576, kv_heads=(1, None), ranks=4))
 
     assert layout == ByHead(head_bytes=576, total=1)
     assert [layout.pieces(576, 4, rank) for rank in range(4)] == [(Piece(0, 0, 576),)] * 4
