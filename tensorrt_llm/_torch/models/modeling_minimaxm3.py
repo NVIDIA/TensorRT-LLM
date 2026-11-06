@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -40,6 +40,34 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import NORM_FP4 as _CTX_NORM_FP4
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import NORM_MXFP8 as _CTX_NORM_MXFP8
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    NORM_MXFP8_MIN_ROWS as _CTX_NORM_MXFP8_MIN_ROWS,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    P5A_COMBINE_MXFP8 as _CTX_P5A_COMBINE_MXFP8,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import QKV_FUSED as _CTX_QKV_FUSED
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    ROUTER_BF16_SPLIT_TERMS as ROUTER_BF16_SPLIT_TERMS,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    ROUTER_TF32_FIXED as _CTX_ROUTER_TF32_FIXED,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    autotuner_tuning as _autotuner_tuning,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    norm_op_has_fp4 as _ctx_norm_op_has_fp4,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    qkv_fused_runner as _ctx_qkv_fused_runner,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import (
+    qkv_fused_takes_rows as _ctx_qkv_fused_takes_rows,
+)
+from .._experimental.modeling_v2.models.minimax_m3.ops.context import split_router_weight_bf16
 from ..attention.attention import Attention
 from ..attention.backends import AttentionMetadata
 from ..attention.backends.fmha.fallback import FallbackFmha
@@ -60,7 +88,6 @@ from ..attention.backends.sparse.minimax_m3 import (
 from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
-from ..cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
 from ..flashinfer_utils import get_env_enable_pdl
 from ..modules import linear as linear_module
@@ -139,13 +166,10 @@ def _moe_routed_output_is_global(experts: nn.Module) -> bool:
 
 # CTX prefill: fuse the boundary RMSNorm with the next MXFP8 linear's activation quantization (bitwise the same as
 # the stock two-kernel path). TRTLLM_CTX_NORM_MXFP8=0 is the kill switch.
-_CTX_NORM_MXFP8 = os.environ.get("TRTLLM_CTX_NORM_MXFP8", "1") == "1"
-_CTX_NORM_MXFP8_MIN_ROWS = 8192
 _CTX_NORM_MXFP8_LOGGED = False
 # The same kernel at the pre-MoE norm also emits the routed experts' NVFP4 fc31 input (bitwise fp4_quantize(norm,
 # fc31_input_scale, 16, ue8m0=False, swizzled=False), the backend's own quantize_input). TRTLLM_CTX_NORM_FP4=0 is the
 # kill switch.
-_CTX_NORM_FP4 = os.environ.get("TRTLLM_CTX_NORM_FP4", "1") == "1"
 _CTX_NORM_FP4_LOGGED = False
 # CTX prefill: the shared + routed add folded into the routed experts' finalize. The TRTLLM-gen NVFP4 runner returns
 # its unfinalized output (do_finalize=False) and one pass sums each token's top-k rows in the kernel's own order and
@@ -173,16 +197,6 @@ def fold_shared_into_finalize(unfinalized, shared_output: torch.Tensor, top_k: i
         expert_weights.view(num_tokens, top_k),
         shared_output.contiguous(),
     )
-
-
-def _ctx_norm_op_has_fp4() -> bool:
-    """Whether the installed fused norm op takes fp4_global_scale (resolved once)."""
-    has = getattr(_ctx_norm_op_has_fp4, "_cached", None)
-    if has is None:
-        op = getattr(torch.ops.trtllm, "minimax_m3_ctx_residual_rmsnorm_mxfp8", None)
-        has = op is not None and "fp4_global_scale" in str(op.default._schema)
-        _ctx_norm_op_has_fp4._cached = has
-    return has
 
 
 class MiniMaxM3QKVIndexerLinear(Linear):
@@ -692,35 +706,6 @@ def _build_swiglu_oai_dense_mlp(
     )
 
 
-ROUTER_BF16_SPLIT_TERMS = 3
-"""int: BF16 terms the FP32 router weight is split into for the tensor-core router GEMM."""
-
-
-def split_router_weight_bf16(
-    weight: torch.Tensor, terms: int = ROUTER_BF16_SPLIT_TERMS
-) -> torch.Tensor:
-    """Split the FP32 router weight into BF16 terms laid side by side along K.
-
-    ``weight`` [num_experts, hidden] FP32 becomes [num_experts, terms * hidden] BF16 with
-    ``weight ~= sum_t result[:, t * hidden:(t + 1) * hidden]``; each term is the BF16
-    rounding of what the previous terms left over (three terms carry 24 mantissa bits). A
-    BF16 activation ``y`` then gets FP32-grade logits from one tensor-core GEMM with FP32
-    accumulation, ``cat([y] * terms, -1) @ result.t()``, since BF16 x BF16 products are
-    exact in FP32. This is the multi-term emulation of CUTLASS's 3xTF32 GEMMs and of
-    cuBLAS's BF16x9 FP32 mode, with only the weight split because the activation is
-    already BF16.
-    """
-    if weight.dim() != 2 or weight.dtype != torch.float32:
-        raise ValueError("router weight must be a 2-D FP32 tensor")
-    pieces = []
-    remainder = weight
-    for _ in range(terms):
-        piece = remainder.to(torch.bfloat16)
-        pieces.append(piece)
-        remainder = remainder - piece.float()
-    return torch.cat(pieces, dim=1).contiguous()
-
-
 # SM107: from this many tokens the router input is cast to float32 by one vectorized Triton pass instead of the
 # aten dtype-converting copy (its unrolled path runs at ~2 TB/s). The cast is exact, so the result is bitwise the same.
 _SM107_ROUTER_FP32_CAST = True
@@ -766,17 +751,9 @@ def _minimax_m3_router_input_fp32_fake(hidden_states: torch.Tensor) -> torch.Ten
 # CTX prefill (SM107, NVFP4 sparse layers): one CuTe DSL kernel runs the QKV-index MXFP8 GEMM and the horizontal
 # producer (per-head RMSNorm, RoPE, FP8 Q / index-Q, NVFP4 K/V + scales, FP8 index-K paged inserts) in its epilogue,
 # bitwise the stock producer applied to its own BF16 GEMM output. TRTLLM_CTX_QKV_FUSED=0 is the kill switch.
-_CTX_QKV_FUSED = os.environ.get("TRTLLM_CTX_QKV_FUSED", "1") == "1"
-_CTX_QKV_FUSED_MIN_ROWS = 1024
 # A layer whose QKV the fused producer above took runs its attention core and o_proj through _core_then_o_proj, so the
 # NVFP4 combine can also hand the o_proj its MXFP8 input (msa_combine_mxfp8, slot tag "p5a"); same o_proj input values.
 # Kill switch: TRTLLM_CTX_P5A_COMBINE_MXFP8=0 calls the o_proj on the BF16 core output.
-_CTX_P5A_COMBINE_MXFP8 = os.environ.get("TRTLLM_CTX_P5A_COMBINE_MXFP8", "1") == "1"
-
-
-def _ctx_qkv_fused_takes_rows(rows: int) -> bool:
-    """Whether a step of rows QKV rows is large enough for the fused QKV GEMM + producer (eager and breakable alike)."""
-    return rows > _CTX_QKV_FUSED_MIN_ROWS
 
 
 # Breakable prefill CUDA graphs capture the stock qkv_proj, so a captured bucket M > _CTX_QKV_FUSED_MIN_ROWS
@@ -789,21 +766,6 @@ _CTX_BCG_P5A = os.environ.get("TRTLLM_CTX_BCG_P5A", "1") == "1"
 
 
 _BCG_EAGER_QKV_LOGGED: set = set()
-_CTX_QKV_FUSED_YIELD_LOGGED = False
-
-
-def _autotuner_tuning() -> bool:
-    """Whether the AutoTuner warmup pass is running. The fused QKV producer stays out of it, so the stock MXFP8 QKV
-    GEMM profiles its shape there: the steps the producer does not take (captured buckets, < 1024 rows) otherwise run
-    that GEMM on the CUTLASS runner's untuned default tactic."""
-    from ..autotuner import AutoTuner
-
-    global _CTX_QKV_FUSED_YIELD_LOGGED
-    tuning = AutoTuner.get().is_tuning_mode
-    if tuning and not _CTX_QKV_FUSED_YIELD_LOGGED:
-        _CTX_QKV_FUSED_YIELD_LOGGED = True
-        logger.info("[CTX R3] fused QKV yields to AutoTuner tuning pass; plain QKV GEMM tuned")
-    return tuning
 
 
 def _log_bcg_eager_qkv_once(captured_rows: int) -> None:
@@ -824,41 +786,12 @@ def _bcg_bucket_takes_eager_qkv(captured_rows: int) -> bool:
     )
 
 
-if TYPE_CHECKING:
-    from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
-
-
-_CTX_QKV_FUSED_RUNNERS: dict[tuple[int, int, int], M3QkvFusedRunner | None] = {}
 _CTX_QKV_FUSED_LOGGED = False
-
-
-def _ctx_qkv_fused_runner(
-    num_heads_q: int, num_heads_kv: int, num_heads_index: int
-) -> M3QkvFusedRunner | None:
-    """The compiled fused QKV runner for one per-rank head geometry (compiled on first use, outside capture)."""
-    if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
-        return None
-    key = (num_heads_q, num_heads_kv, num_heads_index)
-    if key not in _CTX_QKV_FUSED_RUNNERS:
-        try:
-            from ..kernels.rubin.m3_qkv_fusion.kernel import M3QkvFusedRunner
-
-            runner = M3QkvFusedRunner(
-                num_heads_q=num_heads_q, num_heads_kv=num_heads_kv, num_heads_index=num_heads_index
-            )
-        except Exception as exc:  # noqa: BLE001 — initialization must leave the stock path available
-            logger.warning(
-                f"MiniMax-M3 fused QKV initialization failed for heads {key}: {exc}; using stock QKV"
-            )
-            runner = None
-        _CTX_QKV_FUSED_RUNNERS[key] = runner
-    return _CTX_QKV_FUSED_RUNNERS[key]
 
 
 # Fixed-tile context router: BF16 activations multiply all three loaded BF16 weight terms, with FP32
 # accumulation. Tile and K/term order are fixed within each split-K regime (the cap is 8192 rows).
 # TRTLLM_CTX_ROUTER_TF32_FIXED=0 keeps the stock router.
-_CTX_ROUTER_TF32_FIXED = os.environ.get("TRTLLM_CTX_ROUTER_TF32_FIXED", "1") == "1"
 _CTX_ROUTER_FIXED_LOGGED = False
 # Pure generation steps keep the stock router unless TRTLLM_M3_ROUTER_TF32_IN_GEN=1 selects the fixed tile.
 _ROUTER_TF32_IN_GEN = os.environ.get("TRTLLM_M3_ROUTER_TF32_IN_GEN", "0") == "1"

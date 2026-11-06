@@ -128,6 +128,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config impo
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
     _validate_runtime as _validate_runtime,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops import context as _ctx_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (
     m3_silu_and_mul,
 )
@@ -1825,7 +1826,7 @@ def _split_chunk(rows: int, num_chunks: int) -> List[int]:
 # ``_CTX_NORM_MXFP8_MIN_ROWS``.
 CTX_STACK = True
 CTX_STACK_MIN_ROWS = 4096
-CTX_NORM_MIN_ROWS = 8192
+CTX_NORM_MIN_ROWS = _ctx_ops.NORM_MXFP8_MIN_ROWS
 CTX_STACK_PATH = "m3_ctx_stack"
 
 
@@ -1894,13 +1895,12 @@ def _ctx_reduce_norm(
     for the residual add + RMSNorm that also writes the next linear's MXFP8 input into the prequantized slot and,
     before MoE layer ``moe_layer``, the routed experts' NVFP4 input. Returns ``(normed, updated residual, nvfp4)``
     (``nvfp4`` = (packed e2m1, linear block scales) or None), or None where the built-in keeps the stock boundary."""
-    from tensorrt_llm._torch.models import modeling_minimaxm3 as builtin
     from tensorrt_llm._torch.modules.linear import ctx_eager_only, set_prequantized_mxfp8
 
     rows, hidden = x.shape[0], x.shape[1]
     if (
-        not builtin._CTX_NORM_MXFP8
-        or rows < builtin._CTX_NORM_MXFP8_MIN_ROWS
+        not _ctx_ops.NORM_MXFP8
+        or rows < _ctx_ops.NORM_MXFP8_MIN_ROWS
         or hidden % 256 != 0
         or hidden // 8 > 1024
         or x.dtype != torch.bfloat16
@@ -1909,7 +1909,7 @@ def _ctx_reduce_norm(
         return None
     reduced = m3_allreduce(x, core.allreduce, AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
     fp4_scale = None
-    if moe_layer is not None and builtin._CTX_NORM_FP4 and builtin._ctx_norm_op_has_fp4():
+    if moe_layer is not None and _ctx_ops.NORM_FP4 and _ctx_ops.norm_op_has_fp4():
         fp4_scale = _ctx_fp4_input_scale(core, moe_layer, rows)
     if fp4_scale is None:
         outs = torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
@@ -1935,19 +1935,18 @@ def _ctx_fused_qkv(core, i: int, hidden: torch.Tensor, position_ids, step: dict)
     (``MiniMaxM3Attention._ctx_fused_qkv_gemm_producer``) over this target's packed QKV weight and caches: Q / index-Q
     (FP8) out, K / V / index-K written. None where the built-in declines (its row gate, the tuning pass, a cache the
     kernel's alignment contract does not take); the caller then runs the projection + producer."""
-    from tensorrt_llm._torch.models import modeling_minimaxm3 as builtin
     from tensorrt_llm._torch.modules.linear import ctx_eager_only, take_prequantized_mxfp8
 
     rows = int(hidden.shape[0])
     manager = step["kv_cache_manager"]
     if (
-        not builtin._CTX_QKV_FUSED
+        not _ctx_ops.QKV_FUSED
         or not ctx_eager_only()
         or hidden.dim() != 2
         or not hidden.is_contiguous()
         or hidden.dtype != torch.bfloat16
-        or not builtin._ctx_qkv_fused_takes_rows(rows)
-        or builtin._autotuner_tuning()
+        or not _ctx_ops.qkv_fused_takes_rows(rows)
+        or _ctx_ops.autotuner_tuning()
         or position_ids is None
         or manager is None
         or not _nvfp4_layer(manager, i)
@@ -1982,7 +1981,7 @@ def _ctx_fused_qkv(core, i: int, hidden: torch.Tensor, position_ids, step: dict)
     ):
         return None
     w = core.w
-    runner = builtin._ctx_qkv_fused_runner(core.heads, core.kv_heads, core.index_heads)
+    runner = _ctx_ops.qkv_fused_runner(core.heads, core.kv_heads, core.index_heads)
     if runner is None:
         return None
     q = hidden.new_empty((rows, core.heads, core.head_dim), dtype=torch.float8_e4m3fn)
@@ -2654,8 +2653,10 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             for i in sorted(self.moe_layers)
         }
         # The same three-term weight representation as the built-in context gate, with stable refit buffers.
-        from tensorrt_llm._torch.models.modeling_minimaxm3 import (
-            _CTX_ROUTER_TF32_FIXED,
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
+            ROUTER_TF32_FIXED as _CTX_ROUTER_TF32_FIXED,
+        )
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
             split_router_weight_bf16,
         )
         from tensorrt_llm._torch.moe.fused_moe import (
@@ -2679,7 +2680,9 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
     def cache_derived_state(self) -> None:
         """Build the target and refresh captured router weights after in-place refit."""
         self.post_load_weights()
-        from tensorrt_llm._torch.models.modeling_minimaxm3 import split_router_weight_bf16
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
+            split_router_weight_bf16,
+        )
 
         # post_load_weights intentionally skips rebuilding unchanged storages;
         # their contents can still change on refit. Captures retain these buffers.
@@ -3522,12 +3525,10 @@ class PrefillTarget:
             return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
         ctx = _ctx_stack_step(step, hidden.shape[0])
         if ctx:
-            from tensorrt_llm._torch.models import modeling_minimaxm3 as builtin
-
             horizontal = _ctx_fused_qkv(core, i, hidden, position_ids, step)
             if horizontal is not None:
                 q, idx_q = horizontal
-                if builtin._CTX_P5A_COMBINE_MXFP8:
+                if _ctx_ops.P5A_COMBINE_MXFP8:
                     return self._ctx_core_then_o_proj(i, q, idx_q, step, "p5a"), False
                 o = self._attention_core(i, q, None, None, idx_q, step)
                 return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)

@@ -155,7 +155,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_invalid_arguments_keep_stock_fallback
   - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_backend_is_rubin_only
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl
-  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_memoizes_initialization_failure
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_shares_initialization_cache
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_skips_autotune_pass
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.

@@ -18,16 +18,19 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp2 import (
     modeling,
 )
-from tensorrt_llm._torch.models import modeling_minimaxm3 as builtin
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops import (
+    context as m3_context,
+)
 
 pytestmark = pytest.mark.cpu_only
 
 
 def test_the_ctx_stack_defaults() -> None:
     # On by default from 4096 rows; the MoE hand-off and the CTX norm start at the norm's floor, above the stack's.
+    assert modeling._ctx_ops is m3_context
     assert modeling.CTX_STACK is True
     assert modeling.CTX_STACK_MIN_ROWS == 4096
-    assert modeling.CTX_NORM_MIN_ROWS == builtin._CTX_NORM_MXFP8_MIN_ROWS == 8192
+    assert modeling.CTX_NORM_MIN_ROWS == m3_context.NORM_MXFP8_MIN_ROWS == 8192
 
 
 @pytest.mark.parametrize(

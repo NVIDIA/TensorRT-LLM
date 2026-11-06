@@ -39,6 +39,9 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops import (
+    context as m3_context,
+)
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -3371,10 +3374,10 @@ def test_ctx_qkv_fused_skips_autotune_pass(monkeypatch, tuning: bool) -> None:
     tuner = Mock(spec_set=["is_tuning_mode"])
     tuner.is_tuning_mode = tuning
     monkeypatch.setattr(AutoTuner, "get", lambda: tuner)
-    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_YIELD_LOGGED", False)
+    monkeypatch.setattr(m3_context, "_CTX_QKV_FUSED_YIELD_LOGGED", False)
     assert modeling_minimaxm3._autotuner_tuning() is tuning
     # The yield is logged once per process, and only when it happens.
-    assert modeling_minimaxm3._CTX_QKV_FUSED_YIELD_LOGGED is tuning
+    assert m3_context._CTX_QKV_FUSED_YIELD_LOGGED is tuning
 
 
 @pytest.mark.cpu_only
@@ -3382,8 +3385,8 @@ def test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Native MXFP8 support does not imply that the optional Rubin DSL is installed."""
-    monkeypatch.setattr(modeling_minimaxm3, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", False)
-    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_RUNNERS", {})
+    monkeypatch.setattr(m3_context, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", False)
+    monkeypatch.setattr(m3_context, "_CTX_QKV_FUSED_RUNNERS", {})
     monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED", True)
     monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
@@ -3408,34 +3411,47 @@ def test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl(
         )
         is None
     )
-    assert not modeling_minimaxm3._CTX_QKV_FUSED_RUNNERS
+    assert not m3_context._CTX_QKV_FUSED_RUNNERS
 
 
 @pytest.mark.cpu_only
-def test_ctx_qkv_fused_memoizes_initialization_failure(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("fails", [False, True])
+def test_ctx_qkv_fused_shares_initialization_cache(
+    monkeypatch: pytest.MonkeyPatch, fails: bool
 ) -> None:
-    """A failed optional runner is tried and logged once for each head geometry."""
+    """Built-in and target callers share successful runners and one failed attempt per geometry."""
 
     def construct_runner(*, num_heads_q: int, num_heads_kv: int, num_heads_index: int) -> object:
         return object()
 
     module = ModuleType("tensorrt_llm._torch.kernels.rubin.m3_qkv_fusion.kernel")
     constructor = create_autospec(
-        construct_runner, spec_set=True, side_effect=RuntimeError("compile failed")
+        construct_runner,
+        spec_set=True,
+        side_effect=RuntimeError("compile failed") if fails else construct_runner,
     )
     module.M3QkvFusedRunner = constructor
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(modeling_minimaxm3, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
-    monkeypatch.setattr(modeling_minimaxm3, "_CTX_QKV_FUSED_RUNNERS", {})
-    warning = create_autospec(modeling_minimaxm3.logger.warning, spec_set=True)
-    monkeypatch.setattr(modeling_minimaxm3.logger, "warning", warning)
-    for _ in range(2):
-        assert modeling_minimaxm3._ctx_qkv_fused_runner(8, 1, 1) is None
+    monkeypatch.setattr(m3_context, "IS_CUTLASS_DSL_RUBIN_AVAILABLE", True)
+    monkeypatch.setattr(m3_context, "_CTX_QKV_FUSED_RUNNERS", {})
+    warning = create_autospec(m3_context.logger.warning, spec_set=True)
+    monkeypatch.setattr(m3_context.logger, "warning", warning)
+    assert modeling_minimaxm3._ctx_qkv_fused_runner is m3_context.qkv_fused_runner
+    assert modeling_minimaxm3._ctx_qkv_fused_takes_rows is m3_context.qkv_fused_takes_rows
+    assert modeling_minimaxm3._ctx_norm_op_has_fp4 is m3_context.norm_op_has_fp4
+    assert modeling_minimaxm3.split_router_weight_bf16 is m3_context.split_router_weight_bf16
+    first = m3_context.qkv_fused_runner(8, 1, 1)
+    for caller in (modeling_minimaxm3._ctx_qkv_fused_runner, m3_context.qkv_fused_runner):
+        assert caller(8, 1, 1) is first
     constructor.assert_called_once_with(num_heads_q=8, num_heads_kv=1, num_heads_index=1)
-    assert warning.call_count == 1
-    assert modeling_minimaxm3._ctx_qkv_fused_runner(16, 1, 1) is None
-    assert constructor.call_count == warning.call_count == 2
+    second = modeling_minimaxm3._ctx_qkv_fused_runner(16, 1, 1)
+    assert constructor.call_count == 2
+    assert warning.call_count == (2 if fails else 0)
+    assert m3_context._CTX_QKV_FUSED_RUNNERS == {(8, 1, 1): first, (16, 1, 1): second}
+    if fails:
+        assert first is second is None
+    else:
+        assert first is not None and second is not None and first is not second
 
 
 @pytest.mark.cpu_only
