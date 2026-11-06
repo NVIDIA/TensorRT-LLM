@@ -132,9 +132,9 @@ class NixlEncoderCache:
         self._close_error = None
 
     @contextmanager
-    def _operation(self):
+    def _operation(self, *, unavailable_error=RuntimeError):
         with self._lock:
-            self._healthy()
+            self._healthy(unavailable_error=unavailable_error)
             self._active += 1
         try:
             yield
@@ -161,9 +161,9 @@ class NixlEncoderCache:
                 self._discard(item)
                 del self._exports[identity]
 
-    def _healthy(self):
+    def _healthy(self, *, unavailable_error=RuntimeError):
         if self.failed or self._closed or self._closing:
-            raise RuntimeError("encoder NIXL transport unavailable; restart the engine")
+            raise unavailable_error("encoder NIXL transport unavailable; restart the engine")
 
     def publish(self, result, request, llm):
         with self._operation():
@@ -247,7 +247,7 @@ class NixlEncoderCache:
             value = self._reference(reference)
             peer = _decode(destination)
             with self._lock:
-                self._healthy()
+                self._healthy(unavailable_error=EncoderTransferRejected)
                 self._collect()
                 item = self._exports.get(value["id"])
                 if item is None:
@@ -292,7 +292,7 @@ class NixlEncoderCache:
             TransferRequest,
         )
 
-        with self._operation():
+        with self._operation(unavailable_error=EncoderTransferRejected):
             identity, item, peer, agent_desc = self._claim(reference, destination)
             agent = None
             status = None

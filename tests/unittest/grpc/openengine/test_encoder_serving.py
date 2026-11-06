@@ -14,11 +14,35 @@ from test_encoder import model, native_result, request
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.grpc.openengine import servicer
-from tensorrt_llm.grpc.openengine.bindings import model_pb2
+from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2, model_pb2
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer
 
 pytestmark = pytest.mark.cpu_only
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("healthy", [True, False])
+async def test_encoder_health_skips_language_probe_without_masking_unhealthy_engine(healthy):
+    inference = _inference()
+    inference.encoder_role = "encode"
+    control = _servicer(inference=inference, _executor_unhealthy=not healthy)
+
+    def unexpected_generate(*args, **kwargs):
+        pytest.fail("encoder health must not submit a language-generation probe")
+
+    control._llm.generate_async = unexpected_generate
+    response = await control.Health(
+        lifecycle_pb2.HealthRequest(include_inference_probe=True), FakeServicerContext()
+    )
+    probe = next(check for check in response.checks if check.name == "inference_probe")
+    assert probe.state == lifecycle_pb2.HEALTH_STATE_READY
+    assert "not applicable" in probe.message and "encoder-only" in probe.message
+    assert "inference liveness was not tested" in probe.message
+    assert response.state == (
+        lifecycle_pb2.HEALTH_STATE_READY if healthy else lifecycle_pb2.HEALTH_STATE_NOT_READY
+    )
+    assert inference.active_request_count() == 0
 
 
 @pytest.mark.asyncio

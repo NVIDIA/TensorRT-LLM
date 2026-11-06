@@ -418,6 +418,44 @@ def test_requires_explicit_revision():
         transport.NixlEncoderCache("", "", device="cpu", agent_factory=FakeAgent)
 
 
+@pytest.mark.parametrize(
+    "state,during_claim",
+    [("failed", False), ("closing", False), ("closed", False), ("failed", True), ("closing", True)],
+)
+def test_unhealthy_producer_rejects_before_write_without_poisoning_receiver(
+    pair, monkeypatch, state, during_claim
+):
+    producer, consumer = pair
+    llm, _ = model()
+    reference = producer.publish(native_result()[0], request(), llm)
+    health = producer._healthy
+    checks = 0
+    attribute = {"failed": "failed", "closing": "_closing", "closed": "_closed"}[state]
+    with monkeypatch.context() as patch:
+        if state == "closed":
+            producer.close()
+        elif not during_claim:
+            patch.setattr(producer, attribute, True)
+        else:
+
+            def change_health(*args, **kwargs):
+                nonlocal checks
+                checks += 1
+                if checks == 2:
+                    patch.setattr(producer, attribute, True)
+                return health(*args, **kwargs)
+
+            patch.setattr(producer, "_healthy", change_health)
+        with pytest.raises(transport.EncoderTransferRejected, match="transport unavailable"):
+            _receive(consumer, reference)
+        assert not consumer.failed
+        assert consumer._used == 0 and not _receiver(consumer).registrations
+        assert _writes(producer) == 0
+        if during_claim:
+            assert checks == 2
+    consumer._healthy()
+
+
 @pytest.mark.skipif(
     os.environ.get("TRTLLM_TEST_NIXL_ENCODER") != "1",
     reason="opt-in native NIXL/UCX runtime test",

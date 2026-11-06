@@ -413,14 +413,16 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
             conversation_params = conversation_params_from_request(request)
             disaggregated_params = disaggregated_params_from_request(request)
             if encoder_action and disaggregated_params is not None:
-                if (
-                    encoder_action != "consume"
-                    or disaggregated_params.request_type != "context_only"
+                if encoder_action != "consume" or disaggregated_params.request_type not in (
+                    "context_only",
+                    "context_and_generation",
                 ):
                     raise UnsupportedFeatureError(
                         "encoder handoffs require a prefill or aggregated request"
                     )
-                if not callable(getattr(self._llm.input_processor, "capture_decode_state", None)):
+                if disaggregated_params.request_type == "context_only" and not callable(
+                    getattr(self._llm.input_processor, "capture_decode_state", None)
+                ):
                     raise UnsupportedFeatureError(
                         "encoder prefill requires portable decode preparation"
                     )

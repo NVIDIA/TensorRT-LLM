@@ -534,6 +534,15 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     async def _run_inference_probe(self, model: str) -> lifecycle_pb2.HealthCheck:
         from tensorrt_llm.sampling_params import SamplingParams
 
+        if getattr(self._inference, "encoder_role", "") == "encode":
+            return lifecycle_pb2.HealthCheck(
+                name="inference_probe",
+                state=lifecycle_pb2.HEALTH_STATE_READY,
+                message=(
+                    "probe not applicable: encoder-only engine does not generate tokens; "
+                    "inference liveness was not tested"
+                ),
+            )
         if not token_ids_input_supported(self._llm):
             return lifecycle_pb2.HealthCheck(
                 name="inference_probe",

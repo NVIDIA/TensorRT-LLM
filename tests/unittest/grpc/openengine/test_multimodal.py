@@ -2570,10 +2570,11 @@ async def test_raw_audio_mime_type_is_validated(image_video_audio_llm):
 
 @pytest.mark.asyncio
 @pytest.mark.threadleak(enabled=False)  # grpc.aio owns a process-lifetime polling thread.
-@pytest.mark.parametrize("separate_prefill_decode", [False, True])
+@pytest.mark.parametrize("request_type", ["", "context_and_generation", "context_only"])
 async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
-    image_llm, monkeypatch, tmp_path, separate_prefill_decode
+    image_llm, monkeypatch, tmp_path, request_type
 ):
+    separate_prefill_decode = request_type == "context_only"
     capability_llm, _ = image_llm
     processor = capability_llm.input_processor
     processor.support_mm_disagg = True
@@ -2618,7 +2619,9 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
         restored_state.append((state, prompt_length))
         return {}
 
-    monkeypatch.setattr(processor, "capture_decode_state", capture_decode_state)
+    monkeypatch.setattr(
+        processor, "capture_decode_state", capture_decode_state if separate_prefill_decode else None
+    )
     monkeypatch.setattr(processor, "restore_decode_state", restore_decode_state)
 
     def consume(inputs, sampling, params):
@@ -2666,8 +2669,8 @@ async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
         request.encoder.CopyFrom(
             generation_pb2.EncoderOptions(cache=responses[0].encoder_ready.cache)
         )
-        if separate_prefill_decode:
-            request.extra.update({"request_type": "context_only"})
+        if request_type:
+            request.extra.update({"request_type": request_type})
         responses = [value async for value in clients[1].Generate(request, timeout=10)]
         if separate_prefill_decode:
             assert responses[-1].WhichOneof("event") == "prefill_ready"

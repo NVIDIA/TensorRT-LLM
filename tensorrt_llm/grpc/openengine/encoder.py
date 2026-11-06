@@ -149,11 +149,14 @@ class EncoderCache:
         for path in self.root.iterdir():
             if path.suffix not in (".safetensors", ".tmp"):
                 continue
-            stat = path.stat()
-            if time.time() - stat.st_mtime > _TTL_SECONDS:
-                path.unlink()
-            else:
-                used += stat.st_size
+            try:
+                stat = path.stat()
+                if time.time() - stat.st_mtime > _TTL_SECONDS:
+                    path.unlink(missing_ok=True)
+                else:
+                    used += stat.st_size
+            except FileNotFoundError:
+                continue
         return used
 
     def publish(self, result: Any, request: Any, llm: Any):
