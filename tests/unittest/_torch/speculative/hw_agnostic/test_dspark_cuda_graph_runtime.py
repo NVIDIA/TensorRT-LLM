@@ -457,7 +457,7 @@ def test_stale_replay_vote_rejoins_the_shape_collective():
         dist=SimpleNamespace(tp_allgather_int64=exchange),
     )
     runner._resolve_sample_type = lambda *_args: SampleType.FAST
-    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FAST)
+    assert runner._agree_graph_shape(batch, True, frozenset()) == (True, SampleType.FAST, None)
     assert exchanges == [[True, 4, 16, 5, SampleType.FAST.value]]
 
 
