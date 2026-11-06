@@ -28,6 +28,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
     layer_groups,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _Role(str):
     """A role as the runtime names one: a string subclass."""
@@ -50,6 +52,13 @@ def test_spec_names_roles_and_layer_ids_by_plain_values():
     assert dict(spec.layer_ids) == {3: (6, 3)}
 
 
+def test_spec_names_mixed_precision_types_as_a_pair():
+    assert PageTableSpec(mixed_precision=["nvfp4", "bf16"]).mixed_precision == ("nvfp4", "bf16")
+    assert PageTableSpec().mixed_precision is None
+    with pytest.raises(ValueError, match="low and a high type"):
+        PageTableSpec(mixed_precision=("nvfp4",))
+
+
 def test_spec_is_immutable():
     spec = PageTableSpec(role_layouts={"k": ByHead()}, layer_ids={0: (0, 0)})
 
@@ -70,7 +79,7 @@ def test_spec_with_fields_replaced_keeps_the_others():
     assert spec.quant_mode == "fp8"
 
 
-def test_layout_of_a_role_falls_back_to_the_default_then_to_the_rank_s_own_share():
+def test_layout_of_a_role_falls_back_to_the_default():
     spec = PageTableSpec(
         role_layouts={"k": ByHead()},
         untransferred_roles={"pad"},
@@ -84,7 +93,18 @@ def test_layout_of_a_role_falls_back_to_the_default_then_to_the_rank_s_own_share
     # A role that moves and that the spec does not lay out has no layout.
     assert spec.layout_of("index_k") is None
     assert replace(spec, default_layout=Replicated()).layout_of("index_k") == Replicated()
-    assert replace(spec, default_layout=Replicated()).layout_of("pad") == Replicated()
+
+
+def test_a_role_that_never_moves_is_the_rank_s_own_share_whatever_else_lays_it_out():
+    spec = PageTableSpec(
+        role_layouts={"pad": ByHead()},
+        default_layout=Replicated(),
+        untransferred_roles={"pad"},
+        derived_roles={"v_scale"},
+    )
+
+    assert spec.layout_of("pad") == Own()
+    assert spec.layout_of("v_scale") == Own()
 
 
 def test_layer_groups_list_each_layer_once_in_buffer_order():
