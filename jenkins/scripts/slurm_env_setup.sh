@@ -1,6 +1,4 @@
 #!/bin/bash
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
 
 # Shared runtime-environment setup for SLURM test steps. Sourced by
 # slurm_run.sh (real test steps) AND by
@@ -11,13 +9,6 @@
 # valid for both callers.
 
 slurm_setup_runtime_env() {
-    # The container's shell initialization selects the platform's NCCL plugins.
-    if [ "${NCCL_NET_PLUGIN:-}" = "gcp" ] || [ "${NCCL_ENV_PLUGIN:-}" = "gcp" ]; then
-        export NCCL_IB_DISABLE=0
-        export NCCL_NET=gIB
-        export NCCL_PROFILER_PLUGIN=none
-    fi
-
     # Prepend the installed tensorrt_llm wheel's libs to LD_LIBRARY_PATH.
     local containerPipLLMLibPath
     containerPipLLMLibPath=$(pip3 show tensorrt_llm | grep "Location" | awk -F ":" '{ gsub(/ /, "", $2); print $2"/tensorrt_llm/libs"}')

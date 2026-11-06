@@ -69,6 +69,7 @@ def llmArtifactsPrimary()
 // "Setup Environment" stashes jenkins/scripts/fetch_build_artifact.sh from the run's commit under
 // this name, because test stages read build artifacts before they have a source tree.
 FETCH_BUILD_ARTIFACT_STASH = "fetch-build-artifact"
+SLURM_NCCL_ENV_STASH = "slurm-nccl-env"
 
 // Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
 // names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
@@ -2185,6 +2186,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"
+            def scriptNcclEnvPathNode = "${jobWorkspace}/${jobUID}-slurm_nccl_env.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
@@ -2233,6 +2235,20 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
+
+                // Keep shell initialization tied to this run, even when the build tarball is reused.
+                def ncclEnvDir = "${pipeline.pwd(tmp: true)}/slurm-nccl-env"
+                pipeline.dir(ncclEnvDir) {
+                    pipeline.unstash(SLURM_NCCL_ENV_STASH)
+                }
+                def ncclEnvUploadPath = "${scriptNcclEnvPathNode}.${UUID.randomUUID()}.tmp"
+                Utils.copyFileToRemoteHost(
+                    pipeline, remote, "${ncclEnvDir}/slurm_nccl_env.sh", ncclEnvUploadPath
+                )
+                // An active job may start another Bash while a frontend retry redelivers this hook.
+                Utils.exec(
+                    pipeline, script: Utils.sshUserCmd(remote, "\"mv -f '${ncclEnvUploadPath}' '${scriptNcclEnvPathNode}'\"")
+                )
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -2624,6 +2640,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
                     "--container-env=NVIDIA_IMEX_CHANNELS",
+                    "--container-env=BASH_ENV",
                     "--container-env=SKIP_INSTALL"
                 ]
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
@@ -2669,6 +2686,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
+                    export BASH_ENV="$scriptNcclEnvPathNode"
                     export tarName=$tarName
                     export llmTarArtifactPath=$llmTarArtifactPath
                     export LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}
@@ -2764,6 +2782,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptPrepareBodyPathNode,
                     scriptBashUtilsPathNode,
                     scriptFetchHelperPathNode,
+                    scriptNcclEnvPathNode,
                     artifactoryNetrcPathNode,
                     fatArtifactoryNetrcPathNode,
                     scriptLaunchPathNode,
@@ -7966,6 +7985,11 @@ pipeline {
                     trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/fetch_build_artifact.sh", fetchHelperDir)
                     dir(fetchHelperDir) {
                         stash(name: FETCH_BUILD_ARTIFACT_STASH, includes: "fetch_build_artifact.sh")
+                    }
+                    def ncclEnvDir = "${pwd(tmp: true)}/slurm-nccl-env"
+                    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/slurm_nccl_env.sh", ncclEnvDir)
+                    dir(ncclEnvDir) {
+                        stash(name: SLURM_NCCL_ENV_STASH, includes: "slurm_nccl_env.sh")
                     }
                 }
             }

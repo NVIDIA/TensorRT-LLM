@@ -2501,7 +2501,7 @@ def findCachedPLCSourceScanResult(commit) {
     return [result: buildInfo.result, url: buildInfo.url]
 }
 
-def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:]) {
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:], Closure onResult = null) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
@@ -2541,6 +2541,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
 
     def logger = new Logger(pipeline)
     def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
+    onResult?.call(buildStatus)
     // Infra-scoped fail-fast (parent half). A downstream sub-job returns UNSTABLE
     // when it saw only infra aborts and no genuine test/build failure (see
     // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
@@ -3171,7 +3172,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
-                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters)
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters) { status ->
+                            imageBuildStatus = status
+                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -3181,7 +3184,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 stageResult: 'FAILURE') {
                                 error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
                             }
-                        } else if (scanAfterImageBuildFailure) {
+                        } else if (scanAfterImageBuildFailure && imageBuildStatus == "FAILURE") {
                             catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
                                 throw e
                             }
@@ -3190,7 +3193,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         }
                     }
                 }
-                if (!runContainerScanning || (imageBuildStatus != "SUCCESS" && !scanAfterImageBuildFailure)) {
+                def canScanImages = imageBuildStatus == "SUCCESS" ||
+                    (scanAfterImageBuildFailure && imageBuildStatus in ["FAILURE", "UNSTABLE"])
+                if (!runContainerScanning || !canScanImages) {
                     return
                 }
                 stage("[NGC-Container-Compliance-Check] Run") {
