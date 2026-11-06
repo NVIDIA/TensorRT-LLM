@@ -115,6 +115,25 @@ class InfraDryRunPipelineTest(unittest.TestCase):
             classifier.index("retryContext.failureEvidence = evidence"),
         )
 
+    def test_no_rerun_failure_preserves_initial_infra_classification(self) -> None:
+        isolated = _function_body(L0_TEST, "runIsolatedTests", "getInfraDryRunPytestTargets")
+        platform = _function_body(
+            L0_TEST, "runLLMTestlistOnPlatformImpl", "runLLMTestlistOnPlatform"
+        )
+        classify_initial_failure = "classifyFailure(pipeline, e, scope, retryContext)"
+
+        self.assertIn(classify_initial_failure, isolated)
+        self.assertIn("unrerunInfraFailure: unrerunInfraFailure", isolated)
+        self.assertIn(classify_initial_failure, platform)
+        self.assertIn(
+            "unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure",
+            platform,
+        )
+        self.assertLess(
+            platform.index("throw unrerunInfraFailure"),
+            platform.rindex('error "Some tests failed and were not eligible for rerun'),
+        )
+
     def test_post_actions_keep_interruptions_higher_priority_than_primary_failures(self) -> None:
         result_handler = _function_body(
             L0_TEST, "cacheErrorAndUploadResult", "createKubernetesPodConfig"

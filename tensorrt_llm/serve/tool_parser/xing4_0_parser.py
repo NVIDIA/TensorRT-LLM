@@ -147,6 +147,9 @@ def _parse_payload(
             arguments = parsed.get("arguments", parsed.get("parameters"))
             name = str(parsed["name"])
             return name, dict(arguments) if isinstance(arguments, Mapping) else {}
+        # A "{"-prefixed payload that is not a call object is malformed, not a
+        # tool name; return empty so callers keep it as normal text.
+        return "", {}
 
     tool_name, params_text, json_text = _split_payload(payload, tools)
     arguments = _json_arguments(json_text) if json_text else {}
@@ -198,7 +201,7 @@ class Xing4_0ToolParser(BaseToolParser):
         normal_text_parts: list[str] = []
         consumed = 0
         try:
-            for call_idx, match in enumerate(TOOL_CALL_REGEX.finditer(text)):
+            for match in TOOL_CALL_REGEX.finditer(text):
                 tool_name, arguments = _parse_payload(match.group(1), tools)
                 if not tool_name:
                     # Keep malformed blocks in the normal text, matching the
@@ -210,6 +213,9 @@ class Xing4_0ToolParser(BaseToolParser):
                     continue
                 normal_text_parts.append(text[consumed : match.start()])
                 consumed = match.end()
+                # Index emitted calls only, matching the streaming path, so a
+                # skipped malformed block does not shift later call indices.
+                call_idx = len(calls)
                 if tool_indices and tool_name not in tool_indices:
                     logger.warning(
                         "Model attempted to call undefined function: %s",

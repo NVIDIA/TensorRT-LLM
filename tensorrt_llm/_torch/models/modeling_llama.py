@@ -61,7 +61,8 @@ from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model)
+                             EagerFusionConfig, moe_experts_quant_config,
+                             register_auto_model)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -320,6 +321,8 @@ class Llama4MoE(nn.Module):
             overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
+        self.experts_quant_config = moe_experts_quant_config(
+            model_config, f"model.layers.{layer_idx}.feed_forward.experts")
         self.experts = create_moe(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -330,6 +333,7 @@ class Llama4MoE(nn.Module):
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
             weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
             model_config=model_config,
+            override_quant_config=self.experts_quant_config,
             apply_router_weight_on_input=True,
             aux_stream_dict={AuxStreamType.MoeChunkingOverlap: aux_stream},
             layer_idx=layer_idx)

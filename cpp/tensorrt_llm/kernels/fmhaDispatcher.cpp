@@ -63,10 +63,16 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
 
 FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     : mFixedParams(fixedParams)
-    // TRTLLM-GEN only supports power of 2 head sizes (and 80 with padding).
-    // The exception will fall back to fmha v2.
+    // FMHA v2 provides head-size 72 and FP16/BF16 full/causal packed-QKV head-size 104 kernels.
+    // Keep mixed Q/KV precisions on TRTLLM-GEN: fmha v2 requires matching types.
     // Please update fmha_v2/setup.py if you want to add more supported head sizes.
-    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72)
+    , mUseTllmGen(tensorrt_llm::common::isSM100Family() && fixedParams.headSize != 72
+          && !(fixedParams.headSize == 104 && fixedParams.headSizeV == 104
+              && fixedParams.attentionInputLayout == AttentionInputLayout::PACKED_QKV
+              && fixedParams.dataType == fixedParams.dataTypeKv
+              && (fixedParams.dataType == DATA_TYPE_FP16 || fixedParams.dataType == DATA_TYPE_BF16)
+              && (fixedParams.attentionMaskType == ContextAttentionMaskType::PADDING
+                  || fixedParams.attentionMaskType == ContextAttentionMaskType::CAUSAL)))
     , mMultiProcessorCount(tensorrt_llm::common::getMultiProcessorCount())
 {
     if (mUseTllmGen)
@@ -167,6 +173,8 @@ bool FmhaDispatcher::isSupported()
         // Sparse context attention uses a generation-style kernel with per-token sparse indices.
         if (mFixedParams.useTllmGenSparseAttention)
         {
+            // Sparse selection needs a positive TopK, aligned to four, even for this synthetic probe.
+            tllmRunnerParams.mSparseTopK = 4;
             tllmRunnerParams.mSparseAttention
                 = (mFixedParams.useSparseMLA && mFixedParams.headSizeV == mFixedParams.headSize)
                 ? SparseType::DynamicTokenSparse
@@ -257,6 +265,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.qPtr = runnerParams.qPtr;
         tllmRunnerParams.kPtr = runnerParams.kPtr;
         tllmRunnerParams.vPtr = runnerParams.vPtr;
+        tllmRunnerParams.mVTokenStrideInBytes = runnerParams.vStrideInBytes;
         tllmRunnerParams.kvPtr = kvPoolPtr;
         tllmRunnerParams.kvSfPtr = kvSfPoolPtr;
         tllmRunnerParams.qkvPtr = runnerParams.qkvPtr;

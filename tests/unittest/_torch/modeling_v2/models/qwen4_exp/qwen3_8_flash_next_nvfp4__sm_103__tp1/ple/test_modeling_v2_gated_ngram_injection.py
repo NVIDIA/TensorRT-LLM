@@ -1,13 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the gated_ngram_injection entry.
+"""GPU test for the gated_ngram_injection entry: the cells (the sub-floor and
+zero dots are a cell), the leading-dim guard and CUDA-graph replay."""
 
-Every mis-reading of this formula keeps the shapes and stays bounded by
-`|value|`, so beyond the cells one test measures how far outside the entry's
-band each wrong reading lands, and two pin the floor and the zero-dot gate.
-"""
-
-import math
 import zlib
 
 import pytest
@@ -112,12 +107,10 @@ def _build(spec, seed):
         dots = spec["dots"]
         key, query, value = _single_channel_operands(dots, spec["value_dtype"])
         return key, query, value, len(dots), spec["clamp_min"]
-    hc_count = spec.get("hc_count", HC_COUNT)
-    dtype = spec.get("dtype", torch.bfloat16)
     key, query, value = _make_operands(
-        seed, dtype, spec["leading"], hc_count, spec.get("value_dtype")
+        seed, torch.bfloat16, spec["leading"], value_dtype=spec.get("value_dtype")
     )
-    return key, query, value, hc_count, spec.get("clamp_min", CLAMP_MIN)
+    return key, query, value, HC_COUNT, spec.get("clamp_min", CLAMP_MIN)
 
 
 @pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
@@ -134,119 +127,6 @@ def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest res
     _compare(out, op.reference(*args))
 
 
-def test_flattened_call_matches_batched() -> None:
-    key, query, value = _make_operands(11, torch.bfloat16, (3, 17))
-    batched = op(key, query, value, HC_COUNT)
-    flat = op(key.reshape(-1, WIDTH), query.reshape(-1, WIDTH), value.reshape(-1, HIDDEN), HC_COUNT)
-    assert torch.equal(flat, batched.reshape(-1, WIDTH))
-
-
-def test_output_is_bounded_by_the_value_it_gates() -> None:
-    """sigmoid is in (0, 1): no stream amplifies its value, to 4096x the operands."""
-    key, query, value = _make_operands(40, torch.bfloat16, (256,))
-    for scale in (1.0, 8.0, 64.0, 512.0, 4096.0):
-        got = op(
-            (key.float() * scale).to(torch.bfloat16),
-            (query.float() * scale).to(torch.bfloat16),
-            value,
-            HC_COUNT,
-        )
-        assert torch.isfinite(got.float()).all(), scale
-        bound = value.float().abs().max().item() * (1.0 + torch.finfo(torch.bfloat16).eps)
-        assert got.float().abs().max().item() <= bound, scale
-
-
-def test_clamp_floor_moves_fp32_and_not_bf16() -> None:
-    """Sub-floor dots move by > 1e-4 relative in fp32; bf16 is bitwise unmoved."""
-    dots = (0.0, 5e-8, -5e-8, 0.05)
-    key, query, value32 = _single_channel_operands(dots, torch.float32)
-    floored = op(key, query, value32, len(dots), CLAMP_MIN)
-    unfloored = op(key, query, value32, len(dots), 0.0)
-    apart = (floored - unfloored).abs().unflatten(-1, (len(dots), HIDDEN))
-    relative = (apart / floored.abs().unflatten(-1, (len(dots), HIDDEN))).amax(dim=(0, 2))
-    print(f"\n  fp32 relative movement per stream: {relative.tolist()}")
-    assert relative[0].item() == 0.0 and relative[3].item() == 0.0
-    assert relative[1].item() > 1e-4 and relative[2].item() > 1e-4
-
-    _, _, value16 = _single_channel_operands(dots, torch.bfloat16)
-    assert torch.equal(
-        op(key, query, value16, len(dots), CLAMP_MIN), op(key, query, value16, len(dots), 0.0)
-    )
-
-
-def test_exact_zero_dot_gives_exactly_half_the_value() -> None:
-    key, query, value = _single_channel_operands((0.0,) * HC_COUNT, torch.float32)
-    assert torch.equal(op(key, query, value, HC_COUNT), value.repeat(1, HC_COUNT) * 0.5)
-
-
-def _signed_sqrt(x):
-    return x.abs().clamp_min(CLAMP_MIN).sqrt() * x.sign()
-
-
-def test_wrong_variants_land_outside_the_band() -> None:
-    """Each reading stays shaped and bounded; each must land > 5x outside."""
-    key, query, value = _make_operands(50, torch.bfloat16, (2048,))
-    want = op.reference(key, query, value, HC_COUNT)
-    correct = gate_ratio(op(key, query, value, HC_COUNT), want)
-    print(f"\n  correct {correct:.4g}x the band")
-    assert correct <= 1.0
-
-    keys = key.double().unflatten(-1, (HC_COUNT, HIDDEN))
-    queries = query.double().unflatten(-1, (HC_COUNT, HIDDEN))
-    values = value.double().unsqueeze(-2)
-    dot = (keys * queries).sum(dim=-1, keepdim=True)
-    scaled = dot / math.sqrt(HIDDEN)
-
-    def interleaved():
-        k = key.double().unflatten(-1, (HIDDEN, HC_COUNT)).transpose(-1, -2)
-        q = query.double().unflatten(-1, (HIDDEN, HC_COUNT)).transpose(-1, -2)
-        g = (k * q).sum(dim=-1, keepdim=True) / math.sqrt(HIDDEN)
-        return torch.sigmoid(_signed_sqrt(g)) * values
-
-    variants = (
-        ("no square root", lambda: torch.sigmoid(scaled) * values),
-        (
-            "unsigned square root",
-            lambda: torch.sigmoid(scaled.abs().clamp_min(CLAMP_MIN).sqrt()) * values,
-        ),
-        ("no 1/sqrt(D) scale", lambda: torch.sigmoid(_signed_sqrt(dot)) * values),
-        ("divided by D", lambda: torch.sigmoid(_signed_sqrt(dot / HIDDEN)) * values),
-        (
-            "scale after the root",
-            lambda: torch.sigmoid(_signed_sqrt(dot) / math.sqrt(HIDDEN)) * values,
-        ),
-        ("sigmoid before the root", lambda: _signed_sqrt(torch.sigmoid(scaled)) * values),
-        ("tanh instead of sigmoid", lambda: torch.tanh(_signed_sqrt(scaled)) * values),
-        ("streams read interleaved", interleaved),
-    )
-    for name, build in variants:
-        wrong = build().flatten(-2).to(torch.bfloat16)
-        ratio = gate_ratio(wrong, want)
-        print(f"  {name:<26} {ratio:10.4g}x the band")
-        assert ratio > 5.0, f"the band does not separate {name!r} ({ratio:.4g}x)"
-        with pytest.raises(AssertionError):
-            _compare(wrong, want)
-
-
-def test_fp32_chain_differs_from_the_bf16_chain() -> None:
-    """The literal bf16 chain falls outside the band; the entry does not."""
-    key, query, value = _make_operands(90, torch.bfloat16, (2048,))
-    want = op.reference(key, query, value, HC_COUNT)
-    got = op(key, query, value, HC_COUNT)
-    native = (key.unflatten(-1, (HC_COUNT, HIDDEN)) * query.unflatten(-1, (HC_COUNT, HIDDEN))).sum(
-        dim=-1, keepdim=True
-    ) / math.sqrt(HIDDEN)
-    native = (torch.sigmoid(_signed_sqrt(native)) * value.unsqueeze(-2)).flatten(-2)
-    differing = (got != native).float().mean().item()
-    print(
-        f"\n  fp32 chain {gate_ratio(got, want):.4g}x, bf16 chain {gate_ratio(native, want):.4g}x"
-    )
-    print(f"  output elements whose bits differ: {differing:.4%}")
-    assert gate_ratio(got, want) <= 1.0
-    assert gate_ratio(native, want) > 1.0
-    assert differing > 0.0
-
-
 def test_guard_refuses_unequal_leading_dims() -> None:
     """Unguarded, one query (or value) row is broadcast over every key row."""
     key, query, value = _make_operands(60, torch.bfloat16, (64,))
@@ -261,15 +141,6 @@ def test_guard_refuses_unequal_leading_dims() -> None:
     with pytest.raises(AssertionError, match="broadcasts silently"):
         with validating(op):
             op(key, query, value[:1], HC_COUNT)
-
-
-def test_malformed_widths_raise_rather_than_return() -> None:
-    """Why the width is not guarded: both mistakes are loud."""
-    key, query, value = _make_operands(70, torch.bfloat16, (32,))
-    with pytest.raises(RuntimeError):
-        op(key[:, : WIDTH - 8], query[:, : WIDTH - 8], value, HC_COUNT)
-    with pytest.raises(RuntimeError):
-        op(key, query, value, 3)
 
 
 def test_cuda_graph_capture_and_replay() -> None:

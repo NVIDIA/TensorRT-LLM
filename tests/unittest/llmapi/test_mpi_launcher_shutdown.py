@@ -52,7 +52,7 @@ from pathlib import Path
 root = Path(os.environ["LAUNCHER_TEST_ROOT"])
 mode = os.environ["LAUNCHER_TEST_MODE"]
 role = "task" if sys.argv[1] == "task" else "server"
-if "--action" in sys.argv:
+if "--action" in sys.argv or Path(sys.argv[1]).name == "_llmapi_mpi_stop.py":
     role = "stop"
 if sys.argv[1] == "-S":
     if "--parent-pid" in sys.argv and "--role" in sys.argv:
@@ -231,7 +231,10 @@ def _launcher_env(tmp_path: Path, mode: str) -> dict[str, str]:
     stub_bin = tmp_path / "bin"
     stub_bin.mkdir()
     python_stub = stub_bin / "python3"
-    python_stub.write_text(f"#!{sys.executable}\n{_STUB}")
+    # Like the launcher's own `python3 -S` helpers, skip site so interpreter
+    # startup hooks (e.g. a CI coverage sitecustomize) cannot import mpi4py and
+    # initialize MPI in every stand-in process.
+    python_stub.write_text(f"#!{sys.executable} -S\n{_STUB}")
     python_stub.chmod(0o755)
     for name in ("server_ready", "task_ready", "stop_requested"):
         os.mkfifo(tmp_path / name)

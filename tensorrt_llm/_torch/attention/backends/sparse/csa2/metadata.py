@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from math import prod
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -22,6 +23,21 @@ if TYPE_CHECKING:
 
 _SWA_TILE = 128
 _HEAD_DIM = 512
+_TMA_MIN_BACKING_BYTES = 128 * 1024
+
+
+def _allocate_staging_pool(
+    shape: tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    # Native sparse FMHA describes an unbounded row domain. Blackwell TMA
+    # out-of-bounds fetches require 128 KiB mapped after the pool address,
+    # including when the logical staging pool is smaller.
+    elements = prod(shape)
+    element_bytes = 2 if dtype == torch.bfloat16 else 1
+    storage = torch.empty(
+        max(elements, _TMA_MIN_BACKING_BYTES // element_bytes), dtype=dtype, device=device
+    )
+    return storage[:elements].view(shape)
 
 
 @dataclass
@@ -231,15 +247,15 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
             )
         self._csa2_context_geometry = None
         if shared_rows is None:
-            self.swa_pool = torch.empty(
-                capacity, _SWA_TILE, _HEAD_DIM, dtype=staging_dtype, device=device
+            self.swa_pool = _allocate_staging_pool(
+                (capacity, _SWA_TILE, _HEAD_DIM), staging_dtype, device
             )
-            self.extra_pool = torch.empty(
-                capacity, max(extra_capacity, 1), _HEAD_DIM, dtype=staging_dtype, device=device
+            self.extra_pool = _allocate_staging_pool(
+                (capacity, max(extra_capacity, 1), _HEAD_DIM), staging_dtype, device
             )
         else:
-            self.shared_pool = torch.empty(
-                shared_rows, _HEAD_DIM, dtype=staging_dtype, device=device
+            self.shared_pool = _allocate_staging_pool(
+                (shared_rows, _HEAD_DIM), staging_dtype, device
             )
             self._csa2_shared_selected = torch.empty(shared_rows, dtype=torch.int32, device=device)
             self.swa_pool = self.extra_pool = self.shared_pool
