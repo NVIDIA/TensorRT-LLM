@@ -3,10 +3,13 @@
 
 # Stability reference for the `trtllm-serve` CLI surface.
 #
-# Every Click option on the `serve`, `disaggregated`, `disaggregated_mpi_worker`,
-# and `mm_embedding_serve` subcommands MUST be listed here with an explicit
-# stability status. The CI test (`tests/unittest/api_stability/test_serve_cli.py`)
-# diffs the live Click group against this file and fails on any divergence.
+# Every Click option of every subcommand registered on `trtllm-serve` MUST be
+# listed here with an explicit stability status. The gated subcommand list is
+# derived from `main.commands` in tensorrt_llm/commands/serve.py, so a newly
+# registered subcommand is gated automatically and needs a section here. The
+# CI test (`tests/unittest/api_stability/test_serve_cli.py`) diffs the live
+# Click group against this file and fails on any divergence, including a
+# subcommand with no section and a section for an unregistered subcommand.
 #
 # Allowed statuses (forward transitions only):
 #     prototype  ->  beta  ->  stable  ->  deprecated  (-> removed after grace period)
@@ -799,3 +802,257 @@ commands:
         is_flag: true
         flags:
         - "--trust_remote_code"
+  embeddings:
+    options:
+      extra_llm_api_options:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--config"
+        - "--extra_llm_api_options"
+      host:
+        type: str
+        default: localhost
+        status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--host"
+      log_level:
+        type: Choice(['debug', 'error', 'info', 'internal_error', 'trace', 'verbose', 'warning'])
+        default: info
+        status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--log_level"
+      max_batch_size:
+        type: int
+        default: 2048
+        status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_batch_size"
+      max_num_tokens:
+        type: int
+        default: 8192
+        status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_num_tokens"
+      max_queue_delay:
+        type: float
+        default: 0.005
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_queue_delay"
+      max_queue_size:
+        type: int
+        default: 2048
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--max_queue_size"
+      metadata_server_config_file:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--metadata_server_config_file"
+      port:
+        type: int
+        default: 8000
+        status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--port"
+      revision:
+        type: str
+        default: null
+        status: beta
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--hf_revision"
+        - "--revision"
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"
+      trust_remote_code:
+        type: bool
+        default: false
+        status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--trust_remote_code"
+  mooncake_master:
+    options:
+      binary:
+        type: str
+        default: mooncake_master
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--binary"
+      eviction_ratio:
+        type: float
+        default: 0.05
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--eviction_ratio"
+      heartbeat_seconds:
+        type: int
+        default: 300
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--heartbeat_seconds"
+      metadata_server:
+        type: str
+        default: P2PHANDSHAKE
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--metadata_server"
+      metrics_port:
+        type: int
+        default: 9004
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--metrics_port"
+      namespace:
+        type: str
+        default: trtllm
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--namespace"
+      pool_file:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--pool_file"
+      protocol:
+        type: str
+        default: rdma
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--protocol"
+      rpc_port:
+        type: int
+        default: 50051
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--rpc_port"
+      run_dir:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--run_dir"
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"
+      timeout:
+        type: float
+        default: 60.0
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--timeout"
+  mooncake_pool_report:
+    options:
+      master_log:
+        type: str
+        default: null
+        status: prototype
+        required: false
+        multiple: false
+        is_flag: false
+        flags:
+        - "--master_log"
+      run_dir:
+        type: str
+        default: null
+        status: prototype
+        required: true
+        multiple: false
+        is_flag: false
+        flags:
+        - "--run_dir"
+      telemetry:
+        type: bool
+        default: true
+        status: beta
+        required: false
+        multiple: false
+        is_flag: true
+        flags:
+        - "--no-telemetry"
+        - "--telemetry"

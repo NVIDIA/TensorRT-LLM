@@ -61,19 +61,52 @@ from tensorrt_llm.commands._serve_stability import ALLOWED_TAGS, collect_command
 
 REFERENCE_PATH = pathlib.Path(__file__).parent / "references" / "trtllm_serve_cli.yaml"
 
-# Subcommands we gate. Names must match the keys in `main.commands` in
-# tensorrt_llm/commands/serve.py.
-GATED_SUBCOMMANDS = (
-    "serve",
-    "disaggregated",
-    "disaggregated_mpi_worker",
-    "mm_embedding_serve",
-)
+# Every subcommand registered on `trtllm-serve` is gated. The list is derived
+# from `main.commands` (in registration order) so that a newly registered
+# subcommand is gated automatically: its options must carry stability tags and
+# the reference YAML must gain a section for it, or this file's tests fail.
+GATED_SUBCOMMANDS = tuple(serve_cmd.main.commands)
+
+_YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 
 
-def _load_reference() -> dict[str, Any]:
-    with open(REFERENCE_PATH) as f:
-        return yaml.safe_load(f)
+class _UniqueKeyLoader(yaml.SafeLoader):
+    """SafeLoader that rejects a repeated mapping key instead of keeping its last value.
+
+    With plain ``yaml.safe_load`` a second ``serve:`` section or a repeated
+    option entry silently replaces the first, so the gate would compare
+    against whichever copy came last.
+    """
+
+    def __init__(self, stream: str) -> None:
+        super().__init__(stream)
+        self._checked_mappings: set[yaml.MappingNode] = set()
+
+    def flatten_mapping(self, node: yaml.MappingNode) -> None:
+        # SafeLoader flattens merge sources before constructing them. Check each
+        # mapping's own keys once, so an explicit override of a merged key stays legal.
+        if node in self._checked_mappings:
+            return
+        self._checked_mappings.add(node)
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            # Merge keys and (unhashable) non-scalar keys are left to SafeLoader.
+            if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == _YAML_MERGE_TAG:
+                continue
+            key = self.construct_object(key_node)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            seen.add(key)
+        super().flatten_mapping(node)
+
+
+def _load_reference(path: pathlib.Path = REFERENCE_PATH) -> dict[str, Any]:
+    return yaml.load(path.read_text(encoding="utf-8"), Loader=_UniqueKeyLoader)
 
 
 def _live_surface() -> dict[str, dict[str, dict[str, Any]]]:
@@ -101,6 +134,40 @@ class TestServeCLIStability:
     @pytest.fixture(scope="class")
     def live(self) -> dict[str, dict[str, dict[str, Any]]]:
         return _live_surface()
+
+    def test_reference_lists_exactly_the_registered_subcommands(self, reference):
+        """The YAML must have exactly one section per registered subcommand.
+
+        `GATED_SUBCOMMANDS` is derived from `main.commands`, so a new
+        subcommand is gated automatically. This check keeps the YAML in step
+        in both directions: a registered subcommand without a section would
+        otherwise ship ungated options, and a section for a subcommand that
+        is no longer registered would never be read again.
+        """
+        registered = set(serve_cmd.main.commands)
+        listed = set(reference.get("commands", {}) or {})
+        errors: list[str] = []
+        missing = sorted(registered - listed)
+        if missing:
+            errors.append(
+                f"trtllm-serve subcommand(s) {missing} have no section in "
+                "tests/unittest/api_stability/references/trtllm_serve_cli.yaml. "
+                "Add `commands: <name>: options:` with one entry per option "
+                "(status: prototype | beta | stable | deprecated) and declare "
+                "each option with stability_option(..., status=...). The API "
+                "review committee approves changes to this file."
+            )
+        extra = sorted(listed - registered)
+        if extra:
+            errors.append(
+                "tests/unittest/api_stability/references/trtllm_serve_cli.yaml "
+                f"lists subcommand(s) {extra} that trtllm-serve no longer "
+                "registers. If one was removed or renamed, was it deprecated "
+                "for at least one minor release first? Remove the section in "
+                "the same PR; the API review committee approves."
+            )
+        if errors:
+            pytest.fail("\n".join(errors))
 
     def test_every_option_has_a_stability_tag(self, live):
         """Every CLI option must carry an explicit stability tag.
@@ -257,3 +324,41 @@ class TestServeCLIStability:
 
         if demotions:
             pytest.fail("Forbidden stability demotions:\n" + "\n".join(demotions))
+
+
+@pytest.mark.parametrize(
+    "text, duplicate",
+    [
+        pytest.param(
+            "commands:\n  serve:\n    options: {}\n  serve:\n    options: {}\n",
+            "serve",
+            id="subcommand-section",
+        ),
+        pytest.param(
+            "commands:\n  serve:\n    options:\n"
+            "      port: {status: stable}\n      port: {status: beta}\n",
+            "port",
+            id="option-entry",
+        ),
+    ],
+)
+def test_reference_with_a_duplicate_key_fails_to_load(tmp_path, text, duplicate):
+    """A repeated section or option fails to load instead of collapsing into one."""
+    path = tmp_path / "trtllm_serve_cli.yaml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(yaml.constructor.ConstructorError, match=f"duplicate key '{duplicate}'"):
+        _load_reference(path)
+
+
+def test_reference_may_override_a_merged_key(tmp_path):
+    """Keys pulled in through a YAML merge (``<<``) are not duplicates of the mapping's own."""
+    path = tmp_path / "trtllm_serve_cli.yaml"
+    path.write_text(
+        "base: &base {status: beta, type: int}\n"
+        "derived: &derived {<<: *base, status: stable}\n"
+        "nested: {<<: *derived}\n",
+        encoding="utf-8",
+    )
+    reference = _load_reference(path)
+    assert reference["derived"] == {"status": "stable", "type": "int"}
+    assert reference["nested"] == {"status": "stable", "type": "int"}
