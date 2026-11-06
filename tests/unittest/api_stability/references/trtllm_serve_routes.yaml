@@ -1,0 +1,663 @@
+# Routes of every trtllm-serve app configuration. Generated, do not edit by hand:
+#   PYTHONPATH=tests python3 -m test_common.serve.routes --write
+# Each route is "<METHODS> <path> <route class>", in registration order. "#<name>" is
+# added only when two routes share methods and path. The checker compares the order
+# only for routes that can match the same request. Changing this file changes the
+# HTTP surface of trtllm-serve; the API review committee approves it.
+version: 1
+configs:
+  llm:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_context:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_generation:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_gpt_oss:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_gpt_oss_harmony_disabled:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_governor:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /_resource_governor/truncate _MsgspecRoute
+    - POST /_control/kv_cache/truncate _MsgspecRoute
+    - POST /_control/kv_cache/truncate_tokens _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_rl_control:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - POST /release_memory _MsgspecRoute
+    - POST /resume_memory _MsgspecRoute
+    - POST /update_weights _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_runtime_control:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - POST /release_memory _MsgspecRoute
+    - POST /resume_memory _MsgspecRoute
+    - GET /memory_status _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+  llm_rl_and_runtime_control:
+    kind: openai_server
+    error: 'ValueError: Legacy RL control and runtime control endpoints cannot both be enabled.'
+  llm_perf_metrics:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+    - MOUNT /prometheus/metrics Mount
+  llm_perf_metrics_enable_metrics_env:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - 'GET /metrics _MsgspecRoute #get_iteration_stats'
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+    - 'GET /metrics _MsgspecRoute #metrics'
+    - MOUNT /prometheus/metrics Mount
+  llm_perf_metrics_output_dir_only:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+    - MOUNT /prometheus/metrics Mount
+  llm_render_endpoints:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - POST /steady_clock_offset _MsgspecRoute
+    - POST /kv_cache_events _MsgspecRoute
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - POST /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - POST /start_profile _MsgspecRoute
+    - POST /stop_profile _MsgspecRoute
+    - GET /server_info _MsgspecRoute
+    - POST /v1/chat/completions/render _MsgspecRoute
+    - POST /v1/completions/render _MsgspecRoute
+  llm_multi_frontend_attached:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - 'GET /metrics _MsgspecRoute #forward'
+    - 'POST /kv_cache_events _MsgspecRoute #forward'
+    - 'POST /start_profile _MsgspecRoute #forward'
+    - 'POST /stop_profile _MsgspecRoute #forward'
+    - 'POST /steady_clock_offset _MsgspecRoute #forward'
+    - 'GET /v1/messages/batches _MsgspecRoute #forward'
+    - 'POST /v1/messages/batches _MsgspecRoute #forward'
+    - GET /v1/messages/batches/{rest:path} _MsgspecRoute
+    - POST /v1/messages/batches/{rest:path} _MsgspecRoute
+    - DELETE /v1/messages/batches/{rest:path} _MsgspecRoute
+    - GET /health _MsgspecRoute
+    - GET /health_generate _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /v1/data_transceiver_state _MsgspecRoute
+    - 'GET /metrics _MsgspecRoute #get_iteration_stats'
+    - GET /energy_metrics _MsgspecRoute
+    - GET /steady_clock_offset _MsgspecRoute
+    - 'POST /steady_clock_offset _MsgspecRoute #set_steady_clock_offset'
+    - 'POST /kv_cache_events _MsgspecRoute #get_kv_cache_events'
+    - POST /v1/completions _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+    - POST /v1/messages _MsgspecRoute
+    - POST /v1/messages/count_tokens _MsgspecRoute
+    - 'POST /v1/messages/batches _MsgspecRoute #anthropic_create_batch'
+    - 'GET /v1/messages/batches _MsgspecRoute #anthropic_list_batches'
+    - GET /v1/messages/batches/{batch_id} _MsgspecRoute
+    - DELETE /v1/messages/batches/{batch_id} _MsgspecRoute
+    - POST /v1/messages/batches/{batch_id}/cancel _MsgspecRoute
+    - GET /v1/messages/batches/{batch_id}/results _MsgspecRoute
+    - POST /v1/responses _MsgspecRoute
+    - GET /v1/responses/{response_id} _MsgspecRoute
+    - DELETE /v1/responses/{response_id} _MsgspecRoute
+    - POST /_internal/tokenize _MsgspecRoute
+    - 'POST /start_profile _MsgspecRoute #start_profile'
+    - 'POST /stop_profile _MsgspecRoute #stop_profile'
+    - GET /server_info _MsgspecRoute
+  mm_encoder:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - POST /v1/chat/completions _MsgspecRoute
+  mm_encoder_rl_control:
+    kind: openai_server
+    error: 'ValueError: RL control endpoints require AsyncLLM'
+  embedding:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - POST /v1/embeddings _MsgspecRoute
+  embedding_runtime_control:
+    kind: openai_server
+    error: 'ValueError: Runtime control endpoints are not supported for embedding servers'
+  disagg_local:
+    kind: disagg_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
+    - MOUNT /prometheus/metrics Mount
+  disagg_local_perf_metrics:
+    kind: disagg_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
+    - MOUNT /prometheus/metrics Mount
+  disagg_local_http_cluster_storage:
+    kind: disagg_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
+    - MOUNT /prometheus/metrics Mount
+    - POST /set KvHintsRoute
+    - GET /get KvHintsRoute
+    - DELETE /delete KvHintsRoute
+    - GET /expire KvHintsRoute
+    - GET /get_prefix KvHintsRoute
+  disagg_fleet:
+    kind: disagg_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
+    - MOUNT /prometheus/metrics Mount
+  disagg_fleet_perf_metrics:
+    kind: disagg_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
+    - MOUNT /prometheus/metrics Mount
+  disagg_fleet_http_cluster_storage:
+    kind: disagg_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /v1/completions KvHintsRoute
+    - POST /v1/chat/completions KvHintsRoute
+    - POST /v1/messages KvHintsRoute
+    - POST /v1/messages/count_tokens KvHintsRoute
+    - POST /v1/responses KvHintsRoute
+    - GET /v1/models KvHintsRoute
+    - GET /health KvHintsRoute
+    - GET /cluster_info KvHintsRoute
+    - GET /version KvHintsRoute
+    - MOUNT /prometheus/metrics Mount
+    - POST /set KvHintsRoute
+    - GET /get KvHintsRoute
+    - DELETE /delete KvHintsRoute
+    - GET /expire KvHintsRoute
+    - GET /get_prefix KvHintsRoute
+  coordinator:
+    kind: coordinator_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /select APIRoute
+    - POST /finish APIRoute
+    - POST /renew APIRoute
+    - GET /cluster_info APIRoute
+    - GET /health APIRoute
+    - GET /version APIRoute
+  coordinator_http_cluster_storage:
+    kind: coordinator_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - POST /select APIRoute
+    - POST /finish APIRoute
+    - POST /renew APIRoute
+    - GET /cluster_info APIRoute
+    - GET /health APIRoute
+    - GET /version APIRoute
+    - POST /set APIRoute
+    - GET /get APIRoute
+    - DELETE /delete APIRoute
+    - GET /expire APIRoute
+    - GET /get_prefix APIRoute
+  visual_gen:
+    kind: openai_server
+    routes:
+    - GET,HEAD /openapi.json Route
+    - GET,HEAD /docs Route
+    - GET,HEAD /docs/oauth2-redirect Route
+    - GET,HEAD /redoc Route
+    - GET /health _MsgspecRoute
+    - GET /version _MsgspecRoute
+    - GET /v1/models _MsgspecRoute
+    - GET /metrics _MsgspecRoute
+    - POST /v1/images/generations _MsgspecRoute
+    - POST /v1/images/edits _MsgspecRoute
+    - GET /v1/images/{image_id}/content _MsgspecRoute
+    - POST /v1/videos _MsgspecRoute
+    - POST /v1/videos/sync _MsgspecRoute
+    - POST /v1/videos/generations _MsgspecRoute
+    - GET /v1/videos _MsgspecRoute
+    - GET /v1/videos/{video_id} _MsgspecRoute
+    - GET /v1/videos/{video_id}/content _MsgspecRoute
+    - DELETE /v1/videos/{video_id} _MsgspecRoute

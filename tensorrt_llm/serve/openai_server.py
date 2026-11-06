@@ -22,10 +22,9 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import (TYPE_CHECKING, Annotated, Any, AsyncGenerator,
-                    AsyncIterator, Dict, List, Optional, Tuple, Union)
+from typing import (TYPE_CHECKING, Annotated, Any, AsyncIterator, Dict, List,
+                    Optional, Tuple, Union)
 
-import msgspec
 import uvicorn
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -43,8 +42,6 @@ from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
-from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
-                                         is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.data import TokensPrompt
 from tensorrt_llm.inputs.media_io import (BaseMediaIO,
@@ -67,6 +64,11 @@ from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.runtime.kv_cache_hash import \
     get_effective_kv_cache_event_hash_algo
 from tensorrt_llm.sampling_params import GuidedDecodingParams, SamplingParams
+from tensorrt_llm.serve._base.errors import (EngineFatalError, ServingError,
+                                             error_body, serving_error)
+from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve._base.sse import chat_stream_generator
 from tensorrt_llm.serve._perf_metrics_config import resolve_perf_metrics_config
 from tensorrt_llm.serve.anthropic_adapter import (
     AnthropicRequestError, AnthropicResponseError, anthropic_error_response,
@@ -81,6 +83,7 @@ from tensorrt_llm.serve.anthropic_protocol import (AnthropicBatchDeleteResponse,
                                                    AnthropicCountTokensResponse,
                                                    AnthropicCreateBatchRequest,
                                                    AnthropicMessagesRequest)
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.chat_tokenization import tokenize_harmony_chat_request
 from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
@@ -104,14 +107,13 @@ from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionResponse, ChatCompletionResponseChoice,
     ChatCompletionToolsParam, ChatMessage, CompletionRequest,
     CompletionResponse, CompletionResponseChoice, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo, ErrorResponse,
+    EmbeddingResponse, EmbeddingResponseData, EmbeddingUsageInfo,
     ImageEditRequest, ImageGenerationRequest, ImageGenerationResponse,
-    ImageObject, MemoryUpdateRequest, ModelCard, ModelList, PromptTokensDetails,
-    ResponseFormat, ResponsesRequest, ResponsesResponse,
-    RuntimeMemoryUpdateRequest, StartProfileRequest, TokenizeRequest,
-    TokenizeResponse, UpdateWeightsRequest, UsageInfo,
-    ensure_request_chat_template_allowed, to_llm_conversation_params,
-    to_llm_disaggregated_params)
+    ImageObject, MemoryUpdateRequest, PromptTokensDetails, ResponseFormat,
+    ResponsesRequest, ResponsesResponse, RuntimeMemoryUpdateRequest,
+    StartProfileRequest, TokenizeRequest, TokenizeResponse,
+    UpdateWeightsRequest, UsageInfo, ensure_request_chat_template_allowed,
+    to_llm_conversation_params, to_llm_disaggregated_params)
 from tensorrt_llm.serve.openai_video_routes import _VideoRoutesMixin
 from tensorrt_llm.serve.perf_metrics import (PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
@@ -153,11 +155,10 @@ from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import (AdjustedSteadyClock,
-                      get_global_steady_clock_now_in_seconds, nvtx_mark,
+                      get_global_steady_clock_now_in_seconds,
                       set_prometheus_multiproc_dir)
 from ._telemetry import create_uvicorn_server
 from .harmony_adapter import HarmonyAdapter, get_harmony_adapter
-from .kv_hints import KvHintsRequest, KvHintsRoute
 
 if TYPE_CHECKING:
     from tensorrt_llm.visual_gen import VisualGen
@@ -178,33 +179,6 @@ def _is_visual_gen_instance(obj) -> bool:
     return visual_gen is not None and isinstance(obj, visual_gen.VisualGen)
 
 # yapf: enable
-
-_msgpack_decoder = msgspec.msgpack.Decoder()
-
-
-class _MsgspecRequest(KvHintsRequest):
-    """Request that decodes X-TRTLLM-Msgpack bodies with msgspec."""
-
-    async def json(self):
-        if not hasattr(self, "_json_body"):
-            body = await self.body()
-            if not body:
-                self._json_body = {}
-            elif self.headers.get("x-trtllm-msgpack") == "1":
-                try:
-                    self._json_body = _msgpack_decoder.decode(body)
-                except msgspec.DecodeError as e:
-                    raise json.JSONDecodeError(f"msgpack: {e}", "", 0) from e
-            else:
-                self._json_body = json.loads(body)
-        return self.filter_kv_hints(self._json_body)
-
-
-class _MsgspecRoute(KvHintsRoute):
-    """Parse msgpack/JSON and apply hint trust policy before model validation."""
-
-    request_type = _MsgspecRequest
-
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
 
@@ -907,6 +881,16 @@ class OpenAIServer(_VideoRoutesMixin):
                     len(detail) - 4096)
             return JSONResponse(status_code=400, content={"error": detail})
 
+        # /health, /version and /v1/models for every role. The health
+        # probe stays here, with its private accesses, until the public
+        # health API exists.
+        self.app.state.ops_serving_system = SystemServing(
+            model=self.model, health_probe=self._health_probe)
+        attach_routers(self.app, ServerCapabilities.for_role(self.server_role))
+        # Runs before the role dispatch for now. It moves after the dispatch
+        # once the serving objects attach_router checks for are built per
+        # role.
+
         if self.server_role is ServerRole.VISUAL_GEN:
             assert self._is_visual_gen, \
                 "generator must be a VisualGen for VISUAL_GEN server"
@@ -1148,15 +1132,7 @@ class OpenAIServer(_VideoRoutesMixin):
             message: str,
             err_type: str = "BadRequestError",
             status_code: HTTPStatus = HTTPStatus.BAD_REQUEST) -> Response:
-        # Over-length prompts are detected from the message text because they
-        # cross the executor IPC boundary as plain strings (RequestError), so
-        # no exception type survives to here.
-        code: Union[int, str] = status_code.value
-        if is_context_length_exceeded_message(message):
-            code = CONTEXT_LENGTH_EXCEEDED_CODE
-        error_response = ErrorResponse(message=message,
-                                       type=err_type,
-                                       code=code)
+        error_response = error_body(message, err_type, status_code)
         return JSONResponse(content=error_response.model_dump(),
                             status_code=status_code.value)
 
@@ -1223,12 +1199,9 @@ class OpenAIServer(_VideoRoutesMixin):
         return True
 
     def register_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/health_generate",
                                self.health_generate,
                                methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/data_transceiver_state",
                                self.data_transceiver_state,
                                methods=["GET"])
@@ -1373,9 +1346,6 @@ class OpenAIServer(_VideoRoutesMixin):
         self.app.routes.append(metrics_route)
 
     def register_mm_encoder_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
@@ -1479,9 +1449,6 @@ class OpenAIServer(_VideoRoutesMixin):
         )
 
     def register_embedding_routes(self):
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/v1/embeddings",
                                self.openai_embedding,
                                methods=["POST"])
@@ -1586,10 +1553,6 @@ class OpenAIServer(_VideoRoutesMixin):
 
     def register_visual_gen_routes(self):
         """Register routes for diffusion model serving."""
-        # Health and info endpoints
-        self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/version", self.version, methods=["GET"])
-        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         self.app.add_api_route("/metrics",
                                self.get_iteration_stats,
                                methods=["GET"])
@@ -1706,9 +1669,9 @@ class OpenAIServer(_VideoRoutesMixin):
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
 
-    async def health(self) -> Response:
+    def _health_probe(self) -> bool:
         if self._check_health():
-            return Response(status_code=200)
+            return True
         else:
             # If the engine has a fatal error, trigger server shutdown so the
             # pod doesn't linger as a zombie that accepts connections but never
@@ -1726,11 +1689,7 @@ class OpenAIServer(_VideoRoutesMixin):
                         f"server shutdown: {executor._fatal_error}")
                     _record_generator_termination(self.generator)
                     signal.raise_signal(signal.SIGINT)
-            return Response(
-                status_code=503,
-                content=
-                "LLM is unavailable. Please check the server logs for more details."
-            )
+            return False
 
     async def health_generate(self, raw_request: Request) -> Response:
         """Health check that performs a minimal generation."""
@@ -1780,14 +1739,6 @@ class OpenAIServer(_VideoRoutesMixin):
             logger.error(f"Health generate check encountered exception: {e}")
             return Response(status_code=500,
                             content=f"Generation health check failed: {str(e)}")
-
-    async def version(self) -> JSONResponse:
-        ver = {"version": VERSION}
-        return JSONResponse(content=ver)
-
-    async def get_model(self) -> JSONResponse:
-        model_list = ModelList(data=[ModelCard(id=self.model)])
-        return JSONResponse(content=model_list.model_dump())
 
     async def get_iteration_stats(self) -> JSONResponse:
         # Visual-gen deployments use a separate iteration-stats producer
@@ -2055,6 +2006,42 @@ class OpenAIServer(_VideoRoutesMixin):
 
     async def openai_chat(self, request: ChatCompletionRequest,
                           raw_request: Request) -> Response:
+        try:
+            result = await self.create_chat_completion(request, raw_request)
+            if isinstance(result, ChatCompletionResponse):
+                return JSONResponse(content=result.model_dump())
+            return StreamingResponse(content=result,
+                                     media_type="text/event-stream")
+        except ServingError as e:
+            return JSONResponse(content=e.body.model_dump(),
+                                status_code=e.status)
+        except EngineFatalError:
+            # Answered as HTTP 200 with body null (FastAPI's rendering of
+            # None); the in-process callers map that to their own errors.
+            # Answering 5xx would be a behavior change of its own.
+            return None
+        except ValueError as e:
+            # JSONResponse encodes in its constructor (allow_nan=False), so a
+            # response that cannot be encoded fails here and keeps its 400.
+            return self.create_error_response(str(e))
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
+
+    async def create_chat_completion(
+        self, request: ChatCompletionRequest, raw_request: Request
+    ) -> Union[ChatCompletionResponse, AsyncIterator[str]]:
+        """Run one chat completion and return a typed result.
+
+        Returns the ChatCompletionResponse for a non-streaming request, and
+        for a streaming one the SSE stream as strings, ending with
+        "data: [DONE]".
+
+        Raises:
+            ServingError: The request is rejected; the HTTP status travels
+                apart from the body.
+            EngineFatalError: The engine failed; SIGINT has been sent.
+        """
 
         def get_role() -> str:
             if request.add_generation_prompt:
@@ -2062,38 +2049,6 @@ class OpenAIServer(_VideoRoutesMixin):
             else:
                 role = request.messages[-1]["role"]
             return role
-
-        async def chat_stream_generator(
-                promise: RequestOutput,
-                postproc_params: PostprocParams) -> AsyncGenerator[str, None]:
-            try:
-                if not self.postproc_worker_enabled:
-                    post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
-                first_response = await anext(promise)
-                raw_request.state.server_first_token_time = self._adjusted_steady_clock.now(
-                )
-                pp_results = first_response.outputs[
-                    0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                        first_response, args)
-                for pp_res in pp_results:
-                    yield pp_res
-                # Making sure we can handle the situation where there is only one response
-                res = first_response
-                async for res in promise:
-                    pp_results = res.outputs[
-                        0]._postprocess_result if self.postproc_worker_enabled else post_processor(
-                            res, args)
-                    for pp_res in pp_results:
-                        yield pp_res
-                yield "data: [DONE]\n\n"
-                await self._extract_metrics(res, raw_request)
-                nvtx_mark("generation ends")
-            except Exception:
-                # Only failures are logged: a consumer that stops reading closes
-                # the stream with GeneratorExit, and a client that disconnects
-                # cancels it, and neither is an error of this stream.
-                logger.error(traceback.format_exc())
-                raise
 
         try:
             # Extension preprocessing, the required-tool check and tool dumping
@@ -2150,7 +2105,7 @@ class OpenAIServer(_VideoRoutesMixin):
             if isinstance(request.tool_choice,
                           ChatCompletionNamedToolChoiceParam):
                 if not request.tools:
-                    return self.create_error_response(
+                    raise serving_error(
                         message=("tool_choice with a named function requires "
                                  "`tools` to be set."),
                         err_type="BadRequestError",
@@ -2168,7 +2123,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     # testing ``prompt_token_ids`` alone lets a base64 request
                     # through to the pre-tokenized branch, where the begin
                     # prefix is never appended.
-                    return self.create_error_response(
+                    raise serving_error(
                         message=("tool_choice with a named function is not "
                                  "supported alongside `prompt_token_ids`; pass "
                                  "`messages` instead."),
@@ -2183,7 +2138,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     # instead. Honouring only one of them silently would either
                     # ignore an explicit instruction or emit a tool call whose
                     # arguments are unconstrained text, so reject instead.
-                    return self.create_error_response(
+                    raise serving_error(
                         message=("tool_choice with a named function cannot be "
                                  "combined with `response_format` or other "
                                  "guided-decoding settings."),
@@ -2206,14 +2161,13 @@ class OpenAIServer(_VideoRoutesMixin):
                     # ends up reported as ``function.arguments``. Fail loudly
                     # instead of returning a tool call whose arguments are
                     # unconstrained text.
-                    return self.create_error_response(
-                        message=(
-                            "tool_choice with a named function requires the "
-                            "server to be started with a guided decoding "
-                            "backend (set `guided_decoding_backend` to "
-                            "'xgrammar' or 'llguidance')."),
-                        err_type="BadRequestError",
-                        status_code=HTTPStatus.BAD_REQUEST)
+                    raise serving_error(message=(
+                        "tool_choice with a named function requires the "
+                        "server to be started with a guided decoding "
+                        "backend (set `guided_decoding_backend` to "
+                        "'xgrammar' or 'llguidance')."),
+                                        err_type="BadRequestError",
+                                        status_code=HTTPStatus.BAD_REQUEST)
                 forced_tool_name = request.tool_choice.function.name
 
             reasoning_parser_name = self.generator.args.reasoning_parser
@@ -2266,7 +2220,7 @@ class OpenAIServer(_VideoRoutesMixin):
                                     request.tools, self.tool_parser,
                                     forced_tool_name))
                         except ValueError as e:
-                            return self.create_error_response(
+                            raise serving_error(
                                 message=str(e),
                                 err_type="BadRequestError",
                                 status_code=HTTPStatus.BAD_REQUEST)
@@ -2281,7 +2235,7 @@ class OpenAIServer(_VideoRoutesMixin):
                             sampling_params.guided_decoding = strict_guided
             elif forced_tool_name is not None:
                 # tools were provided but the server has no tool_parser configured.
-                return self.create_error_response(
+                raise serving_error(
                     message=("tool_choice with a named function requires the "
                              "server to be started with --tool_parser."),
                     err_type="BadRequestError",
@@ -2497,10 +2451,10 @@ class OpenAIServer(_VideoRoutesMixin):
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
 
             if request.stream:
-                response_generator = chat_stream_generator(
-                    promise, postproc_params)
-                return StreamingResponse(content=response_generator,
-                                         media_type="text/event-stream")
+                return chat_stream_generator(promise,
+                                             postproc_params,
+                                             server=self,
+                                             raw_request=raw_request)
             else:
                 response = await self._create_chat_response(
                     promise, postproc_params, raw_request, disaggregated_params)
@@ -2516,17 +2470,20 @@ class OpenAIServer(_VideoRoutesMixin):
                         np.asarray(response.prompt_token_ids,
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
-                return JSONResponse(content=response.model_dump())
-        except CppExecutorError:
+                return response
+        except ServingError:
+            raise
+        except CppExecutorError as e:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
             _record_generator_termination(self.generator)
             signal.raise_signal(signal.SIGINT)
+            raise EngineFatalError() from e
         except ValueError as e:
-            return self.create_error_response(str(e))
+            raise serving_error(str(e)) from e
         except Exception as e:
             logger.error(traceback.format_exc())
-            return self.create_error_response(str(e))
+            raise serving_error(str(e)) from e
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
