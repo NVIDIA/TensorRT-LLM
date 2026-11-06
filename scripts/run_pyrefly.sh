@@ -2,15 +2,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Run Pyrefly on supplied product Python files, or the whole project when no
-# eligible files are supplied or --full-project is used. Pre-commit supplies
-# the file list with pass_filenames: true.
+# Run Pyrefly on supplied product Python files, or the whole project when
+# --full-project is used. With no eligible file paths, return success without
+# checking. Pre-commit supplies the file list with pass_filenames: true.
 # Paths from tool.pyrefly.project-excludes and symbols from
 # tool.pyrefly-exclusions in pyproject.toml are removed from the JSON report by
 # scripts/pyrefly_exclusion.py. Whole-project checks are always advisory;
 # file-list checks are advisory unless --strict is supplied.
-# The filtered diagnostic report is written to pyrefly_final_report.json and
-# up to eight diagnostics are printed to stdout when the check finishes.
+# The filtered diagnostic report is written to pyrefly_final_report.json.
+# File-list checks print all diagnostics; full-project checks print only the
+# report path.
 # File-list checks compare with HEAD. Diagnostics are filtered to added and
 # modified lines when Git finds them; otherwise they remain at file level. Pass
 # --no-diff-filter for file-level output on every supplied file.
@@ -38,8 +39,8 @@ while (( $# > 0 )); do
             cat <<'EOF'
 Run Pyrefly on supplied product Python files, or the whole project.
 
-Pre-commit passes filenames to this script. If none are eligible, check all
-configured sources. Use --full-project to request that scan explicitly.
+Pre-commit passes filenames to this script. With no eligible filenames, skip
+the check. Use --full-project to check all configured sources explicitly.
 
 Options:
   --full-project           Check all product Python files.
@@ -65,6 +66,10 @@ EOF
             ;;
     esac
 done
+if (( ! FULL_PROJECT && $# == 0 )); then
+    printf 'No file paths supplied; skipping Pyrefly check.\n'
+    exit 0
+fi
 if (( ! FULL_PROJECT && DIFF_FILTER )); then
     DIFF_BASE="HEAD"
 fi
@@ -75,6 +80,9 @@ EXCLUSION_SCRIPT="$SCRIPT_DIR/pyrefly_exclusion.py"
 EXCLUSIONS_CONFIG="$PROJECT_DIR/pyproject.toml"
 WORKFLOW_SCRIPT="$SCRIPT_DIR/pyrefly_workflow.py"
 REPORT_FILE="${PYREFLY_REPORT_PATH:-$PROJECT_DIR/pyrefly_final_report.json}"
+if [[ "$REPORT_FILE" != /* ]]; then
+    REPORT_FILE="$PROJECT_DIR/$REPORT_FILE"
+fi
 PYREFLY_OUTPUT=""
 PYREFLY_STDERR=""
 FILTERED_REPORT=""
@@ -83,10 +91,7 @@ PYREFLY_CONFIG=""
 CANDIDATE_PATHS=""
 ALLOWED_PATHS=""
 FILTERED_ARG_COUNT=0
-
-print_report_summary() {
-    python3 "$WORKFLOW_SCRIPT" print-summary "$REPORT_FILE" >&3 || true
-}
+SKIP_CHECK=0
 
 cleanup() {
     local status=$?
@@ -97,11 +102,22 @@ cleanup() {
             rm -f "$file" || true
         fi
     done
-    print_report_summary
+    if (( SKIP_CHECK )); then
+        trap - EXIT
+        exit 0
+    fi
+    if (( FULL_PROJECT )); then
+        printf 'Pyrefly full-project report saved to: %s\n' "$REPORT_FILE" >&3
+    else
+        python3 "$WORKFLOW_SCRIPT" print-diagnostics "$REPORT_FILE" >&3 || true
+    fi
     trap - EXIT
     if (( STRICT )); then
         printf 'Pyrefly check exit status: %s\n' "$status" >&3 || true
         exit "$status"
+    fi
+    if (( FULL_PROJECT )); then
+        exit 0
     fi
     printf 'Pyrefly check exit status: %s; advisory script exit status: 0\n' \
         "$status" >&3 || true
@@ -148,14 +164,17 @@ if (( ! FULL_PROJECT && PATH_MODULE_FILTER && FILTERED_ARG_COUNT > 0 )); then
             > "$REPORT_FILE"
         exit 2
     fi
-    mapfile -d '' -t FILTERED_ARGS < "$ALLOWED_PATHS"
+    FILTERED_ARGS=()
+    while IFS= read -r -d '' path; do
+        FILTERED_ARGS+=("$path")
+    done < "$ALLOWED_PATHS"
     FILTERED_ARG_COUNT=${#FILTERED_ARGS[@]}
 fi
 
 if (( ! FULL_PROJECT && FILTERED_ARG_COUNT == 0 )); then
-    FULL_PROJECT=1
-    DIFF_BASE=""
-    printf 'No eligible supplied product Python files; checking the whole project.\n' >&3
+    SKIP_CHECK=1
+    printf 'No eligible supplied product Python files; skipping Pyrefly check.\n' >&3
+    exit 0
 fi
 if (( FULL_PROJECT )); then
     STRICT=0
@@ -172,7 +191,7 @@ FILTERED_REPORT="$(mktemp)"
 PYREFLY_ARGS=(check --output-format=json --summary=none --progress-bar=no
     --relative-to "$PROJECT_DIR")
 if (( ! PATH_MODULE_FILTER )); then
-    PYREFLY_CONFIG="$(mktemp "$PROJECT_DIR/.pyrefly-config.XXXXXX.toml")"
+    PYREFLY_CONFIG="$(mktemp "$PROJECT_DIR/.pyrefly-config.XXXXXX")"
     python3 "$WORKFLOW_SCRIPT" clear-exclusions-config \
         "$PROJECT_DIR/pyproject.toml" "$PYREFLY_CONFIG"
     PYREFLY_ARGS+=(--config "$PYREFLY_CONFIG")

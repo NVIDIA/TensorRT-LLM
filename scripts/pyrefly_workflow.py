@@ -23,8 +23,8 @@ def report_status(report_path: Path) -> int:
     return int(bool(result["errors"]))
 
 
-def print_summary(report_path: Path) -> None:
-    """Print a concise diagnostic summary from a Pyrefly report."""
+def print_summary(report_path: Path, *, all_diagnostics: bool = False) -> None:
+    """Print diagnostics from a Pyrefly report."""
     try:
         report = json.loads(report_path.read_text())
     except (OSError, json.JSONDecodeError) as error:
@@ -39,7 +39,12 @@ def print_summary(report_path: Path) -> None:
         if not errors:
             print("No Pyrefly diagnostics.")
         else:
-            for error in errors[:8]:
+            if all_diagnostics:
+                print("Pyrefly type check on your changed files. Please fix the type errors below.")
+                print(
+                    "They are only warnings for now, but in the future they may block your commits and PR merges."
+                )
+            for error in errors if all_diagnostics else errors[:8]:
                 path = str(error.get("path", "<unknown>"))
                 line = error.get("line")
                 column = error.get("column")
@@ -47,9 +52,15 @@ def print_summary(report_path: Path) -> None:
                 if column is not None:
                     location += f":{column}"
                 kind = error.get("name", "error")
-                message = error.get("concise_description") or error.get("description", "")
-                print(f"{location}: [{kind}] {str(message).replace(chr(10), ' ')}")
-            if len(errors) > 8:
+                message = (
+                    error.get("description") or error.get("concise_description", "")
+                    if all_diagnostics
+                    else error.get("concise_description") or error.get("description", "")
+                )
+                if not all_diagnostics:
+                    message = str(message).replace("\n", " ")
+                print(f"{location}: [{kind}] {message}")
+            if not all_diagnostics and len(errors) > 8:
                 print(f"Showing 8 of {len(errors)} diagnostics.")
     print(f"See full Pyrefly report at: {report_path}")
 
@@ -214,6 +225,9 @@ def main() -> int:
     summary_parser = subparsers.add_parser("print-summary")
     summary_parser.add_argument("report", type=Path)
 
+    diagnostics_parser = subparsers.add_parser("print-diagnostics")
+    diagnostics_parser.add_argument("report", type=Path)
+
     status_parser = subparsers.add_parser("report-status")
     status_parser.add_argument("report", type=Path)
 
@@ -237,6 +251,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.command == "print-summary":
         print_summary(args.report)
+    elif args.command == "print-diagnostics":
+        print_summary(args.report, all_diagnostics=True)
     elif args.command == "report-status":
         return report_status(args.report)
     elif args.command == "clear-exclusions-config":
