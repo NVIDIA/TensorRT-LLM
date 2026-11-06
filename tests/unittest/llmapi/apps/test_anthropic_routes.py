@@ -278,32 +278,47 @@ def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
     }
 
 
-def _records_engine_request_id(request_id):
-    """An openai_chat stand-in that, like the real one, notes the engine's id on the request."""
+def _records_executor_client_id(request_id, *, stream=False):
+    """An openai_chat stand-in that, like the real one, notes the executor client id.
+
+    A streamed answer names its chunks ``chatcmpl-5``, which the message must not take.
+    """
 
     async def answer(chat_request, raw_request):
-        raw_request.state.engine_request_id = request_id
+        raw_request.state.executor_client_id = request_id
+        if stream:
+            return _streaming_chat_response(chat_id="chatcmpl-5")
         return _json_chat_response()
 
     return answer
 
 
-def test_nonstream_message_is_named_after_the_engine_request():
-    client, backend = _make_route_client("standard", _json_chat_response())
-    backend.side_effect = _records_engine_request_id(42)
+def _message_id(response, stream):
+    """The id of the message in a /v1/messages response."""
+    if not stream:
+        return response.json()["id"]
+    start = response.text.split("\n\n")[0]
+    assert start.startswith("event: message_start\n")
+    return json.loads(start.split("data: ", 1)[1])["message"]["id"]
 
-    response = client.post("/v1/messages", json=_request())
 
-    assert response.status_code == 200
-    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", response.json()["id"])
+@pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
+def test_message_is_named_after_the_executor_client_id(stream):
+    client, backend = _make_route_client("standard", None)
+    backend.side_effect = _records_executor_client_id(42, stream=stream)
+
+    response = client.post("/v1/messages", json=_request(stream=stream))
+
+    assert response.status_code == 200, response.text
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", _message_id(response, stream))
 
 
-def test_batched_message_is_named_after_the_engine_request():
+def test_batched_message_is_named_after_the_executor_client_id():
     from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
 
     server = object.__new__(OpenAIServer)
     server.model = MODEL
-    server.openai_chat = AsyncMock(side_effect=_records_engine_request_id(7))
+    server.openai_chat = AsyncMock(side_effect=_records_executor_client_id(7))
 
     status, message = asyncio.run(
         server._run_batched_message(AnthropicMessagesRequest(**_request()))
@@ -393,9 +408,9 @@ def _disagg_route_client(answer):
 @pytest.mark.parametrize("disagg_request_ids", [[17], [16, 17]], ids=["once", "ctx_retried"])
 @pytest.mark.parametrize("stream", [False, True], ids=["nonstream", "stream"])
 def test_disagg_message_is_named_after_the_disagg_request(stream, disagg_request_ids):
-    """Not after the generation worker's engine request: each worker numbers its own.
+    """Not after the generation worker's id for it: each worker numbers its own.
 
-    The worker names its chat stream ``chatcmpl-<its engine request id>``, and a
+    The worker names its chat stream ``chatcmpl-<its id for the request>``, and a
     non-streamed chat completion has a random id. A retried context request gets
     a new disaggregated request id; the reply takes the one the perf metrics record.
     """
@@ -411,13 +426,7 @@ def test_disagg_message_is_named_after_the_disagg_request(stream, disagg_request
     response = _disagg_route_client(answer).post("/v1/messages", json=_request(stream=stream))
 
     assert response.status_code == 200, response.text
-    if stream:
-        start = response.text.split("\n\n")[0]
-        assert start.startswith("event: message_start\n")
-        message_id = json.loads(start.split("data: ", 1)[1])["message"]["id"]
-    else:
-        message_id = response.json()["id"]
-    assert re.fullmatch(r"msg_17_[0-9a-f]{16}", message_id)
+    assert re.fullmatch(r"msg_17_[0-9a-f]{16}", _message_id(response, stream))
 
 
 class _StreamedGeneration:
@@ -457,12 +466,12 @@ class _ModelConfig:
     vocab_size = 1024
 
 
-async def _chat_stream(monkeypatch, generation):
-    """The body of a streamed /v1/chat/completions response, and the server.
+def _streaming_chat_server(monkeypatch, generation):
+    """A server whose real ``openai_chat`` streams ``generation``.
 
-    The real ``openai_chat`` handler runs on a server built with
-    ``object.__new__``; prompt rendering and the engine are stubbed, and the
-    engine's output is already post-processed into SSE frames.
+    The server is built with ``object.__new__``; prompt rendering and the
+    engine are stubbed, and the engine's output is already post-processed into
+    SSE frames.
     """
 
     async def render(**kwargs):
@@ -493,6 +502,12 @@ async def _chat_stream(monkeypatch, generation):
     )
     server.await_disconnected = AsyncMock()
     server._extract_metrics = AsyncMock()
+    return server
+
+
+async def _chat_stream(monkeypatch, generation):
+    """The body of a streamed /v1/chat/completions response, and the server."""
+    server = _streaming_chat_server(monkeypatch, generation)
     request = ChatCompletionRequest(
         model=MODEL, messages=[{"role": "user", "content": "hi"}], stream=True
     )
@@ -500,6 +515,36 @@ async def _chat_stream(monkeypatch, generation):
     response = await server.openai_chat(request, raw_request)
     assert isinstance(response, StreamingResponse), response.body
     return response.body_iterator, server
+
+
+async def _collect(stream):
+    return [frame async for frame in stream]
+
+
+def test_streamed_message_takes_the_id_the_real_chat_route_notes(monkeypatch):
+    """Through the real openai_chat: the chat stream's own id does not name the message."""
+    from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+
+    chunks = _streaming_chat_response(chat_id="chatcmpl-5").body_iterator
+    generation = _StreamedGeneration(
+        [[frame] for frame in asyncio.run(_collect(chunks)) if frame != "data: [DONE]\n\n"]
+    )
+    generation.request_id = 42
+
+    async def run():
+        server = _streaming_chat_server(monkeypatch, generation)
+        raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
+        response = await server.anthropic_messages(
+            AnthropicMessagesRequest(**_request(stream=True)), raw_request
+        )
+        assert isinstance(response, StreamingResponse), response.body
+        return await _collect(response.body_iterator)
+
+    frames = asyncio.run(run())
+
+    start = next(frame for frame in frames if frame.startswith("event: message_start\n"))
+    message_id = json.loads(start.split("data: ", 1)[1])["message"]["id"]
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", message_id)
 
 
 @pytest.fixture

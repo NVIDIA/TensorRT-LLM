@@ -900,8 +900,8 @@ def chunk(
     )
 
 
-def run_reframer(chunks):
-    reframer = AnthropicStreamReframer(model=MODEL)
+def run_reframer(chunks, request_id=None):
+    reframer = AnthropicStreamReframer(model=MODEL, request_id=request_id)
     frames = []
     for c in chunks:
         frames.extend(reframer.process_chunk(c))
@@ -2158,45 +2158,46 @@ def test_stream_ends_when_the_upstream_is_cancelled_on_its_own(monkeypatch):
     assert "ping" in [name for name, _ in events]
 
 
-# Message ids carry the engine request id
+# Message ids carry the caller's request id
 # ---------------------------------------------------------------------------
 
 
-def test_message_id_carries_the_engine_request_id():
-    """``chatcmpl-<engine id>`` becomes ``msg_<engine id>_<hex>``, unique per message."""
+def test_message_id_carries_the_callers_request_id():
+    """``request_id`` 42 names the message ``msg_42_<hex>``, unique per message."""
     response = make_chat_response(ChatMessage(role="assistant", content="hello"))
-    response.id = "chatcmpl-123"
+    response.id = "chatcmpl-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
 
-    first = convert_chat_response(response).id
-    second = convert_chat_response(response).id
+    first = convert_chat_response(response, request_id=42).id
+    second = convert_chat_response(response, request_id=42).id
 
-    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", first)
-    assert re.fullmatch(r"msg_123_[0-9a-f]{16}", second)
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", first)
+    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", second)
     assert first != second
 
 
-def test_message_id_without_an_engine_request_id_is_random():
+def test_message_id_without_a_request_id_is_random():
+    """The chat completion's id is not read, even when it ends in digits."""
     response = make_chat_response(ChatMessage(role="assistant", content="hello"))
-    response.id = "chatcmpl-0a1b2c3d4e5f"
+    response.id = "chatcmpl-123"
 
     assert re.fullmatch(r"msg_[0-9a-f]{32}", convert_chat_response(response).id)
 
 
-def test_nonstreamed_message_id_takes_the_engine_request_id_from_the_caller():
-    """A non-streamed chat completion's own id is random; the caller's request id names it."""
-    response = make_chat_response(ChatMessage(role="assistant", content="hello"))
-    response.id = "chatcmpl-0a1b2c3d4e5f60718293a4b5c6d7e8f9"
-
-    assert re.fullmatch(r"msg_42_[0-9a-f]{16}", convert_chat_response(response, request_id=42).id)
-
-
-def test_streamed_message_id_carries_the_engine_request_id():
+def _streamed_message_id(chat_id, request_id):
     first = chunk({"role": "assistant", "content": "hi"})
-    first.id = "chatcmpl-77"
+    first.id = chat_id
     last = chunk({}, finish_reason="stop", usage=UsageInfo(prompt_tokens=3, completion_tokens=1))
-    last.id = "chatcmpl-77"
+    last.id = chat_id
 
-    events = run_reframer([first, last])
+    events = run_reframer([first, last], request_id=request_id)
 
-    start = next(payload for name, payload in events if name == "message_start")
-    assert re.fullmatch(r"msg_77_[0-9a-f]{16}", start["message"]["id"])
+    return next(payload for name, payload in events if name == "message_start")["message"]["id"]
+
+
+def test_streamed_message_id_carries_the_callers_request_id():
+    assert re.fullmatch(r"msg_77_[0-9a-f]{16}", _streamed_message_id("chatcmpl-5", 77))
+
+
+def test_streamed_message_id_without_a_request_id_is_random():
+    """The chunks' id is not read, even when it ends in digits."""
+    assert re.fullmatch(r"msg_[0-9a-f]{32}", _streamed_message_id("chatcmpl-77", None))

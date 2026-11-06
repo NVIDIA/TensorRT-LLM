@@ -487,7 +487,7 @@ class OpenAIDisaggServer:
                                             e.status_code)
 
         # The reply is named after the disaggregated request rather than the
-        # worker's engine request (see anthropic_message_id).
+        # worker's own id for it (see anthropic_message_id).
         disagg_request_id = getattr(raw_request.state, "disagg_request_id",
                                     None)
         if isinstance(openai_response, StreamingResponse):

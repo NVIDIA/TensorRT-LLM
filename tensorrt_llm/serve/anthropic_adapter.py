@@ -624,29 +624,24 @@ def convert_usage(usage: Optional[UsageInfo]) -> AnthropicUsage:
     return anthropic_usage
 
 
-def anthropic_message_id(chat_id: Optional[str], request_id: Optional[int] = None) -> str:
+def anthropic_message_id(request_id: Optional[int]) -> str:
     """The Anthropic message id for a generation.
 
-    The message keeps the engine's request id, ``msg_<engine request id>_<random
-    hex>``, so a reply can be matched with the server's log lines and raw-output
-    records for the same request; the random part keeps the id unique across
-    server restarts, which reset the engine's counter.
+    The message keeps the server's id for the request, ``msg_<request id>_<random
+    hex>``, so a reply can be matched with the server's records of the same
+    request; the random part keeps the id unique across server restarts, which
+    restart the count. Without ``request_id`` the message id is random.
 
-    ``request_id`` is that id when the caller has it. Otherwise it is read from a
-    ``chatcmpl-<engine request id>`` chat id, which is how a streamed chat
-    completion is named; a non-streamed one has a random id, so its caller must
-    pass ``request_id``. With neither, the message id has no request id in it.
+    A single server passes the executor client id (``RequestOutput.request_id``).
+    The perf metrics, the post-processor hook records and the disconnect log
+    name the request by it; PyExecutor numbers its requests on its own, so its
+    log lines carry a different id.
 
-    A disaggregated server passes its disaggregated request id as ``request_id``:
-    each worker numbers its own engine requests, so a worker's id can name
-    different requests on different workers, while the disaggregated request id
-    is unique across the deployment and is the one its perf metrics record.
+    A disaggregated server passes its disaggregated request id: each worker
+    numbers its own requests, so a worker's id can name different requests on
+    different workers, while the disaggregated request id is unique across the
+    deployment and is the one its perf metrics record.
     """
-    prefix = "chatcmpl-"
-    if request_id is None and chat_id and chat_id.startswith(prefix):
-        suffix = chat_id[len(prefix) :]
-        if suffix.isdigit():
-            request_id = int(suffix)
     if request_id is not None:
         return f"msg_{request_id}_{uuid.uuid4().hex[:16]}"
     return f"msg_{uuid.uuid4().hex}"
@@ -672,8 +667,8 @@ def convert_chat_response(
 ) -> AnthropicMessagesResponse:
     """Translate a non-streaming chat completion into an Anthropic message.
 
-    ``request_id`` is the id of the generation, when the caller has it; the
-    message id carries it (see ``anthropic_message_id``).
+    ``request_id`` is the server's id for the request, when the caller has it;
+    the message id carries it (see ``anthropic_message_id``).
     """
     content: List[Any] = []
     stop_reason: AnthropicStopReason = "end_turn"
@@ -720,7 +715,7 @@ def convert_chat_response(
         content.append(AnthropicTextBlock(text=""))
 
     return AnthropicMessagesResponse(
-        id=anthropic_message_id(chat_response.id, request_id),
+        id=anthropic_message_id(request_id),
         model=chat_response.model,
         content=content,
         stop_reason=stop_reason,
@@ -783,10 +778,7 @@ class AnthropicStreamReframer:
 
     def __init__(self, model: str, request_id: Optional[int] = None):
         self.model = model
-        # The id of the generation, when the caller has it; without it the
-        # message is named after the upstream chunks (see adopt_id).
-        self.request_id = request_id
-        self.message_id = anthropic_message_id(None, request_id)
+        self.message_id = anthropic_message_id(request_id)
         self.message_started = False
         self.block_index = -1
         self.open_block_type: Optional[str] = None
@@ -987,15 +979,6 @@ class AnthropicStreamReframer:
         if model and not self.message_started:
             self.model = model
 
-    def adopt_id(self, chat_id: Optional[str]) -> None:
-        """Name the message after the upstream generation (see ``anthropic_message_id``).
-
-        The constructor's id stays for a stream that fails before its first chunk,
-        and for a caller that gave the request id.
-        """
-        if chat_id and self.request_id is None and not self.message_started:
-            self.message_id = anthropic_message_id(chat_id)
-
     def _start_message(self, usage: Optional[AnthropicUsage]) -> List[str]:
         if self.message_started:
             return []
@@ -1014,7 +997,6 @@ class AnthropicStreamReframer:
         frames: List[str] = []
 
         self.adopt_model(getattr(chunk, "model", None))
-        self.adopt_id(getattr(chunk, "id", None))
 
         usage = None
         if chunk.usage is not None:
