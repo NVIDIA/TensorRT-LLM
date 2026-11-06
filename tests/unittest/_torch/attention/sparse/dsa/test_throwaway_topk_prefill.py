@@ -523,6 +523,37 @@ def test_interleaved_chunks_across_layers(qkv):
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_plan_is_issued_once_per_chunk_and_reissued_when_the_chunk_changes(monkeypatch, qkv):
+    """Layers of one chunk share a plan; a different chunk (or returning to one) needs a new
+    plan, and every layer's result stays correct either way."""
+    runner = _runner("ds_v32", 16384, qkv=qkv)
+    planned = []
+    real_plan = runner._wrapper.plan
+
+    def spy(*args, **kwargs):
+        planned.append(kwargs.get("num_query_rows"))
+        return real_plan(*args, **kwargs)
+
+    monkeypatch.setattr(runner._wrapper, "plan", spy)
+    runner._planned_key = None
+    chunks = {"a": (256, 4096), "b": (192, 6000)}
+    caches = {"a": {}, "b": {}}
+    for step, which in enumerate(["a", "a", "a", "b", "b", "a"]):
+        num_q, kv_prefix = chunks[which]
+        _check(
+            "ds_v32",
+            num_q,
+            kv_prefix,
+            qkv=qkv,
+            seed=200 + step,
+            runner=runner,
+            plan_cache=caches[which],
+        )
+    assert planned == [256, 192, 256], planned
+
+
+@skip_not_sm100
 def test_mxfp4_key_storage_is_padded_to_256_rows():
     runner = ThrowawayPrefillTopK(
         n_heads=64,

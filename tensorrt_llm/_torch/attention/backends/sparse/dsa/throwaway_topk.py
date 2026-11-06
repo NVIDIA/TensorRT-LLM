@@ -156,6 +156,8 @@ class ThrowawayPrefillTopK:
             self._k_scale_stage = torch.empty(self.num_keys, dtype=torch.float32, device=device)
         self._device = device
         self._pool_prepared = False
+        # (kv_prefix_len, rows) of the plan the wrapper currently holds, or None.
+        self._planned_key: Optional[Tuple[int, int]] = None
 
     def can_run(self, num_k_rows: int) -> bool:
         """Returns True when ``num_k_rows`` compressed keys fit the staging buffer."""
@@ -228,10 +230,14 @@ class ThrowawayPrefillTopK:
 
         for begin in range(0, num_q, self.max_chunk_size):
             end = min(begin + self.max_chunk_size, num_q)
-            qo_indptr, kv_indptr = self._plan_tensors(
-                plan_cache, kv_prefix_len + begin, end - begin
-            )
-            self._wrapper.plan(qo_indptr, kv_indptr, num_query_rows=end - begin)
+            # The plan depends only on the two prefixes, not on K, Q or the layer, and one plan
+            # serves every layer that runs after it. Layers of a step repeat the same plan, so
+            # only a change of (prefix, rows) -- another chunk or tile -- needs a new one.
+            plan_key = (kv_prefix_len + begin, end - begin)
+            if plan_key != self._planned_key:
+                qo_indptr, kv_indptr = self._plan_tensors(plan_cache, *plan_key)
+                self._wrapper.plan(qo_indptr, kv_indptr, num_query_rows=end - begin)
+                self._planned_key = plan_key
             if not self._pool_prepared:
                 self._wrapper.prepare_pool(self._k_stage, k_scale=self._k_scale_stage)
                 self._pool_prepared = True
