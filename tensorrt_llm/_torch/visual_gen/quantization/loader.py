@@ -366,6 +366,9 @@ class DynamicLinearWeightLoader:
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
 
+        if getattr(self.quant_config, "ignored_steps", []) and quant_algo is not None:
+            self._retain_unquantized_weight(module, name, weight_dicts)
+
         # Static (pre-quantized) recipes must not be loaded from checkpoints
         # that do not carry the expected scale tensors.
         for weight_dict in weight_dicts:
@@ -382,3 +385,36 @@ class DynamicLinearWeightLoader:
             ]
 
         module.load_weights(quantized_weight_dicts)
+
+    def _retain_unquantized_weight(self, module, name, weight_dicts) -> None:
+        """Load an unquantized local shard with the same fused/TP weight mapping."""
+        import copy
+
+        from tensorrt_llm._torch.modules.linear import UnquantizedLinearMethod
+        from tensorrt_llm.models.modeling_utils import QuantConfig
+
+        if not self.dynamic_weight_quant or any(
+            wd.get("weight") is None
+            or wd["weight"].dtype not in (torch.bfloat16, torch.float16, torch.float32)
+            for wd in weight_dicts
+        ):
+            raise ValueError(
+                f"quant_config.ignored_steps requires original BF16/FP16 weights for {name}; "
+                "a pre-quantized checkpoint cannot restore the original BF16 precision."
+            )
+        # Reuse the original module's TP sharding and fused-weight descriptors,
+        # but give the temporary loader its own parameter/module dictionaries.
+        shadow = copy.copy(module)
+        shadow._parameters = {}
+        shadow._buffers = {}
+        shadow._modules = {}
+        shadow.quant_config = QuantConfig()
+        shadow.quant_method = UnquantizedLinearMethod()
+        with torch.device(module.weight.device):
+            shadow.quant_method.create_weights(
+                shadow, module.in_features, module.out_features, module.has_bias, module.dtype
+            )
+        shadow.quant_method.load_weights(
+            shadow, weight_dicts, module.weights_loading_config.weight_mode
+        )
+        module.register_buffer("_unquantized_weight", shadow.weight.detach(), persistent=False)

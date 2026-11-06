@@ -107,7 +107,9 @@ class FluxJointAttention(Attention):
         )
 
         self.requires_static_e4m3_attention = bool(
-            requests_static_e4m3_attention and self.attn_backend == "CUTEDSL"
+            requests_static_e4m3_attention
+            and self.attn_backend == "CUTEDSL"
+            and not self._quantization_excluded
         )
         self.register_buffer(
             "_static_q_dequant_scale", torch.empty((), dtype=torch.float32), persistent=False
@@ -286,7 +288,7 @@ class FluxJointAttention(Attention):
         q_add = self.norm_added_q.weight if hasattr(self, "norm_added_q") else None
         k_add = self.norm_added_k.weight if hasattr(self, "norm_added_k") else None
 
-        if self.requires_static_e4m3_attention:
+        if self.requires_static_e4m3_attention and self.attention_quantization_enabled:
             batch_size, seq_len, _ = qkv.shape
             query, key, value = torch.ops.trtllm.fused_dit_qk_norm_rope_quant_fp8(
                 qkv.view(batch_size * seq_len, -1),
@@ -377,7 +379,7 @@ class FluxJointAttention(Attention):
         )
 
         attention_kwargs = {"timestep": timestep}
-        if self.requires_static_e4m3_attention:
+        if self.requires_static_e4m3_attention and self.attention_quantization_enabled:
             attention_kwargs.update(
                 {
                     "static_q_scale": self._static_q_dequant_scale,
@@ -589,6 +591,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
 
         return (
             mlp_proj.has_nvfp4
+            and not mlp_proj.requires_unquantized_activation
             and mlp_proj.input_scale is not None
             and mlp_proj.pre_quant_scale is None
             and not mlp_proj.force_dynamic_quantization

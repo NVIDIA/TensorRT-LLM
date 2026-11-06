@@ -535,3 +535,47 @@ class TestWanI2VTransformerCorrectness:
         assert cos_sim >= COS_SIM_THRESHOLD, (
             f"I2V cosine similarity {cos_sim:.6f} < {COS_SIM_THRESHOLD}. max_diff={max_diff:.6f}"
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("norm", ["adaln", "affine"])
+def test_linear_ignored_steps_keep_fused_norm_output_bf16(norm: str) -> None:
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.models.wan.utils_wan import (
+        apply_fused_layernorm_adaln_quant,
+        apply_fused_layernorm_affine_quant,
+        get_nvfp4_input_scale,
+    )
+
+    projection = SimpleNamespace(
+        quant_config=SimpleNamespace(ignored_steps=[1]),
+        input_scale=torch.ones(()),
+        scaling_vector_size=16,
+        pre_quant_scale=None,
+        force_dynamic_quantization=False,
+    )
+    inputs = torch.randn(1, 8, 128, dtype=torch.bfloat16)
+    scale = get_nvfp4_input_scale(projection)
+    assert scale is None
+    with (
+        patch(
+            "torch.ops.trtllm.fused_adaptive_layernorm_quant",
+            side_effect=AssertionError("Upstream FP4 quantization must be disabled"),
+        ),
+        patch(
+            "torch.ops.trtllm.fused_adaptive_layernorm", return_value=torch.empty_like(inputs)
+        ) as bf16,
+    ):
+        if norm == "adaln":
+            result = apply_fused_layernorm_adaln_quant(
+                inputs, torch.randn(1, 1, 128), torch.randn(1, 1, 128), 8, scale
+            )
+        else:
+            result = apply_fused_layernorm_affine_quant(
+                inputs, torch.randn(128), torch.randn(128), scale
+            )
+    bf16.assert_called_once()
+    assert result.dtype == torch.bfloat16
+    projection.quant_config.ignored_steps = []
+    assert get_nvfp4_input_scale(projection) is projection.input_scale

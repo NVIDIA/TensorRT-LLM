@@ -37,6 +37,7 @@ from tensorrt_llm.visual_gen.args import (
     CompilationConfig,
     CpuOffloadConfig,
     CudaGraphConfig,
+    DiffusionQuantConfig,
     ParallelConfig,
     RuntimeLoRAConfig,
     SeaCacheConfig,
@@ -315,6 +316,13 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
         if isinstance(user_quant, dict) and user_quant.get("quant_algo") is not None:
             return cls.load_diffusion_quant_config(user_quant)
         if isinstance(user_quant, QuantConfig) and user_quant.quant_algo is not None:
+            if isinstance(user_quant, DiffusionQuantConfig) and user_quant.ignored_steps:
+                return (
+                    user_quant,
+                    None,
+                    True,
+                    user_quant.quant_algo in (QuantAlgo.NVFP4, QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN),
+                )
             return user_quant, None, False, False
         if isinstance(checkpoint_quant, dict):
             return cls.load_diffusion_quant_config(checkpoint_quant)
@@ -387,11 +395,18 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
             if quant_algo == QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN:
                 dynamic_activation_quant = True
 
-        quant_config = QuantConfig(
+        quant_config = DiffusionQuantConfig(
             quant_algo=quant_algo,
             group_size=group_size,
             exclude_modules=quant_config_dict.get("ignore"),
+            ignored_steps=quant_config_dict.get("ignored_steps", []),
         )
+
+        if quant_config.ignored_steps and not dynamic_weight_quant:
+            raise ValueError(
+                "quant_config.ignored_steps requires a quant_algo and dynamic weight "
+                "quantization from a BF16/FP16 checkpoint (dynamic: true)."
+            )
 
         # TODO: Per-layer config (None for now - future: parse mixed precision settings)
         layer_quant_config = None
@@ -823,9 +838,13 @@ class DiffusionPipelineConfig(_VisualGenConfigBase):
 
             FP8RowwiseLinearMethod.use_tunable_quantize = True
 
+        recipe = attention_cfg.quant_attention_config
+        needs_quant_ignore_state = any(
+            getattr(quant[0], "ignored_steps", []) for quant in transformer_quant_configs.values()
+        ) or (recipe is not None and bool(recipe.ignored_steps))
         attention_metadata_state = (
             create_attention_metadata_state()
-            if attention_cfg.backend in ("TRTLLM", "FLASHINFER")
+            if attention_cfg.backend in ("TRTLLM", "FLASHINFER") or needs_quant_ignore_state
             else None
         )
 

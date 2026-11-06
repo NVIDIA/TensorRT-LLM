@@ -219,6 +219,7 @@ class LTX2Attention(Attention):
                 dtype=self.dtype,
                 attention_config=config.attention,
                 attention_metadata_state=config.attention_metadata_state,
+                module_name=self.module_name,
                 sparse_params=self.sparse_params,
             )
             self._attn_stage2 = wrap_parallel_attention(

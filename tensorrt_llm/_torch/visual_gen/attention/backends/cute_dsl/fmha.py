@@ -895,7 +895,7 @@ class CuTeDSLAttention(AttentionBackend):
 
         Returns:
             output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] - log-sum-exp per query position,
+            lse:    [batch_size, num_heads, seq_len] - natural-log LSE per query position,
                     always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
@@ -903,7 +903,8 @@ class CuTeDSLAttention(AttentionBackend):
         output, lse = self._fwd(q, k, v, is_causal, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
-        return output, lse.transpose(1, 2)
+        # The kernel reports log2 LSE; parallel softmax merges require natural-log LSE.
+        return output, lse.transpose(1, 2) * math.log(2.0)
 
     @classmethod
     def support_lse(cls) -> bool:

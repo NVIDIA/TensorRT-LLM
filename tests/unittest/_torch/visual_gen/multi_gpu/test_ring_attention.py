@@ -26,6 +26,7 @@ Run with:
     pytest tests/unittest/_torch/visual_gen/multi_gpu/test_ring_attention.py -v
 """
 
+import functools
 import math
 import os
 
@@ -49,6 +50,8 @@ from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
 from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
 
 from ._worker_pool import run_distributed
+
+__extra_import_path__ = [".."]
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -478,6 +481,64 @@ class TestRingUlyssesAttentionFlashAttn4:
 class TestRingAttentionInitGuards:
     def test_inner_without_lse_raises(self):
         run_test_in_distributed(world_size=4, test_fn=_logic_ring_init_guard_no_lse, use_cuda=False)
+
+
+def _logic_attention_ignored_steps(rank: int, world_size: int, *, parallelism: str) -> None:
+    """Observe the BF16/quantized inner backend after actual distributed exchanges."""
+    from test_common.visual_gen_quantization import (
+        assert_quantization_routes,
+        observe_quantization_paths,
+    )
+
+    from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_attention
+    from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+
+    device = torch.device(f"cuda:{rank}")
+    torch.manual_seed(42)
+    heads, head_dim = 4, 128
+    values = [
+        torch.randn(1, 128, heads, head_dim, dtype=torch.bfloat16, device=device) for _ in range(3)
+    ]
+    state = {}
+    selected = create_attention(
+        backend="CUTEDSL",
+        layer_idx=0,
+        head_dim=head_dim,
+        dtype=torch.bfloat16,
+        num_heads=heads // world_size if parallelism == "ulysses" else heads,
+        attention_metadata_state=state,
+        attention_config=AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4", v_dtype="fp8", ignored_steps=[0, 2]
+            ),
+        ),
+    )
+    wrapper = UlyssesAttention if parallelism == "ulysses" else RingAttention
+    holder = torch.nn.Module()
+    holder.attention = torch.nn.Module()
+    holder.attention.attn = wrapper(selected, process_group=dist.group.WORLD)
+    with observe_quantization_paths(holder) as trace:
+        for step in range(3):
+            trace.step = step
+            state["attention_quant_ignored"] = step in (0, 2)
+            holder.attention.attn(*values)
+    assert_quantization_routes(
+        trace,
+        {
+            (step, "attention", "attention"): "bf16" if step in (0, 2) else "quantized"
+            for step in range(3)
+        },
+    )
+
+
+@pytest.mark.parametrize("wrapper", ["ulysses", "ring"])
+def test_attention_ignored_steps_with_sequence_parallel(wrapper: str) -> None:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("Quantized CuTe DSL attention requires Blackwell")
+    run_test_in_distributed(
+        2, functools.partial(_logic_attention_ignored_steps, parallelism=wrapper)
+    )
 
 
 if __name__ == "__main__":

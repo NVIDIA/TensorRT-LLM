@@ -236,6 +236,8 @@ def get_nvfp4_input_scale(linear) -> Optional[torch.Tensor]:
     """
     if linear is None:
         return None
+    if getattr(getattr(linear, "quant_config", None), "ignored_steps", []):
+        return None
     scale = getattr(linear, "input_scale", None)
     if scale is None:
         return None
