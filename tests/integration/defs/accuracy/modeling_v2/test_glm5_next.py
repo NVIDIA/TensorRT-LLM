@@ -15,12 +15,15 @@
 """Full-GSM8K gates for the NVFP4 GLM-5.3-Flash targets on SM100 (B200).
 
 Two targets share the deployment and differ in how speculative decoding runs:
-the stock-framework target (no speculation, or the engine's speculative worker)
-and the MTP-fused target (one-model MTP-Eagle inside its forward). Each test
+the split target (no speculation, or the engine's speculative worker after its
+forward) and the MTP-fused target (one-model MTP-Eagle inside its forward). Each test
 picks a configuration that routes to exactly one of them. Requiring
 modeling_v2 prevents an unsupported deployment from silently testing the
 built-in model.
 """
+
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 
@@ -31,28 +34,35 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MTPDecodingConfi
 
 from ...conftest import llm_models_root
 from ..accuracy_core import GSM8K, LlmapiAccuracyTestHarness
+from ._env import scoped_env_overrides
 
 _MODEL_NAME = "zai-org/GLM-5.3-Flash"
 _MODEL_PATH = f"{llm_models_root()}/GLM-5.3-Flash-NVFP4"
 
 
-def _llm(model_path: str, speculative_config=None) -> LLM:
-    return LLM(
-        model_path,
-        tensor_parallel_size=4,
-        pipeline_parallel_size=1,
-        moe_expert_parallel_size=4,
-        modeling_v2="require",
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5, enable_block_reuse=False),
-        max_batch_size=64,
-        max_num_tokens=16384,
-        max_seq_len=8192,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=64, enable_padding=True),
-        enable_chunked_prefill=True,
-        disable_mm_encoder=True,
-        speculative_config=speculative_config,
-        env_overrides={MODELING_V2_VALIDATE_ENV: "1"},
-    )
+@contextmanager
+def _llm(model_path: str, speculative_config=None) -> Iterator[LLM]:
+    """The engine at TP4/EP4, with the targets' step contract checked on the ranks."""
+    with (
+        scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+        LLM(
+            model_path,
+            tensor_parallel_size=4,
+            pipeline_parallel_size=1,
+            moe_expert_parallel_size=4,
+            modeling_v2="require",
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5, enable_block_reuse=False),
+            max_batch_size=64,
+            max_num_tokens=16384,
+            max_seq_len=8192,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=64, enable_padding=True),
+            enable_chunked_prefill=True,
+            disable_mm_encoder=True,
+            speculative_config=speculative_config,
+            env_overrides=rank_env,
+        ) as llm,
+    ):
+        yield llm
 
 
 _SM100_TP4 = (
@@ -73,19 +83,17 @@ def _sm100_tp4(cls):
 
 @_sm100_tp4
 class TestModelingV2Glm53FlashNvfp4Sm100Default(LlmapiAccuracyTestHarness):
-    """The stock-framework target at attention TP4 with expert-parallel MoE (EP4)."""
+    """The split target at attention TP4 with expert-parallel MoE (EP4)."""
 
     MODEL_NAME = _MODEL_NAME
     MODEL_PATH = _MODEL_PATH
 
-    def test_gsm8k(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "1")
+    def test_gsm8k(self) -> None:
         with _llm(self.MODEL_PATH) as llm:
             GSM8K(self.MODEL_NAME).evaluate(llm)
 
-    def test_gsm8k_mtp_vanilla(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_gsm8k_mtp_vanilla(self) -> None:
         """Vanilla one-model MTP, which the fused target declines: the engine's MTP worker drives this target."""
-        monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "1")
         spec = MTPDecodingConfig(max_draft_len=1, use_mtp_vanilla=True)
         with _llm(self.MODEL_PATH, spec) as llm:
             GSM8K(self.MODEL_NAME).evaluate(llm)
@@ -98,7 +106,6 @@ class TestModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused(LlmapiAccuracyTestHarnes
     MODEL_NAME = _MODEL_NAME
     MODEL_PATH = _MODEL_PATH
 
-    def test_gsm8k_mtp(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv(MODELING_V2_VALIDATE_ENV, "1")
+    def test_gsm8k_mtp(self) -> None:
         with _llm(self.MODEL_PATH, MTPDecodingConfig(max_draft_len=3)) as llm:
             GSM8K(self.MODEL_NAME).evaluate(llm)

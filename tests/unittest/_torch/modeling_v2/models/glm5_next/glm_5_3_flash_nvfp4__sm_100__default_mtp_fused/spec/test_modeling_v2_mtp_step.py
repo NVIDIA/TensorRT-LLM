@@ -293,7 +293,7 @@ def test_no_drafts_step_matches_stock_worker():
     [
         (dict(use_rejection_sampling=True), "rejection sampling"),
         (dict(use_relaxed_acceptance_for_thinking=True), "relaxed acceptance"),
-        (dict(use_mtp_vanilla=True), "other than one-model MTP-Eagle"),
+        (dict(use_mtp_vanilla=True), "vanilla MTP"),
     ],
 )
 def test_unsupported_speculation_is_refused(overrides, refused):
@@ -306,6 +306,6 @@ def test_supported_speculation_is_admitted():
 
 
 def test_no_speculation_is_refused():
-    """Without speculative decoding the engine routes to the stock-framework target instead."""
-    with pytest.raises(ValueError, match="one-model MTP-Eagle only"):
+    """Without speculative decoding the engine routes to the split target instead."""
+    with pytest.raises(ValueError, match="no speculative decoding"):
         _check_speculation(None)
