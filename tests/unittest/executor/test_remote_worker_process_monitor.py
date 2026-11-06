@@ -5,6 +5,7 @@
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -36,7 +37,11 @@ finally:
 def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_process):
     # Regression: a remote rank's SIGKILL leaves MPI futures and its root alive,
     # so serving must fail through the independent process monitor instead.
-    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    if lost_process == "worker":
+        monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
+        monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.1.1")
+    else:
+        monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
     monkeypatch.setattr(remote, "_HEARTBEAT_TIMEOUT", 1.5)
     wake = threading.Event()
     monitor = WorkerProcessMonitor()
@@ -79,7 +84,8 @@ def test_remote_rank_loss_wakes_existing_monitor_without_mpi(monkeypatch, lost_p
 
 
 def test_remote_readiness_requires_every_rank(monkeypatch):
-    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
+    monkeypatch.setattr(remote.socket, "gethostbyname", lambda _host: "127.0.1.1")
     monitor = remote.RemoteWorkerProcessMonitor(2)
     watch = remote.WorkerProcessWatch(monitor.endpoint, 0)
     try:
@@ -88,6 +94,23 @@ def test_remote_readiness_requires_every_rank(monkeypatch):
     finally:
         monitor.close()
         watch.close()
+
+
+@pytest.mark.parametrize("override", [None, "missing.invalid"])
+def test_unresolvable_watch_host_reports_configuration_error(monkeypatch, override):
+    if override is None:
+        monkeypatch.delenv("TRTLLM_WORKER_WATCH_HOST", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", override)
+    failure = socket.gaierror("hostname cannot be resolved")
+
+    def resolve(_host):
+        raise failure
+
+    monkeypatch.setattr(remote.socket, "gethostbyname", resolve)
+    with pytest.raises(RuntimeError, match="TRTLLM_WORKER_WATCH_HOST") as error:
+        remote.RemoteWorkerProcessMonitor(1)
+    assert error.value.__cause__ is failure
 
 
 def test_shutdown_before_worker_submission_closes_remote_monitor(monkeypatch):

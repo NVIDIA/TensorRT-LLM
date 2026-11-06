@@ -57,7 +57,7 @@ If a recovery acknowledgement is lost, the sender retries only the idempotent ba
 
 With request batching disabled, submission releases Python's execution lock while the socket owner writes the command or detects a connection outage. This avoids leaving a queued command waiting behind the caller's Python work. Healthy submissions do not wait for a worker acknowledgement. With `TRTLLM_PROXY_BATCH_REQUESTS=1`, submission stays asynchronous and the owner coalesces queued commands.
 
-All MPI workers must be able to reach an authenticated ephemeral TCP listener on the proxy host. The advertised IPv4 address defaults to the proxy's hostname. Set `TRTLLM_WORKER_WATCH_HOST` on the proxy to select an address reachable from every worker, especially in containers or hosts with multiple interfaces. Startup does not admit requests until every worker has reported to that listener. Local `MpiPoolSession` workers keep using process handles and do not start these helpers.
+All MPI workers must be able to reach an authenticated ephemeral TCP listener on the proxy host. The advertised IPv4 address defaults to the proxy's hostname. A loopback address is valid for same-host MPI sessions; startup does not admit requests until authenticated reports from every worker prove that the listener is reachable. Set `TRTLLM_WORKER_WATCH_HOST` on the proxy to select an address reachable from every worker, especially across hosts or network namespaces. A hostname-resolution failure reports this configuration requirement with the original DNS error as its cause. Local `MpiPoolSession` workers keep using process handles and do not start these helpers.
 
 For a Pod with a Dynamo sidecar and native Kubernetes gRPC probes, bind one listener to all Pod interfaces:
 

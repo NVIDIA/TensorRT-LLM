@@ -940,10 +940,9 @@ def _proxy_awaiting_worker_init(
     proxy._fatal_error = None
     proxy._owns_mpi_session = owns_session
     proxy.worker_cls = object
-    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
-    # time is live: keep it out of pre_shutdown(), whose attributes (the
-    # worker-process monitor teardown, the request queue) this fixture does
-    # not seed.
+    # This partial fixture owns no worker or socket resources. Its finalizer
+    # must not wait on fake futures or tear down uninitialized fields.
+    proxy.shutdown = _Mock()
     proxy.doing_shutdown = True
 
     worker_future = _Future()
@@ -968,6 +967,29 @@ def _proxy_awaiting_worker_init(
         status_queue.get.return_value = ready_status
     proxy.worker_init_status_queue = status_queue
     return proxy
+
+
+def test_remote_supervision_failure_after_ready_preserves_startup_error():
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=True, ready_status=(GenerationExecutorProxy.READY_SIGNAL, None)
+    )
+    proxy._worker_process_monitor.wait_remote_ready.return_value = False
+    proxy._worker_process_monitor.find_dead_worker.return_value = WorkerProcessIdentity(
+        1, 4321, None, "follower", None
+    )
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+
+    with pytest.raises(RuntimeError, match="supervision is unavailable") as error:
+        proxy._start_executor_workers({})
+
+    cause = error.value.__cause__
+    assert isinstance(cause, RuntimeError)
+    assert "rank 1 (pid 4321)" in str(cause)
+    assert proxy._fatal_error is cause
+    assert pending.queue.get_nowait().root_cause is cause
+    called = [call[0] for call in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
 
 
 def test_worker_death_during_init_aborts_the_wedged_world():

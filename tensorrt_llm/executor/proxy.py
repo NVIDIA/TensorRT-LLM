@@ -995,7 +995,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._fail_initialization(
                 RuntimeError(
                     "Remote worker process supervision is unavailable"),
-                self._worker_process_monitor.find_dead_worker())
+                self._detect_worker_death_during_init())
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
