@@ -26,9 +26,9 @@ and role on all ranks together hold one space of bytes, of which each rank's buf
 
 A new way of laying a role out is one ``RoleLayoutV2`` subclass saying which pieces a rank holds.
 What a source rank sends a destination rank of one role follows from the two layouts alone. A KV
-cache manager names a layout per role (``page_table.PageTableSpec``). The layouts describe memory
-the KV cache owns, so they live beside it rather than in the transfer package; this module imports
-the standard library alone, so that any transfer backend may read them.
+cache manager names a layout per role (``pyexecutor.kv_cache.page_table.PageTableSpec``); only
+disaggregated transfer maps pages by them, so they live with it. This module imports the standard
+library alone, so that any transfer backend may read them.
 
 ``RoleLayoutV2`` is not the resharding geometry the ``get_disagg_*`` hooks return
 (``disaggregation.resource.page.RoleLayout``)."""

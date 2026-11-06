@@ -18,11 +18,11 @@ from typing import List, Optional
 
 import msgpack
 
+from tensorrt_llm._torch.disaggregation.base.role_layout import RankTopology
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
-from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import RankTopology
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 

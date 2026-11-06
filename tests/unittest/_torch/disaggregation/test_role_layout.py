@@ -21,7 +21,7 @@ from typing import ClassVar
 
 import pytest
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import (
+from tensorrt_llm._torch.disaggregation.base.role_layout import (
     ByHead,
     Own,
     Piece,
