@@ -63,6 +63,69 @@ def is_nccl_ep_installed() -> bool:
     return _nccl_ep_installed
 
 
+_device_api_support_cache: dict = {}
+
+
+def nccl_ep_device_api_supported(mapping: Mapping) -> bool:
+    """Return True iff NCCL reports Device API support for this EP group.
+
+    NCCL EP is built on the NCCL Device API (GPU-initiated networking and
+    symmetric memory). Platforms without it, e.g. DGX Spark over RoCE without
+    GPUDirect RDMA, fail in ``Group.create`` with "Device API is not supported",
+    after MoE communication was already selected and with no fallback. Probe the
+    EP-scoped communicator up front so auto-selection can skip NcclEP instead.
+
+    Collective over the EP group: every EP rank reaches MoE communication
+    selection together. The result is the minimum across ranks, so all ranks
+    pick the same strategy, and is cached per EP group. Any probe failure is
+    treated as "unsupported".
+    """
+    key = (mapping.pp_rank, mapping.moe_ep_size, mapping.moe_ep_rank)
+    if key in _device_api_support_cache:
+        return _device_api_support_cache[key]
+
+    import nccl.core as nccl_core
+
+    from tensorrt_llm._utils import mpi_comm, mpi_disabled
+
+    ep_mpi_comm = None
+    owned_comm = None
+    try:
+        if mpi_disabled():
+            from nccl.ep.interop.torch import get_nccl_comm_from_group
+
+            # Communicator owned by the torch process group; do not destroy it.
+            comm = get_nccl_comm_from_group(mapping.moe_ep_group_pg)
+            supported = bool(comm.device_api_support)
+        else:
+            from mpi4py import MPI
+
+            ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+            rank = ep_mpi_comm.Get_rank()
+            unique_id = nccl_core.get_unique_id() if rank == 0 else None
+            unique_id = ep_mpi_comm.bcast(unique_id, root=0)
+            owned_comm = nccl_core.Communicator.init(
+                nranks=ep_mpi_comm.Get_size(), rank=rank, unique_id=unique_id
+            )
+            local_ok = bool(owned_comm.device_api_support)
+            supported = bool(ep_mpi_comm.allreduce(int(local_ok), op=MPI.MIN) == 1)
+    except Exception as e:  # noqa: BLE001 - a failed probe means "do not use NcclEP"
+        logger.info(f"NCCL EP Device API probe failed ({e!r}); treating as unsupported")
+        supported = False
+    finally:
+        if owned_comm is not None:
+            try:
+                owned_comm.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        if ep_mpi_comm is not None:
+            ep_mpi_comm.Free()
+
+    logger.info(f"NCCL EP Device API supported: {supported}")
+    _device_api_support_cache[key] = supported
+    return supported
+
+
 def get_nccl_ep_version() -> Optional[Version]:
     """Return the loaded embedded ``libnccl_ep.so`` version, if available."""
     try:
