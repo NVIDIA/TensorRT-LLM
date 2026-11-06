@@ -50,7 +50,7 @@ from tensorrt_llm._torch.distributed import AllReduce
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from . import dispatch_combine
+from .. import dispatch_combine
 from . import expert as nvfp4_expert
 from .component_bf16 import (
     MAX_TOKENS,

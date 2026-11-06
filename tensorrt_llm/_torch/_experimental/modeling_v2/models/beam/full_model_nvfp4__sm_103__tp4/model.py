@@ -48,7 +48,7 @@ from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadat
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from . import _attention
+from .. import _attention
 
 #: Logical decoder layers, all executed by every call.
 NUM_LAYERS = 52

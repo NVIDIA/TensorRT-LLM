@@ -85,7 +85,7 @@ from tensorrt_llm._torch.distributed import AllReduce, allgather
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping as ParallelMapping
 
-from . import _attention, dispatch_combine
+from .. import _attention, dispatch_combine
 from .layout_bf16 import (
     EMBED,
     FINAL_NORM,

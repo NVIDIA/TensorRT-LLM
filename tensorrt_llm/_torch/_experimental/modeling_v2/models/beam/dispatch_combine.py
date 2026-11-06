@@ -1,15 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Beam MoE dispatch and weighted combination of decoder block 3 / sm_103 / tp1, called directly.
+"""Shared Beam MoE dispatch and weighted combination for TP1 components and TP4 models.
 
-A component, not a routed target. There is no ``routing.py``, no router-index entry and
-no ``ForCausalLM``: nothing in the engine calls this function, and it serves no request.
-A caller passes the hidden states that enter block 3's feed-forward sublayer, the router's
-result for them -- eight expert ids and eight mixing weights per token -- and an expert
-provider. The function sends each token's rows to its experts through the provider and
-returns the weighted, combined and scaled expert outputs. It holds no state: no router
-parameter, no expert matrix and no configuration object, so there is nothing to build or
-load before calling it. It does not call the built-in Beam modeling.
+A caller supplies hidden states, eight expert ids and mixing weights per token, and
+an expert provider. This stateless helper sends token rows to their experts and
+returns the weighted, combined and scaled outputs. The provider owns parameter
+loading and expert execution.
 
 Ownership. This component owns dispatch and combination; the provider owns the expert
 computation. ``expert_provider(expert_id, rows)`` is called once for every selected

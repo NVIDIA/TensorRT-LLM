@@ -48,7 +48,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from ..full_model_nvfp4__sm_103__tp4 import _attention
+from .. import _attention
 
 #: The configuration this component computes, as the checkpoint's config.json states it.
 #: Anything else is rejected at construction rather than computed approximately.

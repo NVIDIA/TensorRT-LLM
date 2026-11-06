@@ -2,10 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU component, cache geometry and checkpoint contracts; no engine registration."""
 
+import ast
+from importlib.util import resolve_name
+from pathlib import Path
 from types import SimpleNamespace as NS
 
 import pytest
 
+from tensorrt_llm._torch._experimental.modeling_v2.models import beam
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
     layout_bf16 as layout,
 )
@@ -226,3 +230,25 @@ def test_checkpoint_validation_uses_shared_recipe_reader(
     (tmp_path / "config.json").write_text(json.dumps(cfg))
     monkeypatch.setattr(nvfp4_layout, "tensor_specs", lambda config: recipe_specs)
     assert nvfp4_layout.check_checkpoint(tmp_path) == cfg
+
+
+def test_components_do_not_import_full_model_internals():
+    family = Path(next(iter(beam.__path__)))
+    target = family / "full_model_nvfp4__sm_103__tp4"
+    target_module = f"{beam.__name__}.{target.name}"
+    for source in family.rglob("*.py"):
+        if source.is_relative_to(target):
+            continue
+        package = ".".join((beam.__name__, *source.parent.relative_to(family).parts))
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                module = resolve_name("." * node.level + (node.module or ""), package)
+                modules = [f"{module}.{alias.name}" for alias in node.names]
+            else:
+                continue
+            for module in modules:
+                assert module != target_module and not module.startswith(target_module + "."), (
+                    f"{source.relative_to(family)} imports target-private code: {module}"
+                )

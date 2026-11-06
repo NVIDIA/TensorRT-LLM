@@ -60,7 +60,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 
-from ..full_model_nvfp4__sm_103__tp4 import _attention
+from .. import _attention
 from ..moe_bf16__sm_103__tp1.moe import BeamMoeBf16Sm103Tp1, check_weights
 from ..moe_bf16__sm_103__tp1.moe import check_config as check_moe_config
 
