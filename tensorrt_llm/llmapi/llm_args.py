@@ -4760,13 +4760,15 @@ class ColdPageQuantizationCompressionConfig(KvCacheCompressionConfig):
         status="prototype",
         description=
         "Number of leading tokens per sequence kept unquantized in the cold tiers, "
-        "in whole cache pages.")
+        "in whole cache pages. Applies to full-attention layers; sliding-window "
+        "layers are stored as ordinary cold pages.")
     mixed_precision_last_n: NonNegativeInt = Field(
         default=0,
         status="prototype",
         description=
         "Number of most recent tokens per sequence kept unquantized in the cold "
-        "tiers, in whole cache pages.")
+        "tiers, in whole cache pages. Applies to full-attention layers; "
+        "sliding-window layers are stored as ordinary cold pages.")
 
     @property
     def mixed_precision_high_window(self) -> Optional[tuple[int, int]]:

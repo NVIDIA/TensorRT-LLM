@@ -294,6 +294,25 @@ def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
     assert manager.mixed_precision_high_block_deltas == {0: 0}
 
 
+def test_cold_page_window_is_per_layer_and_skips_sliding_window_layers(make_manager):
+    """A sliding-window layer gets no high layer and stays an ordinary cold-page layer of the codec."""
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(max_attention_window=[1024, 513], pool_ratio=[0.5, 0.25, 0.25]),
+        num_layers=2,
+        cold_page_codec_provider=provider,
+    )
+    # Only the full-attention layer 0 takes the window; its high layer is appended as layer 2.
+    assert manager.mixed_precision_high_layers == {0: 2}
+    config = manager.kv_cache_manager_py_config
+    assert config.layers[1].sliding_window_size == 513
+    assert (config.layers[2].num_sink_tokens, config.layers[2].sliding_window_size) == (1, 66)
+    # The codec quantizes both model layers, the sliding-window layer included, never the high layer.
+    assert [
+        [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
+    ] == [[0, 1]]
+
+
 def test_cold_page_window_skips_the_codec_while_estimating(make_manager):
     provider = _ColdPageProvider(first_n=0, last_n=65)
     manager = make_manager(
