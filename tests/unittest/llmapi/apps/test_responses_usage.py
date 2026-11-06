@@ -263,7 +263,7 @@ def test_a_streamed_response_counts_reasoning_tokens():
         token_ids=[1, 2, 3],
         disaggregated_params=None,
     )
-    result = SimpleNamespace(outputs=[output], _done=True, prompt_token_ids=[1], cached_tokens=0)
+    result = SimpleNamespace(outputs=[output], finished=True, prompt_token_ids=[1], cached_tokens=0)
     processor.process_single_output(result)
     frame = processor.get_final_response_non_store(result, tokenizer=_WordTokenizer())
     usage = json.loads(frame.split("data: ", 1)[1])["response"]["usage"]

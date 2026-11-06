@@ -659,7 +659,7 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
             data = chunk.model_dump_json(exclude_none=True)
             res.append(f"data: {data}\n\n")
 
-    if include_usage and rsp._done:
+    if include_usage and rsp.finished:
         completion_tokens = sum(output.length for output in rsp.outputs)
         final_usage = UsageInfo(
             prompt_tokens=prompt_tokens,
@@ -950,7 +950,7 @@ def completion_stream_post_processor(rsp: DetokenizedGenerationResultBase,
         data = chunk.model_dump_json(exclude_unset=False)
         res.append(f"data: {data}\n\n")
 
-    if include_usage and rsp._done:
+    if include_usage and rsp.finished:
         completion_tokens = sum(output.length for output in rsp.outputs)
         final_usage = UsageInfo(
             prompt_tokens=prompt_tokens,
@@ -1089,7 +1089,7 @@ def chat_harmony_streaming_post_processor(
         result=rsp,
         model=args.model,
         request_id=str(rsp.id),
-        done=rsp._done,
+        done=rsp.finished,
         num_prompt_tokens=prompt_tokens,
         first_iteration=args.first_iteration,
         stream_options=args.stream_options,
@@ -1146,7 +1146,7 @@ def responses_api_streaming_post_processor(
         raise ValueError(
             "streaming_processor is required for streaming post-processing")
     outputs = args.streaming_processor.process_single_output(rsp)
-    if rsp._done:
+    if rsp.finished:
         outputs.append(
             args.streaming_processor.get_final_response_non_store(
                 rsp, args.usage_num_prompt_tokens(), tokenizer=args.tokenizer))

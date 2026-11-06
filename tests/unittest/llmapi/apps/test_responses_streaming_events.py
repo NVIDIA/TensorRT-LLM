@@ -523,7 +523,7 @@ def test_streamed_responses_use_wire_field_names():
         token_ids=[1],
         disaggregated_params=None,
     )
-    result = SimpleNamespace(outputs=[output], _done=True, prompt_token_ids=[1], cached_tokens=0)
+    result = SimpleNamespace(outputs=[output], finished=True, prompt_token_ids=[1], cached_tokens=0)
     frames = processor.get_initial_responses() + processor.process_single_output(result)
     frames.append(processor.get_final_response_non_store(result))
 
@@ -548,9 +548,7 @@ def _step(text, diff, done):
         token_ids=[1] * len(text),
         disaggregated_params=None,
     )
-    return SimpleNamespace(
-        outputs=[output], _done=done, prompt_token_ids=[1], cached_tokens=0, finished=done
-    )
+    return SimpleNamespace(outputs=[output], finished=done, prompt_token_ids=[1], cached_tokens=0)
 
 
 def _server_frames(steps, processor=None, fail=None, produced=None):
@@ -573,7 +571,7 @@ def _server_frames(steps, processor=None, fail=None, produced=None):
             text += diff
             result = _step(text, diff, done=fail is None and i == len(steps) - 1)
             step_frames = processor.process_single_output(result)
-            if result._done:
+            if result.finished:
                 step_frames.append(processor.get_final_response_non_store(result))
             for frame in step_frames:
                 produced.append(frame)
@@ -972,7 +970,7 @@ def _server_streaming(monkeypatch, steps):
                 await asyncio.sleep(pause)
                 text += diff
                 result = _step(text, diff, done=i == len(steps) - 1)
-                self.finished = result._done
+                self.finished = result.finished
                 yield result
 
     server.generator = SimpleNamespace(
