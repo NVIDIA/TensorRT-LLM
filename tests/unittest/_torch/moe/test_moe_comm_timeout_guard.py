@@ -14,10 +14,11 @@
 # limitations under the License.
 """Tests for the MoE communication timeout guard and its backend proxies.
 
-The budget and guard tests are CPU-only. The proxy tests call each backend's native setter, so
-they need the built extensions; all but the DeepGEMM and DeepEP round trips, which need a GPU,
-are CPU-only too. They import the backends inside the tests, because the CPU-only stage collects
-this whole file.
+The budget and guard tests are CPU-only. The NVLink one-sided and moe_a2a proxy tests call the
+native ops, so they need the built extensions; the DeepGEMM and NCCL-EP mapping tests use
+stand-ins. All proxy tests except the DeepGEMM and DeepEP round trips, which need a GPU, are
+CPU-only. They import the backends inside the tests, because the CPU-only stage collects this
+whole file.
 """
 
 import gc
