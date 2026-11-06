@@ -39,38 +39,38 @@ from collections import OrderedDict
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.beam_logit_softcap import (  # noqa: E501
-    beam_logit_softcap,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
-    swiglu_fp32,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_nope_query_scale import (  # noqa: E501
-    beam_nope_query_scale,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
-    beam_output_gate,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (  # noqa: E501
-    beam_dispatch_combine_op,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
-    beam_grouped_topk_router,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (  # noqa: E501
+    beam_logit_softcap,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
+    swiglu_fp32,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
+    beam_neox_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
+    beam_nope_query_scale,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
+    beam_output_gate,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
+    beam_dispatch_combine_op,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
+    beam_grouped_topk_router,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.small_model_prefill_bf16__sm_103__tp1 import (  # noqa: E501

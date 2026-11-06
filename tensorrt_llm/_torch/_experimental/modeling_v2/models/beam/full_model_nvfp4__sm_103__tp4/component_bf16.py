@@ -48,33 +48,35 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     MODELING_V2_VALIDATE_ENV,
     step_contract_enabled,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.beam_logit_softcap import (
-    beam_logit_softcap,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import swiglu_fp32
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_nope_query_scale import (  # noqa: E501
-    beam_nope_query_scale,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
-    beam_output_gate,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (
-    beam_grouped_topk_router,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.beam_rmsnorm_fp32 import (
-    beam_rmsnorm_fp32,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
+    beam_logit_softcap,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (
+    swiglu_fp32,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
+    beam_neox_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
+    beam_nope_query_scale,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
+    beam_output_gate,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
+    beam_grouped_topk_router,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.norm.beam_rmsnorm_fp32 import (
+    beam_rmsnorm_fp32,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual,
     depth_scales,
 )

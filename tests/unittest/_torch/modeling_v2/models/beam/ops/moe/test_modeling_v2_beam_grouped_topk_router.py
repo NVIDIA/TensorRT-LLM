@@ -5,11 +5,11 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
     beam_grouped_topk_router as op,
 )
 
-__extra_import_path__ = ["..", "../../../.."]
+__extra_import_path__ = ["../../moe_router_bf16__sm_103__tp1", "../../../.."]
 import _router_cases as cases  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 

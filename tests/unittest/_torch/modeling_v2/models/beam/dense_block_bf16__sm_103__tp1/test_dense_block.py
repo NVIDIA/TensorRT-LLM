@@ -55,21 +55,12 @@ except ModuleNotFoundError as exc:
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.flashinfer_silu_and_mul import (  # noqa: E501
     flashinfer_silu_and_mul,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
-    beam_output_gate,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     thop_attention,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
-    beam_depth_residual,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16__sm_103__tp1 import (  # noqa: E501
     block as block_module,
@@ -79,6 +70,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.beam.dense_block_bf16_
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (
     _attention,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
+    beam_neox_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
+    beam_output_gate,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
+    beam_depth_residual,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2

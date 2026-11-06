@@ -28,14 +28,14 @@ import inspect
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (  # noqa: E501
-    beam_dispatch_combine_op,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4 import (  # noqa: E501
     dispatch_combine,
 )
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.full_model_nvfp4__sm_103__tp4.dispatch_combine import (  # noqa: E501
     beam_dispatch_combine,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
+    beam_dispatch_combine_op,
 )
 
 __extra_import_path__ = [".", ".."]

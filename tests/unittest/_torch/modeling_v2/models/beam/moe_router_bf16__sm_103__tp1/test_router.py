@@ -57,13 +57,13 @@ except ModuleNotFoundError as exc:
     if exc.name != "tensorrt_llm._torch.models.modeling_beam":
         raise
     builtin_beam = None  # The standard-serving implementation is a separate PR.
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (  # noqa: E501
-    BeamGroupedTopkRouter,
-    beam_grouped_topk_router,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.models.beam.moe_router_bf16__sm_103__tp1.router import (  # noqa: E501
     NORM_EPS,
     BeamMoeRouterBf16Sm103Tp1,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (  # noqa: E501
+    BeamGroupedTopkRouter,
+    beam_grouped_topk_router,
 )
 
 __extra_import_path__ = [".", "..", "../../.."]

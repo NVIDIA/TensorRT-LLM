@@ -26,7 +26,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_grouped_topk_router import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_grouped_topk_router import (
     beam_grouped_topk_router,
 )
 

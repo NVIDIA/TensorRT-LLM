@@ -5,21 +5,30 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.swiglu_fp32 import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.swiglu_fp32 import (  # noqa: E501
     swiglu_fp32 as op,
 )
 
-__extra_import_path__ = ["..", "../../../.."]
+__extra_import_path__ = ["../../moe_expert_bf16__sm_103__tp1", "../../../.."]
 import _expert_cases as cases  # noqa: E402
+from _cells import certified_cells  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "swiglu_fp32 requires a CUDA device"
 
 
-@pytest.fixture(scope="module", autouse=True)
-def controls():
-    with cases.numerical_controls():
-        yield
+TARGET_CELLS = {
+    "beam/full_model_nvfp4__sm_103__tp4": tuple(
+        Cell(
+            why=f"beam TP4 SwiGLU {width} wide, {tokens} tokens",
+            spec=dict(tokens=tokens, intermediate=width, dtype=torch.bfloat16),
+        )
+        for width in (640, 5120)
+        for tokens in (1, 17, 129)
+    ),
+}
+CELLS = certified_cells(op, TARGET_CELLS)
 
 
 def _build(spec, seed):
@@ -32,7 +41,7 @@ def _build(spec, seed):
 
 
 @pytest.mark.parametrize("seed", cases.SEEDS)
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:26] for c in op.CELLS])
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:26] for c in CELLS])
 def test_certified_cells(cell, seed, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """SiLU and product within 2^-16 relative of the fp64 steps (fp32 formula spread on the
     same inputs), the activation within one bf16 unit (a product that close to a rounding
