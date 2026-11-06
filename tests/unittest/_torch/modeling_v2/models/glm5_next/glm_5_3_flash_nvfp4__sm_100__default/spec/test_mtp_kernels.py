@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_100__default.kernels import (  # noqa: E501
     drafting_rows,
     embed_rms_norm_columns,
+    mtp_commit,
 )
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
@@ -53,3 +54,22 @@ def test_drafting_rows_matches_torch(n):
     want = batch_indices.long() * width + num_accepted - 1
     assert got.dtype == torch.int64
     torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("n", [1, 3, 64])
+def test_mtp_commit_matches_cache_manager_update(n):
+    """The fused drafting rows + KDA replay record against drafting_rows and the cache manager's torch update."""
+    torch.manual_seed(n)
+    width = 4
+    batch_indices = torch.randperm(n, device="cuda").to(torch.int32)
+    num_accepted = torch.randint(1, width + 1, (n,), dtype=torch.int32, device="cuda")
+    state_indices = torch.randperm(2 * n, device="cuda")[:n].to(torch.int32)
+    dummy = torch.rand(n, device="cuda") < 0.25
+    prev = torch.randint(0, 4, (2 * n + 1,), dtype=torch.int32, device="cuda")
+    want_prev = prev.clone()
+    current = want_prev[state_indices.long()]
+    accepted = (num_accepted - 1).to(torch.int32).clamp(min=0)
+    want_prev[state_indices.long()] = torch.where(dummy, current, accepted)
+    rows = mtp_commit(batch_indices, num_accepted, width, state_indices, dummy, prev)
+    assert torch.equal(rows, drafting_rows(batch_indices, num_accepted, width))
+    assert torch.equal(prev, want_prev)

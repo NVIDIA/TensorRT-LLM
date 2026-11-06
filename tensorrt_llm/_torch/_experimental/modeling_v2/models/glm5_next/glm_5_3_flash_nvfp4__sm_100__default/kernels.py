@@ -118,3 +118,56 @@ def drafting_rows(
             batch_indices, num_accepted, out, n, width, BLOCK=max(16, triton.next_power_of_2(n))
         )
     return out
+
+
+@triton.jit
+def _mtp_commit_kernel(
+    batch_indices_ptr,
+    num_accepted_ptr,
+    rows_ptr,
+    state_indices_ptr,
+    dummy_ptr,
+    prev_ptr,
+    n,
+    width,
+    BLOCK: tl.constexpr,
+):
+    i = tl.arange(0, BLOCK)
+    m = i < n
+    b = tl.load(batch_indices_ptr + i, mask=m, other=0).to(tl.int64)
+    a = tl.load(num_accepted_ptr + i, mask=m, other=1).to(tl.int64)
+    tl.store(rows_ptr + i, b * width + a - 1, mask=m)
+    slot = tl.load(state_indices_ptr + i, mask=m, other=0).to(tl.int64)
+    dummy = tl.load(dummy_ptr + i, mask=m, other=1) != 0
+    accepted = tl.maximum(a - 1, 0).to(tl.int32)
+    tl.store(prev_ptr + slot, accepted, mask=m & (dummy == 0))
+
+
+def mtp_commit(
+    batch_indices: torch.Tensor,
+    num_accepted: torch.Tensor,
+    width: int,
+    state_indices: torch.Tensor,
+    dummy_mask: torch.Tensor,
+    prev_num_accepted: torch.Tensor,
+) -> torch.Tensor:
+    """:func:`drafting_rows` (returned) and the KDA replay record of each generation request in one launch: for
+    every non-dummy request ``prev_num_accepted[state_indices[i]] = max(num_accepted[i] - 1, 0)`` (the accepted
+    drafts the next verify replays; a dummy request's slot is left as is)."""
+    n = num_accepted.shape[0]
+    assert batch_indices.shape[0] == n and state_indices.shape[0] == n and dummy_mask.shape[0] == n
+    assert prev_num_accepted.dtype == torch.int32
+    out = torch.empty(n, dtype=torch.int64, device=num_accepted.device)
+    if n:
+        _mtp_commit_kernel[(1,)](
+            batch_indices,
+            num_accepted,
+            out,
+            state_indices,
+            dummy_mask,
+            prev_num_accepted,
+            n,
+            width,
+            BLOCK=max(16, triton.next_power_of_2(n)),
+        )
+    return out

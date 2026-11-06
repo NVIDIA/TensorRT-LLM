@@ -99,7 +99,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.modules.mhc.hyper_connection import mHC
 
 from . import weights as _weights
-from .kernels import drafting_rows, embed_rms_norm_columns
+from .kernels import drafting_rows, embed_rms_norm_columns, mtp_commit
 
 # A/B escape hatch (read once at import): run the speculative step on the stock MTP-Eagle worker instead of
 # ``Glm5NextMtpStep``, with the same drafter. Measures the in-model step against the worker it replaces.
@@ -2846,6 +2846,419 @@ class _FusedHeadArgmax:
         return out
 
 
+class _FusedMtpDraftStep:
+    """A draft step ``d >= 1`` of the MTP chain for at most ``MAX_ROWS`` rows in ten kernels (``trtllm::glm5_mtp_*``)
+    around the attention backend's four calls.
+
+    Each kernel streams one weight matrix of the step through the tensor cores with its producer and consumer fused
+    in: the eh input norms and eh_proj; the first all-reduce with input_layernorm and the [q_a | kv_a] / indexer
+    projections; the q_a / kv_a / k norms with q_b; the query absorption; (cache append, pool keys, selection, sparse
+    MLA); the V projection; o_proj; the second all-reduce with the residual, post_attention_layernorm, the router and
+    the shared expert's gate/up; the routing with this rank's FP8 experts' FC1 and the shared expert's down; the
+    experts' FC2 with the routed + shared sum; the third all-reduce with shared_head.norm, the LM head and the greedy
+    token. The all-reduces exchange bf16 partials through this rank's peer-mapped buffers.
+
+    Applies to TP4 attention with EP4 FP8 block-scale experts, without attention DP, on generation rows that share
+    step 0's indexer selection.
+    """
+
+    MAX_ROWS = 8
+    MAX_RANKS = 8
+    HIDDEN = 4096
+    #: bytes of a rank's all-reduce buffers: 3 x MAX_RANKS x MAX_ROWS x HIDDEN bf16.
+    AR_BYTES = 3 * MAX_RANKS * MAX_ROWS * HIDDEN * 2
+    #: experts one rank may run per call, and the routed intermediate size.
+    MAX_SLOTS = 64
+    MOE_INTER = 2048
+    #: int32 words of the route table.
+    ROUTE_WORDS = 4096
+
+    def __init__(self, mapping: Mapping, buffers: Any, device: torch.device) -> None:
+        self._rank = mapping.tp_rank
+        self._ep_rank = mapping.moe_ep_rank
+        self._peer_ptrs = [int(p) for p in buffers.peer_ptrs]
+        self._buffers = buffers  # keeps the peer mappings alive
+        self._device = device
+        self._work: dict[str, torch.Tensor] | None = None
+        self._wk_t: tuple[Any, torch.Tensor] | None = None
+
+    @classmethod
+    def create(
+        cls, mapping: Mapping, head: "_FusedHeadArgmax | None"
+    ) -> "_FusedMtpDraftStep | None":
+        """Collective over the TP group (every rank calls it in step); None where the kernels do not apply."""
+        reason = None
+        if os.environ.get("TLLM_GLM5_MTP_FUSED_STEP", "1") == "0":
+            reason = "TLLM_GLM5_MTP_FUSED_STEP=0"
+        elif not hasattr(torch.ops.trtllm, "glm5_mtp_pre"):
+            reason = "the trtllm::glm5_mtp_* ops are not built"
+        elif torch.cuda.get_device_capability()[0] < 10:
+            reason = "it needs SM100+"
+        elif mapping.enable_attention_dp or mapping.tp_size != 4:
+            reason = "it needs TP4 attention without attention DP"
+        elif mapping.moe_ep_size != mapping.tp_size or mapping.moe_tp_size != 1:
+            reason = "it needs EP experts over the TP group"
+        elif head is None:
+            reason = "the fused LM head is off"
+        fused = None
+        if reason is None:
+            buffers = _PeerBuffers.create(mapping, cls.AR_BYTES)
+            if buffers is None:
+                reason = "no peer memory for the all-reduces"
+            else:
+                # Every element starts out empty (-0.0) before any rank pushes into it.
+                from tensorrt_llm._ipc_utils import cuda as _cuda_driver
+
+                (err,) = _cuda_driver.cuMemsetD16(buffers.local_ptr, 0x8000, cls.AR_BYTES // 2)
+                if err != _cuda_driver.CUresult.CUDA_SUCCESS:
+                    raise RuntimeError(f"glm5_next fused MTP step: cuMemsetD16 failed: {err}")
+                torch.cuda.synchronize()
+                from tensorrt_llm._torch.distributed.mnnvl_memory import TpMnnvlMemory
+
+                TpMnnvlMemory.get_comm(mapping).barrier()
+                fused = cls(mapping, buffers, torch.device("cuda", torch.cuda.current_device()))
+        logger.info_once(
+            "glm5_next fused MTP draft step: " + ("on" if fused is not None else f"off ({reason})"),
+            key="glm5_next_fused_mtp_step",
+        )
+        return fused
+
+    @staticmethod
+    def _eps(norm: nn.Module) -> float:
+        return float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 1e-5)))
+
+    def applies(self, layer: "Glm5NextMTP", rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Host-side check of one draft step (rows, the layer's weight formats, a generation-only decode layout)."""
+        if not 1 <= rows <= self.MAX_ROWS:
+            return False
+        share = layer.index_share
+        if share is None or share.step < 1 or share.selection is None:
+            return False
+        if attn_metadata.num_contexts != 0:
+            return False
+        return self._weights_apply(layer)
+
+    def applies_step0(
+        self, layer: "Glm5NextMTP", rows: int, picked: int, attn_metadata: AttentionMetadata
+    ) -> bool:
+        """Host-side check of step 0 on the verify layout: every request's verify rows (``rows`` in all, at most
+        MAX_ROWS) through the attention, the MoE and the head on its drafting row (``picked``); generation only."""
+        if not 1 <= picked <= rows <= self.MAX_ROWS or rows % picked:
+            return False
+        share = layer.index_share
+        if share is None or share.step != 0 or attn_metadata.num_contexts != 0:
+            return False
+        indexer = layer.self_attn.indexer
+        return (
+            indexer.wk_gate_wp.weight.dtype == torch.bfloat16
+            and indexer.wk_gate_wp.weight.shape[0] % 16 == 0
+            and indexer.wq_b.weight.dtype == torch.bfloat16
+            and tuple(indexer.wq_b.weight.shape)
+            == (indexer.n_heads * indexer.head_dim, layer.self_attn.q_lora_rank)
+            and indexer.n_heads * indexer.head_dim <= 32 * 128
+            and self._weights_apply(layer)
+        )
+
+    def _weights_apply(self, layer: "Glm5NextMTP") -> bool:
+        experts = getattr(layer.mlp.experts, "backend", layer.mlp.experts)
+        w13 = getattr(experts, "w3_w1_weight", None)
+        w2 = getattr(experts, "w2_weight", None)
+        attn = layer.self_attn
+        return (
+            w13 is not None
+            and w2 is not None
+            and w13.dtype == torch.float8_e4m3fn
+            and w2.dtype == torch.float8_e4m3fn
+            and tuple(w13.shape[1:]) == (2 * self.MOE_INTER, self.HIDDEN)
+            and getattr(experts, "w3_w1_weight_scaling_factor", None) is not None
+            and layer.eh_proj.weight.dtype == torch.bfloat16
+            and tuple(layer.eh_proj.weight.shape) == (self.HIDDEN, self.HIDDEN // 2)
+            and attn.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16
+            and attn.q_b_proj.weight.dtype == torch.bfloat16
+            and attn.o_proj.weight.dtype == torch.bfloat16
+            and layer.mlp.shared_experts.gate_up_proj.weight.dtype == torch.bfloat16
+            and layer.mlp.shared_experts.down_proj.weight.dtype == torch.bfloat16
+        )
+
+    def _workspace(self) -> dict[str, torch.Tensor]:
+        """Per-step intermediates, allocated once (graph replays reuse them)."""
+        if self._work is None:
+            m, h, dev, bf16 = self.MAX_ROWS, self.HIDDEN, self._device, torch.bfloat16
+            self._work = {
+                "residual": torch.empty(m, h, dtype=bf16, device=dev),
+                "qkv": torch.empty(m, 1536 + 512 + 256, dtype=bf16, device=dev),
+                # step 0: [q_a | kv_a | k | gate | indexer head weights]
+                "qkv0": torch.empty(m, 1536 + 512 + 256 + 32, dtype=bf16, device=dev),
+                # step 0: the indexer's query (wq_b of the normalized q_a)
+                "q_index": torch.empty(m, 32 * 128, dtype=bf16, device=dev),
+                "latent": torch.empty(m, 512, dtype=bf16, device=dev),
+                "packed": torch.empty(m, 256, dtype=bf16, device=dev),
+                "query": torch.empty(m, 16 * 256, dtype=bf16, device=dev),
+                "q_latent": torch.empty(m, 16 * 512, dtype=bf16, device=dev),
+                "v": torch.empty(m, 16 * 256, dtype=bf16, device=dev),
+                "summed": torch.empty(m, h, dtype=bf16, device=dev),
+                "mlp_in": torch.empty(m, h, dtype=bf16, device=dev),
+                "shared_inter": torch.empty(m, 512, dtype=bf16, device=dev),
+                "shared_out": torch.empty(m, h, dtype=bf16, device=dev),
+                # The routed experts' clamped SwiGLU (fp32), fc1 -> fc2.
+                "inter": torch.empty(
+                    self.MAX_SLOTS, m, self.MOE_INTER, dtype=torch.float32, device=dev
+                ),
+                # The router's routing for fc1 / fc2 (and its tile counter: zero at rest).
+                "route": torch.zeros(self.ROUTE_WORDS, dtype=torch.int32, device=dev),
+            }
+        return self._work
+
+    def _router_logits(self, num_experts: int) -> torch.Tensor:
+        logits = self._work.get("logits")
+        if logits is None or logits.shape[1] != num_experts:
+            logits = torch.empty(
+                self.MAX_ROWS, num_experts, dtype=torch.float32, device=self._device
+            )
+            self._work["logits"] = logits
+        return logits
+
+    def _wk_transposed(self, attn: "Glm5NextSparseAttention") -> torch.Tensor:
+        """``w_k`` as [heads, kv_lora, nope] (the absorption's weight rows K-contiguous), cached per weight."""
+        weight = attn.kv_b_proj.weight
+        key = (weight.data_ptr(), weight._version)
+        if self._wk_t is None or self._wk_t[0] != key:
+            w_k, _ = attn.absorbed_kv_b()
+            self._wk_t = (key, w_k.transpose(1, 2).contiguous())
+        return self._wk_t[1]
+
+    def step0(
+        self,
+        layer: "Glm5NextMTP",
+        draft_model: "Glm5NextDraftModel",
+        step_ids: torch.Tensor,
+        step_hidden: torch.Tensor,
+        pick_rows: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        vocab_head: "_NcclVocabParallelHead",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(hidden [picked, hidden], tokens [picked] int32)`` of step 0 (see :meth:`applies_step0`): the input
+        projections and the attention (with the indexer's scoring and top-k, kept for the later steps) on every verify
+        row, the MoE and the head on ``pick_rows``."""
+        ops = torch.ops.trtllm
+        m0 = step_ids.shape[0]
+        m = pick_rows.shape[0]
+        w = self._workspace()
+        peers, rank = self._peer_ptrs, self._rank
+        attn = layer.self_attn
+        indexer = attn.indexer
+        use_embed = rank < 2
+        ops.glm5_mtp_pre(
+            m0, step_ids.to(torch.int32), 1, step_hidden.contiguous(),
+            draft_model.embed_tokens.weight, use_embed,
+            layer.enorm.weight if use_embed else layer.hnorm.weight,
+            self._eps(layer.enorm if use_embed else layer.hnorm), (rank % 2) * (self.HIDDEN // 2),
+            layer.eh_proj.weight, peers, rank,
+        )  # fmt: skip
+        idx_rows = indexer.wk_gate_wp.weight.shape[0]
+        width = attn.q_lora_rank + attn.kv_lora_rank + idx_rows
+        qkv = w["qkv0"][:m0, :width]
+        ops.glm5_mtp_qkv_a(
+            m0, peers, rank, layer.input_layernorm.weight, self._eps(layer.input_layernorm), w["residual"][:m0],
+            attn.kv_a_proj_with_mqa.weight, indexer.wk_gate_wp.weight, idx_rows, qkv,
+        )  # fmt: skip
+        # q_b and the indexer's wq_b over the same normalized q_a (the draft steps reuse this step's selection).
+        q_index = w["q_index"][:m0]
+        ops.glm5_mtp_q_b(
+            qkv, attn.q_lora_rank, attn.kv_lora_rank, indexer.head_dim,
+            attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight, self._eps(attn.q_a_layernorm),
+            indexer.k_norm.weight, indexer.k_norm.bias, self._eps(indexer.k_norm),
+            w["latent"][:m0], w["packed"][:m0], attn.q_b_proj.weight, w["query"][:m0],
+            indexer.wq_b.weight, q_index,
+        )  # fmt: skip
+        ops.glm5_mtp_absorb(w["query"][:m0], self._wk_transposed(attn), w["q_latent"][:m0])
+        q_index = q_index.view(m0, indexer.n_heads, indexer.head_dim)
+        index_weights = qkv[:, attn.q_lora_rank + attn.kv_lora_rank + 2 * indexer.head_dim :]
+
+        ctx = build_glm5_next_runtime_context(attn_metadata)
+        tokens_per_request = ctx.gen_tokens_per_request
+        batch = m0 // tokens_per_request
+        rows = ctx.generation_rows(indexer.index_kpool)
+        backend = attn.attn_backend
+        backend.append_paged_state(
+            w["latent"][:m0].view(batch, tokens_per_request, -1),
+            w["packed"][:m0].view(batch, tokens_per_request, -1),
+            rows.positions,
+            ctx.metadata,
+        )
+        backend.update_pool_keys(rows.positions, indexer.index_kpool_compress_ape, ctx.metadata)
+        scores = backend.score_pools(
+            q_index,
+            index_weights,
+            ctx.metadata,
+            q_scale=indexer.softmax_scale,
+            w_scale=indexer.head_mix_scale,
+            kv_lens=rows.visible,
+            rows_per_request=tokens_per_request,
+            request_ids=rows.request_ids,
+            max_kv_len=None,
+            table_range=None,
+        )
+        selected = torch.empty(m0, indexer.select_k, dtype=torch.int32, device=q_index.device)
+        indexer.pool_top_k(
+            scores,
+            selected,
+            is_prefill=False,
+            sequence_lengths=rows.num_candidates,
+            scan_lengths=rows.num_candidates,
+        )
+        layer.index_share.keep(selected, AttentionInputType.generation_only)
+        topk_rows = backend.expand_selection(
+            selected, ctx.metadata, kv_lens=rows.visible, request_ids=rows.request_ids
+        )
+        out_latent = backend.forward(
+            w["q_latent"][:m0].view(m0, attn.num_heads, attn.kv_lora_rank),
+            None,
+            None,
+            ctx.metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.generation_only,
+                sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
+            ),
+        )
+        ops.glm5_mtp_v_up(
+            out_latent,
+            attn.kv_b_proj.weight,
+            attn.num_heads,
+            attn.qk_nope_head_dim,
+            attn.v_head_dim,
+            w["v"][:m0],
+        )
+        ops.glm5_mtp_o_proj(w["v"][:m0], attn.o_proj.weight, peers, rank)
+        return self._moe_and_head(
+            layer, m, w["residual"][:m0], pick_rows.to(torch.int32), step_hidden, vocab_head
+        )
+
+    def __call__(
+        self,
+        step: int,
+        layer: "Glm5NextMTP",
+        draft_model: "Glm5NextDraftModel",
+        step_ids: torch.Tensor,
+        step_hidden: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        vocab_head: "_NcclVocabParallelHead",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(hidden [rows, hidden], tokens [rows] int32)`` of draft step ``step`` (see :meth:`applies`)."""
+        ops = torch.ops.trtllm
+        m = step_ids.shape[0]
+        w = self._workspace()
+        peers, rank = self._peer_ptrs, self._rank
+        attn = layer.self_attn
+        indexer = attn.indexer
+        eps = self._eps(layer.input_layernorm)
+        use_embed = rank < 2
+        ops.glm5_mtp_pre(
+            m, step_ids.to(torch.int32), 1, step_hidden.contiguous(),
+            draft_model.embed_tokens.weight, use_embed,
+            layer.enorm.weight if use_embed else layer.hnorm.weight,
+            self._eps(layer.enorm if use_embed else layer.hnorm), (rank % 2) * (self.HIDDEN // 2),
+            layer.eh_proj.weight, peers, rank,
+        )  # fmt: skip
+        idx_rows = 2 * indexer.head_dim
+        ops.glm5_mtp_qkv_a(
+            m, peers, rank, layer.input_layernorm.weight, eps, w["residual"][:m],
+            attn.kv_a_proj_with_mqa.weight, indexer.wk_gate_wp.weight, idx_rows, w["qkv"][:m],
+        )  # fmt: skip
+        ops.glm5_mtp_q_b(
+            w["qkv"][:m], attn.q_lora_rank, attn.kv_lora_rank, indexer.head_dim,
+            attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight, self._eps(attn.q_a_layernorm),
+            indexer.k_norm.weight, indexer.k_norm.bias, self._eps(indexer.k_norm),
+            w["latent"][:m], w["packed"][:m], attn.q_b_proj.weight, w["query"][:m],
+        )  # fmt: skip
+        ops.glm5_mtp_absorb(w["query"][:m], self._wk_transposed(attn), w["q_latent"][:m])
+
+        # The attention backend, as forward_decode runs it on a draft step sharing step 0's selection.
+        ctx = build_glm5_next_runtime_context(attn_metadata)
+        # One row per request at its live length (num_contexts is 0 on a draft step): only the positions.
+        positions = ctx.kv_lens[:m] - 1
+        backend = attn.attn_backend
+        backend.append_paged_state(
+            w["latent"][:m].unsqueeze(1),
+            w["packed"][:m].unsqueeze(1),
+            positions.unsqueeze(1),
+            ctx.metadata,
+        )
+        backend.update_pool_keys(positions, indexer.index_kpool_compress_ape, ctx.metadata)
+        topk_rows = backend.expand_selection(
+            layer.index_share.selection[:m], ctx.metadata, kv_lens=None, tail_extra=step
+        )
+        out_latent = backend.forward(
+            w["q_latent"][:m].view(m, attn.num_heads, attn.kv_lora_rank),
+            None,
+            None,
+            ctx.metadata,
+            AttentionForwardArgs(
+                attention_input_type=AttentionInputType.generation_only,
+                sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
+            ),
+        )
+
+        ops.glm5_mtp_v_up(
+            out_latent,
+            attn.kv_b_proj.weight,
+            attn.num_heads,
+            attn.qk_nope_head_dim,
+            attn.v_head_dim,
+            w["v"][:m],
+        )
+        ops.glm5_mtp_o_proj(w["v"][:m], attn.o_proj.weight, peers, rank)
+        return self._moe_and_head(layer, m, w["residual"][:m], None, step_hidden, vocab_head)
+
+    def _moe_and_head(
+        self,
+        layer: "Glm5NextMTP",
+        m: int,
+        residual: torch.Tensor,
+        rows: torch.Tensor | None,
+        like: torch.Tensor,
+        vocab_head: "_NcclVocabParallelHead",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """All-reduce #2 (of o_proj's pushed partials) through the head for ``m`` rows: ``rows`` (int32, or None
+        for 0..m-1) picks them from the all-reduce input and ``residual``."""
+        ops = torch.ops.trtllm
+        w = self._work
+        peers, rank = self._peer_ptrs, self._rank
+        mlp = layer.mlp
+        experts = getattr(mlp.experts, "backend", mlp.experts)
+        logits = self._router_logits(mlp.gate.weight.shape[0])[:m]
+        local_experts = experts.w3_w1_weight.shape[0]
+        local_start = self._ep_rank * local_experts
+        routing = mlp.gate.routing_impl
+        top_k, scale = int(routing.top_k), float(routing.routed_scaling_factor)
+        route = w["route"]
+        # The router computes the routing once (into route); fc1 and fc2 read it.
+        ops.glm5_mtp_router(
+            peers, rank, residual, w["summed"][:m], layer.post_attention_layernorm.weight,
+            self._eps(layer.post_attention_layernorm), w["mlp_in"][:m], mlp.gate.weight, logits,
+            mlp.shared_experts.gate_up_proj.weight, mlp.swiglu_limit, w["shared_inter"][:m],
+            mlp.gate.e_score_correction_bias, top_k, scale, local_start, local_experts, route, rows,
+        )  # fmt: skip
+        ops.glm5_mtp_fc1(
+            route, top_k, local_start, w["mlp_in"][:m], experts.w3_w1_weight,
+            experts.w3_w1_weight_scaling_factor, mlp.swiglu_limit, w["inter"],
+            w["shared_inter"][:m], mlp.shared_experts.down_proj.weight, w["shared_out"][:m],
+        )  # fmt: skip
+        ops.glm5_mtp_fc2(
+            m, route, top_k, local_start, experts.w2_weight, experts.w2_weight_scaling_factor,
+            w["inter"], w["shared_out"][:m], peers, rank,
+        )  # fmt: skip
+        hidden = torch.empty(m, self.HIDDEN, dtype=torch.bfloat16, device=like.device)
+        tokens = torch.empty(m, dtype=torch.int32, device=like.device)
+        head = vocab_head._fused
+        ops.glm5_mtp_head(
+            peers, rank, w["summed"][:m], layer.shared_head.norm.weight, self._eps(layer.shared_head.norm),
+            hidden, vocab_head.lm_head.weight, vocab_head.col_base, tokens, 1, head._scratch, head._peer_ptrs,
+            head._rank,
+        )  # fmt: skip
+        return hidden, tokens
+
+
 class _NcclVocabParallelHead(VocabParallelHead):
     """Vocab-parallel token selection over the TP group's low-latency key exchange, else an NCCL pair exchange.
 
@@ -2942,10 +3355,18 @@ class Glm5NextMtpStep:
         self.mapping = mapping
         self.vocab_size = vocab_size
         self.vocab_head = vocab_head
+        # Collective: every rank of the TP group builds the fused draft step's buffers here, at construction.
+        self.fused_draft_step = (
+            _FusedMtpDraftStep.create(mapping, getattr(vocab_head, "_fused", None))
+            if vocab_head is not None
+            else None
+        )
         self.force_num_accepted_tokens = get_force_num_accepted_tokens_float()
         self._force_pool: torch.Tensor | None = None
         self._force_counter: torch.Tensor | None = None
         self._saved: dict[str, Any] = {}
+        self._save_buffers: dict[str, torch.Tensor] = {}
+        self._saved_offsets_cpp: Any = None
 
     def __call__(
         self,
@@ -3006,11 +3427,15 @@ class Glm5NextMtpStep:
             num_accepted_tokens, num_contexts, draft_len, spec_metadata
         )
 
+        gen_rows = None
         if num_gens > 0:
-            attn_metadata.kv_cache_manager.update_mamba_states(
-                attn_metadata=attn_metadata,
-                num_accepted_tokens=num_accepted_tokens,
-                state_indices=attn_metadata.mamba_metadata.state_indices,
+            gen_rows = self._commit_accepted(
+                attn_metadata,
+                spec_metadata,
+                accepted_tokens,
+                num_accepted_tokens,
+                num_contexts,
+                draft_len,
             )
 
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
@@ -3025,6 +3450,7 @@ class Glm5NextMtpStep:
                 attn_metadata,
                 spec_metadata,
                 draft_model,
+                gen_rows,
             )
         finally:
             self._restore_metadata(attn_metadata)
@@ -3046,6 +3472,48 @@ class Glm5NextMtpStep:
         if sharded:
             outputs["logits_vocab_shard"] = True
         return outputs
+
+    def _commit_accepted(
+        self,
+        attn_metadata: AttentionMetadata,
+        spec_metadata: Any,
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        num_contexts: int,
+        draft_len: int,
+    ) -> torch.Tensor | None:
+        """Record the accepted counts the next verify replays (the KDA cache manager's ``update_mamba_states``).
+        A generation-only batch on the KDA replay path does it in one launch together with the drafting rows,
+        which it returns; anything else takes the cache manager's method and returns None."""
+        manager = attn_metadata.kv_cache_manager
+        state_indices = attn_metadata.mamba_metadata.state_indices
+        cache = getattr(manager, "mamba_cache", None)
+        prev = getattr(cache, "prev_num_accepted_tokens", None)
+        dummy = getattr(manager, "_dummy_request_mask", None)
+        num_gens = num_accepted_tokens.shape[0] - num_contexts
+        if (
+            num_contexts == 0
+            and accepted_tokens.is_contiguous()
+            and getattr(manager, "_use_kda_replay_update", False)
+            and not getattr(manager, "kda_context_only", False)
+            and prev is not None
+            and prev.dtype == torch.int32
+            and dummy is not None
+        ):
+            return mtp_commit(
+                spec_metadata.batch_indices_cuda[:num_gens],
+                num_accepted_tokens,
+                draft_len + 1,
+                state_indices[:num_gens],
+                dummy[:num_gens],
+                prev,
+            )
+        manager.update_mamba_states(
+            attn_metadata=attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            state_indices=state_indices,
+        )
+        return None
 
     # -- acceptance ---------------------------------------------------------
 
@@ -3144,8 +3612,10 @@ class Glm5NextMtpStep:
         attn_metadata: AttentionMetadata,
         spec_metadata: Any,
         draft_model: Glm5NextDraftModel,
+        gen_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """``next_draft_tokens [B, K]``. Rewrites the attention metadata's lengths as it goes; the caller restores."""
+        """``next_draft_tokens [B, K]``. Rewrites the attention metadata's lengths as it goes; the caller restores.
+        ``gen_rows``: the generation requests' drafting rows when :meth:`_commit_accepted` computed them."""
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -3162,8 +3632,12 @@ class Glm5NextMtpStep:
         if num_contexts == 0 and accepted_tokens.is_contiguous():
             # Generation only (every captured step): the verify rows are the accepted-token columns as they are.
             step_ids = accepted_tokens[:, : draft_len + 1].reshape(-1)
-            gen_rows = drafting_rows(
-                spec_metadata.batch_indices_cuda[:num_gens], num_accepted_tokens, draft_len + 1
+            gen_rows = (
+                gen_rows
+                if gen_rows is not None
+                else drafting_rows(
+                    spec_metadata.batch_indices_cuda[:num_gens], num_accepted_tokens, draft_len + 1
+                )
             )
             step0_rows = gen_rows
             context_rows = gen_rows[:0]
@@ -3221,23 +3695,43 @@ class Glm5NextMtpStep:
             # norm and draft head only on each request's drafting row. Every later step feeds one row per request.
             # Either way the MoE sees one row per request.
             rows = step0_rows if step == 0 else slice(0, batch_size)
-            request_hidden = mtp_layer(
-                embed_tokens=draft_model.embed_tokens,
-                all_rank_num_tokens=spec_metadata.subseq_all_rank_num_tokens,
-                input_ids=step_ids,
-                position_ids=step_positions,
-                hidden_states=step_hidden,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                pick_rows=step0_rows if step == 0 else None,
-            )
-            fused_tokens = getattr(self.vocab_head, "fused_tokens", None)
-            tokens = fused_tokens(request_hidden) if fused_tokens is not None else None
-            if tokens is None:
-                draft_logits = mtp_layer.shared_head(
-                    request_hidden, draft_model.lm_head, attn_metadata, True
+            fused_step = self.fused_draft_step
+            if (
+                step > 0
+                and fused_step is not None
+                and fused_step.applies(mtp_layer, step_ids.shape[0], attn_metadata)
+            ):
+                request_hidden, tokens = fused_step(
+                    step,
+                    mtp_layer,
+                    draft_model,
+                    step_ids,
+                    step_hidden,
+                    attn_metadata,
+                    self.vocab_head,
                 )
-                tokens = self._draft_argmax(draft_logits)
+            elif (
+                step == 0
+                and fused_step is not None
+                and step_hidden.dim() == 2
+                and fused_step.applies_step0(
+                    mtp_layer, step_ids.shape[0], step0_rows.shape[0], attn_metadata
+                )
+            ):
+                request_hidden, tokens = fused_step.step0(
+                    mtp_layer,
+                    draft_model,
+                    step_ids,
+                    step_hidden,
+                    step0_rows,
+                    attn_metadata,
+                    self.vocab_head,
+                )
+            else:
+                request_hidden, tokens = self._module_step(
+                    draft_model, mtp_layer, spec_metadata, attn_metadata, step_ids, step_positions,
+                    step_hidden, step0_rows if step == 0 else None,
+                )  # fmt: skip
             drafts.append(tokens)
             if step + 1 < draft_len:
                 step_ids = tokens
@@ -3249,6 +3743,37 @@ class Glm5NextMtpStep:
                 attn_metadata, step, num_contexts, batch_size, draft_len, num_accepted_tokens
             )
         return torch.stack(drafts, dim=1)
+
+    def _module_step(
+        self,
+        draft_model: Glm5NextDraftModel,
+        mtp_layer: nn.Module,
+        spec_metadata: Any,
+        attn_metadata: AttentionMetadata,
+        step_ids: torch.Tensor,
+        step_positions: torch.Tensor,
+        step_hidden: torch.Tensor,
+        pick_rows: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(hidden, tokens)`` of one draft step through the MTP layer's modules and the draft head."""
+        request_hidden = mtp_layer(
+            embed_tokens=draft_model.embed_tokens,
+            all_rank_num_tokens=spec_metadata.subseq_all_rank_num_tokens,
+            input_ids=step_ids,
+            position_ids=step_positions,
+            hidden_states=step_hidden,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata,
+            pick_rows=pick_rows,
+        )
+        fused_tokens = getattr(self.vocab_head, "fused_tokens", None)
+        tokens = fused_tokens(request_hidden) if fused_tokens is not None else None
+        if tokens is None:
+            draft_logits = mtp_layer.shared_head(
+                request_hidden, draft_model.lm_head, attn_metadata, True
+            )
+            tokens = self._draft_argmax(draft_logits)
+        return request_hidden, tokens
 
     @staticmethod
     def _context_input_ids(
@@ -3335,34 +3860,56 @@ class Glm5NextMtpStep:
 
     def _save_metadata(self, attn_metadata: AttentionMetadata, batch_size: int) -> None:
         """Save what the draft chain overwrites: the sequence lengths (``prepare_for_spec_dec``) and the target's
-        speculative masks, position offsets and generation lengths."""
+        speculative masks, position offsets and generation lengths (one multi-tensor copy into buffers kept
+        across steps; a fresh clone while a graph captures before the buffers exist)."""
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
-        saved = {}
-        if attn_metadata.spec_decoding_packed_mask is not None:
-            saved["packed_mask"] = attn_metadata.spec_decoding_packed_mask[:batch_size].clone()
-        if attn_metadata.spec_decoding_position_offsets is not None:
-            saved["position_offsets"] = attn_metadata.spec_decoding_position_offsets.clone()
-            saved["position_offsets_cpp"] = attn_metadata.spec_decoding_position_offsets_cpp
-        if attn_metadata.spec_decoding_generation_lengths is not None:
-            saved["generation_lengths"] = attn_metadata.spec_decoding_generation_lengths[
-                :batch_size
-            ].clone()
-        self._saved = saved
+        live = []
+        for name, full in (
+            ("packed_mask", attn_metadata.spec_decoding_packed_mask),
+            ("position_offsets", attn_metadata.spec_decoding_position_offsets),
+            ("generation_lengths", attn_metadata.spec_decoding_generation_lengths),
+        ):
+            if full is not None:
+                rows = full.shape[0] if name == "position_offsets" else batch_size
+                live.append((name, full, rows))
+        buffers = self._save_buffers
+        if any(
+            name not in buffers
+            or buffers[name].shape != full.shape
+            or buffers[name].dtype != full.dtype
+            for name, full, _ in live
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                buffers = {name: full.clone() for name, full, _ in live}
+            else:
+                buffers = {name: torch.empty_like(full) for name, full, _ in live}
+                self._save_buffers = buffers
+        if live:
+            torch._foreach_copy_(
+                [buffers[name][:rows] for name, _, rows in live],
+                [full[:rows] for _, full, rows in live],
+            )
+        self._saved = {name: (buffers[name], rows) for name, _, rows in live}
+        if "position_offsets" in self._saved:
+            self._saved_offsets_cpp = attn_metadata.spec_decoding_position_offsets_cpp
 
     def _restore_metadata(self, attn_metadata: AttentionMetadata) -> None:
         if attn_metadata.has_spec_dec_saved_state:
             attn_metadata.restore_from_spec_dec()
             attn_metadata.on_update()
         saved, self._saved = self._saved, {}
-        if "packed_mask" in saved:
-            mask = saved["packed_mask"]
-            attn_metadata.spec_decoding_packed_mask[: mask.shape[0]].copy_(mask)
+        targets = {
+            "packed_mask": attn_metadata.spec_decoding_packed_mask,
+            "position_offsets": attn_metadata.spec_decoding_position_offsets,
+            "generation_lengths": attn_metadata.spec_decoding_generation_lengths,
+        }
+        if saved:
+            torch._foreach_copy_(
+                [targets[name][:rows] for name, (_, rows) in saved.items()],
+                [buffer[:rows] for buffer, rows in saved.values()],
+            )
         if "position_offsets" in saved:
-            attn_metadata.spec_decoding_position_offsets.copy_(saved["position_offsets"])
-            attn_metadata.spec_decoding_position_offsets_cpp = saved["position_offsets_cpp"]
-        if "generation_lengths" in saved:
-            lengths = saved["generation_lengths"]
-            attn_metadata.spec_decoding_generation_lengths[: lengths.shape[0]].copy_(lengths)
+            attn_metadata.spec_decoding_position_offsets_cpp = self._saved_offsets_cpp
 
 
 # ---------------------------------------------------------------------------

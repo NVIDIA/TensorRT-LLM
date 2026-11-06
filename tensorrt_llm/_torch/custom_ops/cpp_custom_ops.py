@@ -1653,6 +1653,86 @@ def _register_fake():
         # Writes the greedy tokens into ``tokens`` in place.
         return None
 
+    # The GLM-5.3-Flash fused MTP draft step: every kernel writes its outputs (and the all-reduce peers' buffers)
+    # in place.
+    @torch.library.register_fake("trtllm::glm5_mtp_pre")
+    def _(rows, tokens, tokens_stride, hidden, embed, use_embed, gamma, eps,
+          col_start, weight, ar_peers, rank):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_qkv_a")
+    def _(rows, ar_peers, rank, gamma, eps, residual_out, qkv_weight,
+          idx_weight, idx_rows, out):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_q_b")
+    def _(qkv,
+          qa_rank,
+          kv_rank,
+          idx_dim,
+          qa_gamma,
+          kv_gamma,
+          eps,
+          ln_weight,
+          ln_bias,
+          ln_eps,
+          latent_out,
+          packed_out,
+          weight,
+          query_out,
+          idx_q_weight=None,
+          idx_q_out=None):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_absorb")
+    def _(query, wk_t, out):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_v_up")
+    def _(latent, kv_b, heads, nope, v_dim, out):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_o_proj")
+    def _(input, weight, ar_peers, rank):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_router")
+    def _(ar_peers,
+          rank,
+          residual_in,
+          residual_out,
+          gamma,
+          eps,
+          norm_out,
+          gate_weight,
+          logits_out,
+          shared_gate_up,
+          swiglu_limit,
+          shared_out,
+          bias,
+          top_k,
+          scale,
+          local_start,
+          local_experts,
+          route,
+          rows=None):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_fc1")
+    def _(route, top_k, local_start, input, w13, w13_scale, swiglu_limit, inter,
+          shared_in, shared_down, shared_down_out):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_fc2")
+    def _(rows, route, top_k, local_start, w2, w2_scale, inter, shared,
+          ar_peers, rank):
+        return None
+
+    @torch.library.register_fake("trtllm::glm5_mtp_head")
+    def _(ar_peers, rank, residual_in, gamma, eps, hidden_out, weight,
+          vocab_offset, tokens, tokens_stride, scratch, key_peers, key_rank):
+        return None
+
     @torch.library.register_fake("trtllm::tinygemm2")
     def _(input: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor):
         # input [M, K], weight [N, K], bias [N]
