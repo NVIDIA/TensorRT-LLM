@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -42,6 +43,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     Role,
     _BasePageTableMaterializer,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Replicated
 from tensorrt_llm._utils import (
     TensorWrapper,
     binding_to_torch_dtype,
@@ -1020,6 +1022,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             for layer_id in self.sparse_layer_ids
             if layer_id in self.layer_offsets
         }
+
+    def page_table_spec(self) -> PageTableSpec:
+        """K/V and their block scales split by head as the backend writes them, head-major (MSA)
+        or token-major (Triton); index-K alike on every rank."""
+        return replace(
+            super().page_table_spec(),
+            role_layouts={Role.INDEX_KEY: Replicated()},
+            default_layout=ByHead(token_major=self._main_kv_layout_name() == "NHD"),
+        )
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Declare the backend's main K/V layout and replicated index-K."""
