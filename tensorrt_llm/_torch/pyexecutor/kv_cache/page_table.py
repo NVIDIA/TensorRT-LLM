@@ -66,9 +66,21 @@ class PageTableSpec:
             than receiving them, so a peer may hold none of them for a model layer it holds.
         layer_ids: Internal layer id -> (global layer id, model layer); None for those of the
             manager's model layers (``pp_layers``) or, keeping several caches per model layer,
-            of its (model layer, attention type) map (``_layer_attn_to_layer_id``).
-        quant_mode: How the KV data is quantized: None unquantized, else ``"fp8"``,
-            ``"nvfp4"`` or ``"fp8_ds_mla"``.
+            of its (model layer, attention type) map (``_layer_attn_to_layer_id``). Stated under
+            mixed-precision KV, whose high layers take global layers ``2 * L + 1`` and every other
+            layer twice the id it has without; the high layers hold the high type
+            (``mixed_precision``).
+        quant_mode: How the manager's own KV data is quantized: None unquantized, else
+            ``"fp8"``, ``"nvfp4"`` or ``"fp8_ds_mla"``. Under mixed-precision KV, the layers it
+            keeps mixed hold the types ``mixed_precision`` names instead.
+        mixed_precision: Under mixed-precision KV, the (low, high) element types by lower-case
+            ``DataType`` name (``"nvfp4"``; ``"half"``, ``"bf16"`` or ``"fp8"``), as
+            ``("nvfp4", "bf16")``: a mixed layer keeps its history in rows of the low
+            type, scales inline, and its first and last tokens in its high layer, of the high
+            type; None without.
+
+    Raises:
+        ValueError: If mixed_precision does not name two types.
     """
 
     role_layouts: Mapping[str, RoleLayout] = field(default_factory=dict)
@@ -78,6 +90,7 @@ class PageTableSpec:
     request_rebuilt_roles: frozenset[str] = frozenset()
     layer_ids: Mapping[int, tuple[int, int]] | None = None
     quant_mode: str | None = None
+    mixed_precision: tuple[str, str] | None = None
 
     def __post_init__(self) -> None:
         layouts = {str(role): layout for role, layout in dict(self.role_layouts).items()}
@@ -87,14 +100,20 @@ class PageTableSpec:
         if self.layer_ids is not None:
             ids = {int(lid): (int(g), int(m)) for lid, (g, m) in dict(self.layer_ids).items()}
             object.__setattr__(self, "layer_ids", types.MappingProxyType(ids))
+        if self.mixed_precision is not None:
+            names = tuple(str(name) for name in self.mixed_precision)
+            if len(names) != 2:
+                raise ValueError(f"mixed precision names a low and a high type, not {names}")
+            object.__setattr__(self, "mixed_precision", names)
 
     def layout_of(self, role: str) -> RoleLayout | None:
-        """The layout of ``role``: its own, else the default, else this rank's own share for a
-        role that never moves; None for a role that moves and that the spec does not lay out."""
-        layout = self.role_layouts.get(role, self.default_layout)
-        if layout is None and role in self.untransferred_roles | self.derived_roles:
+        """The layout of ``role``: this rank's own share for a role that never moves (untransferred
+        or derived), whatever the spec lays out otherwise, else its own, else the default; None for
+        a role that moves and that the spec does not lay out. A transfer leaves the roles that
+        never move by their membership in those sets, not by their layout."""
+        if role in self.untransferred_roles | self.derived_roles:
             return Own()
-        return layout
+        return self.role_layouts.get(role, self.default_layout)
 
 
 def kv_dtype_name(manager: object) -> str | None:

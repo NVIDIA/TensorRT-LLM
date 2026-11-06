@@ -1019,10 +1019,12 @@ class Fp4MlaV2CacheLayoutPolicy:
 
     def page_table_spec(self) -> PageTableSpec:
         """Latents token-major by head, as the FP4 MLA kernels write them, and the policy's other
-        roles and layer names (``_fp4_mla_page_table_spec``)."""
+        roles and layer names (``_fp4_mla_page_table_spec``). The cache is K-only: any other role
+        it registers is a latent cache too."""
         spec = KVCacheManagerV2.page_table_spec(self)
         return self._fp4_mla_page_table_spec(
-            replace(spec, default_layout=ByHead(token_major=True)), recurrent=lambda layer: False
+            replace(spec, role_layouts={}, default_layout=ByHead(token_major=True, total=1)),
+            recurrent=lambda layer: False,
         )
 
     def _fp4_mla_page_table_spec(
@@ -1030,8 +1032,8 @@ class Fp4MlaV2CacheLayoutPolicy:
     ) -> PageTableSpec:
         """``spec`` with the MLA roles and layer names laid over it.
 
-        K and K block scales are token-major by head; every rank holds the same single-head
-        latent state. The high-precision tail is a ring of BF16 latent tokens alike on every rank,
+        K and K block scales are token-major by their one latent head, which every rank holds
+        whole. The high-precision tail is a ring of BF16 latent tokens alike on every rank,
         sized by this worker's speculative rewind, so a context and a generation worker may size
         it differently. V scales and packed V derive from K and K scales; the generation worker
         rebuilds them locally in rebuild_disagg_imported_cache. A model layer's cache and its
@@ -1052,8 +1054,8 @@ class Fp4MlaV2CacheLayoutPolicy:
             spec,
             role_layouts={
                 **spec.role_layouts,
-                Role.KEY: ByHead(token_major=True),
-                Role.KEY_BLOCK_SCALE: ByHead(token_major=True),
+                Role.KEY: ByHead(token_major=True, total=1),
+                Role.KEY_BLOCK_SCALE: ByHead(token_major=True, total=1),
                 Role.MLA_HP_TAIL: RingSlots(self._fp4_mla_hp_pool_size, dtype="bfloat16"),
             },
             derived_roles=spec.derived_roles | {Role.MLA_V_SCALE, Role.MLA_V_PACKED},

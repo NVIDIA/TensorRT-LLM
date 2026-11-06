@@ -34,6 +34,8 @@ from tensorrt_llm._torch.disaggregation.base.role_layout import (
     role_layout_from_dict,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _site(size, *, kv_heads=(0, None), state=False, split=("tp",), ranks=1, tokens=32):
     """The facts of one buffer that a layout in a manager's spec resolves against."""
@@ -101,6 +103,49 @@ def test_head_split_resolves_to_the_rank_s_own_share_without_whole_heads():
 def test_head_split_of_its_own_heads_states_their_total_for_attention():
     with pytest.raises(ValueError, match="total"):
         ByHead(head_bytes=64).resolve(_site(256, kv_heads=(4, 8)))
+
+
+def test_head_split_keeps_a_total_its_spec_states():
+    # MLA's one latent head, which every rank of TP4 holds whole.
+    layout = ByHead(total=1).resolve(_site(576, kv_heads=(1, 4), ranks=4))
+
+    assert layout == ByHead(head_bytes=576, total=1)
+    assert [layout.pieces(576, 4, rank) for rank in range(4)] == [(Piece(0, 0, 576),)] * 4
+    assert layout.even(4) and layout.even(8)
+    check_pieces(layout, 576, 4, 3)
+
+
+def test_head_split_stating_its_total_refuses_a_buffer_without_whole_heads():
+    with pytest.raises(ValueError, match="1 heads"):
+        ByHead(total=1).resolve(_site(576, kv_heads=(0, None)))
+    with pytest.raises(ValueError, match="1 heads"):
+        ByHead(total=1).resolve(_site(576, state=True))
+
+
+def test_head_split_replicates_heads_over_more_ranks_than_heads():
+    # 2 KV heads over TP4: ranks 0 and 1 hold head 0, ranks 2 and 3 head 1.
+    layout = ByHead(head_bytes=10, total=2)
+
+    assert [layout.pieces(10, 4, rank)[0].at for rank in range(4)] == [0, 0, 10, 10]
+    assert layout.even(4)
+
+
+def test_peers_whose_elements_differ_in_type_lay_out_different_spaces():
+    fp16, bf16 = Sectioned((32,), dtype="float16"), Sectioned((32,), dtype="bfloat16")
+
+    head_split = ByHead(head_bytes=8, total=2, dtype="float16")
+
+    assert fp16.space(32, 2) != bf16.space(32, 2)
+    assert head_split.space(8, 2) == ("head_major", 2, 8, "float16")
+    assert RingSlots(4, dtype="bfloat16").space(32, 1) == ("ring", 8, "bfloat16")
+
+
+def test_layouts_name_a_torch_element_type_without_its_module():
+    class _TorchLikeDtype:
+        def __str__(self):
+            return "torch.bfloat16"
+
+    assert RingSlots(4, dtype=_TorchLikeDtype()).dtype == "bfloat16"
 
 
 def test_token_major_split_resolves_its_tokens_from_the_buffer():

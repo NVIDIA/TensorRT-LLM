@@ -60,6 +60,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
     ByHead,
+    Own,
     PageTableSpec,
     Replicated,
     RingSlots,
@@ -67,6 +68,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
 )
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, LayerId
+
+pytestmark = pytest.mark.cpu_only
 
 KV_ROLES = (Role.KEY, Role.VALUE, Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE)
 STATE_ROLES = (MambaRole.CONV_STATE, MambaRole.SSM_STATE)
@@ -83,6 +86,8 @@ def assert_spec_matches_disagg_hooks(manager, roles, layer_groups: int = 0) -> P
     assert set(spec.untransferred_roles | spec.derived_roles) == ignored
     for role in roles:
         if str(role) in ignored:
+            # Whatever else lays it out, a role that never moves is the rank's own share.
+            assert spec.layout_of(str(role)) == Own(), role
             continue
         layout = spec.layout_of(str(role))
         kind = kinds.get(role, kinds[Role.ALL])
@@ -108,9 +113,11 @@ def assert_spec_matches_disagg_hooks(manager, roles, layer_groups: int = 0) -> P
 
 
 def _stub(manager_cls, **attributes):
-    """A manager of ``manager_cls`` holding only ``attributes``, which its spec and hooks read."""
+    """A manager of ``manager_cls`` holding only ``attributes``, which its spec and hooks read; a
+    K/V cache of FP16 unless they say otherwise."""
     manager = object.__new__(manager_cls)
     manager.dtype = DataType.HALF
+    manager.kv_factor = 2
     for name, value in attributes.items():
         setattr(manager, name, value)
     return manager
@@ -144,9 +151,89 @@ def test_base_manager_splits_kv_by_head(dtype, quant_mode):
     assert spec.layer_ids is None
 
 
-def test_dsa_index_keys_are_alike_on_every_rank():
-    spec = assert_spec_matches_disagg_hooks(_stub(DSACacheManagerV2), (Role.KEY, Role.INDEX_KEY))
+def test_base_manager_holds_an_mla_cache_s_one_latent_head_on_every_rank():
+    manager = _stub(KVCacheManagerV2, kv_factor=1)
 
+    spec = assert_spec_matches_disagg_hooks(manager, (Role.KEY, Role.KEY_BLOCK_SCALE))
+
+    assert spec.layout_of(str(Role.KEY)) == ByHead(total=1)
+
+
+def _mixed_precision_buffers(layer_grouping):
+    return [
+        [SimpleNamespace(layer_id=layer, role=Role.KEY) for layer in layers]
+        for layers in layer_grouping
+    ]
+
+
+def test_base_manager_names_mixed_precision_layers_as_its_hooks_do():
+    """Model layers 4 and 5 on this pipeline rank, their high layers internal layers 2 and 3."""
+    layer_grouping = [[LayerId(0), LayerId(1)], [LayerId(2), LayerId(3)]]
+    manager = _stub(
+        KVCacheManagerV2,
+        dtype=DataType.BF16,
+        pp_layers=[4, 5],
+        mixed_precision_low_dtype=DataType.NVFP4,
+        mixed_precision_high_dtype=DataType.BF16,
+        mixed_precision_high_layers={0: 2, 1: 3},
+        impl=SimpleNamespace(
+            layer_grouping=layer_grouping,
+            buffer_grouping=_mixed_precision_buffers(layer_grouping),
+        ),
+    )
+    # As _add_mixed_precision_layers rebinds the hook.
+    manager.get_disagg_global_layer_ids = manager._mixed_precision_global_layer_ids
+
+    spec = assert_spec_matches_disagg_hooks(manager, KV_ROLES, layer_groups=2)
+
+    # Low layers take global layers 2 * L, their high layers 2 * L + 1.
+    assert dict(spec.layer_ids) == {0: (8, 4), 1: (10, 5), 2: (9, 4), 3: (11, 5)}
+    assert spec.mixed_precision == ("nvfp4", "bf16")
+    # Layers it keeps unmixed hold the manager's own type.
+    assert spec.quant_mode is None
+
+
+def test_virtual_layer_manager_names_mixed_precision_layers_as_its_hooks_do():
+    """Model layer 3 keeps its sliding-window and compressed caches in internal layers 0 and 1,
+    the high layer of its local layer in internal layer 2."""
+    swa, compress = DeepseekV4AttentionType.SWA, DeepseekV4AttentionType.COMPRESS
+    layer_grouping = [[LayerId(0)], [LayerId(1)], [LayerId(2)]]
+    manager = _stub(
+        DeepseekV4CacheManager,
+        kv_factor=1,
+        _disagg_ignored_roles=frozenset(),
+        use_fp8_ds_mla=False,
+        pp_layers=[3],
+        _layer_attn_to_layer_id={(3, swa): 0, (3, compress): 1},
+        mixed_precision_low_dtype=DataType.NVFP4,
+        mixed_precision_high_dtype=DataType.FP8,
+        mixed_precision_high_layers={0: 2},
+        impl=SimpleNamespace(
+            layer_grouping=layer_grouping,
+            buffer_grouping=_mixed_precision_buffers(layer_grouping),
+        ),
+    )
+    manager.get_disagg_global_layer_ids = manager._mixed_precision_global_layer_ids
+    num_types = len(DeepseekV4AttentionType)
+
+    spec = assert_spec_matches_disagg_hooks(manager, (), layer_groups=3)
+
+    assert dict(spec.layer_ids) == {
+        0: (2 * (3 * num_types + swa.value), 3),
+        1: (2 * (3 * num_types + compress.value), 3),
+        2: (2 * 3 + 1, 3),
+    }
+    # Its own pool already holds the mixed-precision low format; its high layers hold FP8.
+    assert spec.mixed_precision == ("nvfp4", "fp8")
+    assert spec.quant_mode is None
+
+
+def test_dsa_index_keys_are_alike_on_every_rank():
+    manager = _stub(DSACacheManagerV2, kv_factor=1)
+
+    spec = assert_spec_matches_disagg_hooks(manager, (Role.KEY, Role.INDEX_KEY))
+
+    assert spec.layout_of(str(Role.KEY)) == ByHead(total=1)
     assert spec.layout_of(str(Role.INDEX_KEY)) == Replicated()
 
 
@@ -180,13 +267,16 @@ def test_deepseek_v4_splits_its_attention_caches_by_head(fp8_ds_mla):
     padding = DataRole("deepseek_v4_test_alignment_padding")
     manager = _stub(
         DeepseekV4CacheManager,
+        kv_factor=1,
         _disagg_ignored_roles=frozenset({padding}),
         use_fp8_ds_mla=fp8_ds_mla,
     )
-    roles = (COMPRESS_BLOCK_SCALE_ROLE, *(t.role for t in DeepseekV4AttentionType), padding)
+    head_split = (COMPRESS_BLOCK_SCALE_ROLE, *(t.role for t in DeepseekV4AttentionType))
 
-    spec = assert_spec_matches_disagg_hooks(manager, roles)
+    spec = assert_spec_matches_disagg_hooks(manager, (*head_split, padding))
 
+    # Each holds MLA latents of one head, which every tensor rank holds whole.
+    assert all(spec.layout_of(str(role)) == ByHead(total=1) for role in head_split)
     assert spec.untransferred_roles == frozenset({str(padding)})
     assert spec.quant_mode == ("fp8_ds_mla" if fp8_ds_mla else None)
 
@@ -228,7 +318,8 @@ def test_kda_replay_caches_never_move(manager_cls, kda_replay):
     replay_role = DataRole("kda_test_replay")
     replay = SimpleNamespace(disagg_ignored_roles=lambda layout: frozenset({replay_role}))
     manager = _hybrid(manager_cls, _kda_replay=replay if kda_replay else None, _state_layout=None)
-    roles = (*KV_ROLES, *STATE_ROLES, replay_role)
+    # Without replay the manager registers no replay cache.
+    roles = (*KV_ROLES, *STATE_ROLES, *((replay_role,) if kda_replay else ()))
     if manager_cls is Glm5NextCacheManager:
         roles += (Role.INDEX_KEY,)
 
@@ -247,6 +338,7 @@ def _fp4_mla_manager(hp_pool_size=19):
     return _stub(
         Fp4MlaKVCacheManagerV2,
         dtype=DataType.NVFP4,
+        kv_factor=1,
         pp_layers=[0, 1],
         head_dim_per_layer=[96, 96],
         _cache_manager_layer_ids=[LayerId(0), LayerId(1)],
@@ -273,10 +365,12 @@ def test_fp4_mla_lays_latents_token_major_and_its_tail_as_a_ring():
 
     spec = assert_spec_matches_disagg_hooks(manager, roles, layer_groups=2)
 
-    assert spec.layout_of(str(Role.KEY)) == ByHead(token_major=True)
+    assert spec.layout_of(str(Role.KEY)) == ByHead(token_major=True, total=1)
     assert spec.layout_of(str(Role.MLA_HP_TAIL)) == RingSlots(19, dtype="bfloat16")
-    # V scales and packed V derive from K and K scales on the generation worker.
+    # V scales and packed V derive from K and K scales on the generation worker, so they never
+    # move, though the default lays out every role the spec does not name token-major.
     assert spec.derived_roles == frozenset({str(Role.MLA_V_SCALE), str(Role.MLA_V_PACKED)})
+    assert spec.layout_of(str(Role.MLA_V_SCALE)) == Own()
     assert spec.quant_mode == "nvfp4"
     # Latent caches take global layers 2 * L, their tails 2 * L + 1.
     assert dict(spec.layer_ids) == {0: (0, 0), 1: (2, 1), 2: (1, 0), 3: (3, 1)}
@@ -299,6 +393,7 @@ def test_hybrid_fp4_mla_lays_its_attention_roles_and_layer_names_over_its_state(
 
     manager = _hybrid(
         MambaHybridCacheManagerV2,
+        kv_factor=1,
         local_num_mamba_layers=2,
         pp_layers=[0, 1, 2, 3],
         _mamba_layer_mask=[True, False, True, False],
@@ -335,7 +430,8 @@ def test_hybrid_fp4_mla_lays_its_attention_roles_and_layer_names_over_its_state(
     spec = assert_spec_matches_disagg_hooks(manager, roles, layer_groups=3)
 
     assert isinstance(spec.layout_of(str(MambaRole.CONV_STATE)), Sectioned)
-    assert spec.layout_of(str(Role.KEY)) == ByHead(token_major=True)
+    assert spec.layout_of(str(Role.KEY)) == ByHead(token_major=True, total=1)
+    assert spec.layout_of(str(Role.MLA_V_SCALE)) == Own()
     # Recurrent layers and latent caches take global layers 2 * L, the tails 2 * L + 1.
     assert dict(spec.layer_ids) == {
         0: (0, 0),

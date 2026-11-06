@@ -1620,14 +1620,15 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
 
     def page_table_spec(self) -> PageTableSpec:
         """The cache of each attention type and the compressed cache's block scales hold MLA
-        latents of one KV head, which every tensor rank holds: split by head as the base manager
-        splits K/V. Storage-only NVFP4 alignment pages hold no state a peer needs and never move.
-        FP8 pages carrying their own scales are quantized as ``"fp8_ds_mla"``."""
+        latents of one KV head, which every tensor rank holds whole: split by that one head as the
+        base manager splits an MLA cache. Storage-only NVFP4 alignment pages hold no state a peer
+        needs and never move. FP8 pages carrying their own scales are quantized as
+        ``"fp8_ds_mla"``."""
         spec = super().page_table_spec()
         head_split = (COMPRESS_BLOCK_SCALE_ROLE, *_ATTENTION_TYPE_ROLES)
         return replace(
             spec,
-            role_layouts={**spec.role_layouts, **{role: ByHead() for role in head_split}},
+            role_layouts={**spec.role_layouts, **{role: ByHead(total=1) for role in head_split}},
             untransferred_roles=spec.untransferred_roles | self._disagg_ignored_roles,
             quant_mode="fp8_ds_mla" if self.use_fp8_ds_mla else spec.quant_mode,
         )
