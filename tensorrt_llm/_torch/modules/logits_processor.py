@@ -24,7 +24,7 @@ from ..attention.backends import AttentionMetadata
 from .context_logits import project_context_logits
 from .embedding import LMHead
 from .linear import Linear
-from .logits_cast import fast_logits_cast_enabled, widen_logits_to_fp32
+from .logits_cast import widen_logits_to_fp32
 
 
 def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
@@ -81,8 +81,6 @@ class LogitsProcessor(nn.Module):
         logits = lm_head(hidden_states)
         if keep_lm_head_dtype:
             return logits
-        if fast_logits_cast_enabled():
-            # Bit-identical to .float(); the vectorized kernel runs at HBM
-            # bandwidth (see logits_cast.py).
-            return widen_logits_to_fp32(logits)
-        return logits.float()
+        # Bit-identical to .float(); the vectorized kernel runs at HBM
+        # bandwidth when the logits fit it (see logits_cast.py).
+        return widen_logits_to_fp32(logits)

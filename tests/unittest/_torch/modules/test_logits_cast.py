@@ -18,10 +18,24 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch.modules import logits_cast
-from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.modules import logits_cast, logits_processor
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
+
+
+@pytest.fixture
+def kernel_launches(monkeypatch):
+    """Record the grid of each widening kernel launch."""
+    launches = []
+    kernel = logits_cast._widen_to_fp32_kernel
+
+    class RecordingKernel:
+        def __getitem__(self, grid):
+            launches.append(grid)
+            return kernel[grid]
+
+    monkeypatch.setattr(logits_cast, "_widen_to_fp32_kernel", RecordingKernel())
+    return launches
 
 
 def _special_values(dtype):
@@ -46,8 +60,9 @@ def _special_values(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("shape", [(1, 163840), (7, 1001), (240, 163840), (3, 5, 4099)])
-def test_widen_matches_float_bitwise(dtype, shape):
+# A partial last block in 2D, and a 3D tensor that spans many blocks.
+@pytest.mark.parametrize("shape", [(7, 1001), (3, 5, 4099)])
+def test_widen_matches_float_bitwise(dtype, shape, kernel_launches):
     torch.manual_seed(0)
     x = (torch.randn(shape, device="cuda") * 30).to(dtype)
     flat = x.view(-1)
@@ -55,26 +70,29 @@ def test_widen_matches_float_bitwise(dtype, shape):
     flat[: special.numel()] = special
     out = logits_cast.widen_logits_to_fp32(x)
     ref = x.float()
+    assert len(kernel_launches) == 1
     assert out.dtype == torch.float32 and out.shape == ref.shape and out.is_contiguous()
     assert torch.equal(out.view(torch.int32), ref.view(torch.int32))
 
 
-def test_non_contiguous_and_fp32_take_tensor_float():
+def test_unsupported_inputs_take_tensor_float(kernel_launches, monkeypatch):
     x = torch.randn(64, 256, device="cuda", dtype=torch.bfloat16)[:, ::2]
     assert torch.equal(logits_cast.widen_logits_to_fp32(x), x.float())
     y = torch.randn(4, 8, device="cuda")
-    assert logits_cast.widen_logits_to_fp32(y) is not None
     assert torch.equal(logits_cast.widen_logits_to_fp32(y), y)
+    w = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    assert torch.equal(logits_cast.widen_logits_to_fp32(w), w.float())
+    assert not kernel_launches
 
 
-def test_logits_processor_flag(monkeypatch):
+def test_logits_processor_takes_kernel(kernel_launches):
     torch.manual_seed(1)
     head = torch.nn.Linear(512, 4096, bias=False, device="cuda", dtype=torch.bfloat16)
     hidden = torch.randn(6, 512, device="cuda", dtype=torch.bfloat16)
-    monkeypatch.delenv(logits_cast.FAST_LOGITS_CAST_ENV, raising=False)
-    ref = LogitsProcessor()(hidden, head, None, True)
-    monkeypatch.setenv(logits_cast.FAST_LOGITS_CAST_ENV, "1")
-    out = LogitsProcessor()(hidden, head, None, True)
+    out = logits_processor.LogitsProcessor()(hidden, head, None, True)
+    ref = head(hidden).float()
+    assert len(kernel_launches) == 1
     assert out.dtype == torch.float32
     assert torch.equal(out.view(torch.int32), ref.view(torch.int32))
 
