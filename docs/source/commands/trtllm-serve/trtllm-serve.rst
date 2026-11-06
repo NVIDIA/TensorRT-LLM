@@ -463,6 +463,16 @@ aggregate it explicitly. Used/free block counts can be summed across ranks;
 the maximum utilization identifies the fullest rank. Do not sum utilization or
 cache-hit ratios, or multiply rank-0-owned metrics by the number of ranks.
 
+Shared-prefix attention counters
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When shared-prefix attention is enabled, each record carries cumulative
+``sharedPrefixAttnStats`` counters, exported to Prometheus per ``dp_rank`` as
+``trtllm_shared_prefix_attn_request_steps_total``,
+``trtllm_shared_prefix_attn_shareable_request_steps_total`` and
+``trtllm_shared_prefix_attn_shared_request_steps_total``. See
+:doc:`../../features/sampling-shared-prefix-attention`.
+
 .. _runtime-profiling-endpoints:
 
 Runtime Profiling Endpoints
