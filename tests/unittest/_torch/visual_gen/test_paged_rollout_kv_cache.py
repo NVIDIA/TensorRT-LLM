@@ -122,6 +122,10 @@ def check_page_lists(cache, plan, step=""):
     torch.testing.assert_close(
         tables.cu_seqlens_q.cpu(), torch.arange(n + 1, dtype=torch.int32) * size
     )
+    # The TRTLLM op's format: page p's K is at 2p and its V at 2p + 1 of the pool viewed as
+    # [2 * num_pages, H, page_size, D].
+    assert torch.equal(tables.kv_block_offsets[:, 0], 2 * tables.page_table)
+    assert torch.equal(tables.kv_block_offsets[:, 1], 2 * tables.page_table + 1)
     for i in range(plan.num_causal_blocks):
         expected = expected_keys(cache, cache.staging_offset + i * size, size)
         assert int(lengths[i]) == len(expected), f"{step} causal block {i}"

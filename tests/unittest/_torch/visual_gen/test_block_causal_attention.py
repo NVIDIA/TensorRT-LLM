@@ -34,6 +34,7 @@ from tensorrt_llm._torch.visual_gen.attention.attention import Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import PagedRolloutKVCache, RolloutSpec
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
@@ -92,6 +93,15 @@ def cache(request):
 
 
 def make_backend(name, layer_idx=0, dtype=DTYPE):
+    if name == "trtllm":
+        return TrtllmAttention(
+            layer_idx=layer_idx,
+            num_heads=NUM_HEADS,
+            head_dim=HEAD_DIM,
+            num_kv_heads=NUM_KV_HEADS,
+            dtype=dtype,
+            attention_metadata_state={},
+        )
     if name == "flashinfer":
         return FlashInferAttention(
             layer_idx=layer_idx,
@@ -155,6 +165,7 @@ def open_with_prompt(cache, prompt_len):
 
 BACKENDS = [
     "cudnn",
+    "trtllm",
     pytest.param(
         "cutedsl",
         marks=pytest.mark.skipif(
@@ -693,6 +704,7 @@ def test_backend_without_cache_support_refuses_a_cache(cache):
     assert not attn.attn.support_kv_cache()
     assert make_backend("cudnn").support_kv_cache()
     assert make_backend("cutedsl").support_kv_cache()
+    assert make_backend("trtllm").support_kv_cache()
     if get_sm_version() // 10 == 10:
         assert make_backend("flashinfer").support_kv_cache()
     open_with_prompt(cache, 9)
@@ -716,6 +728,10 @@ def test_quantized_or_sparse_backends_report_no_cache_support():
     skip_softmax = make_backend("cutedsl")
     skip_softmax.skip_softmax_threshold_scale = 1.0
     assert not skip_softmax.support_kv_cache()
+    for name, value in (("quant_attention_config", SimpleNamespace()), ("sparse_params", object())):
+        trtllm = make_backend("trtllm")
+        setattr(trtllm, name, value)
+        assert not trtllm.support_kv_cache()
     quantized_flashinfer = make_backend("flashinfer")
     quantized_flashinfer.quant_attention_config = SimpleNamespace()
     assert not quantized_flashinfer.support_kv_cache()

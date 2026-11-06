@@ -144,13 +144,19 @@ def _stage_kernel(
 class PagedKVTables(NamedTuple):
     """What a paged attention kernel reads for one forward's causal blocks, as int32 device
     tensors: sequence ``b`` attends to the first ``seq_lens_kv[b]`` tokens of the pool pages
-    ``page_table[b]`` lists, in order."""
+    ``page_table[b]`` lists, in order.
+
+    ``kv_block_offsets`` lists the same pages in the TRTLLM attention op's format, which gives K
+    and V separate page ids: viewing a layer's pool ``[num_pages, 2, H, page_size, D]`` as
+    ``[2 * num_pages, H, page_size, D]``, page ``p``'s K is at ``2p`` and its V at ``2p + 1``.
+    """
 
     page_table: torch.Tensor  # [num_causal_blocks, max_pages]
     seq_lens_q: torch.Tensor  # [num_causal_blocks], all causal_block_size
     seq_lens_kv: torch.Tensor  # [num_causal_blocks]
     cu_seqlens_kv: torch.Tensor  # [num_causal_blocks + 1]
     cu_seqlens_q: torch.Tensor  # [num_causal_blocks + 1], entry i is i * causal_block_size
+    kv_block_offsets: torch.Tensor  # [num_causal_blocks, 2, max_pages]: K, then V page ids
 
 
 @dataclass
@@ -163,6 +169,7 @@ class _Layout:
     seq_lens_kv: torch.Tensor  # [n]
     cu_seqlens_kv: torch.Tensor  # [n + 1]
     cu_seqlens_q: torch.Tensor  # [n + 1]
+    kv_block_offsets: torch.Tensor  # [n, 2, max_pages]
     # A fixed ``private_slots`` entries per causal block, so the first ``m`` causal blocks'
     # entries are a prefix; see ``_stage_kernel``.
     private_src: torch.Tensor  # [n * private_slots]
@@ -521,6 +528,7 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
             shapes[f"{size}.seq_lens_kv"] = (n,)
             shapes[f"{size}.cu_seqlens_kv"] = (n + 1,)
             shapes[f"{size}.cu_seqlens_q"] = (n + 1,)
+            shapes[f"{size}.kv_block_offsets"] = (n, 2, max_pages)
             shapes[f"{size}.private_src"] = (n * self.private_slots,)
             shapes[f"{size}.private_dst"] = (n * self.private_slots,)
         # Every view starts on a 128-byte boundary: kernels take them as aligned tensors.
@@ -552,6 +560,7 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
                 seq_lens_kv=views[f"{size}.seq_lens_kv"],
                 cu_seqlens_kv=views[f"{size}.cu_seqlens_kv"],
                 cu_seqlens_q=views[f"{size}.cu_seqlens_q"],
+                kv_block_offsets=views[f"{size}.kv_block_offsets"],
                 private_src=views[f"{size}.private_src"],
                 private_dst=views[f"{size}.private_dst"],
                 first_private_page=first_private_page,
@@ -601,6 +610,9 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
             page_table[i, len(whole) : used] = private_page + np.arange(used - len(whole))
             seq_lens_kv[i] = len(whole) * tpb + partial.size
             cu_seqlens_kv[i + 1] = cu_seqlens_kv[i] + seq_lens_kv[i]
+            kv_block_offsets = views[f"{size}.kv_block_offsets"]
+            kv_block_offsets[i, 0] = 2 * page_table[i]
+            kv_block_offsets[i, 1] = 2 * page_table[i] + 1
             k = np.arange(partial.size)
             private_dst[i, : partial.size] = (private_page + k // tpb) * tpb + k % tpb
             # A committed token is copied from its home slot, a staged one from the new K/V.
@@ -680,6 +692,7 @@ class PagedRolloutKVCache(RolloutKVCacheInterface):
             layout.seq_lens_kv[:n],
             layout.cu_seqlens_kv[: n + 1],
             layout.cu_seqlens_q[: n + 1],
+            layout.kv_block_offsets[:n],
         )
 
     def write_staged(

@@ -1160,6 +1160,11 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
     {
         T* attention_input = p.getQueryInput<T>();
         bool const enablePagedKVContextFMHA = mPagedKVCache && paged_context_fmha;
+        // A Q-only input leaves the cache as it is; the FMHA reads K/V from it.
+        // Otherwise AttentionOp copies the KV from input tensor to the KV cache.
+        bool const qOnlyInput = isQOnlySelfAttention(p);
+        int const inputHiddenUnits
+            = qOnlyInput ? local_hidden_units_qo : local_hidden_units_qo + 2 * local_hidden_units_kv;
         TLLM_CHECK_WITH_INFO(!(quant_mode.hasInt8KvCache() && enablePagedKVContextFMHA),
             "Paged Context FMHA doesn't work with int8 kv cache currently.");
 
@@ -1204,6 +1209,7 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         preprocessingParams.separate_q_kv_output = enablePagedKVContextFMHA;
         preprocessingParams.quantized_fp8_output = mFP8ContextFMHA;
         preprocessingParams.generation_phase = false;
+        preprocessingParams.q_only_input = qOnlyInput;
         preprocessingParams.multi_processor_count = mMultiProcessorCount;
 
         preprocessingParams.is_last_chunk
@@ -1212,9 +1218,8 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
 
         {
             std::string const beforeRopeStr = "ctx attention before RoPE at layer " + std::to_string(p.attn.layer_idx);
-            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens,
-                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), p.getType(),
-                                           const_cast<T*>(attention_input), stream, beforeRopeStr)
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens, inputHiddenUnits,
+                                           p.getType(), const_cast<T*>(attention_input), stream, beforeRopeStr)
                     == false,
                 "Found invalid number (NaN or Inf) in " + beforeRopeStr);
         }
@@ -1287,9 +1292,8 @@ int MHA::enqueueContext(FmhaParams const& p, cudaStream_t stream)
         sync_check_cuda_error(stream);
         {
             std::string const afterRopeStr = "ctx attention after RoPE at layer " + std::to_string(p.attn.layer_idx);
-            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens,
-                                           (local_hidden_units_qo + 2 * local_hidden_units_kv), p.getType(),
-                                           const_cast<T*>(attention_input), stream, afterRopeStr)
+            TLLM_CHECK_DEBUG_WITH_INFO(tensorrt_llm::runtime::utils::tensorHasInvalid(p.num_tokens, inputHiddenUnits,
+                                           p.getType(), const_cast<T*>(attention_input), stream, afterRopeStr)
                     == false,
                 "Found invalid number (NaN or Inf) in " + afterRopeStr);
             sync_check_cuda_error(stream);
@@ -2385,8 +2389,13 @@ void MHA::prepareInputs(FmhaParams& p, bool isGen)
                 "variable-window bounds must have one element per packed context query token");
         }
     }
-    TLLM_CHECK_WITH_INFO(p.fwd.is_fused_qkv || sageAttnRequested() || p.is_cross,
-        "For non-cross, non-SageAttention attention, only fused QKV is supported now.");
+    bool const qOnlySelfAttention = isQOnlySelfAttention(p);
+    TLLM_CHECK_WITH_INFO(p.fwd.is_fused_qkv || qOnlySelfAttention || sageAttnRequested() || p.is_cross,
+        "For non-cross, non-SageAttention attention, only fused QKV or a Q-only input over the paged KV cache "
+        "is supported now.");
+    // A Q-only input attends to K/V already in the cache, which only the paged-context FMHA reads.
+    TLLM_CHECK_WITH_INFO(!qOnlySelfAttention || (!isGen && paged_context_fmha && use_kv_cache),
+        "A Q-only self-attention input needs the context phase with a paged KV cache and paged-context FMHA.");
 
     if (isGen)
     {

@@ -262,6 +262,15 @@ public:
         return p.is_cross;
     }
 
+    // Self-attention whose only input is Q: K/V are already in the paged cache, which the call
+    // reads and does not update. A fused QKV input is wider, and separate K/V inputs (as for
+    // SageAttention) come with K/V of their own.
+    [[nodiscard]] bool isQOnlySelfAttention(FmhaParams const& p) const
+    {
+        return !p.is_cross && !p.key_input.has_value() && !p.value_input.has_value()
+            && p.getQueryInput().size(-1) == static_cast<int64_t>(num_heads) * getHeadSize();
+    }
+
     [[nodiscard]] bool useKVCache(FmhaParams const& p) const
     {
         return p.hasKvCache();
