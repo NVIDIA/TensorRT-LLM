@@ -36,7 +36,7 @@ def _make_inputs(
     return x, weight, freqs
 
 
-def _with_row_padding(x: torch.Tensor, padding: int = 128) -> torch.Tensor:
+def _with_row_padding(x: torch.Tensor, padding: int) -> torch.Tensor:
     storage = torch.empty((*x.shape[:-1], x.shape[-1] + padding), device=x.device, dtype=x.dtype)
     padded = storage[..., : x.shape[-1]]
     padded.copy_(x)
@@ -213,14 +213,21 @@ def test_fused_dspark_rmsnorm_rope_compiles_once_per_row_layout_across_batches()
     )
 
     _compile_fused_dspark_rmsnorm_rope.cache_clear()
-    for batch, padded in ((1, False), (3, False), (2, True), (4, True)):
+    args = (1, 64, 1e-6, True, True, False)
+    # A padding of 0 gives compact rows; the two strided calls differ in row stride.
+    for batch, padding in ((1, 0), (3, 0), (2, 64), (4, 128)):
         inputs = _make_inputs(batch, 5, 512, 64, 1, seed=batch)
-        if padded:
-            inputs = (_with_row_padding(inputs[0]), *inputs[1:])
-        cute_dsl_dspark_rmsnorm_rope(*inputs, 1, 64, 1e-6, True, True, False)
+        if padding:
+            inputs = (_with_row_padding(inputs[0], padding), *inputs[1:])
+        torch.testing.assert_close(
+            cute_dsl_dspark_rmsnorm_rope(*inputs, *args),
+            _reference(*inputs, *args),
+            rtol=2e-2,
+            atol=2e-2,
+        )
 
     # Compact rows and row-strided views compile separately; neither recompiles
-    # when the batch changes.
+    # when the batch or the row stride changes.
     cache_info = _compile_fused_dspark_rmsnorm_rope.cache_info()
     assert cache_info.misses == 2
     assert cache_info.hits == 2
