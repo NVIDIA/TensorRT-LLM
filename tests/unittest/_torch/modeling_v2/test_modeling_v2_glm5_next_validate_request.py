@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""The GLM-5.3-Flash target's admission check fails a request its step cannot serve.
+"""The GLM-5.3-Flash target refuses up front what its step cannot serve.
 
-With MTP the worker's head samples without materializing the logits, so a logits
-post-processor (a thinking budget, a request's own processor) has nothing to edit;
-without MTP the forward computes each sequence's last-token logits only, not the
-prompt's. Raised inside the step, either would fail every active request. The check
-reads only host-side request fields, so these run on fake objects: no GPU or engine.
+Its admission check fails such a request: with MTP the step's head samples without
+materializing the logits, so a logits post-processor (a thinking budget, a request's
+own processor) has nothing to edit; without MTP the forward computes each sequence's
+last-token logits only, not the prompt's. Raised inside the step, either would fail
+every active request. With MTP it also refuses the engine's guided decoder, which the
+step has no bitmask for. The checks read only host-side fields, so these run on fake
+objects: no GPU or engine.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ Shell = M.ModelingV2Glm53FlashNvfp4Sm10xTp4
 
 
 def _admit(request, *, mtp: bool) -> None:
-    Shell.validate_request(SimpleNamespace(spec_worker=object() if mtp else None), request)
+    Shell.validate_request(SimpleNamespace(spec_config=object() if mtp else None), request)
 
 
 def _request(post_processors=None, context_logits=False):
@@ -63,3 +65,9 @@ def test_without_mtp_context_logits_are_refused():
 def test_with_mtp_context_logits_are_left_to_the_sampler():
     # SpecSampler.validate_request refuses them before the model's check runs.
     _admit(_request(context_logits=True), mtp=True)
+
+
+def test_guided_decoding_is_refused():
+    # The engine then fails startup with guided decoding and MTP, instead of the step running
+    # without the grammar's bitmask.
+    assert Shell.set_guided_decoder(SimpleNamespace(), object()) is False
