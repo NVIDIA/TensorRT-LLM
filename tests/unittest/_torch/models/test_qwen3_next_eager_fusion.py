@@ -412,9 +412,7 @@ def test_norms_outside_fused_allreduce_get_fp8_scales(case) -> None:
     ]
     model_config = SimpleNamespace(
         lora_config=object() if case == "lora" else None,
-        mapping=SimpleNamespace(
-            has_pp=lambda: case == "pp", has_cp_helix=lambda: case == "helix"
-        ),
+        mapping=SimpleNamespace(has_pp=lambda: case == "pp", has_cp_helix=lambda: case == "helix"),
     )
 
     _attach_norm_fp8_scales(layers, model_config)
