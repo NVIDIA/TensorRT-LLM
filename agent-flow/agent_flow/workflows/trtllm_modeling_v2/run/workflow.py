@@ -716,13 +716,16 @@ class TrtllmModelingV2Workflow:
         What it read of the tree is unchanged: its narrowed marker (:meth:`_commit_marker`
         with ``reads``) on the checkout's ``HEAD`` is the one it recorded. ``workspace``
         holds the verdict's list of what it read: this run's by default, or the run that
-        recorded it. Asked once per head, list and workspace.
+        recorded it. Asked once per head, list, workspace and native build: a rebuild changes
+        the marker without a commit.
         """
         head = self._head()
         if not head or not verdict.reads or not verdict.reads_marker:
             return False
+        repo = str(self.task_data.get("trtllm_repo_path") or "")
         lists = (workspace or self.workspace) / READS_DIRNAME
-        key = (head, verdict.reads, str(lists))
+        libraries = tuple(native_libraries(Path(repo))) if repo else ()
+        key = (head, verdict.reads, str(lists), libraries)
         cache = self.__dict__.setdefault("_narrowed_now", {})
         if key not in cache:
             try:
