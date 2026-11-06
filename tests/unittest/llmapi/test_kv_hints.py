@@ -7,20 +7,133 @@ import asyncio
 import json
 import pickle
 import queue
+from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import msgspec
 import pytest
 from pydantic import JsonValue, ValidationError
 
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.kv_hints import KvHintsEnvelope
-from tensorrt_llm.kv_hints.protocol import MAX_KV_HINTS_BYTES, admit_kv_hints, snapshot_kv_hints
+from tensorrt_llm.kv_hints.protocol import (
+    MAX_KV_HINTS_BYTES,
+    KvHintsSnapshot,
+    admit_kv_hints,
+    snapshot_kv_hints,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_admission_carries_a_msgspec_envelope() -> None:
+    wire = _wire()
+    wire["actions"][0]["payload"]["block_hashes"] = [0, (1 << 64) - 1]
+    request = _request(KvHintsEnvelope.model_validate(wire))
+    hint = request.kv_hints
+
+    assert isinstance(hint, msgspec.Struct)
+    assert all(isinstance(action, msgspec.Struct) for action in hint.actions)
+    assert hint.protocol_version == "0.1" and hint.message_id == "msg-123"
+    assert hint.actions[0].payload == wire["actions"][0]["payload"]
+    assert msgspec.to_builtins(hint) == wire
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(lambda h: h.actions.append(h.actions[0]), id="action-list"),
+        pytest.param(lambda h: h.actions.clear(), id="clear-actions"),
+        pytest.param(lambda h: h.actions[0].payload.clear(), id="clear-payload"),
+        pytest.param(lambda h: h.actions[0].payload.update(x=1), id="update-payload"),
+        pytest.param(lambda h: h.actions[0].payload.pop("block_hashes"), id="pop-payload"),
+        pytest.param(lambda h: h.actions[0].payload.popitem(), id="popitem-payload"),
+        pytest.param(lambda h: h.actions[0].payload.setdefault("new", 1), id="setdefault-payload"),
+        pytest.param(lambda h: h.actions[0].payload.__setitem__("new", 1), id="assign-payload"),
+        pytest.param(
+            lambda h: h.actions[0].payload.__delitem__("block_hashes"), id="delete-payload"
+        ),
+        pytest.param(lambda h: h.actions[0].payload.__ior__({"new": 1}), id="merge-payload"),
+        pytest.param(
+            lambda h: h.actions[1].payload["nested"].__setitem__("enabled", False),
+            id="nested-object",
+        ),
+        pytest.param(lambda h: h.actions[0].payload["block_hashes"].append(99), id="append-hash"),
+        pytest.param(lambda h: h.actions[0].payload["block_hashes"].extend([99]), id="extend-hash"),
+        pytest.param(
+            lambda h: h.actions[0].payload["block_hashes"].insert(0, 99), id="insert-hash"
+        ),
+        pytest.param(lambda h: h.actions[0].payload["block_hashes"].pop(), id="pop-hash"),
+        pytest.param(lambda h: h.actions[0].payload["block_hashes"].remove(11), id="remove-hash"),
+        pytest.param(lambda h: h.actions[0].payload["block_hashes"].reverse(), id="reverse-hashes"),
+        pytest.param(lambda h: h.actions[0].payload["block_hashes"].sort(), id="sort-hashes"),
+        pytest.param(
+            lambda h: h.actions[0].payload["block_hashes"].__iadd__([99]), id="add-hashes"
+        ),
+        pytest.param(
+            lambda h: h.actions[0].payload["block_hashes"].__imul__(2), id="repeat-hashes"
+        ),
+        pytest.param(
+            lambda h: h.actions[0].payload["block_hashes"].__setitem__(slice(None), []),
+            id="slice-hashes",
+        ),
+        pytest.param(
+            lambda h: h.actions[0].payload["block_hashes"].__delitem__(0), id="delete-hash"
+        ),
+    ],
+)
+def test_admitted_msgspec_payloads_reject_nested_mutation(
+    mutate: Callable[[KvHintsSnapshot], object],
+) -> None:
+    request = _request(_hints())
+    hint = request.kv_hints
+    assert isinstance(hint, msgspec.Struct)
+    with pytest.raises(TypeError, match="immutable"):
+        mutate(hint)
+    assert hint.envelope().model_dump(mode="json") == _wire()
+
+
+def test_msgspec_request_transport_and_selection_need_no_json_conversion() -> None:
+    from tensorrt_llm._torch.disaggregation.orchestration._kv_hints import (
+        _collect_kv_fetch_candidates,
+    )
+
+    wire = _wire()
+    wire["actions"][0]["payload"]["provider_metadata"] = {"trace": ["router"]}
+    wire["actions"][0]["payload"]["_extra"] = {"trace": ["source"]}
+    request = _request(KvHintsEnvelope.model_validate(wire))
+    with (
+        patch.object(KvHintsEnvelope, "model_validate_json", side_effect=AssertionError("decoded")),
+        patch.object(KvHintsEnvelope, "model_dump_json", side_effect=AssertionError("encoded")),
+        patch(
+            "tensorrt_llm.kv_hints.protocol.msgspec.json.decode",
+            side_effect=AssertionError("decoded"),
+        ),
+    ):
+        transported = pickle.loads(pickle.dumps(request)).kv_hints
+        assert isinstance(transported, msgspec.Struct)
+        transported = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(transported), type=type(transported)
+        )
+        candidates = _collect_kv_fetch_candidates(
+            transported, family_capabilities={"kvcr": frozenset({("kv.fetch", "1.0")})}
+        )
+        selected = candidates.candidates[0].snapshot()
+        assert isinstance(selected, msgspec.Struct)
+        assert len(selected.actions) == 1
+        assert selected.actions[0].payload["block_hashes"] == [11, 22]
+        with pytest.raises(TypeError, match="immutable"):
+            selected.actions[0].payload["block_hashes"].append(99)
+        with pytest.raises(TypeError, match="immutable"):
+            selected.actions.clear()
+        with pytest.raises(TypeError, match="immutable"):
+            selected.actions[0].payload["provider_metadata"]["trace"].append("changed")
+        with pytest.raises(TypeError, match="immutable"):
+            selected.actions[0].payload["_extra"]["trace"].append("changed")
+    assert selected.envelope().model_dump(mode="json") == dict(wire, actions=wire["actions"][:1])
 
 
 class _StubModelConfig:
@@ -71,25 +184,40 @@ def test_wire_round_trip_preserves_unknown_actions_and_json() -> None:
     assert json.loads(envelope.model_dump_json()) == _wire()
 
 
-def test_optional_metadata_survives_admission_without_a_version_change() -> None:
-    """Unknown envelope and action metadata remain JSON-valid and immutable."""
-    wire = _wire()
+@pytest.mark.parametrize("typed", [False, True])
+def test_admission_keeps_only_protocol_fields(typed: bool) -> None:
+    """Public and admitted wire shapes match, with provider data kept in payload."""
+    expected = _wire()
+    expected["actions"][0]["payload"]["_extra"] = {"trace": ["provider"]}
+    wire = json.loads(json.dumps(expected))
     wire["producer_metadata"] = {"trace": ["router-a", 7]}
+    wire["_extra"] = {"legacy": True}
     wire["actions"][0]["optional_metadata"] = {"future": True}
-    hints = KvHintsEnvelope.model_validate(wire)
+    wire["actions"][0]["_extra"] = ["legacy"]
+    hints = KvHintsEnvelope.model_validate(wire) if typed else wire
+    public = KvHintsEnvelope.model_validate(hints)
+    assert public.model_dump(mode="json") == expected
     request = _request(hints)
-    assert request.kv_hints.envelope().model_dump() == wire
-    hints.__pydantic_extra__["producer_metadata"]["trace"].append("mutated")
-    assert request.kv_hints.envelope().model_dump() == wire
+    snapshot = request.kv_hints
+    assert snapshot.envelope().model_dump(mode="json") == expected
+    assert set(msgspec.to_builtins(snapshot)) == {"protocol_version", "message_id", "actions"}
+    assert set(msgspec.to_builtins(snapshot.actions[0])) == {
+        "action_id",
+        "action_type",
+        "action_version",
+        "payload",
+    }
+    for codec in (msgspec.json, msgspec.msgpack):
+        assert codec.decode(codec.encode(snapshot)) == public.model_dump(mode="json")
+    wire["actions"][0]["payload"]["_extra"]["trace"].append("mutated")
+    assert snapshot.envelope().model_dump(mode="json") == expected
 
 
-@pytest.mark.parametrize("action_level", [False, True])
 @pytest.mark.parametrize("invalid", [float("nan"), object()])
-def test_optional_metadata_must_remain_json(action_level: bool, invalid: object) -> None:
-    """Forward-compatible metadata cannot carry non-JSON Python objects."""
+def test_provider_payload_must_remain_json(invalid: object) -> None:
+    """Opaque provider payloads cannot carry non-JSON Python objects."""
     wire = _wire()
-    target = wire["actions"][0] if action_level else wire
-    target["optional_metadata"] = {"nested": invalid}
+    wire["actions"][0]["payload"]["provider_metadata"] = {"nested": invalid}
     with pytest.raises(ValidationError):
         KvHintsEnvelope.model_validate(wire)
     with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
@@ -156,7 +284,6 @@ def test_non_json_raw_hints_are_ignored_before_admission(invalid_json: str) -> N
 
 
 @pytest.mark.parametrize("typed", [False, True])
-@pytest.mark.parametrize("location", ["payload", "envelope_extra", "action_extra"])
 @pytest.mark.parametrize(
     ("value", "accepted"),
     [
@@ -168,19 +295,12 @@ def test_non_json_raw_hints_are_ignored_before_admission(invalid_json: str) -> N
         (2**64, False),
     ],
 )
-def test_admission_enforces_msgpack_integer_bounds(
-    typed: bool, location: str, value: int, accepted: bool
-) -> None:
+def test_admission_enforces_msgpack_integer_bounds(typed: bool, value: int, accepted: bool) -> None:
     """Admitted opaque JSON values must survive the proxy's MessagePack transport."""
     import msgspec
 
     wire = _wire()
-    targets = {
-        "payload": wire["actions"][0]["payload"],
-        "envelope_extra": wire,
-        "action_extra": wire["actions"][0],
-    }
-    targets[location]["nested"] = {"items": [value]}
+    wire["actions"][0]["payload"]["nested"] = {"items": [value]}
     hints = KvHintsEnvelope.model_validate(wire) if typed else wire
     with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
         request = _request(hints)
@@ -265,52 +385,42 @@ def test_http_request_repr_omits_hints_without_changing_transport(
 
 @pytest.mark.parametrize("typed", [False, True])
 @pytest.mark.parametrize("container_kind", ["dict", "list"])
-@pytest.mark.parametrize("location", ["payload", "envelope_extra", "action_extra"])
-@pytest.mark.parametrize(("depth", "accepted"), [(32, True), (200, False)])
-def test_admission_requires_decodable_nested_json(
-    typed: bool, container_kind: str, location: str, depth: int, accepted: bool
+@pytest.mark.parametrize("depth", [32, 200])
+def test_admission_accepts_nested_metadata_supported_by_msgspec(
+    typed: bool, container_kind: str, depth: int
 ) -> None:
-    """Python-valid metadata must also fit the snapshot's JSON decoder."""
+    """Valid metadata need not pass an unused JSON decoder before binary transport."""
     nested: JsonValue = "leaf"
     for _ in range(depth):
         nested = {"child": nested} if container_kind == "dict" else [nested]
     wire = _wire()
-    targets = {
-        "payload": wire["actions"][0]["payload"],
-        "envelope_extra": wire,
-        "action_extra": wire["actions"][0],
-    }
-    targets[location]["nested"] = nested
+    wire["actions"][0]["payload"]["nested"] = nested
     envelope = KvHintsEnvelope.model_validate(wire)
     wire_json = envelope.model_dump_json().encode("utf-8")
     assert len(wire_json) < MAX_KV_HINTS_BYTES
     hints = envelope if typed else wire
 
-    if not accepted:
-        with pytest.raises(ValidationError, match="recursion limit exceeded"):
-            KvHintsEnvelope.model_validate_json(wire_json)
-
-    with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
+    with (
+        patch.object(
+            KvHintsEnvelope,
+            "model_validate_json",
+            side_effect=AssertionError("admission must not decode JSON"),
+        ),
+        patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count,
+    ):
         admitted = admit_kv_hints(hints)
-        if accepted:
-            assert admitted is not None
-            assert admitted.model_dump() == wire
-            count.assert_not_called()
-        else:
-            assert admitted is None
-            count.assert_called_once_with("malformed")
-
-    with patch("tensorrt_llm.kv_hints.protocol.count_ignored_kv_hints") as count:
+        assert admitted is not None
+        assert admitted.model_dump() == wire
         request = _request(hints)
         assert request.prompt_token_ids == [1, 2, 3]
-        if accepted:
-            assert request.kv_hints is not None
-            assert request.kv_hints.wire_json == wire_json
-            assert request.kv_hints.envelope().model_dump() == wire
-            count.assert_not_called()
-        else:
-            assert request.kv_hints is None
-            count.assert_called_once_with("malformed")
+        assert request.kv_hints is not None
+        assert request.kv_hints.wire_json == wire_json
+        transported = msgspec.msgpack.decode(
+            msgspec.msgpack.encode(request.kv_hints), type=KvHintsSnapshot
+        )
+        assert transported.envelope().model_dump() == wire
+        assert pickle.loads(pickle.dumps(request)).kv_hints == request.kv_hints
+        count.assert_not_called()
 
 
 def test_invalid_request_input_is_not_hidden_by_ignored_hints() -> None:
@@ -330,7 +440,7 @@ def test_admission_snapshot_is_deeply_immutable() -> None:
     decoded = request.kv_hints.envelope()
     decoded.actions[1].payload["nested"]["enabled"] = False
     assert request.kv_hints.envelope().model_dump() == _wire()
-    with pytest.raises(FrozenInstanceError):
+    with pytest.raises(AttributeError):
         request.kv_hints.wire_json = b"{}"
 
 
@@ -358,6 +468,7 @@ def test_generation_request_pickle_preserves_snapshot() -> None:
     """The existing request pickle path retains Python hint metadata."""
     request = _request(_hints())
     clone = pickle.loads(pickle.dumps(request))
+    assert isinstance(clone.kv_hints, msgspec.Struct)
     assert clone.kv_hints == request.kv_hints
     assert clone.kv_hints.envelope().model_dump() == _wire()
 
@@ -476,11 +587,13 @@ def test_worker_and_llm_request_conversion(with_hints: bool) -> None:
     BaseWorker._enqueue_request(worker, request)
     native_request = worker.engine.enqueue_request.call_args.args[0]
     assert native_request.py_kv_hints == request.kv_hints
+    assert isinstance(native_request.py_kv_hints, msgspec.Struct) is with_hints
 
     llm_request = executor_request_to_llm_request(
         42, native_request, child_req_ids=[], exclude_last_generation_logits=False
     )
     assert llm_request.py_kv_hints == request.kv_hints
+    assert isinstance(llm_request.py_kv_hints, msgspec.Struct) is with_hints
 
 
 def test_child_requests_inherit_hint_snapshot() -> None:
@@ -498,6 +611,7 @@ def test_child_requests_inherit_hint_snapshot() -> None:
         42, request, child_req_ids=[43], exclude_last_generation_logits=False
     )
     assert llm_request.child_requests[0].py_kv_hints == request.py_kv_hints
+    assert isinstance(llm_request.child_requests[0].py_kv_hints, msgspec.Struct)
 
 
 @pytest.mark.parametrize("broadcast_kind", ["single_round", "tensor_parallel", "pipeline_parallel"])
@@ -574,11 +688,12 @@ def test_request_broadcast_transports_hints(broadcast_kind: str) -> None:
     attach_py_objects_to_requests(targets, received)
     transported_hints = targets[0].request.py_kv_hints
     assert transported_hints == hints
+    assert isinstance(transported_hints, msgspec.Struct)
     assert targets[0].request.py_lora_ckpt_source == "hf"
     assert getattr(targets[1].request, "py_kv_hints", None) is None
     transported_hints.envelope().actions[0].payload["block_hashes"].append(99)
     assert transported_hints.envelope().model_dump() == _wire()
-    with pytest.raises(FrozenInstanceError):
+    with pytest.raises(AttributeError):
         transported_hints.wire_json = b"{}"
 
 

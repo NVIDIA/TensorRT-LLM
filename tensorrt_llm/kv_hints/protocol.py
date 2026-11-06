@@ -8,8 +8,7 @@ an envelope does not activate a backend, perform a fetch, or apply source policy
 """
 
 import json
-from dataclasses import dataclass
-from typing import TypeAlias
+from typing import NoReturn, TypeAlias
 
 import msgspec
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
@@ -32,8 +31,7 @@ _SUPPORTED_PROTOCOL_VERSION = "0.1"
 class KvHintAction(BaseModel):
     """One producer-versioned action carried without interpreting its payload."""
 
-    model_config = ConfigDict(extra="allow", allow_inf_nan=False, revalidate_instances="always")
-    __pydantic_extra__: dict[str, JsonValue]
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False, revalidate_instances="always")
 
     action_id: str = Field(min_length=1, description="Producer's action identifier.")
     action_type: str = Field(min_length=1, description="Opaque action type, such as kv.fetch.")
@@ -46,12 +44,11 @@ class KvHintAction(BaseModel):
 class KvHintsEnvelope(BaseModel):
     """Versioned KV hints transported as prototype per-request metadata.
 
-    Unknown action types, action versions and optional JSON fields are preserved. Consumers must
-    negotiate and validate executable actions separately from this wire format.
+    Unknown envelope and action fields are ignored. Action types, versions and opaque
+    payloads are preserved; consumers negotiate and validate executable actions separately.
     """
 
-    model_config = ConfigDict(extra="allow", allow_inf_nan=False, revalidate_instances="always")
-    __pydantic_extra__: dict[str, JsonValue]
+    model_config = ConfigDict(extra="ignore", allow_inf_nan=False, revalidate_instances="always")
 
     protocol_version: str = Field(
         min_length=1,
@@ -64,23 +61,77 @@ class KvHintsEnvelope(BaseModel):
 KvHintsInput: TypeAlias = KvHintsEnvelope | dict[str, JsonValue]
 
 
-@dataclass(frozen=True, slots=True)
-class KvHintsSnapshot:
-    """Immutable admitted metadata, including every nested payload value.
+def _reject_mutation(*args: object, **kwargs: object) -> NoReturn:
+    raise TypeError("KV hint metadata is immutable")
 
-    Attributes:
-        wire_json: Validated envelope encoded as UTF-8 JSON bytes.
+
+class _FrozenDict(dict[str, object]):
+    """Read-only JSON object retaining dict compatibility for consumers."""
+
+    __setitem__ = __delitem__ = __ior__ = _reject_mutation
+    clear = pop = popitem = setdefault = update = _reject_mutation
+
+    def __reduce__(self) -> tuple[type, tuple[dict[str, object]]]:
+        return type(self), (dict(self),)
+
+
+class _FrozenList(list[object]):
+    """Read-only JSON array retaining list compatibility for consumers."""
+
+    __setitem__ = __delitem__ = __iadd__ = __imul__ = _reject_mutation
+    append = clear = extend = insert = pop = remove = reverse = sort = _reject_mutation
+
+    def __reduce__(self) -> tuple[type, tuple[list[object]]]:
+        return type(self), (list(self),)
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, (_FrozenDict, _FrozenList)):
+        return value
+    if isinstance(value, dict):
+        return _FrozenDict((key, _freeze(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return _FrozenList(_freeze(item) for item in value)
+    return value
+
+
+class _KvHintActionSnapshot(msgspec.Struct, frozen=True, kw_only=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: dict[str, object]
+
+    def __post_init__(self) -> None:
+        msgspec.structs.force_setattr(self, "payload", _freeze(self.payload))
+
+
+class KvHintsSnapshot(msgspec.Struct, frozen=True, kw_only=True):
+    """Admitted msgspec envelope with read-only nested request metadata.
+
+    Consumers can pass this envelope directly to a compatible provider after
+    selection and authorization. Only defined protocol fields are carried; provider
+    metadata belongs inside the opaque action payload.
     """
 
-    wire_json: bytes
+    protocol_version: str
+    message_id: str
+    actions: list[_KvHintActionSnapshot]
+
+    def __post_init__(self) -> None:
+        msgspec.structs.force_setattr(self, "actions", _freeze(self.actions))
+
+    @property
+    def wire_json(self) -> bytes:
+        """Render the public wire format on demand; request transport stores no JSON."""
+        return self.envelope().model_dump_json().encode("utf-8")
 
     def envelope(self) -> KvHintsEnvelope:
-        """Decode an independent copy for a consumer without exposing mutable state.
+        """Build an independent public model for inspection or wire serialization.
 
         Returns:
             A validated envelope whose mutation cannot change this snapshot.
         """
-        return KvHintsEnvelope.model_validate_json(self.wire_json)
+        return KvHintsEnvelope.model_validate(msgspec.to_builtins(self))
 
 
 def admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
@@ -94,12 +145,11 @@ def admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
         or malformed hint. Unsupported raw versions need not follow the supported
         schema. Direct construction of a typed envelope still validates its fields.
     """
-    admitted = _admit_kv_hints(hints)
-    return None if admitted is None else admitted[0]
+    return _admit_kv_hints(hints)
 
 
-def _admit_kv_hints(hints: KvHintsInput | None) -> tuple[KvHintsEnvelope, bytes] | None:
-    """Return the admitted model and its checked, decodable JSON encoding."""
+def _admit_kv_hints(hints: KvHintsInput | None) -> KvHintsEnvelope | None:
+    """Return the model after schema, wire-size and transport checks."""
     if hints is None:
         return None
     if isinstance(hints, KvHintsEnvelope):
@@ -135,23 +185,36 @@ def _admit_kv_hints(hints: KvHintsInput | None) -> tuple[KvHintsEnvelope, bytes]
         count_ignored_kv_hints("oversized")
         return None
     try:
-        validated = KvHintsEnvelope.model_validate_json(wire_json)
         msgspec.msgpack.encode(validated.model_dump(mode="json"))
     except (OverflowError, TypeError, ValueError, RecursionError):
         count_ignored_kv_hints("malformed")
         return None
-    return validated, wire_json
+    return validated
 
 
 def snapshot_kv_hints(hints: KvHintsInput | None) -> KvHintsSnapshot | None:
-    """Validate and freeze optional hints before queueing a generation request.
+    """Validate and convert hints to a read-only msgspec envelope at admission.
 
     Args:
         hints: The optional producer envelope or raw JSON object.
 
     Returns:
-        Immutable UTF-8 JSON, or None for absent or ignored hints. Malformed
+        A msgspec envelope, or None for absent or ignored hints. Malformed
         metadata is counted and discarded before the request is queued.
     """
-    admitted = _admit_kv_hints(hints)
-    return None if admitted is None else KvHintsSnapshot(admitted[1])
+    envelope = _admit_kv_hints(hints)
+    if envelope is None:
+        return None
+    return KvHintsSnapshot(
+        protocol_version=envelope.protocol_version,
+        message_id=envelope.message_id,
+        actions=[
+            _KvHintActionSnapshot(
+                action_id=action.action_id,
+                action_type=action.action_type,
+                action_version=action.action_version,
+                payload=action.payload,
+            )
+            for action in envelope.actions
+        ],
+    )

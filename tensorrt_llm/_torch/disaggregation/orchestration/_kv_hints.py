@@ -6,6 +6,8 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+import msgspec
+
 from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 
 
@@ -33,9 +35,10 @@ class _KvFetchCandidate:
             An immutable one-action envelope with all envelope and action
             metadata preserved. Each call returns an independent snapshot.
         """
-        envelope = self._envelope_snapshot.envelope()
-        envelope.actions = [envelope.actions[self._action_index]]
-        return KvHintsSnapshot(envelope.model_dump_json().encode("utf-8"))
+        return msgspec.structs.replace(
+            self._envelope_snapshot,
+            actions=[self._envelope_snapshot.actions[self._action_index]],
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +90,10 @@ def _collect_kv_fetch_candidates(
     capabilities = tuple(
         (family, frozenset(actions)) for family, actions in family_capabilities.items()
     )
-    envelope = snapshot.envelope()
     candidates = []
     unknown_actions = 0
     unsupported_version_actions = 0
-    for index, action in enumerate(envelope.actions):
+    for index, action in enumerate(snapshot.actions):
         if action.action_type != "kv.fetch":
             unknown_actions += 1
             continue
