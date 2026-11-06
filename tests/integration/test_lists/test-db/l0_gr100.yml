@@ -62,6 +62,7 @@ l0_gr100:
   # MXFP8 fused FC12 MoE: the SM107 kernel, the leaf end to end against the
   # Cutlass MXFP8 leaf, and its gate/up interleave across partial refits.
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_moe_rubin
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_mxfp8_chunked_forward_with_aux_stream
   - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache
   - unittest/_torch/moe/test_moe_backend.py::test_cutedsl_mxfp8_fused_fc12_accuracy_ab
   - unittest/_torch/moe/test_mxfp8_moe_partial_refit.py

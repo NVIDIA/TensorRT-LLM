@@ -76,7 +76,11 @@ class TrtllmCutedslFusedFc12Mxfp8Impl(CuteDslLocalityDomainMixin, MoEImplBase):
         capabilities=MoEStaticCapability(
             supports_apply_router_weight_on_input=True,
         ),
-        input_requirement=MoEInputRequirement(routing_scales_dtype=torch.float32),
+        # The persistent FC2 tiles wait on FC1 tiles of the same grid.
+        input_requirement=MoEInputRequirement(
+            routing_scales_dtype=torch.float32,
+            run_moe_requires_coresident_grid=True,
+        ),
         doc="Rubin (SM107) MXFP8 fused FC1 + SwiGLU + FC2 + finalize persistent "
         "CuTe DSL grouped GEMM.",
     )

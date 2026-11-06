@@ -5435,6 +5435,113 @@ def _mxfp8_fused_fc12_reference(
     get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
 )
+def test_moe_module_mxfp8_chunked_forward_with_aux_stream():
+    """A layer whose ``moe_max_num_tokens`` is below the batch gets an aux
+    stream for chunk overlap. The persistent MXFP8 fused FC12 grid needs all
+    its CTAs resident, so the scheduler must run the chunks one after another
+    on the main stream; the chunked forward then finishes and matches an
+    unchunked one."""
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    num_tokens, chunk_tokens, top_k = 1024, 256, 8
+    hidden_size, intermediate_size, num_experts = 2048, 1536, 64
+    dtype = torch.bfloat16
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, input_tensor, "CUTEDSL"
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        def create_module(moe_max_num_tokens: int):
+            model_config = ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                mapping=mapping,
+                moe_backend="CUTEDSL",
+                max_num_tokens=num_tokens,
+                moe_max_num_tokens=moe_max_num_tokens,
+            )
+            moe = create_moe(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=model_config,
+                allow_backend_degradation=False,
+            )
+            assert type(moe.backend).__name__ == "TrtllmCutedslFusedFc12Mxfp8Impl"
+            moe.create_weights()
+            moe.load_weights([weights])
+            moe.post_load_weights()
+            moe.cuda()
+            return moe
+
+        full_moe = create_module(num_tokens)
+        chunked_moe = create_module(chunk_tokens)
+        assert full_moe.aux_stream is None
+        assert chunked_moe.aux_stream is not None
+
+        with torch.inference_mode():
+            full_output = full_moe.forward(input_tensor, router_logits)
+            chunked_output = chunked_moe.forward(input_tensor, router_logits)
+            torch.cuda.synchronize()
+
+        # Each token's routing and MXFP8 input quantization do not depend on
+        # the other tokens. The finalize scatter-adds the top-k contributions
+        # in no fixed order, so two unchunked runs already differ by about
+        # 0.25% RMS (0.45% on the worst row) at outputs of order 1e5; compare
+        # relative errors, not elements.
+        diff = (chunked_output.float() - full_output.float()).norm(dim=1)
+        row_rel = diff / full_output.float().norm(dim=1).clamp_min(1e-6)
+        rms_rel = (diff.norm() / full_output.float().norm()).item()
+        cos = torch.nn.functional.cosine_similarity(
+            chunked_output.float().flatten(), full_output.float().flatten(), dim=0
+        ).item()
+        assert rms_rel < 1e-2, f"chunked vs unchunked RMS error {rms_rel:.4%}"
+        assert row_rel.max().item() < 2e-2, (
+            f"worst row error {row_rel.max().item():.4%} at row {row_rel.argmax().item()}"
+        )
+        assert cos > 0.9999, f"cosine {cos}"
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize(
     "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",

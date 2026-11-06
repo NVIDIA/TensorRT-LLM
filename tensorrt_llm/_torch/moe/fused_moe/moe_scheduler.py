@@ -923,9 +923,14 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # A backend that reuses its buffers across calls can have only one chunk
         # in flight, and each chunk's output is gone once the next one runs.
-        reuses_buffers = moe.backend.input_requirement.run_moe_reuses_buffers
+        # A backend whose grid must be co-resident cannot overlap two chunks.
+        input_requirement = moe.backend.input_requirement
+        reuses_buffers = input_requirement.run_moe_reuses_buffers
         use_multi_stream = (
-            not moe.enable_alltoall and moe.aux_stream is not None and not reuses_buffers
+            not moe.enable_alltoall
+            and moe.aux_stream is not None
+            and not reuses_buffers
+            and not input_requirement.run_moe_requires_coresident_grid
         )
 
         # ========== Setup auxiliary stream ==========
