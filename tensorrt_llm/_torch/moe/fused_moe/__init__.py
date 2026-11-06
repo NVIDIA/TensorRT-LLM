@@ -29,7 +29,9 @@ from .cutlass import cutlass_leaf, find_cutlass_leaf
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cute_dsl_b12x import (CuteDslB12xFusedMoE,
                                       CuteDslB12xNvfp4FusedMoE,
-                                      CuteDslB12xW4a16Nvfp4FusedMoE)
+                                      CuteDslB12xW4a16Nvfp4FusedMoE,
+                                      FlashinferCutedslNvfp4Impl,
+                                      FlashinferCutedslW4a16Nvfp4Impl)
 from .fused_moe_cute_dsl_fc12 import CuteDslFc12FusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_marlin import MarlinFusedMoE
@@ -72,6 +74,8 @@ __all__ = [
     "CuteDslB12xFusedMoE",
     "CuteDslB12xNvfp4FusedMoE",
     "CuteDslB12xW4a16Nvfp4FusedMoE",
+    "FlashinferCutedslNvfp4Impl",
+    "FlashinferCutedslW4a16Nvfp4Impl",
     "CuteDslFc12FusedMoE",
     "TrtllmCutedslFusedFc12Nvfp4Impl",
     "CuteDslFusedMoE",
