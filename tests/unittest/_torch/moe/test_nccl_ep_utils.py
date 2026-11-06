@@ -68,14 +68,14 @@ class _DispatchQuantizationRecipe(enum.Enum):
 class _GroupConfig:
     """Plain stand-in without ``__dataclass_fields__``: the zero-copy probe reads False."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, **kwargs: object) -> None:
         self.kwargs = kwargs
 
 
 class _LayoutInfo:
     """Stand-in without ``recv_topk_idx_kind``: the global-id probe reads False."""
 
-    def __init__(self, src_rank_counters=None) -> None:
+    def __init__(self, src_rank_counters: _Tensor | None = None) -> None:
         self.src_rank_counters = src_rank_counters
         self._lowpp = SimpleNamespace()
 
@@ -94,10 +94,10 @@ class _CpuTorch:
     )
 
     @staticmethod
-    def device(*args, **kwargs) -> torch.device:
+    def device(*args: object, **kwargs: object) -> torch.device:
         return torch.device("cpu")
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> object:
         return getattr(torch, name)
 
 
@@ -160,7 +160,7 @@ def _install_fake_nccl(
 
 
 @pytest.fixture
-def bootstrap(monkeypatch: pytest.MonkeyPatch):
+def bootstrap(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Patch everything around ``NcclEpContext.__init__`` except the bootstrap branch."""
     torch_group_comm = Mock(name="torch_group_comm")
     mpi_comm_result = Mock(name="mpi_seeded_comm")
@@ -206,7 +206,7 @@ def _create_context(mapping: SimpleNamespace) -> nccl_ep_utils.NcclEpContext:
     )
 
 
-def test_ray_orchestrator_seeds_comm_from_torch_ep_group(bootstrap) -> None:
+def test_ray_orchestrator_seeds_comm_from_torch_ep_group(bootstrap: SimpleNamespace) -> None:
     bootstrap.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
     mapping = _make_mapping()
 
@@ -239,7 +239,9 @@ def test_ray_orchestrator_seeds_comm_from_torch_ep_group(bootstrap) -> None:
 
 
 @pytest.mark.parametrize("ep_world_rank", [0, 1])
-def test_mpi_orchestrator_splits_comm_world_by_pipeline_stage(bootstrap, ep_world_rank) -> None:
+def test_mpi_orchestrator_splits_comm_world_by_pipeline_stage(
+    bootstrap: SimpleNamespace, ep_world_rank: int
+) -> None:
     bootstrap.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
     bootstrap.sub_comm.Get_rank.return_value = ep_world_rank
     mapping = _make_mapping()
@@ -266,7 +268,7 @@ def test_mpi_orchestrator_splits_comm_world_by_pipeline_stage(bootstrap, ep_worl
 
 @pytest.mark.parametrize("mpi_disabled", [True, False])
 def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
-    bootstrap, mpi_disabled
+    bootstrap: SimpleNamespace, mpi_disabled: bool
 ) -> None:
     bootstrap.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: mpi_disabled)
     ctx = _create_context(_make_mapping())
