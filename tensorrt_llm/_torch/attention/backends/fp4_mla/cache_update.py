@@ -1117,6 +1117,19 @@ def _fp4_mla_layer_has_decode_views(kv_cache_manager: Any, local_layer: int) -> 
     return callable(has_views) and bool(has_views(local_layer))
 
 
+def _fp4_mla_generation_writes_owned_pages(kv_cache_manager: Any) -> bool:
+    """Whether every page a generation step appends to belongs to its request.
+
+    Without block reuse it always does. With it, a reused page may be shared or
+    lack this process-local packed-V sidecar, unless the manager's reuse claims
+    whole blocks only (``fp4_mla_reuse_claims_whole_blocks``): a request then
+    appends past the reused prefix on pages it allocated itself.
+    """
+    if getattr(kv_cache_manager, "enable_block_reuse", True) is False:
+        return True
+    return getattr(kv_cache_manager, "fp4_mla_reuse_claims_whole_blocks", False) is True
+
+
 def _fp4_mla_v_scale_pool_for_layer(
     metadata: Any, local_layer: int, v_head_dim: int
 ) -> torch.Tensor:
@@ -1318,17 +1331,16 @@ def scatter_fp4_mla_kv_cache(
             page_size=metadata.page_size,
             block_v=FP4_MLA_SCALE_ROW_GROUP,
         )
-        # Reused/imported pages may not carry this process-local sidecar. Write
-        # packed V directly only when the cache pages are exclusively owned.
-        # The fused generation kernel handles uniform linear-MTP batches and
-        # updates every 16-token tile touched by the verification window.
+        # Write packed V directly only to pages the requests own; otherwise
+        # repack the pages the step touched. The fused generation kernel
+        # handles uniform linear-MTP batches and updates every 16-token tile
+        # touched by the verification window.
         num_gen = metadata.num_seqs - metadata.num_contexts
-        block_reuse = getattr(kv_cache_manager, "enable_block_reuse", True)
         direct_v_packed_write = (
             num_gen > 0
             and num_tokens >= num_gen
             and num_tokens % num_gen == 0
-            and block_reuse is False
+            and _fp4_mla_generation_writes_owned_pages(kv_cache_manager)
         )
         if direct_v_packed_write:
             v_packed_base = _get_fp4_mla_v_packed_pool_base(metadata)
