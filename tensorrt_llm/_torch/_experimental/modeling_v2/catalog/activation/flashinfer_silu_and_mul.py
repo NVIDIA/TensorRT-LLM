@@ -37,6 +37,13 @@ class FlashinferSiluAndMul(OpWrapper):
             why="the dense layers' wider intermediate, 2 x 18432",
             spec=dict(shape=(16, 36864), dtype=torch.bfloat16),
         ),
+        *(
+            Cell(
+                why=f"beam dense block, {tokens} tokens: 2 x 20480",
+                spec=dict(shape=(tokens, 40960), dtype=torch.bfloat16),
+            )
+            for tokens in (1, 17, 129)
+        ),
     )
 
     note = """

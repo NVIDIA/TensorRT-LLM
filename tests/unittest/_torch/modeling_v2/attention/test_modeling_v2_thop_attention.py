@@ -5668,6 +5668,7 @@ def _op_reference(
     causal: bool = True,
     e4m3: bool = False,
     layer: Optional[int] = None,
+    window: Optional[int] = None,
     nvfp4: bool = False,
 ) -> torch.Tensor:
     """`op.reference` over the history the env mirrored for these requests.
@@ -5699,6 +5700,7 @@ def _op_reference(
         v_head_dim=d,
         softmax_scale=1.0 / math.sqrt(d),
         causal=causal,
+        window=window,
         e4m3_inputs=e4m3,
         e4m3_probabilities=e4m3,
     )
@@ -7242,10 +7244,11 @@ def _cell_paged(cell, arm) -> None:
         tokens_per_block=spec["tokens_per_block"],
         num_blocks=spec["num_blocks"],
         max_batch=spec["max_num_requests"],
-        max_blocks_per_seq=16,
+        max_blocks_per_seq=spec.get("max_blocks_per_seq", 16),
         pool_dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
         quant_mode=spec["quant_mode"],
         kv_scaling_factor=spec["kv_scale"] if fp8 or nvfp4 else None,
+        attention_window_size=spec["window"],
     )
     cached, new, nc = spec["cached"], spec["new"], spec["num_contexts"]
     p, paged = spec["predicted_tokens_per_seq"], spec["use_paged_context_fmha"]
@@ -7283,7 +7286,10 @@ def _cell_paged(cell, arm) -> None:
     assert not (nvfp4 and not paged), "an NVFP4 cell runs the paged-context path"
     e4m3 = (fp8 or nvfp4) and (paged or nc == 0)
     causal = spec["mask_type"] == MASK_CAUSAL
-    _compare(out, _op_reference(env, qkv, list(new), rids, causal=causal, e4m3=e4m3, nvfp4=nvfp4))
+    ref = _op_reference(
+        env, qkv, list(new), rids, causal=causal, e4m3=e4m3, window=spec["window"], nvfp4=nvfp4
+    )
+    _compare(out, ref)
     for rid in rids:
         env.check_cache(rid)
     env.check_unwritten_pool_zero()
@@ -7409,6 +7415,25 @@ _QWEN4_NVFP4 = dict(QWEN4_DENSE, quant_mode=QM_NVFP4_KV_CACHE, kv_scale=1.0)
 _QWEN4_DENSE_G32 = dict(QWEN4_DENSE, max_num_requests=32, num_blocks=144)
 _QWEN4_FP8_G32 = dict(_QWEN4_FP8, max_num_requests=32, num_blocks=144)
 
+# Beam TP4 splits 48 query / 8 KV heads into 12 / 2 per rank. Its NVFP4
+# weight format does not change this attention call's BF16 Q/K/V and KV pool.
+_BEAM_TP4 = dict(
+    input_type=STANDARD,
+    num_heads=12,
+    num_kv_heads=2,
+    head_size=128,
+    v_head_dim=128,
+    sinks=False,
+    quant_mode=0,
+    mask_type=MASK_CAUSAL,
+    tokens_per_block=32,
+    num_blocks=64,
+    max_num_requests=3,
+    max_blocks_per_seq=20,
+    use_paged_context_fmha=True,
+    predicted_tokens_per_seq=1,
+)
+
 
 def _spread(batch: int, longest: int) -> tuple[int, ...]:
     """`batch` histories rising evenly from 1 to `longest` tokens: one-page, page-boundary
@@ -7419,6 +7444,17 @@ def _spread(batch: int, longest: int) -> tuple[int, ...]:
 # The shapes each shipped target calls this entry with, by target directory
 # under `models/`. The entry's own `CELLS` are the op's whoever calls it.
 TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "beam/full_model_nvfp4__sm_103__tp4": tuple(
+        Cell(
+            why=f"beam TP4 {layer} {phase}: GQA 12q/2kv d128, cached {cached}, new {new}",
+            spec=dict(_BEAM_TP4, window=window, cached=cached, new=new, num_contexts=num_contexts),
+        )
+        for layer, window in (("sliding", 512), ("full", None))
+        for phase, cached, new, num_contexts in (
+            ("paged context", (64,), (17,), 1),
+            ("decode", (511, 512, 513), (1, 1, 1), 0),
+        )
+    ),
     "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
         Cell(
             why="deepseek MLA context: explicit k/v, qk 576 -> v 128, fp8 pool",

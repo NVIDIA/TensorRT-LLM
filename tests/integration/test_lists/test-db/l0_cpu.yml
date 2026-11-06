@@ -82,6 +82,9 @@ l0_cpu:
   # splice and admission check on a stub tower, the KV pool contract, its KV storage
   # derivation and attention-call arguments, its routed-expert scalars and its weight table.
   # The rest of unittest/_torch/modeling_v2 needs a GPU.
+  - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/test_engine_contracts.py
+  - unittest/tools/test_beam_baseline_accuracy_gate.py
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
@@ -369,3 +372,8 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
+
+  # Beam baseline diagnostic checks (no checkpoints or GPU).
+  - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
+  - unittest/_torch/modeling_v2/models/beam/test_loading_contracts.py
+  - unittest/_torch/modeling_v2/models/beam/full_model_nvfp4__sm_103__tp4/test_serving.py
