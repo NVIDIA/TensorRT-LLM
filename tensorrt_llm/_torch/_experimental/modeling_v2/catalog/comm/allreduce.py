@@ -41,16 +41,27 @@ def allreduce_group_args(mapping, strategy: int = AUTO) -> dict:
 
     The IPC workspace is this op's own fixture: one per mapping, shared with
     every other user of that mapping in the process, allocated on first use.
-    It exists only for strategies that read it.
+    It exists only for strategies that read it. When CUDA IPC turned out to be
+    unusable while building it, the returned strategy is NCCL with no workspace.
 
     Mirrors the router in `_torch/distributed/ops.py`: under MPI the plain
     symbol is called and `process_group` stays None; with MPI disabled the
     `_pg` symbol needs the TP process group and this rank's global rank.
     """
-    from tensorrt_llm._torch.distributed.ops import get_allreduce_workspace
+    from tensorrt_llm._torch.distributed.ops import (
+        allreduce_workspace_ipc_failed,
+        get_allreduce_workspace,
+    )
     from tensorrt_llm._utils import mpi_disabled
 
-    workspace = None if strategy in _NO_WORKSPACE else get_allreduce_workspace(mapping)
+    workspace = None
+    if strategy not in _NO_WORKSPACE:
+        workspace = get_allreduce_workspace(mapping)
+        # The IPC handles could not be exchanged even though P2P was reported, so
+        # the workspace holds null peer pointers. Only NCCL can run, as in the
+        # `AllReduce` module.
+        if allreduce_workspace_ipc_failed(mapping):
+            strategy, workspace = int(AllReduceStrategy.NCCL), None
     process_group, rank = None, None
     if mpi_disabled():
         process_group = mapping.tp_group_pg.boxed()
