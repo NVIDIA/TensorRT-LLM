@@ -72,7 +72,9 @@ def _scheduler(managers):
 def rewinds(monkeypatch):
     calls = []
     monkeypatch.setattr(
-        scheduler_v2, "rewind_context_after_cache_drop", lambda req, tpb: calls.append((req.py_request_id, tpb))
+        scheduler_v2,
+        "rewind_context_after_cache_drop",
+        lambda req, tpb: calls.append((req.py_request_id, tpb)),
     )
     return calls
 
@@ -160,10 +162,14 @@ def test_try_schedule_context_releases_failed_first_admission_unsampled(
     target.kv_cache_map[11] = object()
     sched = _scheduler((target, None, None))
     monkeypatch.setattr(
-        KVCacheV2Scheduler, "_try_schedule_context_full", lambda self, req, budget, preempt: (action, 0, False)
+        KVCacheV2Scheduler,
+        "_try_schedule_context_full",
+        lambda self, req, budget, preempt: (action, 0, False),
     )
 
-    result = sched._try_schedule_context(_Req(11, first_chunk), budget=None, preempt_for_pages=lambda r: False)
+    result = sched._try_schedule_context(
+        _Req(11, first_chunk), budget=None, preempt_for_pages=lambda r: False
+    )
 
     assert result[0] is action
     if sampled_expected is None:

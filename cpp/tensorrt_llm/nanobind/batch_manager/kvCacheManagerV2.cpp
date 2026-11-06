@@ -3791,6 +3791,17 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             },
             nb::arg("buffers"))
         .def("adjust", &kv::KvCacheManager::adjust, nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "raise_hot_min_slots",
+            [](kv::KvCacheManager& self, kv::BatchDesc const& batch)
+            {
+                nb::gil_scoped_release release;
+                auto const floors = self.raiseHotMinSlots(batch);
+                return std::vector<kv::SlotCount>(floors.begin(), floors.end());
+            },
+            nb::arg("batch"),
+            "Raise the hot-level slot floors rebalancing respects to what `batch` needs, capped at the current "
+            "slot counts. Returns the floors per pool group.")
         .def_prop_ro("need_adjustment",
             [](kv::KvCacheManager const& self)
             {
