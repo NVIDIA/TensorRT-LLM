@@ -183,8 +183,15 @@ KvCacheManager::~KvCacheManager()
             "KVCacheManagerV2 is being finalised without a usable CUDA context (CUDA driver error %d); its memory "
             "is leaked. Call shutdown() from the thread that drives the manager.",
             static_cast<int>(context.error()));
-        new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
-        new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
+        auto* const tree = new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
+        auto* const storage = new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
+        if (tree == nullptr || storage == nullptr)
+        {
+            // A failed nothrow allocation leaves its argument unmoved, so that member is destroyed
+            // below after all; its destructor then fails for want of a context and poisons KVCM2.
+            TLLM_LOG_ERROR("KVCacheManagerV2 could not even leak its memory (allocation failed); its destructors "
+                           "run without a CUDA context and may poison KVCacheManagerV2.");
+        }
         return;
     }
     if (context.pushed())
