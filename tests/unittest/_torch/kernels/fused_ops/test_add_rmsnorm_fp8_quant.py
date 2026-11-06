@@ -170,7 +170,9 @@ def test_static_fp8_linear_takes_the_norm_fp8_copy(num_tokens):
         dtype=torch.bfloat16,
         quant_config=QuantConfig(quant_algo=QuantAlgo.FP8),
     ).cuda()
-    linear.weight.copy_((0.05 * torch.randn(512, hidden_size, device="cuda")).to(torch.float8_e4m3fn))
+    linear.weight.copy_(
+        (0.05 * torch.randn(512, hidden_size, device="cuda")).to(torch.float8_e4m3fn)
+    )
     linear.weight_scale.fill_(0.01)
     linear.input_scale.fill_(0.0213)
     norm.fp8_scale = _fp8_linear_input_scale(linear)
