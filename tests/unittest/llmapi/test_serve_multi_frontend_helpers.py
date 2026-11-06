@@ -33,7 +33,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.llmapi.disagg_utils import ServerRole
+from tensorrt_llm.llmapi.disagg_utils import DisaggClusterConfig, ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
 from tensorrt_llm.serve.multi_frontend import (
@@ -306,7 +306,7 @@ def test_only_the_launcher_registers_the_server(monkeypatch, is_launcher: bool) 
     server = object.__new__(OpenAIServer)
     server._registers_server = is_launcher
     server.metadata_server = mock.Mock()
-    server.disagg_cluster_config = SimpleNamespace(cluster_uri="etcd://h:2379", cluster_name="c")
+    server.disagg_cluster_config = DisaggClusterConfig("etcd://h:2379", "c", ca_cert="/ca.pem")
     server.disagg_cluster_worker = None
     server.server_role = ServerRole.CONTEXT
     server.model, server.binding_addr = "m", "http://h:8000"
@@ -318,6 +318,7 @@ def test_only_the_launcher_registers_the_server(monkeypatch, is_launcher: bool) 
     if is_launcher:
         key, metadata = server.metadata_server.put.call_args.args
         assert key == "trtllm/h-1-0" and metadata["url"] == "http://h:8000"
+        storage.assert_called_once_with("etcd://h:2379", "c", ca_cert="/ca.pem")
         assert server.disagg_cluster_worker is worker_cls.return_value
     else:
         server.metadata_server.put.assert_not_called()

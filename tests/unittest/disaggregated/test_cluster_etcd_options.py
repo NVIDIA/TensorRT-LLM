@@ -25,9 +25,9 @@ OPTIONS = {
 
 
 def test_cluster_config_etcd_options():
-    assert DisaggClusterConfig(ETCD_URI).etcd_client_options() == {}
+    assert DisaggClusterConfig(ETCD_URI).cluster_storage_options() == {}
     cfg = DisaggClusterConfig(ETCD_URI, **OPTIONS)
-    assert cfg.etcd_client_options() == OPTIONS
+    assert cfg.cluster_storage_options() == OPTIONS
     assert ETCD_SECRET not in repr(cfg) and RECORD_KEY not in repr(cfg)
 
 
@@ -37,17 +37,34 @@ def test_cluster_config_rejects_credentials_without_ca_cert():
     assert ETCD_SECRET not in str(excinfo.value)
 
 
-@pytest.mark.parametrize("options", [{"ca_cert": "/ca.pem"}, {"record_auth_key": RECORD_KEY}])
+@pytest.mark.parametrize("name", list(OPTIONS))
+@pytest.mark.parametrize("value", ["", 987654321, True, ["/ca.pem"]])
+def test_cluster_config_rejects_etcd_settings_that_are_not_non_empty_strings(name, value):
+    for build in (
+        lambda: DisaggClusterConfig(ETCD_URI, **{**OPTIONS, name: value}),
+        lambda: extract_disagg_cluster_config({"cluster_uri": ETCD_URI, **OPTIONS, name: value}),
+    ):
+        with pytest.raises(ValueError) as excinfo:
+            build()
+        assert str(excinfo.value) == f"disagg_cluster {name} must be a non-empty string"
+
+
+@pytest.mark.parametrize(
+    "options", [{"ca_cert": "/ca.pem"}, {"ca_cert": "/ca.pem", "record_auth_key": RECORD_KEY}]
+)
 def test_cluster_config_etcd_options_require_an_etcd_uri(options):
-    with pytest.raises(ValueError, match="require an etcd:// cluster_uri"):
+    with pytest.raises(ValueError) as excinfo:
         DisaggClusterConfig("http://host:8000", **options)
+    assert str(excinfo.value) == (
+        f"disagg_cluster settings for etcd ({', '.join(options)}) require an etcd:// cluster_uri"
+    )
 
 
 def test_extract_cluster_config_reads_the_options():
     # A worker takes the uri from --disagg_cluster_uri and the credentials from its config file.
     cfg = extract_disagg_cluster_config({"cluster_name": "c", **OPTIONS}, cluster_uri=ETCD_URI)
     assert cfg.cluster_uri == ETCD_URI and cfg.cluster_name == "c"
-    assert cfg.etcd_client_options() == OPTIONS
+    assert cfg.cluster_storage_options() == OPTIONS
 
 
 def test_extract_cluster_config_validates_the_options_it_sets():

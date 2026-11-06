@@ -171,7 +171,7 @@ class DisaggCoordinatorService(DisaggCoordinator):
             create_cluster_storage(
                 config.disagg_cluster_config.cluster_uri,
                 config.disagg_cluster_config.cluster_name,
-                **config.disagg_cluster_config.etcd_client_options(),
+                **config.disagg_cluster_config.cluster_storage_options(),
             )
             if config.disagg_cluster_config
             else None

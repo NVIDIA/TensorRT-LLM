@@ -38,6 +38,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from unittest import mock
 
 import aiohttp
 import pytest
@@ -49,11 +50,13 @@ from prometheus_client.parser import text_string_to_metric_families
 
 from tensorrt_llm.llmapi.disagg_utils import (
     CtxGenServerConfig,
+    DisaggClusterConfig,
     DisaggServerConfig,
     RouterConfig,
     ServerRole,
 )
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import openai_disagg_server
 from tensorrt_llm.serve.coordinator_server import CoordinatorServer
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
@@ -293,6 +296,29 @@ def test_disagg_completion_e2e_through_coordinator(
     # The full ctx -> coordinator/select -> gen chain returned the gen text.
     assert body["choices"][0]["text"] == GEN_TEXT, body
     assert body["choices"][0]["finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize(
+    "cluster_config",
+    [
+        DisaggClusterConfig("etcd://127.0.0.1:2379", "c", ca_cert="/ca.pem"),
+        DisaggClusterConfig("http://127.0.0.1:18000", "c"),
+    ],
+)
+def test_disagg_server_builds_only_an_http_cluster_storage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, cluster_config: DisaggClusterConfig
+) -> None:
+    # The server serves an HTTP cluster storage itself; an etcd one is the coordinator's.
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    create_storage = mock.Mock()
+    monkeypatch.setattr(openai_disagg_server, "create_cluster_storage", create_storage)
+    config = _make_config("127.0.0.1:8001", "127.0.0.1:8002", _free_port())
+    config.disagg_cluster_config = cluster_config
+    OpenAIDisaggServer(config=config, coordinator_url="http://127.0.0.1:8003")
+    if cluster_config.cluster_uri.startswith("etcd://"):
+        create_storage.assert_not_called()
+    else:
+        create_storage.assert_called_once_with("http://127.0.0.1:18000", "c")
 
 
 def _write_config(path, ctx_url, gen_url, public_port, num_workers=1):
