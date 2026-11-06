@@ -563,6 +563,8 @@ def _fp8_block_identity_on_device(
     for module in (utils_mod, model_config_mod):
         monkeypatch.setattr(module, "get_sm_version", lambda: sm_version)
         monkeypatch.setattr(module, "is_sm_100f", _is_sm_100f)
+    # `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` would resolve AUTO to CUTEDSL before the FP8 rule.
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
     moe_backend = model_config_mod.ModelConfig.resolve_moe_backend(
         "AUTO",
         "Qwen3ForCausalLM",

@@ -2893,6 +2893,8 @@ def test_qwen3_moe_auto_backend_resolves_to_qualified_cutlass(
     monkeypatch.setattr(model_config_mod, "get_sm_version", lambda: sm)
     monkeypatch.setattr(model_config_mod, "is_sm_100f", in_sm_family(100, 110))
     monkeypatch.setattr(model_config_mod, "is_sm_120f", in_sm_family(120, 130))
+    # `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` would resolve AUTO to CUTEDSL on every SM.
+    monkeypatch.delenv("OVERRIDE_QUANT_ALGO", raising=False)
 
     resolved = ModelConfig.resolve_moe_backend("AUTO", "Qwen3MoeForCausalLM", QuantConfig())
 
