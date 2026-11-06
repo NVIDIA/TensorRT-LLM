@@ -653,6 +653,35 @@ def _single_rank_adp_skips_padding(executor: "PyExecutor") -> bool:
     return connector is None or connector.capacity_only
 
 
+def _create_request_response(executor: "PyExecutor", request: LlmRequest,
+                             gpu_times_cache: dict):
+    """Create ``request``'s response with the fields every emitted one carries."""
+    if request.return_perf_metrics:
+        # Response creation may finalize and copy scalar ctx GPU totals.
+        executor.perf_manager.compute_batch_gpu_times(
+            [request], gpu_times_cache=gpu_times_cache)
+    response = request.create_response()
+    if response:
+        response.result.cached_tokens = request.cached_tokens
+        response.result.ctx_computed_tokens = getattr(request,
+                                                      'py_ctx_computed_tokens',
+                                                      0)
+        response.result.ctx_first_begin = getattr(request, 'py_ctx_first_begin',
+                                                  -1)
+        response.result.ctx_num_chunks = getattr(request, 'py_ctx_num_chunks',
+                                                 0)
+        executor._maybe_attach_ctx_usage(request, response)
+        response.result.per_pos_drafted = request.py_per_pos_drafted
+        response.result.per_pos_accepted = request.py_per_pos_accepted
+        if request.py_total_draft_tokens > 0:
+            # Backfill RequestPerfMetrics.speculative_decoding on
+            # the client side from the Python-owned counters.
+            response.result.spec_dec_totals = (
+                request.py_total_accepted_draft_tokens,
+                request.py_total_draft_tokens)
+    return response
+
+
 def _rebuild_disagg_imported_cache(resource_manager: ResourceManager,
                                    requests: List[LlmRequest]) -> None:
     """Rebuild the cache state derived from the KV the requests received.
@@ -10726,7 +10755,7 @@ class PyExecutor:
             req.update_perf_metrics(self.iter_counter)
         logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
                            if self._has_prepended_logits(req) else None)
-        response = self._create_request_response(req, {})
+        response = _create_request_response(self, req, {})
         if logits_snapshot is not None and response is not None:
             response.result.generation_logits = logits_snapshot
         return response
@@ -12305,33 +12334,6 @@ class PyExecutor:
             return True
         return first_gen_emit or decoding_iter % self.stream_interval == 0
 
-    def _create_request_response(self, request: LlmRequest,
-                                 gpu_times_cache: dict):
-        """Create ``request``'s response with the fields every emitted one carries."""
-        if request.return_perf_metrics:
-            # Response creation may finalize and copy scalar ctx GPU totals.
-            self.perf_manager.compute_batch_gpu_times(
-                [request], gpu_times_cache=gpu_times_cache)
-        response = request.create_response()
-        if response:
-            response.result.cached_tokens = request.cached_tokens
-            response.result.ctx_computed_tokens = getattr(
-                request, 'py_ctx_computed_tokens', 0)
-            response.result.ctx_first_begin = getattr(request,
-                                                      'py_ctx_first_begin', -1)
-            response.result.ctx_num_chunks = getattr(request,
-                                                     'py_ctx_num_chunks', 0)
-            self._maybe_attach_ctx_usage(request, response)
-            response.result.per_pos_drafted = request.py_per_pos_drafted
-            response.result.per_pos_accepted = request.py_per_pos_accepted
-            if request.py_total_draft_tokens > 0:
-                # Backfill RequestPerfMetrics.speculative_decoding on
-                # the client side from the Python-owned counters.
-                response.result.spec_dec_totals = (
-                    request.py_total_accepted_draft_tokens,
-                    request.py_total_draft_tokens)
-        return response
-
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -12455,8 +12457,8 @@ class PyExecutor:
                     and not request.return_perf_metrics):
                 should_emit = False
             if should_emit:
-                response = self._create_request_response(
-                    request, gpu_times_cache)
+                response = _create_request_response(self, request,
+                                                    gpu_times_cache)
                 if response:
                     if first_gen_emit:
                         request.py_gen_first_emitted = True
