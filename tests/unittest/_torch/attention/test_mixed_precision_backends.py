@@ -839,9 +839,11 @@ class _ColdPageProvider:
         return None
 
 
-def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16"):
+def _small_manager(
+    block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloat16", layout: str = "gqa"
+):
     """A one-layer BF16 cache; mixed precision ("mixed_*", or "cold" for the cold-page window)
-    keeps one page at each end in the high pool."""
+    keeps one page at each end in the high pool. "mla" is a single latent KV head of 576 (K only)."""
     mixed = (
         dict(mixed_precision_first_n=block, mixed_precision_last_n=block, pool_ratio=[0.75, 0.25])
         if dtype.startswith("mixed_")
@@ -855,10 +857,10 @@ def _small_manager(block: int, mapping: Mapping, dtype: str = "mixed_nvfp4_bfloa
             dtype="auto" if cold else dtype,
             **(dict(pool_ratio=[0.75, 0.25]) if cold else mixed),
         ),
-        CacheType.SELF,
+        CacheType.SELFKONLY if layout == "mla" else CacheType.SELF,
         num_layers=1,
-        num_kv_heads=2,
-        head_dim=64,
+        num_kv_heads=1 if layout == "mla" else 2,
+        head_dim=576 if layout == "mla" else 64,
         tokens_per_block=block,
         max_seq_len=1024,
         max_batch_size=2,
@@ -937,6 +939,8 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
     ]
     metadata = Mock(spec=cls)
     metadata.kv_cache_manager = Mock(name="draft_kv_cache_manager")
+    # The property reads this class flag; a Mock attribute would be truthy.
+    metadata.mixed_precision_block_offsets_redirect = cls.mixed_precision_block_offsets_redirect
     metadata.draft_sliding_block_tables = None
     metadata.draft_mixed_precision_high_block_table = None
     metadata.draft_replay_swapped_attrs = {}
@@ -951,6 +955,50 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
     metadata.restore_draft_swaps()
     assert metadata.mixed_precision_high_block_table is table
     assert cls.has_mixed_precision_high_rows.fget(metadata) is True
+
+
+@pytest.mark.cpu_only
+def test_high_rows_property_is_sparse_only_and_dense_reports_the_redirect():
+    """With a high page table, the sparse metadata reports high rows and the dense metadata reports
+    the block-offset redirect, never both: the MLA write path must not run the sparse row store for
+    dense MLA models."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
+        DSAtrtllmAttentionMetadata,
+    )
+
+    table = torch.full((2, 4), -1, dtype=torch.int32)
+    for cls, high_rows in ((TrtllmAttentionMetadata, False), (DSAtrtllmAttentionMetadata, True)):
+        metadata = Mock(spec=cls)
+        metadata.mixed_precision_block_offsets_redirect = cls.mixed_precision_block_offsets_redirect
+        metadata.mixed_precision_high_block_table = table
+        assert cls.has_mixed_precision_high_rows.fget(metadata) is high_rows
+        assert cls.redirects_mixed_precision_block_offsets.fget(metadata) is not high_rows
+        metadata.mixed_precision_high_block_table = None
+        assert cls.has_mixed_precision_high_rows.fget(metadata) is False
+        assert cls.redirects_mixed_precision_block_offsets.fget(metadata) is False
+
+
+@pytest.mark.cpu_only
+def test_cold_page_copy_back_runs_only_for_layers_with_a_high_layer():
+    """Only a layer that has a high layer copies its rows back; a layer without one (a sliding-window
+    layer of the same model) runs the staging context untouched."""
+    metadata = Mock(spec=TrtllmAttentionMetadata)
+    # A Mock attribute would be truthy on its own; set the property's value explicitly.
+    metadata.redirects_mixed_precision_block_offsets = True
+    metadata.kv_cache_manager = Mock(layer_offsets={0: 0, 1: 1}, mixed_precision_high_layers={0: 2})
+    metadata._layer_takes_mixed_precision = partial(
+        TrtllmAttentionMetadata._layer_takes_mixed_precision, metadata
+    )
+    with patch(
+        "tensorrt_llm._torch.attention.backends.trtllm.store_mixed_precision_low_rows"
+    ) as store:
+        with TrtllmAttentionMetadata.mixed_precision_kv_staging(metadata, 0):
+            pass
+        store.assert_called_once_with(metadata, 0)
+        store.reset_mock()
+        with TrtllmAttentionMetadata.mixed_precision_kv_staging(metadata, 1):
+            pass
+        store.assert_not_called()
 
 
 @pytest.mark.cpu_only
@@ -1100,9 +1148,11 @@ def test_steady_decode_step_skips_mixed_precision(dtype):
         manager.shutdown()
 
 
-def test_cold_page_window_redirects_dense_block_offsets():
+@pytest.mark.parametrize("layout", ("gqa", "mla"))
+def test_cold_page_window_redirects_dense_block_offsets(layout):
     """TRTLLM block offsets of the held blocks point at the high layer's blocks of the same pages;
-    after attention the step's rows come back to the layer's own blocks."""
+    after attention the step's rows come back to the layer's own blocks. GQA has K and V blocks,
+    dense MLA one latent block per page."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision KV requires Blackwell")
     from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
@@ -1111,7 +1161,7 @@ def test_cold_page_window_redirects_dense_block_offsets():
 
     block, cached = 32, 4 * 32 + 5
     mapping = Mapping(world_size=1, rank=0, tp_size=1)
-    manager = _small_manager(block, mapping, "cold")
+    manager = _small_manager(block, mapping, "cold", layout)
     try:
         # A decode request with 133 cached tokens writes one: the high pool holds the first block
         # (first_n) and the last two (last_n + 1 tokens); the window released blocks 1 and 2.
@@ -1138,13 +1188,14 @@ def test_cold_page_window_redirects_dense_block_offsets():
         assert metadata.mixed_precision_high_block_table[0, :blocks].tolist() == high
         held = [i for i, page in enumerate(high) if page >= 0]
         assert held == [0, 3, 4]
+        kv_factor = manager.kv_factor
         delta, kv_offset = manager.mixed_precision_high_block_deltas[0], int(manager.kv_offset[0])
         offsets = metadata.kv_cache_block_offsets[0, 0, :, :blocks].tolist()
         kept = metadata.mixed_precision_low_block_offsets[0, 0, :, :blocks].tolist()
-        for kv in range(2):
-            assert kept[kv] == [page * 2 + kv * kv_offset for page in low]
+        for kv in range(kv_factor):
+            assert kept[kv] == [page * kv_factor + kv * kv_offset for page in low]
             assert offsets[kv] == [
-                (high[i] * 2 + delta if i in held else low[i] * 2) + kv * kv_offset
+                (high[i] * kv_factor + delta if i in held else low[i] * kv_factor) + kv * kv_offset
                 for i in range(blocks)
             ]
         # The redirected offsets address the high layer's blocks of those pages (HND: a block is
@@ -1152,10 +1203,12 @@ def test_cold_page_window_redirects_dense_block_offsets():
         low_pool = manager.get_buffers(0, "HND", mixed_precision_pool="low")
         high_pool = manager.get_buffers(0, "HND", mixed_precision_pool="high")
         rows = low_pool.view(-1, low_pool.shape[4])
+        heads = high_pool.shape[2]
         for i in held:
-            for kv in range(2):
+            for kv in range(kv_factor):
                 assert (
-                    rows[offsets[kv][i] * 2 * block].data_ptr() == high_pool[high[i], kv].data_ptr()
+                    rows[offsets[kv][i] * heads * block].data_ptr()
+                    == high_pool[high[i], kv].data_ptr()
                 )
         # Attention wrote this step's token (position 133: block 4, token 5) into the high layer;
         # the copy back fills that token of every head in the layer's block and nothing else.
@@ -1163,9 +1216,16 @@ def test_cold_page_window_redirects_dense_block_offsets():
         for page in low:
             low_pool[page].fill_(7)
         torch.manual_seed(0)
-        written = torch.randn(2, 2, 64, device="cuda").to(torch.bfloat16)
+        written = torch.randn(kv_factor, heads, high_pool.shape[4], device="cuda").to(
+            torch.bfloat16
+        )
         high_pool[high[4], :, :, 5].copy_(written)
         high_pool[high[4], :, :, 4].fill_(1.0)
+        # The MTP draft step corrects the query length (one new token) but not the metadata's
+        # separate KV-length copy, which under CUDA graphs still says two; the copy back follows
+        # the query length, so token 4 of the layer's block must stay untouched below.
+        metadata.seq_lens_kv = torch.tensor([2], dtype=torch.int32)
+        assert int(metadata.seq_lens_kv_cuda[0]) == 2 and int(metadata.seq_lens_cuda[0]) == 1
         store_mixed_precision_low_rows(metadata, 0)
         torch.cuda.synchronize()
         assert torch.equal(low_pool[low[4], :, :, 5].view(torch.bfloat16), written)

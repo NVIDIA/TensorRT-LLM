@@ -589,11 +589,14 @@ def _store_mixed_precision_low_rows_kernel(
 
 
 def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_idx: int) -> None:
-    """Copy this step's rows of the held blocks from the high layer's blocks to the layer's own."""
+    """Copy this step's rows of the held blocks from the high layer's blocks to the layer's own.
+
+    Called only for a layer that has a high layer (TrtllmAttentionMetadata.mixed_precision_kv_staging).
+    """
     manager = metadata.kv_cache_manager
     local_layer = manager.layer_offsets[layer_idx]
     num_seqs = metadata.num_seqs
-    if local_layer not in manager.mixed_precision_high_layers or num_seqs == 0:
+    if num_seqs == 0:
         return
     pool_id = int(manager.impl.get_layer_group_id(local_layer))
     # Block offsets as attention used them (held blocks point at the high layer's blocks) and
