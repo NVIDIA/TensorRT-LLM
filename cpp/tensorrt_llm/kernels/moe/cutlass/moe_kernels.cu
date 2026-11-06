@@ -1597,6 +1597,156 @@ __global__ void expandInputRowsKernel(InputActivationsType const* unpermuted_inp
     }
 }
 
+#ifdef ENABLE_FP4
+// Row expansion for NVFP4 input that is already quantized. It writes the same bytes as
+// expandInputRowsKernel<__nv_fp4_e2m1, __nv_fp4_e2m1, NVFP4, false>, but the expansion is a pure gather, so it
+// copies with fewer and wider accesses:
+// - Each CTA copies a contiguous run of permuted rows. All threads share the run's 16-byte vectors, instead of
+//   one row of 4-byte pieces per CTA iteration.
+// - Each row's source row, expert and scale factor (SF) offsets are looked up once and shared via shared memory.
+// - SFs are copied four at a time, since the four SFs of one K group of the 128x4 swizzled atom are contiguous.
+// The launcher uses it only when the rows are 16-byte aligned and the SF buffers 4-byte aligned.
+__global__ void expandPrequantizedFp4RowsKernel(__nv_fp4_e2m1 const* unpermuted_input, __nv_fp4_e2m1* permuted_output,
+    float const* unpermuted_scales, float* permuted_scales, int const* permuted_row_to_unpermuted_row,
+    int64_t const num_tokens, int64_t const hidden_size, int64_t const k, float const* /* fc1_act_global_scale */,
+    bool /* use_per_expert_act_scale */, int64_t const* expert_first_token_offset,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc1_act_sf_flat,
+    TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
+    int64_t const num_experts_per_node, __nv_fp4_e2m1 const* /* prequant_scales */)
+{
+    using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
+    constexpr int VecSize = TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
+    constexpr int ELEM_PER_COPY = 32; // FP4 values per 16-byte vector
+    constexpr int SF_PER_COPY = 4;    // SFs of one K group of the swizzled atom
+    constexpr int ROWS_PER_STEP = EXPAND_THREADS_PER_BLOCK;
+
+    __shared__ int64_t step_source_row[ROWS_PER_STEP];
+    __shared__ int64_t step_sf_expert_offset[ROWS_PER_STEP];
+    __shared__ int step_row_in_expert[ROWS_PER_STEP];
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+#endif
+
+    int64_t const padded_hidden_size = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(
+        hidden_size, TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4);
+    int const num_sf_cols = hidden_size / VecSize;
+    int const num_padded_sf_cols = padded_hidden_size / VecSize;
+    int const sf_copies_per_row = num_padded_sf_cols / SF_PER_COPY;
+    int const vecs_per_row = hidden_size / ELEM_PER_COPY;
+    auto const* input_vecs = reinterpret_cast<uint4 const*>(unpermuted_input);
+    auto* output_vecs = reinterpret_cast<uint4*>(permuted_output);
+    auto const input_sf_layout = swizzled_input_sf ? QuantizationSFLayout::SWIZZLED : QuantizationSFLayout::LINEAR;
+    auto const sf_scaling_type = TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4;
+
+    int64_t const num_valid_tokens = expert_first_token_offset[num_experts_per_node];
+    int64_t const rows_per_block = ceilDiv(num_valid_tokens, static_cast<int64_t>(gridDim.x));
+    int64_t const row_begin = std::min(blockIdx.x * rows_per_block, num_valid_tokens);
+    int64_t const row_end = std::min(row_begin + rows_per_block, num_valid_tokens);
+
+    for (int64_t step_begin = row_begin; step_begin < row_end; step_begin += ROWS_PER_STEP)
+    {
+        int const step_rows = std::min(static_cast<int64_t>(ROWS_PER_STEP), row_end - step_begin);
+        __syncthreads(); // The previous step is done with the shared row tables
+        if (threadIdx.x < step_rows)
+        {
+            int64_t const permuted_row = step_begin + threadIdx.x;
+            int64_t const unpermuted_row = permuted_row_to_unpermuted_row[permuted_row];
+            int64_t const source_row = unpermuted_row % num_tokens;
+            int64_t const expert
+                = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, permuted_row + 1) - 1;
+            int64_t const num_tokens_before_expert = expert_first_token_offset[expert];
+            step_source_row[threadIdx.x] = source_row;
+            step_sf_expert_offset[threadIdx.x]
+                = getOffsetActivationSF(expert, num_tokens_before_expert, padded_hidden_size, sf_scaling_type);
+            step_row_in_expert[threadIdx.x] = permuted_row - num_tokens_before_expert;
+            if (permuted_scales)
+            {
+                int64_t const source_k_idx = source_row * k + unpermuted_row / num_tokens;
+                permuted_scales[permuted_row] = unpermuted_scales ? unpermuted_scales[source_k_idx] : 1.0f;
+            }
+        }
+        __syncthreads();
+
+        // Consecutive threads copy consecutive 16-byte vectors of the run
+        int const step_vecs = step_rows * vecs_per_row;
+        for (int index = threadIdx.x; index < step_vecs; index += EXPAND_THREADS_PER_BLOCK)
+        {
+            int const row = index / vecs_per_row;
+            int const vec = index - row * vecs_per_row;
+            output_vecs[(step_begin + row) * vecs_per_row + vec]
+                = input_vecs[step_source_row[row] * vecs_per_row + vec];
+        }
+
+        // Consecutive threads copy the same SF group of consecutive rows, which are adjacent in the swizzled atom.
+        // SFs past hidden_size are the zero padding along K.
+        int const step_sf_copies = step_rows * sf_copies_per_row;
+        for (int index = threadIdx.x; index < step_sf_copies; index += EXPAND_THREADS_PER_BLOCK)
+        {
+            int const sf_col = index / step_rows * SF_PER_COPY;
+            int const row = index % step_rows;
+            auto* sf_out = cvt_quant_get_sf_out_offset<ElementSF, 1>(std::nullopt /* batchIdx */,
+                step_row_in_expert[row], sf_col, std::nullopt /* numRows */, num_padded_sf_cols,
+                fc1_act_sf_flat + step_sf_expert_offset[row], QuantizationSFLayout::SWIZZLED);
+            if (!sf_out)
+            {
+                continue;
+            }
+            uint32_t sf_group = 0;
+            if (input_sf && sf_col < num_sf_cols)
+            {
+                auto const* sf_in = cvt_quant_get_sf_out_offset<ElementSF, 1>(std::nullopt /* batchIdx */,
+                    step_source_row[row], sf_col, std::nullopt /* numRows */, num_padded_sf_cols,
+                    const_cast<ElementSF*>(input_sf), input_sf_layout);
+                if (sf_col + SF_PER_COPY <= num_sf_cols)
+                {
+                    sf_group = *reinterpret_cast<uint32_t const*>(sf_in);
+                }
+                else
+                {
+                    for (int i = 0; i < num_sf_cols - sf_col; i++)
+                    {
+                        sf_group |= static_cast<uint32_t>(sf_in[i]) << (8 * i);
+                    }
+                }
+            }
+            *reinterpret_cast<uint32_t*>(sf_out) = sf_group;
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
+    // Zero the SFs of the padding rows along N, as expandInputRowsKernel does, one SF group per thread
+    constexpr int64_t min_num_tokens_alignment = TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
+    int64_t const num_padding_sf_copies = min_num_tokens_alignment * num_experts_per_node * sf_copies_per_row;
+    for (int64_t index = blockIdx.x * EXPAND_THREADS_PER_BLOCK + threadIdx.x; index < num_padding_sf_copies;
+         index += static_cast<int64_t>(gridDim.x) * EXPAND_THREADS_PER_BLOCK)
+    {
+        int64_t const padding_token = index / sf_copies_per_row;
+        int const sf_col = (index - padding_token * sf_copies_per_row) * SF_PER_COPY;
+        int64_t const expert = padding_token / min_num_tokens_alignment;
+        int64_t const num_tokens_before_expert = expert_first_token_offset[expert];
+        int64_t const tokens_to_expert = expert_first_token_offset[expert + 1] - num_tokens_before_expert;
+        int64_t const row_in_expert = tokens_to_expert + padding_token % min_num_tokens_alignment;
+        if (row_in_expert
+            < TmaWarpSpecializedGroupedGemmInput::alignToSfDim(tokens_to_expert, min_num_tokens_alignment))
+        {
+            auto* sf_out = cvt_quant_get_sf_out_offset<ElementSF, 1>(std::nullopt /* batchIdx */, row_in_expert, sf_col,
+                std::nullopt /* numRows */, num_padded_sf_cols,
+                fc1_act_sf_flat
+                    + getOffsetActivationSF(expert, num_tokens_before_expert, padded_hidden_size, sf_scaling_type),
+                QuantizationSFLayout::SWIZZLED);
+            if (sf_out)
+            {
+                *reinterpret_cast<uint32_t*>(sf_out) = 0;
+            }
+        }
+    }
+}
+#endif
+
 template <class InputActivationsType, class ExpandedActivationsType>
 void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
     ExpandedActivationsType* permuted_output, float const* unpermuted_scales, float* permuted_scales,
@@ -1653,6 +1803,18 @@ void expandInputRowsKernelLauncher(InputActivationsType const* unpermuted_input,
             TLLM_CHECK_WITH_INFO(
                 quant_params.fp4.fc1.weight_block_scale, "NVFP4 block scaling is expected for FP4xFP4");
             TLLM_CHECK_WITH_INFO(!prequant_scales, "NVFP4 is not supported for AWQ");
+            if constexpr (std::is_same_v<InputActivationsType, __nv_fp4_e2m1>)
+            {
+                // Already quantized input is a pure copy: use 16-byte row and 4-byte SF accesses when aligned.
+                // A per-expert act scale keeps the existing kernel, which asserts on it in debug builds.
+                auto const is_aligned = [](void const* ptr, uintptr_t alignment)
+                { return reinterpret_cast<uintptr_t>(ptr) % alignment == 0; };
+                if (!use_per_expert_act_scale && hidden_size % 32 == 0 && is_aligned(unpermuted_input, 16)
+                    && is_aligned(permuted_output, 16) && is_aligned(fc1_act_sf_flat, 4) && is_aligned(input_sf, 4))
+                {
+                    return &expandPrequantizedFp4RowsKernel;
+                }
+            }
             return &expandInputRowsKernel<InputActivationsType, ExpandedActivationsType,
                 TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4, false>;
         }
