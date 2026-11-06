@@ -282,7 +282,7 @@ def test_target_with_a_custom_logits_processor_keeps_gathered_logits(monkeypatch
     assert worker.target_vocab_parallel_head is None
 
 
-@pytest.mark.parametrize("walk", ["_setup_aliases", "_walk_full_post_load"])
+@pytest.mark.parametrize("walk", ["setup_aliases", "walk_full_post_load"])
 def test_loader_post_load_walk_binds_the_draft_side(monkeypatch, walk):
     """The worker is a module of the engine, registered after the drafter, so
     the model loader's post-load walks bind its target side and its draft side
@@ -291,7 +291,7 @@ def test_loader_post_load_walk_binds_the_draft_side(monkeypatch, walk):
 
     from torch import nn
 
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
     from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 
     lm_head = nn.Linear(4, 4)
@@ -307,7 +307,7 @@ def test_loader_post_load_walk_binds_the_draft_side(monkeypatch, walk):
     engine.spec_worker = worker
     # The drafter takes over the target's head while the weights load.
     engine.draft_model.lm_head = lm_head
-    getattr(ModelLoader, walk)(engine)
+    getattr(model_hooks, walk)(engine)
     assert worker.target_vocab_parallel_head.lm_head is lm_head
     assert worker._vocab_parallel.draft_tokens == worker._argmax_block_tokens
 

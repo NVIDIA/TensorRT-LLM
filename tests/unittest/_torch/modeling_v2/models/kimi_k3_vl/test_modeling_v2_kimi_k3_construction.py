@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
-from tensorrt_llm._torch.models import modeling_kimi_linear as shared
+from tensorrt_llm._torch.models.modeling_kimi_k3_loader import _K3ExpertCkptSpec
 from tensorrt_llm._torch.speculative.dspark import DSparkWorker
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -81,7 +81,7 @@ def test_each_target_requires_its_layout(target, parallel, split, other):
 @pytest.mark.parametrize("target", [route_a, route_b], ids=["tp16_moetp4ep4", "tp16_moetp16ep1"])
 def test_expert_ckpt_spec_meets_the_shared_loader_contract(target):
     spec = target._k3_expert_ckpt_spec(QuantAlgo.W4A8_MXFP4_MXFP8)
-    assert set(shared._K3ExpertCkptSpec._fields) <= set(spec._fields)
+    assert set(_K3ExpertCkptSpec._fields) <= set(spec._fields)
     assert tuple(spec.optional_suffixes) == ()
 
     loaded = {}

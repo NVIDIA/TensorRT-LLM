@@ -38,6 +38,8 @@ from pydantic import (NonNegativeFloat, NonNegativeInt, PositiveInt,
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 try:
     from ray.util.placement_group import PlacementGroup
 except ImportError:
@@ -6784,6 +6786,7 @@ class CheckpointIOPolicy(StrEnum):
     AUTO = "auto"
     NATIVE = "native"
     RANK_STRIPED_READ_AHEAD = "rank_striped_read_ahead"
+    MODEL_STREAMER = "model_streamer"
 
 
 class LoadFormat(Enum):
@@ -7443,10 +7446,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    checkpoint_format: Optional[str] = Field(
+    checkpoint_format: Union[CheckpointFormat, str, None] = Field(
         default=None,
+        telemetry=False,
         description=
-        "The registered checkpoint loader format to use. `MX` selects ModelExpress as an opportunistic P2P "
+        "The checkpoint loader format to use. Built-in formats use CheckpointFormat; custom registered formats accept strings. "
+        "`MX` selects ModelExpress as an opportunistic P2P "
         "loading path and falls back to loading the provided Hugging Face checkpoint; it does not require "
         "converting that checkpoint to an MX-specific format. You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
@@ -7465,7 +7470,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "'native' preserves the existing loader. "
         "'rank_striped_read_ahead' lets node-local ranks read disjoint "
         "SafeTensors extents while native mapping, materialization, and H2D "
-        "continue. Incompatible configurations select native I/O before "
+        "continue. 'model_streamer' streams node-selected SafeTensors to GPU "
+        "using Model Streamer (Kimi K3 only; requires load_format='AUTO', "
+        "checkpoint_format='HF', and a wheel with tensor_names support). "
+        "Model Streamer rejects unsupported configurations. For auto and "
+        "rank_striped_read_ahead, incompatible configurations select native I/O before "
         "optimized reader or collective setup. Runtime-ineligible loads fall "
         "back to native before model mutation.",
         status="prototype",
@@ -7509,7 +7518,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "encoder's GPU memory (enlarging the KV cache pool) for workloads "
         "that never send image/video/audio inputs; such requests are "
         "rejected. Only takes effect for model implementations that support "
-        "it (currently Mistral3 and the Qwen3-VL / Qwen3.5-VL family); a "
+        "it (currently Kimi K2.5/K3, Mistral3, and the Qwen3-VL / "
+        "Qwen3.5-VL family); a "
         "no-op otherwise. "
         "Defaults to False.",
         status="prototype")
@@ -8434,6 +8444,19 @@ class TorchLlmArgs(BaseLlmArgs):
             self.enable_early_first_token_response = False
         return self
 
+    @field_validator("checkpoint_format", mode="before")
+    @classmethod
+    def convert_checkpoint_format(
+            cls, value: CheckpointFormat | str | None
+    ) -> CheckpointFormat | str | None:
+        if isinstance(value, str):
+            try:
+                return CheckpointFormat(value)
+            except ValueError:
+                # Custom loader registrations can define additional formats.
+                return value
+        return value
+
     @model_validator(mode="after")
     def validate_checkpoint_format(self):
         if self.checkpoint_format is not None and self.checkpoint_loader is not None:
@@ -8446,8 +8469,29 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.info(
                 "neither checkpoint_format nor checkpoint_loader were provided, "
                 "checkpoint_format will be set to HF.")
-            self.checkpoint_format = "HF"
+            self.checkpoint_format = CheckpointFormat.HF
 
+        return self
+
+    # NOTE: `validate_checkpoint_format()` must be placed before this function, as this
+    # function depends on the default checkpoint_format that it resolves.
+    # The order is enforced when Pydantic runs after-validators.
+    @model_validator(mode="after")
+    def validate_model_streamer_config(self) -> 'TorchLlmArgs':
+        if self.checkpoint_io_policy != CheckpointIOPolicy.MODEL_STREAMER:
+            return self
+        if self.load_format != LoadFormat.AUTO:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' requires load_format='AUTO'"
+            )
+        if self.checkpoint_loader is not None or self.checkpoint_format != CheckpointFormat.HF:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' requires the built-in HF "
+                "checkpoint loader (checkpoint_format='HF')")
+        if self.is_partial_model_loading:
+            raise ValueError(
+                "checkpoint_io_policy='model_streamer' does not support partial model loading"
+            )
         return self
 
     @model_validator(mode="after")
@@ -8457,7 +8501,7 @@ class TorchLlmArgs(BaseLlmArgs):
         # env var that the upstream ``modelexpress`` library reads. This
         # lets orchestrators configure MX via the environment while keeping
         # the resolved value visible on ``llm_args.mx_config.server_url``.
-        if self.checkpoint_format == "MX" and self.mx_config.server_url is None:
+        if self.checkpoint_format == CheckpointFormat.MX and self.mx_config.server_url is None:
             env_url = os.environ.get("MODEL_EXPRESS_URL")
             if env_url:
                 logger.info(
@@ -8465,7 +8509,7 @@ class TorchLlmArgs(BaseLlmArgs):
                     "from environment.", env_url)
                 self.mx_config.server_url = env_url
 
-        if self.mx_config.server_url is not None and self.checkpoint_format != "MX":
+        if self.mx_config.server_url is not None and self.checkpoint_format != CheckpointFormat.MX:
             logger.warning(
                 "mx_config.server_url is set but checkpoint_format is '%s', not "
                 "'MX'. The MX config will be ignored. Set "

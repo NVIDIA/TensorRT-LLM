@@ -375,11 +375,11 @@ def test_bf16_linear_locality_domain_end_to_end_rubin():
         locality_domain_policy=LocalityDomainPolicy(enabled=True),
     ).cuda()
     linear.load_weights([{"weight": weight, "bias": bias}])
-    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+    from tensorrt_llm._torch.models.checkpoints import model_hooks
 
-    ModelLoader._walk_transform(linear)
+    linear.transform_weights()
     shards = linear._locality_domain_weight_shards
-    ModelLoader._walk_cache_state(linear)
+    model_hooks.walk_cache_state(linear)
     linear.post_load_weights()
     assert linear._locality_domain_weight_shards is shards
 
