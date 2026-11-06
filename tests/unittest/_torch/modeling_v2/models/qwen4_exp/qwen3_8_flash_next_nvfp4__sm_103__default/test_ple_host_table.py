@@ -63,4 +63,5 @@ def test_host_table_loads_when_huge_page_advice_is_refused(monkeypatch) -> None:
     table, host = _host_resident_empty(_ROWS, _HEAD_DIM, torch.float8_e4m3fn, torch.device("cuda"))
     assert isinstance(host._mapping, _Refused) and host.pointer
     assert table.shape == (_ROWS, _HEAD_DIM)
-    assert len(warnings) == 1 and "MADV_HUGEPAGE" in warnings[0], warnings
+    # Other modules on the path (the NUMA placement) may warn too; count only this one.
+    assert len([w for w in warnings if "MADV_HUGEPAGE" in str(w)]) == 1, warnings
