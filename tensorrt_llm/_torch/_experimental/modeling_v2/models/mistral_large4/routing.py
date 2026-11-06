@@ -241,7 +241,7 @@ def route(
     # The NVFP4 checkpoint carries a BF16 DSpark block; the target and draft
     # follow the same parallel topology, on 4 ranks or 8 over two nodes.
     if (
-        compute_capability == (10, 3)
+        compute_capability in ((10, 3), (10, 7))
         and shape == _SHAPE
         and nvfp4_world
         and tep4
@@ -250,6 +250,15 @@ def route(
         and math_ok
         and nvfp4
     ):
+        if compute_capability == (10, 7):
+            # fmt: off
+            # isort: off
+            from .mistral_large_4_nvfp4__sm_107__tep4.modeling import ModelingV2MistralLarge4Nvfp4Sm107Tep4
+            # isort: on
+            # fmt: on
+
+            return ModelingV2MistralLarge4Nvfp4Sm107Tep4
+
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
@@ -262,7 +271,7 @@ def route(
 
     # DEP replicates the attention and dense draft for each rank's requests.
     if (
-        compute_capability == (10, 3)
+        compute_capability in ((10, 3), (10, 7))
         and shape == _SHAPE
         and nvfp4_world
         and dep4
@@ -271,6 +280,15 @@ def route(
         and math_ok
         and nvfp4
     ):
+        if compute_capability == (10, 7):
+            # fmt: off
+            # isort: off
+            from .mistral_large_4_nvfp4__sm_107__dep4.modeling import ModelingV2MistralLarge4Nvfp4Sm107Dep4
+            # isort: on
+            # fmt: on
+
+            return ModelingV2MistralLarge4Nvfp4Sm107Dep4
+
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
@@ -283,7 +301,7 @@ def route(
 
     # TP shards the draft attention and dense MLP like the target's dense layer.
     if (
-        compute_capability == (10, 3)
+        compute_capability in ((10, 3), (10, 7))
         and shape == _SHAPE
         and nvfp4_world
         and tp4
@@ -292,6 +310,15 @@ def route(
         and math_ok
         and nvfp4
     ):
+        if compute_capability == (10, 7):
+            # fmt: off
+            # isort: off
+            from .mistral_large_4_nvfp4__sm_107__tp4.modeling import ModelingV2MistralLarge4Nvfp4Sm107Tp4
+            # isort: on
+            # fmt: on
+
+            return ModelingV2MistralLarge4Nvfp4Sm107Tp4
+
         # One line on purpose: the claims suite reads the routed targets off
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
@@ -318,8 +345,8 @@ def route(
         f"(SSMax, LeRoPE, soft-cap, softmax routing, YaRN magnitude 1, fp8 KV) "
         f"{'as written' if math_ok else 'differ'}, quantization {quant}; the mistral_large4 "
         "targets are Mistral-Large-4-1T-A52B-NVFP4 (ModelOpt MIXED_PRECISION: NVFP4 routed "
-        "experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 at tep4, at dep4 "
-        "and at tp4; each target serves 4 ranks on one node or 8 ranks over two nodes of "
+        "experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 or sm107 at tep4, "
+        "at dep4 and at tp4; each target serves 4 ranks on one node or 8 ranks over two nodes of "
         "four (world_size=tp=4 or 8, pp=1); tep4 is tensor-parallel attention, expert-parallel "
         "MoE, attention DP off (world_size=4 tp=4 pp=1 moe_ep=4 moe_tp=1, or world_size=8 tp=8 "
         "pp=1 moe_ep=8 moe_tp=1: tep8); dep4 is attention data parallel with lm_head TP off, "
