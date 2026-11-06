@@ -16,9 +16,9 @@ imported the package from, and the engine driver names it once per engine. A
 file inside a snapshot names that snapshot's commit; any other names a tree no
 commit pins. A check whose commands imported more than one tree, or a tree no
 commit pins, is void. What each process imported of the tree is read too (the
-rank hook's reads files): a verdict holds on a later commit that changes none
-of the Python files it read and nothing else its check runs
-(``run/workflow.py:_verdict_holds``).
+rank hook's reads files): a verdict holds on a later commit whose Python files
+it read, and every file of the tree that is not Python, are unchanged
+(``run/workflow.py:_commit_marker``).
 """
 
 from __future__ import annotations

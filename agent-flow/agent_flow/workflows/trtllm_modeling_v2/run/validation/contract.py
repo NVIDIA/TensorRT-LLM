@@ -16,11 +16,10 @@ gate and member, with a tier that says when it runs:
 Verdicts are appended to ``contract_status.jsonl`` as gates return, keyed by
 unit. Delivery evaluates the contract: every required check's latest verdict
 must have passed, on the target as it is now. A verdict recorded against an
-earlier state of the target (its ``marker``) holds there still when the change
-since touches nothing its check runs (:func:`evaluate`'s ``holds``); otherwise
-it is stale and counts as missing, as is one recorded with other ``inputs``
-(:func:`check_inputs`). Checks that carry one ``equivalence`` key
-(:func:`equivalence_key`) share a pass on the target as it is now.
+earlier state of the target (its ``marker``), or with other ``inputs``
+(:func:`check_inputs`), is stale and counts as missing. Checks that carry one
+``equivalence`` key (:func:`equivalence_key`) share a pass on the target as it
+is now.
 
 The first state of the target on which the first unit's boot and accuracy
 hold at the member its accuracy runs at is where the bring-up was delivered
@@ -78,10 +77,6 @@ MILESTONE_FILENAME = "correctness.jsonl"
 #: member, or every required check.
 MILESTONE_BRINGUP = "bringup"
 MILESTONE_CORRECTNESS = "correctness"
-#: The gates that run a test of the tree itself (``checks/disagg.py``). Such a gate
-#: runs more of the tree than its marker counts (the tree's tests), so whether its
-#: verdict holds is :func:`evaluate`'s ``holds`` to say, on its own marker too.
-TREE_TEST_GATES = frozenset({disagg.GATE_NAME})
 
 
 @dataclass(frozen=True)
@@ -540,9 +535,8 @@ class Verdict:
     inputs: str = ""
     #: What the check read of the tree: the id of its list of Python files
     #: (``workflow._narrowed``), and the target's marker narrowed to them on
-    #: the commit it measured. With the list, the verdict holds on a later state
-    #: of the target whose change touches none of those files and nothing else
-    #: its check runs (``workflow._verdict_holds``).
+    #: the commit it measured. With both, the verdict holds on any later state
+    #: of the target whose narrowed marker is the same (:func:`evaluate`).
     reads: str = ""
     reads_marker: str = ""
     #: How long the check's gate ran, in seconds; 0 when it did not say.
@@ -680,29 +674,34 @@ def evaluate(
 ) -> Evaluation:
     """Each required check against its latest verdict.
 
-    A verdict whose :attr:`Verdict.inputs` are not its check's is stale and the
-    check counts as missing (one without inputs counts as the check's). With
-    ``marker``, so is one that is not about the target at ``marker``
-    (:func:`_about`). With an established ``marker``, a check with no verdict of
-    its own passes when an equivalent check (the same :attr:`Check.equivalence`)
-    passed on this state of the target. A check's own verdict always wins over
-    an equivalent's, so a check that failed here stays failed, and two verdicts
-    recorded where the marker was not established are never taken to be about
-    one tree.
+    With ``marker``, a verdict recorded against another state of the target is
+    stale and the check counts as missing, unless ``holds`` says it holds there
+    still (what it read of the tree is unchanged: :attr:`Verdict.reads`); so is
+    one whose :attr:`Verdict.inputs` are not the check's (one without inputs
+    counts as the check's). With an established ``marker``, a check with no
+    verdict of its own passes when an equivalent check (the same
+    :attr:`Check.equivalence`) passed on this state of the target. A check's own
+    verdict always wins over an equivalent's, so a check that failed here stays
+    failed, and two verdicts recorded where the marker was not established are
+    never taken to be about one tree.
     """
     latest = (
         verdicts.latest()
         if isinstance(verdicts, ContractStatus)
         else {f"{v.unit}:{v.gate}@{v.member}": v for v in verdicts}
     )
+    if marker is not None:
+        latest = {
+            k: v
+            for k, v in latest.items()
+            if v.marker == marker or (marker and holds is not None and holds(v))
+        }
     checks = {c.key: c for c in contract.checks}
     latest = {
         k: v
         for k, v in latest.items()
-        if k in checks and (not v.inputs or not checks[k].inputs or v.inputs == checks[k].inputs)
+        if not v.inputs or k not in checks or not checks[k].inputs or v.inputs == checks[k].inputs
     }
-    if marker is not None:
-        latest = {k: v for k, v in latest.items() if _about(v, marker, holds)}
     holders: dict[str, Check] = {}
     if marker:
         for check in contract.checks:
@@ -731,25 +730,13 @@ def verdict_on(
     marker: str,
     holds: Callable[[Verdict], bool] | None = None,
 ) -> Verdict | None:
-    """``key``'s latest verdict if it is about the target at ``marker`` (:func:`_about`), else ``None``."""
+    """``key``'s latest verdict if it is about the target at ``marker``, as :func:`evaluate` reads it."""
     verdict = status.latest().get(key)
-    return verdict if verdict is not None and _about(verdict, marker, holds) else None
-
-
-def _about(verdict: Verdict, marker: str, holds: Callable[[Verdict], bool] | None) -> bool:
-    """Whether ``verdict`` is about the target at ``marker``.
-
-    It is when it was recorded there, and when ``holds`` says one recorded on
-    another state holds there still: the change since touches nothing its check
-    runs (``workflow._verdict_holds``). A gate that runs the tree's tests
-    (:data:`TREE_TEST_GATES`) runs more than the marker counts, so with ``holds``
-    and an established ``marker`` its verdict is about ``marker`` where ``holds``
-    says so, wherever it was recorded.
-    """
-    judged = bool(marker) and holds is not None
-    if verdict.marker == marker and not (judged and verdict.gate in TREE_TEST_GATES):
-        return True
-    return judged and holds(verdict)
+    if verdict is None:
+        return None
+    if verdict.marker == marker or (marker and holds is not None and holds(verdict)):
+        return verdict
+    return None
 
 
 def measured_commit(
@@ -976,7 +963,6 @@ __all__ = [
     "TIER_DELIVERY",
     "TIER_INNER",
     "TIER_PROOF",
-    "TREE_TEST_GATES",
     "Verdict",
     "benchmark_members",
     "bringup_checks",

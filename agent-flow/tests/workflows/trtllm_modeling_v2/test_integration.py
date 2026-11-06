@@ -464,13 +464,10 @@ def test_a_check_measures_one_commit_while_integrations_move_the_checkout(
     assert f"- VOID {check.key}: " in rendered
 
 
-_DISAGG_TEST = "tests/integration/defs/accuracy/test_disagg.py"
 _FILES = {
     "tensorrt_llm/models/target.py": "T = 1\n",
-    "tensorrt_llm/models/other.py": "O = 1\n",
     "tensorrt_llm/README.md": "the package\n",
     "tests/integration/defs/accuracy/references/gsm8k.yaml": "m: [{accuracy: 50}]\n",
-    _DISAGG_TEST: "def test_dep2():\n    pass\n",
     "examples/llm-api/quickstart_advanced.py": "print('q')\n",
 }
 
@@ -491,25 +488,16 @@ def _workflow_marker_workflow(repo: Path) -> TrtllmModelingV2Workflow:
     workflow = TrtllmModelingV2Workflow(workspace=repo / "ws")
     workflow.task_data = {
         "trtllm_repo_path": str(repo),
-        "accuracy": {
-            "reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml",
-            "disagg": {"test": f"{_DISAGG_TEST}::test_dep2"},
-        },
+        "accuracy": {"reference_yaml": "tests/integration/defs/accuracy/references/gsm8k.yaml"},
     }
     return workflow
 
 
-def _workflow_marker_commit(repo: Path, name: str, text: str) -> str:
+def _workflow_marker_commit(repo: Path, name: str, text: str) -> None:
     (repo / name).parent.mkdir(parents=True, exist_ok=True)
     (repo / name).write_text(text)
-    _git(repo, "add", "--", name)
+    _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", f"change {name}")
-    return _git(repo, "rev-parse", "HEAD").strip()
-
-
-def _journaled(workflow: TrtllmModelingV2Workflow) -> str:
-    path = workflow.journal_path
-    return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
 @pytest.mark.parametrize(
@@ -523,129 +511,10 @@ def _journaled(workflow: TrtllmModelingV2Workflow) -> str:
 )
 def test_only_a_commit_a_gate_can_see_changes_the_marker(checkout, name, seen):
     workflow = _workflow_marker_workflow(checkout)
-    first = _git(checkout, "rev-parse", "HEAD").strip()
     before = workflow._target_marker()
     assert before.startswith("tree:")
-    head = _workflow_marker_commit(checkout, name, "edited\n")
+    _workflow_marker_commit(checkout, name, "edited\n")
     assert (workflow._target_marker() != before) is seen
-    said = f"every verdict on {first[:10]} holds on {head[:10]}, which changes only "
-    assert (said in _journaled(workflow)) is not seen
-
-
-@pytest.mark.parametrize(
-    "change,carried,said",
-    [
-        # The marker counts none of the tree's tests; the disagg gate runs them.
-        (
-            _DISAGG_TEST,
-            {"core:boot@tp1"},
-            ["every verdict on {a} but a disagg check's holds on {b}, which changes only tests"],
-        ),
-        # No gate runs the flow's own source, which the marker counts.
-        (
-            "agent-flow/pyproject.toml",
-            {"core:boot@tp1", "disagg:disagg@dep2"},
-            [
-                "core:boot@tp1 pass carried from {a} to {b}: the diff touches only the flow's own",
-                "disagg:disagg@dep2 pass carried from {a} to {b}: the diff touches only the flow's",
-            ],
-        ),
-        # The boot never imported it; the disagg test, which did not say what it imported, may have.
-        (
-            "tensorrt_llm/models/other.py",
-            {"core:boot@tp1"},
-            ["core:boot@tp1 pass carried from {a} to {b}: the diff touches only Python files it"],
-        ),
-        ("tensorrt_llm/models/target.py", set(), []),
-        # A native library rebuilt under the same commit.
-        (None, set(), []),
-    ],
-)
-def test_a_verdict_carries_to_a_commit_that_changes_nothing_its_check_runs(
-    checkout, change, carried, said
-):
-    library = checkout / "tensorrt_llm" / "libs" / "libth_common.so"
-    library.parent.mkdir(parents=True)
-    library.write_bytes(b"\x7fELF")
-    workflow = _workflow_marker_workflow(checkout)
-    commit = _git(checkout, "rev-parse", "HEAD").strip()
-    marker = workflow._target_marker()
-    status = contract_mod.ContractStatus.load(workflow.workspace)
-    boot = check_result.GateResult(
-        name="boot",
-        member="tp1",
-        passed=True,
-        detail="",
-        tree_state=commit[:10],
-        marker=marker,
-        imported=(commit,),
-        reads=("tensorrt_llm/__init__.py", "tensorrt_llm/models/target.py"),
-    )
-    status.record("core", boot, reads=workflow._narrowed(boot))
-    # Its commands said nothing of what they imported: its tree is the commit `git describe` names.
-    disagg = check_result.GateResult(
-        name="disagg",
-        member="dep2",
-        passed=True,
-        detail="",
-        tree_state=check_result.describe_tree_state(checkout),
-        marker=marker,
-    )
-    status.record("disagg", disagg)
-    contract = contract_mod.Contract(
-        checks=(
-            contract_mod.Check("core", "boot", "tp1", contract_mod.TIER_INNER),
-            contract_mod.Check("disagg", "disagg", "dep2", contract_mod.TIER_PROOF),
-        )
-    )
-    workflow._contract = contract
-    if change is None:
-        library.write_bytes(b"\x7fELF, rebuilt")
-        head = commit
-    else:
-        head = _workflow_marker_commit(checkout, change, "edited\n")
-
-    evaluation = contract_mod.evaluate(
-        contract, status, marker=workflow._target_marker(), holds=workflow._verdict_holds
-    )
-    assert {c.key for c in evaluation.passed} == carried
-    assert {c.key for c in evaluation.missing} == {c.key for c in contract.checks} - carried
-    journal = _journaled(workflow)
-    for line in said:
-        assert line.format(a=commit[:10], b=head[:10]) in journal
-    assert journal.count("**carried**") == len(said)
-
-
-def test_a_tree_test_gates_verdict_naming_no_commit_holds_nowhere(checkout):
-    """Without the commit it measured, nothing says the tree's tests are the ones it ran."""
-    workflow = _workflow_marker_workflow(checkout)
-    marker = workflow._target_marker()
-    status = contract_mod.ContractStatus.load(workflow.workspace)
-    for gate, member in (("boot", "tp1"), ("disagg", "dep2")):
-        status.record(
-            "core" if gate == "boot" else gate,
-            check_result.GateResult(
-                name=gate,
-                member=member,
-                passed=True,
-                detail="",
-                tree_state=check_result.UNKNOWN_TREE_STATE,
-                marker=marker,
-            ),
-        )
-    contract = contract_mod.Contract(
-        checks=(
-            contract_mod.Check("core", "boot", "tp1", contract_mod.TIER_INNER),
-            contract_mod.Check("disagg", "disagg", "dep2", contract_mod.TIER_PROOF),
-        )
-    )
-    workflow._contract = contract
-    evaluation = contract_mod.evaluate(
-        contract, status, marker=workflow._target_marker(), holds=workflow._verdict_holds
-    )
-    # The boot holds on its own marker; the disaggregated gate is run again.
-    assert {c.key for c in evaluation.passed} == {"core:boot@tp1"}
-    assert {c.key for c in evaluation.missing} == {"disagg:disagg@dep2"}
 
 
 def _planned_writer(tmp_path, monkeypatch, decision="LANDED"):

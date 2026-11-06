@@ -123,12 +123,8 @@ must change before that.
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
-   Evidence is reused only while its relevant code, inputs and environment remain valid: a verdict
-   carries to a later commit whose change touches nothing its check runs (unit tests, CI test
-   lists, docs and the flow's own source for every check, the tree's other tests and examples for
-   every gate but the disaggregated-serving test's, Python files its processes never imported),
-   and the journal says so (`carried`). Missing engine facts stay unknown. Delivery requires the
-   contract, tests and files to agree.
+   Evidence is reused only while its relevant code, inputs and environment remain valid. Missing
+   engine facts stay unknown. Delivery requires the contract, tests and files to agree.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    you or the launching agent handle cluster allocations and session renewal.
