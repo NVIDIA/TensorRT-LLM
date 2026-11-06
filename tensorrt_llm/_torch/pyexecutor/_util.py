@@ -15,6 +15,7 @@
 import copy
 import dataclasses
 import os
+import sys
 from contextlib import ExitStack
 from typing import Dict, List, Optional, Sequence, Union
 
@@ -2149,12 +2150,16 @@ class KvCacheCreator:
                     and not self._is_disagg):
                 # Aggregated helix ranks schedule independently but must admit
                 # the same context batches, so they agree on the smallest cap.
-                # A rank without a cap sends -1, which leaves every rank uncapped.
+                # A rank without a cap does not limit the others; the result
+                # is uncapped only when no rank has a cap.
                 local_cap = self._fp8_ctx_mla_kv_len_cap
                 cap = py_executor.dist.allreduce(
-                    -1 if local_cap is None else local_cap, op=ReduceOp.MIN)
-                self._fp8_ctx_mla_kv_len_cap = cap if cap >= 0 else None
-                workspace_reserve = max(cap, 0) * w_bytes_per_token
+                    sys.maxsize if local_cap is None else local_cap,
+                    op=ReduceOp.MIN)
+                self._fp8_ctx_mla_kv_len_cap = (None if cap == sys.maxsize
+                                                else cap)
+                workspace_reserve = (self._fp8_ctx_mla_kv_len_cap
+                                     or 0) * w_bytes_per_token
             if workspace_reserve > 0:
                 kv_cache_max_memory = int(budget_before - workspace_reserve)
                 logger.info(

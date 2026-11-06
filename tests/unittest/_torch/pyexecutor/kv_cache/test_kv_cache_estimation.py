@@ -10,6 +10,7 @@ produces tp_size duplicate requests, but the scheduler distributes them
 share, not all copies.
 """
 
+import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
@@ -2483,7 +2484,9 @@ def test_helix_estimation_profiles_agg_and_keeps_fraction_for_disagg(is_disagg) 
         assert kv_cache_config.max_tokens is None  # temporary estimation size not kept
 
 
-def _configure_context_mla_capacity(mapping: Mapping, other_rank_cap: int = 100):
+def _configure_context_mla_capacity(
+    mapping: Mapping, other_rank_cap: int = 100, sparse_algorithm: str | None = None
+):
     """Run configure_kv_cache_capacity with the context-MLA reserve active.
 
     The estimation KV manager lowers _max_seq_len from 4096 to 1024 before
@@ -2567,19 +2570,23 @@ def _configure_context_mla_capacity(mapping: Mapping, other_rank_cap: int = 100)
         assert creator.try_prepare_estimation()
         # The estimation KV manager can lower _max_seq_len to what its small pool fits.
         creator._max_seq_len = 1024
+        if sparse_algorithm is not None:
+            creator._sparse_attention_config = SimpleNamespace(algorithm=sparse_algorithm)
         creator.configure_kv_cache_capacity(py_executor)
     return creator, py_executor, kv_cache_config, get_kv_len_cap, get_fixed_bytes
 
 
 @pytest.mark.parametrize(
-    "other_rank_cap, expected_cap", [(100, 100), (-1, None)], ids=["min_cap", "uncapped_rank"]
+    "other_rank_cap, expected_cap",
+    [(100, 100), (sys.maxsize, None)],
+    ids=["min_cap", "all_ranks_uncapped"],
 )
 def test_agg_helix_syncs_context_mla_admission_cap(
     other_rank_cap: int, expected_cap: int | None
 ) -> None:
     """Aggregated helix ranks must admit the same context batches, so the
     context-MLA admission cap is the minimum across ranks. A rank without a cap
-    sends -1, which leaves every rank uncapped."""
+    sends sys.maxsize, so the result is uncapped only when no rank has a cap."""
     creator, py_executor, kv_cache_config, _, _ = _configure_context_mla_capacity(
         Mapping(world_size=2, rank=0, cp_size=2, cp_config={"cp_type": CpType.HELIX}),
         other_rank_cap,
@@ -2600,3 +2607,15 @@ def test_capacity_reserves_use_configured_max_seq_len() -> None:
     assert get_kv_len_cap.call_args.args[3] == 4096
     assert get_fixed_bytes.call_args.kwargs["max_seq_len"] == 4096
     py_executor.dist.allreduce.assert_not_called()
+
+
+def test_indexer_reserve_uses_configured_max_seq_len() -> None:
+    """The DeepSeek-V4 indexer logits reserve is sized for the configured
+    max_seq_len, not the shorter one the estimation KV manager settled on."""
+    with patch(
+        "tensorrt_llm._torch.pyexecutor._util.get_indexer_mqa_logits_workspace_bytes",
+        return_value=0,
+    ) as get_indexer_bytes:
+        _configure_context_mla_capacity(Mapping(), sparse_algorithm="deepseek_v4")
+
+    get_indexer_bytes.assert_called_once_with(256, 4096)
