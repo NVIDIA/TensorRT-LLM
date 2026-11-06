@@ -662,3 +662,19 @@ def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
         creator._tokens_per_block = context_tokens_per_block
         assert "tokens_per_block is 128" in creator._dflash_unify_blocker()
         assert not creator._should_unify_dflash_kv_cache()
+
+
+def test_launcher_requires_one_pool_ratio(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Peers with different pool ratios could get different hosting-manager gate decisions."""
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    page = {"tokens_per_block": 128}
+    servers = (
+        {"speculative_config": spec, "kv_cache_config": {**page, "pool_ratio": [1.0]}},
+        {"speculative_config": spec, "kv_cache_config": page},
+    )
+    with pytest.raises(click.UsageError, match="the same kv_cache_config.pool_ratio"):
+        _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == "0"

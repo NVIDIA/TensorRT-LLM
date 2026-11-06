@@ -2864,6 +2864,14 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
     if len(page_sizes) > 1 and not page_sizes <= {16, 32, 64}:
         return ("kv_cache_config.tokens_per_block to be equal in both "
                 "sections, or 16, 32, or 64 in both")
+    # A hosting manager's gate also checks the pool ratio's arity.
+    pool_ratios = {
+        tuple((cfg.other_args.get("kv_cache_config") or {}).get("pool_ratio")
+              or ())
+        for cfg in server_configs
+    }
+    if len(pool_ratios) > 1:
+        return "the same kv_cache_config.pool_ratio in both sections"
     return None
 
 
