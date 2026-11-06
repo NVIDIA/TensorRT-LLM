@@ -4232,6 +4232,17 @@ class KVCacheManagerV2(BaseResourceManager):
                 )
             )
 
+        if not self.mixed_precision_high_layers and not self.is_estimating_kv_cache:
+            option = (
+                "kv_cache_config.dtype=mixed_nvfp4_*"
+                if self.mixed_precision_low_dtype != self.mixed_precision_high_dtype
+                else "kv_cache_compression_config.mixed_precision_first_n/last_n"
+            )
+            logger.warning(
+                f"{option} has no effect on this KV cache manager: none of its attention "
+                "layers takes mixed precision. Every layer has a sliding window, shares its "
+                "KV cache with another layer, or is a plain draft layer."
+            )
         # A configured pool_ratio must now cover the appended mixed-precision high
         # group as well; the runtime rejects a mismatched length.
         return replace(config, layers=layers)
