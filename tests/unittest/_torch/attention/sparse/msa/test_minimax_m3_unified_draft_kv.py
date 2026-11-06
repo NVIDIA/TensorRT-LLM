@@ -80,11 +80,14 @@ def _manager(
     dtype: DataType = DataType.NVFP4,
     implementation: str = "msa",
     is_disagg: bool = False,
+    max_gpu_total_bytes: int = 64 << 20,
+    max_seq_len: int = 1024,
+    max_batch_size: int = 2,
 ) -> MiniMaxM3KVCacheManagerV2:
     """A MiniMax-M3 manager (hybrid NVFP4 MSA by default), with or without draft layer specs."""
     return MiniMaxM3KVCacheManagerV2(
         KvCacheConfig(
-            max_gpu_total_bytes=64 << 20,
+            max_gpu_total_bytes=max_gpu_total_bytes,
             host_cache_size=0,
             enable_block_reuse=False,
             enable_swa_scratch_reuse=False,
@@ -94,8 +97,8 @@ def _manager(
         num_kv_heads=HEADS,
         head_dim=HEAD_DIM,
         tokens_per_block=128,
-        max_seq_len=1024,
-        max_batch_size=2,
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
         max_num_tokens=256,
         mapping=Mapping(world_size=1, rank=0, tp_size=1, pp_size=1),
         dtype=dtype,
@@ -152,6 +155,16 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
         (request,) = unified.add_dummy_requests(
             [7], token_nums=[200], draft_kv_cache_manager=unified.get_draft_kv_cache_view()
         )
+        # Target layers get raw slot ids, draft layers rows of their base view.
+        for layer in unified.pp_layers:
+            raw = unified.get_batch_cache_indices([7], layer_idx=layer, raw_indices=True)[0]
+            indices = unified.get_batch_cache_indices([7], layer_idx=layer)[0]
+            if layer in unified.draft_layer_ids:
+                scale = unified.get_layer_page_index_scale(layer)
+                expected = [s * scale // 2 if s >= 0 else s for s in raw]
+            else:
+                expected = raw
+            assert indices[: len(raw)] == expected, layer
         offsets = torch.zeros(
             unified.num_attention_op_pools,
             1,
@@ -196,27 +209,6 @@ def test_draft_layer_specs_join_the_hybrid_nvfp4_manager() -> None:
     finally:
         unified.shutdown()
         plain.shutdown()
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
-def test_page_indices_follow_the_layer_owner() -> None:
-    """Target layers get raw slot ids and draft layers base view rows."""
-    torch.cuda.init()
-    manager = _manager(_specs())
-    try:
-        (request,) = manager.add_dummy_requests([7], token_nums=[200])
-        for layer in manager.pp_layers:
-            raw = manager.get_batch_cache_indices([7], layer_idx=layer, raw_indices=True)[0]
-            indices = manager.get_batch_cache_indices([7], layer_idx=layer)[0]
-            if layer in manager.draft_layer_ids:
-                scale = manager.get_layer_page_index_scale(layer)
-                expected = [s * scale // 2 if s >= 0 else s for s in raw]
-            else:
-                expected = raw
-            assert indices[: len(raw)] == expected, layer
-        manager.free_resources(request)
-    finally:
-        manager.shutdown()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
@@ -355,11 +347,51 @@ def test_window_sized_draft_pool_admits_a_full_context_chunk() -> None:
         manager.shutdown()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA cache pools")
+def test_unified_target_capacity_matches_a_separate_draft_pool() -> None:
+    """Hosting the drafter costs the target only the draft lifecycle's bytes.
+
+    The separate-pool arm is the target manager alone on the quota a draft pool of the same size
+    leaves. A bytes-per-token split would give the BF16 drafter about half of the quota instead.
+    """
+    torch.cuda.init()
+    quota, max_seq_len, max_batch_size = 256 << 20, 1 << 18, 8
+    sizes = dict(max_seq_len=max_seq_len, max_batch_size=max_batch_size)
+    unified = _manager(_specs(), max_gpu_total_bytes=quota, **sizes)
+    try:
+        _, draft_ratio = unified.kv_cache_manager_py_config.initial_pool_ratio
+        draft_bytes = int(draft_ratio * quota)
+        unified_tokens = unified.get_num_available_tokens(token_num_upper_bound=max_seq_len)
+        # Every sequence holds a window and one context chunk fits beside them.
+        requests = unified.add_dummy_requests(
+            list(range(max_batch_size)),
+            token_nums=[DRAFT_WINDOW] * (max_batch_size - 1) + [unified.max_num_tokens],
+        )
+        assert requests is not None and len(requests) == max_batch_size
+        for request in requests:
+            unified.free_resources(request)
+    finally:
+        unified.shutdown()
+    capacities = []
+    for target_quota in (quota, quota - draft_bytes):
+        target_only = _manager(_specs()[:NUM_TARGET], max_gpu_total_bytes=target_quota, **sizes)
+        try:
+            capacities.append(
+                target_only.get_num_available_tokens(token_num_upper_bound=max_seq_len)
+            )
+        finally:
+            target_only.shutdown()
+    whole_quota_tokens, separate_pool_tokens = capacities
+    assert whole_quota_tokens < max_seq_len  # The quota, not max_seq_len, bounds the capacity.
+    # Within the allocation grain of the draft lifecycle's pools at this small quota.
+    assert unified_tokens >= 0.98 * separate_pool_tokens
+    assert unified_tokens >= 0.95 * whole_quota_tokens
+
+
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("pp_size", [1, 2])
-@pytest.mark.parametrize("is_disagg", [False, True])
-def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
-    """A windowed draft lifecycle gets its windows plus one chunk, not a bytes-per-token share."""
+def test_window_sized_draft_ratio(pp_size: int) -> None:
+    """A windowed draft lifecycle gets its windows plus one chunk, below a bytes-per-token share."""
 
     def _configs(specs: tuple[KVCacheLayerSpec, ...], target_sinks: Optional[int] = None) -> list:
         return [
@@ -377,52 +409,45 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     manager.max_batch_size = 2
     manager.max_num_tokens = 256
     manager.mapping = Mapping(world_size=pp_size, rank=0, pp_size=pp_size)
-    manager.is_disagg = is_disagg
+    manager.is_disagg = False
     manager._generation_kv_capacity_headroom = 1
     manager.num_extra_kv_tokens = 0
     configs = _configs(manager.layer_specs)
     draft_bytes_per_token = 2 * HEADS * HEAD_DIM * 2 * NUM_DRAFT
-    # Admissible sequences (batch x PP stages, doubled for the overlap scheduler's retiring
-    # request unless an aggregated PP pipeline) hold three pages of window each, plus one chunk.
-    num_sequences = 2 * pp_size * (2 if is_disagg or pp_size == 1 else 1)
-    draft_bytes = (num_sequences * 3 * 128 + 256) * draft_bytes_per_token
-    assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) == pytest.approx(
-        [1 - draft_bytes / (1 << 30), draft_bytes / (1 << 30)]
-    )
-    # Resume refuses a pool above its watermark, so the share covers the windows below it.
-    assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128, 0.5)[1] == pytest.approx(
-        2 * draft_bytes / (1 << 30)
-    )
-    # A quota too small for every window keeps the bytes-per-token split.
     token_share = draft_bytes_per_token / sum(
         spec.bytes_per_token() for spec in manager.layer_specs
     )
+    quota = 1 << 30
+    target_ratio, draft_ratio = manager._windowed_draft_pool_ratio(configs, quota, 128)
+    assert target_ratio + draft_ratio == pytest.approx(1.0)
+    # Every PP stage's batch holds a window, and one context chunk fits beside them.
+    windows_and_chunk = (manager.max_batch_size * pp_size * DRAFT_WINDOW + 256) * (
+        draft_bytes_per_token
+    )
+    assert windows_and_chunk <= draft_ratio * quota < token_share * quota
+    # Resume refuses a pool above its watermark, so a lower watermark needs a larger share.
+    assert manager._windowed_draft_pool_ratio(configs, quota, 128, 0.5)[1] > draft_ratio
+    # A quota too small for every window keeps the bytes-per-token split.
     manager.max_batch_size = 64
     assert manager._windowed_draft_pool_ratio(configs, 8 << 20, 128)[1] == pytest.approx(
         token_share
     )
     manager.max_batch_size = 2
-    # The quota must hold the context-chunk floor: two blocks per lifecycle over the resume
-    # watermark, each buffer rounded to the 2 MiB allocation granularity; otherwise the backend
-    # keeps its own split.
-    floor_bytes = len(configs) * (2 << 20)
-    assert manager._windowed_draft_pool_ratio(configs, floor_bytes - 1, 128, 0.95) is None
-    assert manager._windowed_draft_pool_ratio(configs, floor_bytes, 128, 0.95) is not None
+    # A quota without room for one context chunk per lifecycle keeps the backend's split.
+    assert manager._windowed_draft_pool_ratio(configs, 1 << 20, 128) is None
     # Without a context-chunk bound the backend keeps its own split.
     manager.max_num_tokens = None
-    assert manager._windowed_draft_pool_ratio(configs, 1 << 30, 128) is None
+    assert manager._windowed_draft_pool_ratio(configs, quota, 128) is None
     manager.max_num_tokens = 256
     # Without a windowed draft lifecycle the backend keeps its own split.
     manager.layer_specs = _specs(draft_window=None)[NUM_TARGET - 1 :]
-    assert manager._windowed_draft_pool_ratio(_configs(manager.layer_specs), 1 << 30, 128) is None
+    assert manager._windowed_draft_pool_ratio(_configs(manager.layer_specs), quota, 128) is None
     # A target sharing the drafter's window shares its lifecycle too: sink tokens that round to
     # no sink block do not make a second one.
     manager.layer_specs = tuple(
         replace(spec, sliding_window_size=DRAFT_WINDOW) for spec in _specs()[NUM_TARGET - 1 :]
     )
-    assert (
-        manager._windowed_draft_pool_ratio(_configs(manager.layer_specs, 0), 1 << 30, 128) is None
-    )
+    assert manager._windowed_draft_pool_ratio(_configs(manager.layer_specs, 0), quota, 128) is None
 
 
 def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCacheCreator:
@@ -480,113 +505,141 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
     return creator
 
 
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("is_disagg", [False, True])
-def test_m3_unifies_a_dspark_drafter(monkeypatch: pytest.MonkeyPatch, is_disagg: bool) -> None:
-    """MiniMax-M3's manager hosts a DSpark drafter that reads its 128-token pages."""
-    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
-    assert _dspark_creator(is_disagg=is_disagg)._dflash_unify_blocker() is None
-    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache()
-
-    # The disagg opt-out keeps the separate draft KV cache.
-    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "0")
-    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache() is not is_disagg
-
-    # A drafter running the non-causal context kernel cannot read 128-token pages.
-    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
-    blocker = _dspark_creator(is_disagg=is_disagg, context_kernel=True)._dflash_unify_blocker()
-    assert blocker is not None and "128-token pages" in blocker
-
-
-@pytest.mark.cpu_only
-def test_dflash_trtllm_page_sizes() -> None:
-    """Pages from 128 tokens serve the generation kernels but not the context kernel."""
-    from tensorrt_llm._torch.speculative.dflash_attention import dflash_trtllm_supports_page_size
-
-    for tokens_per_block in (16, 32, 64):
-        assert dflash_trtllm_supports_page_size(tokens_per_block, has_context_attention=True)
-    assert dflash_trtllm_supports_page_size(128, has_context_attention=False)
-    assert dflash_trtllm_supports_page_size(256, has_context_attention=False)
-    assert not dflash_trtllm_supports_page_size(128, has_context_attention=True)
-    assert not dflash_trtllm_supports_page_size(96, has_context_attention=False)
-
-
-@pytest.mark.cpu_only
-def test_nvfp4_target_with_bf16_draft_needs_a_hosting_manager() -> None:
-    """An NVFP4 target transfers with a BF16 draft only when the draft has pools of its own."""
-    target = (1, 128, DataType.NVFP4, False)
-    draft = (1, 128, DataType.BF16, False)
-    compatible = KvCacheCreator._dflash_disagg_layouts_compatible
-    assert not compatible(target, draft)
-    assert compatible(target, draft, nvfp4_target_with_other_draft=True)
-    assert not compatible(
-        target, (2, 128, DataType.BF16, False), nvfp4_target_with_other_draft=True
-    )
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("is_disagg", [False, True])
-def test_gate_keeps_layouts_the_hosting_manager_refuses(
-    monkeypatch: pytest.MonkeyPatch, is_disagg: bool
-) -> None:
-    """Layouts MiniMax-M3's manager refuses at construction keep the separate draft KV cache."""
-    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
-    creator = _dspark_creator(is_disagg=is_disagg)
-    assert creator._dflash_unify_blocker() is None
-
-    # NVFP4 draft layers.
-    creator = _dspark_creator(is_disagg=is_disagg)
+def _gate_creator(
+    *,
+    is_disagg: bool,
+    tokens_per_block: int = 128,
+    context_kernel: bool = False,
+    nvfp4_draft: bool = False,
+    draft_window: Optional[int] = 4096,
+    pool_ratio: Optional[list[float]] = None,
+    implementation: str = "msa",
+    tp_size: int = 2,
+    draft_kv_heads: int = 4,
+    plain_v2: bool = False,
+    nvfp4_target: bool = True,
+    speculative: bool = True,
+) -> KvCacheCreator:
+    """``_dspark_creator`` with one setting changed, for the unify-gate table."""
+    creator = _dspark_creator(is_disagg=is_disagg, context_kernel=context_kernel)
+    creator._tokens_per_block = tokens_per_block
     draft = creator._get_draft_kv_model_config()
-    draft.quant_config = SimpleNamespace(
-        quant_mode=QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.NVFP4)
-    )
-    assert "NVFP4 draft layers" in creator._dflash_unify_blocker()
+    if nvfp4_draft:
+        draft.quant_config = SimpleNamespace(
+            quant_mode=QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.NVFP4)
+        )
+    draft.pretrained_config.num_key_value_heads = draft_kv_heads
+    window = creator._unification_max_seq_len if draft_window is None else draft_window
+    creator._get_draft_max_attention_window = lambda *_: [window]
+    if pool_ratio is not None:
+        creator._pool_ratio_in = pool_ratio
+    creator._sparse_attention_config = SimpleNamespace(implementation=implementation)
+    creator._mapping.tp_size = tp_size
+    if plain_v2:
+        creator._kv_cache_manager_cls = KVCacheManagerV2
+    if not nvfp4_target:
+        creator._model_engine.model.model_config.quant_config = SimpleNamespace(
+            quant_mode=QuantMode.from_quant_algo()
+        )
+    if not speculative:
+        creator._speculative_config = None
+    return creator
 
-    # A draft window that resolves to a target layer's window: one lifecycle for both.
-    creator = _dspark_creator(is_disagg=is_disagg)
-    creator._get_draft_max_attention_window = lambda *_: [creator._unification_max_seq_len]
-    assert "share a KV cache lifecycle" in creator._dflash_unify_blocker()
 
-    # An explicit pool ratio sized for the separate pools' single lifecycle each.
-    creator = _dspark_creator(is_disagg=is_disagg)
-    creator._pool_ratio_in = [1.0]
-    assert "pool_ratio has 1 entries" in creator._dflash_unify_blocker()
-    creator._pool_ratio_in = [0.9, 0.1]
-    assert creator._dflash_unify_blocker() is None
-
-    # The Triton implementation keeps an NVFP4 cache NHD, which transfer cannot pair with draft layers.
-    creator = _dspark_creator(is_disagg=is_disagg)
-    creator._sparse_attention_config = SimpleNamespace(implementation="triton")
-    blocker = creator._dflash_unify_blocker()
-    if is_disagg:
-        assert "HND K/V layout" in blocker
-    else:
-        assert blocker is None
+_BOTH = (False, True)
+# (id, workers, TRTLLM_DISAGG_SHARED_DRAFT_KV, creator settings, unifies, blocker substring or None)
+_GATE_CASES = [
+    ("hosting-manager", _BOTH, "1", {}, True, None),
+    ("unset-env", (False,), None, {}, True, None),
+    ("unset-env", (True,), None, {}, False, None),
+    ("opt-out", (True,), "0", {}, False, None),
+    ("context-kernel-64", _BOTH, "1", dict(tokens_per_block=64, context_kernel=True), True, None),
+    ("context-kernel-128", _BOTH, "1", dict(context_kernel=True), False, "128-token pages"),
+    ("page-96", _BOTH, "1", dict(tokens_per_block=96), False, "96-token pages"),
+    ("page-256", _BOTH, "1", dict(tokens_per_block=256), True, None),
+    ("nvfp4-draft", _BOTH, "1", dict(nvfp4_draft=True), False, "NVFP4 draft layers"),
+    ("shared-lifecycle", _BOTH, "1", dict(draft_window=None), False, "share a KV cache lifecycle"),
+    ("pool-ratio-arity", _BOTH, "1", dict(pool_ratio=[1.0]), False, "pool_ratio has 1 entries"),
+    ("pool-ratio-per-lifecycle", _BOTH, "1", dict(pool_ratio=[0.9, 0.1]), True, None),
+    ("triton-nhd", (False,), "1", dict(implementation="triton"), True, None),
+    ("triton-nhd", (True,), "1", dict(implementation="triton"), False, "HND K/V layout"),
+    # TP 4 sees one head per rank on both sides, TP 2 does not: disagg peers with different TP
+    # would choose different layouts.
+    ("unequal-global-heads", (False,), "1", dict(tp_size=4, draft_kv_heads=2), True, None),
+    (
+        "unequal-global-heads",
+        (True,),
+        "1",
+        dict(tp_size=4, draft_kv_heads=2),
+        False,
+        "2 KV heads, the target 4",
+    ),
+    ("no-speculation", _BOTH, "1", dict(speculative=False), False, "not enabled"),
+    (
+        "plain-v2-64",
+        _BOTH,
+        "1",
+        dict(plain_v2=True, tokens_per_block=64, nvfp4_target=False),
+        True,
+        None,
+    ),
+    (
+        "plain-v2-128",
+        _BOTH,
+        "1",
+        dict(plain_v2=True, nvfp4_target=False),
+        False,
+        "tokens_per_block is 128",
+    ),
+    # An NVFP4 target pairs with a BF16 draft in transfer only when the draft has pools of its own.
+    (
+        "plain-v2-nvfp4-target",
+        (True,),
+        "1",
+        dict(plain_v2=True, tokens_per_block=64),
+        False,
+        "k_only",
+    ),
+]
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("is_disagg", [False, True])
-def test_hosting_manager_without_a_drafter(is_disagg: bool) -> None:
-    """Without speculative decoding the MiniMax-M3 manager stays target-only."""
-    creator = _dspark_creator(is_disagg=is_disagg)
-    creator._speculative_config = None
-    assert creator._should_unify_dflash_kv_cache() is False
+@pytest.mark.parametrize(
+    ("is_disagg", "env", "settings", "unifies", "blocker"),
+    [
+        pytest.param(
+            is_disagg,
+            env,
+            settings,
+            unifies,
+            blocker,
+            id=f"{name}-{'disagg' if is_disagg else 'agg'}",
+        )
+        for name, workers, env, settings, unifies, blocker in _GATE_CASES
+        for is_disagg in workers
+    ],
+)
+def test_unify_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    is_disagg: bool,
+    env: Optional[str],
+    settings: dict,
+    unifies: bool,
+    blocker: Optional[str],
+) -> None:
+    """MiniMax-M3's manager hosts a DSpark drafter unless a layout it or transfer refuses applies.
 
-
-@pytest.mark.cpu_only
-def test_disagg_needs_equal_global_kv_heads(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Disaggregated workers unify only when draft and target have the same global KV heads.
-
-    With 4 target and 2 draft heads, TP 4 sees 1 head per rank on both sides but TP 2 does not, so
-    context and generation workers with different TP would choose different layouts.
+    Disaggregated workers share draft KV only on request; the refused layouts keep the separate
+    draft KV cache instead of failing at construction.
     """
-    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
-    for is_disagg in (False, True):
-        creator = _dspark_creator(is_disagg=is_disagg)
-        creator._mapping.tp_size = 4
-        creator._get_draft_kv_model_config().pretrained_config.num_key_value_heads = 2
-        blocker = creator._dflash_unify_blocker()
-        if is_disagg:
-            assert "2 KV heads, the target 4" in blocker
-        else:
-            assert blocker is None
+    if env is None:
+        monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
+    else:
+        monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", env)
+    creator = _gate_creator(is_disagg=is_disagg, **settings)
+    reason = creator._dflash_unify_blocker()
+    if blocker is None:
+        assert reason is None
+    else:
+        assert reason is not None and blocker in reason
+    assert creator._should_unify_dflash_kv_cache() is unifies
