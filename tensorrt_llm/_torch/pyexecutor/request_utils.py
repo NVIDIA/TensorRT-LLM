@@ -334,7 +334,9 @@ def merge_requests(
     """Merge RequestQueueItems to LlmRequests based on CP configuration.
 
     This is a router function that dispatches to the appropriate merge function
-    based on the CP (Context Parallelism) configuration.
+    based on the CP (Context Parallelism) configuration. A cp_type other than
+    HELIX takes effect only with context parallelism on (cp_size > 1); with a
+    single CP rank, requests are merged as without CP.
 
     Args:
         new_requests: List of RequestQueueItem objects.
@@ -351,7 +353,7 @@ def merge_requests(
         List of LlmRequest objects.
 
     Raises:
-        NotImplementedError: If cp_type is not supported.
+        NotImplementedError: If cp_size > 1 and cp_type is not supported.
     """
     if "cp_type" in cp_config:
         cp_type = cp_config["cp_type"]
@@ -365,7 +367,7 @@ def merge_requests(
                     exclude_last_generation_logits=exclude_last_generation_logits,
                 )
             return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
-        else:
+        elif cp_size > 1:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 
     return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
