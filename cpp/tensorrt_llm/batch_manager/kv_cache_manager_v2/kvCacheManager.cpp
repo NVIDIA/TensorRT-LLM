@@ -178,11 +178,25 @@ KvCacheManager::~KvCacheManager()
         // Its storage and tree are handed to allocations that are never freed, which keeps their
         // destructors -- and the driver calls in them -- from running at all. That is deliberately
         // not a poisoning: no structure is left half-torn, and the managers that follow in this
-        // process stay usable.
-        TLLM_LOG_ERROR(
-            "KVCacheManagerV2 is being finalised without a usable CUDA context (CUDA driver error %d); its memory "
-            "is leaked. Call shutdown() from the thread that drives the manager.",
-            static_cast<int>(context.error()));
+        // process stay usable. The leaked objects still refer to mLifeCycles, which is destroyed
+        // with the rest of the manager; the reference dangles but is unreachable, since no code
+        // holds the leaked pointers and no destructor or method of theirs runs again.
+        //
+        // A deinitialised driver means the process is exiting: a leak at that point costs nothing
+        // and is only worth a warning. Any other failure is a live process without its context.
+        if (context.error() == CUDA_ERROR_DEINITIALIZED)
+        {
+            TLLM_LOG_WARNING(
+                "KVCacheManagerV2 is being finalised after the CUDA driver was deinitialised; its memory is left "
+                "to the exiting process. Call shutdown() before interpreter exit to release it explicitly.");
+        }
+        else
+        {
+            TLLM_LOG_ERROR(
+                "KVCacheManagerV2 is being finalised without a usable CUDA context (CUDA driver error %d); its "
+                "memory is leaked. Call shutdown() from the thread that drives the manager.",
+                static_cast<int>(context.error()));
+        }
         auto* const tree = new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
         auto* const storage = new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
         if (tree == nullptr || storage == nullptr)
