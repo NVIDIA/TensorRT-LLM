@@ -15,6 +15,8 @@
 """Tests for culprit attribution in the unittest integration wrapper."""
 
 import importlib.util
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -118,6 +120,40 @@ def test_long_selectors_preserve_separate_reports(
     assert [path.read_text(encoding="utf-8") for path in reports[:2]] == ["1", "2"]
     assert reports[2].read_text(encoding="utf-8") == "3"
     assert reports[4].read_text(encoding="utf-8") == "5"
+
+
+@pytest.mark.cpu_only
+def test_long_selector_report_names_are_stable_across_processes(tmp_path: Path) -> None:
+    names_by_seed = []
+    for seed in ("1", "2"):
+        run_dir = tmp_path / seed
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--noconftest",
+                "-p",
+                "no:cacheprovider",
+                "-c",
+                "/dev/null",
+                "-q",
+                "--basetemp",
+                str(run_dir),
+                f"{Path(__file__)}::test_long_selectors_preserve_separate_reports",
+            ],
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        names_by_seed.append(
+            sorted(path.name for path in run_dir.rglob("results-sub-unittests-*.xml"))
+        )
+
+    assert len(names_by_seed[0]) == 4
+    assert names_by_seed[0] == names_by_seed[1]
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
