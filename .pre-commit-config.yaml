@@ -1596,6 +1596,12 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+    -   id: check-requirements
+        name: Check the requirement files at the repository root
+        entry: python scripts/check_requirements.py
+        language: python
+        additional_dependencies: [packaging]
+        files: ^(requirements|constraints)[^/]*\.txt$
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py
