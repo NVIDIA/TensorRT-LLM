@@ -32,7 +32,7 @@ Collection stub (``--l0`` / ``--qa`` / ``--waive``):
   not be compiled and no ``tensorrt_llm`` wheel is downloaded. The stub fabricates
   the compiled modules on demand; its ``_EXPLICIT`` table is only for symbols
   whose real *value* is consumed at import time. Full local builds will not catch
-  stub gaps — watch Jenkins Check Test List. Pre-commit still runs only
+  stub gaps — watch the Check Test List CI check. Pre-commit still runs only
   ``--validate`` / waive duplicate checks (no stubbed ``--co``).
 
 Note:
@@ -52,6 +52,9 @@ from pathlib import Path
 
 # The markers in our test lists, need to be preprocess before checking
 MARKER_LIST_IN_TEST = [" TIMEOUT"]
+
+# The only test-db file format version the Jenkins test-db scheduler accepts.
+TEST_DB_VERSION = "0.0.1"
 
 # AST validation defaults
 _DEFAULT_TEST_LISTS_DIR = "tests/integration/test_lists"
@@ -911,18 +914,6 @@ def compute_parity(
 # =============================================================================
 
 
-def _get_trt_test_db_version() -> str:
-    """Read TRT_TEST_DB_VERSION from jenkins/ci_versions.properties."""
-    props_file = Path(
-        __file__).resolve().parent.parent / "jenkins" / "ci_versions.properties"
-    with open(props_file) as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("TRT_TEST_DB_VERSION="):
-                return line.split("=", 1)[1]
-    raise RuntimeError(f"TRT_TEST_DB_VERSION not found in {props_file}")
-
-
 def install_python_dependencies(llm_src: str) -> None:
     """Install collection dependencies without TRT-LLM binaries."""
     subprocess.run(
@@ -930,20 +921,74 @@ def install_python_dependencies(llm_src: str) -> None:
         cwd=llm_src,
         check=True,
     )
-    trt_test_db_ver = _get_trt_test_db_version()
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--extra-index-url",
-            "https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple",
-            "--ignore-installed",
-            f"trt-test-db=={trt_test_db_ver}",
-        ],
-        check=True,
-    )
+
+
+def list_test_db_names(test_db_path: str) -> list[str]:
+    """Return every test entry in test-db/*.yml, across all stages and conditions.
+
+    Perf lists other than perf_sanity are skipped: their tests are generated
+    dynamically.
+
+    Raises ValueError on input the test-db scheduler rejects: duplicate mapping
+    keys, a missing or unsupported version, a context defined in more than one
+    file, a context or block of the wrong type, or a block without a
+    'condition' or a 'tests' list.
+    """
+    # Imported here so --validate runs without PyYAML (pre-commit uses system python).
+    import yaml
+
+    class _UniqueKeyLoader(yaml.SafeLoader):
+
+        def construct_mapping(self, node, deep=False):
+            seen = set()
+            for key_node, _ in node.value:
+                key = self.construct_object(key_node, deep=deep)
+                if key in seen:
+                    raise ValueError(
+                        f"duplicate key {key!r} at line {key_node.start_mark.line + 1}"
+                    )
+                seen.add(key)
+            return super().construct_mapping(node, deep=deep)
+
+    names = set()
+    context_files = {}
+    for path in sorted(glob.glob(os.path.join(test_db_path, "*.yml"))):
+        base = os.path.basename(path)
+        if "perf" in base and "perf_sanity" not in base:
+            continue
+        with open(path) as f:
+            try:
+                data = yaml.load(f, Loader=_UniqueKeyLoader)
+            except ValueError as e:
+                raise ValueError(f"{path}: {e}") from None
+        if not isinstance(data, dict):
+            raise ValueError(f"{path}: expected a mapping at the top level")
+        version = data.pop("version", None)
+        if version != TEST_DB_VERSION:
+            raise ValueError(
+                f"{path}: version must be {TEST_DB_VERSION!r}, got {version!r}")
+        for context, blocks in data.items():
+            if context in context_files:
+                raise ValueError(f"{path}: context {context!r} is already "
+                                 f"defined in {context_files[context]}")
+            context_files[context] = path
+            if not isinstance(blocks, list):
+                raise ValueError(
+                    f"{path}: context {context!r} must be a list of blocks")
+            for block in blocks:
+                if not isinstance(block, dict):
+                    raise ValueError(
+                        f"{path}: context {context!r} has a non-mapping block")
+                if "condition" not in block:
+                    raise ValueError(
+                        f"{path}: context {context!r} has a block without 'condition'"
+                    )
+                if not isinstance(block.get("tests"), list):
+                    raise ValueError(
+                        f"{path}: context {context!r} has a block whose 'tests' is not a list"
+                    )
+                names.update(str(t) for t in block["tests"])
+    return sorted(names)
 
 
 def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
@@ -956,7 +1001,7 @@ def _collection_pytest_env(llm_src: str, models_root: str) -> dict[str, str]:
         "TRT_LLM_NO_LIB_INIT": "1",
         # Override any caller LLM_MODELS_ROOT. Collection only interpolates the
         # path into class-body constants; an empty directory keeps the models
-        # NFS share off the Check Test List pod.
+        # NFS share off the collection host.
         "LLM_MODELS_ROOT": models_root,
     }
 
@@ -989,25 +1034,9 @@ def verify_l0_test_lists(llm_src):
     test_db_path = f"{llm_src}/tests/integration/test_lists/test-db"
     test_list = f"{llm_src}/l0_test.txt"
 
-    # Remove dynamically generated perf tests
-    # Exclude perf_sanity tests from being removed since they are different and statically defined
-    for file_path in glob.glob(os.path.join(test_db_path, "*perf*")):
-        if "perf_sanity" not in os.path.basename(file_path):
-            try:
-                os.remove(file_path)
-            except OSError:
-                pass
-    subprocess.run(
-        f"trt-test-db -d {test_db_path} --test-names --output {test_list}",
-        shell=True,
-        check=True)
-
     # Remove the duplicated test names
     cleaned_lines = set()
-    with open(test_list, "r") as f:
-        lines = f.readlines()
-
-    for line in lines:
+    for line in list_test_db_names(test_db_path):
         # Remove markers and rest of the line if present
         cleaned_line = line.strip()
 
