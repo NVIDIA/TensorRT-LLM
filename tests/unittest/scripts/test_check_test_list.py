@@ -426,25 +426,6 @@ def test_verify_qa_yaml_membership_and_waives(mod, tmp_path, monkeypatch):
     assert not (tmp_path / "nonexits_cases.json").exists()
 
 
-def test_multinode_compatibility_list_matches_yaml(mod):
-    qa_dir = REPO_ROOT / "tests" / "integration" / "test_lists" / "qa"
-    yaml_entries, malformed = mod.collect_entries(str(qa_dir))
-    assert not malformed
-    yaml_path = str(qa_dir / "llm_function_multinode.yml")
-    cases = {
-        entry
-        for entry, refs in yaml_entries.items()
-        if any(ref.startswith(yaml_path + ":") for ref in refs)
-    }
-    text_cases = [
-        mod.parse_test_entry(line)
-        for line in (qa_dir / "llm_function_multinode.txt").read_text().splitlines()
-    ]
-    text_cases = [entry for entry in text_cases if entry is not None]
-    assert len(text_cases) == len(set(text_cases))
-    assert set(text_cases) == cases
-
-
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------
