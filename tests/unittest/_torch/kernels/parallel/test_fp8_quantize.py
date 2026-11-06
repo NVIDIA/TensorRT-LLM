@@ -303,6 +303,89 @@ def test_mxfp8_quantize_tiny_block_is_finite(dtype, is_sf_swizzled_layout):
             4] != 0, "a block just above the threshold lost its value"
 
 
+def _mxfp8_input_with_special_blocks(m, k, dtype, seed):
+    """Random values, and in every third row some special 32-element blocks:
+    all zero, one value below the smallest UE8M0 scale, the dtype maximum,
+    subnormal values and negative zeros."""
+    torch.random.manual_seed(seed)
+    a = torch.randn([m, k], dtype=torch.float) * 16
+    blocks = a.view(m, k // 32, 32)
+    num_blocks = k // 32
+    tiny = 448.0 * 2.0**-127
+    finfo = torch.finfo(dtype)
+    for row in range(0, m, 3):
+        special = [(row + i) % num_blocks for i in range(min(5, num_blocks))]
+        blocks[row, special[0]] = 0.0
+        if len(special) > 1:
+            blocks[row, special[1]] = 0.0
+            blocks[row, special[1], 7] = tiny * 0.5
+        if len(special) > 2:
+            blocks[row, special[2], 3] = finfo.max
+        if len(special) > 3:
+            blocks[row, special[3]] = finfo.smallest_normal * 0.25
+        if len(special) > 4:
+            blocks[row, special[4]] = -0.0
+    return a.to(dtype).cuda().contiguous()
+
+
+@pytest.mark.parametrize("m", [1, 2, 6, 12, 31, 32, 33, 128])
+@pytest.mark.parametrize("k", [1024, 2048, 2176, 2880, 5120, 7168, 16384])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_swizzled_matches_linear_layout(m, k, dtype):
+    """The swizzled output is the linear output with interleaved scales.
+
+    The check covers every byte of both buffers, including the zero scale
+    factors of the padding rows. Small m, wide k takes the small-M kernel;
+    the other shapes take quantize_with_block_size.
+    """
+    a = _mxfp8_input_with_special_blocks(m, k, dtype, seed=m * 131 + k)
+
+    fp8_linear, sf_linear = torch.ops.trtllm.mxfp8_quantize(a, False, 32)
+    ref_sf = torch.ops.trtllm.block_scale_interleave(
+        sf_linear.view(torch.uint8).view(m, k // 32).contiguous())
+
+    # Release 0xFF blocks of the output sizes to the caching allocator, so
+    # that a byte that the kernel does not write is likely to show as 0xFF.
+    sf_size = (m + 127) // 128 * 128 * ((k // 32 + 3) // 4 * 4)
+    poison = [
+        torch.full((size, ), 0xFF, dtype=torch.uint8, device="cuda")
+        for size in (m * k, sf_size)
+    ]
+    del poison
+
+    fp8_swizzled, sf_swizzled = torch.ops.trtllm.mxfp8_quantize(a, True, 32)
+    torch.cuda.synchronize()
+
+    assert sf_swizzled.numel() == sf_size
+    assert torch.equal(fp8_swizzled.view(torch.uint8),
+                       fp8_linear.view(torch.uint8))
+    assert torch.equal(sf_swizzled.view(torch.uint8), ref_sf.view(torch.uint8))
+
+
+@pytest.mark.parametrize("m,k", [(6, 5120), (32, 7168), (64, 5120)])
+@pytest.mark.parametrize("dtype", [torch.half, torch.bfloat16])
+@skip_pre_blackwell_unittest
+def test_mxfp8_quantize_swizzled_cuda_graph_replays(m, k, dtype):
+    """Graph replays with new inputs give the bytes of eager calls."""
+    x = _mxfp8_input_with_special_blocks(m, k, dtype, seed=0)
+    # Run once outside of the capture.
+    torch.ops.trtllm.mxfp8_quantize(x, True, 32)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fp8, sf = torch.ops.trtllm.mxfp8_quantize(x, True, 32)
+
+    for seed in range(1, 6):
+        x.copy_(_mxfp8_input_with_special_blocks(m, k, dtype, seed=seed))
+        graph.replay()
+        ref_fp8, ref_sf = torch.ops.trtllm.mxfp8_quantize(x, True, 32)
+        torch.cuda.synchronize()
+        assert torch.equal(fp8.view(torch.uint8), ref_fp8.view(torch.uint8))
+        assert torch.equal(sf.view(torch.uint8), ref_sf.view(torch.uint8))
+
+
 def _run_megamoe_prepare(hidden_states, token_selected_experts,
                          token_final_scales):
     m, k = hidden_states.shape
