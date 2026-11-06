@@ -63,7 +63,10 @@ CONFIGS = {
     "glm_5_3": (32, 2048, 1),
     "dsv4_flash": (64, 512, 4),
     "dsv4_pro": (64, 1024, 4),
+    # Qwen3.8-Flash-Next: FP8, fixed weights 128 ** -0.5 and unit key scales (kernel contract)
+    "qwen": (4, 512, 4),
 }
+QWEN_MODEL_CONFIG = "Qwen3.8-Flash-Next"
 FP8_DISTRIBUTIONS = ["all_equal", "all_zero", "few_high", "monotonic", "heavy_tail"]
 FP4_DISTRIBUTIONS = ["all_equal", "heavy_tail"]
 
@@ -92,6 +95,7 @@ def _runner(
             device=torch.device("cuda"),
             logits_dtype=logits_dtype,
             qkv_dtype=qkv,
+            model_config=QWEN_MODEL_CONFIG if config == "qwen" else None,
         )
     return _RUNNERS[key]
 
@@ -164,6 +168,11 @@ def _make_inputs(config, num_q, kv_prefix, seed, qkv="fp8", dist="random"):
         return Inputs(q, k, k_scale, weights, q_scale, qkv)
 
     k_scale = rand(num_k) * 0.5 + 0.5
+    if config == "qwen":
+        if dist != "random":
+            raise ValueError("the Qwen contract fixes the weights; only 'random' data is defined")
+        weights.fill_(HEAD_DIM**-0.5)
+        k_scale.fill_(1.0)
     if dist == "random":
         q, k = _fp8(randn(num_q, heads, HEAD_DIM)), _fp8(randn(num_k, HEAD_DIM))
     elif dist == "all_equal":  # every valid key has the same score
@@ -392,6 +401,34 @@ def test_top_k_boundary(config, qkv):
     """Valid-key counts equal to, just below and just above top_k, with unaligned prefixes."""
     for num_q, prefix in _boundary_cases(config):
         _check(config, num_q, prefix, qkv=qkv, seed=3, max_context_length=32768)
+
+
+QWEN_SHAPES = [(64, 8192), (256, 4096), (300, 5000), (1024, 4096), (1, 5000), (8192, 0)]
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("num_q,kv_prefix", QWEN_SHAPES)
+def test_matches_reference_qwen(num_q, kv_prefix):
+    """H4 / top_k 512 / ratio 4 with the fixed-weight Qwen contract (FP8)."""
+    _check("qwen", num_q, kv_prefix, seed=14)
+
+
+@skip_not_sm100
+def test_qwen_top_k_boundary():
+    for num_q, prefix in _boundary_cases("qwen"):
+        _check("qwen", num_q, prefix, seed=15, max_context_length=32768)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float16])
+def test_qwen_low_precision_logits(logits_dtype):
+    _check("qwen", 256, 4096, seed=16, logits_dtype=logits_dtype)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("num_q,kv_prefix", [(4096, 4096), (4096, 28672)])
+def test_qwen_large_shapes(num_q, kv_prefix):
+    _check("qwen", num_q, kv_prefix, seed=17, max_context_length=131072)
 
 
 @skip_not_sm100

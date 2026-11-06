@@ -79,6 +79,7 @@ class ThrowawayPrefillTopK:
         device: torch.device,
         logits_dtype: Optional[torch.dtype] = None,
         qkv_dtype: str = "fp8",
+        model_config: Optional[str] = None,
     ):
         """Builds the wrapper and the K staging buffers.
 
@@ -94,6 +95,10 @@ class ThrowawayPrefillTopK:
                 (``fp32``, ``bf16`` or ``fp16``; default fp32).
             qkv_dtype: ``"fp8"`` for token-scaled FP8 E4M3 queries/keys, or ``"mxfp4"`` for
                 packed E2M1 values with UE8M0 scales per 32 channels (the DSA FP4 indexer).
+            model_config: Optional kernel model name. ``"Qwen3.8-Flash-Next"`` selects the fixed
+                weight contract: every head weight must equal ``128 ** -0.5`` and token-scaled FP8
+                key scales must be 1. The kernel policy is otherwise inferred from the geometry,
+                and a 4-head geometry alone does not imply the Qwen contract.
 
         Raises:
             ValueError: If the kernels do not support this configuration.
@@ -136,6 +141,7 @@ class ThrowawayPrefillTopK:
             qkv_dtype=qkv_dtype,
             logits_dtype=logits_dtype,
             weights_dtype=torch.float32,
+            model_config=model_config,
         )
         if self._mxfp4:
             # Packed E2M1 bytes [N, D/2] and four UE8M0 scale bytes per key [N, 4].
