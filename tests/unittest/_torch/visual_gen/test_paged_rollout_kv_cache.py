@@ -118,6 +118,10 @@ def check_page_lists(cache, plan, step=""):
     )
     lengths = tables.seq_lens_kv.cpu()
     torch.testing.assert_close(tables.cu_seqlens_kv.cpu()[1:], lengths.cumsum(0).int())
+    n = plan.num_causal_blocks
+    torch.testing.assert_close(
+        tables.cu_seqlens_q.cpu(), torch.arange(n + 1, dtype=torch.int32) * size
+    )
     for i in range(plan.num_causal_blocks):
         expected = expected_keys(cache, cache.staging_offset + i * size, size)
         assert int(lengths[i]) == len(expected), f"{step} causal block {i}"
