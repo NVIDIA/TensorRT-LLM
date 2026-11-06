@@ -3171,6 +3171,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
+                        // Inspect the result before deciding whether nightly scans may continue.
                         imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters, false)
                         if (!(imageBuildStatus in ["SUCCESS", "UNSTABLE"])) {
                             error "Build-Docker-Images job returned ${imageBuildStatus}"

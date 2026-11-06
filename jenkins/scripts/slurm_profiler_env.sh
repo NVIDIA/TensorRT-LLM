@@ -22,6 +22,7 @@ if [ -f "$BASH_ENV" ]; then
 fi
 export BASH_ENV="${BASH_SOURCE[0]}"
 
-# Regular CI tests do not collect NCCL profiles. Apply this after every image
-# initialization, including the multi-node launcher, and retain network defaults.
+# Image initialization can re-enable the GCP profiler despite an inherited none.
+# Regular CI tests do not collect NCCL profiles; apply this after initialization
+# on every Bash startup, including multi-node launchers, and retain network defaults.
 export NCCL_PROFILER_PLUGIN=none

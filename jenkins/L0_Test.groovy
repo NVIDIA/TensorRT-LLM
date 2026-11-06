@@ -2634,6 +2634,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
                     "--container-env=NVIDIA_IMEX_CHANNELS",
+                    // Preserve the job hook over the image's BASH_ENV default.
                     "--container-env=BASH_ENV",
                     "--container-env=SKIP_INSTALL"
                 ]
@@ -2680,7 +2681,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
-                    # Batch Bash commands must use BASH_ENV, not SSH startup files.
+                    # Inherited SSH markers can make fresh bash -c processes skip
+                    # BASH_ENV and use startup files that re-enable the image profiler.
                     unset SSH_CLIENT SSH2_CLIENT
                     export BASH_ENV="$scriptProfilerEnvPathNode"
                     export tarName=$tarName
