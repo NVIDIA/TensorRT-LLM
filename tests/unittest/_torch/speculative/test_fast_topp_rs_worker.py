@@ -145,9 +145,11 @@ def test_worker_paths_fast_topp(monkeypatch):
     assert bool((rec[:, 3] == 0).all())
     p = Nucleus(tgt_rows, temps, tps).probs(kept_k).reshape(ngen, K + 1, V).cpu().numpy()
     real_gens = slice(nctx, bsz - 1)
+    # Both paths draw the acceptance from the step's acceptance slot.
+    accept_offset = offset + md.rng_accept_slot * itf._RNG_SLOT_SPAN
     _check_verify(
         a1[real_gens].cpu().numpy(), n1[real_gens].cpu().numpy(), p[: ngen - 1], q,
-        drafts[: ngen - 1].cpu().numpy(), [seed] * ngen, [offset] * ngen, K, gaps,
+        drafts[: ngen - 1].cpu().numpy(), [seed] * ngen, [accept_offset] * ngen, K, gaps,
     )  # fmt: skip
     same = int((n0[real_gens] == n1[real_gens]).sum())
     print(
@@ -227,9 +229,10 @@ def test_worker_mixed_per_request_temperature_and_top_p(monkeypatch):
         )
     p = nuc_t.probs(kept_k).reshape(ngen, K + 1, V).cpu().numpy()
     real_gens = slice(nctx, bsz - 1)
+    accept_offset = offset + md.rng_accept_slot * itf._RNG_SLOT_SPAN
     _check_verify(
         acc[real_gens].cpu().numpy(), num[real_gens].cpu().numpy(), p[:nreal], q,
-        drafts[:nreal].cpu().numpy(), [seed] * ngen, [offset] * ngen, K, gaps,
+        drafts[:nreal].cpu().numpy(), [seed] * ngen, [accept_offset] * ngen, K, gaps,
     )  # fmt: skip
     print(f"mixed batch: worst {gaps.worst}; accepted counts {num[real_gens].tolist()}")
     gaps.check(nreal)

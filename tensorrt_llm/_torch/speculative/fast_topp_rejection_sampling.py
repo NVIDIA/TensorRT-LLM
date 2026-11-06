@@ -42,13 +42,13 @@ from .fast_rejection_sampling import (
     _WORKSPACE,
     _check_draft_args,
     _check_request_args,
-    _curand_uniform,
     _inv_temperature,
     _load_scaled,
     _markov_feedback_emb_kernel,
     _num_chunks,
     _pick_chunk,
     _rs_draft_pick_kernel,
+    _verify_uniform,
 )
 
 # Row descriptor ``rd[row]`` (16 x fp32), written by the last stats program of the row:
@@ -923,7 +923,7 @@ def _topp_accept_pos(
         z = tl.where(is_pad, 0.0, x * inv_t)
         p_t = _topp_target_prob(z, z_pivot, big_m, inv_z)
         q_d = tl.load(probs_ptr + slot * stride_slot + i * stride_step + d)
-        u = _curand_uniform(seed, offset, req, i)
+        u = _verify_uniform(seed, offset, i)
         reject = (pos == NUM_DRAFT) & (~(u * q_d < p_t))
         pos = tl.where(reject, i, pos)
     return pos
@@ -944,6 +944,8 @@ def _topp_verify_resid_kernel(
     pos_ptr,
     rsum_ptr,
     rlast_ptr,
+    tsum_ptr,
+    tlast_ptr,
     vocab,
     num_chunks,
     NUM_DRAFT: tl.constexpr,
@@ -990,6 +992,10 @@ def _topp_verify_resid_kernel(
     res = tl.where(mask, tl.maximum(p_t - q_d, 0.0), 0.0)
     tl.store(rsum_ptr + req * num_chunks + ch, tl.sum(res, 0))
     tl.store(rlast_ptr + req * num_chunks + ch, tl.max(tl.where(res > 0.0, offs, -1), 0))
+    # The target nucleus alone, which the pick kernel samples when the residual has no mass.
+    p_t = tl.where(mask, p_t, 0.0)
+    tl.store(tsum_ptr + req * num_chunks + ch, tl.sum(p_t, 0))
+    tl.store(tlast_ptr + req * num_chunks + ch, tl.max(tl.where(p_t > 0.0, offs, -1), 0))
     if ch == 0:
         tl.store(pos_ptr + req, pos)
 
@@ -1009,6 +1015,8 @@ def _topp_verify_pick_kernel(
     pos_ptr,
     rsum_ptr,
     rlast_ptr,
+    tsum_ptr,
+    tlast_ptr,
     out_tokens_ptr,
     out_num_ptr,
     vocab,
@@ -1023,13 +1031,21 @@ def _topp_verify_pick_kernel(
     slot = tl.load(slot_ptr + req)
     pos = tl.load(pos_ptr + req)
     has_draft = pos < NUM_DRAFT
-    # Draw K, after the accept draws 0..K-1, for the residual and the bonus token alike.
-    u = _curand_uniform(seed, offset, req, NUM_DRAFT)
-    total = 0.0
+    # The draw after the accept draws, as 1 - u in [0, 1), like chain_speculative_sampling.
+    u = 1.0 - _verify_uniform(seed, offset, tl.where(has_draft, pos + 1, NUM_DRAFT))
+    r_total = 0.0
+    t_total = 0.0
     for k in range(num_chunks):
-        total = total + tl.load(rsum_ptr + req * num_chunks + k)
-    u = u * total
-    kstar, base, last = _pick_chunk(rsum_ptr, rlast_ptr, req, num_chunks, u)
+        r_total = r_total + tl.load(rsum_ptr + req * num_chunks + k)
+        t_total = t_total + tl.load(tsum_ptr + req * num_chunks + k)
+    # A residual without mass (target == draft) falls back to the target, as the reference does.
+    target_only = (~has_draft) | (~(r_total > 0.0))
+    u = u * tl.where(target_only, t_total, r_total)
+    r_kstar, r_base, r_last = _pick_chunk(rsum_ptr, rlast_ptr, req, num_chunks, u)
+    t_kstar, t_base, t_last = _pick_chunk(tsum_ptr, tlast_ptr, req, num_chunks, u)
+    kstar = tl.where(target_only, t_kstar, r_kstar)
+    base = tl.where(target_only, t_base, r_base)
+    last = tl.where(target_only, t_last, r_last)
     row = req * (NUM_DRAFT + 1) + pos
     rec = rec_ptr + row * 8
     z_pivot = tl.load(rec)
@@ -1045,7 +1061,7 @@ def _topp_verify_pick_kernel(
     p_t = _topp_target_prob(z, z_pivot, big_m, inv_z)
     q_d = tl.load(
         probs_ptr + slot * stride_slot + tl.minimum(pos, NUM_DRAFT - 1) * stride_step + offs,
-        mask=mask & has_draft,
+        mask=mask & (~target_only),
         other=0.0,
     )
     res = tl.where(mask, tl.maximum(p_t - q_d, 0.0), 0.0)
@@ -1461,7 +1477,8 @@ def fast_topp_rs_verify(
         slot_ids: ``[num_gens]`` int64 ``draft_probs`` slot of each request.
         dummy_row: slot of CUDA-graph padding requests (their logits are treated as zeros).
         draft_probs: ``[slots, >= K, vocab]`` fp32 nucleus proposals stored by the previous draft step.
-        seed, offset: ``[num_gens]`` int64 per-request Philox seed and offset.
+        seed, offset: ``[num_gens]`` int64 per-request Philox seed and offset of the acceptance
+            draws, drawn as `fast_rs_verify` draws them (``chain_speculative_sampling``'s stream).
     Returns:
         ``accepted_tokens [num_gens, K + 1]`` int32 (accepted drafts, the drawn token, then
         ``-1``) and ``num_accepted [num_gens]`` int32 (accepted drafts + 1).
@@ -1488,6 +1505,8 @@ def fast_topp_rs_verify(
     pos = _WORKSPACE.get("topp.verify.pos", (num_gens,), torch.int64, device)
     rsum = _WORKSPACE.get("topp.verify.rsum", (num_gens, nc), torch.float32, device)
     rlast = _WORKSPACE.get("topp.verify.rlast", (num_gens, nc), torch.int32, device)
+    tsum = _WORKSPACE.get("topp.verify.tsum", (num_gens, nc), torch.float32, device)
+    tlast = _WORKSPACE.get("topp.verify.tlast", (num_gens, nc), torch.int32, device)
     _topp_verify_resid_kernel[(num_gens, nc)](
         logits,
         logits.stride(0),
@@ -1502,6 +1521,8 @@ def fast_topp_rs_verify(
         pos,
         rsum,
         rlast,
+        tsum,
+        tlast,
         vocab,
         nc,
         NUM_DRAFT=k,
@@ -1522,6 +1543,8 @@ def fast_topp_rs_verify(
         pos,
         rsum,
         rlast,
+        tsum,
+        tlast,
         accepted,
         num_acc,
         vocab,

@@ -38,6 +38,7 @@ from topp_rs_test_utils import (
     _draft_key,
     _Gaps,
     _request_top_ps,
+    _verify_u,
     curand_uniform,
     fi_support_ok,
     kernel_kept,
@@ -214,16 +215,15 @@ def test_verify_matches_flashinfer(kind, accept_bias, bf16):
                 worst_fi_err = max(worst_fi_err, target_error(nuc, r, kept_ref[r]))
             support_rows += 1
         _, ref_num = rejection_sampling_one_model(
-            buf[slots], drafts, tprobs.view(num_gens, K + 1, V), deterministic=True, seed=seeds,
-            offset=offs,
-        )  # fmt: skip
+            buf[slots], drafts, tprobs.view(num_gens, K + 1, V), seeds, offs
+        )
         p = nuc.probs(kept_k).reshape(num_gens, K + 1, V).cpu().numpy()
         q = buf[slots].double().cpu().numpy()
         dr = drafts.cpu().numpy()
         for b in (num.long() != ref_num.long()).nonzero().flatten().tolist():
             i = min(int(num[b]), int(ref_num[b])) - 1
             d = int(dr[b, i])
-            u = curand_uniform(seed, offset, b, i)
+            u = _verify_u(seed, offset, i)
             margin = abs(u * q[b, i, d] - p[b, i, d]) / max(p[b, i, d], 1e-300)
             if margin <= _ACCEPT_TOL:
                 decisions.add("accept", margin)
@@ -434,10 +434,10 @@ def test_top_p_one_reproduces_the_temperature_kernels():
 
 
 def test_philox_layout_never_reuses_a_draw():
-    """Over consecutive steps whose offsets are only ``K + 1`` words apart (the narrowest spacing;
-    `SpecMetadata._take_rng_window_offsets` spaces them further), no ``(key, subsequence, word)`` is
-    drawn twice, even with every request on one seed: the layout of the nucleus kernels is that of
-    the temperature-only kernels (see `test_top_p_one_reproduces_the_temperature_kernels`)."""
+    """Over consecutive steps, with every request on one seed and on its own offset window as
+    `SpecMetadata._take_rng_window_offsets` assigns them (here only ``K + 1`` words wide, the
+    narrowest), no ``(key, subsequence, word)`` is drawn twice: the layout of the nucleus kernels is
+    that of the temperature-only kernels (see `test_top_p_one_reproduces_the_temperature_kernels`)."""
     window = K + 1
     seed = 7
     for k in range(1, K + 1):
@@ -445,8 +445,8 @@ def test_philox_layout_never_reuses_a_draw():
             seen = set()
             for step in range(3):
                 for b in range(g):
-                    offset = (b % 3 + step) * window
-                    draws = [(seed, b, offset + i) for i in range(k + 1)]
+                    offset = (step * g + b) * window
+                    draws = [(seed, (1 << 63) | offset, i) for i in range(k + 1)]
                     draws += [(_draft_key(seed), b * k + i, offset + 1) for i in range(k)]
                     for d in draws:
                         assert d not in seen, (k, g, step, b, d)

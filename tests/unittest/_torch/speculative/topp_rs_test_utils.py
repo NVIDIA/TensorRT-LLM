@@ -123,30 +123,40 @@ def _token_gap(weights, u, got):
     return _cdf_gap(weights, u, int(got), want) / max(float(np.sum(weights)), 1e-300)
 
 
-def _verify_model(p, q, drafts, seed, offset, b, k):
-    """Request ``b``'s accept position and drawn-token weights from float64 target nuclei ``p``
-    [k + 1, V] and stored proposals ``q`` [k, V]: (pos, weights, u scaled by their mass)."""
+def _verify_u(seed, offset, draw):
+    """Verify draw ``draw`` of a request: `chain_speculative_sampling`'s stream,
+    ``curand_init(seed, PER_ROW_SUBSEQUENCE_BASE | offset, 0)``."""
+    return curand_uniform(seed, 0, (1 << 63) | (offset & ((1 << 64) - 1)), draw)
+
+
+def _verify_model(p, q, drafts, seed, offset, k):
+    """A request's accept position and drawn-token weights from float64 target nuclei ``p`` [k + 1, V]
+    and stored proposals ``q`` [k, V]: (pos, weights, the token's threshold on their running mass)."""
     pos = k
     for i in range(k):
         d = int(drafts[i])
-        if not curand_uniform(seed, offset, b, i) * q[i, d] < p[i, d]:
+        if not _verify_u(seed, offset, i) * q[i, d] < p[i, d]:
             pos = i
             break
     w = np.maximum(p[pos] - q[pos], 0.0) if pos < k else p[pos]
-    return pos, w, curand_uniform(seed, offset, b, k) * float(w.sum())
+    if not w.sum() > 0.0:
+        w = p[pos]
+    # The draw after the accept draws, as 1 - u.
+    u = 1.0 - _verify_u(seed, offset, pos + 1 if pos < k else k)
+    return pos, w, u * float(w.sum())
 
 
-def _verify_row_gap(acc_row, num, p, q, drafts, seed, offset, b, k):
-    """Compare request ``b``'s verify row with the float64 model.
+def _verify_row_gap(acc_row, num, p, q, drafts, seed, offset, k):
+    """Compare a request's verify row with the float64 model.
 
     Returns: the decision that differs (``"accept"`` or ``"token"``) and the size of the rounding that
     must explain it (0 when the drawn tokens agree)."""
-    pos_m, w, u = _verify_model(p, q, drafts, seed, offset, b, k)
+    pos_m, w, u = _verify_model(p, q, drafts, seed, offset, k)
     pos = int(num) - 1
     if pos != pos_m:
         i = min(pos, pos_m)
         d = int(drafts[i])
-        u_i = curand_uniform(seed, offset, b, i)
+        u_i = _verify_u(seed, offset, i)
         return "accept", abs(u_i * q[i, d] - p[i, d]) / max(p[i, d], 1e-300)
     row = [int(x) for x in acc_row]
     assert row[:pos] == [int(x) for x in drafts[:pos]]
@@ -406,6 +416,4 @@ def _check_drafts(tokens, stored, seeds, offsets, k, gaps):
 
 def _check_verify(acc, num, p, q, drafts, seeds, offsets, k, gaps):
     for b in range(acc.shape[0]):
-        gaps.add(
-            *_verify_row_gap(acc[b], num[b], p[b], q[b], drafts[b], seeds[b], offsets[b], b, k)
-        )
+        gaps.add(*_verify_row_gap(acc[b], num[b], p[b], q[b], drafts[b], seeds[b], offsets[b], k))
