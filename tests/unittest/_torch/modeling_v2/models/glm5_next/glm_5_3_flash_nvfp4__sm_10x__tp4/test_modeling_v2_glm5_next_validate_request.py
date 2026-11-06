@@ -17,8 +17,6 @@ from types import SimpleNamespace
 
 import pytest
 
-__extra_import_path__ = [".."]  # noqa: F841 -- repo's file-scoped import hook
-
 from tensorrt_llm._torch._experimental.modeling_v2.models.glm5_next.glm_5_3_flash_nvfp4__sm_10x__tp4 import (  # noqa: E501
     modeling as M,
 )
