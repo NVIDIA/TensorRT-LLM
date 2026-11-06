@@ -74,14 +74,12 @@ def _check_d2t_matches_t2d(t2d: Optional[torch.Tensor],
             absent.
         d2t: The checkpoint's draft-to-target offsets, or None if absent.
 
-    Nothing is checked when either map is absent or ``t2d`` is all zero.
+    Nothing is checked when either map is absent.
     """
     if t2d is None or d2t is None:
         return
     # Maps may be lazy safetensors slices; [:] materializes them.
     t2d, d2t = t2d[:], d2t[:]
-    if not t2d.any():
-        return
     # Use the integer offsets the int32 d2t parameter will hold, also for
     # maps stored in floating point.
     draft_ids = torch.arange(len(d2t), device=d2t.device)
@@ -1114,6 +1112,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
         )
 
     def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        """Check the draft's vocab maps, then load the draft weights."""
         if hasattr(self.model, "d2t"):
             _check_d2t_matches_t2d(weights.get("t2d"), weights.get("d2t"))
         # Remap weight names: some Eagle3 checkpoints use "layers.X.*" naming convention

@@ -367,11 +367,19 @@ def test_check_d2t_rejects_size_mismatch() -> None:
 
 
 @pytest.mark.cpu_only
-def test_check_d2t_skips_absent_or_placeholder_t2d() -> None:
-    _, d2t = _make_vocab_maps()
+def test_check_d2t_skips_absent_maps() -> None:
+    t2d, d2t = _make_vocab_maps()
     _check_d2t_matches_t2d(None, d2t)
-    _check_d2t_matches_t2d(torch.zeros(_TARGET_VOCAB_SIZE, dtype=torch.bool), d2t)
-    _check_d2t_matches_t2d(torch.ones(_TARGET_VOCAB_SIZE, dtype=torch.bool), None)
+    _check_d2t_matches_t2d(t2d, None)
+
+
+@pytest.mark.cpu_only
+def test_check_d2t_rejects_all_zero_t2d() -> None:
+    _, d2t = _make_vocab_maps()
+    zeros = torch.zeros(_TARGET_VOCAB_SIZE, dtype=torch.bool)
+
+    with pytest.raises(ValueError, match=f"{_DRAFT_VOCAB_SIZE} of {_DRAFT_VOCAB_SIZE} draft ids"):
+        _check_d2t_matches_t2d(zeros, d2t)
 
 
 @pytest.mark.cpu_only
