@@ -854,6 +854,7 @@ class PerfOptimizeWorkflow:
                     "phase": STAGE_OPTIMIZER,
                     "status": "pending",
                     "candidate_commit": "",
+                    "has_native_changes": False,
                     "candidate_config_path": "",
                     "last_error": "",
                     "finalized": False,
@@ -1006,6 +1007,7 @@ class PerfOptimizeWorkflow:
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
             state.profile_required = True
+            state.has_accepted_native_changes |= bool(entry.get("has_native_changes", False))
             self._checkpoint(state)
             if entry.get("candidate_commit"):
                 gitops.fast_forward(repo, str(entry["item_branch"]))
@@ -1164,6 +1166,8 @@ class PerfOptimizeWorkflow:
                 gain = self._latest_evaluator_measured_gain(progress_path)
                 value = self._latest_evaluator_measured_value(progress_path)
                 curve = self._latest_evaluator_curve(progress_path)
+                evaluator_verdict = latest_entry(progress_path, "evaluator") or {}
+                has_native_changes = bool(evaluator_verdict.get("has_native_changes", False))
                 if decision == "APPROVE":
                     commit = ""
                     if not gitops.worktree_clean(repo):
@@ -1179,6 +1183,7 @@ class PerfOptimizeWorkflow:
                         phase="complete",
                         attempts=attempt_no,
                         candidate_commit=commit,
+                        has_native_changes=has_native_changes,
                         candidate_config_path=str(live_config),
                         measured_gain_pct=gain,
                         measured_value=value,
@@ -1289,7 +1294,9 @@ class PerfOptimizeWorkflow:
             clear_stale_benchmark_results(integration_dir)
             self._stamp_progress(state, round_no=round_no)
             self.integrator(
-                self._disagg_directive() + f"Workspace: {self.workspace}\n"
+                self._native_history_note(state)
+                + self._disagg_directive()
+                + f"Workspace: {self.workspace}\n"
                 f"Round: {round_no}\n"
                 f"Integration worktree: {state.integration_worktree_path}\n"
                 f"Integration branch: {state.integration_branch}\n"
@@ -1320,7 +1327,8 @@ class PerfOptimizeWorkflow:
                 f"restore the base and REJECT.\n\n"
                 f"Call `append_integrator_progress` exactly once with the final "
                 f"APPROVE, FALLBACK_BEST, or REJECT decision and all required "
-                f"fields. Leave precisely the accepted code/config state in the "
+                f"fields, including whether the final retained state has native "
+                f"changes. Leave precisely the accepted code/config state in the "
                 f"integration worktree and integration config."
             )
         self._require_stage_outputs(STAGE_INTEGRATOR, [report_path])
@@ -1400,6 +1408,7 @@ class PerfOptimizeWorkflow:
             # Persist the stale-profile decision before mutating the accepted
             # campaign state so a crash cannot resume into replan-only mode.
             state.profile_required = True
+            state.has_accepted_native_changes |= bool(verdict.get("has_native_changes", False))
             self._checkpoint(state)
             if not gitops.worktree_clean(state.integration_worktree_path):
                 gitops.commit_all(
@@ -1994,6 +2003,11 @@ class PerfOptimizeWorkflow:
             return f"{repo}/tensorrt_llm"
         return "<trtllm_repo_path>/tensorrt_llm"
 
+    @staticmethod
+    def _native_history_note(state: WorkflowState) -> str:
+        value = str(state.has_accepted_native_changes).lower()
+        return f"Historical accepted native changes: `{value}`.\n\n"
+
     # -------------------------------------------------------- decision readers
 
     def _latest_evaluator_decision(self, path: Path | None = None) -> str | None:
@@ -2148,7 +2162,9 @@ class PerfOptimizeWorkflow:
                 "the roadmap's `baseline.value`. "
             )
         self.benchmarker(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n\n"
             f"Read `{self.task_path}` for the spec — resolve `checkpoint_path`, "
             f"`trtllm_repo_path`, and the `benchmark` / `optimize` blocks.\n\n"
             + self._casebook_instruction(
@@ -2183,7 +2199,7 @@ class PerfOptimizeWorkflow:
             "the Analyzer's per-round measured\u2194SOL correlation",
         )
         self.projector(
-            f"Workspace: {self.workspace}\n\n"
+            self._native_history_note(state) + f"Workspace: {self.workspace}\n\n"
             f"You run once per campaign — your projection guides the "
             f"Analyzer's roadmap ranking and the Reporter's headroom story "
             f"for every later round.\n\n"
@@ -2272,7 +2288,9 @@ class PerfOptimizeWorkflow:
                 f"`{analysis_dir}` — do not re-derive it.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
             f"Round: 1 (**reused analysis** — no profiling this round)\n"
             f"Analysis directory (already populated): {analysis_dir}\n\n"
             f"This campaign was launched with "
@@ -2436,7 +2454,9 @@ class PerfOptimizeWorkflow:
                 f"cannot be closed in this campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
             f"Round: {round_no}\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Read `{self.task_path}` and `{self.baseline_results_path}` to "
@@ -2558,7 +2578,9 @@ class PerfOptimizeWorkflow:
                 f"campaign.\n\n"
             )
         self.analyzer(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} (**replan only** — no profiling this round)\n"
             f"Analysis directory (write your artifacts here): {analysis_dir}\n\n"
             f"Round {state.round_index} accepted **nothing**. "
@@ -2688,7 +2710,9 @@ class PerfOptimizeWorkflow:
                 f"your summary, not a claim to re-assert.\n\n"
             )
         (agent or self.optimizer)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2854,10 +2878,11 @@ class PerfOptimizeWorkflow:
                 f"subdirectories; diff at the largest point)"
             )
             progress_fields = (
-                "with all six fields — `summary`, `decision` "
+                "with all seven fields — `summary`, `decision` "
                 "(APPROVE|REJECT|PUSH_BACK), `reason_category` "
                 "(none|code_quality|functionality|perf_shortfall), "
-                f"{mean_fields} — exactly as measured; the "
+                f"{mean_fields}, and `has_native_changes` — exactly as "
+                "measured/reviewed; the "
                 "orchestrator acts on them"
             )
         else:
@@ -2873,11 +2898,12 @@ class PerfOptimizeWorkflow:
                 f"the reference result JSON for the full-metric diff is under `{reference_dir}`"
             )
             progress_fields = (
-                "with all five fields — `summary`, `decision` "
+                "with all six fields — `summary`, `decision` "
                 "(APPROVE|REJECT|PUSH_BACK), `reason_category` "
                 "(none|code_quality|functionality|perf_shortfall), "
-                "`measured_gain_pct`, `measured_value` — exactly as "
-                "measured; the orchestrator acts on them"
+                "`measured_gain_pct`, `measured_value`, and "
+                "`has_native_changes` — exactly as measured/reviewed; the "
+                "orchestrator acts on them"
             )
         if attempt_no >= state.max_attempts_per_item:
             attempt_note = (
@@ -2888,7 +2914,9 @@ class PerfOptimizeWorkflow:
         else:
             attempt_note = ""
         (agent or self.evaluator)(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
             f"Round: {round_no} — item {state.item_index + 1} of at most "
             f"{state.max_items_per_round} this round — attempt {attempt_no} "
             f"of {state.max_attempts_per_item}\n"
@@ -2999,7 +3027,9 @@ class PerfOptimizeWorkflow:
                 "`cumulative_improvement_pct` — from your own measurement"
             )
         self.qa(
-            self._disagg_directive() + f"Workspace: {self.workspace}\n"
+            self._native_history_note(state)
+            + self._disagg_directive()
+            + f"Workspace: {self.workspace}\n"
             f"Campaign: the optimization loop is over ({state.round_index} "
             f"round(s) ran); the system under test is the final accepted "
             f"state.\n"
@@ -3115,7 +3145,7 @@ class PerfOptimizeWorkflow:
                 f"measurement for one this campaign made),"
             )
         self.reporter(
-            f"Workspace: {self.workspace}\n"
+            self._native_history_note(state) + f"Workspace: {self.workspace}\n"
             f"Optimization branch: `{state.campaign_git_branch}` — base commit "
             f"`{state.campaign_git_base_commit}` in `trtllm_repo_path`\n\n"
             f"The campaign is over ({state.round_index} round(s) ran). Read "

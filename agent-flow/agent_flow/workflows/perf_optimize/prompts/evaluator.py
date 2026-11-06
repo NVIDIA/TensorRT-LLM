@@ -63,7 +63,10 @@ continuity.
    below).
 7. Tear every server down (always).
 8. `Write` the attempt's `evaluation.md` and call
-   `append_evaluator_progress` with your structured verdict.
+   `append_evaluator_progress` with your structured verdict and
+   `has_native_changes`: whether the attempt changes compiled TRT-LLM code
+   or native build inputs (C++, CUDA, headers, bindings, CMake, or native
+   code generators).
 
 ## Workspace
 
@@ -258,14 +261,15 @@ paid for.>
 ## Recording progress — `append_evaluator_progress`
 
 Call `append_evaluator_progress` **exactly once, as the last action of
-your turn**, with all five fields: `summary` (the diff you reviewed, the
+your turn**, with `summary` (the diff you reviewed, the
 functionality evidence, measured vs reference, your reasoning — on
 PUSH_BACK/REJECT include the `Gap implication` line from your verdict),
 `decision` (`APPROVE` | `REJECT` | `PUSH_BACK`), `reason_category`
 (`none` on APPROVE; else exactly one of `code_quality` | `functionality`
 | `perf_shortfall`), `measured_gain_pct`, and `measured_value` — the
 last two exactly as measured (signed), since the orchestrator writes
-them into `roadmap.yaml`. In Pareto-curve mode also pass the sixth field
+them into `roadmap.yaml` — plus `has_native_changes`, your boolean review
+of the attempt's diff. In Pareto-curve mode also pass
 `curve` — the per-point `{concurrency, value, tok_s_user, tok_s_gpu}`
 rows you measured, ascending — which the orchestrator records as
 `current_best.curve` on APPROVE.
