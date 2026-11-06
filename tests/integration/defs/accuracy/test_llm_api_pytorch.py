@@ -370,7 +370,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("enable_block_reuse,enable_chunked_prefill,mtp_nextn",
                           [(True, False, 0), (False, True, 0), (True, True, 0),
                            (True, True, 3)])
-    def test_nvfp4_mla_cached_context(self, enable_block_reuse: bool,
+    def test_nvfp4_mla_cached_context(self, monkeypatch,
+                                      enable_block_reuse: bool,
                                       enable_chunked_prefill: bool,
                                       mtp_nextn: int):
         """FP4 MLA context attention over a prefix already in the FP4 cache.
@@ -378,7 +379,17 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         GSM8K prompts share their few-shot examples, so with block reuse most
         requests reuse that prefix; a 512-token budget splits every prompt
         into several chunked-prefill chunks.
+
+        Decode runs with the 4x path dispatcher on, so the decoder CUDA graphs
+        are keyed by KV regime. The 16 heads of DeepSeek-V3-Lite fill no
+        256-row 4x item, so every graph shape keeps one regime and the
+        dispatcher keeps the 2x kernel.
         """
+        # env_overrides also sets it in this process; monkeypatch removes it
+        # from this process once the test ends.
+        env = {"TRTLLM_FP4_MLA_CUTEDSL_4X": "1"}
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
         kv_cache_config = KvCacheConfig(dtype="nvfp4",
                                         free_gpu_memory_fraction=0.75,
                                         use_kv_cache_manager_v2=True,
@@ -389,6 +400,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         with LLM(
                 f"{llm_models_root()}/DeepSeek-V3-Lite/nvfp4_moe_only_mtp",
                 attn_backend="TRTLLM",
+                env_overrides=env,
                 kv_cache_config=kv_cache_config,
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_num_tokens=512 if enable_chunked_prefill else 8192,
