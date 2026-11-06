@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager, nullcontext
 from enum import IntEnum
@@ -557,6 +558,47 @@ class BatchStatePP(BatchState):
 
 
 @dataclasses.dataclass
+class _PipelinedForwardResult:
+    """Return value of ``PyExecutor._forward_and_sample_worker``."""
+    sample_state: Optional[SampleState]
+    fwd_timing: object = None
+    sample_timing: object = None
+
+
+@dataclasses.dataclass
+class _PipelinedSlot:
+    """One in-flight batch in ``_executor_loop_pipelined``'s 2-deep pipeline.
+
+    Mirrors ``BatchState``, but ``sample_state`` isn't known at construction
+    time (it's produced asynchronously by the worker thread), so it's merged
+    in later via ``into_batch_state`` once the future resolves.
+    """
+    scheduled_requests: ScheduledRequests
+    fwd_sample_future: Future
+    iter_start_time: float = 0
+    iter_stats: Optional[IterationStats] = None
+    iter_id: Optional[int] = None
+    scheduled_batch_stats: Optional[ScheduledBatchStats] = None
+    gpu_forward_start_event: Optional[torch.cuda.Event] = None
+    gpu_forward_end_event: Optional[torch.cuda.Event] = None
+    gpu_sample_end_event: Optional[torch.cuda.Event] = None
+    gpu_forward_events_from_perf_pool: bool = False
+
+    def into_batch_state(self, sample_state: SampleState) -> BatchState:
+        return BatchState(
+            scheduled_requests=self.scheduled_requests,
+            sample_state=sample_state,
+            iter_start_time=self.iter_start_time,
+            iter_stats=self.iter_stats,
+            iter_id=self.iter_id,
+            scheduled_batch_stats=self.scheduled_batch_stats,
+            gpu_forward_start_event=self.gpu_forward_start_event,
+            gpu_forward_end_event=self.gpu_forward_end_event,
+            gpu_forward_events_from_perf_pool=self.
+            gpu_forward_events_from_perf_pool)
+
+
+@dataclasses.dataclass
 class EncoderStepResult:
     hidden_states: torch.Tensor
     sequence_lengths: List[int]
@@ -677,6 +719,10 @@ class PyExecutor:
     # If the number of micro batches is too large, the executor will spend too much host memory (No additional GPU memory is required).
     # 1024 in-flight micro batches can avoid synchronization in most cases and keep host memory usage low.
     MIN_ASYNC_MICRO_BATCH_NUM = 1024
+
+    # Number of in-flight batches kept queued by ``_executor_loop_pipelined``.
+    # Matches vLLM v1's uniproc-executor default (see enable_pipelined_scheduler).
+    PIPELINE_DEPTH = 2
 
     def __init__(
         self,
@@ -1539,6 +1585,8 @@ class PyExecutor:
 
         if self.dist.pp_size > 1:
             self.event_loop = self._executor_loop_pp
+        elif self._is_pipelined_loop_eligible():
+            self.event_loop = self._executor_loop_pipelined
         else:
             self.event_loop = self._executor_loop if self.disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
@@ -7481,6 +7529,365 @@ class PyExecutor:
 
                 self.iter_counter += 1
 
+    # ------------------------------------------------------------------
+    # Pipelined executor loop (see ``enable_pipelined_scheduler``).
+    # ------------------------------------------------------------------
+
+    def _is_pipelined_loop_eligible(self) -> bool:
+        """Gate for ``_executor_loop_pipelined`` (see ``enable_pipelined_scheduler``).
+
+        Restricted to the subset of features validated for the 2-batch
+        pipeline: no speculative decoding, no disaggregated serving / KV
+        cache connector, no guided decoding, no benchmark-disagg gating, no
+        attention-DP, no pipeline parallelism (which has its own loop), no
+        multimodal encoder scheduling, no encoder-decoder models, and the
+        standard KV-cache-manager path.
+
+        Plain tensor parallelism (TP > 1, without attention-DP) IS supported:
+        ``_prepare_and_schedule_batch`` -- including its internal TP/CP
+        schedule broadcasts -- always runs on the main thread here, the same
+        number of times and in the same order on every rank, so collectives
+        stay aligned across ranks despite the 2-deep lookahead.
+        """
+        if not self.llm_args.enable_pipelined_scheduler:
+            return False
+        if self.disable_overlap_scheduler:
+            return False
+        if self.drafter is not None:
+            return False
+        if self.kv_cache_transceiver is not None:
+            return False
+        if self.guided_decoder is not None:
+            return False
+        if self.kv_connector_manager is not None:
+            return False
+        if self.is_benchmark_disagg:
+            return False
+        if self.enable_attention_dp:
+            return False
+        if self._mm_encoder_item_scheduling_enabled:
+            return False
+        if self.is_encoder_decoder:
+            return False
+        return True
+
+    def _forward_and_sample_worker(
+            self, scheduled_batch: ScheduledRequests,
+            previous_tensors_device,
+            staging_done_event: torch.cuda.Event,
+            gpu_forward_start: Optional[torch.cuda.Event],
+            gpu_forward_end: Optional[torch.cuda.Event],
+            gpu_sample_end: Optional[torch.cuda.Event]) -> _PipelinedForwardResult:
+        """Runs on ``_executor_loop_pipelined``'s single worker thread.
+
+        Deliberately limited to forward + sample kernel dispatch, plus
+        ``_update_request_states`` (safe here: for ongoing generation
+        requests it only touches ``context_requests``, never the
+        ``generation_requests`` fields the main thread's drain step reads).
+        Nothing here mutates cross-iteration request bookkeeping the main
+        thread might concurrently read for an adjacent, request-sharing
+        batch -- see ``_executor_loop_pipelined``'s docstring.
+        """
+        torch.cuda.set_device(self.device_id)
+        # ``prepare_resources`` for this batch ran on the MAIN thread, inside
+        # ``with torch.cuda.stream(self.execution_stream)``. torch's "current
+        # stream" is thread-local, so ``_forward_step``'s internal
+        # ``execution_stream.wait_stream(torch.cuda.current_stream())`` below
+        # cannot see that dependency from this (worker) thread. Wait on the
+        # explicit event instead of relying on ambient default-stream
+        # ordering across threads.
+        self.execution_stream.wait_event(staging_done_event)
+        with self.perf_manager.record_perf_events(
+                gpu_forward_start, gpu_forward_end) as fwd_timing:
+            batch_outputs = self._forward_step(scheduled_batch,
+                                               previous_tensors_device)
+        with self.perf_manager.record_perf_events(
+                None, gpu_sample_end) as sample_timing:
+            sample_state = self._sample_async(scheduled_batch, batch_outputs)
+        self._update_request_states(scheduled_batch)
+        return _PipelinedForwardResult(sample_state=sample_state,
+                                       fwd_timing=fwd_timing,
+                                       sample_timing=sample_timing)
+
+    def _executor_loop_pipelined(self):
+        """2-batch pipelined loop (see ``enable_pipelined_scheduler``).
+
+        Forward + sample dispatch for the newest scheduled batch runs on a
+        dedicated single worker thread while the main thread schedules the
+        next batch and drains the oldest batch's results (commits sampled
+        tokens, emits responses, frees KV cache). Modeled on vLLM v1's
+        ``step_with_batch_queue``: keep ``PIPELINE_DEPTH`` batches in flight
+        instead of ``_executor_loop_overlap``'s single ``previous_batch``, so
+        the host can schedule + dispatch batch N+1 while the GPU is still
+        running batch N, instead of only once the GPU goes idle.
+
+        Correctness invariants relied on here:
+
+        - All scheduling and its internal TP/CP collectives
+          (``_prepare_and_schedule_batch``) run ONLY on the main thread, and
+          are attempted the same number of times, in the same order, on
+          every rank (one call per fill attempt, success or not). This keeps
+          ``tp_broadcast``/``tp_allgather`` ordering aligned across ranks
+          despite the 2-deep lookahead: never make a call to
+          ``_prepare_and_schedule_batch`` conditional on this rank's local
+          state, or a straggler rank's collective will pair with the wrong
+          peer call and hang.
+        - ``_update_generation_requests_that_will_complete_next_iteration``
+          is run on the MAIN thread as part of draining a batch (not
+          inside the worker as part of dispatching it), immediately before
+          that batch's own ``_process_previous_batch`` call. Ongoing
+          generation requests are scheduled every iteration, so the same
+          ``LlmRequest`` objects are shared between whatever batch is
+          in-flight in the worker and whatever batch the main thread is
+          concurrently draining. ``_executor_loop_overlap`` documents this
+          same call as needing to run after processing the *previous*
+          batch's response for exactly this reason (shared, mutable
+          per-request state); running it inside the worker here would race
+          the main thread's read of those same fields for an adjacent
+          batch instead of merely needing reordering.
+        """
+        torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
+
+        worker = ThreadPoolExecutor(max_workers=1,
+                                    thread_name_prefix="trtllm-fwd-sample")
+        pipeline: deque = deque()
+        previous_tensors_device = None
+        stop_scheduling = False
+
+        def _schedule_and_submit() -> bool:
+            """One fill attempt. Returns False once the executor should
+            stop scheduling new batches (shutdown signalled)."""
+            nonlocal previous_tensors_device
+            self.hang_detector.checkpoint()
+            if self._resource_governor_enabled:
+                self._sync_and_process_resource_governor_queue()
+            if self._can_pause_for_rebalance():
+                self._maybe_rebalance_kv_pools()
+
+            # Need to wait for the copy of previous iteration before
+            # modifying any host memory copied to GPU. The V2 scheduler
+            # modifies the host page table, so wait before scheduling.
+            self._wait_for_model_engine_input_copy()
+
+            iter_start_time = time.time() if self.enable_iter_perf_stats else 0
+            scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+            if scheduled_batch is None:
+                return False
+
+            can_queue, _ = self._can_queue(scheduled_batch)
+            if not can_queue:
+                # Nothing to forward this attempt (e.g. waiting for the
+                # first request). ``enable_attention_dp`` is excluded by
+                # ``_is_pipelined_loop_eligible``, so can_queue here just
+                # means "no active requests this attempt" -- retry.
+                self._revert_gen_alloc(scheduled_batch)
+                return True
+
+            scheduled_batch.generation_requests = sorted(  # stable sort
+                scheduled_batch.generation_requests,
+                key=lambda req: int(req.py_batch_idx is not None),
+            )
+
+            if pipeline:
+                prior_result = pipeline[-1].fwd_sample_future.result()
+                previous_tensors_device = (prior_result.sample_state
+                                           and prior_result.sample_state.device)
+
+            scheduled_batch_stats = (
+                self._collect_scheduled_batch_stats(scheduled_batch)
+                if self.enable_iter_perf_stats else None)
+            gpu_forward_start, gpu_forward_end, gpu_sample_end = (
+                self.perf_manager.create_timing_events())
+            gpu_forward_events_from_perf_pool = False
+            if self.enable_iter_perf_stats and gpu_forward_start is None:
+                gpu_forward_start, gpu_forward_end = (
+                    self.perf_manager.borrow_forward_timing_events())
+                gpu_forward_events_from_perf_pool = True
+
+            # See ``_forward_and_sample_worker``: this call runs on the MAIN
+            # thread, so make its dependency explicit via a CUDA event
+            # rather than relying on torch's (thread-local) "current
+            # stream" to link it to the worker's forward dispatch.
+            with torch.cuda.stream(self.execution_stream):
+                self.resource_manager.prepare_resources(scheduled_batch)
+            staging_done_event = torch.cuda.Event()
+            staging_done_event.record(self.execution_stream)
+
+            future = worker.submit(self._forward_and_sample_worker,
+                                   scheduled_batch, previous_tensors_device,
+                                   staging_done_event, gpu_forward_start,
+                                   gpu_forward_end, gpu_sample_end)
+            pipeline.append(
+                _PipelinedSlot(scheduled_requests=scheduled_batch,
+                               fwd_sample_future=future,
+                               iter_start_time=iter_start_time,
+                               iter_stats=iter_stats,
+                               iter_id=self.iter_counter,
+                               scheduled_batch_stats=scheduled_batch_stats,
+                               gpu_forward_start_event=gpu_forward_start,
+                               gpu_forward_end_event=gpu_forward_end,
+                               gpu_sample_end_event=gpu_sample_end,
+                               gpu_forward_events_from_perf_pool=
+                               gpu_forward_events_from_perf_pool))
+            return True
+
+        def _drain_oldest():
+            slot = pipeline.popleft()
+            result = slot.fwd_sample_future.result()
+            assert result.sample_state is not None, "Sampling failed"
+            sample_state = result.sample_state
+            batch_state = slot.into_batch_state(sample_state)
+            scheduled_requests = batch_state.scheduled_requests
+
+            self._update_requests(sample_state)
+            self._send_kv_async(scheduled_requests.all_requests())
+            self._flush_pending_transfer_responses()
+
+            if self.perf_manager.enabled:
+                self.perf_manager.save_timing_to_requests(
+                    scheduled_requests.all_requests(),
+                    batch_state.gpu_forward_start_event,
+                    batch_state.gpu_forward_end_event,
+                    slot.gpu_sample_end_event, result.fwd_timing.start_time,
+                    result.fwd_timing.end_time, result.sample_timing.start_time,
+                    result.sample_timing.end_time)
+
+            # Must run before ``_process_previous_batch`` below -- see this
+            # method's docstring for why this cross-iteration bookkeeping
+            # runs here (main thread, at drain time) rather than inside
+            # ``_forward_and_sample_worker``.
+            self._update_generation_requests_that_will_complete_next_iteration(
+                scheduled_requests.generation_requests)
+
+            self._commit_kv_cache_stats(scheduled_requests)
+            self._process_previous_batch(batch_state)
+            self.perf_manager.compute_batch_gpu_times(
+                scheduled_requests.all_requests())
+
+            self._kv_connector_terminate_requests()
+            self.iter_counter += 1
+
+            # Drain buffers from per-rank-divergent _process_previous_batch
+            # above; rank-symmetric companion to overlap loop's drain call.
+            self.disagg.handle_timeouts_synced()
+            self._flush_iter_stats_synced()
+
+        try:
+            with self._profiler() as profile_step, self.hang_detector:
+                while True:
+                    self.hang_detector.checkpoint()
+                    profile_step()
+                    self.disagg.handle_errors_synced()
+
+                    if not stop_scheduling:
+                        while len(pipeline) < self.PIPELINE_DEPTH:
+                            if not _schedule_and_submit():
+                                stop_scheduling = True
+                                break
+
+                    if not pipeline:
+                        break
+                    _drain_oldest()
+        finally:
+            # Drain in-flight worker jobs before shutting down so we don't
+            # leak requests or leave the worker thread mid-launch.
+            for slot in pipeline:
+                try:
+                    slot.fwd_sample_future.result()
+                except Exception:
+                    pass
+            worker.shutdown(wait=True)
+
+    @nvtx_range("_accept_draft_tokens")
+    def _accept_draft_tokens(
+        self, scheduled_batch: ScheduledRequests,
+        target_outputs: SampleStateTensors,
+        target_inputs: Optional[SampleStateTensors]
+    ) -> Tuple[SampleStateTensorsSpec, Optional[torch.Tensor]]:
+        """
+        Prepare target device inputs after computing draft token acceptance.
+
+        This function:
+        1. If draft tokens exist: compares sampled tokens with draft tokens to compute acceptance
+        2. If no draft tokens: directly uses the first sampled token
+        3. Creates new_tokens by extracting accepted tokens per request
+
+        Args:
+            scheduled_batch: The scheduled requests
+            target_outputs: Contains new_tokens [max_draft_len + 1, batch_size, beam_width]
+                                or [1, batch_size, beam_width] if no draft tokens
+            target_inputs: Contains next_draft_tokens [batch_size, max_draft_len]
+        Returns:
+            Tuple of:
+            - SampleStateTensorsSpec with new_tokens set to accepted tokens,
+              new_tokens_lens and next_draft_tokens set to None
+            - num_accepted_tokens: [batch_size] tensor with acceptance counts per request,
+              or None if no draft tokens
+        """
+        has_draft_tokens = target_inputs is not None and isinstance(
+            target_inputs, SampleStateTensorsSpec
+        ) and target_inputs.next_draft_tokens is not None
+        target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
+        new_tokens = torch.zeros_like(target_tokens)
+
+        # Squeeze the beam dimension (beam_width=1 for greedy or single beam)
+        target_tokens = target_tokens.squeeze(
+            -1)  # [max_draft_len + 1, batch_size] or [1, batch_size]
+
+        batch_size = target_tokens.shape[1]
+        device = target_tokens.device
+        # Compute number of accepted tokens per request
+        num_accepted_tokens = torch.zeros(batch_size,
+                                          dtype=torch.int32,
+                                          device=device)
+
+        if has_draft_tokens:
+            # Draft tokens exist, compute acceptance
+            draft_tokens = target_inputs.next_draft_tokens  # [batch_size, max_draft_len]
+            max_draft_len = draft_tokens.shape[1]
+
+            # Compute number of accepted tokens per request
+            # Generation requests: compare with draft tokens to find acceptance
+            num_contexts = scheduled_batch.num_context_requests
+            if batch_size > num_contexts:
+                # Use .T to transpose: [max_draft_len + 1, num_gens] -> [num_gens, max_draft_len + 1]
+                gen_target_tokens = target_tokens[:,
+                                                  num_contexts:].T  # [num_gens, max_draft_len + 1]
+
+                # Compare draft tokens with target tokens to find acceptance
+                # Use cumprod to find the first rejection point
+                draft_tokens_gen = draft_tokens[
+                    num_contexts:, :].int()  # [num_gens, max_draft_len]
+                num_accepted_tokens[num_contexts:] += torch.cumprod(
+                    (draft_tokens_gen == gen_target_tokens[:, :max_draft_len]
+                     ).int(),
+                    dim=-1).sum(dim=1)
+
+            # Vectorized extraction using advanced indexing (no GPU-CPU sync)
+            # Use num_accepted_tokens as indices to gather the right tokens
+            batch_indices = torch.arange(batch_size, device=device)
+            new_tokens[0, :, 0] = target_tokens[num_accepted_tokens,
+                                                batch_indices]
+        else:
+            # No draft tokens to accept, just use the first (and only) sampled token
+            batch_indices = torch.arange(batch_size, device=device)
+            new_tokens[0, :, 0] = target_tokens[0, batch_indices]
+
+        # Create the updated SampleStateTensorsSpec
+        # new_tokens_lens and next_draft_tokens are left as None
+        result_tensors = SampleStateTensorsSpec(
+            new_tokens=new_tokens,
+            log_probs=target_outputs.log_probs,
+            new_tokens_lens=None,
+            next_draft_tokens=None)
+
+        # Copy logits if available
+        if hasattr(target_outputs, 'logits'):
+            result_tensors.logits = target_outputs.logits
+
+        return result_tensors, num_accepted_tokens
     def _update_v2_generation_resources(
             self, scheduled_requests: ScheduledRequests) -> None:
         if not self._is_kv_manager_v2:
@@ -7491,8 +7898,20 @@ class PyExecutor:
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
 
-    def _process_previous_batch(self):
-        scheduled_requests = self.previous_batch.scheduled_requests
+    def _process_previous_batch(self, batch_state: Optional[BatchState] = None):
+        """Process a completed batch's outputs: cancel/response handling,
+        KV cache resource update, and iter stats.
+
+        ``batch_state`` defaults to ``self.previous_batch`` for the
+        ``_executor_loop_overlap`` / ``_consume_previous_batch_for_rebalance``
+        callers, which carry exactly one in-flight batch in that instance
+        attribute. ``_executor_loop_pipelined`` has no single
+        ``previous_batch`` attribute -- it keeps a 2-deep queue of
+        ``_PipelinedSlot`` instances instead -- and passes the just-drained
+        ``BatchState`` here explicitly.
+        """
+        batch_state = batch_state if batch_state is not None else self.previous_batch
+        scheduled_requests = batch_state.scheduled_requests
         # A request that finishes here may still be in the in-flight next
         # batch, which writes KV past the committed prefix after commit/close.
         # This is safe: the radix tree trusts only each page's committed token
@@ -7504,8 +7923,10 @@ class PyExecutor:
         # handled it.
         finished_requests = self._handle_responses(
             emit_first_iter=not self.enable_early_first_token_response)
-        attn_metadata = self.model_engine.attn_metadata
-        kv_cache_dtype_byte_size = self.model_engine.kv_cache_dtype_byte_size
+
+        attn_metadata = getattr(self.model_engine, 'attn_metadata', None)
+        kv_cache_dtype_byte_size = getattr(self.model_engine,
+                                           'kv_cache_dtype_byte_size', None)
         self.resource_manager.update_resources(
             scheduled_requests,
             attn_metadata,
@@ -7514,7 +7935,7 @@ class PyExecutor:
 
         if self.enable_iter_perf_stats:
             self._process_iter_stats(finished_requests, self.active_requests,
-                                     self.previous_batch)
+                                     batch_state)
 
     def _forward_step_inter_pp(self,
                                scheduled_batch,
