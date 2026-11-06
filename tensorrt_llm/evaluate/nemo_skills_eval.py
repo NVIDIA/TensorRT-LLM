@@ -50,6 +50,8 @@ from typing import Any, Iterable, List, Optional
 
 import click
 
+from tensorrt_llm._utils import get_env_flag
+
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -266,7 +268,7 @@ def _ensure_sandbox_server():
         except ValueError:
             return h == "localhost"
 
-    allow_remote = os.environ.get("NEMO_SKILLS_SANDBOX_ALLOW_REMOTE", "0") == "1"
+    allow_remote = get_env_flag("NEMO_SKILLS_SANDBOX_ALLOW_REMOTE", False)
     if not _is_loopback(host) and not allow_remote:
         raise RuntimeError(
             f"Refusing to auto-start the NeMo-Skills sandbox on non-loopback "

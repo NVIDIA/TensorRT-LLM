@@ -23,7 +23,6 @@ import pytest
 from fastapi import UploadFile
 from PIL import Image
 
-from tensorrt_llm.serve import visual_gen_utils
 from tensorrt_llm.serve.openai_protocol import ImageGenerationRequest, VideoGenerationRequest
 from tensorrt_llm.serve.visual_gen_utils import (
     _merge_extra_params,
@@ -980,27 +979,13 @@ class TestLocalMediaPathCanBeDisallowed:
             prompt="x", image_reference={"content": content, "format": fmt}
         )
 
-    def test_path_is_accepted_by_default(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", raising=False)
+    def test_path_is_accepted_by_default(self):
         params = parse_visual_gen_params(self._request(), _StubVisualGen())
 
         assert params.image_reference[0].format == "path"
 
-    def test_path_is_refused_when_disallowed(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
-
+    def test_path_is_refused_when_disallowed(self):
         with pytest.raises(ValueError, match="is disallowed on this server"):
-            parse_visual_gen_params(self._request(), _StubVisualGen())
-
-    def test_an_unrecognized_value_warns_and_stays_allowed(self, monkeypatch):
-        """Silently reading a typo as "1" would break working deployments, and
-        silently reading it as "0" would leave one that believes it is locked
-        down wide open. Neither is safe to do quietly."""
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "true")
-        warnings: list[str] = []
-        monkeypatch.setattr(visual_gen_utils.logger, "warning", warnings.append)
-
-        params = parse_visual_gen_params(self._request(), _StubVisualGen())
-
-        assert params.image_reference[0].format == "path"
-        assert any("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in w for w in warnings)
+            parse_visual_gen_params(
+                self._request(), _StubVisualGen(), local_media_path_disallowed=True
+            )

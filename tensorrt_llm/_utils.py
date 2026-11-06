@@ -31,7 +31,8 @@ from contextlib import contextmanager
 from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
-from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
+from typing import (Any, Callable, Dict, List, Optional, Sequence, TypeVar,
+                    Union, overload)
 
 import numpy as np
 import nvtx
@@ -956,6 +957,12 @@ def nvtx_range(msg: str,
     return nvtx.annotate(msg, color=color, domain=domain, category=category)
 
 
+def nvtx_debug_enabled() -> bool:
+    """Whether the debug NVTX ranges are on (``TLLM_LLMAPI_ENABLE_NVTX`` or ``TLLM_NVTX_DEBUG``)."""
+    return get_env_flag("TLLM_LLMAPI_ENABLE_NVTX", False) or get_env_flag(
+        "TLLM_NVTX_DEBUG", False)
+
+
 def nvtx_range_debug(msg: str,
                      color: str = "grey",
                      domain: str = "TensorRT-LLM",
@@ -978,8 +985,7 @@ def nvtx_range_debug(msg: str,
                         that is both a context manager and an identity
                         decorator; it is safe for concurrent and nested use.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if nvtx_debug_enabled():
         return nvtx_range(msg, color=color, domain=domain, category=category)
     else:
         return _NULL_RANGE
@@ -992,8 +998,7 @@ def nvtx_mark_debug(msg: str,
     """
     Creates an NVTX marker for debugging purposes.
     """
-    if os.getenv("TLLM_LLMAPI_ENABLE_NVTX", "0") == "1" or \
-            os.getenv("TLLM_NVTX_DEBUG", "0") == "1":
+    if nvtx_debug_enabled():
         nvtx_mark(msg, color=color, domain=domain, category=category)
 
 
@@ -1338,6 +1343,65 @@ def confidential_compute_enabled() -> bool:
     """Return whether confidential compute restrictions are enabled."""
     cc_enabled, _ = get_cc_and_nvle_status()
     return cc_enabled
+
+
+_ENV_FLAG_TRUE_VALUES = ("1", "true", "yes", "on")
+_ENV_FLAG_FALSE_VALUES = ("0", "false", "no", "off")
+
+
+@overload
+def get_env_flag(name: str, default: bool) -> bool:
+    ...
+
+
+@overload
+def get_env_flag(name: str, default: None = None) -> Optional[bool]:
+    ...
+
+
+def get_env_flag(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    """Read an on/off switch from the environment.
+
+    The value is compared case-insensitively, with surrounding whitespace
+    ignored.
+
+    Args:
+        name: name of the environment variable.
+        default: value returned when the variable is unset or blank.
+
+    Returns:
+        True for ``1``/``true``/``yes``/``on``, False for
+        ``0``/``false``/``no``/``off``, and ``default`` when the variable is
+        unset or blank.
+
+    Raises:
+        ValueError: the variable holds any other value.
+    """
+    raw = os.environ.get(name, "")
+    value = raw.strip().lower()
+    if not value:
+        return default
+    if value in _ENV_FLAG_TRUE_VALUES:
+        return True
+    if value in _ENV_FLAG_FALSE_VALUES:
+        return False
+    raise ValueError(f"{name}={raw!r} is not one of "
+                     f"{'/'.join(_ENV_FLAG_TRUE_VALUES)} or "
+                     f"{'/'.join(_ENV_FLAG_FALSE_VALUES)}")
+
+
+def get_env_enable_pdl() -> bool:
+    """Whether ``TRTLLM_ENABLE_PDL`` leaves programmatic dependent launch on.
+
+    Parsed like the C++ ``getEnvEnablePDL()`` so Python and native kernels launch
+    with the same setting: on unless the variable is exactly ``0``. Callers check
+    the GPU architecture themselves.
+    """
+    enabled = os.environ.get("TRTLLM_ENABLE_PDL") != "0"
+    if enabled and not getattr(get_env_enable_pdl, "_printed", False):
+        logger.info("PDL enabled")
+        setattr(get_env_enable_pdl, "_printed", True)
+    return enabled
 
 
 @lru_cache(maxsize=None)

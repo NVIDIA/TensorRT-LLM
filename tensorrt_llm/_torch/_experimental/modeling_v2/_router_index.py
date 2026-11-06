@@ -41,9 +41,9 @@ target.
 from __future__ import annotations
 
 import enum
-import os
 from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 if TYPE_CHECKING:
@@ -93,12 +93,7 @@ def step_contract_enabled() -> bool:
     Read once per model instance at construction rather than per forward: the
     answer cannot change within a process, and the forward is the hot path.
     """
-    return os.environ.get(MODELING_V2_VALIDATE_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return get_env_flag(MODELING_V2_VALIDATE_ENV, False)
 
 
 class ModelingV2Mode(str, enum.Enum):

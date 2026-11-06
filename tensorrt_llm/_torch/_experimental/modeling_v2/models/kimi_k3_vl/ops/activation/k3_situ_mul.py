@@ -30,7 +30,7 @@ class K3SituMul(OpWrapper):
     A result-neutral process cache holds compiled kernels by
     (K, linear_beta is not None, PDL). Warm each key eagerly before graph capture;
     a cold capture raises RuntimeError. M and cap values are runtime arguments.
-    TRTLLM_ENABLE_PDL is read per call: unset or 1 enables PDL. Each CTA releases
+    TRTLLM_ENABLE_PDL is read per call: PDL is on unless it is 0. Each CTA releases
     dependents, then waits for its predecessor before reading gu. A PDL consumer
     must wait before reading the output; non-PDL consumers retain stream ordering.
     The grid is ceil(K / 1024) by 8 CTAs of 128 threads, eight columns per thread;

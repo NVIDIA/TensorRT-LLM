@@ -1,19 +1,11 @@
-import os
 import platform
 import traceback
 
+# Re-exported: many modules import get_env_enable_pdl from here.
+from .._utils import get_env_enable_pdl as get_env_enable_pdl  # noqa: F401
 from ..logger import logger
 
 IS_FLASHINFER_AVAILABLE = False
-
-
-def get_env_enable_pdl() -> bool:
-    enabled = os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1"
-    if enabled and not getattr(get_env_enable_pdl, "_printed", False):
-        logger.info("PDL enabled")
-        setattr(get_env_enable_pdl, "_printed", True)
-    return enabled
-
 
 if platform.system() != "Windows":
     try:

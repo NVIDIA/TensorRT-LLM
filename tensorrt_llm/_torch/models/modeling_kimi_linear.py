@@ -110,7 +110,7 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_env_flag, get_sm_version, is_sm_100f
 from ...logger import logger
 from ...mapping import Mapping
 from ...models.modeling_utils import QuantAlgo, QuantConfig
@@ -151,9 +151,7 @@ from .modeling_utils import DecoderModel, register_auto_model, run_concurrently
 
 # A/B escape hatch: restore nn.Linear for the K3 latent MoE projections
 # instead of the min-latency fused GEMM op (read once at import).
-_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = (
-    os.environ.get("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", "0") == "1"
-)
+_K3_DISABLE_MIN_LATENCY_LATENT_PROJ = get_env_flag("TLLM_K3_DISABLE_MIN_LATENCY_LATENT_PROJ", False)
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -425,7 +423,7 @@ for it.
 Deriving this from checkpoint metadata is not possible today: neither published
 drafter's config records which capture convention it was distilled against."""
 
-_AUX_ATTN_RES_STREAM_ENABLED = os.environ.get(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, "1") == "1"
+_AUX_ATTN_RES_STREAM_ENABLED = get_env_flag(KIMI_K3_AUX_ATTN_RES_STREAM_ENV, True)
 
 KIMI_K3_FUSED_ATTN_RES_ENV = "KIMI_K3_FUSED_ATTN_RES"
 """Set to ``0`` to run every attention-residual mix as the PyTorch reference.
@@ -433,7 +431,7 @@ Default: the fused kernels (``trtllm::attn_res_fwd``, ``_attn_res_kernel``)
 where they serve the shape. ``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS`` bounds the
 per-token fused mixes (decode) without touching ``trtllm::attn_res_fwd``."""
 
-_FUSED_ATTN_RES_ENABLED = os.environ.get(KIMI_K3_FUSED_ATTN_RES_ENV, "1") == "1"
+_FUSED_ATTN_RES_ENABLED = get_env_flag(KIMI_K3_FUSED_ATTN_RES_ENV, True)
 
 
 KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV = "KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS"
@@ -1673,11 +1671,8 @@ class KimiK3MoERuntime(nn.Module):
         # 3-run bisect on 62b20dd868), and the bs1-latency win is irrelevant
         # at DEP batch sizes. helix_a2a ranks share requests and keep bf16.
         # KIMI_K3_ROUTER_BF16=1/0 forces either path.
-        _router_bf16_env = os.environ.get("KIMI_K3_ROUTER_BF16")
-        _router_bf16 = (
-            _router_bf16_env == "1"
-            if _router_bf16_env is not None
-            else model_config.mapping.tp_group_shares_requests
+        _router_bf16 = get_env_flag(
+            "KIMI_K3_ROUTER_BF16", model_config.mapping.tp_group_shares_requests
         )
         # The router-logits kernel serves the MoE blocks after KDA attention: there the earlier
         # routing shortens the MoE front, while after MLA attention it lands in the burst of

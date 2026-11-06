@@ -3,7 +3,6 @@
 """Validate caller controls against the active Jinja chat template."""
 
 import hashlib
-import os
 from collections.abc import Collection
 from functools import lru_cache
 
@@ -11,9 +10,12 @@ import jinja2
 import jinja2.ext
 import jinja2.nodes
 
+from .._utils import get_env_flag
 from ..logger import logger
 
 ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR = "TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS"
+# Read once at import, so a bad value fails the launch instead of every request.
+_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS = get_env_flag(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, False)
 
 
 class UnusedChatTemplateKwargsError(ValueError):
@@ -157,12 +159,13 @@ def validate_chat_template_kwargs(
     if not unknown:
         return
     if strict is None:
-        strict = os.getenv(ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR, "0") != "1"
+        strict = not _ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS
     if strict:
         raise UnusedChatTemplateKwargsError(
             f"chat_template_kwargs {unknown} are not referenced by the active chat template. "
             "Remove them, or set "
-            f"{ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR}=1 to allow them with a warning."
+            f"{ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS_ENV_VAR}=1 before starting the process "
+            "to allow them with a warning."
         )
     template_hash = hashlib.sha256(template_source.encode("utf-8")).hexdigest()
     for key in unknown:

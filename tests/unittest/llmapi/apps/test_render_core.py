@@ -26,6 +26,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm.inputs import chat_template_guard
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
 from tensorrt_llm.serve import serving_extensions
 from tensorrt_llm.serve.render import (
@@ -582,7 +583,7 @@ class TestExtensions:
     def test_kimi_generic_effort_is_consumed_before_jinja_validation(
         self, tokenizer, monkeypatch, kwargs, template, expected
     ) -> None:
-        monkeypatch.delenv("TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", raising=False)
+        monkeypatch.setattr(chat_template_guard, "_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", False)
         request = chat_request(chat_template=template, chat_template_kwargs=kwargs)
         res = RenderResources.from_tokenizer(tokenizer, model_type="kimi_k3")
 
@@ -593,7 +594,7 @@ class TestExtensions:
     ) -> None:
         from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
 
-        monkeypatch.delenv("TRTLLM_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", raising=False)
+        monkeypatch.setattr(chat_template_guard, "_ALLOW_UNUSED_CHAT_TEMPLATE_KWARGS", False)
         request = chat_request(
             chat_template="{{ thinking_effort | default('max') }}",
             chat_template_kwargs={"reasoning_effort": "medium"},

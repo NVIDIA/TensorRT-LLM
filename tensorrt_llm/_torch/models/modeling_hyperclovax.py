@@ -1,6 +1,5 @@
 import copy
 import math
-import os
 from functools import partial
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -25,12 +24,13 @@ from ...sampling_params import SamplingParams
 from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
+from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
+                                        fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_siglip import SiglipVisionModel
 from .modeling_utils import register_auto_model
 
-DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
+DISAGG = _is_mm_disagg()
 
 
 def select_best_resolution(original_size: tuple,

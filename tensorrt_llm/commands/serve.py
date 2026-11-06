@@ -44,7 +44,8 @@ from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
-from tensorrt_llm._utils import mpi_rank, set_prometheus_multiproc_dir
+from tensorrt_llm._utils import (get_env_flag, mpi_rank,
+                                 set_prometheus_multiproc_dir)
 from tensorrt_llm.commands import _telemetry as _command_telemetry
 from tensorrt_llm.commands._config_overrides import (ConfigOverride,
                                                      ConfigOverrideError,
@@ -928,7 +929,7 @@ def launch_server(
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
-                if os.getenv("TRTLLM_SERVER_DISABLE_GC", "0") == "1":
+                if get_env_flag("TRTLLM_SERVER_DISABLE_GC", False):
                     gc.disable()
 
                 _signal_frontend_ready(multi_frontend)
@@ -2455,7 +2456,7 @@ def disaggregated(
         #   increment, and observed that `count0` (obtained by `gc.get_count()`)
         #   increases by fewer than 1,000 after every 200,000 requests, while the
         #   maximum value of `count0` exceeded 3,000,000 during the test.
-        if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+        if get_env_flag("TRTLLM_DISAGG_SERVER_DISABLE_GC", True):
             gc.disable()
 
         set_lifecycle_phase("serving")
@@ -2601,8 +2602,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # The fleet is co-located with the implicit coordinator, so route its hot
     # /select,/finish over a Unix domain socket (avoids the TCP loopback stack
     # that dominated per-request latency). Opt-out via the UDS env = "0".
-    use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
-                             "1") == "1"
+    use_uds = get_env_flag(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS, True)
     coord_uds = (
         f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
         if use_uds else None)
@@ -2706,7 +2706,7 @@ def _init_fleet_worker_process():
     # A worker is a plain HTTP process, never an MPI rank; drop WEB_CONCURRENCY so
     # it is never itself re-forked into multiple uvicorn workers.
     os.environ.pop("WEB_CONCURRENCY", None)
-    if os.getenv("TRTLLM_DISAGG_SERVER_DISABLE_GC", "1") == "1":
+    if get_env_flag("TRTLLM_DISAGG_SERVER_DISABLE_GC", True):
         gc.disable()
 
     # This is a fresh Python process, so the TRT-LLM logger defaults to WARNING
@@ -2900,8 +2900,9 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
     _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
     from tensorrt_llm._utils import mpi_rank
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
+    run_remote_mpi_session_client = get_env_flag(
+        DisaggLauncherEnvs.TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT, False)
+    if not run_remote_mpi_session_client:
         set_cuda_device()
     # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
@@ -2919,8 +2920,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
                                                        if blocker else "auto")
 
     # Run a server with the underlying LLM invokes a RemoteMPISessionClient
-    if os.environ.get(DisaggLauncherEnvs.
-                      TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) == "1":
+    if run_remote_mpi_session_client:
         instance_idx = os.environ.get(
             DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX)
         server_cfg = disagg_cfg.server_configs[int(instance_idx)]

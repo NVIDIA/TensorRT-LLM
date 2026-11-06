@@ -23,6 +23,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 from tensorrt_llm._torch.disaggregation.resource.utils import get_layer_byte_ranges
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
@@ -127,7 +128,7 @@ def supports_context_first_bf16(
         and not config.enable_pipelined_transfer
         and not use_pure_python_transfer_agent()
         and os.getenv("TRTLLM_NIXL_KVCACHE_BACKEND", "UCX") == "UCX"
-        and os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") == "1"
+        and get_env_flag("TRTLLM_DISAGG_NO_RETRY", False)
         and os.getenv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP", "0") != "1"
         and os.getenv("TRTLLM_DISAGG_LAYERWISE", "0") != "1"
     ):

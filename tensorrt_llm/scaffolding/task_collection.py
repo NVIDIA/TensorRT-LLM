@@ -1,8 +1,9 @@
 import json
-import os
 import time
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type
+
+from tensorrt_llm._utils import get_env_flag
 
 from .controller import Controller, ParallelProcess
 from .execution_scope import current_scope
@@ -1039,9 +1040,8 @@ class SubRequestMarker(TaskCollection):
 
     unique_id_generator = UniqueIdGenerator()
     top_node_count = 0
-    enable_sub_request_marker = os.getenv("ENABLE_SUB_REQUEST_MARKER",
-                                          "0") == "1"
-    set_unique_id_zero = os.getenv("SET_UNIQUE_ID_ZERO", "0") == "1"
+    enable_sub_request_marker = get_env_flag("ENABLE_SUB_REQUEST_MARKER", False)
+    set_unique_id_zero = get_env_flag("SET_UNIQUE_ID_ZERO", False)
 
     def __init__(self, node_name: str, is_top_level: bool = False):
         super().__init__()

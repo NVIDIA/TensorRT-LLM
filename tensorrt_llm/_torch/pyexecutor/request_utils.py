@@ -3,7 +3,6 @@
 
 """Utility functions for request processing."""
 
-import os
 import time
 from typing import TYPE_CHECKING, Optional
 
@@ -13,12 +12,17 @@ if TYPE_CHECKING:
 
 import numpy as np
 
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_env_flag, nvtx_range
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
 from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+
+# Forward requests to the next PP rank with isend; see
+# RequestBroadcaster._broadcast_requests. Read once at import, so a bad value
+# fails the launch instead of the first request.
+_PP_REQ_SEND_ASYNC = get_env_flag("TRTLLM_PP_REQ_SEND_ASYNC", False)
 
 
 def get_num_child_requests(request: ExecutorRequest) -> int:
@@ -494,11 +498,7 @@ class RequestBroadcaster:
         # 1. rank1 will wait on nccl.send(rank2), without invoking mpi.wait(isend-handle)
         # 2. rank2 will wait on mpi.recv(rank1) but never receive the new requests.
         # 3. rank1 will hang on nccl.send because rank2 will never reach nccl.recv(rank1).
-        pp_send_func = (
-            self.dist.isend_object
-            if os.environ.get("TRTLLM_PP_REQ_SEND_ASYNC", "0") == "1"
-            else self.dist.send_object
-        )
+        pp_send_func = self.dist.isend_object if _PP_REQ_SEND_ASYNC else self.dist.send_object
 
         if not self.dist.is_last_pp_rank:
             if self.send_requests_handler is not None:

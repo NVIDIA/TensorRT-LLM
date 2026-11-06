@@ -48,11 +48,12 @@ The CuTe DSL is imported lazily so that this module can be imported (and its
 eligibility checks used) where the DSL is absent.
 """
 
-import os
 import threading
 from typing import Dict, Optional, Tuple
 
 import torch
+
+from tensorrt_llm._utils import get_env_enable_pdl
 
 # Geometry of the native kernel whose arithmetic is reproduced.
 THREADS_PER_EXPERT = 128
@@ -75,7 +76,7 @@ DEFAULT_PAIRED_FMA = False
 
 def pdl_enabled() -> bool:
     """Whether kernels launch with programmatic dependent launch."""
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
+    return get_env_enable_pdl()
 
 
 def router_gemm_supported(hidden: torch.Tensor, weight: torch.Tensor) -> Tuple[bool, str]:

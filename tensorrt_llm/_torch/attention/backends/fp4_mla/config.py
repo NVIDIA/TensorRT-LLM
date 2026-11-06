@@ -8,7 +8,7 @@ import inspect
 import os
 from typing import Any, Literal, Optional
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 
 HP_BLOCK_SIZE: int = 16
 
@@ -113,20 +113,8 @@ _FP4_MLA_MAX_GRID_Z = 65_535
 # Environment helpers
 
 
-def _env_enabled_default(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value == "":
-        return default
-    return value.lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    )
-
-
 def _fp4_mla_cutedsl_fused_v_transpose_enabled() -> bool:
-    return _env_enabled_default(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
+    return get_env_flag(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, False)
 
 
 FP4_MLA_PACKED_Q_ENV = "TRTLLM_FP4_MLA_PACKED_Q"
@@ -142,7 +130,7 @@ _FP4_MLA_SPLIT_KV_ENV = "TRTLLM_FP4_MLA_SPLIT_KV"
 def _fp4_mla_packed_q_enabled() -> bool:
     """Whether decode uses the packed per-request Q layout (mufu16 CuTe DSL only)."""
     return (
-        _env_enabled_default(FP4_MLA_PACKED_Q_ENV, True)
+        get_env_flag(FP4_MLA_PACKED_Q_ENV, True)
         and _fp4_mla_attention_backend() == _FP4_MLA_CUTEDSL_BACKEND
         and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
     )

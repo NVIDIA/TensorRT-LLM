@@ -160,7 +160,11 @@ class _VideoRoutesMixin:
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = parse_visual_gen_params(
+                    request,
+                    self.generator,
+                    local_media_path_disallowed=self._local_media_path_disallowed,
+                )
                 request_format = _resolve_tensor_only_format(
                     request.format, params.extra_params, self.generator.extra_param_specs
                 )
@@ -410,7 +414,11 @@ class _VideoRoutesMixin:
             if path_error is not None:
                 return path_error
 
-            params = parse_visual_gen_params(request, self.generator)
+            params = parse_visual_gen_params(
+                request,
+                self.generator,
+                local_media_path_disallowed=self._local_media_path_disallowed,
+            )
             # Synchronously validate the resolved params against the
             # loaded pipeline's extra-param specs / declared defaults
             # so unknown ``extra_params`` keys and similar engine-side

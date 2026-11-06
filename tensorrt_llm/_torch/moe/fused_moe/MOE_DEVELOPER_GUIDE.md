@@ -488,7 +488,7 @@ the package.
 | `dense_gemm` / `nvfp4` | `TrtllmCutedslDenseGemmNvfp4Impl` | `trtllm.cutedsl.dense_gemm.nvfp4` |
 
 The grouped-GEMM NVFP4 leaf wraps `quantize_input_nvfp4` to supply an
-import-time default from `TRTLLM_MOE_TRITON_FP4_QUANT` (off unless set to `1`).
+import-time default from `TRTLLM_MOE_TRITON_FP4_QUANT` (off by default).
 Callers can override that default with `enable_triton`. The fused-FC12 and
 dense-GEMM NVFP4 leaves bind the helper directly and do not read this switch.
 

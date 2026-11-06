@@ -46,8 +46,13 @@ from blake3 import blake3
 from packaging.version import Version
 from PIL import Image
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.inputs.multimodal_data import AudioData, MediaModality, VideoData
 from tensorrt_llm.logger import logger
+
+# Read once at import, so a bad value fails the launch instead of every request
+# that carries audio in a video.
+_PYAV_ENABLED = get_env_flag("TRTLLM_ENABLE_PYAV", False)
 
 
 class MediaFetchError(RuntimeError):
@@ -493,10 +498,11 @@ def extract_audio_from_video(
     Raises:
         ValueError: If the video has no audio stream or the data is corrupt.
     """
-    if os.environ.get("TRTLLM_ENABLE_PYAV", "0") != "1":
+    if not _PYAV_ENABLED:
         raise RuntimeError(
             "PyAV is required for audio extraction from video. "
-            "Set the environment variable TRTLLM_ENABLE_PYAV=1 to enable it."
+            "Set the environment variable TRTLLM_ENABLE_PYAV=1 before starting "
+            "the process to enable it."
         )
     try:
         import av

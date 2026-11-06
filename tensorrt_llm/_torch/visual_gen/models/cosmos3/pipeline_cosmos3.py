@@ -47,7 +47,7 @@ from tensorrt_llm._torch.visual_gen.utils import (
     postprocess_video_tensor,
     synchronize_media_prepare_status,
 )
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_env_flag, nvtx_range
 from tensorrt_llm.inputs.media_io import convert_image_mode
 from tensorrt_llm.logger import logger
 from tensorrt_llm.media.decoding import decode_video_reference_window, video_stream_info
@@ -240,7 +240,7 @@ COSMOS3_DURATION_TEMPLATE = "The video is {duration:.1f} seconds long and is of 
 COSMOS3_DEFAULT_RESOLUTION_TEMPLATE = "This video is of {height}x{width} resolution."
 COSMOS3_IMAGE_RESOLUTION_TEMPLATE = "This image is of {height}x{width} resolution."
 
-TRTLLM_DISABLE_COSMOS3_GUARDRAILS = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+TRTLLM_DISABLE_COSMOS3_GUARDRAILS = get_env_flag("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", False)
 
 # Public offload component names for the two transformer towers. The "reasoner"
 # (understanding) pathway is the causal language model that processes text; the
@@ -740,7 +740,7 @@ class Cosmos3OmniMoTPipeline(BasePipeline):
                 self._base_action_scheduler = self.action_scheduler
 
         # Re-check the env var in case it was changed after initialization like in unit tests.
-        guardrails_disabled = os.environ.get("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", "0") == "1"
+        guardrails_disabled = get_env_flag("TRTLLM_DISABLE_COSMOS3_GUARDRAILS", False)
         global TRTLLM_DISABLE_COSMOS3_GUARDRAILS
         TRTLLM_DISABLE_COSMOS3_GUARDRAILS = guardrails_disabled
         if not TRTLLM_DISABLE_COSMOS3_GUARDRAILS:

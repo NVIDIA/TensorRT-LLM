@@ -2,14 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """FP4 MLA decode dispatch and Triton/CuTeDSL launch preparation."""
 
-import os
 from typing import Any
 
 import torch
 import triton
 import triton.language as tl
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_env_flag, get_sm_version
 
 from .cache_update import _prepare_fp4_mla_q_buffers
 from .config import (
@@ -1152,7 +1151,7 @@ def run_fp4_mla_attention_decode(
             and getattr(cutedsl_kernel, "SUPPORTS_FOLDED_QUERIES", False)
             and not _fp4_mla_cutedsl_fused_v_transpose_enabled()
             and getattr(metadata, "_fp4_mla_fold_q", True)
-            and os.environ.get("TRTLLM_FP4_MLA_FOLD_Q", "1") != "0"
+            and get_env_flag("TRTLLM_FP4_MLA_FOLD_Q", True)
         )
         if fold_queries:
             from .fp4_mla_splitkv import select_split_count

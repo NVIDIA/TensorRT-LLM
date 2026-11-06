@@ -49,6 +49,7 @@ import os
 import subprocess  # nosec B404
 from typing import Dict, List, Optional
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 #: CI sets this to "1" only in the BOLT profile-generation job.
@@ -91,7 +92,7 @@ _already_cleared = False
 
 
 def _is_enabled() -> bool:
-    return os.environ.get(CLEAR_COUNTERS_ENV, "").strip() == "1"
+    return get_env_flag(CLEAR_COUNTERS_ENV, False)
 
 
 def _iter_loaded_target_libs() -> Dict[str, int]:
@@ -284,7 +285,7 @@ def maybe_bolt_clear_counters() -> int:
     if _already_cleared or not _is_enabled():
         return 0
 
-    strict = os.environ.get(CLEAR_STRICT_ENV, "").strip() == "1"
+    strict = get_env_flag(CLEAR_STRICT_ENV, False)
     _already_cleared = True
 
     libs = _iter_loaded_target_libs()

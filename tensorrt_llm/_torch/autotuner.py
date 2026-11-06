@@ -39,7 +39,8 @@ from tensorrt_llm._torch.nccl_window_graph import (
     nccl_window_graph_capture, release_nccl_window_graph_owner)
 from tensorrt_llm._torch.nccl_window_tensor_scope import \
     nccl_window_tensor_scope
-from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
+from tensorrt_llm._utils import (confidential_compute_enabled, get_env_flag,
+                                 nvtx_range)
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
 from tensorrt_llm.logger import logger
@@ -948,8 +949,8 @@ class AutoTuner:
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
         # Increase log level for AutoTuner associated logger`
-        self._log_level_to_info = os.getenv(
-            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", '0') == '1'
+        self._log_level_to_info = get_env_flag(
+            "TLLM_AUTOTUNER_LOG_LEVEL_DEBUG_TO_INFO", False)
         self._debug_logger = logger.info if self._log_level_to_info else logger.debug
 
         self.repeat = repeat
@@ -1290,7 +1291,7 @@ class AutoTuner:
         **kwargs,
     ) -> None:
         """Compile cached winners in this process during tuning, not inference."""
-        if os.environ.get("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", "1") != "1":
+        if not get_env_flag("TLLM_AUTOTUNER_PRIME_CACHED_TACTICS", True):
             return
         # Cache hits may differ across ranks; collective runners must stay
         # inside lockstep profiling, including profiling scratch allocation.

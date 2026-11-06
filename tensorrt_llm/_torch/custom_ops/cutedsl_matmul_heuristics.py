@@ -19,6 +19,7 @@ import re
 from functools import lru_cache
 from typing import List, NamedTuple, Optional, Tuple
 
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 
 try:
@@ -98,7 +99,7 @@ def nvmmh_fields() -> set:
 
 def nvmmh_enabled() -> bool:
     """Master opt-in switch for heuristic tactic pruning."""
-    return IS_NVMMH_AVAILABLE and os.environ.get("TRTLLM_CUTEDSL_NVMMH_ENABLE", "0") == "1"
+    return IS_NVMMH_AVAILABLE and get_env_flag("TRTLLM_CUTEDSL_NVMMH_ENABLE", False)
 
 
 def nvmmh_enabled_for_nvfp4() -> bool:

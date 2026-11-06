@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tensorrt_llm._utils import get_env_flag
+
 _ROOT = Path(__file__).resolve().parents[4]
 _SOURCE = _ROOT / "tensorrt_llm/_torch/moe/kernels/megamoe_shared_fc12.py"
 _AUTOTUNER = _ROOT / "tensorrt_llm/_torch/autotuner.py"
@@ -471,7 +473,7 @@ class CpuContractTests(unittest.TestCase):
             )
         )
         namespace = dict(
-            os=os,
+            get_env_flag=get_env_flag,
             inspect=inspect,
             nvtx_range=lambda name: nullcontext(),
             DistributedTuningStrategy=SimpleNamespace(MERGE=object()),

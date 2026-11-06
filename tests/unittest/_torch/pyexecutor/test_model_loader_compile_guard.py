@@ -13,6 +13,7 @@ import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.pyexecutor import model_loader
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     _check_compile_wrapper_before_reload,
     _load_weights_strips_compile_wrapper,
@@ -48,7 +49,7 @@ def test_generic_loader_is_wrapper_tolerant():
 
 
 def test_custom_loader_still_guarded(monkeypatch):
-    monkeypatch.delenv("TLLM_REFIT_SKIP_WRAPPER_CHECK", raising=False)
+    monkeypatch.setattr(model_loader, "_REFIT_SKIP_WRAPPER_CHECK", False)
     model = _wrapped_instance(_CustomWalk)
     assert not _load_weights_strips_compile_wrapper(model)
     with pytest.raises(RuntimeError, match="_orig_mod"):
@@ -60,5 +61,5 @@ def test_custom_loader_still_guarded(monkeypatch):
 
 def test_opt_in_and_escape_hatch(monkeypatch):
     _check_compile_wrapper_before_reload(_wrapped_instance(_Delegating))
-    monkeypatch.setenv("TLLM_REFIT_SKIP_WRAPPER_CHECK", "1")
+    monkeypatch.setattr(model_loader, "_REFIT_SKIP_WRAPPER_CHECK", True)
     _check_compile_wrapper_before_reload(_wrapped_instance(_CustomWalk))

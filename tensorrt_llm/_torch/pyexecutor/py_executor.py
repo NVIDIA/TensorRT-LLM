@@ -29,7 +29,7 @@ except ImportError:
 
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
-                                 get_steady_clock_now_in_seconds,
+                                 get_env_flag, get_steady_clock_now_in_seconds,
                                  global_mpi_size, is_trace_enabled, mpi_comm,
                                  mpi_disabled, nvtx_range,
                                  set_thread_local_mpi_comm, trace_func)
@@ -1229,8 +1229,8 @@ class PyExecutor:
         # Sample-state relay mode. "1": a background thread relays them,
         # overlapping with forward, but it needs the GIL and can be starved
         # into a PP deadlock by GIL-holding native calls. "0": relay inline.
-        self.pp_async_broadcast_sample_state = os.environ.get(
-            "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", "0") == "1"
+        self.pp_async_broadcast_sample_state = get_env_flag(
+            "TLLM_PP_ASYNC_BROADCAST_SAMPLE_STATE", False)
 
         # list of requests in each PP micro batch
         # The synchronous relay retires each microbatch within its own
@@ -1250,12 +1250,14 @@ class PyExecutor:
         self.unhandled_batch_counter = 0
         self.pp_scheduler_max_retry_count = int(
             os.environ.get("TLLM_PP_SCHEDULER_MAX_RETRY_COUNT", 10))
-        self.pp_multi_stream_sample = os.environ.get(
-            "TRTLLM_PP_MULTI_STREAM_SAMPLE", "1") == "1"
+        self.pp_multi_stream_sample = get_env_flag(
+            "TRTLLM_PP_MULTI_STREAM_SAMPLE", True)
+        # Gather every attention-DP rank's iteration stats; see
+        # _flush_iter_stats_synced.
+        self._metrics_all_ranks = get_env_flag("TLLM_METRICS_ALL_RANKS", False)
         # Debug: compare each aggregated helix CP rank's schedule every
         # iteration; see _check_helix_schedule_consistency.
-        check_requested = os.environ.get("TLLM_HELIX_AGG_CHECK_SCHEDULE",
-                                         "0") == "1"
+        check_requested = get_env_flag("TLLM_HELIX_AGG_CHECK_SCHEDULE", False)
         self._check_helix_schedule = (check_requested
                                       and self.dist.mapping.has_cp_helix()
                                       and self.dist.mapping.pp_size == 1
@@ -1908,9 +1910,8 @@ class PyExecutor:
         buffer.
         """
         tp_size = self.dist.tp_size
-        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
-        if not (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp):
+        if not (self._metrics_all_ranks and self.enable_iter_perf_stats
+                and tp_size > 1 and self.enable_attention_dp):
             return
         local_dict = self._pending_iter_stats_dict
         self._pending_iter_stats_dict = None
@@ -3549,9 +3550,9 @@ class PyExecutor:
         scheduler_mode = "overlap" if is_overlap_like else "non_overlap"
 
         tp_size = getattr(self.dist, "tp_size", 1)
-        gather_all_ranks = os.environ.get("TLLM_METRICS_ALL_RANKS", "0") == "1"
-        if (gather_all_ranks and self.enable_iter_perf_stats and tp_size > 1
-                and self.enable_attention_dp and attention_dp_rank is None):
+        if (self._metrics_all_ranks and self.enable_iter_perf_stats
+                and tp_size > 1 and self.enable_attention_dp
+                and attention_dp_rank is None):
             import json as _json
             local_dict = _json.loads(stats.to_json_str())
             if req_stats:

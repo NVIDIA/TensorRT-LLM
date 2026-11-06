@@ -41,13 +41,14 @@ experiments. Every engine is deterministic; rows ``[num_rows, out_rows)`` of
 the partial are written as zeros.
 """
 
-import os
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import torch
 import triton
 import triton.language as tl
+
+from tensorrt_llm._utils import get_env_enable_pdl
 
 ROW_TILE = 16
 """Row tile of both kernels; it is also the largest supported row count."""
@@ -175,7 +176,7 @@ _MAX_BLOCK_K = 512
 
 def pdl_enabled() -> bool:
     """Return whether attention_output_tail may use programmatic dependent launch at all."""
-    return os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0"
+    return get_env_enable_pdl()
 
 
 def pdl_entry_enabled() -> bool:

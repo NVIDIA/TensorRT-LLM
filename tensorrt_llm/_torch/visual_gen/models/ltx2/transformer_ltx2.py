@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import fnmatch
-import os
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
@@ -41,6 +40,7 @@ from tensorrt_llm._torch.visual_gen.attention.backends.utils import create_atten
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._utils import get_env_flag
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -594,9 +594,7 @@ class AudioShardMode(Enum):
 
 # TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD=true (default) replicates the audio stream
 # (CONDITIONAL); set false/0 to force the legacy full seq-shard (FULL).
-_LTX2_AUDIO_CONDITIONAL_SHARD = os.environ.get(
-    "TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD", "true"
-).strip().lower() not in ("0", "false", "no")
+_LTX2_AUDIO_CONDITIONAL_SHARD = get_env_flag("TRTLLM_LTX2_AUDIO_CONDITIONAL_SHARD", True)
 
 
 @dataclass(frozen=True)

@@ -32,7 +32,6 @@
 
 import copy
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -65,7 +64,7 @@ from tensorrt_llm._torch.moe.fused_moe import (
     SwigluActivation,
     create_moe,
 )
-from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
+from tensorrt_llm._utils import get_env_flag, get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.bindings.internal.thop import BufferKind
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.mapping import Mapping
@@ -722,7 +721,7 @@ class Glm52DecoderLayer(DecoderLayer):
         )
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
+        self.enable_fusion = not get_env_flag("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", False)
         self.enable_fusion &= not self.enable_attention_dp
 
         quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)

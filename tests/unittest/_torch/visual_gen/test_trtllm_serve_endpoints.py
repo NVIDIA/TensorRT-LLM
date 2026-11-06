@@ -1298,8 +1298,9 @@ class TestImageEdit:
         """``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1`` gates the edit route too,
         so the path transport cannot leak server-side paths on shared
         deployments."""
-        client, _ = self._client(tmp_path, monkeypatch)
+        # The server reads the switch when it is constructed.
         monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+        client, _ = self._client(tmp_path, monkeypatch)
 
         resp = client.post(
             "/v1/images/edits",
