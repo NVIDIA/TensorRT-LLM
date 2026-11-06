@@ -144,10 +144,10 @@ SparseAttentionConfig = Annotated[
 class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4"] = Field(
+    backend: Literal["VANILLA", "TRTLLM", "CUDNN", "FLASHINFER", "CUTEDSL", "FA4", "SAGEATTN"] = Field(
         "VANILLA",
         status="prototype",
-        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, CUDNN, FLASHINFER, CUTEDSL, FA4",
+        description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, CUDNN, FLASHINFER, CUTEDSL, FA4, SAGEATTN (SM120)",
     )
     quant_attention_config: Optional[QuantAttentionConfig] = Field(
         None,
