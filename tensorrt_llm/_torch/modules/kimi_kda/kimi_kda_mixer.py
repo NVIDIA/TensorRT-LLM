@@ -1637,7 +1637,8 @@ class KimiKDALinearAttention(nn.Module):
         ``allow_prequantized_output`` is set and ``o_proj`` accepts a
         prequantized activation (Rubin CuTe MXFP8 GEMM), the epilogue also
         quantizes the core to MXFP8 and ``_project_output`` hands it to
-        ``o_proj.forward_prequantized``.
+        ``o_proj.forward_prequantized``, except where
+        :meth:`_bf16_core_overlaps_o_proj`.
 
         Fallback path: the kernel indexes each request's new tokens at
         ``cu_seqlens[n] + num_accepted[n] + i``, so we pass
@@ -1661,6 +1662,7 @@ class KimiKDALinearAttention(nn.Module):
             and output is None
             and isinstance(self.o_proj, PrequantizedInputProjection)
             and self.o_proj.supports_prequantized_input
+            and not self._bf16_core_overlaps_o_proj(num_generations, num_spec, T_total, x2d.device)
         )
         projections = self._project_verify_inputs(
             x,
@@ -1776,6 +1778,25 @@ class KimiKDALinearAttention(nn.Module):
         core = self._output_gate(x, o, onorm_g)
         # Can be removed once attention writes the core in place.
         return self._store_core(core, output)
+
+    def _bf16_core_overlaps_o_proj(
+        self, num_requests: int, num_spec: int, num_rows: int, device: torch.device
+    ) -> bool:
+        """Whether the verify hands o_proj the BF16 core rather than its MXFP8 form.
+
+        The MXFP8 epilogue runs on the two-CTA kernel, which has no PDL prologue. Where the
+        BF16-output verify runs ``kda_decode_mtp_v2`` as a programmatic dependent of the
+        projections (one wave) and o_proj runs its low-M GEMM on these rows
+        (``takes_prequantized_input``: it quantizes BF16 rows itself), the BF16 core keeps the
+        verify's prologue under the projections and o_proj's weight stream under the recurrence.
+        """
+        if not self._use_pdl or torch.compiler.is_compiling():
+            return False
+        if not self.o_proj.takes_prequantized_input(num_rows):
+            return False
+        from ...custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import v2_verify_applies
+
+        return v2_verify_applies(self.num_heads, num_requests, num_spec, device)
 
     def _build_mtp_conv_weights(self) -> None:
         """Prebuild packed-prefill and fused-verify convolution weights.
