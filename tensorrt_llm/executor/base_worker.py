@@ -43,6 +43,7 @@ from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
                                         configure_moe_launch_queues,
                                         uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
+from ..llmapi.startup_checks import no_visible_gpu_error
 from ..llmapi.tokenizer import TokenizerBase
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, configure_cpu_affinity, logger_debug
@@ -164,7 +165,12 @@ class BaseWorker(GenerationExecutor):
         return self._resource_governor_queue
 
     def _configure_device(self):
-        device_id = self.global_rank % torch.cuda.device_count()
+        # Ranks launched on other nodes (mpirun, Slurm, trtllm-llmapi-launch)
+        # are not covered by the GPU check in the LLM's own process.
+        device_count = torch.cuda.device_count()
+        if device_count == 0:
+            raise no_visible_gpu_error()
+        device_id = self.global_rank % device_count
         # Fail before loading the model: missing optimized kernels for this GPU otherwise
         # surface much later as unrelated errors such as running out of memory.
         check_cuda_architecture_supported(device_id)
