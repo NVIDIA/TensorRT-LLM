@@ -2620,11 +2620,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
-                        # Store SFC to global memory
+                        # Store SFC to global memory (guarded for the N boundary)
                         #
-                        # TODO: Need to think about predicate on it
-                        # if cute.elem_less():
-                        cute.autovec_copy(tCrSFC, tCgSFC)
+                        # SF blocks past the last column alias the next 128 rows' SFs.
+                        if sfc_subtile_idx_mn[1] < cute.size(tCgSFC_mn, mode=[4]):
+                            cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type
