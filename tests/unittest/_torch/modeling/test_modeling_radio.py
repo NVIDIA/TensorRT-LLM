@@ -9,6 +9,7 @@ from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.models import modeling_radio
 from tensorrt_llm._torch.models.modeling_multimodal_encoder import MultimodalEncoderMixin
 from tensorrt_llm._torch.models.modeling_radio import RADIOVisionModel, VisionTransformer
+from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
 from tensorrt_llm._torch.utils import is_torch_compiling, torch_compiling
 from tensorrt_llm.llmapi.llm_args import MultimodalEncoderCudaGraphConfig
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -26,6 +27,18 @@ _TINY_VIT = modeling_radio.VITTIMMConfig(
 # ``AttentionMetadata`` is sized once at load to this maximum; each forward
 # re-preps it with the real per-image sequence lengths.
 _ENCODER_TEST_MAX_NUM_TOKENS = 8192
+
+
+def _setup_encoder_attn_metadata(model: torch.nn.Module) -> None:
+    """Build the encoder attention metadata the way the engine does after load.
+
+    The engine walks `model.modules()` for `MultimodalEncoderMixin` instances (the mixin lives on
+    the inner `VisionTransformer`, not the `RADIOVisionModel` wrapper); standalone tests must
+    mirror that themselves.
+    """
+    for module in model.modules():
+        if isinstance(module, MultimodalEncoderMixin):
+            module.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
 
 
 def _make_vision_config():
@@ -88,15 +101,7 @@ def test_radio_fp8_parent_kv_cache_does_not_leak_into_vit(tiny_vit_config):
     vision tower, FlashInfer raises at forward time about it not being supported.
     """
     vision_model = RADIOVisionModel(_make_fp8_model_config(), disable_quantization=True)
-    # Engine normally calls this after model load by walking `model.modules()`
-    # for `MultimodalEncoderMixin` instances (the mixin lives on the inner
-    # `VisionTransformer`, not the `RADIOVisionModel` wrapper); standalone tests
-    # must mirror that themselves.
-    for module in vision_model.modules():
-        if isinstance(module, MultimodalEncoderMixin):
-            module.setup_attn_metadata(
-                max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS,
-            )
+    _setup_encoder_attn_metadata(vision_model)
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -334,7 +339,7 @@ def test_radio_blocks_cuda_graph_matches_eager_multi_context(tiny_vit_config):
     torch.testing.assert_close(graph_out, eager_out, rtol=0, atol=0)
 
 
-def _make_temporal_model_config():
+def _make_temporal_model_config() -> model_config_lib.ModelConfig:
     """bf16 ModelConfig whose vision config groups video frames in pairs (tubelets)."""
     vision_config = _make_vision_config()
     vision_config.video_temporal_patch_size = 2
@@ -344,20 +349,17 @@ def _make_temporal_model_config():
     )
 
 
+@pytest.mark.usefixtures("tiny_vit_config")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_radio_video_forward_after_dummy_weight_init(tiny_vit_config):
+def test_radio_video_forward_after_dummy_weight_init() -> None:
     """A video forward runs on the weights the dummy loader fills.
 
     ``load_format="dummy"`` fills every parameter, ``video_embedder`` included, with
     ``initialize_dummy_weights`` and never calls ``load_weights``.
     """
-    from tensorrt_llm._torch.pyexecutor.model_loader import initialize_dummy_weights
-
     device = torch.device("cuda")
     model = RADIOVisionModel(_make_temporal_model_config(), disable_quantization=True)
-    for module in model.modules():
-        if isinstance(module, MultimodalEncoderMixin):
-            module.setup_attn_metadata(max_num_tokens=_ENCODER_TEST_MAX_NUM_TOKENS)
+    _setup_encoder_attn_metadata(model)
     model = model.to(device).to(torch.bfloat16)
     model.eval()
     initialize_dummy_weights(model)
@@ -373,8 +375,9 @@ def test_radio_video_forward_after_dummy_weight_init(tiny_vit_config):
     assert features.isfinite().all()
 
 
+@pytest.mark.usefixtures("tiny_vit_config")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_radio_load_weights_requires_video_embedder_weights(tiny_vit_config):
+def test_radio_load_weights_requires_video_embedder_weights() -> None:
     """A checkpoint without ``video_embedder`` weights is refused when it is loaded."""
     model = RADIOVisionModel(_make_temporal_model_config(), disable_quantization=True)
     weights = {
