@@ -81,6 +81,7 @@ class ThrowawayPrefillTopK:
         compress_ratio: int,
         max_context_length: int,
         device: torch.device,
+        logits_dtype: Optional[torch.dtype] = None,
     ):
         """Builds the wrapper and the K staging buffers.
 
@@ -91,6 +92,9 @@ class ThrowawayPrefillTopK:
             max_context_length: Longest sequence in original (uncompressed) tokens,
                 including the query rows.
             device: CUDA device that owns the buffers.
+            logits_dtype: Storage dtype of the scores the kernels select over (float32,
+                bfloat16 or float16). None reads ``TRTLLM_THROWAWAY_TOPK_LOGITS_DTYPE``
+                (``fp32``, ``bf16`` or ``fp16``; default fp32).
 
         Raises:
             ValueError: If the kernels do not support this configuration.
@@ -100,12 +104,19 @@ class ThrowawayPrefillTopK:
         )
 
         self.max_chunk_size = int(os.environ.get(THROWAWAY_MAX_CHUNK_ENV, _DEFAULT_MAX_CHUNK))
-        logits_name = os.environ.get(THROWAWAY_LOGITS_DTYPE_ENV, "fp32")
-        if logits_name not in _LOGITS_DTYPES:
+        if logits_dtype is None:
+            logits_name = os.environ.get(THROWAWAY_LOGITS_DTYPE_ENV, "fp32")
+            if logits_name not in _LOGITS_DTYPES:
+                raise ValueError(
+                    f"{THROWAWAY_LOGITS_DTYPE_ENV} must be one of {sorted(_LOGITS_DTYPES)}, "
+                    f"got {logits_name!r}"
+                )
+            logits_dtype = _LOGITS_DTYPES[logits_name]
+        elif logits_dtype not in _LOGITS_DTYPES.values():
             raise ValueError(
-                f"{THROWAWAY_LOGITS_DTYPE_ENV} must be one of {sorted(_LOGITS_DTYPES)}, "
-                f"got {logits_name!r}"
+                f"logits_dtype must be float32, bfloat16 or float16, got {logits_dtype}"
             )
+        self.logits_dtype = logits_dtype
         self.num_keys = max_context_length // compress_ratio
         self._wrapper = FP8MQATopKWrapper(
             max_context_length=max_context_length,
@@ -118,7 +129,7 @@ class ThrowawayPrefillTopK:
             compression_ratio=compress_ratio,
             num_keys=self.num_keys,
             qkv_dtype="fp8",
-            logits_dtype=_LOGITS_DTYPES[logits_name],
+            logits_dtype=logits_dtype,
             weights_dtype=torch.float32,
         )
         self._k_stage = torch.empty(

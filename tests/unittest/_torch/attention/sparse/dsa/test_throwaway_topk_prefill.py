@@ -37,6 +37,8 @@ from tensorrt_llm._utils import get_sm_version
 
 HEAD_DIM = 128
 REF_ROW_BLOCK = 64
+# Relative slack on the k-th largest score: ~1 ulp of the logits storage dtype.
+SCORE_SLACK = {torch.float32: 1e-3, torch.bfloat16: 8e-3, torch.float16: 2e-3}
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
@@ -53,9 +55,11 @@ CONFIGS = {
 _RUNNERS = {}
 
 
-def _runner(config, max_context_length, max_chunk=None, monkeypatch=None):
+def _runner(
+    config, max_context_length, max_chunk=None, monkeypatch=None, logits_dtype=torch.float32
+):
     """Runners JIT-compile on first use, so reuse them across tests."""
-    key = (config, max_context_length, max_chunk)
+    key = (config, max_context_length, max_chunk, logits_dtype)
     if key not in _RUNNERS:
         heads, top_k, ratio = CONFIGS[config]
         if max_chunk is not None:
@@ -66,6 +70,7 @@ def _runner(config, max_context_length, max_chunk=None, monkeypatch=None):
             compress_ratio=ratio,
             max_context_length=max_context_length,
             device=torch.device("cuda"),
+            logits_dtype=logits_dtype,
         )
     return _RUNNERS[key]
 
@@ -93,11 +98,20 @@ def _reference_logits_block(q, k, k_scale, weights, ends, rows):
     return logits.masked_fill(cols >= ends[rows][:, None], float("-inf"))
 
 
-def _assert_valid_topk(out, q, k, k_scale, weights, ends, top_k, context):
+def _assert_valid_topk(
+    out, q, k, k_scale, weights, ends, top_k, context, logits_dtype=torch.float32
+):
+    """Tie-aware check; scores are rounded to ``logits_dtype`` like the kernel stores them.
+
+    A score computed with a different FP32 summation order can round to the neighbouring
+    representable value, so the k-th-largest comparison allows one unit in the last place.
+    """
     num_q = out.shape[0]
     for begin in range(0, num_q, REF_ROW_BLOCK):
         rows = slice(begin, min(begin + REF_ROW_BLOCK, num_q))
         ref = _reference_logits_block(q, k, k_scale, weights, ends, rows)
+        if logits_dtype != torch.float32:
+            ref = ref.to(logits_dtype).float()
         sel = out[rows].long()
         valid = sel >= 0
         row_ends = ends[rows]
@@ -118,7 +132,7 @@ def _assert_valid_topk(out, q, k, k_scale, weights, ends, top_k, context):
         if bool(long_rows.any()):
             kth = ref.topk(top_k, dim=1).values[:, -1]
             picked = ref.gather(1, sel.clamp(min=0))
-            slack = 1e-3 * kth.abs().clamp(min=1.0)
+            slack = SCORE_SLACK[logits_dtype] * kth.abs().clamp(min=1.0)
             bad = valid & long_rows[:, None] & (picked < (kth - slack)[:, None])
             assert not bool(bad.any()), f"{context}: selected a score below the k-th largest"
 
@@ -167,6 +181,22 @@ def test_run_chunk_matches_reference_other_configs(config, num_q, kv_prefix):
     out = _run(runner, q, weights, k, k_scale, kv_prefix, top_k)
     ends = _causal_ends(num_q, kv_prefix, ratio)
     _assert_valid_topk(out, q, k, k_scale, weights, ends, top_k, f"{config} prefix={kv_prefix}")
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("config,num_q,kv_prefix", [("ds_v32", 256, 4096), ("glm_5_3", 192, 5000)])
+def test_run_chunk_matches_reference_low_precision_logits(logits_dtype, config, num_q, kv_prefix):
+    """Selecting over BF16 / FP16 stored scores must still be an exact top-k of those scores."""
+    _, top_k, ratio = CONFIGS[config]
+    runner = _runner(config, 16384, logits_dtype=logits_dtype)
+    assert runner.logits_dtype == logits_dtype
+    q, k, k_scale, weights = _make_inputs(config, num_q, kv_prefix, seed=5)
+    out = _run(runner, q, weights, k, k_scale, kv_prefix, top_k)
+    ends = _causal_ends(num_q, kv_prefix, ratio)
+    _assert_valid_topk(
+        out, q, k, k_scale, weights, ends, top_k, f"{config} {logits_dtype}", logits_dtype
+    )
 
 
 @skip_not_sm100
