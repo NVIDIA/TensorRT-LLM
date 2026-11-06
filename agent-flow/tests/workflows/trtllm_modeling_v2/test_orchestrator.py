@@ -633,12 +633,12 @@ def test_regression_jobs_fit_the_gate_sessions_and_keep_the_test_budget(tmp_path
     walled_env = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled,))
     assert regression.job_timeout(walled_env) == 4500
     assert regression.job_timeout(RunEnvironment("local", "p")) == regression.JOB_TIMEOUT_S
-    # Only the sessions gate jobs reach size them: a longer `any` session on another spool
-    # never receives one, while a `role: gates` session on its own spool does.
-    longer = SessionSpec("other", "/o", time_limit_s=4 * 3600, handover_lead_s=600)
+    # Only the sessions gate jobs reach size them: a longer `work` session on another spool
+    # never receives one, while an `any` session on its own spool does.
+    longer = SessionSpec("other", "/o", role="work", time_limit_s=4 * 3600, handover_lead_s=600)
     both = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, longer))
     assert regression.job_timeout(both) == 4500
-    gated = replace(longer, role="gates")
-    pooled = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, gated))
+    shared = replace(longer, role="any")
+    pooled = RunEnvironment("session_spool", "p", spool="/g", sessions=(walled, shared))
     assert regression.job_timeout(pooled) == regression.JOB_TIMEOUT_S
     assert regression.max_jobs(regression.JOB_TIMEOUT_S) == 3

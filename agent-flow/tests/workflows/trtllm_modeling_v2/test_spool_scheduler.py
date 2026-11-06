@@ -1057,6 +1057,22 @@ def test_the_gate_pool_skips_a_session_in_hand_over_for_one_that_can_take_the_jo
     assert executor._pick(gate) == busy
 
 
+def test_gate_jobs_reach_any_sessions_but_not_work_ones():
+    """An `any` session on another spool shares the gates; a `work` one keeps to its workers."""
+    env = RunEnvironment(
+        "session_spool",
+        "/p",
+        spool="/s/main",
+        sessions=(
+            sessions.SessionSpec("shared", "/s/shared"),
+            sessions.SessionSpec("gates", "/s/gates", role="gates"),
+            sessions.SessionSpec("work", "/s/work", role="work"),
+        ),
+    )
+    executor = priority.select_command_executor(env)
+    assert executor.pool == [Path("/s/main"), Path("/s/shared"), Path("/s/gates")]
+
+
 def test_a_fresh_inode_leaves_a_mapped_library_untouched(tmp_path):
     lib = tmp_path / "libs" / "libth_common.so"
     lib.parent.mkdir()

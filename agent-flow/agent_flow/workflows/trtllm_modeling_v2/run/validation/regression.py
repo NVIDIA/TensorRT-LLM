@@ -48,6 +48,7 @@ from ...checks import test_results
 from ...infra.compute.commands import CommandSpec
 from ...infra.compute.executor import FEATURE, select_command_executor
 from ...infra.compute.scheduler import parse_duration
+from ...infra.compute.sessions import GATE_ROLES
 from ...infra.git import git_output, read_files_at
 from ...operators.coverage import CATALOG_DIR, CATALOG_TESTS_DIR, MODELING_V2_PACKAGE
 
@@ -129,19 +130,19 @@ def job_timeout(environment: Any) -> int:
     """How long one test job may run in ``environment``: what its gate sessions can run.
 
     :data:`JOB_TIMEOUT_S`, or less on a session spool: the longest usable window of a session
-    gate jobs reach (those on ``environment.spool`` and the ``role: gates`` ones, the pool
-    ``executor.select_command_executor`` sends them to). A session's window is its
-    ``scheduler.default_wall`` and its time limit less its hand-over lead (at least
-    :data:`WINDOW_SLACK_S`), the shorter of those it declares: its scheduler holds a job its
-    allocation cannot finish for the successor, so a job longer than every window never starts.
-    A session declaring neither is not counted.
+    gate jobs reach (those on ``environment.spool`` and the ones whose role takes them,
+    :data:`sessions.GATE_ROLES`: the pool ``executor.select_command_executor`` sends them to).
+    A session's window is its ``scheduler.default_wall`` and its time limit less its hand-over
+    lead (at least :data:`WINDOW_SLACK_S`), the shorter of those it declares: its scheduler holds
+    a job its allocation cannot finish for the successor, so a job longer than every window never
+    starts. A session declaring neither is not counted.
     """
     if getattr(environment, "kind", "") != "session_spool":
         return JOB_TIMEOUT_S
     spool = Path(str(environment.spool or ""))
     windows = []
     for session in environment.sessions:
-        if session.role != "gates" and Path(str(session.spool)) != spool:
+        if session.role not in GATE_ROLES and Path(str(session.spool)) != spool:
             continue
         bounds = []
         if session.scheduler.get("default_wall"):

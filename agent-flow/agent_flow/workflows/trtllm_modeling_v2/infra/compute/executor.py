@@ -49,6 +49,7 @@ from .scheduler import (
     SpoolPaths,
     watcher_age,
 )
+from .sessions import GATE_ROLES
 
 #: How a command's ``infrastructure`` begins when its job was withdrawn through the spool
 #: (by the operator, or by a caller that gave up on it): no verdict, and not a lost session.
@@ -288,11 +289,11 @@ def select_command_executor(
 
     On a spool, ``tree`` (the checkout under test) is every job's working directory and first
     ``PYTHONPATH`` entry, and ``gpus`` (a count, or ``all``) what each job asks for. The spools of
-    every ``role: gates`` session form a pool beside ``environment.spool``, and each command goes
-    to the live one that would start it soonest.
+    every session whose role takes gate jobs (:data:`sessions.GATE_ROLES`) form a pool beside
+    ``environment.spool``, and each command goes to the live one that would start it soonest.
     """
     if environment.kind == "session_spool" and environment.spool:
-        pool = [session.spool for session in environment.sessions if session.role == "gates"]
+        pool = [session.spool for session in environment.sessions if session.role in GATE_ROLES]
         return SpoolCommandExecutor(
             environment.spool,
             name_prefix=name_prefix,

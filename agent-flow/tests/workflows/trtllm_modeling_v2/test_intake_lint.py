@@ -228,25 +228,6 @@ def test_the_environment_can_start_the_run(tmp_path):
     assert prior_art.stock_supports(repo, _CONFIG) is True
 
 
-def test_a_session_no_gate_reaches_is_named():
-    """Every gate queued on one spool while an `any` session on another sat idle."""
-    task = copy.deepcopy(_GOOD)
-    task["environment"].update(
-        spool="/scratch/spool-a",
-        sessions=[
-            {"name": "a", "spool": "/scratch/spool-a"},
-            {"name": "b", "spool": "/scratch/spool-b"},
-            {"name": "c", "spool": "/scratch/spool-c", "role": "gates"},
-            {"name": "d", "spool": "/scratch/spool-d", "role": "work"},
-        ],
-    )
-    finding = _finding("session-no-gates", task)
-    assert finding.severity == lint.WARN
-    assert finding.message.startswith("session(s) b have role `any`")
-    task["environment"]["sessions"][1]["role"] = "work"
-    assert _finding("session-no-gates", task) is None
-
-
 def test_a_kv_dtype_the_engine_refuses_is_a_block(tmp_path):
     repo = _tree(tmp_path)
     loader = repo / KV_DTYPES_SOURCE

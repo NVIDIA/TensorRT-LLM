@@ -146,8 +146,8 @@ environment:
   #   - name: a
   #     spool: /path/to/scratch/spool          # the gate spool above; absolute, one per session
   #     role: gates                            # gates | work | any (the default)
-  #     # Gates run on environment.spool and `gates` sessions only: an `any` session
-  #     # elsewhere never gets one (lint `session-no-gates`).
+  #     # Gates run on environment.spool and every `gates` or `any` session; a `work` session
+  #     # gets only what a worker submits to it.
   #     nodes: 1                               # default 1
   #     gpus_per_node: 4
   #     time_limit: "24:00:00"

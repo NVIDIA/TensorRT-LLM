@@ -39,6 +39,7 @@ import yaml
 
 from ..checks import accuracy_policy, check_config
 from ..checks import disagg as disagg_checks
+from ..infra.compute.sessions import GATE_ROLES
 from ..operators import prior_art, tree_anchors
 from ..tune.schema import REMOVED_PERF_KEYS
 from . import variants as variants_mod
@@ -309,7 +310,7 @@ def _session_nodes(task: Mapping[str, Any]) -> int:
     nodes = [
         s.get("nodes") or 1
         for s in sessions
-        if isinstance(s, Mapping) and s.get("role", "any") in ("gates", "any")
+        if isinstance(s, Mapping) and s.get("role", "any") in GATE_ROLES
     ]
     return max([n for n in nodes if isinstance(n, int)] or [1])
 
@@ -832,37 +833,6 @@ def environment_rules(ctx: LintContext) -> Iterator[Finding]:
         )
 
 
-def session_rules(ctx: LintContext) -> Iterator[Finding]:
-    """No session that reads as sharing the gates is one no gate ever reaches.
-
-    Gate jobs go to ``environment.spool`` and the ``role: gates`` sessions only
-    (``executor.select_command_executor``); ``role: work`` says a session is kept for
-    the workers' own jobs.
-    """
-    env = ctx.environment
-    if env.get("kind") != "session_spool":
-        return
-    spool = Path(str(env.get("spool") or ""))
-    idle = [
-        str(session.get("name"))
-        for session in env.get("sessions") or ()
-        if isinstance(session, Mapping)
-        and session.get("role", "any") == "any"
-        and Path(str(session.get("spool") or "")) != spool
-    ]
-    if idle:
-        yield Finding(
-            "session-no-gates",
-            WARN,
-            f"session(s) {', '.join(idle)} have role `any` on a spool other than "
-            "environment.spool: gate jobs go only to environment.spool and `role: gates` "
-            "sessions, so no gate ever runs there, and every gate queues on the others "
-            "while these hold only what a worker submits to them",
-            "set `role: gates` on a session that should share the gates, or `role: work` on "
-            "one kept for the workers' own jobs",
-        )
-
-
 def agents_rules(ctx: LintContext) -> Iterator[Finding]:
     """Every role's model is stated: the run inherits none and stops before its first worker."""
     from ..agents.roles import AgentConfigError, resolve_role_agents
@@ -1005,7 +975,6 @@ RULES: tuple[Rule, ...] = (
     boot_rules,
     disagg_rules,
     environment_rules,
-    session_rules,
     agents_rules,
     notes_rules,
     engine_rules,
