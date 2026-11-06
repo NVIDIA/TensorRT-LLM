@@ -198,51 +198,6 @@ encoder_max_num_tokens: 65536
 
 Image input is supported in aggregated serving with a local encoder. A separate encoder-to-prefill handoff is not part of this guide.
 
-### Modeling V2 (Experimental)
-
-On GB300 (sm_103), the NVFP4 checkpoint can also be served by the modeling_v2 implementation, which is off by default. Set `modeling_v2` in the YAML file:
-
-```yaml
-modeling_v2: auto     # use modeling_v2 when it supports this deployment, otherwise the built-in model
-# modeling_v2: require  # fail at startup, with the reason, when it does not
-```
-
-It supports these single-node layouts:
-
-| Layout | GPUs | Parallel settings | Speculative decoding |
-|---|---|---|---|
-| tp1 | 1 | `tensor_parallel_size: 1` | none, or MTP with `max_draft_len` 1-7 |
-| tp4 | 4 | `tensor_parallel_size: 4`, `moe_tensor_parallel_size: 4` | none, or MTP with `max_draft_len` 1-7 |
-| tep4 | 4 | `tensor_parallel_size: 4`, `moe_expert_parallel_size: 4` | none, or MTP with `max_draft_len` 1-7 |
-| dep4 | 4 | as tep4, plus `enable_attention_dp: true` | none, or MTP with `max_draft_len` 1-7 |
-| dep2 | 2 | `tensor_parallel_size: 2`, `moe_expert_parallel_size: 2`, `enable_attention_dp: true` | none |
-
-Under `auto`, these settings make the server fall back to the built-in model; under `require`, the server fails at startup:
-
-* Any other layout, including `enable_lm_head_tp_in_adp: true` with attention DP.
-* A checkpoint of the same shape whose config changes what it computes, for example `norm_topk_prob: false`, another `num_experts_per_tok`, other rope settings, or an MTP module that reads another layer's hidden state (`mtp_use_hidden_state_from_layer`).
-* Speculative decoding other than one-model MTP, or a draft length that changes at runtime.
-* MTP with `TRTLLM_USE_GDN_REPLAY=0`.
-* A KV cache dtype other than the checkpoint's bf16, `fp8` or `nvfp4`.
-* A recurrent-state cache other than `bfloat16`. tp1 also accepts `float32`.
-* `moe_config.backend` other than `AUTO` or `TRTLLM`. tp1 also accepts `CUTEDSL` with `max_draft_len` up to 3.
-* `prefill_cuda_graph_backend: piecewise`; with attention DP, also `breakable`.
-* `moe_config.load_balancer` (EPLB) at tep4, dep4 or dep2.
-
-Other differences from the built-in model:
-
-* The PLE n-gram table is in pinned host memory by default, one copy per rank (about 48 GiB each, so about 190 GiB of host memory for a four-GPU node). `TRTLLM_MODELING_V2_PLE_HOST_OFFLOAD=0` keeps it on the device. `TRTLLM_QWEN4_EXP_PLE_HOST_OFFLOAD` applies only to the built-in model.
-* `disable_mm_encoder` has no effect. The vision tower is always built and image requests are accepted.
-* At tp1 these environment switches enable lossy FP8 or NVFP4 copies of projections. All are off by default, and the other layouts ignore them with a warning:
-  * `TRTLLM_MODELING_V2_DENSE_FP8`
-  * `TRTLLM_MODELING_V2_GDN_INPROJ_NVFP4`
-  * `TRTLLM_MODELING_V2_TARGET_HEAD_NVFP4` (with `DENSE_FP8`)
-  * `TRTLLM_MODELING_V2_MTP_HEAD_NVFP4`
-  * `TRTLLM_MODELING_V2_MTP_MOE_NVFP4`
-  * `TRTLLM_MODELING_V2_MTP_DENSE_FP8`
-* At tp1, `TRTLLM_MODELING_V2_MOE_PREFILL_COPY=0` drops the second copy of the routed experts that serves large prefill steps.
-* A `TRTLLM_MODELING_V2_*` switch accepts `1`/`0`, `true`/`false`, `yes`/`no` or `on`/`off`, and the server fails at startup on any other value.
-
 ### Key Configuration Options
 
 These options control TensorRT LLM behavior and are set in the YAML file passed to `trtllm-serve` with the `--config` argument.
