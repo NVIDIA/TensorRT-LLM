@@ -42,6 +42,8 @@ _DEEP_GEMM_THREADS_ENV = "TLLM_OVERLAP_PREWARM_DEEP_GEMM_THREADS"
 # Free device memory left to the loader next to the dummy operands.
 _LOADER_RESERVE_BYTES = 8 << 30
 _KIMI_LINEAR_MODULE = "tensorrt_llm._torch.models.modeling_kimi_linear"
+# Kimi K3's weight-loading helpers: in this module where it exists, else in modeling_kimi_linear.
+_KIMI_K3_LOADER_MODULE = "tensorrt_llm._torch.models.modeling_kimi_k3_loader"
 
 
 @dataclasses.dataclass
@@ -104,16 +106,19 @@ def _uses_flashinfer_mxfp8(model: nn.Module, llm_args: Any, methods: List[Any]) 
     )
 
 
-def _kimi_linear_fp8_shapes(kimi: ModuleType, model: nn.Module) -> List[Tuple[int, int]]:
+def _kimi_linear_fp8_shapes(
+    kimi: ModuleType, loader: ModuleType, model: nn.Module
+) -> List[Tuple[int, int]]:
     """``(out, in)`` of the FP8 block-scale GEMMs on DeepGEMM operands that
     ``KimiLinearForCausalLM._finalize_weight_load`` creates: the attention projections it
     rewraps, the KDA ``qkvg_proj`` that ``finalize_decode_weights`` fuses, and the BF16
-    shared/latent MLP projections it quantizes."""
+    shared/latent MLP projections it quantizes. ``loader`` is the module with the model's
+    weight-loading helpers."""
     if kimi._rubin_mxfp8_is_available():
         return []
     shapes = []
     for layer in model.model.layers:
-        if not kimi._has_weights(layer):
+        if not loader._has_weights(layer):
             continue
         is_kda = getattr(layer, "is_kda", False)
         attention = layer.linear_attn if is_kda else layer.self_attn.mixer
@@ -127,7 +132,7 @@ def _kimi_linear_fp8_shapes(kimi: ModuleType, model: nn.Module) -> List[Tuple[in
     if model._fp8_weight_read_moe_mlp:
         shapes += [
             tuple(getattr(parent, attr).weight.shape)
-            for parent, attr, linear_types in kimi._moe_mlp_fp8_weight_read_targets(
+            for parent, attr, linear_types in loader._moe_mlp_fp8_weight_read_targets(
                 model.model, include_fused_gate_up=model.model_config.mapping.enable_attention_dp
             )
             if isinstance(getattr(parent, attr, None), linear_types)
@@ -144,10 +149,11 @@ def _load_time_fp8_shapes(model: nn.Module) -> Set[Tuple[int, int]]:
     kimi = sys.modules.get(_KIMI_LINEAR_MODULE)
     if kimi is None:
         return shapes
+    loader = sys.modules.get(_KIMI_K3_LOADER_MODULE, kimi)
     for module in model.modules():
         if isinstance(module, kimi.KimiLinearForCausalLM):
             try:
-                shapes.update(_kimi_linear_fp8_shapes(kimi, module))
+                shapes.update(_kimi_linear_fp8_shapes(kimi, loader, module))
             except Exception as e:  # noqa: BLE001 - the warmup builds those kernels
                 logger.warning(
                     f"Overlapped Linear GEMM builds: no load-time shapes of "
