@@ -21,13 +21,14 @@ import types
 from dataclasses import dataclass, field
 from typing import Mapping
 
-# The role layouts a manager's spec names (role_layout), for managers to import from here.
-from .role_layout import ByHead as ByHead
-from .role_layout import Own as Own
-from .role_layout import Replicated as Replicated
-from .role_layout import RingSlots as RingSlots
-from .role_layout import RoleLayoutV2 as RoleLayoutV2
-from .role_layout import Sectioned as Sectioned
+# The role layouts a manager's spec names (disaggregation.base.role_layout), for managers to
+# import from here.
+from ...disaggregation.base.role_layout import ByHead as ByHead
+from ...disaggregation.base.role_layout import Own as Own
+from ...disaggregation.base.role_layout import Replicated as Replicated
+from ...disaggregation.base.role_layout import RingSlots as RingSlots
+from ...disaggregation.base.role_layout import RoleLayoutV2 as RoleLayoutV2
+from ...disaggregation.base.role_layout import Sectioned as Sectioned
 
 
 def layer_groups(manager: object) -> list[list[int]]:

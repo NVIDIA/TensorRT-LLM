@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from tensorrt_llm import bindings
+from tensorrt_llm._torch.disaggregation.base.role_layout import grid_place
 from tensorrt_llm._torch.disaggregation.native import rank_info as rank_info_module
 from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
@@ -29,7 +30,6 @@ from tensorrt_llm._torch.disaggregation.native.rank_info import (
     NATIVE_TRANSFER_PROTOCOL_VERSION,
     RankInfo,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.role_layout import grid_place
 
 pytestmark = pytest.mark.cpu_only
 
