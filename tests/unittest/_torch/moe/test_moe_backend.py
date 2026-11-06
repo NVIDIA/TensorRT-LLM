@@ -6982,6 +6982,24 @@ def test_multi_chunk_forward_overlaps_chunks_of_a_backend_that_allocates_its_out
 
 
 @pytest.mark.cpu_only
+def test_mxfp8_fused_fc12_multi_chunk_forward_runs_chunks_on_one_stream(monkeypatch):
+    """The MXFP8 fused FC12 kernel is a persistent grid whose FC2 tiles wait
+    on FC1 tiles of the same launch, so two chunks in flight on the main and
+    aux streams could each hold part of the GPU and wait forever. The leaf
+    declares this, and the scheduler then runs both chunks on the main stream."""
+    requirement = TrtllmCutedslFusedFc12Mxfp8Impl.descriptor.input_requirement
+    assert requirement.run_moe_requires_coresident_grid
+    assert not requirement.run_moe_reuses_buffers
+    backend = _FreshOutputBackend(_record_streams(monkeypatch))
+    backend.input_requirement = requirement
+
+    x, out = _forward_in_two_chunks(backend)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert backend.streams == [_MAIN_STREAM, _MAIN_STREAM]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("enable_alltoall", [False, True], ids=["allgather", "alltoall"])
 def test_triton_fp8_block_scales_leaf_localizes_global_slot_ids(enable_alltoall, monkeypatch):
     """Dispatch keeps the global slot numbering with or without alltoall, and
