@@ -693,6 +693,12 @@ def runLLMBuild(
     sh "rm -rf **/*.xml *.tar.gz"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    // Set the version before copying the source, so the packaged source gets every version record.
+    if (versionOverride) {
+        withEnv(["TRTLLM_VERSION_OVERRIDE=${versionOverride}"]) {
+            sh "cd ${LLM_ROOT} && python3 scripts/bump_version.py \"\${TRTLLM_VERSION_OVERRIDE}\""
+        }
+    }
 
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
@@ -723,7 +729,6 @@ def runLLMBuild(
 
     withEnv([
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
-        "TRTLLM_VERSION_OVERRIDE=${versionOverride}",
     ]) {
         int buildRetries = 0
         while (true) {
@@ -731,7 +736,7 @@ def runLLMBuild(
                 // cmake will download third-party sources, so we add retry.
                 trtllm_utils.llmExecStepWithRetry(
                     pipeline,
-                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
+                    script: "cd ${LLM_ROOT} && python3 scripts/build_wheel.py --clean --use_ccache -G Ninja -j ${buildJobs} -a '${buildFlags[WHEEL_ARCHS]}' ${buildFlags[WHEEL_EXTRA_ARGS]}"
                 )
                 break
             } catch (InterruptedException e) {
@@ -775,7 +780,6 @@ def runLLMBuild(
         }
     }
 
-    sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
     // Step 3: packaging wheels into tarfile
     sh "cp ${LLM_ROOT}/build/tensorrt_llm-*.whl TensorRT-LLM/"
 
