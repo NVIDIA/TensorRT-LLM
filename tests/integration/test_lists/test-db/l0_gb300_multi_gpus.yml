@@ -61,6 +61,8 @@ l0_gb300_multi_gpus:
   # DWDP expert prefetch on real streams and copies, incl. the gather from
   # peer GPUs.
   - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
+  # Attached dense DWDP beside the expert prefetch on real streams and copies.
+  - unittest/_torch/modules/dwdp/test_dense_attached_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/test_moe_load_balancer.py
   - unittest/_torch/moe/test_moe_routing.py

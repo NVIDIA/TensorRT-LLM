@@ -83,6 +83,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      serve_graceful_shutdown_timeout_s:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       custom_tokenizer:
         annotation: Optional[str]
         default: null

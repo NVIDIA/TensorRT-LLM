@@ -23,13 +23,15 @@ output is checked against the source weights of its pass.
 """
 
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.modules.dwdp import fabric_gather
+from tensorrt_llm._torch.modules.dwdp.dense.manager import DenseDwdpManager
+from tensorrt_llm._torch.modules.dwdp.dense.types import DenseMode
 from tensorrt_llm._torch.modules.dwdp.weight_manager import DWDPWeightManager
 from tensorrt_llm._torch.pyexecutor.dwdp import DwdpManager
 
@@ -82,7 +84,11 @@ class _Harness:
     """Drives the facade the way the executor loop and ``ConfigurableMoE`` do."""
 
     def __init__(
-        self, layers: List[int], num_slots: int, peer_devices: Optional[List[int]] = None
+        self,
+        layers: List[int],
+        num_slots: int,
+        peer_devices: Optional[List[int]] = None,
+        use_tma: bool = False,
     ) -> None:
         self.layers = layers
         peers = [torch.cuda.current_device()] if peer_devices is None else peer_devices
@@ -112,9 +118,12 @@ class _Harness:
             weight_names=["w"],
             dwdp_rank=0,
             dwdp_size=self.num_ranks,
+            use_tma=use_tma,
         )
         self.mgr = object.__new__(DwdpManager)
         self.mgr._weight_manager = self.wm
+        # Expert DWDP alone: the attached dense manager has no runtime.
+        self.mgr._dense_manager = DenseDwdpManager(DenseMode.ATTACHED)
         self.backend = _Backend()
         self.compute_stream = torch.cuda.Stream()
         self.copies: List[int] = []
@@ -208,6 +217,10 @@ def _drive(h: _Harness, moe_delay: int, num_slots: int) -> None:
     for tensors in h.src.values():
         for t in tensors:
             t.add_(1000.0)
+    # The next pass's first copies run on this GPU's copy stream, which nothing orders after the
+    # updates on the source GPUs.
+    for device in {t.device for tensors in h.src.values() for t in tensors}:
+        torch.cuda.synchronize(device)
     weights = h.snapshot()
     h.mgr.invalidate_prefetch()
     h.run_pass(7, moe_delay, weights)
@@ -278,9 +291,45 @@ def _enable_peer_access(devices: List[int]) -> None:
             pytest.skip(f"cudaDeviceEnablePeerAccess({dev}) failed: {err}")
 
 
+def _gather_kernel_names(launch: Callable[[], None]) -> List[str]:
+    """Names of the fabric-gather kernels ``launch`` runs."""
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+        launch()
+        torch.cuda.synchronize()
+    return [event.name for event in prof.events() if "dwdpFabricGather" in event.name]
+
+
+def test_each_gather_launch_runs_the_kernel_it_names():
+    """``use_tma`` picks the kernel of each launch, so one process runs both (local buffers stand
+    in for the peers); a device without the TMA kernel's needs runs the register kernel."""
+    op = fabric_gather.gather_op()
+    if op is None:
+        pytest.skip("trtllm::dwdp_fabric_gather is not registered")
+    props = torch.cuda.get_device_properties(torch.cuda.current_device())
+    # dwdpFabricGatherTmaSupported: SM90 or newer, and the kernel's 224 KiB + 128 B of shared memory.
+    tma_runs = props.major >= 9 and props.shared_memory_per_block_optin >= 224 * 1024 + 128
+    srcs = [
+        torch.randint(0, 256, (size,), dtype=torch.uint8, device="cuda")
+        for size in (4096, 16 * 1000, 1 << 20)
+    ]
+    dsts = [torch.zeros_like(src) for src in srcs]
+    plan = fabric_gather.build_plan(
+        [[(dst.data_ptr(), src.data_ptr(), dst.numel())] for dst, src in zip(dsts, srcs)],
+        torch.device("cuda", torch.cuda.current_device()),
+    )
+    for use_tma in (False, True, False):
+        for dst in dsts:
+            dst.zero_()
+        names = _gather_kernel_names(lambda: op(*plan, fabric_gather.THREADS, use_tma))
+        assert all(torch.equal(dst, src) for dst, src in zip(dsts, srcs))
+        assert names, "no fabric-gather kernel ran"
+        assert any("Tma" in name for name in names) == (use_tma and tma_runs), names
+
+
+@pytest.mark.parametrize("kernel", ["register", "tma"])
 @pytest.mark.parametrize("num_slots", [2, 3])
 @pytest.mark.parametrize("slow", ["moe", "copy"])
-def test_fabric_gather_from_peer_gpus(monkeypatch, num_slots, slow):
+def test_fabric_gather_from_peer_gpus(monkeypatch, num_slots, slow, kernel):
     """The production transport: the SM gather kernel pulls the remote experts from peer GPUs."""
     if torch.cuda.device_count() < 2:
         pytest.skip("needs at least 2 GPUs")
@@ -294,8 +343,8 @@ def test_fabric_gather_from_peer_gpus(monkeypatch, num_slots, slow):
     peers = list(range(1, min(torch.cuda.device_count(), 4)))
     _enable_peer_access(peers)
     layers = [2 * i + 1 for i in range(5)]
-    h = _Harness(layers, num_slots, peer_devices=peers)
-    assert h.wm._use_gather
+    h = _Harness(layers, num_slots, peer_devices=peers, use_tma=kernel == "tma")
+    assert h.wm.use_gather and h.wm.use_tma == (kernel == "tma")
     moe_delay = DELAY_CYCLES if slow == "moe" else 0
     copy = _logged("_prefetch_layer_gather", DELAY_CYCLES if slow == "copy" else 0, h.copies)
     with patch.object(DWDPWeightManager, "_prefetch_layer_gather", copy):

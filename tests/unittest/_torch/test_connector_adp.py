@@ -114,6 +114,7 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.hang_detector = MagicMock()
     executor.hang_detector.detected.return_value = False
     executor._profile_manager = MagicMock()
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.draft_model_engine = None
     executor.sampler = None
     executor.worker_thread = MagicMock()
@@ -668,6 +669,7 @@ def test_shutdown_drains_save_before_loop_exit(
         executor.virtual_memory_pools = {}
         executor.sampler = None
         executor.dwdp_manager = None
+        executor.dense_dwdp_manager = None
         executor.resource_manager = MagicMock()
         resource = MagicMock()
         executor.resource_manager.resource_managers = {"kv": resource}

@@ -35,6 +35,7 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
                     Sequence, Set, Tuple)
 
 import click
+import pydantic
 import torch
 import uvloop
 import yaml
@@ -56,7 +57,7 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi.disagg_utils import (
-    DisaggClusterConfig, MetadataServerConfig, ServerRole,
+    DisaggClusterConfig, DisaggServerConfig, MetadataServerConfig, ServerRole,
     extract_disagg_cluster_config, parse_disagg_config_file,
     parse_metadata_server_config_file, validate_config_bool,
     validate_internal_request_auth_key)
@@ -652,6 +653,113 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     llm_args["num_serve_frontends"] = 1
 
 
+def _bool_setting(value: object) -> bool:
+    """A boolean LLM argument as TorchLlmArgs reads it; False if it does not parse.
+
+    A value that does not parse is left to the LLM arguments' own validation.
+    """
+    try:
+        return pydantic.TypeAdapter(bool).validate_python(value)
+    except pydantic.ValidationError:
+        return False
+
+
+def _dense_dwdp_setting(dwdp_config: object) -> bool:
+    """Whether a ``dwdp_config`` value of the LLM arguments enables dense DWDP.
+
+    The value is a ``DwdpConfig`` once the YAML is merged, or a mapping; a
+    value that does not parse is left to the LLM arguments' own validation.
+    """
+    if isinstance(dwdp_config, dict):
+        return _bool_setting(dwdp_config.get("enable_dense"))
+    return getattr(dwdp_config, "enable_dense", False) is True
+
+
+#: The ``TRTLLM_DISAGG_ROLE`` of the servers of a disaggregated MPI launch, by
+#: server type.
+_DISAGG_SERVER_ROLES = {"ctx": "context", "gen": "generation"}
+
+_DENSE_DWDP_FOR_CONTEXT_ONLY = (
+    "dwdp_config.enable_dense is for context servers only: dense DWDP gathers "
+    "the dense weights of every covered layer in every forward, decode steps "
+    "included.")
+
+
+def _serving_role(role: Optional[str]) -> Optional[str]:
+    """``"context"`` or ``"generation"`` for a ``TRTLLM_DISAGG_ROLE`` value.
+
+    Matched as the usage telemetry matches it: case-insensitive, with the
+    compatible legacy values that start with ``ctx`` or ``gen`` (``ctx0``,
+    ``gen0``). None for any other value.
+    """
+    normalized = (role or "").lower()
+    if normalized == "context" or normalized.startswith("ctx"):
+        return "context"
+    if normalized.startswith("gen"):
+        return "generation"
+    return None
+
+
+def _check_context_only_settings(llm_args: dict, *, warn: bool) -> None:
+    """Refuse dense DWDP on a generation server; warn without the context role.
+
+    Dense DWDP (``dwdp_config.enable_dense``) gathers the dense weights of
+    every covered layer in every forward, decode steps included, so it is
+    meant for context servers. The role is the one the server's ranks see in
+    ``TRTLLM_DISAGG_ROLE`` (read by :func:`_serving_role`): ``launch_server``
+    publishes it from ``--server_role``, the disaggregated MPI worker from its
+    server's type, and a gRPC server, which takes no ``--server_role``, keeps
+    the one its environment holds. A server without the context role gets a
+    warning that names the remedy. Runs before the LLM is built, so a refused
+    launch fails before the model loads.
+
+    Args:
+        llm_args: The merged LLM arguments of the server.
+        warn: Whether to log the warning; an attached frontend repeats its
+            launcher's check without it.
+
+    Raises:
+        click.BadParameter: Dense DWDP is refused for the server's role.
+    """
+    if not _dense_dwdp_setting(llm_args.get("dwdp_config")):
+        return
+    role = _serving_role(os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE))
+    if role == "generation":
+        raise click.BadParameter(
+            f"{_DENSE_DWDP_FOR_CONTEXT_ONLY} Remove it from this server's "
+            "configuration.")
+    if warn and role != "context":
+        logger.warning(
+            "dwdp_config.enable_dense is set on a server without the context "
+            "role, where dense DWDP gathers the dense weights of every covered "
+            "layer in every forward, decode steps included. It is meant for "
+            "context servers and refused on generation servers; launch "
+            "context servers with --server_role CONTEXT (a gRPC server with "
+            "TRTLLM_DISAGG_ROLE=context) so that the role is checked.")
+
+
+def _refuse_dense_dwdp_on_generation_servers(
+        disagg_cfg: DisaggServerConfig) -> None:
+    """Refuse dense DWDP on the generation servers of a disaggregated MPI launch.
+
+    Every rank of the launch runs this on the same configuration before the
+    world is split, so a refused launch exits on every rank. The server
+    process of an instance's leader would refuse it too, but only once the
+    instance's other ranks wait for its MPI tasks, which then never come.
+
+    Raises:
+        click.BadParameter: A generation server enables dense DWDP, in its own
+            settings or in the top-level ones it inherits.
+    """
+    for server_cfg in disagg_cfg.server_configs:
+        if (_DISAGG_SERVER_ROLES.get(server_cfg.type) == "generation" and
+                _dense_dwdp_setting(server_cfg.other_args.get("dwdp_config"))):
+            raise click.BadParameter(
+                f"{_DENSE_DWDP_FOR_CONTEXT_ONLY} Set it under context_servers "
+                "only: the generation servers also inherit the top-level "
+                "settings.")
+
+
 def launch_server(
         host: str,
         port: int,
@@ -671,7 +779,7 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None):
+        runtime_control_api_key: Optional[str] = None) -> None:
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -683,6 +791,8 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    _check_context_only_settings(llm_args,
+                                 warn=not multi_frontend.is_attached_frontend)
     # An attached frontend gets the launcher's socket from its spawn env; the
     # launcher is its parent.
     multi_frontend_serving = None
@@ -812,7 +922,9 @@ def launch_server(
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
                     runtime_control_api_key=runtime_control_api_key,
-                    multi_frontend_serving=multi_frontend_serving)
+                    multi_frontend_serving=multi_frontend_serving,
+                    graceful_shutdown_timeout=llm.args.
+                    serve_graceful_shutdown_timeout_s)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -837,7 +949,7 @@ def launch_mm_encoder_server(
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
-):
+) -> None:
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
@@ -848,7 +960,9 @@ def launch_mm_encoder_server(
         server_role=ServerRole.MM_ENCODER,
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
-        allow_request_chat_template=allow_request_chat_template)
+        allow_request_chat_template=allow_request_chat_template,
+        graceful_shutdown_timeout=mm_encoder.args.
+        serve_graceful_shutdown_timeout_s)
     uvloop.run(server(host, port))
 
 
@@ -933,7 +1047,7 @@ def launch_embedding_server(
     max_queue_delay: float,
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
-):
+) -> None:
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     # encode_only is forced on below; drop any value coming from --config to avoid
@@ -963,13 +1077,15 @@ def launch_embedding_server(
     # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
     llm = PyTorchLLM(encode_only=True, **llm_args)
 
-    server = OpenAIServer(generator=llm,
-                          model=model,
-                          server_role=ServerRole.EMBEDDING,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None,
-                          embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size)
+    server = OpenAIServer(
+        generator=llm,
+        model=model,
+        server_role=ServerRole.EMBEDDING,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        embedding_max_queue_delay=max_queue_delay,
+        embedding_max_queue_size=max_queue_size,
+        graceful_shutdown_timeout=llm.args.serve_graceful_shutdown_timeout_s)
     asyncio.run(server(host, port))
 
 
@@ -1776,6 +1892,7 @@ def serve(
 
                 from tensorrt_llm.grpc.smg.server import launch_smg_server
 
+                _check_context_only_settings(llm_args, warn=True)
                 launch_smg_server(host,
                                   port,
                                   llm_args,
@@ -1793,6 +1910,8 @@ def serve(
 
                 grpc_multi_frontend = _init_multi_frontend_mode(llm_args,
                                                                 enabled=True)
+                _check_context_only_settings(
+                    llm_args, warn=not grpc_multi_frontend.is_attached_frontend)
                 with _provision_kv_cache_pool(
                         llm_args,
                         owns_engine=not grpc_multi_frontend.is_attached_frontend
@@ -2737,6 +2856,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             "remove num_serve_frontends and serve_frontend_affinity_port_stride "
             "from context_servers, or launch the context servers with trtllm-serve."
         )
+    _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
@@ -2864,8 +2984,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
     # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
-    role_map = {"ctx": "context", "gen": "generation"}
-    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = _DISAGG_SERVER_ROLES.get(
         server_cfg.type, "")
 
     logger.info(

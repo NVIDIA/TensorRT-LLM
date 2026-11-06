@@ -23,7 +23,8 @@ from tensorrt_llm._torch.weight_sharing import (
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -58,6 +59,7 @@ from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
 from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
@@ -121,6 +123,22 @@ _MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     rope_types=frozenset({"mrope"}),
     rope_fusion=frozenset({False}),
+)
+# Qwen3 MoE fuses RoPE into the QK-norm kernel, as Qwen3 does, and pins the
+# configured MoE backend and the routed-expert partition. The routed-expert
+# layout differs per MoE implementation, so the pinned backend and
+# quantization must select exactly one implementation on every SM and admitted
+# partition: `CUTLASS` with unquantized weights is the
+# `trtllm.cutlass.grouped_gemm.none` leaf. With TP <= 2, MoE TP x MoE EP x MoE
+# cluster == TP admits only the pure MoE-TP and MoE-EP partitions; wider TP
+# needs a joint partition constraint.
+_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_fusion=frozenset({False}),
+    moe_backends=frozenset({"CUTLASS"}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1, 2}),
+    moe_cluster_sizes=frozenset({1}),
 )
 
 # TorchLlmArgs fields that only the model classes listing them in
@@ -750,6 +768,32 @@ def _check_compile_wrapper_before_reload(model: torch.nn.Module) -> None:
         _assert_no_compile_wrapper_in_paths(model)
 
 
+def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
+    """Refuse to rewrite the weights of a model that dense DWDP sharded.
+
+    Dense DWDP repoints the dense weights of the MoE decoder layers into staging
+    slots that several layers share and that the next gather overwrites, so
+    weights written through the modules would be lost. Its setup marks the
+    model and its decoder with ``_dense_dwdp_active``; the mark stays after the
+    dense DWDP teardown, which leaves zero-size tensors behind.
+
+    Args:
+        model: The model about to be updated.
+        action: What the caller was about to do, for the error message.
+
+    Raises:
+        RuntimeError: The model or its decoder (``model.model``) is marked.
+    """
+    decoder = getattr(model, "model", None)
+    if getattr(model, "_dense_dwdp_active", False) or getattr(
+            decoder, "_dense_dwdp_active", False):
+        raise RuntimeError(
+            f"Cannot {action}: dense DWDP (dwdp_config.enable_dense) moved "
+            "this model's dense weights into staging slots shared across "
+            "layers, so they cannot be rewritten in place. Launch without "
+            "dwdp_config.enable_dense to update weights.")
+
+
 class ModelLoaderMetricNames(Enum):
     TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
     CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
@@ -871,6 +915,19 @@ class ModelLoader:
             transform_abi_id=QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
             transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
             runtime_constraints=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3-moe-for-causal-lm-bf16-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_moe",
+                "Qwen3MoeForCausalLM"),
+            architecture="Qwen3MoeForCausalLM",
+            model_type="qwen3_moe",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
         ),
     ))
 
@@ -1699,21 +1756,11 @@ class ModelLoader:
             )
             return True
 
-        unsupported_features = ",".join(
-            sorted(feature.value
-                   for feature in qualification.unsupported_features))
-        feature_detail = (f"; unsupported_features={unsupported_features}"
-                          if unsupported_features else "")
-        unsupported_runtime_dimensions = ",".join(
-            sorted(qualification.unsupported_runtime_dimensions))
-        runtime_detail = (
-            f"; unsupported_runtime_dimensions={unsupported_runtime_dimensions}"
-            if unsupported_runtime_dimensions else "")
         raise RuntimeError(
             f"MX receiver got post-transform weights for {type(model).__name__}, "
             "but the load does not match a qualified staged post-load profile "
             f"for protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}: "
-            f"reason={qualification.reason.value}{feature_detail}{runtime_detail}. "
+            f"{qualification.describe()}. "
             "Refusing to run the full post-load path on already-transformed "
             "weights.")
 
@@ -1829,6 +1876,16 @@ class ModelLoader:
         if getattr(locality_domain_policy, "enabled", False):
             enabled_features.add(
                 PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
+        # The realized balancer, not the configured one, decides the expert
+        # slot layout: MoE layers create it only when EPLB actually applies.
+        # Both gates read their state directly, so a renamed attribute fails
+        # the load instead of silently reporting the feature as off.
+        if any(
+                is_moe_weight_owner(module) and module._using_load_balancer()
+                for module in model.modules()):
+            enabled_features.add(PostTransformFeature.MOE_LOAD_BALANCER)
+        if model.model_config.mapping.dwdp_enabled:
+            enabled_features.add(PostTransformFeature.DWDP)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
@@ -1881,13 +1938,9 @@ class ModelLoader:
         if checkpoint_loader.checkpoint_format == "MX":
             if not qualification.qualified:
                 if not weights_preloaded:
-                    unsupported_runtime_dimensions = ",".join(
-                        sorted(qualification.unsupported_runtime_dimensions))
                     logger.info("Skipping MX post-transform publish for "
                                 f"{type(model).__name__}: qualification "
-                                f"reason={qualification.reason.value}, "
-                                "unsupported_runtime_dimensions="
-                                f"{unsupported_runtime_dimensions or 'none'}.")
+                                f"{qualification.describe()}.")
                 return
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)
@@ -2038,7 +2091,12 @@ class ModelLoader:
 
         Returns:
             None.
+
+        Raises:
+            RuntimeError: Dense DWDP sharded the model's dense weights, or the
+                weight mapper was not initialized.
         """
+        _reject_dense_dwdp_update(model, "reload weights")
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot reload weights: weight_mapper was not initialized. "
@@ -2055,10 +2113,16 @@ class ModelLoader:
             torch.cuda.current_stream().synchronize()
 
     def begin_update_weights(self) -> None:
-        """Start an incremental update session on the persistent mapper."""
+        """Start an incremental update session on the persistent mapper.
+
+        Raises:
+            RuntimeError: The weight mapper was not initialized, or dense DWDP
+                sharded the dense weights of the model it is bound to.
+        """
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot update weights: weight_mapper was not initialized")
+        _reject_dense_dwdp_update(self.weight_mapper.model, "update weights")
         self.weight_mapper.begin_update_weights()
 
     def finalize_update_weights(self) -> None:
