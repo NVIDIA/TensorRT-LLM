@@ -669,18 +669,22 @@ def _kpool_expand_kernel(
     base_row,
     rows_per_slot,
     out_width,
+    tail_extra,
     SELECT_K: tl.constexpr,
     KPOOL: tl.constexpr,
-    KPOOL_P2: tl.constexpr,
+    TAIL_P2: tl.constexpr,
     PAD_BLOCK: tl.constexpr,
     HAS_REQ: tl.constexpr,
 ):
     """Expand selected pools into latent-cache row ids and append the tail.
 
-    Output row ``b`` is ``[SELECT_K * KPOOL expanded members | KPOOL - 1 tail
-    positions | -1 padding]``; every invalid entry is ``-1`` (the FlashMLA
-    sparse kernel's own invalid marker). Row id of cache position ``p`` is
-    ``base_row + block_table[p // tpb] * rows_per_slot + p % tpb``.
+    Output row ``b`` is ``[SELECT_K * KPOOL expanded members | tail positions |
+    -1 padding]``; every invalid entry is ``-1`` (the FlashMLA sparse kernel's
+    own invalid marker). Row id of cache position ``p`` is
+    ``base_row + block_table[p // tpb] * rows_per_slot + p % tpb``. The tail is
+    every position from the start of the pool holding position
+    ``kv_len - 1 - tail_extra`` on: the incomplete trailing pool when
+    ``tail_extra`` is 0, plus the last ``tail_extra`` positions otherwise.
     """
     b = tl.program_id(0)
     if HAS_REQ:
@@ -694,7 +698,7 @@ def _kpool_expand_kernel(
     j = tl.load(SEL + b * sel_stride + i).to(tl.int64)
     # A radix top-k pads short rows with negative ids; those are invalid too.
     valid = (j >= 0) & (j < num_cand)
-    m = tl.arange(0, KPOOL_P2)
+    m = tl.arange(0, TAIL_P2)
     mmask = m < KPOOL
     pos = j[:, None] * KPOOL + m[None, :]
     page = pos // tpb
@@ -709,10 +713,11 @@ def _kpool_expand_kernel(
         mask=mmask[None, :] & (i[:, None] >= 0),
     )
 
-    # Tail: the incomplete trailing group, always visible to its own query.
-    tail_count = kv_len - num_cand * KPOOL
-    tail_start = kv_len - tail_count
-    t = tl.arange(0, KPOOL_P2)
+    # Tail: the incomplete trailing group (and the last tail_extra positions),
+    # always visible to its own query.
+    tail_start = (tl.maximum(kv_len - tail_extra, 0) // KPOOL) * KPOOL
+    tail_count = kv_len - tail_start
+    t = tl.arange(0, TAIL_P2)
     tpos = tail_start + t
     tvalid = t < tail_count
     tpage = tpos // tpb
@@ -723,7 +728,7 @@ def _kpool_expand_kernel(
     tl.store(OUT + b * out_width + tidx, trows.to(tl.int32), mask=tidx < out_width)
 
     # -1 padding up to the kernel-aligned width.
-    pad0 = SELECT_K * KPOOL + KPOOL_P2
+    pad0 = SELECT_K * KPOOL + TAIL_P2
     for start in range(pad0, out_width, PAD_BLOCK):
         p = start + tl.arange(0, PAD_BLOCK)
         tl.store(OUT + b * out_width + p, tl.full([PAD_BLOCK], -1, tl.int32), mask=p < out_width)
@@ -740,16 +745,22 @@ def kpool_expand(
     kpool: int,
     out_width: int,
     request_ids: torch.Tensor | None = None,
+    tail_extra: int = 0,
 ) -> torch.Tensor:
     """Selected pools ``[N, select_k]`` -> latent row ids ``[N, out_width]`` int32.
 
-    ``out_width`` must cover ``select_k * kpool + (kpool - 1)``; extra columns
-    are ``-1`` padding (FlashMLA tiles the top-k axis in 64s). ``request_ids``
-    (``[N]`` int32) maps rows to block-table rows as in :func:`kpool_score`.
+    ``out_width`` must cover ``select_k * kpool + (kpool - 1 + tail_extra)``;
+    extra columns are ``-1`` padding (FlashMLA tiles the top-k axis in 64s).
+    ``request_ids`` (``[N]`` int32) maps rows to block-table rows as in
+    :func:`kpool_score`. ``tail_extra``: the selection was made ``tail_extra``
+    positions ago (an MTP draft step reusing an earlier step's selection), so
+    the tail also covers the positions appended since, including any pool they
+    completed.
     """
     n, select_k = selected.shape
-    if out_width < select_k * kpool + kpool - 1:
-        raise ValueError(f"kpool_expand: out_width {out_width} < {select_k * kpool + kpool - 1}")
+    tail_width = kpool - 1 + tail_extra
+    if out_width < select_k * kpool + tail_width:
+        raise ValueError(f"kpool_expand: out_width {out_width} < {select_k * kpool + tail_width}")
     out = torch.empty(n, out_width, dtype=torch.int32, device=selected.device)
     if n == 0:
         return out
@@ -765,9 +776,10 @@ def kpool_expand(
         base_row,
         rows_per_slot,
         out_width,
+        tail_extra,
         SELECT_K=select_k,
         KPOOL=kpool,
-        KPOOL_P2=triton.next_power_of_2(kpool),
+        TAIL_P2=triton.next_power_of_2(tail_width + 1),
         PAD_BLOCK=64,
         HAS_REQ=request_ids is not None,
         num_warps=4,
