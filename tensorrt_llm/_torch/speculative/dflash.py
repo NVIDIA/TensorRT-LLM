@@ -698,9 +698,16 @@ class DFlashSpecMetadata(SpecMetadata):
             worker._write_ctx_len(updates, bases)
 
             # Route unknown request IDs (cuda graph padding or warmup dummies)
-            # to dummy slot to avoid corrupting real request's context
+            # to dummy slot to avoid corrupting real request's context. A
+            # generation row with the idle id is a dummy even when a context
+            # warmup stored a prompt under that id: its length is not this row's.
             mapping = torch.tensor(
-                [worker._req_to_slot.get(rid, worker._dummy_slot) for rid in self.request_ids],
+                [
+                    worker._dummy_slot
+                    if i >= num_contexts and rid == ATTENTION_DP_DUMMY_REQUEST_ID
+                    else worker._req_to_slot.get(rid, worker._dummy_slot)
+                    for i, rid in enumerate(self.request_ids)
+                ],
                 dtype=torch.long,
             )
             worker._batch_to_slot_buffer.update(mapping)
@@ -784,6 +791,27 @@ class VocabParallelSelection:
     # :meth:`DFlashWorker.bind_draft_lm_head` after loading, once the drafter
     # has taken over the target's head.
     draft_tokens: Optional[VocabParallelDraftTokens] = None
+
+
+def check_draft_logits_processor(draft_model) -> None:
+    """Require the plain logits processor on a drafter that declares a logit transform.
+
+    The worker applies the transform a drafter's `dflash_config` declares to
+    the logits of the drafter's own processor, so that processor must be the
+    plain `LogitsProcessor`. One that transforms the logits itself, such as a
+    target's, would get the transform a second time.
+    """
+    declares = (
+        getattr(draft_model, "logit_multiplier", 1.0) != 1.0
+        or getattr(draft_model, "logit_softcap", None) is not None
+    )
+    processor = getattr(draft_model, "logits_processor", None)
+    if declares and type(processor) is not LogitsProcessor:
+        raise RuntimeError(
+            "The DFlash drafter declares a logit transform (output_multiplier "
+            f"{draft_model.logit_multiplier}, final_logit_softcapping {draft_model.logit_softcap}), "
+            f"which assumes the plain LogitsProcessor; got {type(processor).__name__}"
+        )
 
 
 class DFlashWorker(SpecWorkerBase):
@@ -1049,7 +1077,9 @@ class DFlashWorker(SpecWorkerBase):
         if target_model is not None:
             self.bind_target_lm_head(target_model.lm_head, target_model.logits_processor)
         if self._draft_model_ref is not None:
-            self.bind_draft_lm_head(self._draft_model_ref())
+            draft_model = self._draft_model_ref()
+            check_draft_logits_processor(draft_model)
+            self.bind_draft_lm_head(draft_model)
 
     def post_load_weights(self) -> None:
         self.setup_aliases()
@@ -1238,26 +1268,28 @@ class DFlashWorker(SpecWorkerBase):
         if isinstance(mgr, KVCacheManagerV2):
             converter = mgr.impl.get_page_index_converter(layer_offset, Role.KEY)
             layer_group_id = mgr.layer_to_pool_mapping_dict[layer_offset]
+            unsupported = None
             if mgr.enable_swa_scratch_reuse:
-                raise NotImplementedError(
-                    "DFlash managed context does not support SWA scratch pages"
-                )
+                unsupported = "DFlash managed context does not support SWA scratch pages"
             for layer_id in self._ctx_layer_ids:
                 local_id = mgr.layer_offsets[layer_id]
                 if (
                     mgr.layer_to_pool_mapping_dict[local_id] != layer_group_id
                     or mgr.get_layer_page_index_scale(layer_id) != converter.scale
                 ):
-                    if self._ctx_unified_cache:
-                        raise NotImplementedError(
-                            "DFlash's shared context block table requires draft layers "
-                            "with the same lifecycle and page-index scale"
-                        )
-                    logger.warning(
-                        "DFlash: draft KV layers have different lifecycles or page-index "
-                        "scales; using the private ctx arena."
+                    unsupported = (
+                        "DFlash's shared context block table requires draft layers "
+                        "with the same lifecycle and page-index scale"
                     )
-                    return False
+                    break
+            if unsupported is not None:
+                # A unified manager was selected for this layout, so the drafter
+                # cannot move to private storage without breaking allocation,
+                # reuse and transfer. A separate manager keeps the private arena.
+                if self._ctx_unified_cache:
+                    raise NotImplementedError(unsupported)
+                logger.warning(f"{unsupported}; using the private ctx arena.")
+                return False
             if per_layer_tables:
                 # Attention tables address the physical pool origin, whereas
                 # get_buffers() starts at this layer's own K buffer.
@@ -1311,6 +1343,23 @@ class DFlashWorker(SpecWorkerBase):
             f"view_pages={pool[0].size(0)}"
         )
         return True
+
+    @staticmethod
+    def _check_block_within_allocation(
+        num_ctx: torch.Tensor, allocated_ctx_limit: torch.Tensor, block_size: int
+    ) -> None:
+        """Raise when a request's drafter block would leave its allocated pages.
+
+        The shared manager sizes the request, so a shortfall there would have the
+        block's scratch write land on the last context position, or on another
+        request's page. Asynchronous, so it adds no host sync and is safe to
+        capture in a CUDA graph; on the device it traps instead of raising.
+        """
+        torch._assert_async(
+            (num_ctx <= allocated_ctx_limit).all(),
+            f"DFlash: the drafter's block of {block_size} positions falls outside the "
+            "pages the shared KV cache manager allocated for the request",
+        )
 
     def _refresh_ctx_block_tables(self, attn_metadata, num_seqs: int) -> bool:
         """Decode this iteration's draft block table into the persistent buffer.
@@ -1376,6 +1425,28 @@ class DFlashWorker(SpecWorkerBase):
             # Holding the old pool's tensors across that writes freed memory.
             logger.info("DFlash: draft KV cache manager replaced, rebinding the ctx cache.")
             self._ctx_buf_inited = False
+
+        # checkpoint's trained block width
+        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
+            self.max_draft_len + 1
+        )
+        # what the draft forward actually computes
+        self._compute_block_size = self._draft_block_width(draft_model)
+        if self._compute_block_size > self._resolved_block_size:
+            slack = self._compute_block_size - self.max_draft_len
+            raise ValueError(
+                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
+                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
+                f"Current max_draft_len={self.max_draft_len}."
+            )
+        if self._ctx_unified_cache:
+            reserved = getattr(draft_kv_cache_manager, "_shared_draft_block_width", 0)
+            if self._compute_block_size > reserved:
+                raise ValueError(
+                    f"Drafter block width {self._compute_block_size} exceeds the "
+                    f"{reserved} positions reserved by the shared KV cache manager. "
+                    "The manager must reserve the drafter's resolved block width."
+                )
 
         # Recorded even when the buffers stay private, so that the estimation
         # pass falling back to the arena still rebinds once the real pool lands.
@@ -1448,20 +1519,6 @@ class DFlashWorker(SpecWorkerBase):
         self._free_slots = deque(range(max_batch))
         self._req_to_slot = {}
         self._req_ctx_pos = {}
-
-        # checkpoint's trained block width
-        self._resolved_block_size = getattr(draft_model, "block_size", None) or (
-            self.max_draft_len + 1
-        )
-        # what the draft forward actually computes
-        self._compute_block_size = self._draft_block_width(draft_model)
-        if self._compute_block_size > self._resolved_block_size:
-            slack = self._compute_block_size - self.max_draft_len
-            raise ValueError(
-                f"DFlash checkpoint was trained with block_size={self._resolved_block_size}."
-                f"Lower max_draft_len to at most {self._resolved_block_size - slack}."
-                f"Current max_draft_len={self.max_draft_len}."
-            )
 
         # +block_size slack lets each backend append the per-iteration noise
         # K/V after the accumulated request context.
@@ -1886,7 +1943,12 @@ class DFlashWorker(SpecWorkerBase):
         is_capturing = torch.cuda.is_current_stream_capturing()
 
         if spec_metadata.is_cuda_graph and not is_capturing:
-            attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda", "kv_lens_cuda")
+            # Only TRTLLM attention metadata keeps device-side KV lengths; on
+            # other backends (FlashInfer) there is nothing to save.
+            fields = ["_seq_lens", "_seq_lens_cuda"]
+            if hasattr(attn_metadata, "kv_lens_cuda"):
+                fields.append("kv_lens_cuda")
+            attn_metadata.prepare_for_spec_dec(*fields)
         else:
             attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
 
@@ -2358,6 +2420,11 @@ class DFlashWorker(SpecWorkerBase):
                     gen_logits = draft_model.logits_processor(
                         gen_hidden_states, draft_model.lm_head, attn_metadata, True
                     )
+                    # The drafter shares the target's LM head but not its logits
+                    # processor, so apply the transform its config declares,
+                    # before any refinement: a DSpark Markov bias is added to
+                    # the transformed logits.
+                    gen_logits = draft_model.apply_draft_logit_transform(gen_logits)
 
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
@@ -2448,7 +2515,12 @@ class DFlashWorker(SpecWorkerBase):
         this alongside :meth:`_draft_slot_ids` — the two must agree, since
         the width bounds the slots the gather is allowed to name.
         """
-        return self.max_draft_len + 1
+        return self.block_width_for(self.spec_config)
+
+    @staticmethod
+    def block_width_for(spec_config) -> int:
+        """Block slots a worker of this family computes for ``spec_config``."""
+        return spec_config.max_draft_len + 1
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -2828,6 +2900,10 @@ class DFlashWorker(SpecWorkerBase):
                 allocated = dflash_allocated_ctx_limit(
                     self._ctx_block_counts, self._ctx_page_size, block_size
                 )
+                if self._ctx_unified_cache:
+                    self._check_block_within_allocation(
+                        num_ctx_per_req_t, allocated[gen_rows_out], block_size
+                    )
                 num_ctx_per_req_t = torch.minimum(num_ctx_per_req_t, allocated[gen_rows_out])
                 # Pages below a slot's base hold no drafter K/V: the read
                 # numbers from the base instead (dflash_rebased_ctx_view).
@@ -2888,6 +2964,9 @@ class DFlashWorker(SpecWorkerBase):
         features, drafting from all ``K + 1`` target tokens."""
         return (
             self._paged_latent_prepare
+            # Shared allocations require the generic path's strict capacity
+            # check; the fused preparation silently caps the context length.
+            and not self._ctx_unified_cache
             and spec_metadata.runtime_draft_len + 1 == self._draft_tokens_per_req
             and spec_metadata.captured_hidden_states is not None
         )

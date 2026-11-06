@@ -18,6 +18,7 @@ l0_b200:
   tests:
   # ------------- CPP tests ---------------
   - cpp/test_unit_tests.py::test_kv_cache_compression_unit_tests[100]
+  - cpp/test_unit_tests.py::test_fmha_head104_unit_tests[100]
 - condition:
     ranges:
       system_gpu_count:
@@ -33,6 +34,8 @@ l0_b200:
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
+  - unittest/_torch/models/test_qwen3_5_int4_loading.py
+  - unittest/_torch/modules/test_linear_uneven_tp.py::TestW4A16AWQMLP::test_optional_pre_quant_scale
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[False]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_v2_decode_beyond_encoder_length[True]
   - llmapi/test_llm_api_pytorch_t5.py::test_t5_pytorch_block_reuse_is_disabled_for_v2
@@ -179,6 +182,8 @@ l0_b200:
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_op.py
   - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_rmsnorm_op.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/modeling_v2/norm/test_modeling_v2_flashinfer_rmsnorm.py
   - unittest/_torch/modeling_v2/gemm/test_modeling_v2_cublas_mm.py
   # KDA runtime state-pool and mixed-batch core coverage.
@@ -190,8 +195,12 @@ l0_b200:
   - unittest/_torch/moe/test_kimi_k3_mlp.py
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py
   - unittest/_torch/moe/test_workspace_cuda.py
+  # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
+  - unittest/_torch/moe/test_kimi_k3_route_sort.py
+  - unittest/_torch/moe/test_moe_sorted_routing.py
   - unittest/_torch/modeling/test_kimi_k3_config_routing.py
   - unittest/_torch/modeling/test_kimi_linear_checkpoint.py
+  - unittest/_torch/modeling/test_kimi_k3_moe_front.py
   # CPU self-test of the Kimi K3 disagg parity harness comparison logic.
   - test_kimi_k3_specdec.py::test_kimi_k3_disagg_parity_selftest
   # ------------- modules (non-MoE) ---------------
@@ -219,6 +228,10 @@ l0_b200:
   # DWDP expert prefetch on real streams and copies; the peer-GPU gather
   # cases skip below 2 GPUs.
   - unittest/_torch/modules/dwdp/test_dwdp_prefetch_gpu.py
+  # Attached dense DWDP beside the expert prefetch on real streams and copies.
+  - unittest/_torch/modules/dwdp/test_dense_attached_gpu.py
+  # Real ConfigurableMoE layers sized and registered for DWDP while the model is built.
+  - unittest/_torch/modules/dwdp/test_dwdp_moe_construction_gpu.py
   # ------------- MoE components tests ---------------
   - unittest/_torch/moe/fused_moe/test_cutedsl_fc2_tuning.py
   - unittest/_torch/moe/test_cutedsl_fc1_weight_layout.py
@@ -231,6 +244,7 @@ l0_b200:
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_routing_round_trip
   - unittest/_torch/moe/test_moe_backend.py::test_cutlass_moe_public_activation_ids
   - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_fused_route_quant_matches_unfused_chain
+  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_fused_route_quant_skips_prequantized_input
   - unittest/_torch/moe/test_moe_backend.py::test_kimi_mxfp8_quantized_tensor_handoff
   - unittest/_torch/moe/test_megamoe_streaming_load.py
@@ -338,6 +352,7 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/modeling/test_modeling_afmoe.py
+  - unittest/_torch/modeling/test_modeling_deepseekv41_multimodal.py
   - unittest/_torch/modeling/test_modeling_exaone_moe.py
   - unittest/_torch/modeling/test_modeling_gemma4.py
   - unittest/_torch/modeling/test_modeling_gemma4_unified.py
