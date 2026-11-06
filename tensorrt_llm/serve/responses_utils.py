@@ -4,6 +4,7 @@
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -3308,8 +3309,35 @@ async def guard_responses_stream(
 # sent again. Clients and proxies cut a stream that sends nothing for long
 # enough, and a stream is silent until its first token (queueing and prefill)
 # and for as long as the model writes a tool call, which is sent only once
-# complete.
+# complete. TRTLLM_RESPONSES_STREAM_KEEPALIVE_S overrides it for a deployment;
+# 0 turns the keepalive off.
 RESPONSES_STREAM_KEEPALIVE_INTERVAL_S = 15.0
+RESPONSES_STREAM_KEEPALIVE_ENV = "TRTLLM_RESPONSES_STREAM_KEEPALIVE_S"
+
+
+def responses_stream_keepalive_interval() -> float:
+    """Seconds a stream may stay silent before a keepalive is sent; 0 means never.
+
+    ``TRTLLM_RESPONSES_STREAM_KEEPALIVE_S`` when it is set, else
+    ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S``. Zero or a negative value turns
+    the keepalive off. A value that is not a finite number is reported once
+    and the default kept.
+    """
+    raw = os.environ.get(RESPONSES_STREAM_KEEPALIVE_ENV, "").strip()
+    if not raw:
+        return RESPONSES_STREAM_KEEPALIVE_INTERVAL_S
+    try:
+        interval = float(raw)
+    except ValueError:
+        interval = math.nan
+    if not math.isfinite(interval):
+        logger.warning_once(
+            f"{RESPONSES_STREAM_KEEPALIVE_ENV}={raw!r} is not a finite number "
+            f"of seconds; keeping {RESPONSES_STREAM_KEEPALIVE_INTERVAL_S:g} s.",
+            key="responses_stream_keepalive_env")
+        return RESPONSES_STREAM_KEEPALIVE_INTERVAL_S
+    return max(interval, 0.0)
+
 
 _IN_PROGRESS_FRAME_START = "event: response.in_progress\n"
 # The response is over once one of these has gone out.
@@ -3368,7 +3396,8 @@ async def _with_ticks(
         timeout: Callable[[], Optional[float]]) -> AsyncGenerator[Any, None]:
     """Yield the items of ``source``, and None each time ``timeout()`` seconds pass first.
 
-    ``timeout()`` is asked before every wait; None waits for the next item. One
+    ``timeout()`` is asked before every wait; None waits for the next item. An
+    item that is already waiting is yielded before a tick that is due. One
     task reads ``source`` to its end, so a tick never interrupts a read and the
     source is never resumed from another task; that task is cancelled, and the
     source closed, when the consumer stops.
@@ -3401,11 +3430,16 @@ async def _with_ticks(
     reader = asyncio.create_task(read_all())
     try:
         while True:
-            try:
-                item = await asyncio.wait_for(items.get(), timeout())
-            except asyncio.TimeoutError:
-                yield None
-                continue
+            if not items.empty():
+                # An item already waiting goes out before a tick that is due:
+                # wait_for(..., 0) cancels the get before it can run.
+                item = items.get_nowait()
+            else:
+                try:
+                    item = await asyncio.wait_for(items.get(), timeout())
+                except asyncio.TimeoutError:
+                    yield None
+                    continue
             if item is end:
                 # Raises what reading the source raised.
                 await reader
@@ -3443,9 +3477,10 @@ async def keep_responses_stream_alive(
     ``frames`` yields one SSE event per item, numbered from 0, the first two
     being ``response.created`` and ``response.in_progress``. Until the response
     ends, the ``response.in_progress`` event is sent again whenever no event has
-    gone out for ``RESPONSES_STREAM_KEEPALIVE_INTERVAL_S`` seconds, before the
-    first token too. It is part of the stream format and carries the same
-    response as at the start, which clients already hold.
+    gone out for the keepalive interval (``responses_stream_keepalive_interval``,
+    read when the stream starts; 0 turns the keepalive off), before the first
+    token too. It is part of the stream format and carries the same response
+    as at the start, which clients already hold.
 
     Events are numbered here, where they leave the server. The processor that
     makes them cannot do it: postprocess workers each format events with their
@@ -3454,6 +3489,7 @@ async def keep_responses_stream_alive(
     after it is renumbered to its place in the stream. Until then each event
     already carries its place and goes out as it came.
     """
+    interval = responses_stream_keepalive_interval()
     in_progress: Optional[str] = None
     ended = False
     renumber = False
@@ -3462,11 +3498,9 @@ async def keep_responses_stream_alive(
     last_sent = loop.time()
 
     def until_keepalive() -> Optional[float]:
-        if in_progress is None or ended:
+        if in_progress is None or ended or interval <= 0:
             return None
-        return max(
-            0.0,
-            RESPONSES_STREAM_KEEPALIVE_INTERVAL_S - (loop.time() - last_sent))
+        return max(0.0, interval - (loop.time() - last_sent))
 
     items = _with_ticks(frames, until_keepalive)
     try:
