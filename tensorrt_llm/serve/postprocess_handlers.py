@@ -14,8 +14,10 @@
 # limitations under the License.
 import json
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, List, Literal, Optional, Tuple, Union
+from typing import (Any, Awaitable, Callable, List, Literal, Optional, Tuple,
+                    Union)
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.responses_utils import ResponsesStreamingProcessor
@@ -25,7 +27,7 @@ from tensorrt_llm.serve.responses_utils import \
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
-from ..executor.postproc_worker import PostprocArgs
+from ..executor.postproc_worker import PostprocArgs, PostprocParams
 from ..executor.result import Logprob, TokenLogprobs
 from ..llmapi import SamplingParams
 from ..llmapi.disagg_utils import (get_usage_tokens_from_ctx,
@@ -1151,3 +1153,53 @@ def responses_api_streaming_post_processor(
             args.streaming_processor.get_final_response_non_store(
                 rsp, args.usage_num_prompt_tokens(), tokenizer=args.tokenizer))
     return outputs
+
+
+class PostprocStrategy(ABC):
+    """How a handler gets the post-processed result of one engine response.
+
+    A server chooses one strategy at construction from
+    num_postprocess_workers. WorkerPostprocStrategy: a postproc worker
+    already ran the post-processor and the frontend stored its return value
+    on outputs[0]. InlinePostprocStrategy: run the post-processor in the
+    server process.
+
+    With n > 1 the two are not equivalent in what the frontend records: in
+    worker mode only outputs[0] carries the result and the metrics arrive
+    merged, while inline mode records metrics per candidate. That difference
+    is known and deliberately not changed here.
+    """
+
+    @abstractmethod
+    def apply(self, result: GenerationResultBase,
+              postproc_params: Optional[PostprocParams]) -> Any:
+        """Return the post-processed value for one engine response."""
+
+    @abstractmethod
+    async def apply_async(self, result: GenerationResultBase,
+                          inline: Callable[[], Awaitable[Any]]) -> Any:
+        """Like apply, for in-server post-processing that is a coroutine."""
+
+
+class WorkerPostprocStrategy(PostprocStrategy):
+
+    def apply(self, result, postproc_params):
+        return result.outputs[0].postprocess_result
+
+    async def apply_async(self, result, inline):
+        return result.outputs[0].postprocess_result
+
+
+class InlinePostprocStrategy(PostprocStrategy):
+
+    def apply(self, result, postproc_params):
+        return postproc_params.post_processor(result,
+                                              postproc_params.postproc_args)
+
+    async def apply_async(self, result, inline):
+        return await inline()
+
+
+def select_postproc_strategy(postproc_worker_enabled: bool) -> PostprocStrategy:
+    return (WorkerPostprocStrategy()
+            if postproc_worker_enabled else InlinePostprocStrategy())
