@@ -1724,7 +1724,9 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            withEnv(["TRTLLM_CI_RUNTIME_IMAGE=${LLM_DOCKER_IMAGE}"]) {
+                executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            }
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -2624,6 +2626,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 envVarNames.each { varName ->
                     envVarsToExport[varName] = env."${varName}"
                 }
+                // Original OCI/base reference; derived .sqsh identity is not captured.
+                envVarsToExport['TRTLLM_CI_RUNTIME_IMAGE'] = LLM_DOCKER_IMAGE
 
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
@@ -4618,6 +4622,8 @@ ${scratchUnreachableNodeAffinity}
                       valueFrom:
                         fieldRef:
                           fieldPath: spec.nodeName
+                    - name: TRTLLM_CI_RUNTIME_IMAGE
+                      value: "${image}"
                     ${extraDeviceEnv}
                   ${serviceContainerConfig}
                   - name: jnlp
