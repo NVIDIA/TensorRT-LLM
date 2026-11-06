@@ -7,7 +7,8 @@ modeling_v2 package's test tree (:data:`PACKAGE_TESTS`), through the run's test
 results (``checks/test_results.py``), which hold at the exact commit they ran at:
 
 1. at the commit the checkout is at (the head), every test file with no result
-   there yet, in a read-only snapshot of the head (:func:`record_at`);
+   there yet, in a read-only snapshot of the head (:func:`record_at`), less the
+   tests that already fail at the base: none of those can regress;
 2. at the commit the last check cleared, else the run's starting commit (the
    base), the tests that fail at the head and have no result there;
 3. the results at the head against those at the base.
@@ -42,7 +43,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Sequence
+from typing import Any, Callable, Collection, ContextManager, Sequence
 
 from ...checks import test_results
 from ...infra.compute.commands import CommandSpec
@@ -219,11 +220,13 @@ def record_at(
     tree_at: TreeAt,
     run_job: RunJob,
     python: str,
+    leave_out: Callable[[str], Collection[str]] | None = None,
 ) -> tuple[test_results.Results, int, int, str]:
     """Probe the current environment, then run missing ``files`` at ``commit``.
 
     The probe is one short job (:data:`PROBE_TIMEOUT_S`); the test jobs, as many as
     :data:`TEST_BUDGET_S` holds at the runner's job size (:func:`_run_unrun`).
+    ``leave_out`` names, given the probed environment's digest, the node ids not to run.
     Returns results, test jobs run, and the last job's exit code and output tail.
     A failed probe returns empty results, never historical results.
     """
@@ -242,6 +245,7 @@ def record_at(
         tree_at=tree_at,
         run_job=run_job,
         python=python,
+        skip=leave_out(match.group(1)) if leave_out is not None else (),
     )
 
 
@@ -255,23 +259,31 @@ def _run_unrun(
     tree_at: TreeAt,
     run_job: RunJob,
     python: str,
+    skip: Collection[str] = (),
 ) -> tuple[test_results.Results, int, int, str]:
     """Run the ``items`` (test files, node ids) with no result at ``commit`` in ``env_digest``.
 
     A job at a time, each resuming from what the last recorded, while one makes progress and
-    :func:`max_jobs` of the runner's job size are not spent. Returns what :func:`record_at` does.
+    :func:`max_jobs` of the runner's job size are not spent. The node ids in ``skip`` are left
+    out and not waited for. Returns what :func:`record_at` does.
     """
     allowed = max_jobs(getattr(run_job, "timeout_s", JOB_TIMEOUT_S))
     results = test_results.recorded(cache_dir, commit, env_digest)
-    unrun = results.unrun(items)
+    unrun = results.unrun(items, skip)
+    skipped = (
+        test_results.write_selection(out / f"{commit[:12]}.skip.txt", sorted(skip))
+        if skip
+        else None
+    )
     jobs, code, tail = 0, 0, ""
     while unrun and jobs < allowed:
         listed = test_results.write_selection(out / f"{commit[:12]}.txt", unrun)
         with tree_at(commit) as tree:
-            code, tail = run_job(test_results.driver_command(python, cache_dir, tree, listed), tree)
+            command = test_results.driver_command(python, cache_dir, tree, listed, skipped)
+            code, tail = run_job(command, tree)
         jobs += 1
         results = test_results.recorded(cache_dir, commit, env_digest)
-        left = results.unrun(items)
+        left = results.unrun(items, skip)
         if len(left) >= len(unrun):
             break
         unrun = left
@@ -541,7 +553,21 @@ def run_regression_check(
         roots=(MODELING_V2_PACKAGE, *paths),
     )
     selected = set(files)
-    results, ran, code, tail = record_at(head, files, **job)
+
+    def failing_at_base(env_digest: str) -> set[str]:
+        """The tests of ``files`` that failed at the base in ``env_digest``: none can regress."""
+        if base is None:
+            return set()
+        at_base = test_results.recorded(cache_dir, base, env_digest)
+        return {
+            nodeid
+            for nodeid, entry in at_base.tests.items()
+            if "::" in nodeid
+            and nodeid.partition("::")[0] in selected
+            and entry.get("outcome") in test_results.FAILING
+        }
+
+    results, ran, code, tail = record_at(head, files, leave_out=failing_at_base, **job)
     if files and not results.env_digest:
         # No session at the head: nothing the jobs ran can be read.
         failure = f"the test job recorded nothing (exit {code}): {tail[-500:]}"
@@ -570,6 +596,9 @@ def run_regression_check(
     failures += [
         f"{c.head.nodeid} (fails at the head; no result at the base)" for c in report.base_unknown
     ]
+    if report.failing_at_base:
+        left_out = f"{len(report.failing_at_base)} test(s) failing at the base not run"
+        scope = f"{scope}; {left_out}" if scope else left_out
     return RegressionResult(head, base, report.verdict, _named(failures), report.passed, ran, scope)
 
 

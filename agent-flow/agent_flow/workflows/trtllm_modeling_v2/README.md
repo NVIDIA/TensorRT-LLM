@@ -115,7 +115,8 @@ must change before that.
    target. Commits are audited and integrated; shared-code changes require regression coverage.
    A regression check runs only when no contract check runs or waits, and only on the test files
    the change can reach (those it changed, those importing a module it changed, the claims
-   gates; every file when it touches code the whole package shares). A kernel task on a shared
+   gates; every file when it touches code the whole package shares). A test that already fails
+   at the check's base cannot regress, so the head does not run it. A kernel task on a shared
    catalog entry lands a local variant in the target's own `ops/`, and the target is delivered
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.

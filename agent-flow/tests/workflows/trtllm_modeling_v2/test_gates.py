@@ -1665,6 +1665,29 @@ def test_environment_change_cannot_reuse_a_pass_and_probe_failure_is_incomplete(
 
 
 @_requires_git
+def test_a_test_that_fails_at_the_base_is_not_run_at_a_later_head(tmp_path):
+    """Kimi-K3's 4-GPU cases time out at the base too: each head paid 54 min for no signal."""
+    repo, workspace, base = _regression_repo(tmp_path)
+    cache = workspace / tc.CACHE_DIRNAME
+    _run(f"{sys.executable} {drv.__file__} run --cache {cache} --repo {repo} tests/test_broken.py "
+         "-- -q -p no:cacheprovider")  # fmt: skip
+    (repo / "pkg" / "mod.py").write_text(
+        "def f():\n    return 1  # same answer\n", encoding="utf-8"
+    )
+    _git(repo, "commit", "-qam", "shared change")
+    head = _git(repo, "rev-parse", "HEAD")
+
+    result, ran = _check(repo, workspace, head, tmp_path)
+
+    assert result.verdict == "CLEAN", result.failures
+    assert "1 test(s) failing at the base not run" in result.scope
+    at_head = tc.recorded(cache, head)
+    assert at_head.result("tests/test_a.py::test_f").outcome == "passed"
+    assert at_head.result("tests/test_broken.py::test_broken") is None
+    assert len(ran) == 2, "the probe and one test job at the head; nothing at the base"
+
+
+@_requires_git
 def test_a_change_reaches_the_tests_that_import_it_through_other_files(tmp_path):
     """``catalog/_op.py`` reaches a test through the entry that imports it, or the helper that does."""
     repo = tmp_path / "repo"
