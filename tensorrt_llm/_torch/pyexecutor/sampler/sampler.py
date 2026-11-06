@@ -36,6 +36,7 @@ from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import add_new_tokens_to_requests
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.executor.utils import context_length_exceeded_message
 from tensorrt_llm.logger import logger
 
 from ...utils import torch_multi_arange
@@ -79,7 +80,7 @@ from .sampler_features import (
     meet_stop_token_criteria,
     scatter_new_tokens,
 )
-from .sampling_resolution import SamplingMode, SlotSamplingParams
+from .sampling_resolution import SamplingMode, SlotSamplingParams, request_row_params
 from .seed_manager import _SeedManager
 from .token_ban import OverlappedTokenBanHandler, SynchronousTokenBanHandler, TokenBanHandler
 from .top_p_decay import TopPDecayHandler
@@ -118,6 +119,34 @@ class SampleState(Generic[GenericSampleStateTensorsHost, GenericSampleStateTenso
 
 # Generic bounds not supported, https://github.com/python/typing/issues/548
 GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)  # type: ignore
+
+# Model output keys of a forward that samples greedily in place of its LM head: per-row greedy token ids, and the
+# head's input rows so the logits can still be computed for a batch that needs them. Such a forward returns no
+# logits.
+GREEDY_TOKENS_KEY = "greedy_tokens"
+GREEDY_HIDDEN_STATES_KEY = "greedy_hidden_states"
+
+
+def greedy_tokens_usable(request: LlmRequest) -> bool:
+    """Whether a generation request is served by the forward's greedy token alone, without logits.
+
+    The request conditions of TorchSampler's stable greedy path, plus every other reader of the logits. A dummy
+    request is not usable: the stable greedy path takes no batch that carries one.
+    """
+    return not request.is_dummy and (
+        get_draft_token_length(request) == 0
+        and request.py_embedding_bias is None
+        and not getattr(request, "py_bad_words", None)
+        and not getattr(request, "py_no_repeat_ngram_size", None)
+        and not has_occurrence_penalty(request)
+        and not request.py_min_length
+        and not request.py_return_log_probs
+        and not request.py_return_generation_logits
+        and not request.py_logits_post_processors
+        and request.py_guided_decoding_params is None
+        and not check_stop_words_length(request)
+        and request_row_params(request).mode is SamplingMode.GREEDY
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -255,13 +284,34 @@ class Sampler(ABC, Generic[GenericSampleState]):
         """
 
 
+def _validate_single_forward_request(request: LlmRequest, max_num_tokens: Optional[int]) -> None:
+    """Reject a prompt that does not fit the one forward a non-generation request runs in."""
+    if max_num_tokens is not None and request.prompt_len > max_num_tokens:
+        raise ValueError(
+            context_length_exceeded_message(
+                max_context_length=max_num_tokens, num_prompt_tokens=request.prompt_len
+            )
+        )
+
+
 class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensors]]):
     """
     Use for skipping decoding step for non generation model,
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
+
+    Args:
+        max_num_tokens: The engine's token budget. A request runs whole in one
+            forward, so a prompt longer than this is rejected; None skips the check.
     """
 
     SampleState: TypeAlias = SampleState[SampleStateTensors, SampleStateTensors]
+
+    def __init__(self, max_num_tokens: Optional[int] = None) -> None:
+        self.max_num_tokens = max_num_tokens
+
+    @override
+    def validate_request(self, request: LlmRequest) -> None:
+        _validate_single_forward_request(request, self.max_num_tokens)
 
     @override
     def sample_async(
@@ -374,12 +424,21 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
             the frontend: the results are exported as CUDA IPC handles, and
             PyTorch keeps an exported allocation alive until a consumer opens
             and releases its handle.
+        max_num_tokens: The engine's token budget. A request runs whole in one
+            forward, so a prompt longer than this is rejected; None skips the check.
     """
 
     SampleState: TypeAlias = SampleStateWithMMResult
 
-    def __init__(self, return_mm_results: bool = True) -> None:
+    def __init__(
+        self, return_mm_results: bool = True, max_num_tokens: Optional[int] = None
+    ) -> None:
         self.return_mm_results = return_mm_results
+        self.max_num_tokens = max_num_tokens
+
+    @override
+    def validate_request(self, request: LlmRequest) -> None:
+        _validate_single_forward_request(request, self.max_num_tokens)
 
     @override
     def sample_async(
@@ -1391,7 +1450,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             return
 
         new_tokens = state.host.new_tokens
-        finish_reasons = state.host.finish_reasons_list()
         first_finish_reasons_host = state.host.first_finish_reasons
         if first_finish_reasons_host is not None:
             first_finish_reasons = first_finish_reasons_host.tolist()
@@ -1409,6 +1467,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         logprobs_state_list: LogProbsStateList | None = None
         if state.host.logprobs_state is not None:
             logprobs_state_list = LogProbsStateList.from_logprobs_state(state.host.logprobs_state)
+
+        # Beam-search requests read their finish reasons from
+        # first_finish_reasons; only single-beam requests (and the batched
+        # fast path below) consume the per-step finish_reasons list, whose
+        # conversion scales with max_num_sequences x max_beam_width.
+        finish_reasons: FinishReasonsList = []
+        if (self._batch_fastpath_eligible and logprobs_state_list is None) or any(
+            req.py_beam_width == 1 for req in state.requests
+        ):
+            finish_reasons = state.host.finish_reasons_list()
 
         beam_history_builders = state.beam_history_builders
         assert (beam_history_builders is not None) == self._use_beam_search
@@ -1502,9 +1570,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     # visible to streaming consumers and to anything reading
                     # get_tokens() mid-flight (e.g. the token-ban suffix
                     # matching) even though finalization later rewrites it.
-                    for beam_idx in range(_get_beam_width_out(req)):
-                        # Beam search does not support speculative decoding.
-                        add_token(req, new_tokens_list, beam_idx=beam_idx)
+                    beam_width_out = _get_beam_width_out(req)
+                    if beam_width_out == req.py_beam_width:
+                        # One binding call appends this step's token to every
+                        # beam; the C++ side requires exactly beam_width tokens.
+                        assert req.py_seq_slot is not None
+                        req.add_new_tokens(new_tokens_list[0][req.py_seq_slot][:beam_width_out])
+                    else:
+                        for beam_idx in range(beam_width_out):
+                            # Beam search does not support speculative decoding.
+                            add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self._log_probs.handle_logprobs(
                         req, logprobs_state_list=logprobs_state_list, count=1
                     )
@@ -1857,9 +1932,28 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batch_next_tokens_cuda_int = torch.empty(
             (logits_cuda.size(0), self.max_beam_width), device=cuda_device, dtype=token_dtype
         )
+        # Only processed logprobs need a full-vocabulary buffer. Raw logprobs
+        # are selected directly from logits; beam search uses its own history.
+        reqs_indices_needing_raw_logprobs: list[int] = []
+        reqs_indices_needing_raw_logits: list[int] = []
+        num_logprobs_rows = 0
+        if return_log_probs:
+            need_raw_logprobs = self._slot_params.need_raw_logprobs
+            need_processed_logprobs = self._slot_params.need_processed_logprobs
+            for req_idx, (request, slot, num_generated_tokens) in enumerate(
+                zip(requests, seq_slots_list, req_num_generated_tokens.tolist())
+            ):
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logprobs.append(req_idx)
+                if self._use_beam_search and request.py_beam_width != 1:
+                    continue
+                if need_raw_logprobs[slot]:
+                    reqs_indices_needing_raw_logits.append(req_idx)
+                if need_processed_logprobs[slot]:
+                    num_logprobs_rows += num_generated_tokens
         batch_processed_logprobs_cuda = (
-            torch.empty(  # NB: overprovisioning buffer for simplicity and later reuse in _process_logprobs
-                (logits_cuda.size(0), logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
+            torch.empty(
+                (num_logprobs_rows, logits_cuda.size(1)), device=cuda_device, dtype=torch.float32
             )
             if return_log_probs
             else None
@@ -2055,20 +2149,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # Prepare logit indices for raw logprobs; beam-search requests get theirs
         # from the beam history instead.
-        reqs_indices_needing_raw_logprobs: list[int] = []
         batch_raw_logprob_indices_cuda = None
-        if return_log_probs:
-            need_raw_logprobs = self._slot_params.need_raw_logprobs
-            reqs_indices_needing_raw_logprobs = [
-                req_idx
-                for req_idx, (request, slot) in enumerate(zip(requests, seq_slots_list))
-                if need_raw_logprobs[slot]
-                and (not self._use_beam_search or request.py_beam_width == 1)
-            ]
-            if reqs_indices_needing_raw_logprobs:
-                batch_raw_logprob_indices_cuda = logits_cuda_indexer[
-                    torch.tensor(reqs_indices_needing_raw_logprobs, dtype=torch.int64)
-                ].to(device=cuda_device, non_blocking=True)
+        if reqs_indices_needing_raw_logits:
+            batch_raw_logprob_indices_cuda = logits_cuda_indexer[
+                torch.tensor(reqs_indices_needing_raw_logits, dtype=torch.int64)
+            ].to(device=cuda_device, non_blocking=True)
 
         return _BatchedSamplingResult(
             req_indices=batch_req_indices,
@@ -2319,7 +2404,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         torch.Tensor,
         bool,
     ]:
-        raw_logits_cuda = model_outputs["logits"]
+        # A forward that sampled greedy tokens in place of the logits (GREEDY_TOKENS_KEY) may return no logits.
+        raw_logits_cuda: Optional[torch.Tensor] = model_outputs.get("logits")
+        greedy_tokens: Optional[torch.Tensor] = model_outputs.get(GREEDY_TOKENS_KEY)
+        if greedy_tokens is not None:
+            rows_cuda = greedy_tokens
+        elif raw_logits_cuda is not None:
+            rows_cuda = raw_logits_cuda
+        else:
+            raise RuntimeError("the forward returned neither logits nor greedy tokens")
 
         generation_requests = scheduled_requests.generation_requests
         request_ids = [request.py_request_id for request in generation_requests]
@@ -2332,7 +2425,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             bool(generation_requests)
             and self.max_beam_width == 1
             and scheduled_requests.num_context_requests == 0
-            and len(generation_requests) <= raw_logits_cuda.shape[0]
+            and len(generation_requests) <= rows_cuda.shape[0]
             and all(
                 not request.is_dummy and get_draft_token_length(request) == 0
                 for request in generation_requests
@@ -2369,6 +2462,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             live_requests = [request for request in generation_requests if not request.is_dummy]
             staged_matches_batch = (
                 self._in_graph_staged
+                # A forward that sampled greedily in place of its LM head skipped the
+                # in-graph sampling, so the staged buffers were never written.
+                and greedy_tokens is None
                 and self._in_graph_dest_indices is not None
                 and [request.py_request_id for request in live_requests]
                 == self._in_graph_request_ids
@@ -2458,12 +2554,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._stable_greedy_seq_slots_host = seq_slots_host
                 self._stable_greedy_seq_slots_cuda = seq_slots_cuda
 
-            next_tokens = fast_greedy_sample_kernel(
-                raw_logits_cuda[: len(generation_requests)],
-                new_tokens_cuda,
-                seq_slots_cuda,
-                self.max_beam_width,
-            )
+            if greedy_tokens is not None:
+                next_tokens = greedy_tokens[: len(generation_requests)].to(new_tokens_cuda.dtype)
+                scatter_new_tokens(
+                    next_tokens, new_tokens_cuda, seq_slots_cuda, self.max_beam_width
+                )
+            else:
+                # Without greedy tokens, rows_cuda is the logits.
+                assert raw_logits_cuda is not None
+                next_tokens = fast_greedy_sample_kernel(
+                    raw_logits_cuda[: len(generation_requests)],
+                    new_tokens_cuda,
+                    seq_slots_cuda,
+                    self.max_beam_width,
+                )
             new_tokens_host = self._copy_to_host(next_tokens)
             return (
                 generation_requests,
@@ -2478,6 +2582,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self._stable_greedy_request_ids = []
         self._stable_greedy_seq_slots = []
 
+        if raw_logits_cuda is None:
+            raise RuntimeError(
+                "the forward returned greedy tokens without logits for a batch that needs logits"
+            )
         sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
             scheduled_requests,
             raw_logits_cuda,

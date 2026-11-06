@@ -10,7 +10,7 @@ import os
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import nn
@@ -42,6 +42,7 @@ from tensorrt_llm.llmapi.llm_args import (
     ENCODER_RUNNER_MANAGED_INPUTS,
     EncodeCudaGraphConfig,
     EncodeExtraInputSpec,
+    TorchLlmArgs,
     validate_token_encoder_bucket_config,
 )
 from tensorrt_llm.logger import logger
@@ -61,7 +62,7 @@ from .interface import PackedInputs, PackedModelRunner, PreparedInputs, RunnerCo
 
 
 @dataclass(frozen=True, kw_only=True)
-class EncoderConfigMixin:
+class EncoderConfig(RunnerConfig):
     """Encoder-specific fields shared by runner configuration types."""
 
     enable_autotuner: bool
@@ -220,7 +221,7 @@ class EncoderConfigMixin:
 
 
 @dataclass(frozen=True)
-class EncoderRunnerConfig(EncoderConfigMixin, RunnerConfig):
+class EncoderRunnerConfig(EncoderConfig):
     """Configuration for the EncoderOnly model runner."""
 
     @classmethod
@@ -272,7 +273,7 @@ class EncoderMixin:
     def _initialize_encoder(
         self,
         model: nn.Module,
-        config: EncoderConfigMixin,
+        config: EncoderConfig,
         *,
         mapping: Mapping,
         dist: Distributed | None,
@@ -284,7 +285,7 @@ class EncoderMixin:
         self._dist = dist
         self._moe_load_balancer = moe_load_balancer
         self._attention_runtime_features = attention_runtime_features
-        self._config = cast(RunnerConfig, config)
+        self._config = config
         self._encoder_config = config
         self._initialize_encoder_cuda_graph()
 
@@ -302,7 +303,6 @@ class EncoderMixin:
                 max_cuda_graph_num_tokens=config.max_cuda_graph_num_tokens,
                 max_num_tokens=self._config.max_num_tokens,
                 max_seq_len=self._config.max_seq_len,
-                cuda_graph_mem_pool=None,
                 is_encoder_decoder=config.is_encoder_decoder,
                 use_fixed_sequence_slots=config.use_fixed_sequence_slots,
                 feature_shape=config.feature_shape,
@@ -599,6 +599,52 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
             attention_runtime_features=attention_runtime_features,
         )
         self._attn_metadata: AttentionMetadata | None = None
+
+    @classmethod
+    def create(
+        cls,
+        model: nn.Module,
+        *,
+        llm_args: TorchLlmArgs,
+        mapping: Mapping,
+        dist: Distributed | None,
+        max_batch_size: int,
+        max_num_tokens: int,
+        max_seq_len: int,
+        max_beam_width: int,
+        model_caller: ModelCaller,
+        attention_backend: type[AttentionBackend],
+        attention_runtime_features: AttentionRuntimeFeatures,
+        moe_load_balancer: MoeLoadBalancer | None = None,
+    ) -> Self:
+        """Build the runner for ``llm_args``.
+
+        Encoder CUDA graphs come only from an ``EncodeCudaGraphConfig`` given as
+        ``cuda_graph_config``; ``encoder_cuda_graph_config`` belongs to
+        encoder-decoder models.
+        """
+        graph_config = llm_args.cuda_graph_config
+        config = EncoderRunnerConfig.create(
+            model=model,
+            mapping=mapping,
+            graph_config=graph_config if isinstance(graph_config, EncodeCudaGraphConfig) else None,
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            max_seq_len=max_seq_len,
+            max_beam_width=max_beam_width,
+            without_logits=False,
+            attention_backend=attention_backend,
+            enable_autotuner=llm_args.enable_autotuner,
+        )
+        return cls(
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            model_caller=model_caller,
+            attention_runtime_features=attention_runtime_features,
+        )
 
     def _setup_attention_metadata(self) -> AttentionMetadata:
         if self._attn_metadata is None:
@@ -1048,7 +1094,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
     ) -> dict[str, Any]:
         forward = partial(
             self._forward_step,
-            gather_ids=prepared.gather_ids,
             gather_context_logits=gather_context_logits,
         )
         graph_runner = self._encoder_cuda_graph_runner
@@ -1086,7 +1131,6 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
         self,
         inputs: dict[str, Any],
         *,
-        gather_ids: torch.Tensor | None,
         gather_context_logits: bool,
     ) -> dict[str, Any]:
         metadata = inputs.get("attn_metadata")
@@ -1095,17 +1139,10 @@ class EncoderRunner(EncoderMixin, PackedModelRunner):
 
         outputs = self._model_caller(
             **inputs,
-            return_context_logits=(gather_ids is not None or gather_context_logits),
+            return_context_logits=gather_context_logits,
         )
         if self._config.without_logits:
             return outputs
-        if isinstance(outputs, dict):
-            logits = outputs.get("logits")
-            if logits is None:
-                return outputs
-        else:
-            logits = outputs
-            outputs = {"logits": logits}
-        if gather_ids is not None:
-            outputs["logits"] = logits[gather_ids]
+        if not isinstance(outputs, dict):
+            outputs = {"logits": outputs}
         return outputs

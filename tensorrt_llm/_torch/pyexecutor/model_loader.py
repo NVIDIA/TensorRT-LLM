@@ -22,7 +22,9 @@ from tensorrt_llm._torch.weight_sharing import (
     MISTRAL_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
     QWEN2_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
-    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
+    QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1, ArtifactIdentity,
     IdentityCheckPolicy, LazyRootModelIdentity, PostTransformConfigIdentity,
     PostTransformFeature, PostTransformProfile, PostTransformProfileRegistry,
     PostTransformQualificationDecision, PostTransformRuntimeConfig,
@@ -42,20 +44,22 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
 
-from ...llmapi.llm_args import LoadFormat
-from .._experimental.modeling_v2 import modeling_v2_resolve
+from ...llmapi.llm_args import CheckpointIOPolicy, LoadFormat
+from .._experimental.modeling_v2 import modeling_v2_resolve_on_all_ranks
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..models import AutoModelForCausalLM
 from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.checkpoints.checkpoint_catalog import CheckpointCatalog
 from ..models.checkpoints.weight_load_plan import WeightLoadPlan
+from ..models.modeling_multimodal_mixin import MultimodalModelMixin
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      get_registered_model_class, timing_metric)
 from ..modules.embedding import Embedding, LMHead
 from ..modules.low_m_gemm import LOW_M_GEMM_ACTIVE, prepare_low_m_gemm
-from ..moe.fused_moe.moe_load_balancer import (MoeLoadBalancer,
+from ..moe.fused_moe.moe_load_balancer import (BaseMoeLoadBalancer,
                                                maybe_create_moe_load_balancer)
+from ..moe.fused_moe.weight_owner import is_moe_weight_owner
 from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
@@ -68,7 +72,7 @@ _KV_CACHE_MAP = {
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
     "auto": "auto",
-    # Mixed-precision KV: the retained tokens and attention use the second
+    # Mixed-precision KV: the first/last tokens and attention use the second
     # dtype. float16/bfloat16 leave the KV cache unquantized and must equal
     # the model dtype (checked in validate_and_set_kv_cache_quant).
     "mixed_nvfp4_fp8": QuantAlgo.FP8.value,
@@ -78,6 +82,7 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
+_SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -111,6 +116,43 @@ _MX_MISTRAL_BF16_DENSE_RUNTIME_CONSTRAINTS = replace(
     _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
     sliding_windows=frozenset({"none"}),
 )
+# Qwen3.5 vision-language roots realize interleaved M-RoPE (`rope_type`
+# `mrope`), applied by the fused QK-norm/RoPE kernel rather than the
+# attention op.
+_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_types=frozenset({"mrope"}),
+    rope_fusion=frozenset({False}),
+)
+# Qwen3 MoE fuses RoPE into the QK-norm kernel, as Qwen3 does, and pins the
+# configured MoE backend and the routed-expert partition. The routed-expert
+# layout differs per MoE implementation, so the pinned backend and
+# quantization must select exactly one implementation on every SM and admitted
+# partition: `CUTLASS` with unquantized weights is the
+# `trtllm.cutlass.grouped_gemm.none` leaf. With TP <= 2, MoE TP x MoE EP x MoE
+# cluster == TP admits only the pure MoE-TP and MoE-EP partitions; wider TP
+# needs a joint partition constraint.
+_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS = replace(
+    _MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
+    rope_fusion=frozenset({False}),
+    moe_backends=frozenset({"CUTLASS"}),
+    moe_tp_sizes=frozenset({1, 2}),
+    moe_ep_sizes=frozenset({1, 2}),
+    moe_cluster_sizes=frozenset({1}),
+)
+
+# TorchLlmArgs fields that only the model classes listing them in
+# `model_specific_llm_args` implement.
+_MODEL_SPECIFIC_LLM_ARGS = ("replicate_embedding",
+                            "mnnvl_allreduce_fp8_payload")
+
+
+def _reject_unsupported_model_llm_args(llm_args: TorchLlmArgs,
+                                       model_cls: type) -> None:
+    supported = getattr(model_cls, "model_specific_llm_args", frozenset())
+    for name in _MODEL_SPECIFIC_LLM_ARGS:
+        if getattr(llm_args, name) and name not in supported:
+            raise ValueError(f"{name} is not supported by {model_cls.__name__}")
 
 
 def _validate_and_adjust_mamba_snapshot_config(config: ModelConfig,
@@ -178,6 +220,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
     # PyTorch configuration quantization
     valid_pyt_quant = bool(pyt_kv_cache_dtype in _VALID_KV_CACHE_DTYPES)
     mapped_pyt_quant = _KV_CACHE_MAP.get(pyt_kv_cache_dtype, None)
+    unquantized_mixed_precision_high_dtype = mapped_pyt_quant is None
+    sparse_attention_config = model_config.sparse_attention_config
+    if (pyt_kv_cache_dtype.startswith("mixed_")
+            and sparse_attention_config is not None
+            and sparse_attention_config.algorithm in ("dsa", "deepseek_v4")):
+        # These backends keep the history in their own pool, in the mixed-precision low
+        # format; a drafter inherits this KV dtype from the model, as for every KV dtype.
+        # TODO: keep drafters that are not MTP in the mixed-precision high dtype on every backend.
+        mapped_pyt_quant = _KV_CACHE_MAP[pyt_kv_cache_dtype.split("_")[1]]
 
     effective_kv_cache_quant = (kv_cache_quant if pyt_kv_cache_dtype == "auto"
                                 else mapped_pyt_quant)
@@ -190,6 +241,10 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             and not supports_fp4_mla_attention(model_config)
             and not uses_minimax_m3_msa and torch.cuda.is_available()
             and get_sm_version() == 107):
+        if pyt_kv_cache_dtype.startswith("mixed_"):
+            raise ValueError(
+                f'kv_cache_config.dtype="{pyt_kv_cache_dtype}" keeps the history '
+                "in NVFP4, which sparse MLA does not support on SM107.")
         logger.warning(
             "NVFP4 KV cache is not supported by trtllm-gen on SM107; "
             "using FP8 KV cache instead.")
@@ -214,15 +269,15 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # An unquantized retained dtype has to be the model dtype; KVCacheManagerV2
+    # An unquantized mixed-precision high dtype has to be the model dtype; KVCacheManagerV2
     # would otherwise reject it after the weights are loaded.
-    if mapped_pyt_quant is None:
-        retained_dtype = str_dtype_to_torch(
+    if unquantized_mixed_precision_high_dtype:
+        mixed_precision_high_dtype = str_dtype_to_torch(
             pyt_kv_cache_dtype.rsplit("_", 1)[1])
-        if model_config.torch_dtype != retained_dtype:
+        if model_config.torch_dtype != mixed_precision_high_dtype:
             raise ValueError(
                 f'llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" keeps '
-                f"the retained tokens in {retained_dtype}, but the model dtype "
+                f"the first/last tokens in {mixed_precision_high_dtype}, but the model dtype "
                 f"is {model_config.torch_dtype}.")
 
     # If we get to this point we have a valid explicit quantization setting.
@@ -252,22 +307,24 @@ def validate_fp4_mla_config(model_config: ModelConfig,
             and model_config.quant_config.quant_mode.has_fp4_kv_cache()):
         return
     if not supports_fp4_mla_attention(model_config):
-        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend; "
-                         "hybrid linear attention is not supported.")
-    if model_config.mapping.cp_size != 1:
-        raise ValueError("FP4 MLA does not support context parallelism.")
+        raise ValueError("Dense FP4 MLA requires the TRTLLM attention backend.")
+    mapping = model_config.mapping
+    if mapping.cp_size != 1 and not mapping.has_cp_helix():
+        raise ValueError(
+            "FP4 MLA supports context parallelism only through Helix.")
     if llm_args.kv_cache_config.use_kv_cache_manager_v2 is False:
         raise ValueError("FP4 MLA requires use_kv_cache_manager_v2=True.")
-    if llm_args.enable_chunked_prefill:
-        raise ValueError(
-            "FP4 MLA does not support chunked prefill or cached context; "
-            "set enable_chunked_prefill=False.")
 
     spec_config = model_config.spec_config
     if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
-        # HP/V-scale side pools are not switched by draft_kv_cache_context.
-        # Set this before models and workers consult the shared predicate.
-        spec_config._allow_separate_draft_kv_cache = False
+        spec_dec_mode = spec_config.spec_dec_mode
+        # A standalone drafter (DFlash, DSpark) keeps its layers in its own
+        # BF16 draft pool, outside the FP4 MLA layout. Without that pool it
+        # falls back to a context arena that is dense in max_seq_len.
+        if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
+            # HP/V-scale side pools are not switched by draft_kv_cache_context.
+            # Set this before models and workers consult the shared predicate.
+            spec_config._allow_separate_draft_kv_cache = False
 
 
 def validate_encoder_decoder_kv_cache_config(model_config: ModelConfig,
@@ -451,31 +508,16 @@ def get_rank_model_storage(model):
     return total_bytes
 
 
-_AUTO_CHECKPOINT_IO_POLICY = "auto"
-_NATIVE_CHECKPOINT_IO_POLICY = "native"
-_RANK_STRIPED_CHECKPOINT_IO_POLICY = "rank_striped_read_ahead"
-_SUPPORTED_CHECKPOINT_IO_POLICIES = (
-    _AUTO_CHECKPOINT_IO_POLICY,
-    _NATIVE_CHECKPOINT_IO_POLICY,
-    _RANK_STRIPED_CHECKPOINT_IO_POLICY,
-)
-_SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
-
-
 def _resolve_checkpoint_io_policy(
     checkpoint_loader: Optional[BaseCheckpointLoader],
     checkpoint_format: Optional[str],
     load_format: LoadFormat | str,
-    requested_policy: str,
+    requested_policy: CheckpointIOPolicy,
     partial_model_loading: bool,
-) -> tuple[str, Optional[str]]:
+) -> tuple[CheckpointIOPolicy, Optional[str]]:
     """Select a safe executable policy before checkpoint loading starts."""
-    if requested_policy not in _SUPPORTED_CHECKPOINT_IO_POLICIES:
-        raise ValueError("checkpoint_io_policy must be one of "
-                         f"{_SUPPORTED_CHECKPOINT_IO_POLICIES}, got "
-                         f"{requested_policy!r}")
-    if requested_policy == _NATIVE_CHECKPOINT_IO_POLICY:
-        return _NATIVE_CHECKPOINT_IO_POLICY, None
+    if requested_policy == CheckpointIOPolicy.NATIVE:
+        return CheckpointIOPolicy.NATIVE, None
 
     reason = None
     if checkpoint_loader is not None:
@@ -509,15 +551,15 @@ def _resolve_checkpoint_io_policy(
     if reason is not None:
         message = ("Checkpoint I/O policy resolved before loading: "
                    f"requested={requested_policy}, "
-                   f"selected={_NATIVE_CHECKPOINT_IO_POLICY}, "
+                   f"selected={CheckpointIOPolicy.NATIVE}, "
                    f"reason={reason}.")
-        if requested_policy == _RANK_STRIPED_CHECKPOINT_IO_POLICY:
+        if requested_policy == CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD:
             logger.warning(message)
         else:
             logger.info(message)
-        return _NATIVE_CHECKPOINT_IO_POLICY, reason
+        return CheckpointIOPolicy.NATIVE, reason
 
-    return _RANK_STRIPED_CHECKPOINT_IO_POLICY, None
+    return CheckpointIOPolicy.RANK_STRIPED_READ_AHEAD, None
 
 
 def _construct_checkpoint_loader(
@@ -525,10 +567,12 @@ def _construct_checkpoint_loader(
     checkpoint_format: Optional[str],
     *,
     mx_config: Optional[ModelExpressConfig] = None,
-    checkpoint_io_policy: str = "native",
+    checkpoint_io_policy: CheckpointIOPolicy = CheckpointIOPolicy.NATIVE,
     load_format: LoadFormat | str = LoadFormat.AUTO,
     partial_model_loading: bool = False,
 ) -> BaseCheckpointLoader:
+    # Just in case someone wrongly passes a str instead of a CheckpointIOPolicy.
+    checkpoint_io_policy = CheckpointIOPolicy(checkpoint_io_policy)
     requested_checkpoint_io_policy = checkpoint_io_policy
     checkpoint_io_policy, selection_fallback_reason = \
         _resolve_checkpoint_io_policy(
@@ -724,6 +768,32 @@ def _check_compile_wrapper_before_reload(model: torch.nn.Module) -> None:
         _assert_no_compile_wrapper_in_paths(model)
 
 
+def _reject_dense_dwdp_update(model: torch.nn.Module, action: str) -> None:
+    """Refuse to rewrite the weights of a model that dense DWDP sharded.
+
+    Dense DWDP repoints the dense weights of the MoE decoder layers into staging
+    slots that several layers share and that the next gather overwrites, so
+    weights written through the modules would be lost. Its setup marks the
+    model and its decoder with ``_dense_dwdp_active``; the mark stays after the
+    dense DWDP teardown, which leaves zero-size tensors behind.
+
+    Args:
+        model: The model about to be updated.
+        action: What the caller was about to do, for the error message.
+
+    Raises:
+        RuntimeError: The model or its decoder (``model.model``) is marked.
+    """
+    decoder = getattr(model, "model", None)
+    if getattr(model, "_dense_dwdp_active", False) or getattr(
+            decoder, "_dense_dwdp_active", False):
+        raise RuntimeError(
+            f"Cannot {action}: dense DWDP (dwdp_config.enable_dense) moved "
+            "this model's dense weights into staging slots shared across "
+            "layers, so they cannot be rewritten in place. Launch without "
+            "dwdp_config.enable_dense to update weights.")
+
+
 class ModelLoaderMetricNames(Enum):
     TOTAL_MODEL_LOADING_SECONDS = "total_model_loading_seconds"
     CHECKPOINT_PREPARATION_SECONDS = "checkpoint_preparation_seconds"
@@ -833,6 +903,32 @@ class ModelLoader:
             transfer_scope=PostTransformTransferScope.TARGET_MODEL,
             runtime_constraints=_MX_BF16_DENSE_RUNTIME_CONSTRAINTS,
         ),
+        PostTransformProfile(
+            profile_id="qwen3_5-for-conditional-generation-bf16-complete-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_5",
+                "Qwen3_5VLModel"),
+            architecture="Qwen3_5ForConditionalGeneration",
+            model_type="qwen3_5",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_5_DENSE_VL_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.COMPLETE_MODEL,
+            runtime_constraints=_MX_QWEN3_5_VL_BF16_RUNTIME_CONSTRAINTS,
+        ),
+        PostTransformProfile(
+            profile_id="qwen3-moe-for-causal-lm-bf16-cutlass-target-v1",
+            root_model_class=LazyRootModelIdentity(
+                "tensorrt_llm._torch.models.modeling_qwen3_moe",
+                "Qwen3MoeForCausalLM"),
+            architecture="Qwen3MoeForCausalLM",
+            model_type="qwen3_moe",
+            speculative_mode=None,
+            protocol_version=_MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transform_abi_id=QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            runtime_constraints=_MX_QWEN3_MOE_BF16_CUTLASS_RUNTIME_CONSTRAINTS,
+        ),
     ))
 
     @classmethod
@@ -922,6 +1018,8 @@ class ModelLoader:
         config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
 
         model_cls = AutoModelForCausalLM._resolve_class(config)
+        if model_cls is not None:
+            _reject_unsupported_model_llm_args(llm_args, model_cls)
         original_kv_cache_manager_setting = (
             llm_args.kv_cache_config.use_kv_cache_manager_v2)
 
@@ -1045,7 +1143,7 @@ class ModelLoader:
         self,
         checkpoint_dir: str,
         checkpoint_loader: BaseCheckpointLoader,
-    ) -> tuple[DecoderModelForCausalLM, MoeLoadBalancer | None]:
+    ) -> tuple[DecoderModelForCausalLM, BaseMoeLoadBalancer | None]:
         """
         Loads the model, its weights, and applies necessary configurations.
 
@@ -1476,9 +1574,9 @@ class ModelLoader:
                         #      compatibility check (GMS has no disk fallback).
                         #   4. `materialize_module`: zero-copy bind GMS
                         #      pool storage onto the model parameters.
-                        #   5. Per-module `cache_derived_state`: recompute
-                        #      Python-side state from real, materialized
-                        #      tensors without re-running one-shot transforms.
+                        #   5. Mark materialized weights as transformed, then
+                        #      recompute Python-side derived state without
+                        #      re-running one-shot transforms.
                         #   6. `post_load_publish`: apply the format-specific
                         #      receiver publication policy.
                         with timing_metric(
@@ -1496,6 +1594,7 @@ class ModelLoader:
                             self._check_gms_source_identity(gms_backend)
 
                             gms_backend.materialize_module(model)
+                            self._mark_weights_transformed(model)
                             self._walk_cache_state(model)
 
                             self._post_load_publish(
@@ -1569,7 +1668,7 @@ class ModelLoader:
                 # `tensorrt_llm/llmapi/llm_args.py`. When implementing the
                 # follow-up, drop the validator gate AFTER moving these calls
                 # into the pool scope.
-                if isinstance(moe_load_balancer, MoeLoadBalancer):
+                if isinstance(moe_load_balancer, BaseMoeLoadBalancer):
                     moe_load_balancer.register_weight_slots_after_to_cuda()
                     logger.info("moe_load_balancer finalizing model...")
                     moe_load_balancer.finalize_model()
@@ -1657,21 +1756,11 @@ class ModelLoader:
             )
             return True
 
-        unsupported_features = ",".join(
-            sorted(feature.value
-                   for feature in qualification.unsupported_features))
-        feature_detail = (f"; unsupported_features={unsupported_features}"
-                          if unsupported_features else "")
-        unsupported_runtime_dimensions = ",".join(
-            sorted(qualification.unsupported_runtime_dimensions))
-        runtime_detail = (
-            f"; unsupported_runtime_dimensions={unsupported_runtime_dimensions}"
-            if unsupported_runtime_dimensions else "")
         raise RuntimeError(
             f"MX receiver got post-transform weights for {type(model).__name__}, "
             "but the load does not match a qualified staged post-load profile "
             f"for protocol v{cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION}: "
-            f"reason={qualification.reason.value}{feature_detail}{runtime_detail}. "
+            f"{qualification.describe()}. "
             "Refusing to run the full post-load path on already-transformed "
             "weights.")
 
@@ -1733,6 +1822,42 @@ class ModelLoader:
                 torch.cuda.synchronize()
 
     @classmethod
+    def _post_transform_transfer_scope(
+            cls, model: torch.nn.Module) -> PostTransformTransferScope:
+        """Return the model component that an MX transfer of `model` carries.
+
+        MX transfers every parameter of the constructed root. A text-only root
+        is the target model. A registered multimodal root is the complete model
+        when it owns parameters outside its language model (a local multimodal
+        encoder), and only the language model otherwise, as with
+        `disable_mm_encoder` or multimodal encoder/prefill disaggregation.
+        Roots without a registered profile keep the target-model scope without
+        querying `language_model`; qualification rejects them by root class.
+        """
+        if not isinstance(model, MultimodalModelMixin):
+            return PostTransformTransferScope.TARGET_MODEL
+        root_model_class = type(model)
+        if not any(
+                profile.root_model_class.matches(root_model_class)
+                for profile in cls._post_transform_profile_registry().profiles):
+            return PostTransformTransferScope.TARGET_MODEL
+        try:
+            language_model = getattr(model, "language_model", None)
+        except NotImplementedError:
+            language_model = None
+        if not isinstance(language_model, torch.nn.Module):
+            return PostTransformTransferScope.TARGET_MODEL
+        language_model_parameters = {
+            id(parameter)
+            for parameter in language_model.parameters()
+        }
+        if any(
+                id(parameter) not in language_model_parameters
+                for parameter in model.parameters()):
+            return PostTransformTransferScope.COMPLETE_MODEL
+        return PostTransformTransferScope.LANGUAGE_MODEL
+
+    @classmethod
     def _qualify_post_transform_profile(
             cls,
             model: DecoderModelForCausalLM,
@@ -1751,13 +1876,23 @@ class ModelLoader:
         if getattr(locality_domain_policy, "enabled", False):
             enabled_features.add(
                 PostTransformFeature.LOCALITY_DOMAIN_LOCALIZED_WEIGHTS)
+        # The realized balancer, not the configured one, decides the expert
+        # slot layout: MoE layers create it only when EPLB actually applies.
+        # Both gates read their state directly, so a renamed attribute fails
+        # the load instead of silently reporting the feature as off.
+        if any(
+                is_moe_weight_owner(module) and module._using_load_balancer()
+                for module in model.modules()):
+            enabled_features.add(PostTransformFeature.MOE_LOAD_BALANCER)
+        if model.model_config.mapping.dwdp_enabled:
+            enabled_features.add(PostTransformFeature.DWDP)
         return cls._post_transform_profile_registry().qualify(
             root_model_class=type(model),
             architecture=config_identity.architecture,
             model_type=config_identity.model_type,
             speculative_mode=speculative_mode,
             protocol_version=cls._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
-            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            transfer_scope=cls._post_transform_transfer_scope(model),
             enabled_features=frozenset(enabled_features),
             runtime_config=PostTransformRuntimeConfig.from_model_config(
                 model.model_config, model=model),
@@ -1803,13 +1938,9 @@ class ModelLoader:
         if checkpoint_loader.checkpoint_format == "MX":
             if not qualification.qualified:
                 if not weights_preloaded:
-                    unsupported_runtime_dimensions = ",".join(
-                        sorted(qualification.unsupported_runtime_dimensions))
                     logger.info("Skipping MX post-transform publish for "
                                 f"{type(model).__name__}: qualification "
-                                f"reason={qualification.reason.value}, "
-                                "unsupported_runtime_dimensions="
-                                f"{unsupported_runtime_dimensions or 'none'}.")
+                                f"{qualification.describe()}.")
                 return
             kwargs["source_identity"] = self._source_identity
         checkpoint_loader.post_load_publish(model, **kwargs)
@@ -1960,7 +2091,12 @@ class ModelLoader:
 
         Returns:
             None.
+
+        Raises:
+            RuntimeError: Dense DWDP sharded the model's dense weights, or the
+                weight mapper was not initialized.
         """
+        _reject_dense_dwdp_update(model, "reload weights")
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot reload weights: weight_mapper was not initialized. "
@@ -1977,10 +2113,16 @@ class ModelLoader:
             torch.cuda.current_stream().synchronize()
 
     def begin_update_weights(self) -> None:
-        """Start an incremental update session on the persistent mapper."""
+        """Start an incremental update session on the persistent mapper.
+
+        Raises:
+            RuntimeError: The weight mapper was not initialized, or dense DWDP
+                sharded the dense weights of the model it is bound to.
+        """
         if self.weight_mapper is None:
             raise RuntimeError(
                 "Cannot update weights: weight_mapper was not initialized")
+        _reject_dense_dwdp_update(self.weight_mapper.model, "update weights")
         self.weight_mapper.begin_update_weights()
 
     def finalize_update_weights(self) -> None:
@@ -2056,6 +2198,12 @@ class ModelLoader:
             moe_load_balancer=self.llm_args.moe_config.load_balancer,
             lora_config=self.lora_config,
             allreduce_strategy=self.llm_args.allreduce_strategy,
+            mnnvl_allreduce_fp8_payload=self.llm_args.
+            mnnvl_allreduce_fp8_payload,
+            replicate_embedding=self.llm_args.replicate_embedding,
+            cuda_graph_batch_sizes=tuple(
+                self.llm_args.cuda_graph_config.batch_sizes or
+                ()) if self.llm_args.cuda_graph_config else (),
             mm_encoder_only=self.llm_args.mm_encoder_only,
             disable_mm_encoder=self.llm_args.disable_mm_encoder,
             attn_backend=self.llm_args.attn_backend,
@@ -2096,7 +2244,7 @@ class ModelLoader:
         # modeling_v2 target reads the arguments as the engine will run with
         # them and never overrides those defaults.
         config = replace(config,
-                         modeling_v2_target=modeling_v2_resolve(
+                         modeling_v2_target=modeling_v2_resolve_on_all_ranks(
                              config, self.llm_args))
 
         if uses_mtp_head_checkpoint(self.spec_config):

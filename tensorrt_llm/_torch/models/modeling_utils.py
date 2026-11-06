@@ -33,6 +33,7 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
+from ..utils import split
 from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
 
@@ -106,6 +107,44 @@ class MetaInitMode(TorchDispatchMode):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
+
+
+def concatenate_weights_by_tp_rank(components: list[torch.Tensor],
+                                   tp_size: int) -> torch.Tensor:
+    """Concatenate projection components in rank-major row order.
+
+    Args:
+        components: Tensors shaped ``[rows_i, ...]`` with matching trailing
+            dimensions. Each physical row count must be divisible by
+            ``tp_size``. Packed weights remain packed; callers must ensure
+            logical channel boundaries align with physical row boundaries.
+        tp_size: Number of tensor-parallel ranks.
+
+    Returns:
+        A tensor ordered as ``[c0_r0 | c1_r0 | ... | c0_r1 | c1_r1 | ...]``.
+        A contiguous row split gives each rank its slice of every component.
+        With one rank, this is a plain concatenation along dimension zero.
+    """
+    if not components:
+        raise ValueError("rank blocking requires at least one projection")
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    trailing_shape = components[0].shape[1:]
+    for component in components:
+        if component.ndim == 0 or component.shape[1:] != trailing_shape:
+            raise ValueError(
+                "rank-blocked projections must have matching trailing dimensions"
+            )
+        if component.shape[0] % tp_size:
+            raise ValueError(
+                f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
+            )
+    if tp_size == 1:
+        return torch.cat(components, dim=0)
+    rows: list[torch.Tensor] = []
+    for rank in range(tp_size):
+        rows.extend(split(c, tp_size, rank) for c in components)
+    return torch.cat(rows, dim=0)
 
 
 def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
@@ -542,6 +581,9 @@ class DecoderModelForCausalLM(nn.Module,
 
     # Keep FX optimizations for decode and prefill above the PCG capture ceiling.
     use_fx_for_pcg_fallback: ClassVar[bool] = True
+    # The model-specific TorchLlmArgs fields this model implements; the loader
+    # rejects a set one that is not listed.
+    model_specific_llm_args: ClassVar[frozenset[str]] = frozenset()
 
     @staticmethod
     def _checkpoint_has_lm_head_scale(
@@ -624,8 +666,14 @@ class DecoderModelForCausalLM(nn.Module,
         # Quant config for lm_head (applies to both the attention-DP replicated
         # and TP lm_head below); None keeps it unquantized.
         lm_head_quant_config = self._resolve_lm_head_quant_config(config)
+        # The LM head sees every row; under helix + attention DP at tp_size 1
+        # the TP group shares requests, so it stays vocab-parallel. A tied LM
+        # head shares the embedding weight, so it keeps the embedding layout.
+        tied = getattr(config.pretrained_config, "tie_word_embeddings", False)
+        lm_head_mapping = (config.mapping
+                           if tied else config.mapping.mapping_for_full_rows())
 
-        if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
+        if lm_head_mapping.enable_attention_dp and not lm_head_mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,
                 hidden_size,
@@ -654,7 +702,7 @@ class DecoderModelForCausalLM(nn.Module,
                 vocab_size,
                 hidden_size,
                 dtype=config.pretrained_config.torch_dtype,
-                mapping=config.mapping,
+                mapping=lm_head_mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=config.lm_head_gather_output,
                 reduce_output=False,
@@ -677,10 +725,13 @@ class DecoderModelForCausalLM(nn.Module,
 
         # use embedding weights in lm_head if tie word embedding is enabled
         if getattr(config.pretrained_config, 'tie_word_embeddings', False):
-            assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
-                "lm_head and vocab embedding should use the same TP size")
             assert self.lm_head.tp_mode == self.model.embed_tokens.tp_mode, (
                 "lm_head and vocab embedding should use the same TP mode")
+            # Replicated weights have the same layout even when ADP's embedding
+            # retains the owner mapping and the LM head uses a singleton mapping.
+            if self.lm_head.tp_mode is not None:
+                assert self.lm_head.tp_size == self.model.embed_tokens.tp_size, (
+                    "lm_head and vocab embedding should use the same TP size")
             self.lm_head.weight = self.model.embed_tokens.weight
             if config.mapping.is_last_pp_rank():
                 self.model.keep_embed_tokens = True

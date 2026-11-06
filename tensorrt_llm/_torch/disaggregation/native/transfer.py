@@ -38,6 +38,7 @@ except ImportError:
 
 import tensorrt_llm.bindings
 from tensorrt_llm import logger
+from tensorrt_llm._torch.disaggregation import diagnostics as disagg_diagnostics
 from tensorrt_llm._torch.disaggregation.base.agent import (
     BaseTransferAgent,
     MemoryDescs,
@@ -65,13 +66,16 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
     get_non_empty_aux_indices,
 )
+from tensorrt_llm._torch.disaggregation.native.context_first_profile import (
+    validate_context_first_peer,
+)
 from tensorrt_llm._torch.disaggregation.native.extent import Chunk
 from tensorrt_llm._torch.disaggregation.native.messenger import ZMQMessenger, decode_message
-from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import AttentionPolicy
-from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
-    MambaPolicy,
-    mamba_receiver_payload_bytes,
+from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
+    RingMapper,
 )
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import MambaPolicy
 from tensorrt_llm._torch.disaggregation.native.ownership import (
     PhysicalOperationState as _PhysicalOperationState,  # noqa: F401 -- native diagnostic alias
 )
@@ -82,13 +86,13 @@ from tensorrt_llm._torch.disaggregation.native.ownership import SendOperationOwn
 from tensorrt_llm._torch.disaggregation.native.ownership import (
     TransferNotSubmittedError as _TransferNotSubmittedError,
 )
-from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
+from tensorrt_llm._torch.disaggregation.native.peer import PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.perf_logger import PerfTimer, perf_log_manager
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 from tensorrt_llm._torch.disaggregation.nixl.agent import NixlTransferAgent
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
-from tensorrt_llm._torch.disaggregation.resource.page import CacheKind, KVCachePageTable, MapperKind
+from tensorrt_llm._torch.disaggregation.resource.page import CacheKind
 from tensorrt_llm._torch.disaggregation.resource.utils import get_unique_pool_memory_descs
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -97,8 +101,6 @@ from tensorrt_llm.disaggregated_params import DisaggregatedParams, DisaggSchedul
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.disaggregation.base.agent import TransferStatus
-
-    from .bounce import Config
 
 AttentionTypeCpp = tensorrt_llm.bindings.internal.batch_manager.AttentionType
 LlmRequestType = tensorrt_llm.bindings.internal.batch_manager.LlmRequestType
@@ -115,6 +117,24 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
 
 
+# Every REQUEST_DATA from a generation server on v1.3.0rc25 or a later release that still has
+# the Python KV bounce buffer carries this key, so its presence identifies such a server.
+# Requests from earlier releases also carry other retired keys, so they fail to decode instead.
+_OLDER_RELEASE_REQUEST_KEY = "bounce_dst_base"
+
+
+class OlderReleaseRequestError(ValueError):
+    """REQUEST_DATA from a generation server running an older TensorRT-LLM release."""
+
+    def __init__(self, req_info: RecvReqInfo):
+        super().__init__(
+            f"Failing request {req_info.unique_rid}: generation server {req_info.instance_name} "
+            f"rank {req_info.instance_rank} runs an older TensorRT-LLM release. Context and "
+            "generation servers must run the same release."
+        )
+        self.req_info = req_info
+
+
 @dataclass
 class RecvReqInfo:
     sender_req_id: int
@@ -129,7 +149,9 @@ class RecvReqInfo:
     dst_start_token: Optional[int] = None
     aux_slot: Optional[int] = None
     slice_id: Optional[int] = None
-    bounce_dst_base: Optional[int] = None
+    # Context-first receivers send REQUEST_DATA only after the context phase
+    # produced the KV cache, so a TxSession must already exist (or have ended).
+    context_first: bool = False
 
     def to_bytes(self) -> bytes:
         return msgpack.packb(
@@ -144,7 +166,7 @@ class RecvReqInfo:
                 "dst_start_token": self.dst_start_token,
                 "aux_slot": self.aux_slot,
                 "slice_id": self.slice_id,
-                "bounce_dst_base": self.bounce_dst_base,
+                "context_first": self.context_first,
             }
         )
 
@@ -154,7 +176,12 @@ class RecvReqInfo:
         d["block_ids_per_layer_groups"] = [
             np.frombuffer(b, dtype=np.int64).copy() for b in d["block_ids_per_layer_groups"]
         ]
-        return cls(**d)
+        from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
+        d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
+        info = cls(**d)
+        if from_older_release:
+            raise OlderReleaseRequestError(info)
+        return info
 
 
 @dataclass
@@ -186,7 +213,21 @@ class WriteMeta:
     receiver_slice_id: int = 0
     is_last_slice: bool = False
     meta_type: WriteMetaType = WriteMetaType.KV
-    bounce_dst_base: Optional[int] = None
+    # Snapshot for this descriptor; a task's per-peer timer may be reused by a later dispatch.
+    transfer_bytes: Optional[int] = None
+
+
+def _capture_transfer_bytes(
+    sizes: np.ndarray, timer: Optional[PerfTimer], peer_rank: int
+) -> Optional[int]:
+    """Share one payload-size measurement without enabling performance logging."""
+    if timer is not None:
+        transfer_bytes = int(sizes.sum())
+        timer.record_transfer_sizes(peer_rank, transfer_bytes, int(sizes.size))
+        return transfer_bytes
+    with disagg_diagnostics.suppress_diagnostic_errors():
+        return int(sizes.sum())
+    return None
 
 
 class MessageType:
@@ -325,6 +366,7 @@ class _LogicalTask:
         self._logical_outcomes = _LogicalOutcomes()
         self._logical_index = self._logical_outcomes.add_task()
         self._retirement: Optional[RetirementDeadline] = None
+        self._enforce_physical_ownership: bool | None = None
 
     def bind_logical_outcomes(self, outcomes: _LogicalOutcomes) -> None:
         """Join the session before this task is exposed to a worker or caller."""
@@ -344,10 +386,9 @@ class AgentResult(Enum):
     FAILED_QUIESCED = "FAILED_QUIESCED"
 
 
-# KV_AGENT_RESULT prefix in one struct frame (was ascii frames serialized/parsed under the
-# GIL per slice per writer): instance_rank, unique_rid, slice_id, is_last, status,
-# transfer_size. The optional bounce tail follows at message[2:].
-_KV_RESULT_PREFIX = struct.Struct("<qqq?Bq")
+# KV_AGENT_RESULT is [type, frame]; the frame is one binary struct carrying instance_rank,
+# unique_rid, slice_id, is_last, status and transfer_size.
+_KV_RESULT_FRAME = struct.Struct("<qqq?Bq")
 _AGENT_RESULT_CODE = {
     AgentResult.SUCCESS: 0,
     AgentResult.FAILED: 1,
@@ -363,14 +404,14 @@ _AGENT_RESULT_BY_CODE = {
 
 
 def _make_kv_result_msg(
-    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0, tail=None
+    instance_rank, unique_rid, slice_id, is_last_slice, agent_result, transfer_size=0
 ):
     """Build a KV_AGENT_RESULT message. ALL result sends (success AND failed/cancelled) must go
-    through this single binary frame so the receiver's _KV_RESULT_PREFIX.unpack never hits a stale
+    through this single binary frame so the receiver's _KV_RESULT_FRAME.unpack never hits a stale
     ascii payload (which would fail to decode and leave the RX task stuck forever)."""
-    msg = [
+    return [
         MessageType.KV_AGENT_RESULT,
-        _KV_RESULT_PREFIX.pack(
+        _KV_RESULT_FRAME.pack(
             int(instance_rank),
             int(unique_rid),
             int(slice_id),
@@ -379,9 +420,6 @@ def _make_kv_result_msg(
             int(transfer_size),
         ),
     ]
-    if tail:
-        msg += tail
-    return msg
 
 
 def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResult) -> list[bytes]:
@@ -397,7 +435,6 @@ def _make_aux_result_msg(instance_rank: int, unique_rid: int, result: AgentResul
 class _PendingSettlement:
     write_meta: WriteMeta
     initial_report: Optional[list[bytes]]
-    send_slot_id: Optional[int] = None
     backend_done: bool = False
     report_error_logged: bool = False
 
@@ -546,15 +583,15 @@ class Sender(SenderBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
-        bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        context_first_ownership: bool = False,
     ) -> None:
         self._registrar = peer_registrar
         self._device_id = peer_registrar.self_rank_info.device_id
         self._agent = agent
-        self._bounce = bounce
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
         self._peer_requests: dict = {}
         self._peer_requests_timestamps: dict[int, float] = {}  # unique_rid -> insert time
@@ -607,6 +644,37 @@ class Sender(SenderBase):
     def endpoint(self):
         return self._messenger.endpoint
 
+    def ownership_enabled(self, context_first: bool) -> bool:
+        """Select ownership without changing unqualified request workflows.
+
+        Args:
+            context_first: Whether the request uses context-first scheduling.
+
+        Returns:
+            Whether this request uses physical ownership enforcement.
+        """
+        return getattr(self, "_enforce_physical_ownership", False) or (
+            getattr(self, "_context_first_ownership", False) and context_first
+        )
+
+    def _owns_task(self, task: SendTaskBase) -> bool:
+        """Read the immutable session selection, including standalone task callers.
+
+        Args:
+            task: Piece whose session selected its ownership policy.
+
+        Returns:
+            Whether the piece requires protected submission and settlement.
+        """
+        selected = task._enforce_physical_ownership
+        if selected is not None:
+            return selected
+        if not getattr(self, "_context_first_ownership", False):
+            return self._enforce_physical_ownership
+        return self.ownership_enabled(
+            task._params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
+
     def _add_req_info(self, unique_rid: int, instance_rank: int, req_info: RecvReqInfo):
         with self._peer_requests_lock:
             if unique_rid not in self._peer_requests:
@@ -643,6 +711,11 @@ class Sender(SenderBase):
         Called opportunistically from the listener thread when a new REQUEST_DATA
         arrives. With gen-first ADP broadcast, non-assigned DP ranks accumulate
         entries that are never consumed; this sweep prevents unbounded growth.
+
+        A context-first entry that no TxSession claimed within the TTL never will
+        be (the session already ended, or the receiver names a request this rank
+        never had), so its receiver is told that the transfer failed instead of
+        waiting for data that will not arrive.
         """
         now = time.monotonic()
         with self._peer_requests_lock:
@@ -653,33 +726,52 @@ class Sender(SenderBase):
             ]
         if not stale_rids:
             return
+        orphaned_infos: list[RecvReqInfo] = []
         for rid in stale_rids:
             with self._sessions_lock, self._peer_requests_lock:
                 if rid not in self._sessions and rid in self._peer_requests:
-                    self._peer_requests.pop(rid, None)
+                    req_info_map = self._peer_requests.pop(rid)
                     self._peer_requests_timestamps.pop(rid, None)
+                    orphaned_infos.extend(
+                        info for info in req_info_map.values() if info.context_first
+                    )
                     logger.debug(f"Swept stale RecvReqInfo for rid={rid}")
+        for info in orphaned_infos:
+            self._fail_orphaned_receiver(info)
+
+    def _fail_orphaned_receiver(self, info: RecvReqInfo) -> None:
+        """Report FAILED for a context-first REQUEST_DATA that no TxSession claimed.
+
+        This resolves the receiver's task, so its RxSession fails through the
+        normal transfer-failure path. The sweep runs on the executor and listener
+        threads, so the message goes through a worker queue.
+        """
+        logger.warning(
+            f"KV transfer request rid={info.unique_rid} from receiver "
+            f"{info.instance_name} rank {info.instance_rank} has no TxSession on this "
+            f"rank after {self._STALE_REQ_INFO_TTL_S:.0f}s; failing it"
+        )
+        self._send_failed_result_to_receiver(info, defer_to_worker=True)
 
     def setup_session(self, tx_session: "TxSession"):
         unique_rid = tx_session.disagg_request_id
+        owned = tx_session._enforce_physical_ownership
         pre_cancel = False
         cancelled_by_peer = False
         with self._sessions_lock:
             if self._shutdown_requested:
                 raise RuntimeError("cannot create a TxSession after Sender shutdown")
-            if self._enforce_physical_ownership and unique_rid in self._sessions:
+            if owned and unique_rid in self._sessions:
                 raise RuntimeError("cannot replace an owned TxSession")
             if unique_rid in self._pre_cancelled_rids:
                 pre_cancel = True
                 cancelled_by_peer = self._pre_cancelled_rids[unique_rid]
-                if not self._enforce_physical_ownership:
+                if not owned:
                     self._pre_cancelled_rids.pop(unique_rid)
-            if not (pre_cancel and self._enforce_physical_ownership):
-                self._sessions[unique_rid] = (
-                    tx_session if self._enforce_physical_ownership else weakref.ref(tx_session)
-                )
+            if not (pre_cancel and owned):
+                self._sessions[unique_rid] = tx_session if owned else weakref.ref(tx_session)
         if pre_cancel:
-            if self._enforce_physical_ownership:
+            if owned:
                 tx_session.cancel_local(by_peer=cancelled_by_peer, report_unsubmitted_aux=False)
                 # Make the cancelled session visible only after its terminal
                 # state and the previously saved requests are captured. Late
@@ -747,11 +839,50 @@ class Sender(SenderBase):
                 task.status = TaskStatus.TRANSFERRING
             return True
 
+    def _emit_kv_transfer_event(
+        self,
+        event: str,
+        write_meta: WriteMeta,
+        *,
+        worker_queue_index: Optional[int] = None,
+        include_transfer_entries: bool = False,
+        outcome: Optional[str] = None,
+    ) -> None:
+        """Emit descriptor-local evidence without affecting transfer execution."""
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            if write_meta.meta_type != WriteMetaType.KV or write_meta.src_ptrs.size == 0:
+                return
+            fields: dict[str, disagg_diagnostics.DiagnosticValue] = {}
+            if worker_queue_index is not None:
+                fields.update(
+                    is_last_slice=write_meta.is_last_slice, worker_queue_index=worker_queue_index
+                )
+            if include_transfer_entries:
+                fields["transfer_entries"] = int(write_meta.sizes.size)
+            if outcome is not None:
+                fields["outcome"] = outcome
+            disagg_diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=write_meta.unique_rid,
+                request_id_scope=disagg_diagnostics.get_request_id_scope(write_meta.task._params),
+                rank_info=self._registrar.self_rank_info,
+                slice_id=write_meta.slice_id,
+                peer_rank=write_meta.peer_rank,
+                receiver_slice_id=write_meta.receiver_slice_id,
+                transfer_bytes=write_meta.transfer_bytes,
+                **fields,
+            )
+
     def _enqueue(self, write_meta: WriteMeta):
+        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            self._emit_kv_transfer_event(
+                "ctx_transfer_queued", write_meta, worker_queue_index=thread_idx
+            )
         # Route by (unique_rid, peer_rank) so that:
         # - Same peer's slices stay ordered on one thread (is_last_slice correctness)
         # - Different peers can run on different threads (better load balancing)
-        thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         self._send_task_queues[thread_idx].put(write_meta)
 
     def _get_or_connect_thread_dealer(self, endpoint: Optional[str]) -> ZMQMessenger:
@@ -769,10 +900,10 @@ class Sender(SenderBase):
         return dealers[endpoint]
 
     def _get_result_dealer(
-        self, endpoint: Optional[str], *, legacy_shared: bool = False
+        self, endpoint: Optional[str], *, legacy_shared: bool = False, owned: bool | None = None
     ) -> ZMQMessenger:
         """Keep legacy early-failure routing outside the ownership bridge."""
-        if legacy_shared and not self._enforce_physical_ownership:
+        if legacy_shared and not (self._enforce_physical_ownership if owned is None else owned):
             return self._get_or_connect_dealer(endpoint)
         return self._get_or_connect_thread_dealer(endpoint)
 
@@ -781,9 +912,26 @@ class Sender(SenderBase):
         task: SendTaskBase,
         peer_rank: int,
         request: TransferRequest,
+        on_submitted: Optional[Callable[[], None]] = None,
     ) -> tuple[bool, Optional[str]]:
-        if not self._enforce_physical_ownership:
+        owned = self._owns_task(task)
+        try:
+            # This query cannot submit a transfer. Reject before acquiring backend ownership.
+            if request.op == TransferOp.WRITE and not self._agent.check_remote_descs(
+                request.remote_name, request.dst_descs
+            ):
+                raise RuntimeError("NIXL WRITE remote descriptors unavailable")
+        except Exception as error:
+            if owned:
+                task.retire_unsubmitted_physical_operation(peer_rank)
+            raise _TransferNotSubmittedError(
+                "NIXL sender rejected transfer before backend submission"
+            ) from error
+        if not owned:
             status = self._agent.submit_transfer_requests(request)
+            if on_submitted is not None:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    on_submitted()
             completed = status.wait()
             detail = None if completed else getattr(status, "last_status_str", lambda: None)()
             return completed, detail
@@ -805,6 +953,9 @@ class Sender(SenderBase):
                 self._ownership_poisoned = error
                 task.mark_physical_operation_in_doubt(peer_rank)
             return False, str(error)
+        if on_submitted is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                on_submitted()
         try:
             if not status.wait():
                 # A non-success query is a logical transfer failure, but the
@@ -864,6 +1015,10 @@ class Sender(SenderBase):
                     except Exception as e:
                         logger.warning(f"failed to send transfer rejection: {e}")
                     continue
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_kv_transfer_event(
+                        "ctx_worker_dequeued", write_meta, worker_queue_index=thread_idx
+                    )
                 try:
                     if write_meta.meta_type == WriteMetaType.AUX:
                         logger.debug(
@@ -896,17 +1051,12 @@ class Sender(SenderBase):
                         )
                 dealers.clear()
 
-    def _retain_in_doubt_transfer(
-        self,
-        write_meta: WriteMeta,
-        initial_report: list[bytes],
-        send_slot_id: Optional[int] = None,
-    ) -> None:
+    def _retain_in_doubt_transfer(self, write_meta: WriteMeta, initial_report: list[bytes]) -> None:
         thread_idx = hash((write_meta.unique_rid, write_meta.peer_rank)) % self._num_threads
         key = (write_meta.task, write_meta.peer_rank)
         if key in self._pending_settlements[thread_idx]:
             return
-        pending = _PendingSettlement(write_meta, initial_report, send_slot_id)
+        pending = _PendingSettlement(write_meta, initial_report)
         self._pending_settlements[thread_idx][key] = pending
         try:
             self._get_result_dealer(write_meta.peer_endpoint).send(initial_report)
@@ -929,9 +1079,6 @@ class Sender(SenderBase):
                     if not meta.task.poll_in_doubt_physical_operation(meta.peer_rank):
                         continue
                     pending.backend_done = True
-                if pending.send_slot_id is not None:
-                    self._bounce.release_send(pending.send_slot_id)
-                    pending.send_slot_id = None
                 if meta.meta_type == WriteMetaType.AUX:
                     message = _make_aux_result_msg(
                         self._instance_rank, meta.unique_rid, AgentResult.FAILED_QUIESCED
@@ -1004,7 +1151,7 @@ class Sender(SenderBase):
             f"WriteMeta ptr/size mismatch for unique_rid={write_meta.unique_rid}"
         )
 
-        owned = self._enforce_physical_ownership
+        owned = self._owns_task(write_meta.task)
         with self._sessions_lock:
             session = self._get_session(write_meta.unique_rid)
         if session is None:
@@ -1045,7 +1192,7 @@ class Sender(SenderBase):
             task.fail(
                 RuntimeError(f"session {write_meta.unique_rid} {status.value}, transfer aborted")
             )
-            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+            self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True, owned=owned).send(
                 _make_kv_result_msg(
                     self._instance_rank,
                     write_meta.unique_rid,
@@ -1056,29 +1203,34 @@ class Sender(SenderBase):
             )
             return
 
-        from .bounce import build_send_request, encode_result_tail
-
         agent_result = AgentResult.SUCCESS
-        send_slot_id = None
         submitted_and_completed = False
+        backend_submitted = False
+        submission_callback: Optional[Callable[[], None]] = None
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+
+            def emit_submitted() -> None:
+                nonlocal backend_submitted
+                backend_submitted = True
+                self._emit_kv_transfer_event("ctx_backend_submitted", write_meta)
+
+            submission_callback = emit_submitted
         if write_meta.src_ptrs.size > 0:
             try:
-                request, send_slot_id = build_send_request(
-                    self._bounce,
-                    write_meta,
-                    lambda: Sender._make_agent_request(write_meta, device_id=self._device_id),
-                )
+                request = Sender._make_agent_request(write_meta, device_id=self._device_id)
             except Exception as e:
-                # Don't let a gather fault escape: without a result the receiver would hang and its
-                # region leak. Tell the receiver it failed and fail the local task instead.
+                # Report the failure instead of letting it escape: without a result the receiver
+                # waits until its transfer timeout. Nothing was submitted yet.
                 logger.error(
-                    f"_deliver_kv_to_agent: failed to build the KV send request for "
+                    f"_deliver_kv_to_agent: failed to build the KV transfer request for "
                     f"{write_meta.unique_rid} slice={write_meta.slice_id}: {e}"
                 )
                 if owned:
                     task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
-                task.fail(RuntimeError(f"build_send_request failed: {e}"))
-                self._get_result_dealer(write_meta.peer_endpoint, legacy_shared=True).send(
+                task.fail(RuntimeError(f"failed to build the KV transfer request: {e}"))
+                self._get_result_dealer(
+                    write_meta.peer_endpoint, legacy_shared=True, owned=owned
+                ).send(
                     _make_kv_result_msg(
                         self._instance_rank,
                         write_meta.unique_rid,
@@ -1090,15 +1242,22 @@ class Sender(SenderBase):
                 return
             if timer:
                 timer.record_transfer_start(write_meta.peer_rank)
-            transfer_finished = False
             try:
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_kv_transfer_event(
+                        "ctx_backend_submit_start", write_meta, include_transfer_entries=True
+                    )
+
                 transfer_finished, last_status = self._submit_transfer(
-                    task, write_meta.peer_rank, request
+                    task,
+                    write_meta.peer_rank,
+                    request,
+                    on_submitted=submission_callback,
                 )
                 if transfer_finished:
                     submitted_and_completed = True
                     del request
-                if not transfer_finished:
+                else:
                     agent_result = AgentResult.IN_DOUBT if owned else AgentResult.FAILED
                     agent_name = getattr(self._agent, "name", "<?>")
                     detail = (
@@ -1118,23 +1277,20 @@ class Sender(SenderBase):
                     task.fail(error)
             except _TransferNotSubmittedError as error:
                 # Backend admission failed, so local resources are safe to retire.
-                transfer_finished = True
                 agent_result = AgentResult.FAILED
                 task.fail(error)
-            finally:
-                if send_slot_id is not None and (not owned or transfer_finished):
-                    self._bounce.release_send(send_slot_id)
         elif owned:
             task.retire_unsubmitted_physical_operation(write_meta.peer_rank)
         if timer:
             timer.record_transfer_end(write_meta.peer_rank)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            if backend_submitted and agent_result != AgentResult.IN_DOUBT:
+                self._emit_kv_transfer_event(
+                    "ctx_backend_complete",
+                    write_meta,
+                    outcome=("completed" if agent_result == AgentResult.SUCCESS else "failed"),
+                )
 
-        # Report every chunk so failures reach the receiver immediately.
-        tail = (
-            encode_result_tail(write_meta)
-            if send_slot_id is not None and agent_result == AgentResult.SUCCESS
-            else None
-        )
         # Attested written bytes: only what was actually submitted to the
         # agent AND completed. The receiver checks the per-slice sum against
         # the byte total of its published destinations before admitting the
@@ -1148,6 +1304,7 @@ class Sender(SenderBase):
         transfer_size = 0
         if submitted_and_completed and agent_result == AgentResult.SUCCESS:
             transfer_size = int(write_meta.sizes.sum())
+        # Report every chunk so failures reach the receiver immediately.
         result_msg = _make_kv_result_msg(
             self._instance_rank,
             write_meta.unique_rid,
@@ -1155,10 +1312,9 @@ class Sender(SenderBase):
             write_meta.is_last_slice,
             agent_result,
             transfer_size=transfer_size,
-            tail=tail,
         )
         if agent_result == AgentResult.IN_DOUBT:
-            self._retain_in_doubt_transfer(write_meta, result_msg, send_slot_id)
+            self._retain_in_doubt_transfer(write_meta, result_msg)
             return
         self._get_result_dealer(write_meta.peer_endpoint).send(result_msg)
 
@@ -1199,7 +1355,7 @@ class Sender(SenderBase):
 
     @nvtx_range("_deliver_aux_to_agent")
     def _deliver_aux_to_agent(self, write_meta: WriteMeta):
-        owned = self._enforce_physical_ownership
+        owned = self._owns_task(write_meta.task)
         session = self._get_session(write_meta.unique_rid)
         if session is None:
             msg = f"_deliver_aux_to_agent: TxSession {write_meta.unique_rid} not found or already GC'd"
@@ -1319,6 +1475,16 @@ class Sender(SenderBase):
         fall out of the same intersection without any per-case arithmetic.
         Ordinals below ``dst_start_block`` are excluded as well.
         """
+        idx = Sender._paired_ordinals(src_block_ids, dst_block_ids, dst_start_block)
+        return src_block_ids[idx], dst_block_ids[idx]
+
+    @staticmethod
+    def _paired_ordinals(
+        src_block_ids: np.ndarray,
+        dst_block_ids: np.ndarray,
+        dst_start_block: int = 0,
+    ) -> np.ndarray:
+        """Table positions where both sides hold a block (see ``_pair_ordinals``)."""
         if src_block_ids.size != dst_block_ids.size:
             raise ValueError(
                 f"positional block tables differ in length: src={src_block_ids.size} "
@@ -1327,8 +1493,28 @@ class Sender(SenderBase):
         mask = (src_block_ids >= 0) & (dst_block_ids >= 0)
         if dst_start_block > 0:
             mask[:dst_start_block] = False
-        idx = np.flatnonzero(mask)
-        return src_block_ids[idx], dst_block_ids[idx]
+        return np.flatnonzero(mask)
+
+    @staticmethod
+    def _ring_position_ranges(
+        global_ordinals: np.ndarray,
+        tokens_per_block: int,
+        end_position: int,
+        retained_positions: int,
+    ) -> list[tuple[int, int]]:
+        """Most recent positions each ring page holds at ``end_position``.
+
+        A ring page holds only the positions of its own block, and of those
+        only the last ``retained_positions`` before ``end_position`` survive
+        in both rings.
+        """
+        first = max(0, end_position - retained_positions)
+        ranges = []
+        for ordinal in global_ordinals:
+            start = max(first, int(ordinal) * tokens_per_block)
+            end = min(end_position, (int(ordinal) + 1) * tokens_per_block)
+            ranges.append((start, max(start, end)))
+        return ranges
 
     @nvtx_range("_build_kv_write_meta")
     def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1395,7 +1581,8 @@ class Sender(SenderBase):
             else:
                 src_block_ids = np.asarray(src_block_ids, dtype=np.int64)
                 dst_block_ids = np.asarray(dst_block_ids, dtype=np.int64)
-                if peer_ri.cp_size > 1 and self_ri.cp_size == 1:
+                helix_stride = peer_ri.cp_size > 1 and self_ri.cp_size == 1
+                if helix_stride:
                     # Helix: the receiver owns global blocks [cp_rank::cp_size]
                     # (same protocol as partition_context_for_helix), so its
                     # table is the strided subset of ours; block reuse is
@@ -1409,9 +1596,10 @@ class Sender(SenderBase):
                 # held), so pairing is a plain intersection: SWA eviction, prefix
                 # reuse, and pipelined chunk bounds are all already encoded as
                 # holes by whichever side owns that state.
-                src_block_ids, dst_block_ids = Sender._pair_ordinals(
+                paired = Sender._paired_ordinals(
                     src_block_ids, dst_block_ids, dst_start_block=dst_start_block
                 )
+                src_block_ids, dst_block_ids = src_block_ids[paired], dst_block_ids[paired]
                 if src_block_ids.size == 0:
                     continue
                 src_region = extractor.extract(src_block_ids, self_lg, self_pi)
@@ -1419,7 +1607,24 @@ class Sender(SenderBase):
 
             # Map and collect fragments (same for all layer types)
             mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
+            if isinstance(mapper, RingMapper):
+                # A ring holds positions, not a region: move the positions both
+                # rings retain at the end of this piece into each side's slots.
+                global_ordinals = (
+                    paired * peer_ri.cp_size + peer_ri.cp_rank if helix_stride else paired
+                )
+                region_pair = mapper.map_positions(
+                    src_region.memory.ptrs,
+                    dst_region.memory.ptrs,
+                    Sender._ring_position_ranges(
+                        global_ordinals,
+                        tpb,
+                        int(token_range.end),
+                        mapper.retained_positions,
+                    ),
+                )
+            else:
+                region_pair = mapper.map(src_region, dst_region)
             region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
             for rp in region_pairs:
                 src_frag_parts.append(rp.src.memory.ptrs)
@@ -1442,7 +1647,9 @@ class Sender(SenderBase):
 
         if timer:
             timer.record_prepare_args_end(peer_ri.instance_rank)
-            timer.record_transfer_sizes(peer_ri.instance_rank, int(kv_sizes.sum()), dst_frags.size)
+        transfer_bytes = None
+        if timer is not None or disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            transfer_bytes = _capture_transfer_bytes(kv_sizes, timer, peer_ri.instance_rank)
 
         return WriteMeta(
             task=task,
@@ -1458,7 +1665,7 @@ class Sender(SenderBase):
             slice_id=task.slice_id,
             receiver_slice_id=req_info.slice_id if req_info.slice_id is not None else 0,
             is_last_slice=task._chunk.is_last,
-            bounce_dst_base=req_info.bounce_dst_base,
+            transfer_bytes=transfer_bytes,
         )
 
     def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
@@ -1524,7 +1731,7 @@ class Sender(SenderBase):
             try:
                 self._dispatch_task_to_peer(task, info)
             except Exception as error:
-                if not self._enforce_physical_ownership:
+                if not self._owns_task(task):
                     raise
                 if first_error is None:
                     first_error = error
@@ -1533,7 +1740,7 @@ class Sender(SenderBase):
 
     def _dispatch_task_to_peer(self, task: KVSendTask | AuxSendTask, info: RecvReqInfo) -> None:
         owned = False
-        if self._enforce_physical_ownership:
+        if self._owns_task(task):
             admission = self._begin_task_operation(task, info.instance_rank)
             if admission is None:
                 return
@@ -1542,6 +1749,13 @@ class Sender(SenderBase):
                 return
             owned = True
         try:
+            if (
+                owned
+                and getattr(self, "_context_first_ownership", False)
+                and task._params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            ):
+                peer = self._registrar.get_peer_rank_info(info.instance_name, info.instance_rank)
+                validate_context_first_peer(self._registrar.self_rank_info, peer)
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(info.instance_rank)
             trans_meta = (
@@ -1555,7 +1769,9 @@ class Sender(SenderBase):
         except Exception:
             if owned:
                 task.retire_unsubmitted_physical_operation(info.instance_rank)
-                self._send_failed_task_result_to_receiver(task, info)
+            # The receiver counts on one terminal result from every writer it
+            # asked; without it the request would wait out its transfer timeout.
+            self._send_failed_task_result_to_receiver(task, info)
             raise
 
     def _start_listener(self):
@@ -1614,19 +1830,24 @@ class Sender(SenderBase):
         session = None
         with self._sessions_lock:
             session = self._get_session(unique_rid)
-            if session is None or self._enforce_physical_ownership:
+            owned = (
+                session._enforce_physical_ownership
+                if session is not None
+                else self.ownership_enabled(context_first=len(message) == 4)
+            )
+            if session is None or owned:
                 # Parked with the peer as who asked: the session built afterwards reads its
                 # cancellation from here, and an id on its own would read as a local cancel.
-                if self._enforce_physical_ownership:
+                if owned:
                     self._pre_cancelled_rids.setdefault(unique_rid, True)
                 else:
                     self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
-            if self._enforce_physical_ownership:
+            if owned:
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
-        if self._enforce_physical_ownership and len(message) == 4:
+        if owned and len(message) == 4:
             # Routing is carried by CANCEL itself, not by expiring REQUEST_DATA.
             self._queue_session_quiescence(unique_rid, message[2].decode(), int(message[3]))
 
@@ -1683,21 +1904,57 @@ class Sender(SenderBase):
 
     @nvtx_range("_respond_with_kv")
     def _respond_with_kv(self, _send_id: bytes, message: list[bytes]):
+        try:
+            info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        except OlderReleaseRequestError as error:
+            # Answer instead of dropping, or the generation server waits out kv_transfer_timeout_ms.
+            info = error.req_info
+            logger.error_once(
+                f"Failing every request from generation server {info.instance_name} rank "
+                f"{info.instance_rank}: it runs an older TensorRT-LLM release. Context and "
+                "generation servers must run the same release. Each rejected request is logged "
+                "at DEBUG.",
+                key=("older_release_request", info.instance_name, info.instance_rank),
+            )
+            logger.debug(str(error))
+            self._send_failed_result_to_receiver(info)
+            return
         # _sessions_lock prevents a race between session lookup and req_info save.
         # session.lock atomically saves peer info and snapshots tasks against send().
-        info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
+        received_timestamp = None
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                received_timestamp = disagg_diagnostics.capture_timestamp()
         with self._sessions_lock:
             session = self._get_session(info.unique_rid)
             fenced = (
-                self._enforce_physical_ownership and info.unique_rid in self._pre_cancelled_rids
+                self.ownership_enabled(info.context_first)
+                and info.unique_rid in self._pre_cancelled_rids
             )
             if session is None and not fenced:
                 self._save_peer_req_info(info)
-                return
+        if received_timestamp is not None:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "ctx_request_data_received",
+                    side="ctx",
+                    request_id=info.unique_rid,
+                    request_id_scope=(
+                        disagg_diagnostics.get_request_id_scope(session._base_args.params)
+                        if session is not None
+                        else "unknown"
+                    ),
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=info.slice_id,
+                    peer_rank=info.instance_rank,
+                    peer_instance=info.instance_name,
+                    timestamp=received_timestamp,
+                )
         if fenced:
             self._queue_session_quiescence(info.unique_rid, info.instance_name, info.instance_rank)
             return
-        assert session is not None
+        if session is None:
+            return
         with session.lock:
             with self._sessions_lock:
                 if self._get_session(info.unique_rid) is not session or session._closed:
@@ -1831,7 +2088,7 @@ class Sender(SenderBase):
         *,
         defer_to_worker: bool,
     ) -> None:
-        if defer_to_worker or self._enforce_physical_ownership:
+        if defer_to_worker or self.ownership_enabled(info.context_first):
             # Listener-side rejection must share the worker's ordered stream;
             # it cannot overtake an ambiguous write's pending IN_DOUBT report.
             thread_idx = hash((info.unique_rid, info.instance_rank)) % self._num_threads
@@ -1902,7 +2159,11 @@ class Sender(SenderBase):
         with self._sessions_lock:
             if self._shutdown:
                 return
-            if self._enforce_physical_ownership and self._sessions:
+            if any(
+                (session := self._get_session(rid)) is not None
+                and session._enforce_physical_ownership
+                for rid in self._sessions
+            ):
                 raise RuntimeError("Sender refuses shutdown while transfer ownership is active")
             if any(self._pending_settlements):
                 raise RuntimeError("Sender refuses shutdown while settlement reports are pending")
@@ -1969,11 +2230,13 @@ class TxSession(TxSessionBase):
         self._overall_timeout_s = overall_timeout_s
         self._deadline_monotonic_s: Optional[float] = None
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._enforce_physical_ownership = getattr(sender, "_enforce_physical_ownership", False)
+        self._enforce_physical_ownership = Sender.ownership_enabled(
+            sender, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         self._sender: Sender  # narrow base class type for Pylance
         self.request_id = request_id
         self._retirement = None
-        if retirement_watchdog is not None:
+        if retirement_watchdog is not None and self._enforce_physical_ownership:
             if overall_timeout_s is None:
                 raise ValueError("deadline retirement requires the overall transfer timeout")
             self._retirement = retirement_watchdog.create_owner(
@@ -2060,6 +2323,76 @@ class TxSession(TxSessionBase):
             return SessionStatus.TRANSFERRING
         return SessionStatus.READY if self.receiver_ready else SessionStatus.INIT
 
+    def _timeout_progress_description(self) -> str:
+        """Describe observed send progress without advancing state or waiting.
+
+        Counts cover per-peer KV and AUX operations, not requests. They can
+        contain several phases at once and are not an all-receiver readiness
+        barrier or a snapshot of the earlier deadline-expiry instant.
+
+        Returns:
+            Best-effort local progress, with unavailable evidence explicit.
+        """
+        if not self.lock.acquire(blocking=False):
+            return "progress_at_observation=unavailable(session_busy)"
+        try:
+            tasks = list(self.kv_tasks)
+            source_pieces = len(tasks)
+            receiver_ready_seen = self.receiver_ready
+            if self.aux_task is not None:
+                tasks.append(self.aux_task)
+        finally:
+            self.lock.release()
+        prefix = (
+            f"progress_at_observation=tx source_pieces={source_pieces} "
+            f"receiver_readiness_seen={receiver_ready_seen}"
+        )
+        if not self._enforce_physical_ownership:
+            return f"{prefix} operation_phases=unavailable(ownership_disabled)"
+        counts = dict.fromkeys(_PhysicalOperationState, 0)
+        busy_tasks = 0
+        for task in tasks:
+            states = task._physical_owner.try_snapshot_operation_states()
+            if states is None:
+                busy_tasks += 1
+                continue
+            for state in states:
+                counts[state] += 1
+        phases = ",".join(
+            f"{'pre_submission' if state is _PhysicalOperationState.ADMITTED else state.value.lower()}={count}"
+            for state, count in counts.items()
+        )
+        return f"{prefix} operation_phases=[{phases}] unavailable_tasks={busy_tasks}"
+
+    def _emit_deadline_event(self, event: str, timer_start_s: float | None = None) -> None:
+        """Observe the native wait deadline without changing its policy.
+
+        Args:
+            event: Deadline-creation or expiry-observation event name.
+            timer_start_s: Existing monotonic clock reading that anchored the deadline.
+        """
+        with disagg_diagnostics.suppress_diagnostic_errors():
+            deadline = self._deadline_monotonic_s
+            if deadline is None:
+                return
+            timeout_s = self._overall_timeout_s
+            if timeout_s is None or timeout_s <= 0:
+                timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
+            disagg_diagnostics.emit_event(
+                event,
+                side="ctx",
+                request_id=self.disagg_request_id,
+                request_id_scope=disagg_diagnostics.get_request_id_scope(self._base_args.params),
+                local_request_id=self.request_id,
+                rank_info=self._sender._registrar.self_rank_info,
+                timeout_owner="native_tx_session",
+                timer_start_monotonic_ns=(
+                    int(timer_start_s * 1_000_000_000) if timer_start_s is not None else None
+                ),
+                deadline_monotonic_ns=int(deadline * 1_000_000_000),
+                timeout_ms=timeout_s * 1000,
+            )
+
     def send(self, chunk: Chunk) -> None:
         if self.transfer_start_time is None:
             self.transfer_start_time = tensorrt_llm.bindings.global_steady_clock_now()
@@ -2070,7 +2403,10 @@ class TxSession(TxSessionBase):
                 overall_timeout_s = self._overall_timeout_s
                 if overall_timeout_s is None or overall_timeout_s <= 0:
                     overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
-                self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+                timeout_start = time.monotonic()
+                self._deadline_monotonic_s = timeout_start + overall_timeout_s
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    self._emit_deadline_event("ctx_native_deadline_started", timeout_start)
             params = self._base_args.params
             slice_id = len(self.kv_tasks)
             task = KVSendTask(
@@ -2080,6 +2416,7 @@ class TxSession(TxSessionBase):
                 prompt_len=self._base_args.prompt_len,
             )
             task._unique_rid = self.disagg_request_id
+            task._enforce_physical_ownership = self._enforce_physical_ownership
             task.bind_logical_outcomes(self._logical_outcomes)
             self.kv_tasks.append(task)
             self._has_last_slice |= chunk.is_last
@@ -2110,6 +2447,7 @@ class TxSession(TxSessionBase):
                 params = self._base_args.params
                 task = AuxSendTask(params, self.aux_slot)
                 task._unique_rid = self.disagg_request_id
+                task._enforce_physical_ownership = self._enforce_physical_ownership
                 task.bind_logical_outcomes(self._logical_outcomes)
                 self.aux_task = task
                 if self._retirement is not None and self._has_last_slice:
@@ -2229,6 +2567,11 @@ class TxSession(TxSessionBase):
                 return False
             self._logical_outcomes.cancel(by_peer)
             self._terminal_status = SessionStatus.CANCELLED
+            if self._enforce_physical_ownership and not self._need_aux:
+                # The context may retire before GEN arrives. Preserve a fence
+                # so late REQUEST_DATA cannot recreate a writer for this ID.
+                with self._sender._sessions_lock:
+                    self._sender._pre_cancelled_rids.setdefault(self.disagg_request_id, by_peer)
             # Who asked is not recoverable later, and the two differ: the peer asking is a transfer
             # error, our own side asking is an ordinary end.
             self.cancelled_by_peer = by_peer
@@ -2295,7 +2638,10 @@ class TxSession(TxSessionBase):
                 overall_timeout_s = _FALLBACK_TX_OVERALL_TIMEOUT_S
             with self.lock:
                 if self._deadline_monotonic_s is None:
-                    self._deadline_monotonic_s = time.monotonic() + overall_timeout_s
+                    timeout_start = time.monotonic()
+                    self._deadline_monotonic_s = timeout_start + overall_timeout_s
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        self._emit_deadline_event("ctx_native_deadline_started", timeout_start)
 
         # ``_timeout_s`` bounds one scheduler wait slice. The separate absolute
         # deadline is shared by every KV task and aux; it is never reset by a
@@ -2328,6 +2674,8 @@ class TxSession(TxSessionBase):
                                 if self.has_failed()
                                 else WaitResult.COMPLETED
                             )
+                        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                            self._emit_deadline_event("ctx_native_deadline_observed")
                         return WaitResult.TIMEOUT
                 timeout_s = wait_slice_s if remaining_s is None else min(wait_slice_s, remaining_s)
                 task.wait(timeout=timeout_s)
@@ -2449,32 +2797,30 @@ class KVRecvTask(_LogicalTask):
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
         self._physical_owner: Optional[_ReceiveOperationOwner] = None
-        self._ownership_state_lock: Optional[threading.Lock] = None
 
     def fail(self, exc: Exception) -> None:
+        """Mark the task ERROR.
+
+        Callers hold the owning RxSession.lock, unless that session is already closed and
+        unregistered (then no other thread can reach the task).
+        """
         self._logical_outcomes.fail(exc)
-        if self._ownership_state_lock is None:
-            self._exception = exc
-            self.status = TaskStatus.ERROR
-            self._event.set()
-            return
-        with self._ownership_state_lock:
-            self._exception = exc
-            self.status = TaskStatus.ERROR
-            self._event.set()
+        self._exception = exc
+        self.status = TaskStatus.ERROR
+        self._event.set()
 
     def complete(self) -> None:
-        if self._ownership_state_lock is None:
-            self._logical_outcomes.complete(self._logical_index)
-            self.status = TaskStatus.TRANSFERRED
-            self._event.set()
+        """Mark the task TRANSFERRED unless it already failed.
+
+        Callers hold the owning RxSession.lock, which makes this check-then-set atomic against
+        fail(). Status is set before _event, so a thread woken by _event reads the status that
+        complete() set.
+        """
+        if self.status == TaskStatus.ERROR:
             return
-        with self._ownership_state_lock:
-            if self.status == TaskStatus.ERROR:
-                return
-            self._logical_outcomes.complete(self._logical_index)
-            self.status = TaskStatus.TRANSFERRED
-            self._event.set()
+        self._logical_outcomes.complete(self._logical_index)
+        self.status = TaskStatus.TRANSFERRED
+        self._event.set()
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """Block until terminal state. Returns True if done, False on timeout."""
@@ -2535,7 +2881,6 @@ class KVRecvTask(_LogicalTask):
     def begin_publication(self) -> None:
         if self._physical_owner is None:
             self._physical_owner = _ReceiveOperationOwner(self._retirement)
-            self._ownership_state_lock = threading.Lock()
         self._physical_owner.begin_publication()
 
     def _get_physical_owner(self) -> _ReceiveOperationOwner:
@@ -2561,21 +2906,8 @@ class KVRecvTask(_LogicalTask):
     def record_writer_settlement(self, peer_rank: int) -> bool:
         return self._get_physical_owner().record_writer_settlement(peer_rank)
 
-    def record_writer_result(
-        self,
-        peer_rank: int,
-        succeeded: bool,
-        *,
-        wait_for_local_completion: bool,
-    ) -> tuple[bool, bool]:
-        return self._get_physical_owner().record_writer_result(
-            peer_rank,
-            succeeded,
-            wait_for_local_completion=wait_for_local_completion,
-        )
-
-    def finish_local_completion(self) -> None:
-        self._get_physical_owner().finish_local_completion()
+    def record_writer_result(self, peer_rank: int, succeeded: bool) -> tuple[bool, bool]:
+        return self._get_physical_owner().record_writer_result(peer_rank, succeeded)
 
     @property
     def resources_drained(self) -> bool:
@@ -2599,16 +2931,14 @@ class Receiver(ReceiverBase):
         self,
         peer_registrar: PeerRegistrar,
         agent: BaseTransferAgent,
-        bounce=None,
         enforce_physical_ownership: bool = False,
         retirement_watchdog: Optional[RetirementWatchdog] = None,
+        context_first_ownership: bool = False,
     ):
         self._registrar = peer_registrar
         self._agent = agent
-        self._bounce = bounce
-        # Internal component gate only. Production wiring is added after the
-        # complete Phase 1 ownership path is available and qualified.
         self._enforce_physical_ownership = enforce_physical_ownership
+        self._context_first_ownership = context_first_ownership
         self._retirement_watchdog = retirement_watchdog
         self._dealers = {}
         self._sender_ep_instance_map = {}
@@ -2617,6 +2947,9 @@ class Receiver(ReceiverBase):
         # without re-validating. Executor-thread-only access, no lock (same
         # discipline as _sender_ep_instance_map).
         self._incompatible_peers: dict[str, str] = {}
+        # Context-first protection has a narrower profile than legacy transfers;
+        # its failures must not poison unrelated requests to the same endpoint.
+        self._context_first_incompatible_peers: dict[str, str] = {}
 
         self._messenger = ZMQMessenger(mode="ROUTER")
         self._sessions = {}  # unique_rid -> RxSession
@@ -2636,6 +2969,19 @@ class Receiver(ReceiverBase):
     def endpoint(self):
         return self._messenger.endpoint
 
+    def ownership_enabled(self, context_first: bool) -> bool:
+        """Select physical protection for the locally qualified request workflow.
+
+        Args:
+            context_first: Whether the request uses context-first scheduling.
+
+        Returns:
+            Whether publication and retirement require ownership evidence.
+        """
+        return getattr(self, "_enforce_physical_ownership", False) or (
+            getattr(self, "_context_first_ownership", False) and context_first
+        )
+
     def shutdown(self):
         watchdog = getattr(self, "_retirement_watchdog", None)
         if watchdog is not None:
@@ -2644,7 +2990,11 @@ class Receiver(ReceiverBase):
         with self._sessions_lock:
             if self._shutdown:
                 return
-            if self._enforce_physical_ownership and self._sessions:
+            if any(
+                (session := self._resolve_session_entry(rid, entry)) is not None
+                and session._enforce_physical_ownership
+                for rid, entry in self._sessions.items()
+            ):
                 raise RuntimeError("Receiver refuses shutdown while transfer ownership is active")
             self._shutdown = True
         for dealer in self._dealers.values():
@@ -2754,57 +3104,8 @@ class Receiver(ReceiverBase):
             dst_start_token=None,
             aux_slot=task._aux_slot,
             slice_id=task.slice_id,
+            context_first=task._params.schedule_style != DisaggScheduleStyle.GENERATION_FIRST,
         )
-
-    @staticmethod
-    def _fanin_bounce_safe(
-        overlap: PeerOverlap,
-        peer_ri: RankInfo,
-        receiver_page_table: Optional[KVCachePageTable],
-    ) -> bool:
-        """Whether multi-writer bounce's equal total//num_writers split is valid for this overlap.
-        The split assumes every writer contributes the same size, which holds when:
-          * duplicate_head_factor == 1 -- else some ranks don't send KV yet still count in
-            expected_transfers, so the live writers overflow their slots;
-          * the PP layer split is even -- a single PP stage (overlap_pp_size <= 1) is trivially fine;
-            for PP fan-in, every overlapping stage must hold the same number of layers
-            (peer_ri.layer_num_per_pp all-equal) or per-writer sizes differ. If that full per-stage
-            list isn't available (shorter than the fan-in degree), be conservative and fall back.
-        Otherwise fall back to the per-fragment path (correct, just not coalesced).
-        Equal layer count means equal bytes only when the per-block sizes match; reserve() rejects
-        the mismatched case, so this only needs the count to split evenly."""
-        if overlap.duplicate_head_factor != 1:
-            return False
-        if overlap.overlap_pp_size > 1:
-            lpp = getattr(peer_ri, "layer_num_per_pp", None)
-            if not lpp or len(lpp) < overlap.overlap_pp_size or len(set(lpp)) != 1:
-                return False
-        # Replicated pools (e.g. MiniMax M3 index-key) are sent by one elected
-        # fan-in owner only, so with multiple writers their contributions
-        # differ in size and the equal split is invalid. Inspect both endpoints:
-        # a masked PP stage may advertise no replicated view even though another
-        # stage owns one that is visible in the receiver's page table.
-        if len(overlap.ranks) > 1:
-            for page_table in (peer_ri.page_table, receiver_page_table):
-                if page_table is None:
-                    continue
-                for layer_group in page_table.layer_groups:
-                    for pool_view in getattr(layer_group, "pool_views", ()):
-                        if pool_view.mapper_kind == MapperKind.REPLICATED:
-                            return False
-        return True
-
-    def _get_mamba_slot(self, req_info: RecvReqInfo) -> Optional[int]:
-        """Extract the mamba slot index from block_ids_per_layer_groups, or None."""
-        pt = self._registrar.self_extractor.page_table
-        if pt is None:
-            return None
-        for lg_idx, lg in enumerate(pt.layer_groups):
-            if lg.kind == CacheKind.STATE:
-                block_ids = req_info.block_ids_per_layer_groups[lg_idx]
-                if block_ids.size > 0:
-                    return int(block_ids[0])
-        return None
 
     def dispatch_task(self, task: KVRecvTask) -> None:
         params = task._params
@@ -2813,8 +3114,29 @@ class Receiver(ReceiverBase):
         )
         receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
+        protected_context_first = (
+            task._enforce_physical_ownership
+            and getattr(self, "_context_first_ownership", False)
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         try:
+            if protected_context_first:
+                info_endpoint = self._extract_info_endpoint(params)
+                cached_error = self._context_first_incompatible_peers.get(info_endpoint)
+                if cached_error is not None:
+                    raise PeerIncompatibleError(cached_error)
             peer_infos: RankInfo = self._get_sender_info(params)
+            if protected_context_first:
+                try:
+                    validate_context_first_peer(self._registrar.self_rank_info, peer_infos)
+                except ValueError as error:
+                    message = (
+                        f"context peer at '{info_endpoint}' cannot provide requested KV "
+                        f"lifecycle enforcement: {error}; restart this generation worker "
+                        "to re-validate after correcting the peer configuration"
+                    )
+                    self._context_first_incompatible_peers[info_endpoint] = message
+                    raise PeerIncompatibleError(message) from error
         except PeerIncompatibleError as e:
             # Fail only this request via the normal transfer-error path
             # (task ERROR -> session ERROR -> WaitResult.FAILED ->
@@ -2824,20 +3146,24 @@ class Receiver(ReceiverBase):
             # globally once any rank fails here — ranks whose page table has
             # no recurrent layers (e.g. a hybrid-model PP stage) pass
             # validation and may still run a transfer that is then
-            # discarded. The task is already in the session's _kv_tasks, no
-            # bounce reservation exists yet, and session._sender_endpoints
-            # is still empty, so the unpublished owner can close locally.
+            # discarded. The task is already in the session's _kv_tasks and
+            # session._sender_endpoints is still empty, so the unpublished
+            # owner can close locally.
             logger.error(
                 "dispatch_task: context peer incompatible, failing request "
                 f"unique_rid={task._unique_rid}: {e}"
             )
-            if self._enforce_physical_ownership:
-                session = self._get_session(task._unique_rid)
-                if session is None:
+            session = self._get_session(task._unique_rid)
+            if session is None:
+                # Closed and unregistered: no listener or executor path can reach this task any more.
+                if task._enforce_physical_ownership:
                     task.cancel_unpublished()
-                else:
-                    session.cancel_unpublished_task(task)
-            task.fail(e)
+                task.fail(e)
+                return
+            if task._enforce_physical_ownership:
+                session.cancel_unpublished_task(task)
+            with session.lock:
+                task.fail(e)
             return
 
         if sender_dp_rank is not None:
@@ -2868,39 +3194,6 @@ class Receiver(ReceiverBase):
             task.expected_transfers = len(peer_overlap.ranks)
         else:
             task.expected_transfers = len(dp0_overlap.ranks)
-        # TP fan-in splits ONE region equally, so allow it only for a uniform writer set:
-        # _fanin_bounce_safe() (TP-by-head / even-PP), and never under ADP broadcast (sender_dp_rank
-        # None), where the real writer count exceeds expected_transfers and would overflow the slot.
-        topo_overlap = peer_overlap if sender_dp_rank is not None else dp0_overlap
-        # Helix writers contribute unequal shares (one KV owner, one state
-        # sender, the rest empty), so the fan-in equal split would overflow
-        # into neighboring reservations; use the per-fragment path.
-        cp_involved = self._registrar.self_rank_info.cp_size > 1 or peer_infos.cp_size > 1
-        allow_bounce = task.expected_transfers == 1 or (
-            sender_dp_rank is not None
-            and not cp_involved
-            and self._fanin_bounce_safe(
-                topo_overlap,
-                peer_infos,
-                self._registrar.self_extractor.page_table,
-            )
-        )
-        # Recurrent (mamba/KDA) state rides the SAME coalesced write as the KV blocks,
-        # so the bounce region must be sized for those bytes too.
-        extra_bytes = 0
-        mamba_dst_slot = self._get_mamba_slot(receiver_req)
-        if mamba_dst_slot is not None:
-            if peer_infos.page_table is None:
-                allow_bounce = False  # cannot size the recurrent-state payload
-            else:
-                extra_bytes = mamba_receiver_payload_bytes(
-                    sender_page_table=peer_infos.page_table,
-                    receiver_page_table=self._registrar.self_extractor.page_table,
-                    dst_slot=mamba_dst_slot,
-                )
-        bounced = allow_bounce and self._bounce.reserve(
-            receiver_req, task.expected_transfers, extra_bytes=extra_bytes
-        )
         session = self._get_session(task._unique_rid)
         if session is None:
             raise RuntimeError(
@@ -2908,46 +3201,55 @@ class Receiver(ReceiverBase):
                 "session may have been closed before dispatch"
             )
         sender_endpoints = {peer_infos.sender_endpoints[rank] for rank in peer_overlap.ranks}
-        # Fan-in: each sender gets its own sub-region base (writers must not overwrite); else serialize once.
-        fanin_bounce = bounced and task.expected_transfers > 1
-        key = (receiver_req.unique_rid, receiver_req.slice_id)
-        receiver_req_bytes = None if fanin_bounce else receiver_req.to_bytes()
-        if not self._enforce_physical_ownership:
+        receiver_req_bytes = receiver_req.to_bytes()
+        if not session._enforce_physical_ownership:
             session.mark_transferring(task.slice_id)
             # Cache sender endpoints so cancel() can send CANCEL_SESSION to them.
             session._sender_endpoints.update(sender_endpoints)
-            for i, rank in enumerate(peer_overlap.ranks):
+            for rank in peer_overlap.ranks:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
-                if fanin_bounce:
-                    receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
-                    receiver_req_bytes = receiver_req.to_bytes()
+                send_timestamp = None
+                if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        send_timestamp = disagg_diagnostics.capture_timestamp()
                 self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
+                if send_timestamp is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        disagg_diagnostics.emit_event(
+                            "gen_request_data_sent",
+                            side="gen",
+                            request_id=receiver_req.unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=receiver_req.slice_id,
+                            peer_rank=rank,
+                            timestamp=send_timestamp,
+                        )
             return
 
         peer_ranks = list(peer_overlap.ranks)
-        serialized_requests: list[tuple[int, bytes]] = []
-        for i, rank in enumerate(peer_ranks):
-            if fanin_bounce:
-                receiver_req.bounce_dst_base = self._bounce.writer_base(key, i)
-                payload = receiver_req.to_bytes()
-            else:
-                assert receiver_req_bytes is not None
-                payload = receiver_req_bytes
-            serialized_requests.append((rank, payload))
-
         published_writers: set[int] = set()
+        published_writer_timestamps: Optional[
+            list[tuple[int, disagg_diagnostics.DiagnosticTimestamp]]
+        ] = [] if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED else None
 
         def publish_requests() -> None:
-            for rank, payload in serialized_requests:
+            for rank in peer_ranks:
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(rank)
+                send_timestamp = None
+                if published_writer_timestamps is not None:
+                    with disagg_diagnostics.suppress_diagnostic_errors():
+                        send_timestamp = disagg_diagnostics.capture_timestamp()
                 published_writers.add(rank)
                 try:
-                    self._request_sender_data(peer_infos.sender_endpoints[rank], payload)
+                    self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req_bytes)
                 except Exception:
                     published_writers.discard(rank)
                     raise
+                if published_writer_timestamps is not None and send_timestamp is not None:
+                    published_writer_timestamps.append((rank, send_timestamp))
 
         # Gen-first ADP publishes the destination to every eligible DP group,
         # but the qualified immutable-request, no-retry/no-reroute profile
@@ -2956,17 +3258,30 @@ class Receiver(ReceiverBase):
         writer_cohort = (
             set(peer_ranks) if sender_dp_rank is not None or peer_infos.dp_size == 1 else None
         )
-        if not session.try_begin_transfer(
-            task.slice_id,
-            sender_endpoints,
-            writer_cohort,
-            writer_candidates=set(peer_ranks),
-            publish=publish_requests,
-            published_writers=published_writers,
-        ):
-            self._bounce.release_idle_reservation(key)
-            task.cancel_unpublished()
-        return
+        try:
+            if not session.try_begin_transfer(
+                task.slice_id,
+                sender_endpoints,
+                writer_cohort,
+                writer_candidates=set(peer_ranks),
+                publish=publish_requests,
+                published_writers=published_writers,
+            ):
+                task.cancel_unpublished()
+        finally:
+            if published_writer_timestamps:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    for rank, send_timestamp in published_writer_timestamps:
+                        disagg_diagnostics.emit_event(
+                            "gen_request_data_sent",
+                            side="gen",
+                            request_id=receiver_req.unique_rid,
+                            request_id_scope=disagg_diagnostics.get_request_id_scope(task._params),
+                            rank_info=self._registrar.self_rank_info,
+                            slice_id=receiver_req.slice_id,
+                            peer_rank=rank,
+                            timestamp=send_timestamp,
+                        )
 
     @staticmethod
     def _extract_info_endpoint(params: DisaggregatedParams) -> str:
@@ -3024,6 +3339,7 @@ class Receiver(ReceiverBase):
                     self._registrar.self_extractor.page_table,
                     sender_info.page_table,
                 )
+                self._registrar.validate_view_head_geometry(sender_info)
             except ValueError as e:
                 msg = (
                     f"context peer at '{info_endpoint}' is incompatible: {e} "
@@ -3049,7 +3365,8 @@ class Receiver(ReceiverBase):
     def send_cancel_to_senders(self, unique_rid: int, sender_endpoints: set[str]) -> set[str]:
         """Notify senders and return the endpoints whose cancel message was sent."""
         message = [MessageType.CANCEL_SESSION, str(unique_rid).encode("ascii")]
-        if self._enforce_physical_ownership:
+        session = self._get_session(unique_rid)
+        if session is not None and session._enforce_physical_ownership:
             rank_info = self._registrar.self_rank_info
             message.extend(
                 [rank_info.instance_name.encode(), str(rank_info.instance_rank).encode("ascii")]
@@ -3098,11 +3415,9 @@ class Receiver(ReceiverBase):
 
     def _process_session_quiesced(self, message: list[bytes]) -> None:
         """Dispatch no-future-access proof only to the matching live request."""
-        if not self._enforce_physical_ownership:
-            return
         peer_rank, unique_rid = int(message[1]), int(message[2])
         session = self._get_session(unique_rid)
-        if session is not None:
+        if session is not None and session._enforce_physical_ownership:
             session.process_session_quiesced(peer_rank)
 
     def _handle_cancel_session(self, message: list[bytes]):
@@ -3116,7 +3431,7 @@ class Receiver(ReceiverBase):
                 # cancellation from here, and an id on its own would read as a local cancel.
                 self._pre_cancelled_rids[unique_rid] = True
         if session is not None:
-            if self._enforce_physical_ownership:
+            if session._enforce_physical_ownership:
                 session.cancel_local(by_peer=True)
             else:
                 session.cancel(by_peer=True)
@@ -3128,25 +3443,44 @@ class Receiver(ReceiverBase):
             )
             return
         peer_rank, unique_rid, receiver_slice_id, is_last_slice, status_code, transfer_size = (
-            _KV_RESULT_PREFIX.unpack(message[1])
+            _KV_RESULT_FRAME.unpack(message[1])
         )
-        from .bounce import decode_result_tail
-
-        dst_ptrs, sizes, src_base = decode_result_tail(message)
         session = self._get_session(unique_rid)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                diagnostic_result = _AGENT_RESULT_BY_CODE.get(status_code)
+                disagg_diagnostics.emit_event(
+                    "gen_writer_result_received",
+                    side="gen",
+                    request_id=unique_rid,
+                    request_id_scope=(
+                        disagg_diagnostics.get_request_id_scope(session._base_args.params)
+                        if session is not None
+                        else "unknown"
+                    ),
+                    rank_info=self._registrar.self_rank_info,
+                    slice_id=receiver_slice_id,
+                    peer_rank=peer_rank,
+                    outcome=(
+                        diagnostic_result.value.lower()
+                        if diagnostic_result is not None
+                        else f"unknown:{status_code}"
+                    ),
+                    is_last_slice=is_last_slice,
+                    transfer_bytes=transfer_size,
+                    session_found=session is not None,
+                )
         if session is None:
             logger.warning(
                 f"_process_kv_agent_result: session {unique_rid} not found (already closed?), dropping status"
             )
             return
+        agent_result = _AGENT_RESULT_BY_CODE[status_code]
         session.process_kv_agent_result(
             peer_rank,
             receiver_slice_id,
             is_last_slice,
-            _AGENT_RESULT_BY_CODE[status_code],
-            dst_ptrs=dst_ptrs,
-            sizes=sizes,
-            src_base=src_base,
+            agent_result,
             transfer_size=transfer_size,
         )
 
@@ -3199,11 +3533,13 @@ class RxSession(RxSessionBase):
         super().__init__(receiver, SessionArgsBase(params, prompt_len=prompt_len))
         self._timeout_s = timeout_s
         self._need_aux = params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        self._enforce_physical_ownership = getattr(receiver, "_enforce_physical_ownership", False)
+        self._enforce_physical_ownership = Receiver.ownership_enabled(
+            receiver, params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+        )
         self._receiver: Receiver  # narrow base class type for Pylance
         self.request_id = request_id
         self._retirement = None
-        if retirement_watchdog is not None:
+        if retirement_watchdog is not None and self._enforce_physical_ownership:
             if timeout_s is None:
                 raise ValueError("deadline retirement requires the transfer timeout")
             self._retirement = retirement_watchdog.create_owner(request_id, "receive", timeout_s)
@@ -3323,6 +3659,57 @@ class RxSession(RxSessionBase):
                 return SessionStatus.TRANSFERRING
         return SessionStatus.INIT
 
+    def _timeout_progress_description(self) -> str:
+        """Describe local receive evidence without polling lifecycle or backend state.
+
+        Counts include KV and AUX owners. Publication and writer results do
+        not establish when the remote sender submitted work to its backend.
+
+        Returns:
+            Observation-time local evidence, with remote submission unknown.
+        """
+        if not self.lock.acquire(blocking=False):
+            return "progress_at_observation=unavailable(session_busy) ctx_submission=unknown"
+        try:
+            owners = [task._physical_owner for task in self._kv_tasks]
+            if self._aux_physical_owner is not None:
+                owners.append(self._aux_physical_owner)
+            publication_escaped = self._publication_may_have_escaped
+        finally:
+            self.lock.release()
+        prefix = "progress_at_observation=rx ctx_submission=unknown"
+        if not self._enforce_physical_ownership:
+            return f"{prefix} receive_phases=unavailable(ownership_disabled)"
+        prefix += f" publication_may_have_escaped={publication_escaped}"
+        counts = dict.fromkeys(
+            (
+                "unpublished_owners",
+                "publication_pending",
+                "expected_writer_results",
+                "received_writer_results",
+                "in_doubt_writers",
+                "unavailable_owners",
+            ),
+            0,
+        )
+        for owner in owners:
+            if owner is None:
+                counts["unpublished_owners"] += 1
+                continue
+            if not owner._lock.acquire(blocking=False):
+                counts["unavailable_owners"] += 1
+                continue
+            try:
+                counts["unpublished_owners"] += owner._expected_writers is None
+                counts["publication_pending"] += owner._publication_pending
+                counts["expected_writer_results"] += owner._expected_writers or 0
+                counts["received_writer_results"] += len(owner._writer_results)
+                counts["in_doubt_writers"] += len(owner._in_doubt_writers)
+            finally:
+                owner._lock.release()
+        phases = ",".join(f"{name}={count}" for name, count in counts.items())
+        return f"{prefix} receive_phases=[{phases}]"
+
     def try_begin_transfer(
         self,
         slice_id: int,
@@ -3390,10 +3777,6 @@ class RxSession(RxSessionBase):
                     # send transfers responsibility to that writer; a failed
                     # send does not. Retain only the successfully queued prefix
                     # and wait for each of those writers to settle.
-                    self._receiver._bounce.abort_publication(
-                        (self.disagg_request_id, task.slice_id),
-                        published_writers,
-                    )
                     task.abort_publication(published_writers)
                     if self._aux_physical_owner is not None:
                         self._aux_physical_owner.abort_publication(published_writers)
@@ -3434,6 +3817,7 @@ class RxSession(RxSessionBase):
             expected_write_bytes=expected_write_bytes,
         )
         task.bind_logical_outcomes(self._logical_outcomes)
+        task._enforce_physical_ownership = self._enforce_physical_ownership
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
 
@@ -3454,6 +3838,7 @@ class RxSession(RxSessionBase):
                 expected_write_bytes=expected_write_bytes,
             )
             task.bind_logical_outcomes(self._logical_outcomes)
+            task._enforce_physical_ownership = self._enforce_physical_ownership
             task.begin_publication()
             self._kv_tasks.append(task)
             if self._retirement is not None and chunk.is_last:
@@ -3478,10 +3863,7 @@ class RxSession(RxSessionBase):
         try:
             self._receiver.dispatch_task(task)
         except Exception as error:
-            if self.cancel_unpublished_task(task):
-                self._receiver._bounce.release_idle_reservation(
-                    (self.disagg_request_id, task.slice_id)
-                )
+            self.cancel_unpublished_task(task)
             self.fail_admission(error)
             raise
 
@@ -3512,9 +3894,6 @@ class RxSession(RxSessionBase):
         receiver_slice_id: int,
         is_last_slice: bool,
         status: AgentResult,
-        dst_ptrs=None,
-        sizes=None,
-        src_base=None,
         transfer_size: int = 0,
     ):
         with self._ownership_evidence_guard(), self.lock:
@@ -3560,22 +3939,16 @@ class RxSession(RxSessionBase):
                 if not self._enforce_physical_ownership:
                     raise RuntimeError("received physical settlement without ownership enabled")
                 try:
-                    accepted = task.record_writer_settlement(peer_rank)
+                    task.record_writer_settlement(peer_rank)
                 except Exception as error:
                     self._record_ownership_evidence_error(error)
                     raise
-                if accepted:
-                    self._receiver._bounce.record_failure(
-                        (self.disagg_request_id, task.slice_id), peer_rank
-                    )
                 return
             if self._enforce_physical_ownership:
                 if status == AgentResult.FAILED or is_last_slice:
                     try:
                         accepted, all_succeeded = task.record_writer_result(
-                            peer_rank,
-                            status == AgentResult.SUCCESS,
-                            wait_for_local_completion=(status == AgentResult.SUCCESS),
+                            peer_rank, status == AgentResult.SUCCESS
                         )
                     except Exception as error:
                         task.fail(error)
@@ -3600,71 +3973,47 @@ class RxSession(RxSessionBase):
                 # attestation of destination bytes actually submitted and
                 # completed for this chunk (0 unless the write completed).
                 task.verified_write_bytes += transfer_size
-
-                from .bounce import scatter_write_result
-
-                on_done = None
-                if is_last_slice and all_succeeded:
-                    # Completing message: defer task.complete()+perf until the scatter has actually
-                    # landed. scatter_write_result fires this inline for the non-bounced path, or on
-                    # the scatter worker (after cudaStreamSynchronize) for the bounced path, so the
-                    # gen consumer never observes completion before the KV is scattered into place.
-                    request_id = self.request_id
+                # Once every expected writer has reported success for the last slice, complete the
+                # task and log perf, unless the task has already failed.
+                if is_last_slice and all_succeeded and task.status != TaskStatus.ERROR:
+                    destination_timestamp = None
+                    if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            destination_timestamp = disagg_diagnostics.capture_timestamp()
+                    task.complete()
+                    # Record completion before best-effort diagnostics.
+                    if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
+                        self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
                     ri = self._receiver._registrar.self_rank_info
-                    instance_name, instance_rank = ri.instance_name, ri.instance_rank
-
-                    def on_done(
-                        success,
-                        task=task,
-                        peer_rank=peer_rank,
-                        receiver_slice_id=receiver_slice_id,
-                        request_id=request_id,
-                        instance_name=instance_name,
-                        instance_rank=instance_rank,
-                    ):
-                        # Runs on the scatter worker thread for the bounced path. Do not acquire
-                        # RxSession.lock here: the non-bounced path invokes this callback inline
-                        # while already holding it. Task outcome/ownership locks are independent.
-                        # complete() sets status before _event for wait_complete's status-first poll.
-                        if self._enforce_physical_ownership:
-                            task.finish_local_completion()
-                        if not success:
-                            task.fail(
-                                RuntimeError(
-                                    f"KV bounce scatter failed for request {request_id} "
-                                    f"slice={receiver_slice_id}"
-                                )
-                            )
-                            return
-                        if task.status == TaskStatus.ERROR:
-                            return  # a concurrent FAILED writer already failed it; don't un-fail
-                        task.complete()
-                        # Record completion before best-effort diagnostics can block the worker.
-                        if all(t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks):
-                            self.transfer_end_time = tensorrt_llm.bindings.global_steady_clock_now()
-                        try:
-                            if task._perf_timer is not None:
-                                task._perf_timer.record_task_end(peer_rank)
-                            task.print_perf_info(peer_rank, instance_name, instance_rank)
-                        except Exception as e:  # perf is best-effort; never block completion
-                            logger.warning(
-                                f"KV transfer perf logging failed for request {request_id} "
-                                f"slice={receiver_slice_id}: {e}"
-                            )
-                        logger.debug(
-                            f"KV transfer complete for request {request_id} "
-                            f"slice={receiver_slice_id}"
+                    try:
+                        if task._perf_timer is not None:
+                            task._perf_timer.record_task_end(peer_rank)
+                        task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+                    except Exception as e:  # perf is best-effort; never block completion
+                        logger.warning(
+                            f"KV transfer perf logging failed for request {self.request_id} "
+                            f"slice={receiver_slice_id}: {e}"
                         )
-
-                scatter_write_result(
-                    self._receiver._bounce,
-                    (self.disagg_request_id, task.slice_id),
-                    peer_rank,
-                    dst_ptrs,
-                    sizes,
-                    src_base,
-                    on_done,
-                )
+                    if destination_timestamp is not None:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            disagg_diagnostics.emit_event(
+                                "gen_destination_complete",
+                                side="gen",
+                                request_id=self.disagg_request_id,
+                                request_id_scope=disagg_diagnostics.get_request_id_scope(
+                                    task._params
+                                ),
+                                local_request_id=self.request_id,
+                                rank_info=ri,
+                                slice_id=receiver_slice_id,
+                                peer_rank=peer_rank,
+                                outcome="completed",
+                                timestamp=destination_timestamp,
+                            )
+                    logger.debug(
+                        f"KV transfer complete for request {self.request_id} "
+                        f"slice={receiver_slice_id}"
+                    )
             elif status == AgentResult.FAILED:
                 detail = (
                     f"KV transfer failed for request {self.request_id} "
@@ -3673,11 +4022,6 @@ class RxSession(RxSessionBase):
                     f"(reported by remote agent; see sender-side log for nixl_status)"
                 )
                 logger.error(detail)
-                # Drain-before-release: record this writer FAILED; the owner frees the shared region
-                # only once every fan-in writer is terminal (freeing now could race a sibling's RMA).
-                self._receiver._bounce.record_failure(
-                    (self.disagg_request_id, task.slice_id), peer_rank
-                )
                 task.fail(RuntimeError(detail))
                 if self._terminal_status is None:  # Don't overwrite CANCELLED with ERROR
                     self._terminal_status = SessionStatus.ERROR
@@ -3727,9 +4071,7 @@ class RxSession(RxSessionBase):
             if self._aux_physical_owner is not None:
                 try:
                     accepted, all_succeeded = self._aux_physical_owner.record_writer_result(
-                        peer_rank,
-                        status == AgentResult.SUCCESS,
-                        wait_for_local_completion=False,
+                        peer_rank, status == AgentResult.SUCCESS
                     )
                 except Exception as error:
                     self._aux_status = TaskStatus.ERROR
@@ -3832,20 +4174,10 @@ class RxSession(RxSessionBase):
             self.cancelled_by_peer = by_peer
             exc = RuntimeError(f"RxSession {self.disagg_request_id} cancelled")
             for task in self._kv_tasks:
-                rid_slice = (self.disagg_request_id, task.slice_id)
                 if task.status == TaskStatus.INIT:
                     if self._enforce_physical_ownership:
                         task.cancel_unpublished()
-                    self._receiver._bounce.release_idle_reservation(rid_slice)
                     task.fail(exc)
-                else:
-                    has_active_access = (
-                        not task.resources_drained
-                        if self._enforce_physical_ownership
-                        else task.status == TaskStatus.TRANSFERRING
-                    )
-                    if has_active_access:
-                        self._receiver._bounce.orphan_reservation(rid_slice)
             if self._aux_physical_owner is not None and not self._publication_may_have_escaped:
                 self._aux_physical_owner.cancel_unpublished()
             return True
@@ -3993,10 +4325,6 @@ class RxSession(RxSessionBase):
             self.aux_slot = None
         # Unregister from Receiver; keep fields alive for in-flight listener messages.
         if self._receiver is not None:
-            # Reclaim any bounce region still live at teardown (closed mid-transfer) so it isn't
-            # leaked; a no-op for finished or non-bounce transfers.
-            for task in self._kv_tasks:
-                self._receiver._bounce.orphan_reservation((self.disagg_request_id, task.slice_id))
             self._receiver.clear_session(self.disagg_request_id)
         return True
 
@@ -4123,15 +4451,13 @@ class TransferWorkerConfig:
     max_draft_len: Optional[int] = None
     tx_timeout_s: Optional[float] = None
     rx_timeout_s: Optional[float] = None
-    bounce: Optional["Config"] = None
     tx_overall_timeout_s: Optional[float] = None
     enforce_physical_ownership: bool = False
+    context_first_ownership: bool = False
     # Internal activation gate: only the qualified containment policy supplies it.
     quiescence_fatal_callback: Optional[Callable[[QuiescenceFatalEvent], None]] = None
-    # Transfer-agent staging (bounce v2) buffer size in MiB; 0 disables the
-    # fast path. Derived upstream from CacheTransceiverConfig: it equals
-    # kv_cache_bounce_size_mb when agent_bounce_buffer_enable is set (in which
-    # case `bounce` above is off) and 0 otherwise.
+    # C++ transfer-agent bounce buffer size in MiB
+    # (CacheTransceiverConfig.kv_cache_bounce_size_mb); 0 disables it.
     agent_buffer_size_mb: int = 0
     # Expert bounce knobs (TRTLLM_NIXL_BOUNCE_* names without the prefix and the
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
@@ -4144,7 +4470,7 @@ class TransferWorker:
         self._config = config
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
-            if not config.enforce_physical_ownership:
+            if not (config.enforce_physical_ownership or config.context_first_ownership):
                 raise ValueError("deadline retirement requires physical ownership")
             for timeout in (config.tx_overall_timeout_s, config.rx_timeout_s):
                 if timeout is None or not math.isfinite(timeout) or timeout <= 0:
@@ -4162,10 +4488,20 @@ class TransferWorker:
             config.device_id,
             self._aux_buffer.meta if self._aux_buffer is not None else None,
         )
+        self._rank_info.context_first_ownership = config.context_first_ownership
         self._setup_peer_infrastructure(kvm)
         self._setup_transfer_engine()
         if self._retirement_watchdog is not None:
             self._retirement_watchdog.start()
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                disagg_diagnostics.emit_event(
+                    "diagnostic_profile",
+                    side="runtime",
+                    request_id=None,
+                    rank_info=self._rank_info,
+                    profile="native_v1",
+                )
 
     def _on_quiescence_fatal(self, event: QuiescenceFatalEvent) -> None:
         """Forward fatal evidence while rooting all worker-owned resources.
@@ -4245,41 +4581,29 @@ class TransferWorker:
             and not self._agent.bounce_enabled
         ):
             logger.warning(
-                f"TransferWorker: the C++ transfer-agent bounce was requested "
-                f"(agent_bounce_buffer_enable=True, kv_cache_bounce_size_mb="
-                f"{self._config.agent_buffer_size_mb}) but is inactive on agent "
-                f"{self._agent.name} (init failed); standard per-descriptor NIXL "
-                "transfers are in use."
+                "TransferWorker: the transfer-agent bounce buffer was requested "
+                f"(kv_cache_bounce_size_mb={self._config.agent_buffer_size_mb}) but is "
+                f"inactive on agent {self._agent.name} (init failed); standard "
+                "per-descriptor NIXL transfers are in use."
             )
         self._registered_mem: list = []
         try:
             self._register_kv_cache()
             if self._aux_buffer is not None:
                 self._register_aux_buffer()
-            from .bounce import create_bounce
-
-            self._bounce = create_bounce(
-                self._agent,
-                self._config.bounce,
-                device_id=self._config.device_id,
-                page_table=self._rank_info.page_table,
-            )
-            # The bounce object owns its own NIXL descriptors (deregistered by Transport.close in
-            # shutdown), so they are NOT added to _registered_mem — single-source to avoid a
-            # double deregister.
             self._sender = Sender(
                 self._peer_registrar,
                 self._agent,
-                bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                context_first_ownership=self._config.context_first_ownership,
             )
             self._receiver = Receiver(
                 self._peer_registrar,
                 self._agent,
-                bounce=self._bounce,
                 enforce_physical_ownership=self._config.enforce_physical_ownership,
                 retirement_watchdog=self._retirement_watchdog,
+                context_first_ownership=self._config.context_first_ownership,
             )
             self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
             self._rank_info.self_endpoint = self._receiver.endpoint
@@ -4353,16 +4677,6 @@ class TransferWorker:
         if rank_info_server is not None:
             rank_info_server.shutdown()
         self._shutdown = True
-        # Close the bounce transport (stops its scatter thread, deregisters its own descriptors and
-        # frees the VMM buffers) once the receiver listener is stopped so no new scatter is enqueued.
-        # No-op for the non-bounced path (NoBounceTransport.close); without this the daemon thread + fabric
-        # buffers leak until process exit.
-        bounce = getattr(self, "_bounce", None)
-        if bounce is not None:
-            try:
-                bounce.close()
-            except Exception as e:
-                logger.warning(f"TransferWorker.shutdown: bounce close failed: {e}")
         # Deregister NIXL memory before agent.shutdown so pinned GPU memory is released
         # (e.g. when the KV cache manager is recreated after profiling).
         agent = getattr(self, "_agent", None)

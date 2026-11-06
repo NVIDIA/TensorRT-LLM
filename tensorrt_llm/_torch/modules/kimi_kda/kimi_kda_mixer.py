@@ -21,7 +21,7 @@ import math
 import os
 import weakref
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from fla.modules import ShortConvolution
@@ -30,6 +30,7 @@ from torch import nn
 from ....models.modeling_utils import QuantConfig
 from ....quantization import QuantAlgo
 from ...attention.backends import AttentionMetadata
+from ...cute_dsl_utils import sm_reserve
 from ...distributed import AllReduce, AllReduceStrategy
 from ...model_config import ModelConfig
 from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
@@ -174,6 +175,7 @@ class KimiKDALinearAttention(nn.Module):
         allreduce_strategy=AllReduceStrategy.AUTO,
         aux_stream: Optional[torch.cuda.Stream] = None,
         model_config: Optional[ModelConfig] = None,
+        reduce_output: bool = True,
     ) -> None:
         super().__init__()
         lin = cfg.linear_attn_config
@@ -192,9 +194,11 @@ class KimiKDALinearAttention(nn.Module):
         else:
             self._kda_tp_size = 1
         self._kda_tp_rank = mapping.tp_rank if self._kda_tp_size > 1 else 0
+        # reduce_output=False returns the row-sharded o_proj partials; the
+        # caller owns the reduction (helix_a2a reduce-scatters them).
         self._o_allreduce = (
             AllReduce(mapping=mapping, strategy=allreduce_strategy, dtype=torch.bfloat16)
-            if self._kda_tp_size > 1
+            if self._kda_tp_size > 1 and reduce_output
             else None
         )
 
@@ -290,6 +294,10 @@ class KimiKDALinearAttention(nn.Module):
         # [q | k | v | g] projection and its output-section metadata.
         self.qkvg_proj: Optional[nn.Module] = None
         self.qkvg_split_sizes: Optional[List[int]] = None
+        # Row counts for which ``qkvg_proj`` projects a prequantized (MXFP8) input bitwise like
+        # its BF16 rows; set by ``accept_prequantized_qkvg_input`` when such a projection is
+        # installed.
+        self._qkvg_takes_prequantized: Optional[Callable[[int], bool]] = None
         _meta_safe_cast_dtype(self, torch.bfloat16)
 
         # The optimized decode/verify kernels specialize the Kimi K3
@@ -307,6 +315,9 @@ class KimiKDALinearAttention(nn.Module):
             use_optimized_decode=kernel_shape_ok,
             use_optimized_verify=kernel_shape_ok,
         )
+        # SMs kept out of the prefill's persistent grids for a kernel resident
+        # for the whole step; fixed before the model is built.
+        self._prefill_sm_reserve = sm_reserve()
 
         self._fuse_prefill_conv = True
 
@@ -457,10 +468,51 @@ class KimiKDALinearAttention(nn.Module):
         # verify call never allocates (a capture-unsafe lazy allocation).
         self._build_mtp_conv_weights()
 
+    def accept_prequantized_qkvg_input(self, takes_prequantized: Callable[[int], bool]) -> None:
+        """Declare that the fused q/k/v/g projection consumes the MXFP8 form of its input
+        (``forward_prequantized``) for the row counts where ``takes_prequantized(num_rows)``."""
+        self._qkvg_takes_prequantized = takes_prequantized
+
+    def qkvg_takes_prequantized(self, num_rows: int) -> bool:
+        """Whether the fused q/k/v/g projection consumes the MXFP8 form of ``num_rows`` rows
+        (``accept_prequantized_qkvg_input``), in any batch."""
+        return self._qkvg_takes_prequantized is not None and self._qkvg_takes_prequantized(num_rows)
+
+    @staticmethod
+    def _is_verify_only_batch(attn_metadata: AttentionMetadata) -> bool:
+        """A generation-only batch of multi-token (speculative verify) requests: the batches
+        whose fused q/k/v/g projection takes ``prequantized_input``."""
+        return (
+            attn_metadata.num_contexts == 0
+            and attn_metadata.num_tokens != attn_metadata.seq_lens.shape[0]
+        )
+
+    def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Whether :meth:`forward` on ``num_rows`` rows consumes their MXFP8 form
+        (``prequantized_input``): verify-only batches (:meth:`_is_verify_only_batch`) outside
+        the breakable CUDA graph, without padding rows (the operand must cover exactly the
+        batch's tokens), whose fused q/k/v/g projection takes a prequantized operand for that
+        many rows. The producer and :meth:`forward` both decide by this method."""
+        return (
+            self._qkvg_takes_prequantized is not None
+            and self._is_verify_only_batch(attn_metadata)
+            and attn_metadata.num_tokens == num_rows
+            and not (self.register_to_config and is_in_breakable_cuda_graph())
+            and self.qkvg_takes_prequantized(num_rows)
+        )
+
     def forward(
-        self, hidden_states: torch.Tensor, attn_metadata: AttentionMetadata
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
-        """Select the eager path or breakable-CUDA-graph path."""
+        """Select the eager path or breakable-CUDA-graph path.
+
+        ``prequantized_input``: the MXFP8 form ``(activation, scale)`` of ``hidden_states``
+        (E4M3 and UE8M0 1x32 R128c4 scales, see :meth:`takes_prequantized_input`), which the
+        fused q/k/v/g projection of the verify path then consumes instead of the BF16 rows.
+        """
         if self.register_to_config and is_in_breakable_cuda_graph():
             core = hidden_states.new_empty(
                 (hidden_states.shape[0], self.num_heads, self.head_dim),
@@ -468,7 +520,9 @@ class KimiKDALinearAttention(nn.Module):
             )
             maybe_bcg_kda_core_inplace(hidden_states, self.layer_idx_str, core)
         else:
-            core = self._forward_impl(hidden_states, attn_metadata)
+            core = self._forward_impl(
+                hidden_states, attn_metadata, prequantized_input=prequantized_input
+            )
 
         return self._project_output(core)
 
@@ -477,6 +531,7 @@ class KimiKDALinearAttention(nn.Module):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         output: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Run metadata-dependent KDA prefill/decode/verify dispatch.
 
@@ -555,6 +610,12 @@ class KimiKDALinearAttention(nn.Module):
                     # The MXFP8 core cannot be concatenated with a prefill
                     # core or stored into the BCG buffer.
                     allow_prequantized_output=output is None and num_prefills == 0,
+                    # The MXFP8 input covers every row of a verify-only batch.
+                    prequantized_input=(
+                        prequantized_input
+                        if self.takes_prequantized_input(hidden_states.shape[0], attn_metadata)
+                        else None
+                    ),
                 )
                 if output is None:
                     cores.append(verify_core)
@@ -576,7 +637,7 @@ class KimiKDALinearAttention(nn.Module):
 
     def _has_kda_replay_caches(self, layer_cache) -> bool:
         """True when the manager allocated the fused-verify replay caches."""
-        return layer_cache is not None and layer_cache.has_kda_replay_caches
+        return bool(getattr(layer_cache, "has_kda_replay_caches", False))
 
     def _sync_kda_replay_conv_window(self, layer_cache, slot_indices, conv_pool) -> None:
         """Seed replay conv caches from the live committed conv pool.
@@ -882,6 +943,7 @@ class KimiKDALinearAttention(nn.Module):
             max_seqlen=getattr(mamba_metadata, "kda_max_seqlen", 0),
             seq_order=getattr(mamba_metadata, "kda_seq_order", None),
             cu_chunks=getattr(mamba_metadata, "kda_cu_chunks", None),
+            sm_reserve=self._prefill_sm_reserve,
         )
 
         # The packed convolution persisted the live convolution pool in place.
@@ -1216,6 +1278,7 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Speculative verification: advance each request ``num_steps``
         tokens (1 golden + ``num_steps - 1`` padded drafts).
@@ -1248,6 +1311,7 @@ class KimiKDALinearAttention(nn.Module):
                 slot_indices,
                 output=output,
                 allow_prequantized_output=allow_prequantized_output,
+                prequantized_input=prequantized_input,
             )
         return self.forward_verify_sequential(
             x2d,
@@ -1257,10 +1321,15 @@ class KimiKDALinearAttention(nn.Module):
             ssm_pool,
             slot_indices,
             output=output,
+            prequantized_input=prequantized_input,
         )
 
     def _project_verify_inputs(
-        self, x: torch.Tensor, num_rows: int, preserve_section_strides: bool = False
+        self,
+        x: torch.Tensor,
+        num_rows: int,
+        preserve_section_strides: bool = False,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[
         tuple[
             torch.Tensor,
@@ -1276,7 +1345,9 @@ class KimiKDALinearAttention(nn.Module):
         With ``preserve_section_strides`` the q/k/v/gate sections stay
         strided views of the fused QKVG output (and beta of the fused
         ``[f_a | b]`` output); the packed fused verify kernel reads them in
-        place instead of paying one copy per section.
+        place instead of paying one copy per section. The fused QKVG
+        projection consumes ``prequantized_input`` (the MXFP8 form of ``x``)
+        where it is given.
         """
         qkvg_weight = self._qkvg_proj_weight
         fused_qkvg = self.qkvg_proj
@@ -1286,6 +1357,8 @@ class KimiKDALinearAttention(nn.Module):
         def _project_qkvg() -> torch.Tensor:
             if qkvg_weight is not None:
                 return torch.nn.functional.linear(x, qkvg_weight)
+            if prequantized_input is not None:
+                return fused_qkvg.forward_prequantized(*prequantized_input).view(*x.shape[:-1], -1)
             return fused_qkvg(x)
 
         onorm_lowrank = None
@@ -1335,6 +1408,7 @@ class KimiKDALinearAttention(nn.Module):
         slot_indices,
         output: Optional[torch.Tensor] = None,
         allow_prequantized_output: bool = False,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, _KdaPrequantizedCore]:
         """Fused multi-token verify via ``trtllm::kda_mtp_decode``.
 
@@ -1366,7 +1440,10 @@ class KimiKDALinearAttention(nn.Module):
 
         can_fuse_output_norm = self._onorm_w_f32 is not None
         projections = self._project_verify_inputs(
-            x, T_total, preserve_section_strides=can_fuse_output_norm
+            x,
+            T_total,
+            preserve_section_strides=can_fuse_output_norm,
+            prequantized_input=prequantized_input,
         )
         if projections is None:
             q_proj = self.q_proj(x)
@@ -1495,6 +1572,7 @@ class KimiKDALinearAttention(nn.Module):
         ssm_pool,
         slot_indices,
         output: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Sequential per-step FLA verification (legacy intermediate-buffer
         path). Live pools are read-only here; ``update_mamba_states()``
@@ -1514,7 +1592,9 @@ class KimiKDALinearAttention(nn.Module):
         num_generations = x2d.shape[0] // num_steps
         x = x2d.view(num_generations, num_steps, -1)  # [B, T, hidden]
 
-        projections = self._project_verify_inputs(x, x2d.shape[0])
+        projections = self._project_verify_inputs(
+            x, x2d.shape[0], prequantized_input=prequantized_input
+        )
         if projections is None:
             q_proj_states = self.q_proj(x)
             k_proj_states = self.k_proj(x)

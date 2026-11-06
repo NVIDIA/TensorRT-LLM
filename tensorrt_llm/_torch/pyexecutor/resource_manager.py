@@ -161,6 +161,19 @@ class ResourceManagerType(enum.Enum):
     KV_CACHE_COMPRESSION_MANAGER = "KV_CACHE_COMPRESSION_MANAGER"
 
 
+def is_context_only_kv_cache(kv_cache_manager: object) -> bool:
+    """Whether a KV cache manager can serve context requests only.
+
+    A disaggregated context worker may omit generation-only cache state: the
+    KDA draft-verification buffers (``kda_context_only``) or the FP4 MLA V
+    scales and packed V (``fp4_mla_context_only_cache``). Such a worker
+    cannot run a generation row, including a warmup or padding dummy.
+    """
+    return (getattr(kv_cache_manager, "kda_context_only", False) is True
+            or getattr(kv_cache_manager, "fp4_mla_context_only_cache",
+                       False) is True)
+
+
 def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
 
@@ -350,6 +363,40 @@ def _populate_dummy_mrope_config(req: LlmRequest, token_num: int,
     req.py_multimodal_data["mrope_config"] = mrope_config
 
 
+# Elements per isnan/isinf call when scanning a KV cache buffer; bounds the
+# temporary bool tensor each call materializes (64 MiB).
+_INVALID_VALUE_SCAN_ELEMS = 1 << 26
+
+
+def scan_kv_buffer_for_invalid_values(buffer: torch.Tensor,
+                                      has_invalid_values: torch.Tensor) -> bool:
+    """OR any NaN/Inf in ``buffer`` into ``has_invalid_values`` (on device).
+
+    Scans in slices along dim 0 of about _INVALID_VALUE_SCAN_ELEMS elements.
+    The cost is dominated by the number of calls, so the slices are as large
+    as the temporary allows. A check the dtype does not implement (e.g.
+    ``isinf`` on FP8) is skipped for the rest of the buffer.
+
+    Returns True if any check was skipped.
+    """
+    if buffer.numel() == 0:
+        return False
+    rows = max(1, _INVALID_VALUE_SCAN_ELEMS // max(1, buffer[0].numel()))
+    checks = [torch.isnan, torch.isinf]
+    skipped = False
+    for i in range(0, buffer.shape[0], rows):
+        buffer_slice = buffer[i:i + rows]
+        for check in list(checks):
+            try:
+                has_invalid_values.logical_or_(check(buffer_slice).any())
+            except NotImplementedError:
+                checks.remove(check)
+                skipped = True
+        if not checks:
+            break
+    return skipped
+
+
 class KVCacheManager(BaseResourceManager):
     # Declared on the class so it is present even when an instance is built
     # without running __init__ (which overwrites it from the spec config);
@@ -405,6 +452,15 @@ class KVCacheManager(BaseResourceManager):
         enable_chunked_prefill: bool = False,
         **kwargs,
     ) -> None:
+        logger.warning_once(
+            f"KV cache manager V1 ({type(self).__name__}) is deprecated as of "
+            "TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month "
+            "migration period; it keeps working until then. Use KV cache "
+            "manager V2 (kv_cache_config.use_kv_cache_manager_v2=True, the "
+            "default) for supported features. Sleep mode, RocketKV, and "
+            "skip-softmax still require V1 until V2 support is available. See "
+            "https://github.com/NVIDIA/TensorRT-LLM#deprecation-policy",
+            key="deprecated_kv_cache_manager_v1")
         self.mapping = mapping
         self.dtype = dtype
         self.kv_cache_type = kv_cache_type
@@ -2066,16 +2122,8 @@ class KVCacheManager(BaseResourceManager):
                                           device=torch.cuda.current_device())
         for layer_idx, layer_offset in self.layer_offsets.items():
             buffer = self.impl.get_primary_pool_data(layer_offset)
-            # process in chunks of 256 pages to avoid OoM
-            for i in range(0, buffer.shape[0], 256):
-                buffer_slice = buffer[i:i + 256]
-                try:
-                    has_invalid_values.logical_or_(
-                        torch.isnan(buffer_slice).any())
-                    has_invalid_values.logical_or_(
-                        torch.isinf(buffer_slice).any())
-                except NotImplementedError:
-                    some_checks_unavailable = True
+            if scan_kv_buffer_for_invalid_values(buffer, has_invalid_values):
+                some_checks_unavailable = True
             if fill_with_zero:
                 buffer.zero_()
         torch.cuda.synchronize()
@@ -2694,6 +2742,11 @@ class KVCacheManager(BaseResourceManager):
     def pin_blocks(self, request_id: int):
         self.impl.pin_blocks(request_id)
 
+    def batch_block_table_key(self, request_ids: List[int]) -> Optional[tuple]:
+        """Key under which ``copy_batch_block_offsets`` rows of ``request_ids`` are unchanged (see
+        ``KVCacheManagerV2.batch_block_table_key``); None: always copy."""
+        return None
+
     def copy_batch_block_offsets(self,
                                  dst_tensor: torch.Tensor,
                                  request_ids: List[int],
@@ -3200,7 +3253,10 @@ class ResourceManager:
             kv_cache_manager.maybe_fit_token_budget(scheduled_batch)
 
     @nvtx_range("prepare_resources")
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources(self,
+                          scheduled_batch: ScheduledRequests,
+                          *,
+                          publish_connector_output: bool = True) -> None:
         for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
@@ -3212,7 +3268,8 @@ class ResourceManager:
         # run. See `report_batch_to_connector`.
         kv_cache_manager = self.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
-        if hasattr(kv_cache_manager, "report_batch_to_connector"):
+        if publish_connector_output and hasattr(kv_cache_manager,
+                                                "report_batch_to_connector"):
             kv_cache_manager.report_batch_to_connector(scheduled_batch)
 
     @nvtx_range("update_resources")

@@ -109,6 +109,38 @@ _FATAL_LOG_PATTERNS = (
 )
 
 
+def archive_process_logs(work_dir, log_output_dir):
+    """Copy the cluster's saved log files into log_output_dir for CI upload.
+
+    In CI, log_output_dir is pytest's --output-dir (the stage directory), which
+    is tarred and uploaded to Artifactory as results-<stage>.tar.gz, so logs
+    copied here survive the test and are downloadable from the CI job. Each
+    test gets its own subdirectory, named after PYTEST_CURRENT_TEST.
+
+    Returns the destination directory, or None if nothing was copied.
+    """
+    if not log_output_dir or not os.path.isdir(work_dir):
+        return None
+    test_name = os.environ.get("PYTEST_CURRENT_TEST", "disagg")
+    test_name = test_name.split("::")[-1].split(" ")[0]
+    test_name = re.sub(r"[^A-Za-z0-9._-]+", "_", test_name)[:200]
+    dest = os.path.join(log_output_dir, "disagg-logs", test_name)
+    os.makedirs(dest, exist_ok=True)
+    copied = 0
+    for name in sorted(os.listdir(work_dir)):
+        if not name.endswith(".log"):
+            continue
+        try:
+            shutil.copy2(os.path.join(work_dir, name), dest)
+            copied += 1
+        except OSError as e:
+            print(f"Could not archive {name}: {e}")
+    if copied == 0:
+        return None
+    print(f"Archived {copied} disagg log file(s) to {dest}", flush=True)
+    return dest
+
+
 def scan_logs_for_fatal_errors(processes):
     """Scan saved process logs for fatal disagg/worker error patterns.
 
@@ -614,12 +646,17 @@ def run_client_tests(example_dir,
         for output_file in output_files:
             with open(output_path(output_file), 'r') as f:
                 content = f.read()
-                if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
+                if ("deepseek_v3_lite" in test_desc
+                        or "qwen3_32b_fp8" in test_desc
+                        or output_file == "output_chat.json"):
                     # Different models (and endpoints) phrase the continuation
                     # of the raw asyncio prompt differently, and repeated
                     # attempts to pin down the exact wording have proven
-                    # fragile across CI runs. Match case-insensitively on the
-                    # prompt's own keywords instead of an exact phrase.
+                    # fragile across CI runs: e.g. qwen3_32b_fp8's near-tied
+                    # greedy tokens flip with the GPU type and with the ctx/gen
+                    # TP sizes (https://nvbugs/6770977). Match
+                    # case-insensitively on the prompt's own keywords instead
+                    # of an exact phrase.
                     lowered_content = content.lower()
                     assert "berlin" in lowered_content, (
                         f"Expected 'Berlin' not found in {output_file}")
@@ -634,17 +671,6 @@ def run_client_tests(example_dir,
                     expected_strings = [
                         "The capital of Germany is Berlin",
                         "Using `asyncio` in Python"
-                    ]
-                elif "qwen3_32b_fp8" in test_desc:
-                    # https://nvbugs/6566734: the greedy completion of the raw
-                    # asyncio prompt is near-tied between answering the question
-                    # and continuing it; both are valid non-garbage outputs.
-                    expected_strings = [
-                        "The capital of Germany is Berlin",
-                        [
-                            "Asyncio in Python is a library",
-                            "I have read that it is used for asynchronous programming"
-                        ]
                     ]
                 else:
                     # Qwen3-0.6B (migrated from TinyLlama onto this default
@@ -771,6 +797,7 @@ def setup_disagg_cluster(
     gen_env: dict[str, str] | None = None,
     share_gpu: bool = False,
     config_overrides: dict[str, Any] | None = None,
+    log_output_dir: str | None = None,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -786,6 +813,10 @@ def setup_disagg_cluster(
             for stress runs (cluster_uri/minimal_instances are still derived below)
         config_overrides: Entries merged into the config (a dict value is merged into the
             section), e.g. {"model": "m", "context_servers": {"router": {"type": "kv_cache_aware"}}}
+        save_log: Redirect each worker's and the server's output to a file in
+            work_dir instead of the inherited stdout
+        log_output_dir: With save_log, directory the logs are copied to if
+            startup fails (CI's --output-dir, so they get uploaded)
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -1050,12 +1081,14 @@ def setup_disagg_cluster(
         print(
             f"[startup] cluster_launch_to_ready: done in {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
-    except Exception:
+    except BaseException:
         print(
             f"[startup] cluster_launch_to_ready: failed after {time.perf_counter() - cluster_start:.3f}s",
             flush=True)
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        if not save_log:
+        if save_log:
+            archive_process_logs(work_dir, log_output_dir)
+        else:
             shutil.rmtree(work_dir, ignore_errors=True)
         raise
 
@@ -1524,6 +1557,67 @@ def test_disaggregated_overlap_transceiver_runtime_python(
                            env=env,
                            model_path=qwen_model_root,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+def test_disaggregated_context_first_bf16_ownership(
+        disaggregated_test_root: str, llm_venv: Any,
+        disaggregated_example_root: str) -> None:
+    """Exercise serving activation and output through two real TP2 executors.
+
+    Args:
+        disaggregated_test_root: Fixture preparing the integration test assets.
+        llm_venv: Runtime environment with the tested TRT-LLM installation.
+        disaggregated_example_root: Existing disaggregated serving/client harness.
+
+    This verifies activation and successful serving, not outstanding-DMA fencing
+    or replacement after a fatal transfer. Native module tests cover retirement.
+    """
+    model_root = resolve_llm_model_path("Qwen3/Qwen3-0.6B")
+    setup_model_symlink(llm_venv, model_root, "Qwen3/Qwen3-0.6B")
+    env = llm_venv._new_env.copy()
+    env.update({
+        "TRTLLM_ENABLE_KV_TRANSFER_LIFECYCLE_ENFORCEMENT": "1",
+        "TRTLLM_DISAGG_NO_RETRY": "1",
+        "TRTLLM_USE_PY_NIXL_KVCACHE": "0",
+        "TRTLLM_NIXL_KVCACHE_BACKEND": "UCX",
+        "TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP": "0",
+        "TRTLLM_DISAGG_LAYERWISE": "0",
+        "TRTLLM_ENABLE_FP4_MLA_KV_OWNERSHIP_BRIDGE": "0",
+    })
+    worker_config = {
+        "dtype": "bfloat16",
+        "tensor_parallel_size": 2,
+        "pipeline_parallel_size": 1,
+        "context_parallel_size": 1,
+        "enable_attention_dp": False,
+        "kv_cache_config": {
+            "use_kv_cache_manager_v2": True,
+            "free_gpu_memory_fraction": 0.2,
+            "enable_partial_reuse": False,
+        },
+        "cache_transceiver_config": {
+            "backend": "NIXL",
+            "transceiver_runtime": "PYTHON",
+            "kv_transfer_timeout_ms": 60000,
+            "kv_cache_bounce_size_mb": 0,
+            "agent_bounce_buffer_enable": False,
+            "enable_pipelined_transfer": False,
+        },
+    }
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "overlap_transceiver_runtime_python",
+        env=env,
+        model_path=model_root,
+        cwd=llm_venv.get_working_directory(),
+        disagg_schedule_style="context_first",
+        config_overrides={
+            "context_servers": worker_config,
+            "generation_servers": worker_config,
+        },
+        assert_ctx_log_contains="Context-first BF16 KV ownership ENABLED",
+        assert_gen_log_contains="Context-first BF16 KV ownership ENABLED")
 
 
 # Exercises the disaggregated KV-cache transfer path with the Python cache transceiver runtime
@@ -2159,6 +2253,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_tp1_attention_dp_overlap_one_mtp(
         cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2175,6 +2270,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2192,6 +2288,7 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
 
 
 # V2 variant of the conditional disagg test: KV manager V2 + Python NIXL transceiver.
+@pytest.mark.skip_less_device(2)
 @skip_no_hopper
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -2522,7 +2619,8 @@ def run_disaggregated_aiperf(config_file,
                              cancellation_delay=None,
                              max_error_rate=0.05,
                              env=None,
-                             cwd=None):
+                             cwd=None,
+                             log_output_dir=None):
     """Run disaggregated test with genai-perf for performance/stress testing.
 
     Args:
@@ -2543,6 +2641,8 @@ def run_disaggregated_aiperf(config_file,
             errors recorded by aiperf exceeds this (None disables the gate)
         env: Environment variables dict
         cwd: Working directory
+        log_output_dir: If set, the full worker/server logs are copied there
+            when the run fails (pass the output_dir fixture so CI uploads them)
     """
     run_env = env.copy()
     run_env["UCX_TLS"] = get_ucx_tls()
@@ -2553,11 +2653,13 @@ def run_disaggregated_aiperf(config_file,
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
                              server_start_timeout=server_start_timeout,
                              save_log=True,
+                             log_output_dir=log_output_dir,
                              disagg_cluster_overrides=PRODUCTION_CLUSTER_TIMINGS)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
 
+    failed = False
     try:
         # Wait for server to be ready
         if not wait_for_server(
@@ -2703,7 +2805,7 @@ def run_disaggregated_aiperf(config_file,
                     "Fatal error patterns detected in disaggregated "
                     f"worker/server logs after accuracy run:\n{summary}")
 
-    except Exception:
+    except BaseException:
         # Print the context around the first fatal-pattern match (the root
         # cause, e.g. an OOM traceback) and the tail of each captured
         # worker/server log to aid triage.
@@ -2721,9 +2823,14 @@ def run_disaggregated_aiperf(config_file,
                             logger.error(line.rstrip())
             except OSError:
                 pass
+        failed = True
         raise
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
+        if failed:
+            # The log writers are closed now, so the files are complete. Copy
+            # them into the CI output directory before work_dir is removed.
+            archive_process_logs(work_dir, log_output_dir)
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
@@ -2839,6 +2946,7 @@ def run_accuracy_test(model_path: str, server_url: str, concurrency: int,
         return False, accuracy_value
 
 
+@pytest.mark.skip_less_device(3)
 @skip_pre_hopper
 @pytest.mark.parametrize("benchmark_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
@@ -3012,11 +3120,14 @@ def test_disaggregated_qwen3_32b_fp8(disaggregated_test_root,
     model_dir = resolve_llm_model_path(model_path)
     setup_model_symlink(llm_venv, model_dir, model_path)
 
+    # Cold-cache startup on B200 takes 544-700s, mostly autotuner warmup, past
+    # the 300s default (https://nvbugs/6888251).
     run_disaggregated_test(disaggregated_example_root,
                            "qwen3_32b_fp8_stress",
                            env=llm_venv._new_env,
                            model_path=model_dir,
-                           cwd=llm_venv.get_working_directory())
+                           cwd=llm_venv.get_working_directory(),
+                           server_start_timeout=900)
 
 
 def _deepseek_v41_completion(server_url: str, model: str, prompt: str,
@@ -3347,7 +3458,7 @@ def _check_deepseek_v41_gsm8k(server_url: str, model_dir: str, tokenizer,
 def test_disaggregated_stress_test(disaggregated_test_root,
                                    disaggregated_example_root, llm_venv,
                                    test_config, input_tokens, output_tokens,
-                                   concurrency):
+                                   concurrency, output_dir):
     # Unpack configuration from dataclass
     model_path = test_config.model_path
     test_desc = test_config.test_desc
@@ -3404,7 +3515,8 @@ def test_disaggregated_stress_test(disaggregated_test_root,
                              cancellation_rate=test_config.cancellation_rate,
                              cancellation_delay=test_config.cancellation_delay,
                              env=llm_venv._new_env,
-                             cwd=llm_venv.get_working_directory())
+                             cwd=llm_venv.get_working_directory(),
+                             log_output_dir=output_dir)
 
 
 def run_cancel_stress_test(server_url: str,
@@ -4244,6 +4356,7 @@ def run_disaggregated_cancel_test(example_dir,
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+@pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,

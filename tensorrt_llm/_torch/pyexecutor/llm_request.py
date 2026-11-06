@@ -17,6 +17,7 @@ from tensorrt_llm.executor.result import SimpleTokenLogprobs, TokenLogprobs
 from tensorrt_llm.inputs.multimodal import (MultimodalEncoderRequestState,
                                             MultimodalParams,
                                             get_multimodal_item_metadata)
+from tensorrt_llm.kv_hints.protocol import KvHintsSnapshot
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tllm_executor.SamplingConfig
@@ -709,6 +710,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
                 tensorrt_llm.bindings.internal.batch_manager.LlmRequest] = None,
+            parent_request: Optional["LlmRequest"] = None,
+            child_id: Optional[int] = None,
             seq_slot: Optional[int] = None,
             num_logprobs: int = 0,
             use_chunked_generation_logits: bool = True,
@@ -763,7 +766,12 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # when the request is next scheduled.
         self.py_mm_encoder_event: Optional[torch.cuda.Event] = None
 
-        if llm_request is not None:
+        if parent_request is not None:
+            if llm_request is not None or child_id is None:
+                raise ValueError(
+                    "Child construction requires a parent and child_id only.")
+            super().__init__(parent_request, child_id)
+        elif llm_request is not None:
             super().__init__(llm_request)
         else:
             super().__init__(*args,
@@ -782,10 +790,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_request_id = self.request_id
         self.py_llm_request_type = self.llm_request_type
         self.py_min_length = self.sampling_config.min_tokens
-        self.py_helix_is_inactive_rank = False
-        # Manager-owned helix decode-step counter; see
-        # KVCacheManagerV2._set_helix_rank_fields.
-        self.py_helix_decode_group_index = 0
         self.py_per_pos_drafted = [0] * MAX_SPEC_DECODE_POSITIONS
         self.py_per_pos_accepted = [0] * MAX_SPEC_DECODE_POSITIONS
         # Cumulative spec-decode counters backing
@@ -851,6 +855,23 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode)  # handle passed a raw string
         self.py_disaggregated_params = None
         self.py_conversation_params = None
+        # Uncached-prefill estimate published by the attention-DP router, if
+        # any. The V2 scheduler drops it when the demotion aging bound lets the
+        # request through.
+        self.py_uncached_prefill_tokens: int | None = None
+        self.py_original_end_id = self.py_end_id
+        self.py_bad_words = None
+        self.py_no_repeat_ngram_size = None
+        self.py_kv_hints: Optional[KvHintsSnapshot] = None
+
+        # In-forward Mamba snapshot point P the scheduler let this context
+        # chunk run past (MambaHybridCacheManagerV2 consumes it).
+        self.py_mamba_inforward_snapshot_point: Optional[int] = None
+        # Whether the first GEN step of a generation-only request was streamed.
+        self.py_gen_first_emitted = False
+        # KVCacheV2Scheduler context ordering: the scheduler iteration the
+        # request was first pending.
+        self.py_ctx_sched_since_iter: Optional[int] = None
 
         self.py_num_connector_matched_tokens = 0
 
@@ -944,6 +965,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         # CP sequence lengths are relevant to helix parallelism.
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
+        self.py_helix_is_inactive_rank = False
+        # Manager-owned helix decode-step counter; see
+        # KVCacheManagerV2._set_helix_rank_fields.
+        self.py_helix_decode_group_index = 0
         self.py_batch_idx = None
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
@@ -1191,42 +1216,66 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             self.py_multimodal_params = MultimodalParams()
         self.py_multimodal_params.encoder_event = event
 
-    def create_child_request(self, child_id):
+    def create_child_request(self, child_id: int) -> None:
+        """Construct a child with copied inputs and fresh execution/output state.
+
+        Mutable Python inputs are copied independently. Logits processor lists
+        are shallow-copied to preserve callable identity and user-owned state.
+        Encoder features and native tensor inputs are shared read-only; clone
+        before mutation.
+        Runtime events, cache ownership, sampler progress, and result history
+        are initialized by the constructor rather than inherited from a parent.
+        """
         if (self.py_mm_encoder_state is not None
                 or self.py_mm_encoder_event is not None):
             raise RuntimeError(
                 "Child requests must be created before MM encoder admission")
-        child = super().create_child_request(child_id)
-        py_request = LlmRequest(llm_request=child)
+        child = LlmRequest(
+            parent_request=self,
+            child_id=child_id,
+            client_id=self.py_client_id,
+            return_log_probs=self.py_return_log_probs,
+            return_context_logits=self.py_return_context_logits,
+            return_generation_logits=self.py_return_generation_logits,
+            return_logits_device_memory=self.py_return_logits_device_memory,
+            exclude_last_generation_logits=self.py_result.
+            _exclude_last_generation_logits,
+            additional_outputs=deepcopy(self.py_additional_outputs),
+            return_perf_metrics=self.return_perf_metrics,
+            return_encoder_output=self.py_return_encoder_output,
+            stop_words_list=deepcopy(self.py_stop_words_list),
+            num_logprobs=self.py_num_logprobs,
+            use_chunked_generation_logits=self.py_use_chunked_generation_logits,
+            logits_chunk_size=self.py_logits_chunk_size,
+            logprobs_mode=self.py_logprobs_mode,
+            logprobs_simple_format=self.py_logprobs_simple_format,
+            return_routed_experts=self.py_return_routed_experts,
+            embedding_bias=deepcopy(self.py_embedding_bias),
+            position_ids=deepcopy(self.py_position_ids),
+            guided_decoding_params=deepcopy(self.py_guided_decoding_params),
+            end_id=self.py_end_id,
+            py_lora_path=self.py_lora_path,
+            py_lora_ckpt_source=self.py_lora_ckpt_source,
+            py_logits_post_processors=(self.py_logits_post_processors.copy()
+                                       if self.py_logits_post_processors
+                                       is not None else None),
+            py_multimodal_data=deepcopy(self.py_multimodal_data),
+            encoder_input_features=self.py_encoder_input_features,
+        )
+        child.py_bad_words = deepcopy(self.py_bad_words)
+        child.py_no_repeat_ngram_size = self.py_no_repeat_ngram_size
+        child.py_original_end_id = self.py_original_end_id
+        child.py_disaggregated_params = deepcopy(self.py_disaggregated_params)
+        child.py_conversation_params = deepcopy(self.py_conversation_params)
+        child.py_kv_hints = self.py_kv_hints
+        child.py_uncached_prefill_tokens = self.py_uncached_prefill_tokens
+        child.py_disable_speculative_decoding = self.py_disable_speculative_decoding
+        child.is_attention_dp_dummy = self.is_attention_dp_dummy
+        child.is_cuda_graph_dummy = self.is_cuda_graph_dummy
 
-        # Encoder features are shared read-only. Before an in-place mutation,
-        # clone and reassign the tensor on the request being modified.
-        # Deep-copy other py_* attributes to preserve child independence.
-        for attr_name, attr_value in self.__dict__.items():
-            if attr_name == 'py_encoder_input_features':
-                py_request.py_encoder_input_features = attr_value
-            elif attr_name.startswith('py_'):
-                attr_value = getattr(self, attr_name)
-                setattr(py_request, attr_name, deepcopy(attr_value))
-            elif attr_name in [
-                    'is_attention_dp_dummy', 'is_cuda_graph_dummy',
-                    'encoder_tokens', 'encoder_output_len'
-            ]:
-                setattr(py_request, attr_name, attr_value)
-
-        # Rewrite specific attributes that should use child_request values.
-        py_request.py_request_id = child.request_id
-        py_request.py_batch_idx = None
-        py_request.py_seq_slot = None
-
-        py_request.child_requests = []
-
-        assert py_request.is_child
-        assert py_request.request_id == child.request_id
-        assert py_request.parent_request_id == self.request_id
-        assert py_request.sampling_config.seed != self.sampling_config.seed
-
-        self.child_requests.append(py_request)
+        # Register only after all input copies and Python initialization succeed.
+        self._register_child_request(child)
+        self.child_requests.append(child)
 
 
 def _validate_optional_int_sequence(values: Any,
@@ -1534,7 +1583,14 @@ def executor_request_to_llm_request(
         position_ids: Optional[List] = None) -> LlmRequest:
     sampling_config = executor_request.sampling_config
 
-    input_tokens = input_token_ids if input_token_ids is not None else executor_request.input_token_ids
+    if input_token_ids is not None:
+        input_tokens = input_token_ids
+    else:
+        # Owned int32 ndarray: the LlmRequest ctor memcpys it, where
+        # `input_token_ids` would build O(ISL) PyLongs to be cast back one by one.
+        input_tokens = executor_request.get_input_token_ids_array()
+    if position_ids is None:
+        position_ids = executor_request.position_ids
 
     llm_request_type = REQUEST_TYPE_MAPPING[executor_request.request_type]
     # Kept in its native list[list[int]] form, like py_bad_words. The
@@ -1588,23 +1644,34 @@ def executor_request_to_llm_request(
     # feature tensor, not encoder token ids. Python owns the payload; native
     # encoder input/output lengths drive admission and post-encoder cross-KV
     # sizing.
-    encoder_input_features = None
-    encoder_output_len = None
+    encoder_input_features = executor_request.encoder_input_features
+    encoder_output_len = executor_request.encoder_output_length
     py_mm_data = py_multimodal_data or {}
     audio_mm_data = py_mm_data.get("audio") or {}
     if isinstance(audio_mm_data, dict):
         # Only enc-dec input processors emit encoder_input_features (decoder-only
         # audio models use the generic HF input_features), so its presence is a
         # safe routing signal.
-        encoder_input_features = audio_mm_data.get("encoder_input_features")
-        if encoder_input_features is not None:
+        mm_encoder_input_features = audio_mm_data.get("encoder_input_features")
+        if mm_encoder_input_features is not None:
+            if encoder_input_features is not None:
+                raise ValueError(
+                    "Specify encoder_input_features either directly or in "
+                    "multimodal_data['audio'], not both.")
             if "encoder_output_len" not in audio_mm_data:
                 raise ValueError(
                     "multimodal_data['audio'] carries encoder_input_features "
                     "without encoder_output_len; encoder-decoder input "
                     "processors must emit both (the post-encoder length "
                     "sizes the cross-KV cache).")
-            encoder_output_len = int(audio_mm_data["encoder_output_len"])
+            mm_encoder_output_len = int(audio_mm_data["encoder_output_len"])
+            if (encoder_output_len is not None
+                    and encoder_output_len != mm_encoder_output_len):
+                raise ValueError(
+                    "encoder_output_length conflicts with "
+                    "multimodal_data['audio']['encoder_output_len'].")
+            encoder_input_features = mm_encoder_input_features
+            encoder_output_len = mm_encoder_output_len
 
     llm_request = LlmRequest(
         request_id=req_id,
@@ -1616,10 +1683,6 @@ def executor_request_to_llm_request(
         embedding_bias=executor_request.embedding_bias,
         stop_words_list=stop_words_list,
         position_ids=position_ids,
-        prompt_embedding_table=None if executor_request.prompt_tuning_config
-        is None else executor_request.prompt_tuning_config.embedding_table,
-        prompt_vocab_size=None if executor_request.prompt_tuning_config is None
-        else executor_request.prompt_tuning_config.embedding_table.shape[0],
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
@@ -1700,6 +1763,10 @@ def executor_request_to_llm_request(
                                                   None)
     llm_request.py_conversation_params = getattr(executor_request,
                                                  "py_conversation_params", None)
+    # Published by the attention-DP router before this conversion, if at all.
+    llm_request.py_uncached_prefill_tokens = getattr(
+        executor_request, "py_uncached_prefill_tokens", None)
+    llm_request.py_kv_hints = getattr(executor_request, "py_kv_hints", None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

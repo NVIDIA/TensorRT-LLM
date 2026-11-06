@@ -94,6 +94,9 @@ class _Fp8MlaContextCacheManagerView:
     kv_cache_pool_mapping: torch.Tensor
     layer_offsets: Tuple[int, ...]
     dtype: DataType = DataType.FP8
+    # The scratch holds one layer with no sliding window, so TRT-LLM attention
+    # falls back to the partition's max_seq_len for the attention window.
+    max_attention_window_vec: Tuple[Optional[int], ...] = (None,)
 
 
 @dataclass
