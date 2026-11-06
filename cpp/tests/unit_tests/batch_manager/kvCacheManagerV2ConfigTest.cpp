@@ -24,6 +24,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -215,7 +216,8 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     auto const privateLc = lifeCycle(1, "replay");
     auto const optional = lifeCycle(1, "draft");
 
-    // Lifecycles are registered in buffer order, after the attention layer's.
+    // The layer lifecycles first (attention, the REQUIRED SSM state, layer 3's layer-level PRIVATE),
+    // then the OPTIONAL one only an override creates; the PRIVATE overrides join layer 3's lifecycle.
     EXPECT_EQ(registry.size(), LifeCycleId{4});
     EXPECT_EQ(storage.numLifeCycles(), LifeCycleId{4});
     EXPECT_EQ(required, LifeCycleId{1});
@@ -241,6 +243,238 @@ TEST(KvCacheManagerV2ConfigTest, SsmBufferReusePoliciesSplitLayerLifecycles)
     EXPECT_NE(grouping[required], grouping[privateLc]);
     EXPECT_NE(grouping[required], grouping[optional]);
     EXPECT_NE(grouping[privateLc], grouping[optional]);
+}
+
+TEST(KvCacheManagerV2ConfigTest, BufferOverridesNumberTheirLifecyclesAfterLayerLifecycles)
+{
+    // Full attention, two SSM layers, windowed attention and a layer-level PRIVATE SSM layer, with no
+    // buffer overrides; then the same config with PRIVATE replay buffers on the first two SSM layers
+    // (a group no layer has on its own) and OPTIONAL ones on the second (a new group too), placed
+    // before the later layers' buffers.
+    auto const makeLayers = [](bool overrides)
+    {
+        auto config = makeTieredConfig();
+        config.commitMinSnapshot = true;
+        for (LayerId layerId = 1; layerId <= 2; ++layerId)
+        {
+            SsmLayerConfig ssm{.layerId = layerId, .buffers = {BufferConfig{.role = "state", .size = 4096}}};
+            if (overrides)
+            {
+                ssm.buffers.push_back(BufferConfig{.role = "old_x", .size = 2048, .reusePolicy = ReusePolicy::PRIVATE});
+                if (layerId == 2)
+                {
+                    ssm.buffers.push_back(
+                        BufferConfig{.role = "draft", .size = 2048, .reusePolicy = ReusePolicy::OPTIONAL});
+                }
+            }
+            // An override equal to the layer's policy is no override.
+            ssm.buffers.push_back(BufferConfig{.role = "conv", .size = 1024, .reusePolicy = ReusePolicy::REQUIRED});
+            config.layers.emplace_back(std::move(ssm));
+        }
+        config.layers.emplace_back(AttentionLayerConfig{.layerId = 3,
+            .buffers = {BufferConfig{.role = "key", .size = 4096}},
+            .slidingWindowSize = 8,
+            .reusePolicy = ReusePolicy::PRIVATE});
+        config.layers.emplace_back(SsmLayerConfig{.layerId = 4,
+            .buffers = {BufferConfig{.role = "state", .size = 4096}},
+            .reusePolicy = ReusePolicy::OPTIONAL});
+        return config;
+    };
+    auto const plain = makeLayers(false);
+    auto const split = makeLayers(true);
+    ASSERT_NO_THROW(plain.validate());
+    ASSERT_NO_THROW(split.validate());
+    LifeCycleRegistry const plainRegistry(plain);
+    LifeCycleRegistry const splitRegistry(split);
+
+    // Every lifecycle of the plain config keeps its id, and the override-only ones follow in buffer order.
+    std::vector<LifeCycle> const expected{AttnLifeCycle{}, SsmLifeCycle{ReusePolicy::REQUIRED},
+        AttnLifeCycle::make(8, std::nullopt, split.tokensPerBlock, ReusePolicy::PRIVATE),
+        SsmLifeCycle{ReusePolicy::OPTIONAL}, SsmLifeCycle{ReusePolicy::PRIVATE}};
+    ASSERT_EQ(plainRegistry.size(), LifeCycleId{4});
+    ASSERT_EQ(splitRegistry.size(), LifeCycleId{5});
+    for (LifeCycleId id{0}; id < splitRegistry.size(); ++id)
+    {
+        SCOPED_TRACE(id.value());
+        EXPECT_EQ(splitRegistry[id], expected.at(id.value()));
+        if (id < plainRegistry.size())
+        {
+            EXPECT_EQ(plainRegistry[id], splitRegistry[id]);
+        }
+    }
+    EXPECT_EQ(
+        splitRegistry.ssmLifeCycleIds(), (std::vector<LifeCycleId>{LifeCycleId{1}, LifeCycleId{3}, LifeCycleId{4}}));
+
+    // The storage config assigns the buffers the same ids, and the OPTIONAL draft buffer joins layer 4's group.
+    auto const plainStorage = createStorageConfig(plain);
+    auto const splitStorage = createStorageConfig(split);
+    for (auto const& [buffer, attr] : plainStorage.bufferAttributes())
+    {
+        SCOPED_TRACE(std::to_string(buffer.layerId) + "/" + buffer.role);
+        EXPECT_EQ(splitStorage.bufferAttributes().at(buffer).lifeCycleId, attr.lifeCycleId);
+    }
+    auto const lifeCycle = [&](LayerId layerId, DataRole const& role) {
+        return splitStorage.bufferAttributes().at(BufferId{layerId, role}).lifeCycleId;
+    };
+    EXPECT_EQ(lifeCycle(1, "old_x"), LifeCycleId{4});
+    EXPECT_EQ(lifeCycle(2, "old_x"), LifeCycleId{4});
+    EXPECT_EQ(lifeCycle(2, "draft"), LifeCycleId{3});
+    EXPECT_EQ(lifeCycle(1, "conv"), LifeCycleId{1});
+}
+
+TEST(KvCacheManagerV2ConfigTest, MaxLiveKvCachesMustBePositive)
+{
+    auto config = makeConfig();
+    EXPECT_FALSE(config.maxLiveKvCaches.has_value());
+    for (int const value : {1, 64})
+    {
+        config.maxLiveKvCaches = value;
+        EXPECT_NO_THROW(config.validate());
+    }
+    for (int const value : {0, -1})
+    {
+        config.maxLiveKvCaches = value;
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+    }
+
+    // The fixed private SSM capacity divides by max_util_for_resume.
+    config.maxLiveKvCaches = 8;
+    for (float const util : {0.0F, -0.5F, 1.5F})
+    {
+        config.maxUtilForResume = util;
+        EXPECT_THROW(config.validate(), std::invalid_argument);
+    }
+    config.maxUtilForResume = 1.0F;
+    EXPECT_NO_THROW(config.validate());
+}
+
+TEST(KvCacheManagerV2ConfigTest, MaxLiveKvCachesGivesPrivateSsmLifecycleAFixedPoolGroup)
+{
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReservedSsmConfig;
+    LifeCycleId const attention{0};
+    LifeCycleId const requiredSsm{1};
+    LifeCycleId const privateAttention{2};
+    LifeCycleId const privateSsm{3};
+
+    // Without the bound the PRIVATE SSM and PRIVATE attention lifecycles share a pool group of equal slots.
+    auto const elastic = createStorageConfig(makeReservedSsmConfig(32 << 20, std::nullopt));
+    auto const elasticGrouping = elastic.lifeCycleGrouping();
+    EXPECT_EQ(elasticGrouping.raw(),
+        (std::vector<PoolGroupIndex>{PoolGroupIndex{0}, PoolGroupIndex{1}, PoolGroupIndex{2}, PoolGroupIndex{2}}));
+    ASSERT_EQ(elastic.fixedSlotCounts.size(), PoolGroupIndex{3});
+    for (auto const& fixed : elastic.fixedSlotCounts)
+    {
+        EXPECT_FALSE(fixed.has_value());
+    }
+
+    // ceil(N / maxUtilForResume) slots, in a group of its own; the other groups keep their order.
+    for (auto const& [maxUtilForResume, expectedSlots] : {std::pair{0.97F, 9}, std::pair{0.8F, 10}, std::pair{1.0F, 8}})
+    {
+        SCOPED_TRACE(maxUtilForResume);
+        auto config = makeReservedSsmConfig(32 << 20, 8);
+        config.maxUtilForResume = maxUtilForResume;
+        ASSERT_NO_THROW(config.validate());
+        auto const reserved = createStorageConfig(config);
+        auto const grouping = reserved.lifeCycleGrouping();
+        EXPECT_EQ(reserved.slotDescList.size(), PoolGroupIndex{4});
+        EXPECT_EQ(grouping[attention], PoolGroupIndex{0});
+        EXPECT_EQ(grouping[requiredSsm], PoolGroupIndex{1});
+        EXPECT_EQ(grouping[privateAttention], PoolGroupIndex{2});
+        EXPECT_EQ(grouping[privateSsm], PoolGroupIndex{3});
+        EXPECT_EQ(reserved.slotDescList[grouping[privateSsm]].variants.size(), 1U);
+        EXPECT_EQ(reserved.slotDescList[grouping[privateSsm]].slotSizeList(),
+            reserved.slotDescList[grouping[privateAttention]].slotSizeList());
+        ASSERT_EQ(reserved.fixedSlotCounts.size(), PoolGroupIndex{4});
+        for (PoolGroupIndex pgIdx{0}; pgIdx < reserved.fixedSlotCounts.size(); ++pgIdx)
+        {
+            if (pgIdx == grouping[privateSsm])
+            {
+                EXPECT_EQ(reserved.fixedSlotCounts[pgIdx], std::optional<SlotCount>{expectedSlots});
+            }
+            else
+            {
+                EXPECT_FALSE(reserved.fixedSlotCounts[pgIdx].has_value());
+            }
+        }
+    }
+
+    // The bound alone changes nothing without a PRIVATE SSM lifecycle.
+    auto config = makeReservedSsmConfig(32 << 20, 8);
+    for (auto& layer : config.layers)
+    {
+        if (auto* ssm = std::get_if<SsmLayerConfig>(&layer))
+        {
+            ssm->buffers.back().reusePolicy.reset();
+        }
+    }
+    auto const withoutPrivateSsm = createStorageConfig(config);
+    EXPECT_EQ(withoutPrivateSsm.slotDescList.size(), PoolGroupIndex{3});
+    for (auto const& fixed : withoutPrivateSsm.fixedSlotCounts)
+    {
+        EXPECT_FALSE(fixed.has_value());
+    }
+}
+
+TEST(KvCacheManagerV2ConfigTest, SinkRequiredOnlyGroupsStayElasticBesideTheFixedPrivateSsmGroup)
+{
+    // The reserved-SSM layout with its windowed layer (3) on SINK_REQUIRED_ONLY, then two REQUIRED windowed
+    // layers whose key buffers override to SINK_REQUIRED_ONLY: layer 4 with another window (a lifecycle only
+    // the override creates) and layer 5 with layer 3's window (the override joins layer 3's lifecycle).
+    using tensorrt_llm::batch_manager::kv_cache_manager_v2::test::makeReservedSsmConfig;
+    auto config = makeReservedSsmConfig(32 << 20, 8);
+    auto& windowed = std::get<AttentionLayerConfig>(config.layers.back());
+    windowed.numSinkTokens = 4;
+    windowed.reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY;
+    for (auto const& [layerId, window] : {std::pair<LayerId, int>{4, 12}, std::pair<LayerId, int>{5, 8}})
+    {
+        config.layers.emplace_back(AttentionLayerConfig{.layerId = layerId,
+            .buffers = {BufferConfig{.role = "key", .size = 4096, .reusePolicy = ReusePolicy::SINK_REQUIRED_ONLY}},
+            .slidingWindowSize = window,
+            .numSinkTokens = 4});
+    }
+    ASSERT_NO_THROW(config.validate());
+
+    // Layer lifecycles first, the SINK_REQUIRED_ONLY layer among them although it is declared after the SSM
+    // layers; then the override-only lifecycles in buffer order, the PRIVATE SSM replay group before layer 4's.
+    LifeCycleRegistry const registry(config);
+    std::vector<LifeCycle> const expected{AttnLifeCycle{}, SsmLifeCycle{ReusePolicy::REQUIRED},
+        AttnLifeCycle::make(8, 4, config.tokensPerBlock, ReusePolicy::SINK_REQUIRED_ONLY),
+        SsmLifeCycle{ReusePolicy::PRIVATE},
+        AttnLifeCycle::make(12, 4, config.tokensPerBlock, ReusePolicy::SINK_REQUIRED_ONLY)};
+    ASSERT_EQ(registry.size(), LifeCycleId{static_cast<int>(expected.size())});
+    for (LifeCycleId id{0}; id < registry.size(); ++id)
+    {
+        SCOPED_TRACE(id.value());
+        EXPECT_EQ(registry[id], expected.at(id.value()));
+    }
+
+    auto const storage = createStorageConfig(config);
+    auto const attributes = storage.bufferAttributes();
+    auto const lifeCycle = [&](LayerId layerId, DataRole const& role) {
+        return attributes.at(BufferId{layerId, role}).lifeCycleId;
+    };
+    LifeCycleId const sinkLayer{2};
+    LifeCycleId const privateSsm{3};
+    LifeCycleId const sinkOverride{4};
+    EXPECT_EQ(lifeCycle(3, "key"), sinkLayer);
+    EXPECT_EQ(lifeCycle(5, "key"), sinkLayer);
+    EXPECT_EQ(lifeCycle(4, "key"), sinkOverride);
+    EXPECT_EQ(lifeCycle(1, "old_x"), privateSsm);
+    EXPECT_EQ(lifeCycle(2, "old_x"), privateSsm);
+
+    // Only the PRIVATE SSM group has a fixed capacity, ceil(8 / 0.97); the SINK_REQUIRED_ONLY groups are
+    // ratio-sized.
+    auto const grouping = storage.lifeCycleGrouping();
+    EXPECT_NE(grouping[sinkLayer], grouping[privateSsm]);
+    EXPECT_NE(grouping[sinkOverride], grouping[privateSsm]);
+    EXPECT_EQ(storage.slotDescList[grouping[privateSsm]].variants.size(), 1U);
+    ASSERT_EQ(storage.fixedSlotCounts.size(), storage.slotDescList.size());
+    for (PoolGroupIndex pgIdx{0}; pgIdx < storage.fixedSlotCounts.size(); ++pgIdx)
+    {
+        SCOPED_TRACE(pgIdx.value());
+        EXPECT_EQ(storage.fixedSlotCounts[pgIdx],
+            pgIdx == grouping[privateSsm] ? std::optional<SlotCount>{9} : std::optional<SlotCount>{});
+    }
 }
 
 } // namespace

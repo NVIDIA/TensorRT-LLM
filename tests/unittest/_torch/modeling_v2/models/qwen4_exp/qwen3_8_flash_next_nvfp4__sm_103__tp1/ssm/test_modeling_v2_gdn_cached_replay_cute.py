@@ -5,10 +5,12 @@ verify steps against the Triton entry's fp32 `reference` and the Triton kernel i
 that entry's test harness (`_Bench`: work items, all-layer commit, `_advance_replay_state` with
 random partial acceptance), in both commit modes: (a) no in-kernel commit + the manager's
 all-layer commit when partitioned, (b) every wrapping row committed in-kernel. Plus rows with a
-negative slot and CUDA-graph replay (PDL on and off) bitwise against eager."""
+negative slot, CUDA-graph replay (PDL on and off) bitwise against eager, and the history at replay
+slots of its own (pool-strided, bookkeeping in strided rows) bitwise against the coupled run."""
 
 import importlib.util
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -81,7 +83,9 @@ def run_cell(name, spec, mode, config=None, seed=1234):
         wi_all = nw_all = None
         if bm.path == "all_layer":
             # the engine's work items cover every decode row (padding included)
-            wi_all = torch.zeros(bm.n, 4, dtype=torch.int32, device="cuda")
+            wi_all = torch.zeros(
+                bm.n, trep.REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda"
+            )
             nw_all = torch.zeros(1, dtype=torch.int32, device="cuda")
             trep._build_replay_work_items_triton(
                 bm.state_indices, bm.pnat, bm.buf, wi_all, nw_all, bm.t, trep.HIST
@@ -362,3 +366,163 @@ def test_launch_mappings_agree(n, t, pdl) -> None:
                 got.append([out.clone()] + [x.clone() for x in bm.state(0)])
             for name, x, y in zip(("out", "state", "u", "k", "G"), *got):
                 assert torch.equal(x, y), f"{name}: {new_cfg} vs {old_cfg} (work items {with_wi})"
+
+
+@pytest.mark.parametrize(
+    "n,work_items,in_kernel_commit",
+    [(4, False, True), (4, True, True), (32, True, False)],
+    ids=["small_in_kernel", "work_items_in_kernel", "partitioned_all_layer"],
+)
+def test_separate_replay_slots_match_coupled(n, work_items, in_kernel_commit) -> None:
+    """Replay slots that differ from the checkpoint slots give, bit for bit, the coupled run.
+
+    The coupled side keeps contiguous history indexed by the checkpoint slots. The other keeps
+    the same history at a disjoint set of replay slots of a pool-like layout (each layer a view
+    of `[slots, layers + 1, ...]` pages, so a foreign slot stride), the pending count and half
+    in strided rows of one metadata row per slot, and NaN in every other slot. Both run verify
+    steps with checkpoint wraps -- in-kernel, with or without the engine's work items (whose
+    fifth field carries the replay slot), or through the work items and the manager's
+    all-layer commit -- then advance their bookkeeping with the same acceptance.
+    """
+    H, HV, K, V, HIST = trep.H, trep.HV, trep.K, trep.V, trep.HIST
+    layers, t = 2, 4
+    gen = torch.Generator(device="cuda").manual_seed(31 + n)
+    cpu = torch.Generator().manual_seed(31 + n)
+    state_slots, replay_slots = n + 3, 2 * n + 5
+    state_indices = torch.randperm(state_slots, generator=cpu)[:n].to("cuda", torch.int32)
+    # The replay slots never coincide with a checkpoint slot.
+    replay_indices = (
+        torch.randperm(replay_slots - state_slots, generator=cpu)[:n] + state_slots
+    ).to("cuda", torch.int32)
+
+    def randn(*shape):
+        return torch.randn(*shape, generator=gen, device="cuda")
+
+    states = (0.3 * randn(state_slots, layers, HV, V, K)).to(BF)
+    history = (
+        (0.5 * randn(layers, n, 2, HIST, HV, V)).to(BF),
+        torch.nn.functional.normalize(randn(layers, n, 2, HIST, H, K), dim=-1).to(BF),
+        -(0.2 * torch.rand(layers, n, 2, HV, HIST, generator=gen, device="cuda")).cumsum(-1),
+    )
+    pnat0 = torch.randint(0, HIST + 1, (n,), generator=cpu, dtype=torch.int32).to("cuda")
+    pnat0[0] = HIST  # a wrap at the first step
+    buf0 = torch.randint(0, 2, (n,), generator=cpu, dtype=torch.int32).to("cuda")
+    a_log, dt_bias = trep._gating(gen, layers)
+    rows_shapes = ((2, HIST, HV, V), (2, HIST, H, K), (2, HV, HIST))
+
+    def make_side(separate):
+        backing = states.clone()
+        if separate:
+            slots, idx = replay_slots, replay_indices
+            old = tuple(
+                torch.full((slots, layers + 1, *shape), float("nan"), device="cuda")
+                .to(x.dtype)[:, 1:]
+                .transpose(0, 1)
+                for shape, x in zip(rows_shapes, history)
+            )
+            meta = torch.full((slots, 4), 13, dtype=torch.int32, device="cuda")
+            pnat, buf = meta[:, 0], meta[:, 1]
+        else:
+            slots, idx = state_slots, state_indices
+            old = tuple(
+                torch.zeros(layers, slots, *shape, device="cuda", dtype=x.dtype)
+                for shape, x in zip(rows_shapes, history)
+            )
+            pnat = torch.zeros(slots, dtype=torch.int32, device="cuda")
+            buf = torch.zeros_like(pnat)
+        for buffer, x in zip(old, history):
+            buffer[:, idx.long()] = x
+        pnat[idx.long()] = pnat0
+        buf[idx.long()] = buf0
+        return SimpleNamespace(
+            backing=backing,
+            old=old,
+            idx=idx,
+            replay_indices=replay_indices if separate else None,
+            meta=trep.ReplayStateUpdateMetadata(pnat, buf, t, HIST),
+            work_items=torch.zeros(
+                n, trep.REPLAY_WORK_ITEM_WIDTH, dtype=torch.int32, device="cuda"
+            ),
+            n_writes=torch.zeros(1, dtype=torch.int32, device="cuda"),
+        )
+
+    coupled, separate = make_side(False), make_side(True)
+    sides = (coupled, separate)
+    wraps = 0
+    for step in range(HIST // t + 3):
+        wraps += int((coupled.meta.prev_num_accepted_tokens[state_indices.long()] + t > HIST).sum())
+        if work_items:
+            for side in sides:
+                trep._build_replay_work_items_triton(
+                    state_indices,
+                    side.meta.prev_num_accepted_tokens,
+                    side.meta.cache_buf_idx,
+                    side.work_items,
+                    side.n_writes,
+                    t,
+                    HIST,
+                    side.replay_indices,
+                )
+            assert torch.equal(coupled.n_writes, separate.n_writes)
+        for layer in range(layers):
+            packed = (0.5 * randn(n * t, trep.W)).to(BF)
+            qkv = packed.view(n, t, trep.W)
+            a, b = randn(n, t, HV).to(BF), randn(n, t, HV).to(BF)
+            outs = [
+                cr.cached_replay_update(
+                    q=qkv[..., : H * K].view(n, t, H, K),
+                    k=qkv[..., H * K : 2 * H * K].view(n, t, H, K),
+                    v=qkv[..., 2 * H * K :].view(n, t, HV, V),
+                    g=a,
+                    beta=b,
+                    ssm_states=side.backing[:, layer],
+                    state_indices=state_indices,
+                    old_u=side.old[0][layer],
+                    old_k=side.old[1][layer],
+                    old_G=side.old[2][layer],
+                    old_beta=None,
+                    cache_buf_idx=side.meta.cache_buf_idx,
+                    prev_num_accepted_tokens=side.meta.prev_num_accepted_tokens,
+                    history_size=HIST,
+                    use_qk_l2norm_in_kernel=True,
+                    A_log=a_log[layer],
+                    dt_bias=dt_bias[layer],
+                    replay_work_items=side.work_items if work_items else None,
+                    n_writes=side.n_writes if work_items else None,
+                    packed_qkv=packed,
+                    use_all_layer_commit=work_items and not in_kernel_commit,
+                    in_kernel_commit=in_kernel_commit,
+                    replay_indices=side.replay_indices,
+                )
+                for side in sides
+            ]
+            torch.cuda.synchronize()
+            assert torch.equal(outs[0], outs[1]), f"step {step} layer {layer}: outputs differ"
+        if not in_kernel_commit:
+            for side in sides:
+                trep.commit_gdn_cached_replay_history_layers(
+                    ssm_states=side.backing[:, 0],
+                    ssm_state_num_layers=layers,
+                    ssm_state_layer_stride=side.backing.stride(1),
+                    ssm_state_slot_stride=side.backing.stride(0),
+                    old_u=side.old[0],
+                    old_k=side.old[1],
+                    old_G=side.old[2],
+                    replay_work_items=side.work_items,
+                    n_writes=side.n_writes,
+                    history_size=HIST,
+                )
+        accepted = torch.randint(1, t + 1, (n,), generator=cpu, dtype=torch.int32).to("cuda")
+        for side in sides:
+            trep._advance_replay_state(side.meta, side.idx, accepted)
+
+    torch.cuda.synchronize()
+    assert wraps >= n, f"only {wraps} checkpoint wraps; increase the steps"
+    assert torch.equal(coupled.backing, separate.backing), "checkpoints differ"
+    for name in ("prev_num_accepted_tokens", "cache_buf_idx"):
+        assert torch.equal(
+            getattr(coupled.meta, name)[state_indices.long()],
+            getattr(separate.meta, name)[replay_indices.long()],
+        ), name
+    for name, x, y in zip(("u", "k", "G"), coupled.old, separate.old):
+        assert torch.equal(x[:, state_indices.long()], y[:, replay_indices.long()]), name

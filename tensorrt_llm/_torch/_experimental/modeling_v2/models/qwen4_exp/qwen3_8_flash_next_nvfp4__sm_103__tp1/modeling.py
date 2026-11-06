@@ -923,9 +923,9 @@ class _Replay(NamedTuple):
     """The GDN cached-replay verify state of one manager: per slot, the recurrent pool
     row is a checkpoint and a compact history holds the tokens accepted since it."""
 
-    old: dict  # GDN layer -> (old_x, old_B, old_dt, old_dA_cumsum) history buffers
-    cache_buf_idx: torch.Tensor  # per slot: which history half is pending
-    prev_num_accepted: torch.Tensor  # per slot: pending history entries
+    old: dict  # GDN layer -> (old_x, old_B, old_dt) history buffers, one row per replay slot
+    cache_buf_idx: torch.Tensor  # per replay slot: which history half is pending
+    prev_num_accepted: torch.Tensor  # per replay slot: pending history entries
     history: int
     width: int  # verify rows per generation request
     all_layer_commit: bool  # the manager commits partitioned steps over every layer
@@ -1072,9 +1072,10 @@ def check_legacy_state(g: _PoolGeometry, int_ssm, ssm) -> None:
     )
 
 
-def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> None:
+def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm, replay_slots) -> None:
     """Cached replay, manager-wide: the geometry the replay entry is certified at, and the
-    per-slot bookkeeping, which must cover every pool slot."""
+    per-slot bookkeeping, which must cover every replay slot. The manager addresses the
+    history by replay slots of its own, which may differ from the recurrent pool's."""
     assert ssm.dtype in _SSM_STATE_DTYPES, (
         f"the recurrent pool is {ssm.dtype}; the replay entry is certified at an fp32 or a "
         "bf16 checkpoint"
@@ -1087,22 +1088,24 @@ def check_replay_state(history, width, prev_accepted, cache_buf_idx, ssm) -> Non
         f"verify rows and never above the history ({history})"
     )
     for name, t in (("prev_num_accepted_tokens", prev_accepted), ("cache_buf_idx", cache_buf_idx)):
-        assert t.dim() == 1 and t.shape[0] >= ssm.shape[0] and t.dtype == torch.int32, (
-            f"{name} is {tuple(t.shape)} {t.dtype}; the kernel reads one int32 per pool slot "
-            f"({ssm.shape[0]})"
+        assert t.dim() == 1 and t.shape[0] >= replay_slots and t.dtype == torch.int32, (
+            f"{name} is {tuple(t.shape)} {t.dtype}; the kernel reads one int32 per replay slot "
+            f"({replay_slots})"
         )
 
 
 def check_replay_history(
-    g: _PoolGeometry, layer: int, history, pool_slots, old_x, old_B, old_dt
+    g: _PoolGeometry, layer: int, history, replay_slots, old_x, old_B, old_dt
 ) -> None:
-    """One GDN layer's replay history: `[slots, 2 halves, ...]`, addressed by `history` and
-    the head geometry, never by the buffer's own shape."""
+    """One GDN layer's replay history: `[replay slots, 2 halves, ...]`, addressed by `history`
+    and the head geometry, never by the buffer's own shape."""
     for name, t in (("old_x", old_x), ("old_B", old_B), ("old_dt", old_dt)):
         assert t is not None, f"layer {layer}: the manager's layer cache carries no {name}"
-    assert old_x.shape[0] >= pool_slots, (
-        f"layer {layer}: the replay history has {old_x.shape[0]} slots for a {pool_slots}-slot pool"
-    )
+    for name, t in (("old_x", old_x), ("old_B", old_B), ("old_dt", old_dt)):
+        assert t.shape[0] >= replay_slots, (
+            f"layer {layer}: the replay history {name} has {t.shape[0]} slots for "
+            f"{replay_slots} replay slots"
+        )
     bf16, fp32 = torch.bfloat16, torch.float32
     x_tail, b_tail = (history, g.num_v_heads, g.head_v_dim), (history, g.num_k_heads, g.head_k_dim)
     _check_pool(old_x, f"layer {layer}: old_x", 2, x_tail, bf16)
@@ -2239,17 +2242,17 @@ class Qwen4ExpTp1ModelingV2(DecoderModel):
             "(prev_num_accepted_tokens / cache_buf_idx / widths)"
         )
         history, width = meta.replay_history_size, meta.replay_step_width
-        check_replay_state(history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0)
+        # The bookkeeping has one row per replay slot; the steps index it, and the history,
+        # with the metadata's `replay_state_indices`.
+        replay_slots = meta.prev_num_accepted_tokens.shape[0]
+        check_replay_state(
+            history, width, meta.prev_num_accepted_tokens, meta.cache_buf_idx, ssm0, replay_slots
+        )
         old = {}
         for i in self.gdn_layers:
             layer_cache = cm.mamba_layer_cache(i)
-            old[i] = (
-                layer_cache.old_x,
-                layer_cache.old_B,
-                layer_cache.old_dt,
-                layer_cache.old_dA_cumsum,
-            )
-            check_replay_history(g, i, history, ssm0.shape[0], *old[i][:3])
+            old[i] = (layer_cache.old_x, layer_cache.old_B, layer_cache.old_dt)
+            check_replay_history(g, i, history, replay_slots, *old[i])
         # The partitioned replay is the manager's to commit: it commits exactly when this
         # flag holds and a step carries `CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE` or more
         # generation requests, and the forward hands the kernel the work items under that
@@ -3254,21 +3257,23 @@ def _replay_verify(
     of `p` rows over the conv output `mq_out` (`[n * p, conv_dim]`, token-major) and the
     raw `a`/`b` projections, with the fp32 gating parameters fused into the kernel.
 
-    `replay` is `(work_items, n_writes, partitioned)`: the work items are given exactly when
-    the manager runs its all-layer commit after the step (without that commit every history
-    wrap goes uncommitted, with it a wrap committed here is committed twice); without them
-    the kernel commits every wrap itself. An fp32 pool runs the Triton kernel, a bf16 pool
-    the CuTe one (`gdn_cached_replay_cute`) under the same contract. `mq_out`
-    is the conv's fresh, contiguous output, so the kernel reads q/k/v from it directly
-    (`packed_qkv`) and never from the views; the CuTe kernel reads `a`/`b` through their
-    row stride (column views of the input projection). `pdl`: the kernel right before is
-    the in_proj GEMV with the conv as its epilogue, which signals its dependents at its
-    start -- the CuTe kernel then reads the checkpoint and the history (which nothing in
-    the step writes ahead of it) before `griddepcontrol.wait`. The Triton conv does not
-    signal dependents, so after it the kernel launches without PDL."""
-    work_items, n_writes, partitioned = replay
+    `replay` is `(work_items, n_writes, partitioned, replay_indices)`: the work items are
+    given exactly when the manager runs its all-layer commit after the step (without that
+    commit every history wrap goes uncommitted, with it a wrap committed here is committed
+    twice); without them the kernel commits every wrap itself. `replay_indices` address the
+    history and its bookkeeping, `si_d` the checkpoint; `None` means the history shares the
+    checkpoint's slots. An fp32 pool runs the Triton kernel, a bf16 pool the CuTe one
+    (`gdn_cached_replay_cute`) under the same contract. `mq_out` is the conv's fresh,
+    contiguous output, so the kernel reads q/k/v from it directly (`packed_qkv`) and never
+    from the views; the CuTe kernel reads `a`/`b` through their row stride (column views of
+    the input projection). `pdl`: the kernel right before is the in_proj GEMV with the conv
+    as its epilogue, which signals its dependents at its start -- the CuTe kernel then reads
+    the checkpoint and the history (which nothing in the step writes ahead of it) before
+    `griddepcontrol.wait`. The Triton conv does not signal dependents, so after it the kernel
+    launches without PDL."""
+    work_items, n_writes, partitioned, replay_indices = replay
     state = core._bound.replay
-    old_x, old_B, old_dt, old_dA = state.old[i]
+    old_x, old_B, old_dt = state.old[i]
     qv, kv, vv = torch.split(mq_out, [core.key_dim, core.key_dim, core.value_dim], 1)
     entry = (
         gdn_cached_replay_cute
@@ -3286,7 +3291,7 @@ def _replay_verify(
         old_u=old_x,
         old_k=old_B,
         old_G=old_dt,
-        old_beta=old_dA,
+        old_beta=None,
         cache_buf_idx=state.cache_buf_idx,
         prev_num_accepted_tokens=state.prev_num_accepted,
         history_size=state.history,
@@ -3306,14 +3311,16 @@ def _replay_verify(
         packed_qkv=mq_out,
         use_all_layer_commit=partitioned,
         output=None,
+        replay_indices=replay_indices,
     )
     return torch.reshape(out, [1, n * p, core.num_v_heads, core.head_v_dim])
 
 
-def _replay_work(core, mm, num_decodes: int) -> tuple:
+def _replay_work(core, mm, num_decodes: int, num_prefills: int = 0) -> tuple:
     """`_replay_verify`'s `replay` argument for a verify step of `num_decodes` generation
-    requests: the partitioned replay exactly when `update_mamba_states` runs the manager's
-    all-layer commit after the step."""
+    requests behind `num_prefills` context requests: the partitioned replay exactly when
+    `update_mamba_states` runs the manager's all-layer commit after the step, and the
+    generation rows' replay slots."""
     partitioned = (
         core._bound.replay.all_layer_commit
         and num_decodes >= CACHED_REPLAY_PARTITION_MIN_BATCH_SIZE
@@ -3322,6 +3329,7 @@ def _replay_work(core, mm, num_decodes: int) -> tuple:
         mm.replay_work_items[:num_decodes] if partitioned else None,
         mm.replay_n_writes if partitioned else None,
         partitioned,
+        mm.replay_state_indices[num_prefills : num_prefills + num_decodes],
     )
 
 
@@ -4405,7 +4413,7 @@ class PrefillTarget:
             assert core._bound.int_idx is not None, "the cache-manager bind has not run"
             int_idx = core._bound.int_idx[:num_decodes]
             if core._bound.replay is not None:
-                replay = _replay_work(core, mm, num_decodes)
+                replay = _replay_work(core, mm, num_decodes, num_prefills)
         gdn_state = (
             num_prefill_tokens,
             num_decode_tokens,

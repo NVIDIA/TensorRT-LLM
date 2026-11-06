@@ -56,8 +56,8 @@ packed token rows, the fused gated RMSNorm and the 3xTF32 recurrence (at most
 ``MAX_NUM_SPEC`` drafts, vector-aligned bf16 operands). The three kernels have
 the same arithmetic in the same order and bitwise identical results:
 
-* ``kda_decode_mtp_kernel``: every call off the contract (replay-only commits,
-  the shifted-metadata layout, the raw output, the BF16 recurrence of
+* ``kda_decode_mtp_kernel``: every call off the contract (the
+  shifted-metadata layout, the raw output, the BF16 recurrence of
   ``TRTLLM_KDA_MTP_BF16_MATH=1``). Its MXFP8 epilogue serves only that BF16
   recurrence and is the bitwise reference of the two-CTA kernel's.
 * ``kda_decode_mtp_2cta_kernel`` (``kda_mtp_decode_2cta.py``, two CTAs per
@@ -279,6 +279,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         beta_cache: cute.Tensor,
         stage_timing: cute.Tensor,
         ssm_state_indices: cute.Tensor,
+        replay_state_indices: cute.Tensor,
         cu_seqlens: cute.Tensor,
         num_accepted_tokens: cute.Tensor,
         precompute_control: cute.Tensor,
@@ -304,7 +305,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         PROFILE_STAGES: cutlass.Constexpr[bool],
         SPLIT_V: cutlass.Constexpr[int],
         BF16_MMA: cutlass.Constexpr[bool],
-        REPLAY_ONLY: cutlass.Constexpr[bool],
         stream: cuda.CUstream,
     ):
         if cutlass.const_expr(USE_ZERO_ACCEPTED):
@@ -346,6 +346,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             beta_cache,
             smem_qk_layout,
             ssm_state_indices,
+            replay_state_indices,
             cu_seqlens,
             num_accepted_tokens,
             precompute_control,
@@ -391,7 +392,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             SPLIT_V,
             BF16_MMA,
             mma.tiled_mma_f32a,
-            REPLAY_ONLY,
         )
         _launch_verify(launched, HV, N, SPLIT_V, stream)
 
@@ -419,6 +419,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         v_cache: cute.Tensor,
         beta_cache: cute.Tensor,
         ssm_state_indices: cute.Tensor,
+        replay_state_indices: cute.Tensor,
         num_accepted_tokens: cute.Tensor,
         N: cutlass.Int32,
         scale: cutlass.Constexpr[float],
@@ -460,6 +461,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             v_cache,
             beta_cache,
             ssm_state_indices,
+            replay_state_indices,
             num_accepted_tokens,
             cute.make_layout((2 * NUM_SPEC + 1, K), stride=(K, 1)),
             mma.tiled_mma1,
@@ -518,6 +520,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         v_cache: cute.Tensor,
         beta_cache: cute.Tensor,
         ssm_state_indices: cute.Tensor,
+        replay_state_indices: cute.Tensor,
         num_accepted_tokens: cute.Tensor,
         o8: cute.Tensor,
         osf: cute.Tensor,
@@ -561,6 +564,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             v_cache,
             beta_cache,
             ssm_state_indices,
+            replay_state_indices,
             num_accepted_tokens,
             o8,
             osf,
@@ -617,6 +621,7 @@ def _require_stride_layout(
     v_cache,
     beta_cache,
     ssm_state_indices,
+    replay_state_indices,
     cu_seqlens,
     num_accepted_tokens,
     out,
@@ -726,17 +731,22 @@ def _require_stride_layout(
         raise ValueError(f"Expected v_cache shape [pool, {num_spec}, {HV * V}].")
     if beta_cache.ndim != 3 or beta_cache.shape[1:] != (num_spec, HV):
         raise ValueError(f"Expected beta_cache shape [pool, {num_spec}, {HV}].")
-    if (
-        k_cache.shape[0] < pool_size
-        or g_cache.shape[0] < pool_size
-        or v_cache.shape[0] < pool_size
-        or beta_cache.shape[0] < pool_size
-    ):
-        raise ValueError("Expected cache pool dimensions to cover recurrent_state rows.")
+    # Replay slots index the conv and replay caches. They are the state slots
+    # unless replay_state_indices names slots of a separate replay pool.
+    replay_pool_size = min(
+        tensor.shape[0] for tensor in (cs_q, cs_k, cs_v, k_cache, g_cache, v_cache, beta_cache)
+    )
+    if replay_state_indices is None and replay_pool_size < pool_size:
+        raise ValueError(
+            "Expected the conv and replay cache pools to cover recurrent_state rows "
+            "when replay_state_indices is not given."
+        )
 
     if ssm_state_indices.ndim != 1 or num_accepted_tokens.ndim != 1:
         raise ValueError("Expected ssm_state_indices and num_accepted_tokens to be 1D.")
     num_requests = ssm_state_indices.shape[0]
+    if replay_state_indices is not None and replay_state_indices.shape != (num_requests,):
+        raise ValueError("Expected one replay_state_indices entry per ssm_state_indices entry.")
     if packed_token_layout:
         if cu_seqlens is not None:
             raise ValueError("packed_token_layout derives row offsets; cu_seqlens must be None.")
@@ -744,8 +754,8 @@ def _require_stride_layout(
             raise ValueError(
                 "packed_token_layout expects exactly num_spec + 1 new-token rows per request."
             )
-        if num_accepted_tokens.shape[0] < pool_size:
-            raise ValueError("Expected slot-indexed num_accepted_tokens to cover the state pool.")
+        if num_accepted_tokens.shape[0] < replay_pool_size:
+            raise ValueError("Expected slot-indexed num_accepted_tokens to cover the replay pool.")
     else:
         if cu_seqlens is None or cu_seqlens.ndim != 1:
             raise ValueError("Expected cu_seqlens to be a 1D tensor.")
@@ -868,7 +878,6 @@ def _select_verify_kernel(
     fuse_output_norm: bool,
     quantize_output: bool,
     bf16_math: bool,
-    replay_only: bool,
     num_spec: int,
     num_tiles: int,
     num_sms: int,
@@ -878,11 +887,7 @@ def _select_verify_kernel(
     contract whose operands fail ``operands_ok`` (`_verify_operands_ok`, evaluated last) is
     rejected."""
     if not (
-        packed_token_layout
-        and fuse_output_norm
-        and not bf16_math
-        and not replay_only
-        and num_spec <= MAX_NUM_SPEC
+        packed_token_layout and fuse_output_norm and not bf16_math and num_spec <= MAX_NUM_SPEC
     ):
         return "v1"
     if not operands_ok():
@@ -986,7 +991,7 @@ def kda_mtp_decode_impl(
     onorm_eps: float = 1e-5,
     fuse_output_norm: bool = False,
     quantize_output: bool = False,
-    replay_only: bool = False,
+    replay_state_indices: Optional[torch.Tensor] = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch the fused KDA MTP verify kernel. See the module docstring.
 
@@ -996,7 +1001,7 @@ def kda_mtp_decode_impl(
             num_spec`` per request. Rows may be described by ``cu_seqlens``
             or packed uniformly by request.
         w_q/w_k/w_v: conv weights ``[H*128, W]`` fp32, width-contiguous.
-        cs_q/cs_k/cs_v: extended conv caches ``[pool, H*128, >= W-1+M]``
+        cs_q/cs_k/cs_v: extended conv caches ``[replay_pool, H*128, >= W-1+M]``
             of raw projection inputs, bf16 (the runtime's caches; the packed
             fused-norm verify requires bf16), dim-contiguous. Columns
             ``[0, W-1)`` are the committed window; tail columns hold raw
@@ -1006,13 +1011,15 @@ def kda_mtp_decode_impl(
         recurrent_state: pool ``[pool, H, V, K]`` fp32 or bf16, **V-first** layout
             (matches the executor ssm pool and the single-token decode
             kernel). Committed in place.
-        k_cache/g_cache/v_cache/beta_cache: replay caches ``[pool, M, H*K]`` (k,
-            fp32 or bf16) / ``[pool, M, H*K]`` (gate, fp32) / ``[pool, M, H*V]`` /
-            ``[pool, M, H]`` (fp32 or bf16). Mutated.
-        ssm_state_indices: per-request state-pool slots. On the legacy
+        k_cache/g_cache/v_cache/beta_cache: replay caches ``[replay_pool, M, H*K]``
+            (k, fp32 or bf16) / ``[replay_pool, M, H*K]`` (gate, fp32) /
+            ``[replay_pool, M, H*V]`` / ``[replay_pool, M, H]`` (fp32 or bf16).
+            Mutated.
+        ssm_state_indices: per-request state-pool slots ``[N]``. On the legacy
             metadata path, ``cu_seqlens`` supplies token offsets ``[N+1]``
             and accepted counts are request-indexed ``[N]``. On the packed
-            path, ``cu_seqlens`` is absent and accepted counts are pool-level.
+            path, ``cu_seqlens`` is absent and accepted counts are indexed by
+            replay slot.
         zero_accepted_hint: caller asserts every ``num_accepted_tokens`` is
             zero (compiles the smaller-smem no-replay variant). Wrong hints
             produce wrong results — pass True only when statically known.
@@ -1027,12 +1034,10 @@ def kda_mtp_decode_impl(
             epilogue using section-strided ``onorm_g`` and ``onorm_weight``.
         quantize_output: return the normalized activation directly as MXFP8
             E4M3 plus packed UE8M0 1x128 scales for a prequantized projection.
-        replay_only: run only the replay steps and commit the state after them
-            (see ``kda_mtp_commit_pending_drafts``); ``num_accepted_tokens``
-            is indexed by request, and the token inputs, conv weights, gate
-            constants, conv caches, ``cu_seqlens`` and ``out`` are not
-            accessed. Takes the shifted-metadata layout without hints, output
-            norm or quantization.
+        replay_state_indices: per-request replay-pool slots ``[N]`` addressing
+            the conv caches, the replay caches and, on the packed path, the
+            accepted counts. ``None`` uses ``ssm_state_indices``: the replay
+            pools then share the state pool's slots.
 
     Returns either BF16 ``[1, T_total, H, V]`` or, with
     ``quantize_output=True``, E4M3 ``[T_total, H*V]`` and packed UE8M0 scales
@@ -1053,17 +1058,6 @@ def kda_mtp_decode_impl(
 
     if packed_token_layout and regular_metadata_hint:
         raise ValueError("packed_token_layout and regular_metadata_hint are mutually exclusive.")
-    if replay_only and (
-        packed_token_layout
-        or zero_accepted_hint
-        or regular_metadata_hint
-        or fuse_output_norm
-        or quantize_output
-    ):
-        raise ValueError(
-            "replay_only takes neither the packed layout, the metadata hints, "
-            "the output norm nor quantization"
-        )
     if packed_token_layout:
         N = ssm_state_indices.shape[0]
     elif cu_seqlens is None:
@@ -1121,6 +1115,7 @@ def kda_mtp_decode_impl(
         v_cache=v_cache,
         beta_cache=beta_cache,
         ssm_state_indices=ssm_state_indices,
+        replay_state_indices=replay_state_indices,
         cu_seqlens=cu_seqlens,
         num_accepted_tokens=num_accepted_tokens,
         out=out,
@@ -1143,6 +1138,9 @@ def kda_mtp_decode_impl(
     # The packed variant proves at compile time that this tensor is never
     # read. Reuse an existing metadata tensor as the CuTe placeholder.
     cu_seqlens_arg = ssm_state_indices if cu_seqlens is None else cu_seqlens
+    replay_state_indices_arg = (
+        ssm_state_indices if replay_state_indices is None else replay_state_indices
+    )
     # These tensors are compile-time dead in the raw-output variant. Reuse
     # existing aligned arguments instead of allocating placeholders.
     onorm_g_arg = onorm_g if onorm_g is not None else out
@@ -1189,7 +1187,6 @@ def kda_mtp_decode_impl(
         fuse_output_norm=fuse_output_norm,
         quantize_output=quantize_output,
         bf16_math=bf16_math,
-        replay_only=replay_only,
         num_spec=num_spec,
         num_tiles=HV * N,
         num_sms=_num_sms(x_q.device),
@@ -1229,6 +1226,7 @@ def kda_mtp_decode_impl(
             (v_cache, 16),
             (beta_cache, beta_cache_assumed_align),
             (ssm_state_indices, 4),
+            (replay_state_indices_arg, 4),
             (num_accepted_tokens, 4),
         ]
         if kernel == "two_cta":
@@ -1304,6 +1302,7 @@ def kda_mtp_decode_impl(
         _layout_key(v_cache),
         _layout_key(beta_cache, assumed_align=beta_cache_assumed_align),
         _layout_key(ssm_state_indices, dynamic_layout=True, assumed_align=4),
+        _layout_key(replay_state_indices_arg, dynamic_layout=True, assumed_align=4),
         _layout_key(cu_seqlens_arg, dynamic_layout=True, assumed_align=4),
         _layout_key(num_accepted_tokens, dynamic_layout=True, assumed_align=4),
         use_regular_metadata,
@@ -1314,7 +1313,6 @@ def kda_mtp_decode_impl(
         bool(quantize_output),
         split_v,
         bf16_math,
-        bool(replay_only),
     )
 
     if key not in _compiled_cache:
@@ -1323,8 +1321,7 @@ def kda_mtp_decode_impl(
             f"num_spec={num_spec} zero_accepted={use_zero_accepted} "
             f"regular_metadata={use_regular_metadata} "
             f"fuse_output_norm={fuse_output_norm} "
-            f"quantize_output={quantize_output} split_v={split_v} bf16_math={bf16_math} "
-            f"replay_only={replay_only}"
+            f"quantize_output={quantize_output} split_v={split_v} bf16_math={bf16_math}"
         )
         _compiled_cache[key] = cute.compile(
             _run_kda_decode_mtp,
@@ -1353,6 +1350,7 @@ def kda_mtp_decode_impl(
             _from_dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
             _dlpack_arg(stage_timing_arg, assumed_align=16),
             _dlpack_arg(ssm_state_indices, assumed_align=4),
+            _dlpack_arg(replay_state_indices_arg, assumed_align=4),
             _dlpack_arg(cu_seqlens_arg, assumed_align=4),
             _dlpack_arg(num_accepted_tokens, assumed_align=4),
             _from_dlpack_arg(precompute_control),
@@ -1378,7 +1376,6 @@ def kda_mtp_decode_impl(
             PROFILE_STAGES=profile_stages,
             SPLIT_V=split_v,
             BF16_MMA=bf16_math,
-            REPLAY_ONLY=bool(replay_only),
             stream=stream,
         )
 
@@ -1414,6 +1411,7 @@ def kda_mtp_decode_impl(
         _dlpack_arg(beta_cache, assumed_align=beta_cache_assumed_align),
         _dlpack_arg(stage_timing_arg, assumed_align=16),
         _dlpack_arg(ssm_state_indices, assumed_align=4),
+        _dlpack_arg(replay_state_indices_arg, assumed_align=4),
         _dlpack_arg(cu_seqlens_arg, assumed_align=4),
         _dlpack_arg(num_accepted_tokens, assumed_align=4),
         _dlpack_arg(precompute_control, assumed_align=16),
@@ -1424,104 +1422,6 @@ def kda_mtp_decode_impl(
     if quantize_output:
         return out, output_scale
     return out
-
-
-# (device_index, N, H, K, V, W) -> stand-ins for the inputs the replay-only
-# variant never reads. Keys are plain values, like _precompute_control_cache.
-_replay_only_inputs_cache = {}
-
-
-def _replay_only_inputs(device: torch.device, N: int, H: int, K: int, V: int, W: int) -> dict:
-    dev = torch.device(device)
-    key = (dev.index if dev.index is not None else torch.cuda.current_device(), N, H, K, V, W)
-    if key not in _replay_only_inputs_cache:
-
-        def unused(*shape, dtype=torch.bfloat16):
-            return torch.empty(shape, dtype=dtype, device=dev)
-
-        _replay_only_inputs_cache[key] = {
-            "x_q": unused(1, N, H, K),
-            "x_k": unused(1, N, H, K),
-            "x_v": unused(1, N, H, V),
-            "g": unused(1, N, H, K),
-            "beta": unused(1, N, H),
-            "w_q": unused(H * K, W, dtype=torch.float32),
-            "w_k": unused(H * K, W, dtype=torch.float32),
-            "w_v": unused(H * V, W, dtype=torch.float32),
-            "A_log": unused(H, dtype=torch.float32),
-            "dt_bias": unused(H * K, dtype=torch.float32),
-            "out": unused(1, N, H, V),
-            # One row per request keeps the shifted-metadata validation's [bos, eos) non-empty;
-            # the replay-only kernel itself does not read it.
-            "cu_seqlens": torch.arange(N + 1, dtype=torch.int32, device=dev),
-        }
-    return _replay_only_inputs_cache[key]
-
-
-def kda_mtp_commit_pending_drafts(
-    recurrent_state: torch.Tensor,
-    cs_q: torch.Tensor,
-    cs_k: torch.Tensor,
-    cs_v: torch.Tensor,
-    k_cache: torch.Tensor,
-    g_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    beta_cache: torch.Tensor,
-    ssm_state_indices: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
-    num_spec: int,
-    conv_width: int,
-) -> None:
-    """Commit the pending accepted drafts of the selected slots in place.
-
-    For request ``n`` this runs the first ``num_accepted_tokens[n]`` rows of a
-    ``kda_mtp_decode`` verify chunk of slot ``ssm_state_indices[n]``, the
-    replay of its cached drafts, with the same kernel code, and commits the
-    recurrent state after them. The slot then holds the state the next verify
-    would reach just before its golden token, with nothing left pending; the
-    caller commits the conv window after the drafts and sets the slot's
-    accepted-draft count to 0. The tensors are those of ``kda_mtp_decode``
-    (``k_cache`` / ``v_cache`` / ``beta_cache`` bf16 or fp32, ``g_cache``
-    fp32); the conv and replay caches are only read.
-
-    The tensor-core verify computes each chunk in one WY-form pass, so the
-    verify that follows this commit (a chunk of the new tokens only) rounds
-    differently from one that replays the drafts itself: the two agree to the
-    kernel's accuracy, not bit for bit.
-    """
-    N = ssm_state_indices.shape[0]
-    if N == 0:
-        return
-    _, H, V, K = recurrent_state.shape
-    inputs = _replay_only_inputs(recurrent_state.device, N, H, K, V, conv_width)
-    kda_mtp_decode_impl(
-        x_q=inputs["x_q"],
-        x_k=inputs["x_k"],
-        x_v=inputs["x_v"],
-        w_q=inputs["w_q"],
-        w_k=inputs["w_k"],
-        w_v=inputs["w_v"],
-        cs_q=cs_q,
-        cs_k=cs_k,
-        cs_v=cs_v,
-        g=inputs["g"],
-        beta=inputs["beta"],
-        A_log=inputs["A_log"],
-        dt_bias=inputs["dt_bias"],
-        recurrent_state=recurrent_state,
-        k_cache=k_cache,
-        g_cache=g_cache,
-        v_cache=v_cache,
-        beta_cache=beta_cache,
-        ssm_state_indices=ssm_state_indices,
-        cu_seqlens=inputs["cu_seqlens"],
-        num_spec=num_spec,
-        num_accepted_tokens=num_accepted_tokens,
-        # Only the new-token steps use the gate bound and the q scale.
-        lower_bound=0.0,
-        out=inputs["out"],
-        replay_only=True,
-    )
 
 
 if IS_CUTLASS_DSL_AVAILABLE:
@@ -1572,6 +1472,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
+        replay_state_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Fused KDA multi-token verify with in-place state commit."""
         return kda_mtp_decode_impl(
@@ -1606,6 +1507,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
             fuse_output_norm=fuse_output_norm,
+            replay_state_indices=replay_state_indices,
         )
 
     @kda_mtp_decode.register_fake
@@ -1641,8 +1543,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
         fuse_output_norm: bool = False,
+        replay_state_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm
+        del onorm_g, onorm_weight, onorm_eps, fuse_output_norm, replay_state_indices
         return x_q.new_empty(x_v.shape)
 
     @torch.library.custom_op(
@@ -1690,6 +1593,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_g: Optional[torch.Tensor] = None,
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
+        replay_state_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Fused KDA verify, gated RMSNorm, and 1x128 MXFP8 quantization."""
         return kda_mtp_decode_impl(
@@ -1725,6 +1629,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_eps=onorm_eps,
             fuse_output_norm=True,
             quantize_output=True,
+            replay_state_indices=replay_state_indices,
         )
 
     @kda_mtp_decode_fp8.register_fake
@@ -1759,6 +1664,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         onorm_g: Optional[torch.Tensor] = None,
         onorm_weight: Optional[torch.Tensor] = None,
         onorm_eps: float = 1e-5,
+        replay_state_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         del (
             x_k,
@@ -1789,6 +1695,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             onorm_g,
             onorm_weight,
             onorm_eps,
+            replay_state_indices,
         )
         rows = x_q.shape[1]
         heads = x_v.shape[2]

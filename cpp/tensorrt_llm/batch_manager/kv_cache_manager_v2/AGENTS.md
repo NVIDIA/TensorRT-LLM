@@ -104,6 +104,12 @@ lifecycle groups. Use `getBufferGroupId(layerId, role)` and `bufferGrouping()`
 (`get_buffer_group_id` and `buffer_grouping` in Python) for exact membership.
 These APIs return or index by `CacheGroupId`, a public alias of `LifeCycleId`.
 `LayerGroupId` remains a lifecycle alias for legacy APIs.
+Lifecycle ids follow registration order in two passes over layers and their
+buffers: first buffers on their layer's policy (no override, or an override
+equal to it), then buffers whose override differs. A lifecycle that only a
+buffer override creates (for example a PRIVATE replay group of REQUIRED SSM
+layers) is numbered after every layer lifecycle, so adding it never renumbers
+the existing groups.
 The legacy `getLayerGroupId(layerId)` and `layerGrouping()` are deprecated in
 documentation only: uniform layers retain their results, while a split layer
 fails a `TLLM_CHECK_WITH_INFO` (for the queried layer or the entire partition,
@@ -345,6 +351,25 @@ physically duplicate the whole prompt; ownership splits at the prompt tail:
 - Every cache level has storage and a per-level eviction controller; each pool
   group has a priority-sorted set of LRU queues. Lower priority is evicted first,
   then least-recently-used within that priority.
+- Hot-tier pool groups are sized by ratio: per-lifecycle demand (from
+  `initialPoolRatio`, `typicalStep`, `constraints` or the tuner's averages)
+  becomes a byte ratio that splits the GPU quota above the constraint floors in
+  `mHotMinSlots`. `CacheLevelStorage::ratioToSlotCountList` does this at
+  construction, in `adjustCacheLevel()` (`resize()`/`adjust()`) and for tuner
+  targets (`constrainPoolGroupRatio()`). When `maxLiveKvCaches` is set, the
+  PRIVATE SSM lifecycle instead gets a pool group of its own with a fixed
+  capacity of `ceil(maxLiveKvCaches / maxUtilForResume)` slots
+  (`StorageConfig::fixedSlotCounts`): its pages never enter the radix tree and
+  each living cache holds exactly one, so that capacity keeps the group at or
+  below the resume gate. All three call sites take fixed groups out of the quota
+  first and split the rest by ratio; their ratio entries are ignored, `adjust()`
+  never resizes them, and their tuner target is their actual size. The fixed
+  capacity is also the group's entry in `mHotMinSlots`, so a GPU quota too small
+  for all floors is raised to fit it, as for the elastic floors.
+  `createKvCache()` enforces the bound (suspended caches count) and
+  `setBeamWidth()` rejects widths above one. Other PRIVATE lifecycles, such as
+  windowed attention, stay ratio-sized because their per-cache demand depends on
+  sequence length; cold tiers are sized as before.
 - `NodeRef` is a stable `std::list` iterator, but only within the exact
   `LRUEvictionPolicy` that issued it. Iterators from different lists are not
   comparable or interchangeable.
