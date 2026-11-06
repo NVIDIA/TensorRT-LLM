@@ -21,6 +21,8 @@ from utils.util import skip_pre_blackwell
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import (
+    CudaCoreNVFP4Runner, NVFP4GemmUnifiedRunner)
 from tensorrt_llm._torch.cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                                                 IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
@@ -715,9 +717,9 @@ def test_fp4_linear_cublaslt(dtype, mnk):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mnk", [(1, 4096, 7168), (4, 7168, 16384),
-                                 (8, 2112, 7168)])
+                                 (8, 2112, 7168), (16, 1024, 1024)])
 def test_fp4_linear_cuda_core(dtype, mnk):
-    """Test CUDA Core NVFP4 GEMM implementation on SM >= 100 (M <= 8)"""
+    """Test CUDA Core NVFP4 GEMM implementation on SM >= 100 (M <= 16)"""
 
     SEQ_LEN, OUTPUT_SIZE, HIDDEN_SIZE = mnk
     torch.manual_seed(0)
@@ -900,8 +902,8 @@ def _make_nvfp4_inputs_for_bias_test(m, n, k, dtype=torch.bfloat16):
 def test_fp4_gemm_bias_per_backend(backend, mnk):
     """Per-backend numerical parity: nvfp4_gemm(bias=B) ≈ nvfp4_gemm(bias=None) + B."""
     m, n, k = mnk
-    if backend == "cuda_core" and m > 8:
-        pytest.skip("cuda_core backend only supports M <= 8")
+    if backend == "cuda_core" and m > 16:
+        pytest.skip("cuda_core backend only supports M <= 16")
 
     act_fp4, w_fp4, act_sf, w_sf, alpha = _make_nvfp4_inputs_for_bias_test(
         m, n, k)
@@ -934,6 +936,80 @@ def test_fp4_gemm_bias_per_backend(backend, mnk):
     # Tolerance is kept because the biased and unbiased calls may pick
     # different autotuner tactics, i.e. a different accumulation order.
     torch.testing.assert_close(out_fused, ref, rtol=1e-2, atol=5e-3)
+
+
+@pytest.mark.skipif(
+    get_sm_version() < 100,
+    reason="CUDA Core backend requires SM >= 100 (Blackwell or newer)",
+)
+@pytest.mark.parametrize("tuning", [False, True])
+def test_nvfp4_gemm_cuda_core_rejects_m_above_limit(tuning):
+    """Forcing cuda_core with M above the kernel limit raises ValueError.
+
+    M=17 falls in the M=16 tuning bucket, so the autotuner can return the
+    cuda_core tactic for it; the unified runner must still refuse it.
+    M=16 acceptance is covered by test_fp4_linear_cuda_core.
+    """
+    m = CudaCoreNVFP4Runner.MAX_M_DIMENSION + 1
+    inputs = _make_nvfp4_inputs_for_bias_test(m, 1024, 1024)
+    with torch.inference_mode(), autotune(tuning):
+        with pytest.raises(ValueError,
+                           match=f"M <= {CudaCoreNVFP4Runner.MAX_M_DIMENSION}"):
+            torch.ops.trtllm.nvfp4_gemm(*inputs,
+                                        torch.bfloat16,
+                                        allowed_backends="cuda_core")
+
+
+@pytest.mark.skipif(
+    get_sm_version() < 100,
+    reason="CUDA Core backend requires SM >= 100 (Blackwell or newer)",
+)
+@pytest.mark.parametrize("m", [17, 31])
+def test_nvfp4_gemm_cuda_core_tactic_falls_back_above_limit(m):
+    """A cuda_core tactic cached for the M=16 bucket is not run for M > 16."""
+    inputs = list(_make_nvfp4_inputs_for_bias_test(m, 1024, 1024))
+    runner = NVFP4GemmUnifiedRunner(0, torch.bfloat16, ["cutlass", "cuda_core"])
+    with torch.inference_mode():
+        output = runner(inputs=inputs, tactic=("cuda_core", 0))
+        output_ref = torch.ops.trtllm.nvfp4_gemm(*inputs,
+                                                 torch.bfloat16,
+                                                 allowed_backends="cutlass")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
+
+
+@pytest.mark.skipif(
+    get_sm_version() < 100,
+    reason="CUDA Core backend requires SM >= 100 (Blackwell or newer)",
+)
+def test_nvfp4_gemm_cuda_core_fallback_skips_unavailable_backend(monkeypatch):
+    """Without cutlass, M > 16 falls back to the first backend that can run.
+
+    CuteDSL is made unavailable (as on SM120/121), so it must be skipped in
+    favor of the later cuBLASLt entry instead of raising.
+    """
+    from tensorrt_llm._torch.cublaslt_utils import IS_CUBLASLT_AVAILABLE
+    if not IS_CUBLASLT_AVAILABLE:
+        pytest.skip("cuBLASLt is not available")
+
+    def no_cutedsl(self, *, required=False):
+        if required:
+            raise ValueError("CuteDSL backend is not available.")
+        return None
+
+    monkeypatch.setattr(NVFP4GemmUnifiedRunner, "_get_cutedsl_runner",
+                        no_cutedsl)
+    m = CudaCoreNVFP4Runner.MAX_M_DIMENSION + 1
+    inputs = list(_make_nvfp4_inputs_for_bias_test(m, 1024, 1024))
+    runner = NVFP4GemmUnifiedRunner(0, torch.bfloat16,
+                                    ["cuda_core", "cutedsl", "cublaslt"])
+    with torch.inference_mode():
+        output = runner(inputs=inputs, tactic=("cuda_core", 0))
+        output_ref = torch.ops.trtllm.nvfp4_gemm(*inputs,
+                                                 torch.bfloat16,
+                                                 allowed_backends="cublaslt")
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=0.15)
 
 
 @pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE
