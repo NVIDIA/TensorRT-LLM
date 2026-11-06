@@ -89,7 +89,13 @@ first; it may already constrain the feature.
   NaN in a test run to prove they are never read: kernels must stop at the
   real length. The KV cache manager V2 debug fills do this without custom
   code: `TRTLLM_KV_FRESH_PAGE_FILL=nan` poisons newly handed-out pages, and
-  `TRTLLM_KV_GUARD_PAGE` adds a guard page.
+  `TRTLLM_KV_GUARD_PAGE` adds a guard page. The fill depends on the KV cache
+  dtype. An unpacked FP8 KV cache has no fill kernel, so the fill is skipped
+  with a warning; run the check with a BF16 or FP16 KV cache instead. A
+  packed NVFP4 pool cannot hold NaN, so a non-zero fill lands as +6.0;
+  compare outputs with the fill on and off, which must be identical. In
+  every case, confirm from the log that the fill reached each pool under
+  test.
 - **Evidence**: the CUDA graph is still replayed for the feature's steps
   (CUDA graph launch counts or a profile). The feature does not force eager
   mode.
@@ -111,9 +117,12 @@ first; it may already constrain the feature.
 - **Smallest test**:
   - compare outputs with the overlap scheduler on and off on the same
     requests, including requests that finish at different steps;
-  - repeat several times. Run-to-run divergence that only appears with the
-    overlap scheduler points to host-side ordering, not to GPU stream
-    ordering.
+  - repeat several times. If run-to-run divergence appears only with the
+    overlap scheduler, check both kinds of ordering. A missing dependency
+    between GPU streams disappears under a full device synchronization and
+    is fixed with an event that the consumer stream waits on. A divergence
+    that survives a full synchronization is host-side ordering: the overlap
+    scheduler prepares the next step while the current one runs.
 - **Evidence**: where the feature's mutation is ordered relative to the
   in-flight step, and what makes it safe.
 - **Never** conclude that a feature "cannot use the overlap scheduler", and
@@ -312,6 +321,21 @@ first; it may already constrain the feature.
   static-buffer rules as decode CUDA graphs.
 - **Smallest test**: the feature with prefill CUDA graphs on and off, with
   outputs compared.
+
+### GPU architectures
+
+- **What breaks**:
+  - a kernel built or tuned for one architecture family fails, is skipped,
+    or produces different numerics on another;
+  - shared-memory limits and supported data types differ between families;
+  - a test registered on one GPU stage leaves the other families untested.
+- **Smallest test**: run the end-to-end path on each architecture the
+  feature claims: Hopper (SM90: H100, H200), datacenter Blackwell (SM100:
+  B200, GB200; SM103: B300, GB300), and workstation Blackwell (SM120) where
+  supported. Reject the others at configuration time.
+- **Evidence**: tests registered in the test list of each claimed GPU, such
+  as `l0_h100.yml`, `l0_b200.yml`, `l0_b300.yml`, `l0_gb200_multi_gpus.yml`,
+  and `l0_gb300.yml`, and an end-to-end run per architecture.
 
 ## Feature-Off Invariance
 

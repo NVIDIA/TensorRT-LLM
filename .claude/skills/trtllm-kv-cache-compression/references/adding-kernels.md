@@ -73,9 +73,12 @@ compilation cost.
 - **Alignment and dtypes.** State the required alignment (for example
   16-byte rows, 16-element scale groups) and the supported dtypes. Reject
   everything else with an actionable error.
-- **Architecture.** Gate device code and imports by architecture family, and
-  give an actionable error on unsupported GPUs, before any kernel is
-  compiled.
+- **Architecture.** Gate device code and imports by architecture family:
+  Hopper (SM90: H100, H200), datacenter Blackwell (SM100: B200, GB200;
+  SM103: B300, GB300), and workstation Blackwell (SM120), using the helpers
+  in `tensorrt_llm/_utils.py` such as `is_blackwell_datacenter()`. Give an
+  actionable error on unsupported GPUs before any kernel is compiled, and
+  test on every family you claim.
 - **Determinism.** Selection kernels define tie-breaking explicitly, so that
   fused and unfused versions, and every tensor-parallel rank, agree.
 - **CUDA graphs.** No allocation inside a captured region, static shapes and

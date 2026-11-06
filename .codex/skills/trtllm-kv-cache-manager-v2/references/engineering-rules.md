@@ -17,34 +17,46 @@ does. This file is the workflow on top of them: how to design and gate a
 change, and the rules that reviews keep enforcing. Paths are relative to this
 file.
 
-Four failure patterns recur in AI-assisted work on KV cache manager V2 and
-the KV cache compression framework. Every section below exists to prevent
-one of them:
+These failure patterns recur in AI-assisted work on KV cache manager V2 and
+the KV cache compression framework. The first one matters most; every
+section below exists to prevent one of them:
 
-1. **Ignoring the existing framework.** A new mechanism is built where
+1. **The feature does not work.** A stub or placeholder, a path that is
+   never wired into the executor, a demonstration on one model presented as
+   general support, or "done" without an end-to-end run.
+2. **Defensive, conservative, and messy code.** Try/except around code that
+   should not fail, fallbacks, checks for states that cannot happen, options
+   nobody asked for, and flags, wrappers, or parallel paths added to avoid
+   changing the code that owns the behavior; dead paths and jargon.
+3. **Test bloat and test gaming.** Many tests that mock the feature away,
+   compare the code with itself, or can never fail; tests edited, skipped,
+   or loosened until they pass.
+4. **Ignoring the existing framework.** A new mechanism is built where
    configuration or an existing extension point would have worked.
-2. **Non-compliant code.** Repository rules for config changes, tests, docs,
+5. **Non-compliant code.** Repository rules for config changes, tests, docs,
    and commits are skipped.
-3. **Messy code.** New abstraction layers, dead paths, silent fallbacks, and
-   jargon pile up.
-4. **No performance check.** A feature is called done without an end-to-end
+6. **No performance check.** A feature is called done without an end-to-end
    comparison in the production configuration.
 
 ## Design Workflow
 
-1. **Behavior contract.** What changes for the user. Also state what stays
-   identical when the feature is off: everything.
-2. **Survey.** Find the existing mechanisms that already do most of the job:
-   life cycles (including sliding-window ones), retention priorities, reuse
-   policies, extra buffers, the KV cache compression manager's lifecycle
-   hooks, cold-page codecs, sparse-attention hooks, the attention metadata's
-   mixed-precision staging copy, transceiver layout resolution. See
-   `design-principles.md`, section 2.
-3. **Extension level.** Use the highest level that works: configuration,
-   then a field, then an existing extension point, then the feature's own
-   package, then shared Python runtime code, then native code. Write a
-   reason for every step down. For changes to shared Python runtime code or
-   native code, list every function you will change, by layer.
+1. **Behavior contract.** What changes for the user, and on which model
+   families. The goal is every family KV cache manager V2 serves (see "The
+   Goal" in `design-principles.md`). Also state what stays identical when
+   the feature is off: everything.
+2. **Survey.** Spend a short time finding mechanisms that already do part of
+   the job: life cycles (including sliding-window ones), retention
+   priorities, reuse policies, extra buffers, the KV cache compression
+   manager's lifecycle hooks, cold-page codecs, sparse-attention hooks, the
+   attention metadata's mixed-precision staging copy, transceiver layout
+   resolution. Use what fits. The survey shapes the design; it does not stop
+   new code that the feature needs. See `design-principles.md`, section 2.
+3. **Placement.** Put each change where the behavior belongs: configuration,
+   a field, an existing extension point, the feature's own package, shared
+   Python runtime code, or native code. Prefer a higher level when it can
+   express the feature, and go lower with a written reason when it cannot.
+   For changes to shared Python runtime code or native code, list every
+   function you will change, by layer.
 4. **Owner boundaries.** Place each responsibility in a row of the owner map.
 5. **Compatibility.** Decide each axis in
    `../../trtllm-kv-cache-compat-testing/SKILL.md` as supported, rejected, or
@@ -55,7 +67,8 @@ one of them:
 7. **Validation plan.** Follow the order in the compression development
    guide (`docs/source/developer-guide/kv-cache-compression-development.md`):
    1. the accuracy or output-quality contract against the uncompressed path;
-   2. real end-to-end activation and the claimed compatibility combinations;
+   2. real end-to-end activation on every claimed model family, and the
+      claimed compatibility combinations;
    3. end-to-end performance;
    4. automated regression tests.
 
@@ -69,9 +82,11 @@ Write the gate before editing:
 ```markdown
 ## Design Gate
 - Behavior contract: <what changes; "feature off = identical to main">
+- Model families: <family -> supported (end-to-end run) | rejected (where,
+  why, follow-up)>
 - Existing mechanisms surveyed: <mechanism -> reused | why not>
-- Extension level: <config | field | extension point | feature package |
-  shared Python runtime code | native>; reason for each step down: <...>
+- Placement: <config | field | extension point | feature package |
+  shared Python runtime code | native>; reason for going lower: <...>
 - Shared functions touched (layer x function): <table, or "none">
 - Owner placement: <responsibility -> owner-map row>
 - Compatibility table: <axis -> supported / rejected (where) / n/a>
@@ -83,15 +98,16 @@ Write the gate before editing:
 - Docs and config artifacts to update: <...>
 ```
 
-If a reviewer can name an existing mechanism the design duplicates, or an
-axis with no decision, the gate is not passed.
+If a reviewer can name a model family or a compatibility axis with no
+decision, or an existing mechanism the design duplicates, the gate is not
+passed.
 
 ### When the Framework Is Not Enough
 
-Be strict about reuse and open to real innovation. If a valuable idea cannot
-be expressed with existing mechanisms:
+Use existing mechanisms where they fit, and build what is missing where they
+do not. When a feature needs something the framework cannot express:
 1. prototype it in your own package and measure it;
-2. write down why each rung of the extension ladder fails;
+2. write down why the existing extension points do not fit;
 3. propose an algorithm-neutral extension point (hook, capability, buffer role,
    life-cycle property, codec interface) that defaults to today's behavior;
 4. get the owners' decision;
@@ -107,9 +123,26 @@ main. Kernels follow
 Details and rationale are in `design-principles.md`. The incidents
 behind them are in `lessons-learned.md`.
 
-- **Reuse before building.** Configuration first, then existing extension
-  points, then the feature package. Do not add a new abstraction layer for a
-  small feature. Do not route around an owner's component with a fallback.
+- **The feature first.** The deliverable is a working feature. Wire the whole
+  path first (configuration, KV cache manager V2, attention metadata,
+  executor callbacks, outputs) and run it end to end on a real model in the
+  production configuration. Then refine.
+- **Every model family.** Make the feature work on every model family KV
+  cache manager V2 serves: dense models with multi-head or grouped-query
+  attention, multi-head latent attention (MLA) models, sparse-attention
+  models such as DeepSeek-V4, sliding-window and hybrid models, hybrid
+  recurrent models, multimodal models, and speculative-decoding draft
+  layers. A family that cannot be supported yet is rejected at configuration
+  time and listed as a gap with its reason, never silently skipped. Cover
+  every GPU architecture the feature claims the same way: Hopper (SM90:
+  H100, H200) and Blackwell (SM100: B200, GB200; SM103: B300, GB300), since
+  kernels, shared-memory limits, and numerics can differ between them.
+- **Fit, do not force.** Use configuration and existing extension points when
+  they fit the feature. When they do not, change the code that owns the
+  behavior or add what is missing. Do not bend the feature to fit an
+  existing mechanism, and do not add a flag, a wrapper, a new abstraction
+  layer, or a parallel path to avoid touching the right file. Do not route
+  around an owner's component with a fallback.
 - **Keep method logic out of shared code.** The runtime, KV cache manager
   V2, attention kernels, and C++ never branch on a method's or model's name.
   Shared changes extend an algorithm-neutral contract.
@@ -120,8 +153,20 @@ behind them are in `lessons-learned.md`.
 - **Fail fast.** Reject unsupported combinations at configuration time, or at
   executor construction before KV cache manager V2 allocation when the check
   needs the device or the engine. No version sniffing, no try/except-import
-  fallbacks, no half-applied state. Load offline artifacts at initialization, never
-  calibrate during inference.
+  fallbacks, no half-applied state. Load offline artifacts at
+  initialization, never calibrate during inference.
+- **Direct code, not defensive code.** Write the code the feature needs and
+  nothing "just in case": no try/except around code that should not fail,
+  no fallback paths, no `getattr` or `hasattr` defaults for attributes that
+  always exist, no checks for states that validation already rules out, and
+  no options nobody asked for. Every guard names the real failure it
+  handles.
+- **Few, strong tests.** Each test exercises the real path and fails if the
+  feature breaks. Do not write tests that mock the feature away, compute
+  their expected values with the code under test, check trivial getters, or
+  repeat another test with different numbers. Never edit, skip, delete, or
+  loosen a test, or special-case test inputs, to make it pass: fix the code,
+  or stop and report the conflict.
 - **Preserve algorithm semantics.** Do not change selection rules or
   granularity, and do not remove modes for convenience. Parallel runs must
   match single-GPU semantics.
@@ -140,8 +185,9 @@ behind them are in `lessons-learned.md`.
   name (ABBR)" at its first use in each document. Comments explain the code
   as it stands; history goes in the PR. Use no internal jargon, codenames,
   version labels, or milestone names anywhere.
-- **Code size is a consideration, not a target.** Before adding a feature,
-  check whether an existing mechanism can carry it, or whether it can merge
+- **Code size is a consideration, not a target.** A working feature comes
+  first. While adding it, check whether an existing mechanism can carry it,
+  or whether it can merge
   into the existing framework, instead of writing a new standalone
   implementation. Add everything the requirement needs. Never remove
   features, modes, model support, or optimizations to make a change smaller.
@@ -167,14 +213,19 @@ behind them are in `lessons-learned.md`.
 | Feature-off invariance | Nothing | Read every new branch; run touched suites with the feature off |
 | Reuse of existing mechanisms; no new layers | Nothing | Compare with the design gate's survey |
 | No method or model branches in shared code or C++ | Nothing | Grep the diff outside the feature package |
-| No silent fallbacks, no version sniffing | Nothing | Read every `except`, `getattr` default, and capability check |
+| No defensive code: silent fallbacks, version sniffing, checks for impossible states | Nothing | Read every `try`/`except`, `getattr` or `hasattr` default, `isinstance` check, and capability check the change adds; each must name a real failure |
 | Per-step host work, syncs, memsets | Nothing | Read the call sites and their guards |
+| The feature works end to end on every claimed model family | Nothing | Ask for the end-to-end run per family, and for the rejection and its reason for every other family |
+| Tests fail when the feature breaks | Nothing | Break the feature on purpose and confirm the new tests fail. Reject mock-only and self-comparing tests, and any test that was edited, skipped, or loosened to pass |
 | Compatibility decided and tested | Nothing | Check the compatibility table against the tests |
 | Activation proven, performance and accuracy measured | Nothing | Ask for the evidence (`../../perf-kv-cache-tuning/SKILL.md`, `../../trtllm-kv-cache-accuracy-eval/SKILL.md`) |
 | One full name per concept; abbreviations defined at first use | Nothing | Read new identifiers, test IDs, comments, and docs for fragments and undefined abbreviations |
 
 ## Agent Working Rules
 
+- **Finish the feature before polishing it.** Get the full path working end
+  to end first; refactors, extra options, and cleanups come after. A change
+  called done has no stubs, placeholders, or "TODO: implement".
 - **Read, don't infer.** Before answering "does X happen once or every
   step", "which engine or backend runs this", or "is this our bug", read the
   call site and its guard, or run it. Never rely on a function name, a
@@ -201,6 +252,9 @@ behind them are in `lessons-learned.md`.
 - **Root-cause before fixing.** Reproduce, locate the first point where the
   behavior diverges, and fix the cause. A retry, a wider tolerance, or a waive
   is not a fix.
+- **Do not game tests.** When a test fails, fix the code. When a test
+  contradicts the requirement, stop and report it. Never edit, skip, delete,
+  or loosen the test, and never special-case its inputs.
 - **Decide open design choices before building.** For each:
   - inventory the existing code;
   - present the options with scope, benefit, and impact on other owners,

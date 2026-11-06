@@ -10,6 +10,29 @@ the KV cache compression framework. Each one comes from a change that was
 reworked in review. The incidents are summarized in
 `lessons-learned.md`.
 
+## The Goal: A Working Feature on Every Model Family
+
+Everything below serves one goal: a new feature that works.
+
+- **Get the whole path working first.** Wire the configuration, the
+  managers, attention metadata, executor callbacks, and outputs, and run the
+  feature end to end on a real model in the production configuration. A
+  feature that is not wired in, or that runs only in a unit test, is not a
+  feature yet.
+- **Then make it work on every model family.** Dense models with multi-head
+  or grouped-query attention, multi-head latent attention (MLA) models,
+  sparse-attention models such as DeepSeek-V4, sliding-window and hybrid
+  models, hybrid recurrent models, multimodal models, and the draft layers
+  of speculative decoding. Each family is either supported, with an
+  end-to-end run, or rejected at configuration time with the reason and a
+  follow-up. Support for one family is not support for all, and the same
+  holds for GPU architectures: a run on B200 does not show that B300,
+  GB300, or Hopper GPUs work.
+- **The other principles are how to get there well.** Reusing mechanisms,
+  keeping the diff small, and clean naming make the feature easier to
+  review and maintain. They never justify a feature that does less, covers
+  fewer models, or is not finished.
+
 ## 1. Start From the Behavior Contract
 
 Write down what the feature changes and for whom before choosing a mechanism.
@@ -24,10 +47,12 @@ Write down what the feature changes and for whom before choosing a mechanism.
 - How success will be shown: accuracy contract, performance hypothesis,
   activation evidence.
 
-## 2. Survey Existing Mechanisms Before Building
+## 2. Know What Already Exists
 
-Most KV-cache features are a new policy on top of machinery that already
-exists. Before designing anything new, search for these and read them:
+Many features are a new policy on top of machinery that already exists.
+Spend a short time finding what you can build on, and use what fits. Where
+nothing fits, write the new code: the survey shapes the design, it does not
+stop the feature. Mechanisms to check:
 
 | Need | Existing mechanism to check first | Where on main |
 |---|---|---|
@@ -47,10 +72,13 @@ exists. Before designing anything new, search for these and read them:
 Record what you found in the design gate. If a reviewer can name an existing
 mechanism the design duplicates, the design is not ready.
 
-## 3. Climb Down the Extension Ladder Only With a Reason
+## 3. Put the Change Where the Behavior Belongs
 
-Pick the highest level that can express the feature. Each step down needs a
-written reason why the level above cannot.
+The levels below form the extension ladder. Higher levels are cheaper to
+review, so prefer them when they can express the feature. When the behavior
+belongs lower, go there and write down why. Do not bend the feature to stay
+high, and do not add a flag, a wrapper, or a parallel path to avoid changing
+the code that owns the behavior.
 
 1. An existing configuration value or combination.
 2. A new field on an existing configuration class.
@@ -114,6 +142,11 @@ lifetime. Keep the change small, and add a native test with it.
 - Call external libraries and kernels directly. Do not probe versions or
   catch import errors to switch to a different path. A missing capability
   should fail loudly where it is first needed.
+- Do not write defensive code: no try/except around code that should not
+  fail, no `getattr` or `hasattr` defaults for attributes that always exist,
+  no checks for states that validation already rules out, and no options
+  nobody asked for. Each guard names the real failure it handles; everything
+  else fails loudly.
 - After a feature has started mutating state, it must complete or fail
   according to the framework's completion contract. It must never fall back
   partway and leave visible state half-updated.
@@ -248,3 +281,21 @@ but on purpose and with evidence.
 Feature-off invariance, fail-fast admission, the compatibility table, and
 the accuracy and performance gates apply to innovative work exactly as to
 routine work. Being new is a reason to measure more, not less.
+
+## 12. Keep Tests Few and Strong
+
+Tests protect a working feature; they do not replace running it.
+- Each test exercises the real path and fails when the feature breaks.
+  Check this by breaking the feature on purpose.
+- Use real components. Mock only what cannot run in the test environment,
+  and never mock the behavior under test.
+- Compute expected values independently of the code under test: exact
+  bookkeeping, invariants, or a simple reference. A test that compares the
+  code with itself proves nothing.
+- Skip tests of trivial getters, and parametrize only over axes that change
+  the behavior.
+- Unit tests check function: the path runs, bookkeeping matches exactly, and
+  unsupported combinations are rejected. Accuracy and end-to-end performance
+  are measured in their own runs, not in unit tests.
+- Never edit, skip, delete, or loosen a test, or special-case its inputs, to
+  make it pass. If the test contradicts the requirement, stop and report it.

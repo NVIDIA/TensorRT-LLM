@@ -49,6 +49,7 @@ tests are in `references/compatibility-matrix.md`.
 | Beam search | | |
 | Sliding-window attention, variable sliding-window attention (VSWA), hybrid recurrent models | | |
 | Multi-head latent attention (MLA) and sparse attention backends | | |
+| GPU architecture: Hopper (SM90: H100, H200), datacenter Blackwell (SM100: B200, GB200; SM103: B300, GB300), workstation Blackwell (SM120) | | |
 | KV cache offload tiers and connectors | | |
 | Reuse identity: low-rank adaptation (LoRA), cache salt, multimodal inputs | | |
 | KV cache events and KV-cache-aware routing | | |
@@ -120,7 +121,11 @@ Rules for the decision:
   - the round trip is stable;
   - lossless spans are byte-exact;
   - scale geometry is right;
-  - repeated encode/decode is idempotent where the format promises it.
+  - repeated encode/decode is idempotent where the format promises it;
+  - for every supported runtime dtype, decoded values match the production
+    quantization routine for the same format byte for byte, or stay within
+    the bound that the format's step size defines. A codec that returns
+    zeros must fail this check.
 - **Mocks**: a bare `MagicMock` attribute is truthy, so gates like
   `if getattr(cfg, "feature", None):` pass on mocks and hide the real branch.
   Use real configuration objects or `spec`'d mocks.

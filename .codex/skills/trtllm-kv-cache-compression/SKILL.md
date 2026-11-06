@@ -48,34 +48,52 @@ in `../trtllm-kv-cache-manager-v2/references/engineering-rules.md`.
 
 ## Hard Rules
 
-Follow all of these in every task on the KV cache compression framework.
+The job is a working method: rules 1 and 2 come first, and the rest keep
+the result correct and reviewable.
 `../trtllm-kv-cache-manager-v2/references/engineering-rules.md` and
 `../trtllm-kv-cache-manager-v2/references/design-principles.md` explain each
 one.
 
-1. Read the required context below before designing or editing.
-2. Reuse an existing mechanism before building a new one: configuration,
-   then an existing extension point, then the method's own package. Native
-   code comes last, with a written reason.
-3. Build only on current paths (KV cache manager V2, the Python cache
+1. Deliver the method end to end first. Wire the whole path (configuration,
+   the KV cache compression manager and its hooks, KV cache manager V2,
+   attention, outputs) and show it running on a real model in the
+   production configuration before polishing anything.
+2. Make it work on every model family KV cache manager V2 serves (dense,
+   multi-head latent attention (MLA), sparse-attention, sliding-window and
+   hybrid, hybrid recurrent, and multimodal models, and speculative-decoding
+   draft layers) and on every GPU architecture it claims, such as Hopper
+   (H100, H200) and Blackwell (B200, GB200, B300, GB300). A family or
+   architecture that cannot be supported yet is rejected at configuration
+   time and listed as a gap, never silently skipped.
+3. Read the required context below before designing or editing, and build
+   only on current paths (KV cache manager V2, the Python cache
    transceiver, `tensorrt_llm/_torch/attention/`), never on deprecated ones.
-4. With the method off, outputs, memory, speed, errors, and API stay
+4. Change the code where the behavior belongs. Use an existing mechanism
+   when it fits; when it does not, extend it or write the new code. Do not
+   add a flag, a wrapper, or a parallel path to avoid touching the right
+   file.
+5. Write direct code: no defensive try/except, no fallback paths, no checks
+   for states that cannot happen, no options nobody asked for. Reject
+   unsupported combinations at configuration time.
+6. With the method off, outputs, memory, speed, errors, and API stay
    identical to main.
-5. Reject unsupported combinations at configuration time. Never fall back
-   silently.
-6. Decide and test every compatibility axis, including block reuse, CUDA
+7. Write few, strong tests: each one runs the real path and fails if the
+   method breaks. Never edit, skip, or loosen a test to make it pass; fix
+   the code, or stop and report the conflict.
+8. Decide and test every compatibility axis, including block reuse, CUDA
    graphs, the overlap scheduler, disaggregated serving, speculative
-   decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`).
-7. Measure performance end to end in the production configuration before
-   calling a change done (`../perf-kv-cache-tuning/SKILL.md`).
-8. Never remove a feature, mode, or optimization to make code smaller, and
-   never change an experiment's settings to make a result pass.
-9. Give each concept one full name and use it everywhere: identifiers, test
-   names, comments, docs, PR text, and replies to people. Write
-   "mixed-precision high window", never "window"; "FP8 KV cache", never
-   "FP8" or "KV". Abbreviate only with common knowledge (LLM, GPU, CUDA,
-   `attn`) or after writing "full name (ABBR)" at first use.
-10. Say "done", "passed", or "pushed" only with evidence you can show.
+   decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`),
+   and measure performance end to end in the production configuration
+   (`../perf-kv-cache-tuning/SKILL.md`).
+9. Never remove a feature, mode, model support, or optimization to make
+   code smaller, and never change an experiment's settings to make a result
+   pass.
+10. Give each concept one full name and use it everywhere: identifiers, test
+    names, comments, docs, PR text, and replies to people. Write
+    "mixed-precision high window", never "window"; "FP8 KV cache", never
+    "FP8" or "KV". Abbreviate only with common knowledge (LLM, GPU, CUDA,
+    `attn`) or after writing "full name (ABBR)" at first use.
+11. Say "done", "passed", or "pushed" only with evidence you can show.
 
 ## Route the Task
 

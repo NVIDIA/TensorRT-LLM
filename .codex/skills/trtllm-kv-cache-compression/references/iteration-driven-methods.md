@@ -110,8 +110,13 @@ prepared batch, a request whose protected tail spans a page boundary.
   published cached-token counts. Update those counts through the existing
   preparation path; do not add new captured tensors.
 - **Overlap scheduler.** Run every test with the overlap scheduler on and
-  off. Output that diverges only with the overlap scheduler on means a
-  host-side ordering problem; adding device synchronization does not fix it.
+  off. When output diverges only with the overlap scheduler on, check both
+  kinds of ordering. A missing dependency between GPU streams disappears
+  under a full device synchronization; fix it with an event that the
+  consumer stream waits on, as TriAttention makes the KV cache manager V2
+  stream wait for its compaction event. A divergence that survives a full
+  synchronization is host-side ordering: the overlap scheduler prepares the
+  next step while the current one runs.
 - **Fast paths.** `changes_physical_kv_length = True` disables the steady
   generation-input fast paths. Measure that cost on the target workload.
 

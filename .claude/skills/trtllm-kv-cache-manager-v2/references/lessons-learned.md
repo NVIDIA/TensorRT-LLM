@@ -20,24 +20,33 @@ read the category you are working in before starting.
 
 ## The Most Common Findings
 
-1. Reuse the mechanism the codebase already has before building a new one.
-2. Read the code, logs, or results before claiming anything. Never invent
+1. Deliver the feature: wire the whole path, run it end to end, and make it
+   work on every model family and GPU architecture it claims. A
+   demonstration on one model is not done.
+2. Write direct code. No defensive try/except, fallbacks, checks for
+   impossible states, or flags and parallel paths added to avoid changing
+   the code that owns the behavior.
+3. Keep tests few and strong, and never edit, skip, or loosen a test to make
+   it pass.
+4. Use the mechanism the codebase already has when it fits; do not build a
+   duplicate.
+5. Read the code, logs, or results before claiming anything. Never invent
    behavior, defaults, numbers, or quotes.
-3. Claim "done", "pushed", or "verified" only with a checkable artifact.
-4. Make the smallest change. Add no class, file, wrapper, manager, or kernel
-   without proof that the existing ones cannot do the job.
-5. Measure performance only in the production configuration, on the workload
+6. Claim "done", "pushed", or "verified" only with a checkable artifact.
+7. Add only the code the feature needs: no class, file, wrapper, manager, or
+   kernel that duplicates an existing one.
+8. Measure performance only in the production configuration, on the workload
    the feature is for, with a trace you have read.
-6. Align accuracy evaluation with the official protocol, on full datasets and
+9. Align accuracy evaluation with the official protocol, on full datasets and
    full repeat counts.
-7. Keep behavior identical when the feature is off, and keep the diff in
-   scope.
-8. Never shrink or expand the scope, and never change experiment settings,
-   without asking.
-9. Name things by behavior and give each concept one full name, used
-   everywhere. Write plain comments, define every abbreviation at first use,
-   and use no internal jargon.
-10. Answer the question that was asked, first.
+10. Keep behavior identical when the feature is off, and keep the diff in
+    scope.
+11. Never shrink or expand the scope, and never change experiment settings,
+    without asking.
+12. Name things by behavior and give each concept one full name, used
+    everywhere. Write plain comments, define every abbreviation at first
+    use, and use no internal jargon.
+13. Answer the question that was asked, first.
 
 ## 1. Design and Architecture
 
@@ -46,8 +55,9 @@ read the category you are working in before starting.
   mechanism, then a new path. Windowing, scale handling, page locking, layouts,
   and metadata usually exist already. The mixed-precision KV cache needed only
   an extra sliding-window-with-sinks life cycle, not new pool logic.
-- **Smallest change.** No new class, file, wrapper, registry, runner, or
-  subsystem without proof. A separate manager per method, extra
+- **No duplicate layers.** Add the classes and files the feature needs, but
+  no class, wrapper, registry, runner, or subsystem that duplicates an
+  existing one. A separate manager per method, extra
   "representation" layers, or wrappers around a single hook add review cost
   and are removed again in review.
 - **Methods are subclasses with hooks.** A compression method subclasses the
@@ -549,6 +559,9 @@ read the category you are working in before starting.
 
 | Failure mode | What it looked like | Countermeasure |
 |---|---|---|
+| Unfinished feature | Stubs and placeholders, a path never wired into the executor, one model or one GPU shown as general support | End-to-end run on every claimed model family and GPU architecture |
+| Defensive and conservative code | Try/except around everything, fallbacks, checks for impossible states, new flags and parallel paths instead of changing the code that owns the behavior | Direct code; change the code that owns the behavior |
+| Test bloat and test gaming | Mock-only tests, expected values computed by the code under test, tests that cannot fail; tests edited, skipped, or loosened until they pass | Few strong tests that fail when the feature breaks; stop and report a conflicting test |
 | Inventing facts | Plausible code structure, defaults, limits, or numbers that were never read or measured | Read or run before claiming |
 | Unsupported status claims | "Almost done", "verified", "pushed" with nothing behind it | Artifacts for every status word |
 | Over-engineering, then defending it | New managers, wrappers, kernels, fallbacks, and checks; diffs that grow under "simplify" | Extension ladder; diff measured each round |
