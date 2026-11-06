@@ -18,6 +18,8 @@
     cutedsl_paged  CuTe DSL backend over the same cache: staging the new K/V + paged FMHA
     flashinfer_paged  FlashInfer backend over the same cache: staging the new K/V + the
                    TRTLLM-Gen paged context FMHA
+    trtllm_paged   TRTLLM backend over the same cache: staging the new K/V + the TRTLLM
+                   attention op, given the queries only
     sdpa_resident  one contiguous K/V buffer per layer: in-place write + torch SDPA
                    (PyTorch picks the kernel) over the resident history
     naive          materialised torch.cat of all K/V + SDPA (the VANILLA path)
@@ -66,6 +68,7 @@ import torch.nn.functional as F
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.visual_gen.cache import PagedRolloutKVCache, RolloutSpec
 
 # The fp32 reference shared with the unit tests lives in the unittest tree.
@@ -392,10 +395,19 @@ def sdpa(q, k, v):
     )[0].transpose(0, 1)
 
 
-PAGED_VARIANTS = ("cudnn_paged", "cutedsl_paged", "flashinfer_paged")
+PAGED_VARIANTS = ("cudnn_paged", "cutedsl_paged", "flashinfer_paged", "trtllm_paged")
 
 
 def make_attn(backend: str, g: Geometry, layer_idx: int):
+    if backend == "trtllm_paged":
+        return TrtllmAttention(
+            layer_idx=layer_idx,
+            num_heads=g.num_heads,
+            head_dim=g.head_dim,
+            num_kv_heads=g.num_kv_heads,
+            dtype=g.torch_dtype,
+            attention_metadata_state={},
+        )
     if backend == "flashinfer_paged":
         return FlashInferAttention(
             layer_idx=layer_idx,
@@ -639,6 +651,7 @@ def main() -> None:
     cudnn_attn = make_attn("cudnn_paged", g, 0)
     cutedsl_attn = make_attn("cutedsl_paged", g, 0)
     flashinfer_attn = make_attn("flashinfer_paged", g, 0)
+    trtllm_attn = make_attn("trtllm_paged", g, 0)
     q4, k4, v4 = q[None], k[None], v[None]
     plan = mgr.plan(chunk, causal_block_size)
 
@@ -650,6 +663,9 @@ def main() -> None:
 
     def run_flashinfer_paged():
         return flashinfer_attn.forward(q4, k4, v4, kv=plan)
+
+    def run_trtllm_paged():
+        return trtllm_attn.forward(q4, k4, v4, batch_size=1, seq_len=chunk, kv=plan)
 
     # Dense paths have no per-causal-block key count, so causal blocks cost them one launch each:
     # that is the per-frame clean pass as the reference runs it.
@@ -684,6 +700,7 @@ def main() -> None:
         "cudnn_paged": run_cudnn_paged,
         "cutedsl_paged": run_cutedsl_paged,
         "flashinfer_paged": run_flashinfer_paged,
+        "trtllm_paged": run_trtllm_paged,
         "sdpa_resident": run_sdpa_resident,
         "naive": run_naive,
     }
