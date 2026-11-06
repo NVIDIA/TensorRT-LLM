@@ -106,6 +106,20 @@ class SendOperationOwner:
         if retirement is not None:
             self._physical_lock = retirement.lock
 
+    def try_snapshot_operation_states(self) -> tuple[PhysicalOperationState, ...] | None:
+        """Read operation states without waiting or advancing lifecycle state.
+
+        Returns:
+            Immutable state values, or None when the metadata lock is busy.
+            An empty tuple means no operations were observed, not missing evidence.
+        """
+        if not self._physical_lock.acquire(blocking=False):
+            return None
+        try:
+            return tuple(operation.state for operation in self._physical_operations.values())
+        finally:
+            self._physical_lock.release()
+
     def begin_physical_operation(self, peer_rank: int) -> bool:
         with self._physical_lock:
             if peer_rank in self._physical_operations:
