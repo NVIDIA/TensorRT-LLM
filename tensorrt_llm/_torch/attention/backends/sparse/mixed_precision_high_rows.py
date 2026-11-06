@@ -609,7 +609,10 @@ def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_id
     )
     head_stride, token_stride = (tokens, 1) if layout == "HND" else (1, heads)
     pool_rows = pool.view(-1, pool.shape[4])
-    max_new_tokens = int(metadata.seq_lens_kv[:num_seqs].max())
+    # This step's new tokens per request: the query lengths, which speculative decoding corrects
+    # on the device before a draft step (seq_lens_kv keeps a separate, uncorrected copy under
+    # CUDA graphs).
+    max_new_tokens = int(metadata.seq_lens[:num_seqs].max())
     tokens_per_program = 16
     _store_mixed_precision_low_rows_kernel[
         (num_seqs, triton.cdiv(max_new_tokens, tokens_per_program), pool.shape[1])
@@ -622,7 +625,7 @@ def store_mixed_precision_low_rows(metadata: "TrtllmAttentionMetadata", layer_id
         redirected_offsets.stride(0),
         redirected_offsets.stride(1),
         metadata.kv_lens_cuda_runtime,
-        metadata.seq_lens_kv_cuda[:num_seqs],
+        metadata.seq_lens_cuda[:num_seqs],
         tokens,
         high_table.shape[1],
         heads,
