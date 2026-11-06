@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Prove a non-clipped histogram bin contains at most one finite 16-bit value."""
 import cutlass
 import cutlass.cute as cute

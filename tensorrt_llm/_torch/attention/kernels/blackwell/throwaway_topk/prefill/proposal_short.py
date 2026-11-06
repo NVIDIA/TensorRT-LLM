@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 from .sample_bucket import unsigned_bucket_index
 import cutlass,cutlass.cute as cute
 from .subset_barrier import subset_barrier

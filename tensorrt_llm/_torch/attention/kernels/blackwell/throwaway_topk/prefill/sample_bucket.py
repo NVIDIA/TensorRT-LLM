@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 """Clamp a descending-key distance before using it as a shared-memory index."""

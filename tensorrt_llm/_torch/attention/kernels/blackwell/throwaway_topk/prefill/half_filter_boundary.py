@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Exact FP32 preimage of a round-to-nearest-even 16-bit threshold."""
 import cutlass
 import cutlass.cute as cute

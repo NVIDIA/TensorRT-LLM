@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """H4 proposal: independent warp histograms, preserving the K1 quantile policy."""
 import cutlass
 import cutlass.cute as cute

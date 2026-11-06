@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Exact radix fallback traversing physical candidate banks directly."""
 import cutlass
 import cutlass.cute as cute

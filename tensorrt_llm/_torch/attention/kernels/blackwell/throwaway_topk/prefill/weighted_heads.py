@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Four FP32 FMA chains, preserving the indexer head-reduction order."""
 from ..packed import fma_packed_f32x2 as indexer_fma_packed_f32x2
 from ..packed import add_packed_f32x2 as indexer_add_packed_f32x2

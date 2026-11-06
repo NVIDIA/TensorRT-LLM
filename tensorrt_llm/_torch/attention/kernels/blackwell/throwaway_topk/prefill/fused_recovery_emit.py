@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 import cutlass,cutlass.cute as cute
 from .selection import encode
 from .selection import emit as dense_emit

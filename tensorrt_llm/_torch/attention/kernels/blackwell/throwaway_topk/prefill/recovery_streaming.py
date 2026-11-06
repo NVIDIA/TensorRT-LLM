@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 from .small_crossing import refine
 """Exact radix fallback traversing physical candidate banks directly."""
 import cutlass

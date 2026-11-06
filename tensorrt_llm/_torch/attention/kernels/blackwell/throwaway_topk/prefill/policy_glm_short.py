@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """GLM MXFP4 short-domain sampling; other models keep their policy."""
 import cutlass
 import cutlass.cute as cute

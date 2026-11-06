@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 import cutlass,cutlass.cute as cute
 from .subset_barrier import subset_barrier
 from .selection import score_key, key_score

@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Reference-style coarse histogram, exact crossing-bin refinement, radix fallback."""
 from .. import memory as indexer_memory
 from ..pdl import pdl_prologue

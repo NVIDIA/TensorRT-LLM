@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Same stratified hash; explicit S must match the actual sampled GEMM tiles."""
 import cutlass
 import cutlass.cute as cute

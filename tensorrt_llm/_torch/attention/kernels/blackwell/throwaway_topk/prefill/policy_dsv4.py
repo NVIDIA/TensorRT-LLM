@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Shape-based C4/H64 sampling, using the shared Qwen stratified method."""
 import cutlass
 import cutlass.cute as cute

@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 import cutlass,cutlass.cute as cute
 @cute.jit
 def proposal_rank(width,samples,k:cutlass.Constexpr,sigma:cutlass.Constexpr):

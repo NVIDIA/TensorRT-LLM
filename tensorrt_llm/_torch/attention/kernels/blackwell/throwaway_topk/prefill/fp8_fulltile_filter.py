@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 from .. import memory as indexer_memory
 from .. import tensor_utils as indexer_tensor_utils
 from ..packed import fma_packed_f32x2 as indexer_fma_packed_f32x2

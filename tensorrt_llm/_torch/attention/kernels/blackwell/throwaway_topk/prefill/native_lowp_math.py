@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 """Packed FP16/BF16 operations for explicit native low-precision head math.

@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 """Four head chains with compile-time FP32 or packed native arithmetic."""

@@ -5,10 +5,6 @@ K1/K2/K3/K4 remain in `prefill/`; `interface.py` and `adapter/` provide the plan
 API. Corresponding modules retain matching names for maintenance, with
 DKG-specific imports, tests and integration.
 
-The root `.nv_internal` excludes this package and its subdirectories from public
-example releases. Python sources also retain per-file internal release markers;
-the test file uses its own marker in the shared test directory.
-
 ## API
 
 ```python

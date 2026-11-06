@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Exact small-boundary selection; ascending score keys, slot-order ties.
 
 Use argmax for one selected entry and complement selection for small exclusions.

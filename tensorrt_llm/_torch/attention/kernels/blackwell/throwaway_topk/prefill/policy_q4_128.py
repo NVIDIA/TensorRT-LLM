@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Input-independent stratified single-key sampling, shared within each Q4 tile."""
 import cutlass,cutlass.cute as cute
 @cute.jit

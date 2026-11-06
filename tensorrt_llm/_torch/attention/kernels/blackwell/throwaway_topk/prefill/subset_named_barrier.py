@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 from cutlass.cutlass_dsl import dsl_user_op

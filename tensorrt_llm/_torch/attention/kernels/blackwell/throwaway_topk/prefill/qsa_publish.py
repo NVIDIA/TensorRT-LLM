@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 import cutlass
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm

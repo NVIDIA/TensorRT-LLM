@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Qwen short-domain sampling; all other models keep the established policy."""
 import cutlass
 import cutlass.cute as cute

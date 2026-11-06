@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Public-shape K1 margin variant; failure detection and exact K4 unchanged."""
 import cutlass
 import cutlass.cute as cute

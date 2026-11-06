@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 """TensorSSA packed FP32 FMA adapter for the indexer's four-element epilogue.

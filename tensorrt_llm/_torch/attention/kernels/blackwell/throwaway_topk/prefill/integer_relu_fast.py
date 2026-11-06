@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Integer ReLU for bounded dot products and either-sign NaNs.
 The caller must preserve its existing safe-path contract: E4M3FN D128, or
 MXFP4 D128 with every E8M0 scale byte <=159. The latter bounds the raw dot

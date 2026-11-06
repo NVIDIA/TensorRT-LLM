@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 import functools,torch,cutlass,cutlass.cute as cute
 from ..api import DTYPES
 @functools.cache

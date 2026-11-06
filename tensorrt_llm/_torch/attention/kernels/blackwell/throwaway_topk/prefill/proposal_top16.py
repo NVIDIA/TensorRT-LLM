@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Exact top16 of 128 samples; disjoint merge scratch avoids SMEM races."""
 import cutlass
 import cutlass.cute as cute

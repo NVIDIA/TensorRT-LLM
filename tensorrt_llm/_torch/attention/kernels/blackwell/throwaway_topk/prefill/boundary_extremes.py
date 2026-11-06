@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Exact single-item or single-exclusion selection in a small crossing bin."""
 import cutlass
 import cutlass.cute as cute

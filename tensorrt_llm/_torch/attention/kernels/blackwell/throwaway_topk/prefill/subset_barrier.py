@@ -1,4 +1,3 @@
-# {$nv-internal-release file}
 """Synchronize a subset of warp-specialized CTA participants at distinct PCs.
 
 Use barrier.cta.sync; aligned bar.sync requires uniform participation."""
