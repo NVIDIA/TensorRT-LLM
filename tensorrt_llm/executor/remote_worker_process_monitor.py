@@ -28,6 +28,7 @@ from pathlib import Path
 
 _HEARTBEAT_INTERVAL = 0.5
 _HEARTBEAT_TIMEOUT = 5.0
+_RECEIVE_WAIT = 0.1
 _START_TIMEOUT = 10.0
 _NETWORK_HINT = (
     "Set TRTLLM_WORKER_WATCH_HOST to this proxy's address reachable from every MPI worker "
@@ -178,11 +179,25 @@ class RemoteWorkerProcessMonitor:
 
         try:
             while not self._stopped.is_set():
-                readable = self._queue.poll(0.1)
-                # After a receiver scheduling pause, other ranks may already
-                # have fresh reports waiting. Read them before expiring leases.
-                for _ in range(max(64, self._world_size * 64)):
-                    if not readable or self._stopped.is_set():
+                waited_from = time.monotonic()
+                self._queue.poll(_RECEIVE_WAIT)
+                # Fix the lease check time before reading. The libzmq I/O
+                # thread queues reports without the GIL, so after this thread
+                # was paused, the earlier poll result is stale while reports
+                # that arrived before ``now`` already wait in the socket.
+                now = time.monotonic()
+                # After a pause longer than the report interval, give the I/O
+                # thread one receive interval to surface reports buffered while
+                # the whole process was stopped.
+                first_wait = (
+                    _RECEIVE_WAIT
+                    if now - waited_from > _RECEIVE_WAIT + _HEARTBEAT_INTERVAL
+                    else 0
+                )
+                for index in range(max(64, self._world_size * 64)):
+                    if self._stopped.is_set() or not self._queue.poll(
+                        first_wait if index == 0 else 0
+                    ):
                         break
                     try:
                         report = self._queue.get()
@@ -191,10 +206,8 @@ class RemoteWorkerProcessMonitor:
                             raise
                     else:
                         self._accept_report(report)
-                    readable = self._queue.poll(0)
                 # Check leases after each bounded drain, even if traffic keeps
                 # arriving. A busy peer must not hide a silent rank forever.
-                now = time.monotonic()
                 with self._lock:
                     expired = [
                         r for r, seen in self._seen.values() if now - seen > _HEARTBEAT_TIMEOUT
