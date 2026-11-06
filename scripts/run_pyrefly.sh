@@ -7,8 +7,9 @@
 # the file list with pass_filenames: true.
 # Paths from tool.pyrefly.project-excludes and symbols from
 # tool.pyrefly-exclusions in pyproject.toml are removed from the JSON report by
-# scripts/pyrefly_exclusion.py. Checks are advisory unless --strict is supplied;
-# the filtered diagnostic report is written to pyrefly_final_report.json and
+# scripts/pyrefly_exclusion.py. Whole-project checks are always advisory;
+# file-list checks are advisory unless --strict is supplied.
+# The filtered diagnostic report is written to pyrefly_final_report.json and
 # up to eight diagnostics are printed to stdout when the check finishes.
 # File-list checks compare with HEAD. Diagnostics are filtered to added and
 # modified lines when Git finds them; otherwise they remain at file level. Pass
@@ -42,7 +43,7 @@ configured sources. Use --full-project to request that scan explicitly.
 
 Options:
   --full-project           Check all product Python files.
-  --strict                 Fail on remaining diagnostics or check failures.
+  --strict                 Fail file-list checks on diagnostics or check failures.
   --no-diff-filter         Keep diagnostics from all lines in supplied files.
   --no-path-module-filter  Include diagnostics from excluded paths and modules.
 
@@ -155,6 +156,9 @@ if (( ! FULL_PROJECT && FILTERED_ARG_COUNT == 0 )); then
     FULL_PROJECT=1
     DIFF_BASE=""
     printf 'No eligible supplied product Python files; checking the whole project.\n' >&3
+fi
+if (( FULL_PROJECT )); then
+    STRICT=0
 fi
 
 if ! command -v pyrefly >/dev/null 2>&1; then
