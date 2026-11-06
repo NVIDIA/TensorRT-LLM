@@ -20,13 +20,14 @@
   `agent-flow/agent_flow/workflows/modeling_bringup/task_schema.py`，该文件已在 main 上。
 - 分四个部分对话：基础配置 → 运行方式 → 精度验证 → 功能验证。
 - 把用户的选择展开成清晰、可验证的英文句子，写进 `completion_criteria` 和 `implements_tips`。
-- 写出文件后，用 `load_and_validate_task_yaml` 校验，并告诉用户怎样运行。
+- 写出文件后，用工作流自己的检查来校验（`modeling-v2-onboard --check`，没有 v2-onboard 时用
+  `load_and_validate_task_yaml`），并告诉用户怎样运行。对话中不再重复实现这些检查。
 
 ## 非目标
 
-- `modeling-v2-onboard` 特有的内容：`gpu_pool`（节点池）、并行拓扑选择、性能 Pareto、性能模型。
-  这些等 v2-onboard 合入 main 后再扩展。
-- 修改 agent-flow 的 schema 或工作流代码。
+- `modeling-v2-onboard` 特有的内容中，除 `gpu_pool`（节点池）以外的部分：并行拓扑选择、
+  性能 Pareto、性能模型。这些等 v2-onboard 合入 main 后再扩展。
+- 修改 agent-flow 的 schema 或工作流代码（`--check` 由 v2-onboard 分支提供）。
 - 不问、也不写入环境细节：PATH/PYTHONPATH/HOME、HF 离线变量、MPI/UCX 变量、编译产物软链接。
   用户主动提供时，可以原样写进 `implements_tips`。
 
@@ -53,17 +54,19 @@
 总的原则：
 - 第 1、2 部分各用一张表单，一条消息问完这一部分的所有字段；第 3、4 部分一次只问一件事。
 - 有固定候选的问题，用选择题，即 AskUserQuestion。
-- 每个部分结束时，用表格逐字段列出具体值、来源和检查结果，请用户确认；不能只说"已核实"。
+- 每个部分结束时，用表格逐字段列出具体值和来源，请用户确认；不能只说"已核实"。
 
 ### 第 1 部分：基础配置
 
-| 项 | 写入位置 | 检查 |
+| 项 | 写入位置 | 说明 |
 |---|---|---|
-| `reference_code_path`（HF modeling 文件） | 顶层 | 必须存在 |
-| `checkpoint_path`（HF checkpoint 目录） | 顶层 | 必须存在，并且有 `config.json` |
-| `trtllm_repo_path` | 顶层 | 必须存在，并且是 git checkout |
-| 目标 GPU（例如 GB300 / sm_103） | `implements_tips` 的一句话 | 能从 partition 或本机推断时，先推断再确认 |
-| `LLM_MODELS_ROOT` | `implements_tips` 的一句话 | 目录必须存在；检查下面有没有 `datasets/openai/gsm8k`，选了多模态时还要检查 MMMU 数据，没有就提醒用户 |
+| `reference_code_path`（HF modeling 文件） | 顶层 | — |
+| `checkpoint_path`（HF checkpoint 目录） | 顶层 | — |
+| `trtllm_repo_path` | 顶层 | 干净的 checkout |
+| 目标 GPU（例如 GB300 / sm_103） | `implements_tips` 的一句话 | 能从本机推断时，先推断再确认 |
+
+路径、镜像、mounts 等检查统一放在收尾时的 `--check` 里做。不再问 `LLM_MODELS_ROOT`：
+运行只从 `checkpoint_path` 读权重，`LLM_MODELS_ROOT` 只用来找评测数据集，数据集改在第 3 部分直接问。
 
 拿到 checkpoint 之后，读取 `config.json` 等文件，推断以下信息，供后面几部分使用：
 - 架构名；
@@ -78,20 +81,18 @@
 先问"是否使用 slurm 模式"。
 
 - 不用：不写 `slurm-environment`。
-- 用：问以下 5 项，全部写在 `slurm-environment` 下面，不写 `gpu_pool`。
-  - `slurm_partition`
-  - `docker_image`：`.sqsh` 文件必须存在
-  - `account`
-  - `qos`
-  - `container_mounts`
-
-`modeling-bringup` 的 prompt 会让 agent 读取整段 `slurm-environment`，所以 account、qos、
-`container_mounts` 写在这里，agent 能看到。
+- 用：问 `slurm_partition`、`docker_image`，以及（agent-flow 有 v2-onboard 时）是否使用 GPU pool。
+  - 不用 pool：`account`、`qos`、`container_mounts` 直接写在 `slurm-environment` 下面，agent 会读到。
+  - 用 pool：这些字段写在 `slurm-environment.gpu_pool` 下面，不在两处重复。用户只填 `nodes` 和
+    `max_nodes`；`account`、`qos`、`gpus_per_node`、`hours`、`container_mounts` 由 skill 从当前环境
+    （`sacctmgr`、`sinfo`）、旧的 task.yaml 或 memory 推断，列出来源请用户确认。
 
 ### 第 3 部分：精度验证
 
 **e2e 精度**
 - 默认用 GSM8K，通过 `trtllm-eval` 跑。标准是和 reference 分数相差小于 1%（绝对分差）。
+- 问数据集来源：用户自己给本地路径（缺失只提醒；Slurm 下要在某个 mount 下面），或者在线下载
+  （让 agent 自己搜索并下载）。多模态的 MMMU 同样处理。
 - 先问用户有没有 reference 分数：
   - 有：把具体数值写进标准。
   - 没有：先判断 HF 实现能不能跑这个 checkpoint，依据是 `config.json` 里的
@@ -145,9 +146,12 @@
 
 1. 展示完整的 task.yaml 草稿，请用户确认或修改。
 2. 问 workspace 路径，把 `task.yaml` 写进去。如果目标文件已经存在，先问用户，不能直接覆盖。
-3. 用 agent-flow 的 `load_and_validate_task_yaml` 校验。校验失败时，把错误告诉用户，
-   改完再校验。
-4. 告诉用户运行命令，例如 `modeling-bringup --task <path> --workspace <path>`。
+3. 用 `modeling-v2-onboard --check` 校验（schema、checkout、workspace、checkpoint、镜像、mounts、
+   GPU pool）；没有 v2-onboard 时用 `load_and_validate_task_yaml`。失败时把问题告诉用户，改完再校验。
+4. Slurm + v2-onboard 时，问用户要不要现在跑运行时检查（`--check --smoke`：提交一个短 Slurm 作业，
+   检查容器、GPU、mounts、CUDA PyTorch；要等节点）。不跑的话，planner 启动后由环境任务做同样的检查，
+   并产出 worker 用的 wrapper。
+5. 告诉用户运行命令，例如 `modeling-bringup --task <path> --workspace <path>`。
 
 ## 交给实现者决定的事
 
