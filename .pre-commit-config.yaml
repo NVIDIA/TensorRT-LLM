@@ -1548,6 +1548,12 @@ repos:
         additional_dependencies: [PyYAML]
         always_run: true
         pass_filenames: false
+    -   id: version-records-check
+        name: verify every version record matches tensorrt_llm/version.py
+        entry: python scripts/bump_version.py --check
+        language: python
+        always_run: true
+        pass_filenames: false
     -   id: openengine-bindings-check
         name: verify generated OpenEngine bindings are in sync
         entry: python scripts/generate_openengine_protos.py --check
