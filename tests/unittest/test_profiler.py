@@ -72,6 +72,28 @@ def test_selection_is_cached_at_module_initialization() -> None:
     subprocess.run([sys.executable, "-c", script], env=env, check=True)
 
 
+def test_invalid_startup_configuration_warns_and_uses_defaults() -> None:
+    """Verify invalid startup configuration warns and enables defaults."""
+    env = os.environ.copy()
+    env["TLLM_PROFILE_CUSTOM_REGIONS"] = "workflow,unknown"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import runpy; "
+                f"p = runpy.run_path({str(Path(profiler.__file__).resolve())!r}); "
+                "assert p['_CUSTOM_REGIONS'] == p['_CUSTOM_REGION_DEFAULTS']"
+            ),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert completed.stderr.count("Invalid TLLM_PROFILE_CUSTOM_REGIONS") == 1
+
+
 @pytest.mark.parametrize(
     ("payload", "expected"),
     [
