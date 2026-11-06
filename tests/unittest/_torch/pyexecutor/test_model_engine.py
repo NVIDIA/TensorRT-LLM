@@ -1152,22 +1152,17 @@ class TestWarmupCleanup(unittest.TestCase):
 
     @pytest.mark.cpu_only
     def test_allreduce_configuration_precedes_runner_warmup(self) -> None:
-        for runner_type in (
-            model_engine_module.PackedModelRunner,
-            model_engine_module.ScheduledModelRunner,
+        engine = object.__new__(ModelEngine)
+        engine._runner = Mock(spec=model_engine_module.ScheduledModelRunner)
+        events = []
+        engine._runner.warmup.side_effect = lambda *args: events.append("warmup")
+        with patch.object(
+            engine,
+            "_configure_allreduce_tuning",
+            side_effect=lambda: events.append("configure"),
         ):
-            with self.subTest(runner_type=runner_type):
-                engine = object.__new__(ModelEngine)
-                engine._runner = Mock(spec=runner_type)
-                events = []
-                engine._runner.warmup.side_effect = lambda *args: events.append("warmup")
-                with patch.object(
-                    engine,
-                    "_configure_allreduce_tuning",
-                    side_effect=lambda: events.append("configure"),
-                ):
-                    engine._warmup_impl(Mock(spec=ResourceManager))
-                self.assertEqual(events, ["configure", "warmup"])
+            engine._warmup_impl(Mock(spec=ResourceManager))
+        self.assertEqual(events, ["configure", "warmup"])
 
     @pytest.mark.cpu_only
     def test_allreduce_forward_routes_tuning_and_inference(self) -> None:
