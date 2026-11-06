@@ -818,6 +818,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         #   drops it when it attaches the output to the execution stream.
         # * py_skip_cross_kv_projection: False until the first context step
         #   has written cross-KV, then True for later chunks and decode steps.
+        #   Read only for context requests: by the cross-attention projection,
+        #   the V1 and V2 cross-KV reservation and the CUDA graph key.
         # All three are unused for decoder-only models.
         self.py_encoder_output: Optional[torch.Tensor] = None
         self.py_encoder_output_ready_event: Optional[torch.cuda.Event] = None

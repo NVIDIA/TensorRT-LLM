@@ -8980,7 +8980,9 @@ class PyExecutor:
     #    freed once every request of its step has dropped its view.
     # 5. Recompute: a pause frees both KV pools and returns the request to
     #    ENCODER_INIT; the next publish clears the skip flag, so cross-KV is
-    #    reserved and projected once per cycle.
+    #    reserved and projected once per cycle. Schedulers pause only requests
+    #    past their first context chunk, so a pause never meets an output that
+    #    has not been consumed.
     #
     # A failed encoder step fails its requests that have not finished.
     # Terminating a request drops an output it has not consumed.
