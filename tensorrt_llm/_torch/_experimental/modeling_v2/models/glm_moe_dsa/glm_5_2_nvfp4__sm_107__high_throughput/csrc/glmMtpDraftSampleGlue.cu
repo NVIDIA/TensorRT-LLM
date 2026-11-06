@@ -15,7 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/glmMoeDsaRubin/highThroughput/glmMtpDraftSampleGlue.h"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmMtpDraftSampleGlue.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -25,7 +26,7 @@
 #include <climits>
 #include <cmath>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::glm_rubin_mtp
 {
@@ -554,4 +555,4 @@ void invokeDraftSampleGlueAdp(DraftSampleGlueAdpParams const& params, cudaStream
 
 } // namespace kernels::glm_rubin_mtp
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

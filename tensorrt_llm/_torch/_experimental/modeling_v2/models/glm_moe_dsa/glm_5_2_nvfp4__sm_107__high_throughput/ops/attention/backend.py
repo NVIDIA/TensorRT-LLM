@@ -18,16 +18,15 @@ from tensorrt_llm._torch.attention.backends.interface import (
     MLAParams,
     PositionalEmbeddingParams,
 )
-from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
-    transform_local_topk_and_prepare_pool_view,
-    transform_local_topk_and_prepare_pool_view_grouped,
-)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
-from . import native_ops  # noqa: F401
+from ..._indexer import (
+    transform_local_topk_and_prepare_pool_view,
+    transform_local_topk_and_prepare_pool_view_grouped,
+)
 from .indexer import RubinIndexer
 from .owner_worklist import Nvfp4OwnerWorklist
 

@@ -15,12 +15,13 @@
  * limitations under the License.
  */
 
-#include "glmNoAuxTcFp4Quant.h"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmNoAuxTcFp4Quant.h"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/moeTopKFuncs.cuh"
 #include "tensorrt_llm/kernels/quantization.cuh"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 #include <cmath>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -28,10 +29,16 @@
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels
 {
+namespace reduce_topk = ::tensorrt_llm::kernels::reduce_topk;
+using ::tensorrt_llm::kernels::CVT_ELTS_PER_THREAD;
+using ::tensorrt_llm::kernels::PackedVec;
+using ::tensorrt_llm::kernels::cvt_quant_get_sf_out_offset;
+using ::tensorrt_llm::kernels::cvt_warp_fp16_to_fp4;
+
 static __device__ inline float sigmoid_accurate(float x)
 {
     return 0.5f * tanhf(0.5f * x) + 0.5f;
@@ -202,4 +209,4 @@ void invokeGlmRubinNoAuxTcFp4Quant(float* scores, float* bias, __nv_bfloat16 con
 
 } // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

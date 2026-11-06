@@ -7,6 +7,7 @@ import torch
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor, is_piecewise_running, is_torch_compiling
 
+from ......_native import namespace_of
 from .projection import forward_dsa_proj
 
 
@@ -47,7 +48,7 @@ def _same_cache_view(actual: torch.Tensor, declared: torch.Tensor) -> bool:
 
 
 @torch.library.custom_op(
-    "trtllm::glm_rubin_high_throughput_dsa_proj", mutates_args=("indexer_k_cache",)
+    f"{namespace_of(__package__)}::dsa_proj", mutates_args=("indexer_k_cache",)
 )
 def mla_dsa_proj(
     hidden_states: torch.Tensor,

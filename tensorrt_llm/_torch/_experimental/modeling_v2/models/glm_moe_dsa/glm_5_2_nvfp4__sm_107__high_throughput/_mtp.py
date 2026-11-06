@@ -41,11 +41,6 @@ from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceParams, allgather
 from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_speculative import (
-    _copy_model_config_with_moe_backend,
-    _enable_trtllm_moe_preload_for_draft,
-    _get_mtp_moe_quant_config,
-)
 from tensorrt_llm._torch.models.modeling_utils import (
     DecoderModelForCausalLM,
     apply_layerwise_quant_config,
@@ -65,6 +60,11 @@ from tensorrt_llm._torch.utils import (
 )
 
 from ._model import Glm52DecoderLayer
+from ._mtp_config import (
+    _copy_model_config_with_moe_backend,
+    _enable_trtllm_moe_preload_for_draft,
+    _get_mtp_moe_quant_config,
+)
 from .ops.spec.draft_sample_glue import DraftGlueWindow
 
 

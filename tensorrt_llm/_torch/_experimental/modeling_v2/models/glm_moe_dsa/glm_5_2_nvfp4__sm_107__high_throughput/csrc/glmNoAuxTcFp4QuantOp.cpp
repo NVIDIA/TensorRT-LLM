@@ -15,14 +15,16 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/glmMoeDsaRubin/highThroughput/glmNoAuxTcFp4Quant.h"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmNoAuxTcFp4Quant.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <ATen/MemoryOverlap.h>
 #include <c10/cuda/CUDAGuard.h>
 
 namespace th = torch;
-namespace tk = tensorrt_llm::kernels;
-TRTLLM_NAMESPACE_BEGIN
+namespace tk = TRTLLM_MV2_NS::kernels;
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -97,9 +99,9 @@ void glm_rubin_noaux_tc_fp4_quantize_out(th::Tensor const& scores, th::Tensor co
 
 } // namespace torch_ext
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "glm_rubin_noaux_tc_fp4_quantize_out(Tensor scores, Tensor bias, Tensor hidden_states, Tensor global_scale, "
@@ -107,7 +109,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor(b!) topk_indices, Tensor(c!) fp4_out, Tensor(d!) sf_out) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("glm_rubin_noaux_tc_fp4_quantize_out", &tensorrt_llm::torch_ext::glm_rubin_noaux_tc_fp4_quantize_out);
+    m.impl("glm_rubin_noaux_tc_fp4_quantize_out", &TRTLLM_MV2_NS::torch_ext::glm_rubin_noaux_tc_fp4_quantize_out);
 }

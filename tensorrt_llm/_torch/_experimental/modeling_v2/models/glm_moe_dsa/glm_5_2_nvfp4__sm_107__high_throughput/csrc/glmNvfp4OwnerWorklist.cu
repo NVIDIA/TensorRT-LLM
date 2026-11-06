@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
-#include "glmNvfp4OwnerWorklist.h"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmNvfp4OwnerWorklist.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <algorithm>
 #include <cuda_fp16.h>
 #include <limits>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels
 {
@@ -772,4 +773,4 @@ void invokeGlmRubinNvfp4WorklistMember(uint8_t const* dataPool, __nv_fp8_e4m3 co
 
 } // namespace kernels
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

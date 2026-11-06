@@ -18,13 +18,14 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::glm_rubin_mtp
 {
@@ -138,4 +139,4 @@ void invokeDraftSampleGlueAdp(DraftSampleGlueAdpParams const& params, cudaStream
 
 } // namespace kernels::glm_rubin_mtp
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

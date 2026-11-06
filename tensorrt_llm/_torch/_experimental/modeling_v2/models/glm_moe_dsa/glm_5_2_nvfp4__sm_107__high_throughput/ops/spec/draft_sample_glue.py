@@ -11,7 +11,7 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from . import native_ops as _native_ops  # noqa: F401
+from ... import native_ops
 from ._draft_exchange import DraftExchangeWorkspace
 
 
@@ -87,7 +87,7 @@ class DraftSampleGlueAdp:
 
     def gather(self, rows: torch.Tensor) -> torch.Tensor:
         """Gather contiguous BF16 [segment_rows, hidden] in group-rank order."""
-        gathered = torch.ops.trtllm.glm_rubin_mtp_head_gather(
+        gathered = native_ops.glm_rubin_mtp_head_gather(
             rows.reshape(1, -1),
             self._rows_gather.buffer,
             self._rows_gather.flags,
@@ -122,7 +122,7 @@ class DraftSampleGlueAdp:
         metadata methods rebuild DSA metadata after the sequence/KV update.
         """
         has_glue = glue_out is not None
-        torch.ops.trtllm.glm_rubin_mtp_sample_glue_adp(
+        native_ops.glm_rubin_mtp_sample_glue_adp(
             logits,
             self._exchange.buffer,
             self._exchange.flags,

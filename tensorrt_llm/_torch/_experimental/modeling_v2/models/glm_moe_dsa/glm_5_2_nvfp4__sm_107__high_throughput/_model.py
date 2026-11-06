@@ -46,7 +46,6 @@ from tensorrt_llm._torch.attention.attention import (
 )
 from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
-from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.distributed import (
     AllReduce,
     AllReduceFusionOp,
@@ -96,6 +95,7 @@ from tensorrt_llm._torch.utils import (
     is_torch_compiling,
 )
 
+from ._mla import Glm52MLA
 from .ops.moe.megamoe import RubinMegaMoE, create_rubin_moe
 
 
@@ -189,7 +189,7 @@ class Glm52Linear(Linear):
         return output
 
 
-class Glm52Attention(MLA):
+class Glm52Attention(Glm52MLA):
     def __init__(
         self,
         model_config: ModelConfig[PretrainedConfig],
@@ -243,28 +243,6 @@ class Glm52Attention(MLA):
             locality_domain_policy=model_config.locality_domain_policy,
         )
 
-        from .ops.attention.backend import RubinDSATrtllmAttention
-        from .ops.attention.projection import RubinDSAHooks
-
-        old_backend = self.mqa
-        self.mqa = RubinDSATrtllmAttention(
-            layer_idx=self.layer_idx,
-            num_heads=self.num_heads_tp,
-            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
-            num_kv_heads=1,
-            quant_config=self.quant_config,
-            q_scaling=old_backend.q_scaling,
-            pos_embd_params=self.pos_embd_params,
-            mla_params=old_backend.mla_params,
-            skip_create_weights_in_init=model_config.skip_create_weights_in_init,
-            sparse_params=self.sparse_params,
-            dtype=config.torch_dtype,
-            aux_stream=self.aux_stream,
-            kv_cache_dtype=self.kv_cache_dtype,
-            skip_correction_threshold=model_config.skip_correction_threshold,
-        )
-        self.sparse_attn_hooks = RubinDSAHooks()
-        self.sparse_attn_hooks.initialize(self)
         self.fused_a_indexer_weight = None
 
     def cache_derived_state(self) -> None:

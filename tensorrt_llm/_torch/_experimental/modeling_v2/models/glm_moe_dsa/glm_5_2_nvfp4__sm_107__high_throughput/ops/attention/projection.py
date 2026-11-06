@@ -8,22 +8,24 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from tensorrt_llm._torch.attention.backends.sparse.dsa.module import (
-    DSAHooks,
-    _forward_dsa_attn,
-    should_use_short_mha,
-)
+from tensorrt_llm._torch.attention.backends.sparse.hooks import MLASparseHooks
 from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
 from tensorrt_llm._torch.modules.multi_stream_utils import maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.utils import Fp4QuantizedTensor
 
+from ..._dsa import (
+    _forward_dsa_attn,
+    _get_short_seq_mha_threshold,
+    initialize_sparse_attn,
+    should_use_short_mha,
+)
 from ..gemm.low_m import _device_limits, low_m_gemm
 from .kv_norm_pack import is_kv_norm_pack_supported, kv_norm_pack
 from .q_a_norm import is_q_a_norm_early_supported, q_a_norm_early
 
 if TYPE_CHECKING:
-    from tensorrt_llm._torch.attention.mla import MLA
+    from ..._mla import Glm52MLA as MLA
 
 
 def build_projection_weights(mla) -> None:
@@ -266,7 +268,21 @@ def forward_dsa_proj(
     return outputs
 
 
-class RubinDSAHooks(DSAHooks):
+class RubinDSAHooks(MLASparseHooks):
+    """Target-owned DSA adapter with the HIGH projection pipeline."""
+
+    need_absorption = True
+
+    def __init__(self) -> None:
+        self.short_seq_mha_threshold = _get_short_seq_mha_threshold()
+        self.need_dense_mha = self.short_seq_mha_threshold > 0
+
+    def initialize(self, mla: MLA) -> None:
+        initialize_sparse_attn(mla, self.short_seq_mha_threshold)
+        self.need_dense_mha = (
+            self.need_dense_mha and mla.mapping.cp_size == 1 and mla.mqa.support_fused_rope()
+        )
+
     def forward(self, mla, position_ids, hidden_states, attn_metadata, attn_output) -> None:
         outputs = forward_dsa_proj(
             mla, position_ids, hidden_states, attn_metadata, allow_k_cache_write=True
@@ -278,10 +294,7 @@ class RubinDSAHooks(DSAHooks):
     def forward_custom_op(
         self, mla, hidden_states, position_ids, attn_output, latent_cache_gen
     ) -> bool:
-        from tensorrt_llm._torch.attention.backends.sparse.dsa.custom_ops import (
-            maybe_bcg_mla_dsa_attn_inplace,
-        )
-
+        from ..._dsa_custom_ops import maybe_bcg_mla_dsa_attn_inplace
         from .projection_op import indexer_cache_for_projection, mla_dsa_proj
 
         indexer_k_cache = indexer_cache_for_projection(mla.layer_idx_str)

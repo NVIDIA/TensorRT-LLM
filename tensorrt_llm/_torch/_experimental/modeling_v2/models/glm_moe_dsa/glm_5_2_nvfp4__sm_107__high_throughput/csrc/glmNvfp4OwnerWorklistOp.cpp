@@ -14,7 +14,9 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/glmMoeDsaRubin/highThroughput/glmNvfp4OwnerWorklist.h"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmNvfp4OwnerWorklist.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 
 #include <ATen/MemoryOverlap.h>
@@ -24,9 +26,9 @@
 #include <limits>
 
 namespace th = torch;
-namespace tk = tensorrt_llm::kernels;
+namespace tk = TRTLLM_MV2_NS::kernels;
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -168,9 +170,9 @@ void glmRubinNvfp4WorklistMember(th::Tensor const& hostPoolPointers, th::Tensor 
 
 } // namespace torch_ext
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "glm_rubin_nvfp4_mla_gather_worklist_pipelined(Tensor host_pool_pointers, Tensor host_pool_mapping, "
@@ -183,8 +185,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor global_dequant_scale, int layer_idx, int num_pool_tokens) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("glm_rubin_nvfp4_mla_gather_worklist_pipelined", &tensorrt_llm::torch_ext::glmRubinNvfp4WorklistPipelined);
-    m.impl("glm_rubin_nvfp4_mla_gather_worklist_member", &tensorrt_llm::torch_ext::glmRubinNvfp4WorklistMember);
+    m.impl("glm_rubin_nvfp4_mla_gather_worklist_pipelined", &TRTLLM_MV2_NS::torch_ext::glmRubinNvfp4WorklistPipelined);
+    m.impl("glm_rubin_nvfp4_mla_gather_worklist_member", &TRTLLM_MV2_NS::torch_ext::glmRubinNvfp4WorklistMember);
 }

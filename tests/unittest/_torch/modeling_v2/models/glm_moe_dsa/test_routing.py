@@ -185,7 +185,13 @@ _DEP16 = dict(world_size=16, tp_size=16, moe_ep_size=16, moe_tp_size=1, enable_a
 @pytest.mark.parametrize("mode", ["auto", "require"])
 @pytest.mark.parametrize("draft_len", [None, 5, 7])
 @pytest.mark.parametrize("world_size", [4, 16])
-def test_glm52_high_throughput_matches(_on_sm107, mode, draft_len, world_size):
+def test_glm52_high_throughput_matches(_on_sm107, monkeypatch, mode, draft_len, world_size):
+    # Exercise the real routing predicates on CPU without requiring the target's
+    # native library. Native loading and execution are covered by GPU tests.
+    module_name, class_name = _GLM52_HIGH_THROUGHPUT_TARGET.rsplit(".", 1)
+    stub = ModuleType(f"tensorrt_llm._torch._experimental.modeling_v2.{module_name}")
+    setattr(stub, class_name, type(class_name, (), {"__module__": stub.__name__}))
+    monkeypatch.setitem(sys.modules, stub.__name__, stub)
     config = _model_config(
         _glm52_config(index_n_heads=32),
         spec_config=MTPDecodingConfig(max_draft_len=draft_len) if draft_len is not None else None,

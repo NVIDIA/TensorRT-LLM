@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """The fused producer must preserve routing and linear-layout NVFP4 bytes."""
 
+from importlib import import_module
+
 import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -13,9 +16,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(scope="module")
+def native_ops():
+    try:
+        target = import_module(
+            "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+            "glm_5_2_nvfp4__sm_107__high_throughput"
+        )
+    except NoTarget as error:
+        pytest.skip(str(error))
+    return target.native_ops
+
+
 @pytest.mark.parametrize("rows", [1, 7, 20, 56, 60, 120])
 @pytest.mark.parametrize("topk", [8, 16])
-def test_fused_route_quant_matches_separate_ops(rows: int, topk: int):
+def test_fused_route_quant_matches_separate_ops(native_ops, rows: int, topk: int):
     torch.manual_seed(123)
     scores = torch.randn(rows, 256, dtype=torch.float32, device="cuda")
     bias = torch.randn(256, dtype=torch.float32, device="cuda")
@@ -27,7 +42,7 @@ def test_fused_route_quant_matches_separate_ops(rows: int, topk: int):
     scales = torch.empty(rows, 6144 // 16, dtype=torch.uint8, device="cuda")
 
     def fused():
-        torch.ops.trtllm.glm_rubin_noaux_tc_fp4_quantize_out(
+        native_ops.glm_rubin_noaux_tc_fp4_quantize_out(
             scores, bias, hidden, scale, 1, 1, topk, 2.5, values, indices, packed, scales
         )
 

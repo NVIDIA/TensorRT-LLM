@@ -15,7 +15,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/glmMoeDsaRubin/highThroughput/glmMtpHeadGather.h"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmMtpHeadGather.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -26,7 +27,7 @@
 #include <cuda_bf16.h>
 #include <type_traits>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::glm_rubin_mtp
 {
@@ -241,4 +242,4 @@ void oneshotAllGatherOp(AllGatherParams const& params)
 
 } // namespace kernels::glm_rubin_mtp
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
