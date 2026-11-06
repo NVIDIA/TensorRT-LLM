@@ -2022,6 +2022,9 @@ class RubinSmallBatchFusedMoeKernel:
         ws = ws_ptr.toint()
         out_base = out_ptr.toint()
         out_row_bytes = self.n2 * 2
+        if cutlass.const_expr(self.output_push_world > 0):
+            # read once, past the grid dependency (as every read of the state must be)
+            push = self._push_target(push)
         racc = cute.make_rmem_tensor((n_tok,), Float32)
         # token-indexed layout: the FC2 task's per-token sums of this thread's channel (rAcc's
         # columns), the per-tile scale buffers of the warpgroup and the buffer of the next tile
@@ -2267,7 +2270,7 @@ class RubinSmallBatchFusedMoeKernel:
         warpgroup barrier that follows its reds); the task that completes the m-tile's ``ns``
         arrivals reads the m-tile's BF16 output rows of every token (every task's reds precede
         its arrival) and stores them into the token's slot of the all-reduce, as
-        :meth:`_push_rows` does for the slice combine."""
+        :meth:`_push_rows` does for the slice combine (``push``: :meth:`_push_target`)."""
         if et == 0:
             old = _atom_add_acq_rel(ctr + Int64(CTR_MTILE_BASE + c) * 4, 1)
             flag = Int32(0)
@@ -2276,8 +2279,7 @@ class RubinSmallBatchFusedMoeKernel:
             sflag[wg] = flag
         self._wg_barrier(wg)
         if sflag[wg] != 0:
-            push_mc, push_flags, push_rank = push
-            cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push_flags)
+            push_mc, push_rank, cur, nbytes = push
             # 16 threads per token row, 8 channels (16 bytes) each, as the reds
             ch8 = (et % 16) * 8
             for rb in cutlass.range_constexpr(0, self.n_tok, 8):
@@ -2386,11 +2388,20 @@ class RubinSmallBatchFusedMoeKernel:
                 _st_relaxed_u32(ctr + Int64(CTR_MTILE_BASE + c) * 4, 0)
 
     @cute.jit
-    def _push_rows(self, racc, push, c, orig_m: Int32, et: Int32):
-        """Output push: lane groups of eight gather their eight channels of every token (BF16)
-        and the group's first lane stores them into the token's slot of the all-reduce."""
+    def _push_target(self, push):
+        """``(push_mc, push_rank, cur, nbytes)`` of the output push: the multicast base, this
+        rank, and the all-reduce call's current buffer and bytes per buffer
+        (:func:`mnnvl_pushed_allreduce.lamport_state`, valid past the grid dependency)."""
         push_mc, push_flags, push_rank = push
         cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push_flags)
+        return push_mc, push_rank, cur, nbytes
+
+    @cute.jit
+    def _push_rows(self, racc, push, c, orig_m: Int32, et: Int32):
+        """Output push: lane groups of eight gather their eight channels of every token (BF16)
+        and the group's first lane stores them into the token's slot of the all-reduce
+        (``push``: :meth:`_push_target`)."""
+        push_mc, push_rank, cur, nbytes = push
         lane = cute.arch.lane_idx()
         group = lane - (lane & 7)
         for tk in cutlass.range_constexpr(self.n_tok):
@@ -2415,8 +2426,7 @@ class RubinSmallBatchFusedMoeKernel:
     def _push_zero_rows(self, push, orig_m: Int32, gtid: Int32, nthreads: Int32):
         """Output push without a local expert: the vectors :meth:`_push_rows` stores for an
         all-zero output (``+0`` words), grid-strided over the token warps."""
-        push_mc, push_flags, push_rank = push
-        cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push_flags)
+        push_mc, push_rank, cur, nbytes = self._push_target(push)
         vecs = self.n2 // 8
         zero = Int32(0)
         for i in cutlass.range(gtid, orig_m * vecs, nthreads, unroll=1):
