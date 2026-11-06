@@ -26,7 +26,8 @@ pulp
 pandas
 h5py==3.12.1
 StrEnum
-sentencepiece>=0.1.99
+# SentencePiece 0.2.3 generates bindings for protobuf 7; this runtime uses protobuf 6.
+sentencepiece>=0.1.99,<0.2.3
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09 uses 2.14.0a0.
 # The floor is the NGC alpha, which PEP 440 orders below the public release of the same
 # series; the ceiling is that public release, which is what the resolver picks off the public
