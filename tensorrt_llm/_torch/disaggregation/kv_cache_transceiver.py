@@ -528,6 +528,14 @@ class KvCacheTransceiver(ABC):
         """Return a human-readable dump of transceiver state for debugging hangs."""
         return ""
 
+    def prepare_shutdown(self) -> None:
+        """Stop transfers before cache release; keep registrations when supported.
+
+        Backends without separate drain and deregistration phases shut down
+        completely here. A failure must leave the cache owned by the caller.
+        """
+        self.shutdown()
+
     def shutdown(self) -> None:
         """Shut down the transceiver and release registered resources."""
 
