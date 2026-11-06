@@ -20,12 +20,17 @@ contract, prefix-cache position keying + store/read-back round trip, fail-closed
 backend gating, and the opt-in config flags.
 """
 
+from contextlib import nullcontext
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from tensorrt_llm import _profiler as profiler
 from tensorrt_llm._torch.route_capture import (
     ROUTE_CAPTURE_ATTR,
     RouteCapture,
+    RouteCopier,
     assert_capturable,
     get_active_route_capture,
 )
@@ -406,3 +411,109 @@ def test_opt_out_owner_feeds_opt_in_prefix_hit():
     ((_, routes),) = sib.py_result.appended
     assert routes.shape == (5, _L, _K) and int(routes.min()) >= 0
     assert rc._pfx_misses == 0
+
+
+class _RouteCopyEvent:
+    """Hold staged CPU rows incomplete until the test releases their copy."""
+
+    def __init__(self):
+        self.ready = False
+        self.synchronize_calls = 0
+
+    def record(self, stream):
+        self.ready = False
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.synchronize_calls += 1
+        self.ready = True
+
+
+@pytest.fixture
+def route_copier_runtime(monkeypatch):
+    """Keep real copier staging and CPU rows, replacing CUDA scheduling only."""
+    stream = SimpleNamespace(wait_event=lambda event: None)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda device=None: stream)
+    monkeypatch.setattr(torch.cuda, "Event", _RouteCopyEvent)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
+    monkeypatch.setattr(torch.cuda, "stream", nullcontext)
+    monkeypatch.setattr("tensorrt_llm._torch.route_capture.prefer_pinned", lambda: False)
+    return RouteCopier(torch.device("cuda:0"), (2, 2, 2), ring=3)
+
+
+def test_route_capture_delayed_callbacks_keep_original_step_rank_and_layers(
+    route_copier_runtime, monkeypatch
+):
+    """Commit R3 rows before observing each delayed copy with its own metadata."""
+    copier = route_copier_runtime
+    rc = RouteCapture(rank=7)
+    rc._copier = copier
+    rc._buf = torch.empty((2, 2, 2), dtype=torch.int32)
+    observed = []
+
+    def observe(rows, *, step, rank, layer_pos):
+        assert rows.device.type == "cpu" and rows.dtype == torch.int32
+        assert torch.equal(rc._store[101][step - 11], rows[0].to(torch.int16))
+        observed.append((rows.clone(), step, rank, layer_pos))
+
+    monkeypatch.setattr(profiler, "custom_region_active", lambda region: True)
+    monkeypatch.setattr(profiler, "record_moe_routing_ids", observe, raising=False)
+    for step, rank, layers in [(11, 7, (2, 7)), (12, 8, (9, 10)), (13, 9, (22, 30))]:
+        rc.set_iter(step)
+        rc.rank = rank
+        rc._layer_pos = dict(zip(layers, (0, 1)))
+        rc._layout = [(101, step - 11)]
+        rc._buf.fill_(step)
+        rc.finish_forward()
+    rc.set_iter(99)
+    rc.rank = 99
+    rc._layer_pos.clear()
+    copier.drain(rc.commit)
+    copier.drain(rc.commit)
+    assert observed == [] and rc._store == {}
+
+    copier._d2h[1].ready = True
+    copier.drain(rc.commit)
+    assert len(observed) == 1
+    copier._d2h[0].ready = copier._d2h[2].ready = True
+    copier.drain(rc.commit)
+    assert [(step, rank, layers) for _, step, rank, layers in observed] == [
+        (12, 8, ((9, 0), (10, 1))),
+        (11, 7, ((2, 0), (7, 1))),
+        (13, 9, ((22, 0), (30, 1))),
+    ]
+    for rows, step, _, _ in observed:
+        assert torch.equal(rows, torch.full((1, 2, 2), step, dtype=torch.int32))
+    assert all(row.dtype == torch.int16 for row in rc._store[101].values())
+    assert not copier._pending
+    assert all(event.synchronize_calls == 0 for event in copier._fwd_done + copier._d2h)
+
+
+@pytest.mark.parametrize("via_capture", [False, True])
+def test_route_copier_default_and_inactive_moe_keep_r3_commit(
+    route_copier_runtime, monkeypatch, via_capture
+):
+    """Keep ordinary R3 staging and inactive profiling free of observer callbacks."""
+    copier = route_copier_runtime
+    rc = RouteCapture(rank=7)
+    rc._copier = copier
+    rc._buf = torch.full((2, 2, 2), 17, dtype=torch.int32)
+    rc._layout = [(101, 0)]
+
+    def unexpected_observation(*args, **kwargs):
+        pytest.fail("inactive MoE must not stage an observer callback")
+
+    monkeypatch.setattr(profiler, "custom_region_active", lambda region: False)
+    monkeypatch.setattr(profiler, "record_moe_routing_ids", unexpected_observation, raising=False)
+    if via_capture:
+        rc.finish_forward()
+    else:
+        copier.stage(rc._buf, 1, rc._layout, rc.commit)
+    assert rc._store == {}
+    copier._d2h[0].ready = True
+    copier.drain(rc.commit)
+    assert torch.equal(rc._store[101][0], torch.full((2, 2), 17, dtype=torch.int16))
+    assert not copier._pending
+    assert all(event.synchronize_calls == 0 for event in copier._fwd_done + copier._d2h)

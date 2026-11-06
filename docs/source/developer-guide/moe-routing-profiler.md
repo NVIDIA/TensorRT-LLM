@@ -18,13 +18,13 @@ Set `TLLM_PROFILE_CUSTOM_REGIONS=moe` before starting the process (or include
 `moe` in a comma-separated selection). This is opt-in and does not start a
 profiler. Use an active PyTorch profiler on the emitting thread, with an
 execution-trace observer and shape recording to retain the metadata string input.
-An observer alone is insufficient; Chrome exports omit the metadata fields. Selection, literal
-decoding, and observational error handling follow the
+An observer alone is insufficient; Chrome exports omit the metadata fields.
+Selection, literal decoding, and observational error handling follow the
 [shared profiler metadata contract](profiler-metadata.md).
 
-Current `ConfigurableMoE` schedulers emit `trtllm::moe_routing` user scopes only
-when selected and profiling is active. Each scope's `TRTLLM1` envelope contains
-these fields:
+Current `ConfigurableMoE` schedulers emit `trtllm::moe_routing` user scopes before
+EPLB remapping. These scopes inspect shapes only, without reading tensor values
+or copying data to CPU:
 
 | Field | Meaning |
 | --- | --- |
@@ -32,52 +32,64 @@ these fields:
 | `moe.num_tokens` | Rows of this materialized local chunk |
 | `moe.num_experts` | Logical expert count, not EPLB slots |
 | `moe.experts_per_token` | Top-k column count |
-| `moe.selected_expert_ids` | Integer row lists in original top-k order |
-| `moe.routing_weights` | Original floating weight row lists, or `None` if unavailable |
 
-Observations occur before EPLB maps logical expert IDs to slots and before
-input-weight folding or backend-required scale dtype conversion. The external
-scheduler supports ordinary separated routing, materialized fused
-route-plus-quantization outputs, and caller-provided `PreroutedRouting` tensors
-without re-running routing or quantization.
-Caller-provided choices take precedence in the observation when present, including
-when forced separated routing also produces intermediate choices.
-The fused-communication scheduler observes real rows after attention-DP
-padding stripping, including its existing empty `[0, top_k]` chunk tensors.
-Unavailable weights in the standalone helper are explicit `None`, never
-fabricated ones; current scheduler requirements for materialized weights are
-unchanged.
+The external scheduler observes ordinary separated routing, materialized fused
+route-plus-quantization outputs, and caller-provided `PreroutedRouting` tensors.
+The fused-communication scheduler observes real rows after attention-DP padding
+stripping, including its empty `[0, top_k]` chunks. Events describe physical chunk
+work: DP padding, substituted empty chunks, and repeated execution can add
+observations. Routing, weights, quantization, communication, and EPLB are unchanged.
 
-Events describe physical chunk work, not unique requests or global token counts.
-External DP padding, substituted empty chunks, and repeated layer execution can
-produce additional observations. Existing RouterReplay row offsets and duplicate
-suppression are independent of these events. Profiling does not change scheduler,
-backend, communication, quantization, or EPLB selection and adds no collectives.
+## Expert IDs from Router Replay
+
+To include expert-ID values, also enable the existing engine option
+`enable_return_routed_experts`. Profiling does not enable Router Replay (R3)
+automatically. The per-request `return_routed_experts` option controls returned
+outputs; it is not needed for profiler metadata once engine capture is enabled.
+
+R3 already copies pre-EPLB logical expert IDs to CPU after each forward. For
+copies staged and processed while MoE profiling is active, the profiler emits
+separate `trtllm::moe_routing_ids` scopes from the raw completed CPU buffer:
+
+| Field | Meaning |
+| --- | --- |
+| `moe.layer` | Original model layer index |
+| `moe.step`, `moe.rank` | Originating executor iteration and engine rank |
+| `moe.num_tokens` | R3 forward-layout row count, including any dummy rows |
+| `moe.experts_per_token` | Top-k column count |
+| `moe.recorded_tokens` | Number of leading rows serialized |
+| `moe.truncated` | Whether rows were omitted from the trace payload |
+| `moe.selected_expert_ids` | Logical integer IDs in original top-k order |
+
+Each layer records at most 64 rows and 4096 IDs. These caps bound trace
+serialization only; R3 retains its complete returned routes. Routing weights are
+not recorded. ID records cover a full forward layout rather than individual
+scheduler chunks; they do not reconstruct cached prefix rows or fabricated
+empty-chunk work. Shape coverage of `PreroutedRouting` does not add R3 capture
+of caller-provided IDs; ID scopes report only the existing R3 buffer. They
+describe logical experts, not physical EPLB slots or expert placement on ranks.
 
 ## Cost and coverage limits
 
-Active eager observations detach, copy expert IDs and available weights to CPU,
-convert them to lists, and serialize a literal payload. CUDA copies synchronize
-and can perturb chunk overlap. Payload size grows with rows times top-k; this
-is not a zero-overhead path. Disabled or selected-but-inactive calls do not read
-tensor values, copy to CPU, query CUDA capture state, or construct metadata.
-Active CPU-only metadata does not initialize CUDA.
+The profiler adds no device buffer, copy stream, device-to-host copy, or wait.
+CPU list conversion and literal encoding still cost time when IDs are emitted.
+R3 keeps its existing costs, including forced drains for prefill/request
+completion and ring reuse. Enabling R3 solely for profiling therefore has a cost.
 
-During genuine current-stream CUDA graph capture the new profiler observation
-is skipped before CPU serialization. The existing graph-capable RouterReplay
-device-buffer write remains active; its persistent buffer must still be warmed
-before capture under its existing contract. Graph replay executes no new Python
-hook, so replay-only profiling cannot produce fresh per-replay routing events.
+ID scopes are best-effort completion-time observations, not forward timings.
+Their timestamps mark readback processing; use `moe.step`, `moe.rank`, and
+`moe.layer` for source attribution. A source step may precede the current trace
+window. Copies that complete after profiling stops are omitted; profiling adds
+no final flush. Without R3, only shape scopes are available.
 
-Fully backend-internal fused routing that exposes no selected IDs or weights
-is unavailable. No routing is recomputed, separated routing forced, backend
-substituted, or weights fabricated to obtain a trace. Empty observations contain
-empty ID/weight lists and retain the top-k count. Unsupported/non-finite payloads
-may lose the observation under the shared codec's error policy without changing
-inference.
+R3's existing restrictions apply, including pipeline parallelism, speculative
+decoding/MTP, and backend paths without capturable separated routing. Profiling
+neither broadens those paths nor recomputes routing to obtain IDs. The R3 buffer
+must be warmed before CUDA graph capture under its existing contract.
 
-Routing observations are unavailable during `torch.compile` tracing and CUDA
-graph replay. The Vanilla and TRITON legacy implementations and model-private
-routing such as Step3p7 do not use this ConfigurableMoE observation boundary;
-selecting `moe` does not make those paths observable. Unsupported backend
-selection emits a warning. No routing is recomputed to obtain metadata.
+Shape observations are skipped during CUDA graph capture and `torch.compile`
+tracing, and Python hooks do not run on graph replay. R3 remains graph-capable;
+its completed readbacks can produce ID scopes without matching shape scopes on
+replay. The Vanilla/TRITON legacy implementations and model-private routing such
+as Step3p7's Python expert fallback remain outside this ConfigurableMoE boundary. Unsupported
+backend selection emits a warning.
