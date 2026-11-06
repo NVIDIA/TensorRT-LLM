@@ -66,13 +66,11 @@ MATCH_KEYS = [
 
 
 def result_metric_paths(backend: str) -> dict[str, str]:
-    """Where each gated metric lives in the result JSON, per route.
+    """Map client timings to the existing database metrics.
 
-    Both series are client-side wall clock, so what they measure is what a
-    caller of the server waits for. The latency series is the whole request.
-    The generation series ends once generation is done: the video route
-    reports that separately as ``gen_latency``, and the image route, being a
-    single leg, cannot tell it apart from the whole request.
+    Video exposes a separate ``gen_latency`` observation; synchronous image
+    routes use ``e2e_latency`` for the same ``d_*_generation`` metrics. These
+    are client wall-clock intervals, not the diagnostic server inference time.
     """
     generation = "gen_latency" if backend == "openai-videos" else "e2e_latency"
     return {
