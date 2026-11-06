@@ -6,7 +6,6 @@ import asyncio
 import json
 import secrets
 from types import SimpleNamespace
-from unittest import mock
 
 import pytest
 
@@ -73,10 +72,9 @@ class DeleteEvent(PutEvent):
 
 def _storage(record_auth_key=RECORD_KEY, client=None):
     client = client or FakeEtcdClient()
-    with mock.patch.object(Etcd3ClusterStorage, "_connect", return_value=client):
-        return client, Etcd3ClusterStorage(
-            "etcd://etcd-host:2379", "c", record_auth_key=record_auth_key
-        )
+    storage = Etcd3ClusterStorage("etcd://etcd-host:2379", "c", record_auth_key=record_auth_key)
+    storage._connect = lambda *args, **kwargs: client
+    return client, storage
 
 
 @pytest.mark.asyncio

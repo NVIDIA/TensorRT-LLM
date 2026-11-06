@@ -8,7 +8,7 @@ import sys
 import time
 from dataclasses import dataclass
 from enum import IntEnum
-from functools import wraps
+from functools import partial, wraps
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -571,9 +571,27 @@ class Etcd3WatchEventQueue(WatchEventQueue):
             self.cancel_event()
 
 
-def _is_unauthenticated(error: grpc.RpcError) -> bool:
-    code = getattr(error, "code", None)
-    return callable(code) and code() == grpc.StatusCode.UNAUTHENTICATED
+# Details of the INVALID_ARGUMENT errors with which etcd rejects a login token
+# that was valid before; the etcd Go client logs in again on these as well.
+_REJECTED_TOKEN_DETAILS = frozenset({
+    "etcdserver: revision of auth store is old",
+    "etcdserver: user name is empty",
+})
+
+
+def _rejects_token(error: grpc.RpcError) -> bool:
+    """Whether etcd answered with ``error`` because it no longer accepts the login token."""
+    code = error.code()
+    return code == grpc.StatusCode.UNAUTHENTICATED or (
+        code == grpc.StatusCode.INVALID_ARGUMENT
+        and error.details() in _REJECTED_TOKEN_DETAILS)
+
+
+def _describe_error(error: Exception) -> str:
+    """Describe ``error`` for a log message; a gRPC error by its status and details."""
+    if isinstance(error, grpc.RpcError):
+        return f"{error.code().name}: {error.details()}"
+    return repr(error)
 
 
 def handle_etcd_error(return_on_error: bool | None):
@@ -582,6 +600,13 @@ def handle_etcd_error(return_on_error: bool | None):
 
         async def wrap(*args, **kwargs):
             storage = args[0]
+            try:
+                await storage.connect()
+            except (etcd3.Etcd3Exception, grpc.RpcError, OSError) as e:
+                logger.warning(
+                    f"Could not connect to etcd in {f.__name__}, trying again "
+                    f"on the next call: {_describe_error(e)}")
+                return return_on_error
             try:
                 return await f(*args, **kwargs)
             except etcd3.Etcd3Exception as e:
@@ -592,10 +617,11 @@ def handle_etcd_error(return_on_error: bool | None):
                 storage.reconnect()
                 return return_on_error
             except grpc.RpcError as e:
-                if not _is_unauthenticated(e):
+                if not storage.logs_in or not _rejects_token(e):
                     raise
-                logger.error(
-                    f"Etcd3 rejected the authentication token in {f.__name__}")
+                logger.warning(
+                    f"Etcd rejected the login token in {f.__name__}, logging "
+                    f"in again on the next call: {_describe_error(e)}")
                 storage.reconnect()
                 return return_on_error
 
@@ -640,7 +666,8 @@ class Etcd3ClusterStorage(ClusterStorage):
                  cert_key: Optional[str] = None,
                  cert_cert: Optional[str] = None,
                  record_auth_key: Optional[str] = None,
-                 **kwargs):
+                 **kwargs) -> None:
+        """Keep the connection settings; the first storage call connects to etcd."""
         self._cluster_uri = cluster_uri
         self._client_options = dict(user=user,
                                     password=password,
@@ -648,7 +675,8 @@ class Etcd3ClusterStorage(ClusterStorage):
                                     cert_key=cert_key,
                                     cert_cert=cert_cert)
         self._record_auth_key = record_auth_key
-        self._client = self._connect(self._cluster_uri, **self._client_options)
+        self._client: Optional[etcd3.MultiEndpointEtcd3Client] = None
+        self._connect_lock = asyncio.Lock()
         self._leases = {}
         self._instance_lease = None
         self._watch_handles = {}
@@ -656,7 +684,8 @@ class Etcd3ClusterStorage(ClusterStorage):
 
     def __del__(self):
         self._watch_handles.clear()
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
 
     def _get_lease(self, key: str, ttl: int = -1) -> etcd3.Lease:
         if ttl <= 0:
@@ -668,11 +697,32 @@ class Etcd3ClusterStorage(ClusterStorage):
         return self._leases[key]
 
     @property
-    def client(self):
+    def client(self) -> Optional[etcd3.MultiEndpointEtcd3Client]:
+        """The etcd client, or None until a storage call connects."""
         return self._client
 
-    def reconnect(self):
-        self._client = self._connect(self._cluster_uri, **self._client_options)
+    @property
+    def logs_in(self) -> bool:
+        """Whether the storage logs in to etcd with a user name and password."""
+        return self._client_options["user"] is not None
+
+    async def connect(self) -> None:
+        """Connect to etcd unless connected.
+
+        With a user name and password, connecting includes a login request, so it
+        runs on a worker thread instead of the event loop.
+        """
+        async with self._connect_lock:
+            if self._client is None:
+                self._client = await asyncio.to_thread(self._connect,
+                                                       self._cluster_uri,
+                                                       **self._client_options)
+
+    def reconnect(self) -> None:
+        """Close the current connection; the next storage call connects again."""
+        client, self._client = self._client, None
+        if client is not None:
+            client.close()
 
     def _sign(self, key: str, value: str) -> str:
         """The record to store: with record_auth_key, the value and its signature as JSON."""
@@ -763,10 +813,11 @@ class Etcd3ClusterStorage(ClusterStorage):
             return self._watch_handles[key_prefix]
         watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix,
                                             verify=self._verify)
-        watch_id = self.client.add_watch_prefix_callback(
+        client = self.client
+        watch_id = client.add_watch_prefix_callback(
             key_prefix, watch_handle.add_events_from_resp)
-        watch_handle.set_cancel_event(
-            lambda: self.client.cancel_watch(watch_id))
+        # Cancel on the client that owns the watch, also after a reconnect.
+        watch_handle.set_cancel_event(partial(client.cancel_watch, watch_id))
         self._watch_handles[key_prefix] = watch_handle
         return watch_handle
 
