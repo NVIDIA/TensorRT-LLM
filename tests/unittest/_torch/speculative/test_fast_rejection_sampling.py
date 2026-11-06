@@ -12,8 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests of the temperature-only fused rejection-sampling kernels in `fast_rejection_sampling`
-(``TLLM_SPEC_FAST_RS=1``).
+"""Tests of the temperature-only fused rejection-sampling kernels in `fast_rejection_sampling`.
 
 The kernels are checked for exactness against the reference samplers (flashinfer's draft sampling,
 `chain_speculative_sampling` for the verify) and float64 models on the same Philox draws, for
@@ -21,7 +20,6 @@ losslessness with chi-square tests, and through the `SpecWorkerBase` entry point
 """
 
 import math
-import os
 import types
 
 import numpy as np
@@ -521,10 +519,19 @@ def _worker_metadata(mbs, slots, seed, offset):
     return md
 
 
-def test_worker_paths_fast(monkeypatch):
-    """`SpecWorkerBase` entry points in ``NO_TOPK_NO_TOPP`` mode with the flag off and on, on a mixed
-    batch (2 context rows) and a padding request routed to the dummy slot: the fused path stores the
-    reference's proposals, and its tokens and accept decisions match the float64 model."""
+def _worker(fused):
+    """A worker that takes the fused path where it applies, or always the reference path."""
+    worker = _Worker()
+    if not fused:
+        worker._fast_rs_applies = lambda *args, **kwargs: False
+    return worker
+
+
+def test_worker_paths_fast():
+    """`SpecWorkerBase` entry points in ``NO_TOPK_NO_TOPP`` mode on the reference path and the fused
+    path, on a mixed batch (2 context rows) and a padding request routed to the dummy slot: the
+    fused path stores the reference's proposals, and its tokens and accept decisions match the
+    float64 model."""
     mbs, nctx, ngen, seed, offset = 16, 2, 9, 99, 13
     bsz = nctx + ngen
     slots = range(3, 3 + bsz)
@@ -533,26 +540,24 @@ def test_worker_paths_fast(monkeypatch):
     tgt_gen, drf = _correlated_case(ngen, gen, 0.5)
     logits = torch.cat([peaked_logits(nctx, V, gen), tgt_gen], dim=0).contiguous()
     probs = {}
-    for flag in ("0", "1"):
-        monkeypatch.setenv(frs.FAST_RS_ENV_VAR, flag)
+    for fused in (False, True):
         md = _worker_metadata(mbs, slots, seed, offset)
-        out = _Worker().sample_draft_tokens(drf, md, bsz, num_contexts=nctx)
-        probs[flag] = md.draft_probs.clone()
+        out = _worker(fused).sample_draft_tokens(drf, md, bsz, num_contexts=nctx)
+        probs[fused] = md.draft_probs.clone()
     drafts = out.view(ngen, K).contiguous()
     # The fused path stores the reference's proposals and draws its tokens from them.
-    assert float((probs["0"][real] - probs["1"][real]).abs().max()) < 1e-6
-    q = probs["1"][real].double().cpu().numpy()
+    assert float((probs[False][real] - probs[True][real]).abs().max()) < 1e-6
+    q = probs[True][real].double().cpu().numpy()
     gaps = _Gaps()
     _check_drafts(drafts[: ngen - 1].cpu().numpy(), q, [seed] * ngen, [offset] * ngen, K, gaps)
     out = {}
-    for flag in ("0", "1"):
-        monkeypatch.setenv(frs.FAST_RS_ENV_VAR, flag)
+    for fused in (False, True):
         md = _worker_metadata(mbs, slots, seed, offset)
-        md.draft_probs.copy_(probs["1"])
+        md.draft_probs.copy_(probs[True])
         md.draft_tokens = drafts.reshape(-1)
-        acc, num = _Worker()._accept_draft_tokens(logits, drafts, nctx, bsz, md)
-        out[flag] = (acc.clone(), num.clone())
-    (a0, n0), (a1, n1) = out["0"], out["1"]
+        acc, num = _worker(fused)._accept_draft_tokens(logits, drafts, nctx, bsz, md)
+        out[fused] = (acc.clone(), num.clone())
+    (a0, n0), (a1, n1) = out[False], out[True]
     assert torch.equal(a0[:nctx, 0], a1[:nctx, 0])  # context rows: the same target sampler
     p = _softmax64(logits[nctx:], torch.ones(ngen * (K + 1), device=DEV)).reshape(ngen, K + 1, V)
     real_gens = slice(nctx, bsz - 1)
@@ -579,10 +584,9 @@ def test_worker_paths_fast(monkeypatch):
     assert same >= ngen - 2
 
 
-def test_guided_decoding_and_watermark_keep_reference(monkeypatch):
-    """With the flag on, a worker with a guided decoder, or a batch with a text watermark, keeps
-    the reference path."""
-    monkeypatch.setenv(frs.FAST_RS_ENV_VAR, "1")
+def test_guided_decoding_and_watermark_keep_reference():
+    """The fused path applies by default, and a worker with a guided decoder, or a batch with a
+    text watermark, keeps the reference path."""
     md = _worker_metadata(4, range(4), 1, 0)
     worker = _Worker()
     logits = torch.zeros((4 * (K + 1), V), device=DEV)
@@ -890,12 +894,3 @@ def test_workspace_growth_keeps_captured_graph(monkeypatch):
     assert bool(torch.cat(junk).isnan().all())
     for a, b in zip(outs, want):
         assert torch.equal(a, b)
-
-
-@pytest.mark.skipif(os.environ.get(frs.FAST_RS_ENV_VAR) == "1", reason="env forces the flag")
-def test_flag_defaults_off():
-    """The fused path is off unless ``TLLM_SPEC_FAST_RS=1``."""
-    assert not frs.fast_rs_enabled()
-    # Flag off: the gate decides before reading the metadata, so a stand-in without the
-    # sampling-mode field (as in test_rejection_buffers_guard) keeps the reference dispatch.
-    assert not _Worker()._fast_rs_applies(types.SimpleNamespace(), None, V)
