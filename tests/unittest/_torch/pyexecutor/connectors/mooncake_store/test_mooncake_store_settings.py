@@ -28,12 +28,14 @@ where the ranks would be spawned.
 import json
 
 import pytest
+from pydantic import ValidationError
 
 import tensorrt_llm.usage as usage
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import settings
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
     CLIENT_CONFIG_NAME,
     CONFIG_PATH_ENV,
+    local_reuse_backoff,
 )
 from tensorrt_llm.llmapi.llm import LLM, _TorchLLM
 from tensorrt_llm.llmapi.llm_args import (
@@ -90,6 +92,9 @@ def test_an_inherited_config_supersedes_the_block_it_ignores(monkeypatch, tmp_pa
         model_key="their-checkpoint",
         transfer_batch_size=128,
         stage_through_host=True,
+        staging_buffer_bytes="256MiB",
+        async_load=True,
+        async_load_workers=2,
     )
     monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
     pool = mooncake_store_config(role="both", segment_size="16GiB")
@@ -102,6 +107,9 @@ def test_an_inherited_config_supersedes_the_block_it_ignores(monkeypatch, tmp_pa
     assert pool.model_key == "their-checkpoint"
     assert pool.transfer_batch_size == 128
     assert pool.stage_through_host is True
+    assert pool.staging_buffer_bytes == 256 * (1 << 20)
+    assert pool.async_load is True
+    assert pool.async_load_workers == 2
 
     # How to reach the pool and where this run's files go are the server's own,
     # so an inherited config has nothing to say about them.
@@ -154,6 +162,76 @@ def test_only_the_values_the_deployment_chose_are_reported_as_overridden(monkeyp
     assert len(overrides) == 1
     assert "role='capacity'" in overrides[0]
     assert "namespace" not in overrides[0]
+
+
+def test_an_inherited_config_restates_the_eviction_and_stats_settings(monkeypatch, tmp_path):
+    """Soft pin, grouping and the stats interval are what the ranks read from the client config."""
+    inherited = write_client_config(
+        tmp_path / "external.json", soft_pin_ttl_ms=5000, group_blocks=True, stats_interval=10
+    )
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
+    pool = mooncake_store_config()
+
+    settings.apply_effective_settings(llm_args(pool=pool))
+
+    assert pool.soft_pin_ttl_ms == 5000
+    assert pool.group_blocks is True
+    assert pool.stats_interval == 10.0
+
+
+def test_an_inherited_config_without_soft_pin_or_stats_turns_them_off(monkeypatch, tmp_path):
+    """A TTL or stats interval the inherited config leaves out is off, not unstated."""
+    inherited = write_client_config(tmp_path / "external.json")
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
+    pool = mooncake_store_config(soft_pin_ttl_ms=86400000, group_blocks=True, stats_interval=30)
+
+    warnings = []
+    monkeypatch.setattr(settings.logger, "warning", warnings.append)
+    settings.apply_effective_settings(llm_args(pool=pool))
+
+    assert pool.soft_pin_ttl_ms is None
+    assert pool.group_blocks is False
+    assert pool.stats_interval is None
+    overrides = [line for line in warnings if "joins the pool as" in line]
+    assert len(overrides) == 1
+    assert "soft_pin_ttl_ms=None" in overrides[0]
+    assert "group_blocks=False" in overrides[0]
+    assert "stats_interval=None" in overrides[0]
+
+
+@pytest.mark.parametrize("ttl", [0, -1])
+def test_a_soft_pin_ttl_must_be_positive(ttl):
+    with pytest.raises(ValidationError, match="soft_pin_ttl_ms"):
+        mooncake_store_config(soft_pin_ttl_ms=ttl)
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf"), float("nan")])
+def test_a_stats_interval_must_be_a_positive_number(interval):
+    with pytest.raises(ValidationError, match="stats_interval"):
+        mooncake_store_config(stats_interval=interval)
+
+
+def test_the_staging_and_async_load_settings_are_checked_up_front():
+    """A bad value names the field it came from rather than failing every rank later."""
+    pool = mooncake_store_config(
+        staging_buffer_bytes="512MiB", async_load=True, async_load_workers=4
+    )
+    assert pool.staging_buffer_bytes == "512MiB"
+    assert mooncake_store_config().staging_buffer_bytes == "1GiB"
+    assert mooncake_store_config().async_load is False
+    assert mooncake_store_config().async_load_workers == 1
+
+    with pytest.raises(ValidationError, match="async_load_workers"):
+        mooncake_store_config(async_load_workers=0)
+    with pytest.raises(ValidationError, match="mooncake_store.staging_buffer_bytes"):
+        mooncake_store_config(staging_buffer_bytes="1GB")
+    with pytest.raises(ValidationError, match="mooncake_store.staging_buffer_bytes"):
+        mooncake_store_config(staging_buffer_bytes=0)
+    # The size check is shared, and still names the segment size for its own.
+    with pytest.raises(ValidationError, match="mooncake_store.segment_size"):
+        mooncake_store_config(segment_size="1GB")
+    with pytest.raises(ValidationError, match="mooncake_store.segment_size"):
+        mooncake_store_config(segment_size=-1)
 
 
 def test_the_pool_replaces_this_engines_own_offload_tiers(monkeypatch, tmp_path):
@@ -244,6 +322,36 @@ def test_a_settled_deployment_is_restated_without_a_word(monkeypatch, tmp_path):
     assert logged == []
     assert pool.role == "producer"
     assert args.kv_cache_config.host_cache_size == 0
+
+
+def test_local_reuse_backoff_takes_only_the_modes_it_has():
+    assert mooncake_store_config().local_reuse_backoff == "off"
+    assert mooncake_store_config(local_reuse_backoff="align").local_reuse_backoff == "align"
+    with pytest.raises(ValidationError):
+        mooncake_store_config(local_reuse_backoff="partial")
+
+
+def test_local_reuse_backoff_is_read_from_the_block_with_off_as_its_default():
+    """Every rank reads it off its own arguments, so no block means the default."""
+    pool = mooncake_store_config(local_reuse_backoff="align")
+    assert local_reuse_backoff(llm_args(pool=pool)) == "align"
+    assert local_reuse_backoff(llm_args(pool=mooncake_store_config())) == "off"
+    # An inherited `MOONCAKE_CONFIG_PATH` needs no block at all.
+    assert local_reuse_backoff(llm_args()) == "off"
+
+
+def test_an_inherited_config_leaves_local_reuse_backoff_alone(monkeypatch, tmp_path):
+    """It is an engine setting the client config does not carry, so nothing restates it."""
+    inherited = write_client_config(tmp_path / "external.json", role="consumer")
+    monkeypatch.setenv(CONFIG_PATH_ENV, str(inherited))
+    pool = mooncake_store_config(local_reuse_backoff="align")
+    args = llm_args(pool=pool)
+
+    settings.apply_effective_settings(args)
+
+    assert pool.role == "consumer"
+    assert pool.local_reuse_backoff == "align"
+    assert local_reuse_backoff(args) == "align"
 
 
 def test_another_connector_keeps_its_own_cache_tiers():

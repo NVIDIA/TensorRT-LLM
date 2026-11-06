@@ -22,17 +22,21 @@ Runs without a Mooncake installation: the store handle is replaced by an
 in-process fake that records what it was handed.
 """
 
+import hashlib
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import config as config_module
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import master as master_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store import staging as staging_module
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.config import (
+    DEFAULT_STAGING_BUFFER_BYTES,
     MooncakeStoreConnectorConfig,
     StoreRole,
     local_address,
+    parse_size,
     split_address,
 )
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
@@ -40,6 +44,7 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.keys import (
     KeyNamespace,
     ReuseScope,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.master import PoolManifest
 from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     HostStagingPool,
     describe_batch_for_get,
@@ -47,6 +52,11 @@ from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.staging import (
     stage_batch_for_put,
     unstage_batch_after_get,
 )
+from tensorrt_llm._torch.pyexecutor.connectors.mooncake_store.validation import (
+    NODE_BUDGET_RESERVE_BYTES,
+    validate_node_budget,
+)
+from tensorrt_llm.llmapi.llm_args import MooncakeStoreConfig
 
 pytestmark = pytest.mark.cpu_only
 
@@ -203,6 +213,233 @@ def test_hash_chain_rejects_shrinking_token_list():
         chain.extend(list(range(TOKENS_PER_BLOCK)))
 
 
+def _reference_chain(scope: ReuseScope, tokens, tokens_per_block: int):
+    """A frozen copy of the per-token encoding stored keys were first written with.
+
+    Each block is blake2b-128 over its parent and its tokens as signed 8-byte
+    little-endian ids, starting from the scope's seed. Kept here, rather than
+    read from the module, so that a change to how the chain encodes tokens
+    cannot also change what it is checked against.
+    """
+
+    def digest(*parts: bytes) -> bytes:
+        hasher = hashlib.blake2b(digest_size=16)
+        for part in parts:
+            hasher.update(part)
+        return hasher.digest()
+
+    parent = scope.seed()
+    hashes = []
+    for start in range(0, len(tokens) - tokens_per_block + 1, tokens_per_block):
+        block = tokens[start : start + tokens_per_block]
+        parent = digest(parent, b"".join(int(t).to_bytes(8, "little", signed=True) for t in block))
+        hashes.append(parent)
+    return hashes
+
+
+@pytest.mark.parametrize(
+    "scope",
+    [
+        ReuseScope(),
+        ReuseScope(cache_salt="tenant-a"),
+        ReuseScope(multimodal_digests=(b"\x01" * 32,)),
+    ],
+    ids=["unscoped", "cache_salt", "multimodal"],
+)
+def test_hash_chain_keeps_the_stored_key_encoding(scope):
+    """Pages already in a pool stay addressable however the chain encodes tokens.
+
+    The token list covers both ends of int64 and -1, and is fed in pieces that
+    end mid-block, so incremental extension is checked against the same
+    reference as a single pass.
+    """
+    tokens = [7, -1, 2**63 - 1, -(2**63), 0, 151_000] * 5 + list(range(23))
+    expected = _reference_chain(scope, tokens, TOKENS_PER_BLOCK)
+    assert len(expected) == len(tokens) // TOKENS_PER_BLOCK
+
+    chain = BlockHashChain(TOKENS_PER_BLOCK, scope=scope)
+    for end in (5, 6, 17, len(tokens)):
+        chain.extend(tokens[:end])
+    assert list(chain.hashes) == expected
+    # Extending again with no new block leaves the chain as it is.
+    assert list(chain.extend(tuple(tokens))) == expected
+    # A tuple encodes like a list; a fresh chain makes it encode every block.
+    from_tuple = BlockHashChain(TOKENS_PER_BLOCK, scope=scope)
+    assert list(from_tuple.extend(tuple(tokens))) == expected
+
+
+def test_hash_chain_golden_digest():
+    """Pinned keys, captured from the per-token encoding before it was replaced.
+
+    A change here changes every key a deployment has stored, so pages written
+    by an older build stop being found. Regenerating these from the code under
+    test would prove nothing.
+    """
+    assert [h.hex() for h in BlockHashChain(4).extend(list(range(8)))] == [
+        "2e8c598e5152642e1a12a2345cedf3e3",
+        "4c62122a866d675f3f436e12723d692a",
+    ]
+    salted = BlockHashChain(2, scope=ReuseScope(cache_salt="tenant-a"))
+    assert [h.hex() for h in salted.extend([-1, 2**63 - 1, -(2**63), 0])] == [
+        "4308a783baf926ba62be9f96df5db867",
+        "3205a431e8c69e7077da3e22ce5b56da",
+    ]
+    multimodal = BlockHashChain(3, scope=ReuseScope(multimodal_digests=(b"\x01" * 32,)))
+    assert [h.hex() for h in multimodal.extend([151_000, 7, -5, 2**40, 0, 1, 99])] == [
+        "9e3d925110ea5d2fc057a7874a546f11",
+        "29d8726fadccb94fc9beacdde9042f0a",
+    ]
+
+
+@pytest.mark.parametrize("token", [2**63, -(2**63) - 1], ids=["above", "below"])
+def test_hash_chain_rejects_tokens_outside_int64(token):
+    """A token id no 8-byte key can encode is refused, and leaves the chain as it was."""
+    chain = BlockHashChain(TOKENS_PER_BLOCK)
+    chain.extend(list(range(TOKENS_PER_BLOCK)))
+    before = list(chain.hashes)
+    tokens = list(range(TOKENS_PER_BLOCK)) + [0] * (TOKENS_PER_BLOCK - 1) + [token]
+    with pytest.raises(OverflowError):
+        chain.extend(tokens)
+    assert list(chain.hashes) == before
+
+
+@pytest.mark.parametrize("lookahead", [1, TOKENS_PER_BLOCK + 1])
+def test_hash_chain_requires_lookahead_and_matches_incremental_extension(lookahead):
+    """A block is hashed once the draft's lookahead past it is in the prompt too."""
+    tokens = list(range(4 * TOKENS_PER_BLOCK + lookahead))
+    chain = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead)
+    assert chain.prompt_lookahead == lookahead
+    assert list(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead - 1])) == []
+    assert len(chain.extend(tokens[: TOKENS_PER_BLOCK + lookahead])) == 1
+    for end in range(TOKENS_PER_BLOCK + lookahead + 1, len(tokens) + 1):
+        chain.extend(tokens[:end])
+    assert len(chain.hashes) == 4
+    one_shot = BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(tokens)
+    assert list(chain.hashes) == list(one_shot)
+
+    # The last lookahead token of block 0 is part of its identity; the token
+    # after it is not.
+    covered = list(tokens)
+    covered[TOKENS_PER_BLOCK + lookahead - 1] += 1000
+    assert (
+        chain.hashes[0]
+        != BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(covered)[0]
+    )
+    beyond = list(tokens)
+    beyond[TOKENS_PER_BLOCK + lookahead] += 1000
+    assert (
+        chain.hashes[0]
+        == BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(beyond)[0]
+    )
+
+
+def test_hash_chain_rejects_negative_lookahead():
+    with pytest.raises(ValueError, match="prompt_lookahead"):
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=-1)
+
+
+def test_hash_chain_lookahead_separates_keys():
+    """Servers whose drafts read different lookaheads never share a page.
+
+    Nor does a speculative server share one with a server without a draft, and
+    the request scope still separates keys under a lookahead.
+    """
+    tokens = list(range(3 * TOKENS_PER_BLOCK))
+    first_blocks = {
+        BlockHashChain(TOKENS_PER_BLOCK, prompt_lookahead=lookahead).extend(tokens)[0]
+        for lookahead in (0, 1, 2)
+    }
+    assert len(first_blocks) == 3
+
+    scopes = [
+        ReuseScope(),
+        ReuseScope(cache_salt="tenant-a"),
+        ReuseScope(cache_salt="tenant-b"),
+        ReuseScope(multimodal_digests=(b"\x01" * 32,)),
+        ReuseScope(multimodal_digests=(b"\x02" * 32,)),
+    ]
+    scoped = {
+        BlockHashChain(TOKENS_PER_BLOCK, scope=scope, prompt_lookahead=1).extend(tokens)[0]
+        for scope in scopes
+    }
+    assert len(scoped) == len(scopes)
+
+
+def _hand_built_chain(lookahead, cache_salt, multimodal_digests, tokens, tokens_per_block):
+    """Expected key bytes, built from the specification rather than from `ReuseScope`.
+
+    The seed is blake2b-128 over the length-framed, presence-tagged salt and
+    the multimodal digests. A non-zero lookahead re-digests it with
+    `b"prompt-lookahead"` and the lookahead as 8 little-endian bytes. Each block
+    is then blake2b-128 over its parent and its tokens plus the lookahead tokens
+    after it, as signed 8-byte little-endian ids, at a one-block stride.
+    """
+
+    def digest(*parts: bytes) -> bytes:
+        hasher = hashlib.blake2b(digest_size=16)
+        for part in parts:
+            hasher.update(part)
+        return hasher.digest()
+
+    salt_bytes = b"\x00" if cache_salt is None else b"\x01" + cache_salt.encode("utf-8")
+    framed = b"".join(
+        len(part).to_bytes(4, "little") + part for part in (salt_bytes, *multimodal_digests)
+    )
+    parent = digest(framed)
+    if lookahead:
+        parent = digest(parent, b"prompt-lookahead", lookahead.to_bytes(8, "little"))
+    hashes = []
+    for start in range(0, len(tokens) - lookahead - tokens_per_block + 1, tokens_per_block):
+        window = tokens[start : start + tokens_per_block + lookahead]
+        parent = digest(parent, b"".join(t.to_bytes(8, "little", signed=True) for t in window))
+        hashes.append(parent)
+    return hashes
+
+
+@pytest.mark.parametrize(
+    "lookahead, cache_salt, multimodal_digests",
+    [
+        (0, None, ()),
+        (0, "tenant-a", ()),
+        (0, None, (b"\x01" * 32,)),
+        (1, None, ()),
+        (3, None, ()),
+        (1, "tenant-a", ()),
+        (3, None, (b"\x01" * 32,)),
+    ],
+    ids=[
+        "no_lookahead",
+        "no_lookahead_salted",
+        "no_lookahead_multimodal",
+        "lookahead_1",
+        "lookahead_3",
+        "lookahead_1_salted",
+        "lookahead_3_multimodal",
+    ],
+)
+def test_hash_chain_key_bytes_follow_the_framed_scope_and_lookahead(
+    lookahead, cache_salt, multimodal_digests
+):
+    """Pins the bytes of every stored key, with and without a draft lookahead.
+
+    Lookahead 0 pins the keys pools already hold. The token list covers both
+    ends of int64 and -1, and is fed in pieces that end mid-block.
+    """
+    tokens = [7, -1, 2**63 - 1, -(2**63), 0, 151_000] * 5 + list(range(23))
+    expected = _hand_built_chain(
+        lookahead, cache_salt, multimodal_digests, tokens, TOKENS_PER_BLOCK
+    )
+    assert len(expected) == (len(tokens) - lookahead) // TOKENS_PER_BLOCK
+
+    scope = ReuseScope(cache_salt=cache_salt, multimodal_digests=multimodal_digests)
+    chain = BlockHashChain(TOKENS_PER_BLOCK, scope=scope, prompt_lookahead=lookahead)
+    for end in (5, 6, 17, len(tokens)):
+        chain.extend(tokens[:end])
+    assert list(chain.hashes) == expected
+    one_shot = BlockHashChain(TOKENS_PER_BLOCK, scope=scope, prompt_lookahead=lookahead)
+    assert list(one_shot.extend(tuple(tokens))) == expected
+
+
 def test_key_namespace_separates_every_dimension():
     base = dict(
         namespace="trtllm",
@@ -225,6 +462,35 @@ def test_key_namespace_separates_every_dimension():
         ("bytes_per_page", 2048),
     ]:
         assert KeyNamespace(**{**base, field: value}).key(block_hash) != reference
+
+
+def test_key_namespace_group_ignores_rank_and_layer_group():
+    """Every page a hit on a block needs shares one eviction group."""
+    base = dict(
+        namespace="trtllm",
+        model_key="m",
+        rank=0,
+        world_size=2,
+        layer_group_id=0,
+        tokens_per_block=4,
+        bytes_per_page=64,
+    )
+    block = b"\x01" * 16
+    group = KeyNamespace(**base).group(block)
+
+    for field, value in [
+        ("rank", 1),
+        ("layer_group_id", 3),
+        ("tokens_per_block", 8),
+        ("bytes_per_page", 128),
+    ]:
+        assert KeyNamespace(**{**base, field: value}).group(block) == group
+    for field, value in [("world_size", 4), ("namespace", "other"), ("model_key", "n")]:
+        assert KeyNamespace(**{**base, field: value}).group(block) != group
+    assert KeyNamespace(**base).group(b"\x02" * 16) != group
+    # The key still names one shard's page.
+    assert KeyNamespace(**base).key(block) != KeyNamespace(**{**base, "rank": 1}).key(block)
+    assert group == f"trtllm/m/w2/{block.hex()}"
 
 
 # ---- config ----
@@ -366,6 +632,207 @@ def test_config_requires_an_explicit_model_key(store_config, tmp_path, monkeypat
         config.resolve_model_key("/models/MiniMax-M3/")
 
 
+# ---- pool eviction and diagnostics settings ----
+
+
+def test_config_eviction_settings_default_off_and_read_the_json(store_config):
+    config = resolve_config()
+    assert config.soft_pin_ttl_ms is None
+    assert config.group_blocks is False
+
+    set_pool_setting(store_config, soft_pin_ttl_ms=86400000, group_blocks=True)
+    config = resolve_config()
+    assert config.soft_pin_ttl_ms == 86400000
+    assert config.group_blocks is True
+
+    # An explicit null is the same as leaving the TTL out.
+    set_pool_setting(store_config, soft_pin_ttl_ms=None)
+    assert resolve_config().soft_pin_ttl_ms is None
+
+
+@pytest.mark.parametrize("ttl", [0, -1])
+def test_config_rejects_a_soft_pin_ttl_that_is_not_positive(store_config, ttl):
+    set_pool_setting(store_config, soft_pin_ttl_ms=ttl)
+    with pytest.raises(ValueError, match="soft_pin_ttl_ms"):
+        resolve_config()
+
+
+@pytest.mark.parametrize("value", ["yes", "false", 1])
+def test_config_group_blocks_must_be_a_json_boolean(store_config, value):
+    """`bool("false")` is True, so anything but a JSON boolean is refused."""
+    set_pool_setting(store_config, group_blocks=value)
+    with pytest.raises(ValueError, match="group_blocks"):
+        resolve_config()
+
+
+def test_config_stats_interval_defaults_off_and_reads_the_json(store_config):
+    assert resolve_config().stats_interval is None
+
+    set_pool_setting(store_config, stats_interval=30)
+    assert resolve_config().stats_interval == 30.0
+
+    set_pool_setting(store_config, stats_interval=None)
+    assert resolve_config().stats_interval is None
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("inf")])
+def test_config_rejects_a_stats_interval_that_is_not_a_positive_number(store_config, interval):
+    set_pool_setting(store_config, stats_interval=interval)
+    with pytest.raises(ValueError, match="stats_interval"):
+        resolve_config()
+
+
+def test_config_has_no_environment_override_for_eviction_settings(store_config, monkeypatch):
+    """The source branch read these from the environment; this connector reads the JSON only."""
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_SOFT_PIN_TTL_MS", "86400000")
+    monkeypatch.setenv("TRTLLM_MOONCAKE_STORE_GROUP_BLOCKS", "1")
+    monkeypatch.setenv("TRTLLM_MOONCAKE_HOLE_STATS", "1")
+    monkeypatch.setenv("TLLM_M3_LOAD_PHASE_TIMING", "1")
+    monkeypatch.setenv("TLLM_MOONCAKE_LOAD_PHASE_TIMING", "1")
+
+    config = resolve_config()
+
+    assert config.soft_pin_ttl_ms is None
+    assert config.group_blocks is False
+    assert config.stats_interval is None
+
+
+def test_config_async_load_defaults_off_and_reads_the_json(store_config):
+    assert resolve_config().async_load is False
+    set_pool_setting(store_config, async_load=True)
+    assert resolve_config().async_load is True
+    # `bool("false")` is True, so only a JSON boolean is read.
+    set_pool_setting(store_config, async_load="false")
+    with pytest.raises(ValueError, match="async_load"):
+        resolve_config()
+
+
+def test_config_async_load_workers_defaults_to_one_and_rejects_zero(store_config):
+    assert resolve_config().async_load_workers == 1
+    set_pool_setting(store_config, async_load_workers=3)
+    assert resolve_config().async_load_workers == 3
+    set_pool_setting(store_config, async_load_workers=0)
+    with pytest.raises(ValueError, match="async_load_workers"):
+        resolve_config()
+
+
+def test_config_staging_buffer_bytes_defaults_and_parses_binary_units(store_config):
+    """A config without the key, such as vLLM's, stages what an unset field asks."""
+    default = MooncakeStoreConfig.model_fields["staging_buffer_bytes"].default
+    assert resolve_config().staging_buffer_bytes == DEFAULT_STAGING_BUFFER_BYTES
+    assert DEFAULT_STAGING_BUFFER_BYTES == parse_size(default, strict_units=True)
+
+    set_pool_setting(store_config, staging_buffer_bytes="512MiB")
+    assert resolve_config().staging_buffer_bytes == 512 * 1024**2
+
+    set_pool_setting(store_config, staging_buffer_bytes="512MB")
+    with pytest.raises(ValueError, match="ambiguous unit"):
+        resolve_config()
+    set_pool_setting(store_config, staging_buffer_bytes=0)
+    with pytest.raises(ValueError, match="staging_buffer_bytes"):
+        resolve_config()
+
+
+_GIB = 1 << 30
+
+
+def _budget_config(**overrides) -> MooncakeStoreConnectorConfig:
+    settings = dict(
+        master_server_address="10.0.0.7:50051",
+        global_segment_size=4 * _GIB,
+        stage_through_host=True,
+        staging_buffer_bytes=_GIB,
+    )
+    settings.update(overrides)
+    return MooncakeStoreConnectorConfig(**settings)
+
+
+def _assert_node_claim(config, *, ranks, claimed):
+    """`claimed` bytes fit exactly, and one byte less fails with the remedy text."""
+    validate_node_budget(
+        config, ranks_on_node=ranks, available_bytes=claimed + NODE_BUDGET_RESERVE_BYTES
+    )
+    with pytest.raises(ValueError, match="cannot afford") as excinfo:
+        validate_node_budget(
+            config, ranks_on_node=ranks, available_bytes=claimed + NODE_BUDGET_RESERVE_BYTES - 1
+        )
+    return str(excinfo.value)
+
+
+def test_validate_node_budget_counts_staging_once_per_direction():
+    """Each direction a role drives pins `staging_buffer_bytes` per rank, and no more."""
+    # Two ranks, each lending 4 GiB and staging 1 GiB for loads and 1 GiB for saves.
+    message = _assert_node_claim(_budget_config(), ranks=2, claimed=2 * 4 * _GIB + 2 * 2 * _GIB)
+    assert "lower staging_buffer_bytes" in message
+    # The load threads split the load direction's budget rather than adding to it.
+    _assert_node_claim(
+        _budget_config(async_load=True, async_load_workers=4),
+        ranks=2,
+        claimed=2 * 4 * _GIB + 2 * 2 * _GIB,
+    )
+    _assert_node_claim(
+        _budget_config(role=StoreRole.CONSUMER), ranks=2, claimed=2 * 4 * _GIB + 2 * _GIB
+    )
+    _assert_node_claim(
+        _budget_config(staging_buffer_bytes=512 * 1024**2), ranks=1, claimed=4 * _GIB + _GIB
+    )
+    # A capacity role transfers nothing, so it stages nothing either.
+    _assert_node_claim(_budget_config(role=StoreRole.CAPACITY), ranks=2, claimed=2 * 4 * _GIB)
+    message = _assert_node_claim(
+        _budget_config(stage_through_host=False), ranks=2, claimed=2 * 4 * _GIB
+    )
+    assert "staging_buffer_bytes" not in message
+
+
+def test_client_config_renders_the_async_and_staging_settings(tmp_path):
+    rendered, config = _rendered_client_config(
+        tmp_path, async_load=True, async_load_workers=3, staging_buffer_bytes="256MiB"
+    )
+    assert rendered["async_load"] is True
+    assert rendered["async_load_workers"] == 3
+    # Resolved to a byte count, as the segment size is.
+    assert rendered["staging_buffer_bytes"] == 256 * 1024**2
+    assert config.async_load is True
+    assert config.async_load_workers == 3
+    assert config.staging_buffer_bytes == 256 * 1024**2
+
+    rendered, config = _rendered_client_config(tmp_path)
+    assert rendered["async_load"] is False
+    assert rendered["async_load_workers"] == 1
+    assert rendered["staging_buffer_bytes"] == DEFAULT_STAGING_BUFFER_BYTES
+    assert config.async_load is False
+    assert config.staging_buffer_bytes == DEFAULT_STAGING_BUFFER_BYTES
+
+
+def _rendered_client_config(tmp_path, **settings):
+    """What `provision_pool` writes for a block with `settings`, and that file read back."""
+    pool = MooncakeStoreConfig(pool="h:1", model_key="m", **settings)
+    rendered = master_module._client_config(pool, PoolManifest(master_server_address="h:1"), "")
+    path = tmp_path / "rendered.json"
+    path.write_text(json.dumps(rendered))
+    return rendered, MooncakeStoreConnectorConfig.from_file(str(path))
+
+
+def test_client_config_renders_eviction_and_stats_settings(tmp_path):
+    rendered, config = _rendered_client_config(
+        tmp_path, soft_pin_ttl_ms=86400000, group_blocks=True, stats_interval=30
+    )
+    assert rendered["soft_pin_ttl_ms"] == 86400000
+    assert rendered["group_blocks"] is True
+    assert rendered["stats_interval"] == 30
+    assert config.soft_pin_ttl_ms == 86400000
+    assert config.group_blocks is True
+    assert config.stats_interval == 30.0
+
+    rendered, config = _rendered_client_config(tmp_path)
+    assert "soft_pin_ttl_ms" not in rendered
+    assert "stats_interval" not in rendered
+    assert rendered["group_blocks"] is False
+    assert config.soft_pin_ttl_ms is None
+    assert config.group_blocks is False
+    assert config.stats_interval is None
+
+
 # The connector itself, the registry preset that selects it, and the startup
 # gates on parallelism and index-V caching land with the KV cache manager V2
 # support they depend on.
@@ -491,6 +958,12 @@ def test_plan_slot_geometry(page_bytes, batch, budget, expected_slots):
 def test_plan_slot_geometry_rejects_degenerate_inputs(bad):
     with pytest.raises(ValueError):
         plan_slot_geometry(*bad)
+
+
+def test_plan_slot_geometry_needs_the_configured_budget():
+    """The budget is `staging_buffer_bytes` or a load thread's share, never a default."""
+    with pytest.raises(TypeError):
+        plan_slot_geometry(1024, 8)
 
 
 def test_staging_pool_registers_its_whole_buffer_once():
