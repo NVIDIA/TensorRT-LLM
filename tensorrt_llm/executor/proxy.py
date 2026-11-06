@@ -114,13 +114,20 @@ def _create_request_sender(
         on_failure: Optional[weakref.WeakMethod] = None,
         *,
         stop_workers_on_failure: bool = True) -> _RequestSender:
-    """Create the command owner; the environment selects burst coalescing only."""
-    return _RequestSender(request_queue,
-                          error_queue,
-                          batching=os.getenv("TRTLLM_PROXY_BATCH_REQUESTS",
-                                             "0") == "1",
-                          on_failure=on_failure,
-                          stop_workers_on_failure=stop_workers_on_failure)
+    """Create the command owner; the environment selects burst coalescing only.
+
+    Unbatched callers write directly while the owner is idle. ZMQ debug mode
+    requires one writing thread, so it keeps every write on the owner.
+    """
+    batching = os.getenv("TRTLLM_PROXY_BATCH_REQUESTS", "0") == "1"
+    return _RequestSender(
+        request_queue,
+        error_queue,
+        batching=batching,
+        on_failure=on_failure,
+        stop_workers_on_failure=stop_workers_on_failure,
+        direct_send=not batching
+        and not getattr(request_queue, "_zmq_debug_enabled", False))
 
 
 class GenerationExecutorProxy(GenerationExecutor):

@@ -264,10 +264,12 @@ not freed until the run ends, so set it identically in every run you compare.
 With `TRTLLM_PROXY_BATCH_REQUESTS=1`, the executor proxy pickles each request on
 the submitting thread and a background thread sends each burst to the rank-0
 worker as one message, so the worker receives and authenticates one message per
-burst instead of one per request. The sender thread must take the GIL first, so
-while the submitting thread keeps running Python, as a busy `trtllm-serve` event
-loop does, a lone request can wait up to the interpreter's switch interval (5 ms
-by default) before it is sent.
+burst instead of one per request. The sender thread must take the GIL first.
+While the submitting thread keeps running Python and briefly releasing the GIL,
+as a busy `trtllm-serve` event loop does, the sender thread may not run until
+that thread goes idle, so queued requests can wait and admission can fill. By
+default, the submitting thread writes each request itself when the socket is
+idle and writable.
 
 #### Benchmarking with LoRA Adapters in PyTorch workflow
 
