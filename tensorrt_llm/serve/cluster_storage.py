@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import abc
 import asyncio
 import importlib.metadata as importlib_metadata
@@ -19,7 +21,8 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.serve.record_signing import sign_record, signature_matches
+from tensorrt_llm.serve.record_signing import (RECORD_SIGNATURE_FIELD,
+                                               sign_record, signature_matches)
 
 
 def is_loopback_host(host: Optional[str]) -> bool:
@@ -527,36 +530,54 @@ class HttpClusterStorageClient(ClusterStorage):
             "Unwatch functionality not implemented for HTTP client")
 
 
+def _ignore_record(key: object, reason: str) -> None:
+    """Warn, once per record and reason, that a record is skipped."""
+    message = f"Ignoring cluster record {key!r}: {reason}"
+    logger.warning_once(message, key=message)
+
+
+def _decode_key(raw_key: bytes) -> Optional[str]:
+    """The key of a stored record, or None if it is not valid UTF-8."""
+    try:
+        return raw_key.decode("utf-8")
+    except UnicodeDecodeError:
+        _ignore_record(raw_key, "its key is not valid UTF-8")
+        return None
+
+
 class Etcd3WatchEventQueue(WatchEventQueue):
 
     def __init__(self,
                  key_prefix: str,
-                 cancel_event: Callable[[], None] = None,
-                 verify: Optional[Callable[[str, str], Optional[str]]] = None):
+                 decode_record: Callable[[str, bytes], Optional[str]],
+                 cancel_event: Optional[Callable[[], None]] = None) -> None:
         self.key_prefix = key_prefix
         self.events = asyncio.Queue()
         self._cancel_event = cancel_event
-        self._verify = verify
+        self._decode_record = decode_record
 
-    def cancel_event(self):
+    def cancel_event(self) -> None:
         if self._cancel_event:
             self._cancel_event()
 
-    def set_cancel_event(self, cancel_event: Callable[[], None]):
+    def set_cancel_event(self, cancel_event: Callable[[], None]) -> None:
         self._cancel_event = cancel_event
 
     def __del__(self):
         self.cancel_event()
 
-    def add_events_from_resp(self, watch_resp):
+    def add_events_from_resp(self, watch_resp) -> None:
+        """Queue the events of a watch response, skipping records that are not valid."""
         try:
             for event in watch_resp.events:
                 # Event type is not in public interface of etcd3
                 event_type = WatchEventType.SET if "Put" in event.__class__.__name__ else WatchEventType.DELETE
-                key = event.key.decode("utf-8")
-                value = event.value.decode("utf-8")
-                if self._verify is not None and event_type == WatchEventType.SET:
-                    value = self._verify(key, value)
+                key = _decode_key(event.key)
+                if key is None:
+                    continue
+                value = ""
+                if event_type == WatchEventType.SET:
+                    value = self._decode_record(key, event.value)
                     if value is None:
                         continue
                 self.events.put_nowait(
@@ -724,34 +745,50 @@ class Etcd3ClusterStorage(ClusterStorage):
         if client is not None:
             client.close()
 
-    def _sign(self, key: str, value: str) -> str:
+    def _encode_record(self, key: str, value: str) -> str:
         """The record to store: with record_auth_key, the value and its signature as JSON."""
         if self._record_auth_key is None:
             return value
         return json.dumps({
             "value":
             value,
-            "signature":
+            RECORD_SIGNATURE_FIELD:
             sign_record(self._record_auth_key, key, value)
         })
 
-    def _verify(self, key: str, stored: Optional[str]) -> Optional[str]:
-        """The value of a stored record, or None if it has no valid signature."""
-        if self._record_auth_key is None or stored is None:
+    def _decode_record(self, key: str, stored: bytes) -> Optional[str]:
+        """The value of the record stored under ``key``, or None if it is not a valid record."""
+        try:
+            stored = stored.decode("utf-8")
+        except UnicodeDecodeError:
+            return _ignore_record(key, "its value is not valid UTF-8")
+        if self._record_auth_key is None:
             return stored
         try:
             record = json.loads(stored)
         except (ValueError, RecursionError):
             record = None
-        if (not isinstance(record, dict)
-                or not isinstance(record.get("value"), str)
-                or not signature_matches(self._record_auth_key,
-                                         key, record["value"],
-                                         record.get("signature"))):
-            logger.warning(
-                f"Ignoring cluster record {key} without a valid signature")
-            return None
+        if not isinstance(record, dict) or not isinstance(
+                record.get("value"), str):
+            return _ignore_record(
+                key, "it is not a signed record; check that every server and "
+                "worker of the cluster sets record_auth_key")
+        if not signature_matches(self._record_auth_key, key, record["value"],
+                                 record.get(RECORD_SIGNATURE_FIELD)):
+            return _ignore_record(
+                key, "its signature does not match; check that every server "
+                "and worker of the cluster uses the same record_auth_key")
         return record["value"]
+
+    def _read_prefix(self, key_prefix: str) -> Dict[str, str]:
+        """The valid records under ``key_prefix``."""
+        records = {}
+        for stored, metadata in self.client.get_prefix(key_prefix):
+            key = _decode_key(metadata.key)
+            value = None if key is None else self._decode_record(key, stored)
+            if value is not None:
+                records[key] = value
+        return records
 
     async def start(self):
         # nothing to do
@@ -768,7 +805,7 @@ class Etcd3ClusterStorage(ClusterStorage):
                   overwrite_if_exists: bool = False,
                   ttl: int = -1) -> bool:
         lease = self._get_lease(key, ttl)
-        value = self._sign(key, value)
+        value = self._encode_record(key, value)
         if not overwrite_if_exists:
             return self.client.put_if_not_exists(key, value, lease=lease)
         else:
@@ -778,7 +815,7 @@ class Etcd3ClusterStorage(ClusterStorage):
     @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
         data, meta = self.client.get(key)
-        return self._verify(key, data.decode('utf-8')) if data else None
+        return self._decode_record(key, data) if data else None
 
     @handle_etcd_error(return_on_error=False)
     async def delete(self, key: str) -> bool:
@@ -799,20 +836,15 @@ class Etcd3ClusterStorage(ClusterStorage):
     async def get_prefix(self,
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
-        records = {}
-        for v, metadata in self.client.get_prefix(key_prefix):
-            key = metadata.key.decode("utf-8")
-            value = self._verify(key, v.decode("utf-8"))
-            if value is not None:
-                records[key] = "" if keys_only else value
-        return records
+        records = self._read_prefix(key_prefix)
+        return {key: "" for key in records} if keys_only else records
 
     @handle_etcd_error(return_on_error=None)
     async def watch(self, key_prefix: str) -> WatchEventQueue:
         if key_prefix in self._watch_handles:
             return self._watch_handles[key_prefix]
-        watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix,
-                                            verify=self._verify)
+        watch_handle = Etcd3WatchEventQueue(key_prefix,
+                                            decode_record=self._decode_record)
         client = self.client
         watch_id = client.add_watch_prefix_callback(
             key_prefix, watch_handle.add_events_from_resp)

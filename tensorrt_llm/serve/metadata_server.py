@@ -7,10 +7,10 @@ from typing import Any, Optional
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.cluster_storage import etcd3
-from tensorrt_llm.serve.record_signing import sign_record, signature_matches
+from tensorrt_llm.serve.record_signing import (RECORD_SIGNATURE_FIELD,
+                                               sign_record, signature_matches)
 
 METADATA_KEY_PREFIX = "trtllm/"
-RECORD_SIGNATURE_FIELD = "signature"
 
 
 class RemoteDictionary(ABC):
@@ -74,6 +74,11 @@ class EtcdDictionary(RemoteDictionary):
         return list(unique_keys)
 
 
+def _strip_signature(record: dict) -> dict:
+    """A copy of ``record`` without its signature field."""
+    return {k: v for k, v in record.items() if k != RECORD_SIGNATURE_FIELD}
+
+
 class JsonDictionary:
     """JSON view of a RemoteDictionary.
 
@@ -97,21 +102,18 @@ class JsonDictionary:
         except (ValueError, RecursionError):
             if self._record_auth_key is None:
                 raise
-            logger.warning(f"Ignoring unreadable metadata record {key}")
+            logger.warning(f"Ignoring unreadable metadata record {key!r}")
             return None
         if self._record_auth_key is None:
             return value
         if not isinstance(value, dict):
-            logger.warning(f"Ignoring unsigned metadata record {key}")
+            logger.warning(f"Ignoring unsigned metadata record {key!r}")
             return None
-        unsigned = {
-            k: v
-            for k, v in value.items() if k != RECORD_SIGNATURE_FIELD
-        }
+        unsigned = _strip_signature(value)
         if not signature_matches(self._record_auth_key, key, unsigned,
                                  value.get(RECORD_SIGNATURE_FIELD)):
             logger.warning(
-                f"Ignoring metadata record {key} with an invalid signature")
+                f"Ignoring metadata record {key!r} with an invalid signature")
             return None
         return unsigned
 
@@ -119,10 +121,7 @@ class JsonDictionary:
         if self._record_auth_key is not None:
             if not isinstance(value, dict):
                 raise ValueError("Signed metadata records must be dicts")
-            value = {
-                k: v
-                for k, v in value.items() if k != RECORD_SIGNATURE_FIELD
-            }
+            value = _strip_signature(value)
             value[RECORD_SIGNATURE_FIELD] = sign_record(self._record_auth_key,
                                                         key, value)
         self._dict.put(key, json.dumps(value))
