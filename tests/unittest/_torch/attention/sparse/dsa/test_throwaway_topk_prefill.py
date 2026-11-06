@@ -14,13 +14,19 @@
 # limitations under the License.
 """Correctness tests for the fused throwaway Top-K used by the DSA prefill indexer.
 
-GPU tests compare ``ThrowawayPrefillTopK.run_chunk`` with a PyTorch reference. Exact Top-K
-implementations may pick different indices among tied scores, so a selection is valid when it
-has the right size, lies inside the causal window, has no duplicates and every selected score
-is at least the k-th largest reference score. The dispatch tests run on CPU with a fake runner.
+GPU tests compare ``ThrowawayPrefillTopK.run_chunk`` with a PyTorch reference for token-scaled
+FP8 and packed MXFP4 inputs. Exact Top-K implementations may pick different indices among tied
+scores, so a selection is valid when it has the right size, lies inside the causal window, has no
+duplicates and every selected score is at least the k-th largest reference score (scores are
+rounded to the logits storage dtype first). The dispatch tests run on CPU with a fake runner.
+
+``THROWAWAY_TOPK_TEST_LARGE=1`` adds the 64K/128K-key shapes, which need minutes of JIT time.
 """
 
+import os
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 import torch
@@ -36,30 +42,44 @@ from tensorrt_llm._torch.attention.backends.sparse.dsa.throwaway_topk import (
 from tensorrt_llm._utils import get_sm_version
 
 HEAD_DIM = 128
-REF_ROW_BLOCK = 64
+# Score tensor budget (elements) of one reference block: rows_per_block * heads * keys.
+REF_BLOCK_ELEMS = 1 << 27
+MAX_REF_ROWS = 256
 # Relative slack on the k-th largest score: ~1 ulp of the logits storage dtype.
 SCORE_SLACK = {torch.float32: 1e-3, torch.bfloat16: 8e-3, torch.float16: 2e-3}
+# E2M1 code 0b0010 is +1.0; two of them per byte.
+FP4_ONE_BYTE = 0x22
+UE8M0_ONE = 127
+LARGE = os.environ.get("THROWAWAY_TOPK_TEST_LARGE", "0") == "1"
 
 skip_not_sm100 = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason=f"throwaway Top-K supports SM 100/103 only, got SM {get_sm_version()}",
 )
 
-# (num_heads, top_k, compress_ratio) pairs with a kernel policy
+# name: (num_heads, top_k, compress_ratio) pairs that have a kernel policy
 CONFIGS = {
     "ds_v32": (64, 2048, 1),
     "glm_5_3": (32, 2048, 1),
     "dsv4_flash": (64, 512, 4),
+    "dsv4_pro": (64, 1024, 4),
 }
+FP8_DISTRIBUTIONS = ["all_equal", "all_zero", "few_high", "monotonic", "heavy_tail"]
+FP4_DISTRIBUTIONS = ["all_equal", "heavy_tail"]
 
 _RUNNERS = {}
 
 
 def _runner(
-    config, max_context_length, max_chunk=None, monkeypatch=None, logits_dtype=torch.float32
+    config,
+    max_context_length,
+    max_chunk=None,
+    monkeypatch=None,
+    logits_dtype=torch.float32,
+    qkv="fp8",
 ):
     """Runners JIT-compile on first use, so reuse them across tests."""
-    key = (config, max_context_length, max_chunk, logits_dtype)
+    key = (config, max_context_length, max_chunk, logits_dtype, qkv)
     if key not in _RUNNERS:
         heads, top_k, ratio = CONFIGS[config]
         if max_chunk is not None:
@@ -71,185 +91,444 @@ def _runner(
             max_context_length=max_context_length,
             device=torch.device("cuda"),
             logits_dtype=logits_dtype,
+            qkv_dtype=qkv,
         )
     return _RUNNERS[key]
 
 
-def _make_inputs(config, num_q, kv_prefix, seed):
+@dataclass
+class Inputs:
+    q: torch.Tensor
+    k: torch.Tensor
+    k_scale: torch.Tensor
+    weights: torch.Tensor
+    q_scale: Optional[torch.Tensor]
+    qkv: str
+
+    def reference_operands(self, rows):
+        """Dequantized (q rows, all keys, per-key scale or None) in FP32."""
+        if self.qkv == "fp8":
+            return self.q[rows].float(), self.k.float(), self.k_scale
+        if not hasattr(self, "_k_decoded"):
+            self._k_decoded = Indexer._decode_mxfp4(self.k, self.k_scale)
+        return Indexer._decode_mxfp4(self.q[rows], self.q_scale[rows]), self._k_decoded, None
+
+
+def _fp8(x):
+    return x.to(torch.float8_e4m3fn)
+
+
+def _make_inputs(config, num_q, kv_prefix, seed, qkv="fp8", dist="random"):
     heads, _, ratio = CONFIGS[config]
     num_k = (kv_prefix + num_q) // ratio
     gen = torch.Generator(device="cuda").manual_seed(seed)
-    q = torch.randn(num_q, heads, HEAD_DIM, device="cuda", generator=gen).to(torch.float8_e4m3fn)
-    k = torch.randn(num_k, HEAD_DIM, device="cuda", generator=gen).to(torch.float8_e4m3fn)
-    k_scale = (torch.rand(num_k, device="cuda", generator=gen) * 0.5 + 0.5).float()
-    weights = torch.rand(num_q, heads, device="cuda", generator=gen).float()
-    return q, k, k_scale, weights
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", generator=gen)
+
+    def rand(*shape):
+        return torch.rand(*shape, device="cuda", generator=gen)
+
+    weights = rand(num_q, heads)
+    if qkv == "mxfp4":
+        half = HEAD_DIM // 2
+
+        def packed(*shape):
+            return torch.randint(0, 256, shape, dtype=torch.uint8, device="cuda", generator=gen)
+
+        q = packed(num_q, heads, half)
+        k = packed(num_k, half)
+        # UE8M0 exponent bytes near 127 keep the dot products well inside FP32 range.
+        q_scale_bytes = torch.randint(
+            125, 130, (num_q, heads, 4), dtype=torch.uint8, device="cuda", generator=gen
+        )
+        k_scale = torch.randint(
+            125, 130, (num_k, 4), dtype=torch.uint8, device="cuda", generator=gen
+        )
+        if dist == "all_equal":
+            q.fill_(FP4_ONE_BYTE)
+            k.fill_(FP4_ONE_BYTE)
+            q_scale_bytes.fill_(UE8M0_ONE)
+            k_scale.fill_(UE8M0_ONE)
+            weights.fill_(1.0)
+        elif dist == "heavy_tail":
+            q_scale_bytes = torch.randint(
+                110, 141, (num_q, heads, 4), dtype=torch.uint8, device="cuda", generator=gen
+            )
+            k_scale = torch.randint(
+                110, 141, (num_k, 4), dtype=torch.uint8, device="cuda", generator=gen
+            )
+        elif dist != "random":
+            raise ValueError(f"unsupported MXFP4 distribution {dist}")
+        q_scale = q_scale_bytes.view(torch.int32).reshape(num_q, heads)
+        return Inputs(q, k, k_scale, weights, q_scale, qkv)
+
+    k_scale = rand(num_k) * 0.5 + 0.5
+    if dist == "random":
+        q, k = _fp8(randn(num_q, heads, HEAD_DIM)), _fp8(randn(num_k, HEAD_DIM))
+    elif dist == "all_equal":  # every valid key has the same score
+        q = _fp8(torch.ones(num_q, heads, HEAD_DIM, device="cuda"))
+        k = _fp8(torch.ones(num_k, HEAD_DIM, device="cuda"))
+        k_scale.fill_(1.0)
+        weights.fill_(1.0)
+    elif dist == "all_zero":  # negative dot products: ReLU zeroes every score
+        q = _fp8(torch.ones(num_q, heads, HEAD_DIM, device="cuda"))
+        k = _fp8(-torch.ones(num_k, HEAD_DIM, device="cuda"))
+        k_scale.fill_(1.0)
+    else:  # positive dot products with a controlled per-key magnitude
+        q = _fp8(randn(num_q, heads, HEAD_DIM).abs())
+        k = _fp8(randn(num_k, HEAD_DIM).abs())
+        if dist == "few_high":  # a handful of keys far above everything else
+            k_scale = torch.full((num_k,), 1e-3, device="cuda")
+            high = torch.randperm(num_k, device="cuda", generator=gen)[:16]
+            k_scale[high] = 1.0
+        elif dist == "monotonic":  # scores grow with the key position
+            k_scale = torch.linspace(0.1, 1.0, num_k, device="cuda")
+        elif dist == "heavy_tail":  # log-normal key magnitudes
+            k_scale = torch.exp((randn(num_k) * 2).clamp(-8, 8))
+        else:
+            raise ValueError(f"unknown distribution {dist}")
+    return Inputs(q, k, k_scale, weights, None, qkv)
 
 
 def _causal_ends(num_q, kv_prefix, ratio):
     return (kv_prefix + torch.arange(1, num_q + 1, device="cuda")) // ratio
 
 
-def _reference_logits_block(q, k, k_scale, weights, ends, rows):
-    """logits[i, j] = sum_h w[i, h] * relu(q[i, h] . k[j] * k_scale[j]); -inf outside [0, end)."""
-    dots = torch.einsum("qhd,kd->qhk", q[rows].float(), k.float()) * k_scale[None, None, :]
-    logits = (dots.relu() * weights[rows][:, :, None]).sum(1)
+def _reference_logits(inputs, ends, rows):
+    """logits[i, j] = sum_h w[i, h] * relu(q[i, h] . k[j] * scale[j]); -inf outside [0, end)."""
+    q, k, scale = inputs.reference_operands(rows)
+    dots = torch.einsum("qhd,kd->qhk", q, k)
+    if scale is not None:
+        dots = dots * scale[None, None, :]
+    logits = (dots.relu() * inputs.weights[rows][:, :, None]).sum(1)
     cols = torch.arange(k.shape[0], device=k.device)[None, :]
     return logits.masked_fill(cols >= ends[rows][:, None], float("-inf"))
 
 
-def _assert_valid_topk(
-    out, q, k, k_scale, weights, ends, top_k, context, logits_dtype=torch.float32
-):
-    """Tie-aware check; scores are rounded to ``logits_dtype`` like the kernel stores them.
+def _sample_rows(ends, top_k):
+    """Rows checked against the reference: all if few, else an even spread plus the rows around
+    the top_k boundary (where the valid-key count crosses top_k)."""
+    num_q = ends.shape[0]
+    if num_q <= MAX_REF_ROWS:
+        return torch.arange(num_q, device="cuda")
+    spread = torch.linspace(0, num_q - 1, MAX_REF_ROWS - 16, device="cuda").long()
+    near = (ends - top_k).abs() <= 2
+    boundary = near.nonzero().flatten()[:16]
+    return torch.unique(torch.cat((spread, boundary)))
 
-    A score computed with a different FP32 summation order can round to the neighbouring
-    representable value, so the k-th-largest comparison allows one unit in the last place.
-    """
-    num_q = out.shape[0]
-    for begin in range(0, num_q, REF_ROW_BLOCK):
-        rows = slice(begin, min(begin + REF_ROW_BLOCK, num_q))
-        ref = _reference_logits_block(q, k, k_scale, weights, ends, rows)
+
+def _assert_valid_topk(out, inputs, ends, top_k, context, logits_dtype=torch.float32):
+    """Counts, window, padding and duplicates on every row; the score check on sampled rows."""
+    sel = out.long()
+    valid = sel >= 0
+    expected = ends.clamp(max=top_k)
+    assert torch.equal(valid.sum(1), expected), (
+        f"{context}: selected counts {valid.sum(1).tolist()[:8]} != {expected.tolist()[:8]}"
+    )
+    assert bool(((sel == -1) | valid).all()), f"{context}: padding is not -1"
+    assert bool(((sel < ends[:, None]) | ~valid).all()), f"{context}: index outside the window"
+    ordered = sel.masked_fill(~valid, -1).sort(dim=1).values
+    assert not bool(((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()), (
+        f"{context}: duplicate indices"
+    )
+
+    rows_all = _sample_rows(ends, top_k)
+    num_keys = inputs.k.shape[0]
+    heads = inputs.weights.shape[1]
+    block = max(1, min(64, REF_BLOCK_ELEMS // (heads * num_keys)))
+    for begin in range(0, rows_all.numel(), block):
+        rows = rows_all[begin : begin + block]
+        long_rows = ends[rows] > top_k
+        if not bool(long_rows.any()):
+            continue  # all valid keys are selected; the checks above already prove it
+        ref = _reference_logits(inputs, ends, rows)
         if logits_dtype != torch.float32:
             ref = ref.to(logits_dtype).float()
-        sel = out[rows].long()
-        valid = sel >= 0
-        row_ends = ends[rows]
-        expected = row_ends.clamp(max=top_k)
-        assert torch.equal(valid.sum(1), expected), (
-            f"{context}: selected counts {valid.sum(1).tolist()[:8]} != {expected.tolist()[:8]}"
+        kth = ref.topk(top_k, dim=1).values[:, -1]
+        picked = ref.gather(1, sel[rows].clamp(min=0))
+        slack = SCORE_SLACK[logits_dtype] * kth.abs().clamp(min=1.0)
+        bad = valid[rows] & long_rows[:, None] & (picked < (kth - slack)[:, None])
+        assert not bool(bad.any()), (
+            f"{context}: selected a score below the k-th largest (rows {rows[:4].tolist()})"
         )
-        # Padding must be exactly -1 (not stale buffer contents).
-        assert bool(((sel == -1) | valid).all()), f"{context}: padding is not -1"
-        assert bool(((sel < row_ends[:, None]) | ~valid).all()), (
-            f"{context}: index outside the causal window"
-        )
-        ordered = sel.masked_fill(~valid, -1).sort(dim=1).values
-        assert not bool(((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()), (
-            f"{context}: duplicate indices"
-        )
-        long_rows = row_ends > top_k
-        if bool(long_rows.any()):
-            kth = ref.topk(top_k, dim=1).values[:, -1]
-            picked = ref.gather(1, sel.clamp(min=0))
-            slack = SCORE_SLACK[logits_dtype] * kth.abs().clamp(min=1.0)
-            bad = valid & long_rows[:, None] & (picked < (kth - slack)[:, None])
-            assert not bool(bad.any()), f"{context}: selected a score below the k-th largest"
 
 
-def _run(runner, q, weights, k, k_scale, kv_prefix, top_k, plan_cache=None):
-    out = torch.full((q.shape[0], top_k), -2, dtype=torch.int32, device="cuda")
+def _run(runner, inputs, kv_prefix, top_k, plan_cache=None):
+    out = torch.full((inputs.q.shape[0], top_k), -2, dtype=torch.int32, device="cuda")
     runner.run_chunk(
-        q,
-        weights,
-        k,
-        k_scale,
+        inputs.q,
+        inputs.weights,
+        inputs.k,
+        inputs.k_scale,
         out,
         kv_prefix_len=kv_prefix,
         plan_cache={} if plan_cache is None else plan_cache,
+        q_scale=inputs.q_scale,
     )
     return out
 
 
+def _check(
+    config,
+    num_q,
+    kv_prefix,
+    *,
+    seed=0,
+    qkv="fp8",
+    dist="random",
+    logits_dtype=torch.float32,
+    max_context_length=16384,
+    runner=None,
+    plan_cache=None,
+):
+    _, top_k, ratio = CONFIGS[config]
+    runner = runner or _runner(config, max_context_length, logits_dtype=logits_dtype, qkv=qkv)
+    inputs = _make_inputs(config, num_q, kv_prefix, seed, qkv, dist)
+    out = _run(runner, inputs, kv_prefix, top_k, plan_cache)
+    ends = _causal_ends(num_q, kv_prefix, ratio)
+    context = f"{config} {qkv} {dist} q={num_q} prefix={kv_prefix} {logits_dtype}"
+    _assert_valid_topk(out, inputs, ends, top_k, context, logits_dtype)
+
+
+def _boundary_cases(config):
+    """(num_q, prefix) whose rows' valid-key counts sit around top_k, incl. unaligned prefixes."""
+    _, top_k, ratio = CONFIGS[config]
+    base = top_k * ratio
+    cases = [(8, base - 4 + shift) for shift in range(ratio if ratio > 1 else 1)]
+    cases += [(3, base - 1), (3, base - 2), (6, base + ratio - 3)]
+    return cases
+
+
+# ---------------------------------------------------------------------------------------------
+# GPU: negative controls -- the checker above must reject wrong selections
+# ---------------------------------------------------------------------------------------------
+
+
+def _reference_selection(inputs, ends, top_k):
+    """An exact selection computed with torch.topk, -1 padded."""
+    num_q = inputs.q.shape[0]
+    out = torch.full((num_q, top_k), -1, dtype=torch.int32, device="cuda")
+    for begin in range(0, num_q, 16):
+        rows = torch.arange(begin, min(begin + 16, num_q), device="cuda")
+        ref = _reference_logits(inputs, ends, rows)
+        indices = ref.topk(top_k, dim=1).indices
+        keep = ref.gather(1, indices) > float("-inf")
+        out[rows] = torch.where(keep, indices, torch.full_like(indices, -1)).int()
+    return out
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+@pytest.mark.parametrize(
+    "corruption", ["worst_key", "duplicate", "outside_window", "short_count", "stale_padding"]
+)
+def test_checker_rejects_corrupted_selection(qkv, corruption):
+    num_q, kv_prefix, top_k = 64, 4096, 2048
+    inputs = _make_inputs("ds_v32", num_q, kv_prefix, seed=21, qkv=qkv)
+    ends = _causal_ends(num_q, kv_prefix, 1)
+    out = _reference_selection(inputs, ends, top_k)
+    _assert_valid_topk(out, inputs, ends, top_k, "control")  # the untouched selection passes
+    row = 5
+    if corruption == "worst_key":
+        ref = _reference_logits(inputs, ends, torch.tensor([row], device="cuda"))[0]
+        worst = ref.masked_fill(ref == float("-inf"), float("inf")).argmin()
+        assert not bool((out[row] == worst).any())
+        out[row, 0] = worst
+    elif corruption == "duplicate":
+        out[row, 1] = out[row, 0]
+    elif corruption == "outside_window":
+        out[row, 0] = int(ends[row])
+    elif corruption == "short_count":
+        out[row, 0] = -1
+    else:
+        out[row, 0] = -2
+    with pytest.raises(AssertionError):
+        _assert_valid_topk(out, inputs, ends, top_k, corruption)
+
+
+# ---------------------------------------------------------------------------------------------
+# GPU: reference comparison
+# ---------------------------------------------------------------------------------------------
+
+SMALL_SHAPES = [
+    (128, 0),  # first chunk: fewer valid keys than top_k for every row
+    (64, 1024),  # still fewer valid keys than top_k
+    (256, 4096),  # crosses top_k inside the chunk
+    (300, 5000),  # sizes that are not tile multiples
+    (512, 8192),
+    (1024, 7168),
+    (2048, 6144),
+]
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("num_q,kv_prefix", SMALL_SHAPES)
+def test_matches_reference_ds_v32(qkv, num_q, kv_prefix):
+    _check("ds_v32", num_q, kv_prefix, qkv=qkv, seed=1)
+
+
 @skip_not_sm100
 @pytest.mark.parametrize(
-    "num_q,kv_prefix",
+    "config,qkv",
     [
-        (128, 0),  # first chunk: fewer valid keys than top_k for every row
-        (64, 1024),  # still fewer valid keys than top_k
-        (256, 4096),  # crosses top_k inside the chunk
-        (300, 5000),  # sizes that are not tile multiples
-        (512, 8192),
+        ("glm_5_3", "fp8"),
+        ("glm_5_3", "mxfp4"),
+        ("dsv4_flash", "fp8"),
+        ("dsv4_flash", "mxfp4"),
+        ("dsv4_pro", "mxfp4"),
     ],
 )
-def test_run_chunk_matches_reference_ds_v32(num_q, kv_prefix):
-    runner = _runner("ds_v32", 16384)
-    q, k, k_scale, weights = _make_inputs("ds_v32", num_q, kv_prefix, seed=1)
-    out = _run(runner, q, weights, k, k_scale, kv_prefix, 2048)
-    ends = _causal_ends(num_q, kv_prefix, 1)
-    _assert_valid_topk(out, q, k, k_scale, weights, ends, 2048, f"q={num_q} prefix={kv_prefix}")
+@pytest.mark.parametrize("num_q,kv_prefix", [(256, 4096), (1024, 4096)])
+def test_matches_reference_other_configs(config, qkv, num_q, kv_prefix):
+    _check(config, num_q, kv_prefix, qkv=qkv, seed=2)
 
 
 @skip_not_sm100
-@pytest.mark.parametrize(
-    "config,num_q,kv_prefix", [("glm_5_3", 256, 3840), ("dsv4_flash", 256, 4096)]
-)
-def test_run_chunk_matches_reference_other_configs(config, num_q, kv_prefix):
-    heads, top_k, ratio = CONFIGS[config]
-    runner = _runner(config, 16384)
-    q, k, k_scale, weights = _make_inputs(config, num_q, kv_prefix, seed=2)
-    out = _run(runner, q, weights, k, k_scale, kv_prefix, top_k)
-    ends = _causal_ends(num_q, kv_prefix, ratio)
-    _assert_valid_topk(out, q, k, k_scale, weights, ends, top_k, f"{config} prefix={kv_prefix}")
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("config", ["ds_v32", "glm_5_3", "dsv4_flash", "dsv4_pro"])
+def test_top_k_boundary(config, qkv):
+    """Valid-key counts equal to, just below and just above top_k, with unaligned prefixes."""
+    for num_q, prefix in _boundary_cases(config):
+        _check(config, num_q, prefix, qkv=qkv, seed=3, max_context_length=32768)
 
 
 @skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+@pytest.mark.parametrize("num_q,kv_prefix", [(1, 0), (1, 5000), (3, 100), (7, 9000)])
+def test_tiny_query_counts(qkv, num_q, kv_prefix):
+    _check("ds_v32", num_q, kv_prefix, qkv=qkv, seed=4)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
 @pytest.mark.parametrize("logits_dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("config,num_q,kv_prefix", [("ds_v32", 256, 4096), ("glm_5_3", 192, 5000)])
-def test_run_chunk_matches_reference_low_precision_logits(logits_dtype, config, num_q, kv_prefix):
+@pytest.mark.parametrize("config", ["ds_v32", "glm_5_3"])
+def test_low_precision_logits(config, logits_dtype, qkv):
     """Selecting over BF16 / FP16 stored scores must still be an exact top-k of those scores."""
-    _, top_k, ratio = CONFIGS[config]
-    runner = _runner(config, 16384, logits_dtype=logits_dtype)
+    runner = _runner(config, 16384, logits_dtype=logits_dtype, qkv=qkv)
     assert runner.logits_dtype == logits_dtype
-    q, k, k_scale, weights = _make_inputs(config, num_q, kv_prefix, seed=5)
-    out = _run(runner, q, weights, k, k_scale, kv_prefix, top_k)
-    ends = _causal_ends(num_q, kv_prefix, ratio)
-    _assert_valid_topk(
-        out, q, k, k_scale, weights, ends, top_k, f"{config} {logits_dtype}", logits_dtype
-    )
+    _check(config, 256, 4096, qkv=qkv, seed=5, logits_dtype=logits_dtype, runner=runner)
 
 
 @skip_not_sm100
-def test_query_tiling_matches_reference(monkeypatch):
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_bf16_weights_are_accepted(qkv):
+    runner = _runner("ds_v32", 16384, qkv=qkv)
+    num_q, kv_prefix = 128, 2048
+    inputs = _make_inputs("ds_v32", num_q, kv_prefix, 7, qkv)
+    inputs.weights = inputs.weights.bfloat16()
+    out = _run(runner, inputs, kv_prefix, 2048)
+    inputs.weights = inputs.weights.float()
+    _assert_valid_topk(out, inputs, _causal_ends(num_q, kv_prefix, 1), 2048, f"bf16 weights {qkv}")
+
+
+# ---------------------------------------------------------------------------------------------
+# GPU: score distributions that stress the selection paths
+# ---------------------------------------------------------------------------------------------
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dist", FP8_DISTRIBUTIONS)
+@pytest.mark.parametrize("config,num_q,kv_prefix", [("ds_v32", 256, 12288), ("glm_5_3", 128, 6000)])
+def test_distributions_fp8(config, dist, num_q, kv_prefix):
+    _check(config, num_q, kv_prefix, qkv="fp8", dist=dist, seed=8)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("dist", FP4_DISTRIBUTIONS)
+@pytest.mark.parametrize(
+    "config,num_q,kv_prefix", [("ds_v32", 256, 12288), ("dsv4_flash", 256, 8192)]
+)
+def test_distributions_mxfp4(config, dist, num_q, kv_prefix):
+    _check(config, num_q, kv_prefix, qkv="mxfp4", dist=dist, seed=9)
+
+
+# ---------------------------------------------------------------------------------------------
+# GPU: tiling, plan reuse and chunk interleaving
+# ---------------------------------------------------------------------------------------------
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_query_tiling_matches_reference(monkeypatch, qkv):
     """A chunk larger than max_chunk_size is processed in tiles with shifted K prefixes."""
-    runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch)
-    num_q, kv_prefix = 700, 3000
-    q, k, k_scale, weights = _make_inputs("ds_v32", num_q, kv_prefix, seed=3)
-    out = _run(runner, q, weights, k, k_scale, kv_prefix, 2048)
-    ends = _causal_ends(num_q, kv_prefix, 1)
-    _assert_valid_topk(out, q, k, k_scale, weights, ends, 2048, "tiled chunk")
+    runner = _runner("ds_v32", 16384, max_chunk=256, monkeypatch=monkeypatch, qkv=qkv)
+    _check("ds_v32", 700, 3000, qkv=qkv, seed=3, runner=runner)
 
 
 @skip_not_sm100
-def test_layers_reuse_plan_cache_with_different_keys():
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_layers_reuse_plan_cache_with_different_keys(qkv):
     """Every layer of a step reuses the chunk's plan but brings different K / Q / weights."""
-    runner = _runner("ds_v32", 16384)
-    num_q, kv_prefix = 256, 4096
     plan_cache = {}
-    ends = _causal_ends(num_q, kv_prefix, 1)
     for layer in range(4):
-        q, k, k_scale, weights = _make_inputs("ds_v32", num_q, kv_prefix, seed=10 + layer)
-        out = _run(runner, q, weights, k, k_scale, kv_prefix, 2048, plan_cache)
-        _assert_valid_topk(out, q, k, k_scale, weights, ends, 2048, f"layer {layer}")
+        _check("ds_v32", 256, 4096, qkv=qkv, seed=10 + layer, plan_cache=plan_cache)
 
 
 @skip_not_sm100
-def test_interleaved_chunks_across_layers():
+@pytest.mark.parametrize("qkv", ["fp8", "mxfp4"])
+def test_interleaved_chunks_across_layers(qkv):
     """The engine runs layer-outer / chunk-inner, so chunks with different plans alternate."""
-    runner = _runner("ds_v32", 16384)
     chunks = [(256, 4096), (192, 6000), (320, 0)]
     caches = [{} for _ in chunks]
     for layer in range(3):
         for index, (num_q, kv_prefix) in enumerate(chunks):
-            q, k, k_scale, weights = _make_inputs(
-                "ds_v32", num_q, kv_prefix, seed=100 + 10 * layer + index
-            )
-            out = _run(runner, q, weights, k, k_scale, kv_prefix, 2048, caches[index])
-            ends = _causal_ends(num_q, kv_prefix, 1)
-            _assert_valid_topk(
-                out, q, k, k_scale, weights, ends, 2048, f"layer {layer} chunk {index}"
+            _check(
+                "ds_v32",
+                num_q,
+                kv_prefix,
+                qkv=qkv,
+                seed=100 + 10 * layer + index,
+                plan_cache=caches[index],
             )
 
 
 @skip_not_sm100
-def test_bf16_weights_are_accepted():
-    runner = _runner("ds_v32", 16384)
-    num_q, kv_prefix = 128, 2048
-    q, k, k_scale, weights = _make_inputs("ds_v32", num_q, kv_prefix, seed=7)
-    weights_bf16 = weights.bfloat16()
-    out = _run(runner, q, weights_bf16, k, k_scale, kv_prefix, 2048)
-    ends = _causal_ends(num_q, kv_prefix, 1)
-    _assert_valid_topk(out, q, k, k_scale, weights_bf16.float(), ends, 2048, "bf16 weights")
+def test_mxfp4_key_storage_is_padded_to_256_rows():
+    runner = ThrowawayPrefillTopK(
+        n_heads=64,
+        index_topk=2048,
+        compress_ratio=1,
+        max_context_length=10000,
+        device=torch.device("cuda"),
+        qkv_dtype="mxfp4",
+    )
+    assert runner.num_keys == 10240 and runner.num_keys % 256 == 0
+    assert runner.can_run(10000) and not runner.can_run(10241)
+    _check("ds_v32", 256, 8700, qkv="mxfp4", seed=11, runner=runner)
+
+
+# ---------------------------------------------------------------------------------------------
+# GPU: Q = 4096 / 8192 with large K (reference rows are sampled)
+# ---------------------------------------------------------------------------------------------
+
+LARGE_SHAPES = [(4096, 4096), (8192, 0), (4096, 28672)]
+if LARGE:
+    LARGE_SHAPES += [(8192, 57344), (8192, 122880)]
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("num_q,kv_prefix", LARGE_SHAPES)
+@pytest.mark.parametrize(
+    "config,qkv", [("ds_v32", "fp8"), ("glm_5_3", "fp8"), ("dsv4_flash", "mxfp4")]
+)
+def test_large_shapes(config, qkv, num_q, kv_prefix):
+    _check(config, num_q, kv_prefix, qkv=qkv, seed=12, max_context_length=131072)
+
+
+@skip_not_sm100
+@pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
+def test_large_shape_logits_dtypes(logits_dtype):
+    _check(
+        "ds_v32",
+        8192,
+        24576,
+        seed=13,
+        logits_dtype=logits_dtype,
+        max_context_length=131072,
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -265,8 +544,8 @@ class _FakeRunner:
     def can_run(self, num_k_rows):
         return self._can_run
 
-    def run_chunk(self, q, weights, k, k_scale, out, *, kv_prefix_len, plan_cache):
-        self.calls.append((q, weights, k, k_scale, out, kv_prefix_len, plan_cache))
+    def run_chunk(self, q, weights, k, k_scale, out, *, kv_prefix_len, plan_cache, q_scale=None):
+        self.calls.append((q, weights, k, k_scale, out, kv_prefix_len, plan_cache, q_scale))
 
 
 def _fake_indexer(runner, enabled=True, failed=False):
@@ -291,14 +570,14 @@ def _chunk(kv_prefix_len, token_start=3):
     )
 
 
-def _call(indexer, chunk, q_begin=0, q_end=10):
+def _call(indexer, chunk, q_begin=0, q_end=10, q_scale=None):
     q = torch.arange(32 * 4 * 2, dtype=torch.float32).reshape(32, 4, 2)
     weights = torch.arange(32 * 4, dtype=torch.float32).reshape(32, 4)
     k = torch.zeros(20, 2)
     k_scale = torch.ones(20)
     out = torch.zeros(32, 8, dtype=torch.int32)
     handled = Indexer._run_throwaway_chunk(
-        indexer, None, chunk, q, weights, k, k_scale, q_begin, q_end, out
+        indexer, None, chunk, q, weights, k, k_scale, q_begin, q_end, out, q_scale=q_scale
     )
     return handled, q, weights, out
 
@@ -331,10 +610,21 @@ def test_dispatch_slices_rows_and_shifts_prefix():
     handled, q, weights, out = _call(_fake_indexer(runner), chunk, q_begin=2, q_end=7)
     assert handled is True
     assert len(runner.calls) == 1
-    q_arg, w_arg, _, _, out_arg, prefix, plan_cache = runner.calls[0]
+    q_arg, w_arg, _, _, out_arg, prefix, plan_cache, q_scale_arg = runner.calls[0]
     # chunk rows start at token_start=3, local rows [2, 7) -> global rows [5, 10)
     assert torch.equal(q_arg, q[5:10])
     assert torch.equal(w_arg, weights[5:10])
     assert out_arg.data_ptr() == out[5:10].data_ptr()
     assert prefix == 100 + 2
     assert plan_cache is chunk.throwaway_plans
+    assert q_scale_arg is None
+
+
+def test_dispatch_slices_fp4_query_scales_with_the_rows():
+    runner = _FakeRunner()
+    q_scale = torch.arange(32 * 4, dtype=torch.int32).reshape(32, 4)
+    handled, *_ = _call(
+        _fake_indexer(runner), _chunk(kv_prefix_len=0, token_start=3), 2, 7, q_scale=q_scale
+    )
+    assert handled is True
+    assert torch.equal(runner.calls[0][7], q_scale[5:10])
