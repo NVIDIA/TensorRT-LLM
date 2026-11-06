@@ -786,6 +786,24 @@ unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latenc
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_sample_glue.py
 unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/comm/test_modeling_v2_intra_node_reduce_op_matrix.py
 
+# Qwen3.8-Flash-Next-NVFP4, modeling_v2 qwen4_exp target (sm_103 only): every accuracy test of
+# the target, the CI ones included, and those that run only here (tp1 without speculation,
+# tp1's breakable prefill graph against eager, mmmu at tep4).
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_gsm8k
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_gsm8k_and_long_context
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp1_gsm8k_mmmu_and_video
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp7_long_context_passkey
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_breakable_prefill_matches_eager
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_disaggregated_mtp2 TIMEOUT (90)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tp4_nvfp4_kv_breakable] TIMEOUT (60)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[dep4_fp8_kv] TIMEOUT (60)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_fp8_kv_flashinfer_ring] TIMEOUT (60)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_quantized_kv[tep4_nvfp4_kv_no_reuse] TIMEOUT (60)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_mmmu TIMEOUT (90)
+accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_disaggregated_dep2 TIMEOUT (90)
+
 # Dense FP4 MLA accuracy (SM107 only)
 accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_mla
 accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nvfp4_kv_cache_nixl
