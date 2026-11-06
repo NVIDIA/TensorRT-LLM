@@ -1214,6 +1214,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
          "This is a parameter used by chat template in tokenizer config of the "
          "model."),
     )
+    continue_final_message: bool = Field(
+        default=False,
+        description=(
+            "If true, the chat is rendered so that the model continues the "
+            "final message, without closing it or starting a new turn. Passed "
+            "to the chat template through `chat_template_kwargs`, where it "
+            "takes precedence over the same key. Cannot be combined with "
+            "`add_generation_prompt`."),
+    )
     add_special_tokens: bool = Field(
         default=False,
         description=(
@@ -1396,6 +1405,27 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 raise ValueError(
                     "When using `tool_choice`, `tools` must be set.")
         return data
+
+    @model_validator(mode="after")
+    def check_continue_final_message(self):
+        """Forward continue_final_message; reject it with a generation prompt.
+
+        The flag reaches the chat template through ``chat_template_kwargs``,
+        which a caller may also set directly. Either way it cannot be combined
+        with ``add_generation_prompt``: a renderer that does not read the flag
+        would silently start a new assistant turn instead.
+        """
+        if "continue_final_message" in self.model_fields_set:
+            self.chat_template_kwargs = {
+                **(self.chat_template_kwargs or {}),
+                "continue_final_message":
+                self.continue_final_message,
+            }
+        if ((self.chat_template_kwargs or {}).get("continue_final_message")
+                and self.add_generation_prompt):
+            raise ValueError("Cannot set both add_generation_prompt and "
+                             "continue_final_message to True.")
+        return self
 
     @model_validator(mode="before")
     @classmethod
