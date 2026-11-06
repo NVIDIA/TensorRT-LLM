@@ -475,10 +475,17 @@ def nvfp4_fc1_row_alignment_rejection(
 
     ``W4A16_NVFP4`` is answered too: its weights go through the same CUTLASS
     NVFP4 loader, and the op then splits the dequantized buffer the same way.
+
+    ``NVFP4_PLUS`` needs 256 rows: with one scale per 32 values, the FC2 input
+    (``intermediate_size_per_partition`` wide) has whole 4-column scale tiles
+    only when that width is a multiple of 128.
     """
     from tensorrt_llm._torch.utils import is_gated_activation
 
-    if p.identity_quant not in ("nvfp4", "w4a16_nvfp4") or p.intermediate_size is None:
+    if (
+        p.identity_quant not in ("nvfp4", "nvfp4_plus", "w4a16_nvfp4")
+        or p.intermediate_size is None
+    ):
         return None
     # Non-gated FC1 is one block with no gate/up split, so the rows the loader
     # adds stay a zero tail that the kernel never reads as an operand.
@@ -488,13 +495,14 @@ def nvfp4_fc1_row_alignment_rejection(
     if p.intermediate_size % tp_size != 0:
         # Uneven shards are a different concern; do not answer for them.
         return None
+    row_alignment = 256 if p.identity_quant == "nvfp4_plus" else 128
     fc1_rows_full = p.intermediate_size * 2
     fc1_rows = fc1_rows_full // tp_size
-    if fc1_rows % 128 == 0:
+    if fc1_rows % row_alignment == 0:
         return None
-    if fc1_rows_full % 128 == 0:
+    if fc1_rows_full % row_alignment == 0:
         hint = (
-            f"moe_tp_size must divide {fc1_rows_full // 128}; raise "
+            f"moe_tp_size must divide {fc1_rows_full // row_alignment}; raise "
             f"moe_expert_parallel_size to shrink moe_tp_size, which "
             f"non-ULYSSES CP multiplies by cp_size"
         )
@@ -503,7 +511,7 @@ def nvfp4_fc1_row_alignment_rejection(
     return MoEEligibility.no(
         MoERejectReason.SHAPE_UNALIGNED,
         f"{p.quant} MoE requires gated FC1 rows "
-        f"(2 * intermediate_size_per_partition) to be a multiple of 128, but "
+        f"(2 * intermediate_size_per_partition) to be a multiple of {row_alignment}, but "
         f"moe_tp_size={tp_size} gives {fc1_rows}. {hint}.",
     )
 
@@ -695,6 +703,21 @@ class MoECommPlan:
 
 
 @dataclass(frozen=True)
+class PreroutedRouting:
+    """Routing a caller computed for one ``run_moe`` of an impl that declares
+    ``supports_prerouted_routing``: the routing tables of the kernels' tile
+    (flat int32, layout of ``trtllm_gen.decode_front.prerouted_table_views``),
+    the [tile, config] tactic they are built for, and the [num_tokens, top_k]
+    expert ids (int32) and BF16 weights. The impl runs that tactic and skips
+    its routing kernel."""
+
+    tables: torch.Tensor
+    tactic: List[int]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+
+
+@dataclass(frozen=True)
 class MoEReplicaPlan:
     """Per-forward physical replica layout produced by the EPLB layer.
 
@@ -737,6 +760,19 @@ class MoEReplicaPlan:
 
 
 @dataclass(frozen=True)
+class MoESortTables:
+    """This rank's ``moe_sort`` outputs, produced by the routing kernel itself.
+
+    ``outputs`` are the six tensors ``torch.ops.trtllm.moe_sort`` returns, in
+    its order, for the routed expert ids, the rank's expert range and
+    ``tile_size``.
+    """
+
+    tile_size: int
+    outputs: Tuple[torch.Tensor, ...]
+
+
+@dataclass(frozen=True)
 class MoERunContext:
     """Everything ``run_moe`` needs that the CALLER genuinely produces.
 
@@ -766,8 +802,14 @@ class MoERunContext:
     all_rank_num_tokens: Optional[List[int]] = None
     # produced by the comm strategy, one object per forward
     comm_plan: Optional[MoECommPlan] = None
+    # produced by a decode front end that routed the tokens itself; single
+    # chunk, no communication (see PreroutedRouting)
+    prerouted: Optional[PreroutedRouting] = None
     # produced by per-layer dynamic EPLB; None for standard EPLB and OFF.
     replica_plan: Optional[MoEReplicaPlan] = None
+    # produced by routing when the impl's ``try_route_with_sort`` routed this
+    # forward: the ``moe_sort`` tables of ``token_selected_experts``.
+    sort_tables: Optional[MoESortTables] = None
 
 
 def require_comm_plan(impl: object, ctx: MoERunContext) -> MoECommPlan:

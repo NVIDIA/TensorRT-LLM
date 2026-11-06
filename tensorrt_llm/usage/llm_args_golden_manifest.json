@@ -182,7 +182,7 @@
         "native",
         "rank_striped_read_ahead"
       ],
-      "capture_policy": "literal",
+      "capture_policy": "enum[CheckpointIOPolicy]",
       "kind": "categorical",
       "path": "checkpoint_io_policy"
     },
@@ -296,9 +296,38 @@
       "path": "dwdp_config.contention_opt"
     },
     {
+      "allowed_values": [
+        "per_slice",
+        "batched",
+        "gather"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.copy_mode"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "dwdp_config.dwdp_size"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_dense"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "dwdp_config.enable_experts"
+    },
+    {
+      "allowed_values": [
+        "register",
+        "tma"
+      ],
+      "capture_policy": "literal|none",
+      "kind": "categorical",
+      "path": "dwdp_config.gather_kernel"
     },
     {
       "capture_policy": "int",
@@ -1033,6 +1062,11 @@
       "path": "mm_encoder_only"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "mnnvl_allreduce_fp8_payload"
+    },
+    {
       "allowed_values": [
         "off",
         "auto",
@@ -1148,6 +1182,11 @@
       "capture_policy": "float|none",
       "kind": "value",
       "path": "multimodal_config.video_pruning_rate"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "multimodal_config.vision_gpu_normalize"
     },
     {
       "allowed_values": [
@@ -1377,6 +1416,11 @@
       "path": "reorder_policy_config.policy_name"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "replicate_embedding"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "request_stats_max_iterations"
@@ -1412,6 +1456,20 @@
       "path": "scheduler_config.context_chunking_policy"
     },
     {
+      "allowed_values": [
+        "fcfs",
+        "shortest_uncached_first"
+      ],
+      "capture_policy": "enum[ContextSchedulingPolicy]",
+      "kind": "categorical",
+      "path": "scheduler_config.context_scheduling_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_starvation_iterations"
+    },
+    {
       "capture_policy": "int",
       "kind": "value",
       "path": "scheduler_config.dynamic_batch_config.dynamic_batch_moving_average_window"
@@ -1444,6 +1502,16 @@
       "capture_policy": "enum[WaitingQueuePolicy]",
       "kind": "categorical",
       "path": "scheduler_config.waiting_queue_policy"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_frontend_affinity_port_stride"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "serve_graceful_shutdown_timeout_s"
     },
     {
       "capture_policy": "bool",
@@ -1742,6 +1810,11 @@
       "path": "speculative_config.block_size"
     },
     {
+      "capture_policy": "float",
+      "kind": "value",
+      "path": "speculative_config.confidence_min_predicted_gain"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.context_recompute_tail"
@@ -1766,6 +1839,24 @@
       "path": "speculative_config.decoding_type"
     },
     {
+      "allowed_values": [
+        "auto",
+        "mxfp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.draft_lm_head_dtype"
+    },
+    {
+      "allowed_values": [
+        "auto",
+        "nvfp4"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.draft_moe_dtype"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.dynamic_tree_max_topK"
@@ -1783,6 +1874,16 @@
       "capture_policy": "literal",
       "kind": "categorical",
       "path": "speculative_config.eagle3_model_arch"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_confidence_scheduling"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.enable_fused_confidence_scheduler"
     },
     {
       "capture_policy": "bool",

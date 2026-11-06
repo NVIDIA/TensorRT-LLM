@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -9,25 +8,28 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor.encoder_executor import EncoderExecutor
 from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
 
-def test_encoder_executor_warms_up_through_model_engine() -> None:
-    model_engine = Mock()
+def test_create_rejects_more_than_one_rank() -> None:
+    with pytest.raises(ValueError, match="single GPU"):
+        EncoderExecutor.create(
+            Mock(),
+            model_path="model",
+            checkpoint_loader=Mock(),
+            mapping=Mapping(world_size=2, tp_size=2),
+            dist=Mock(),
+        )
 
-    executor = EncoderExecutor(model_engine, SimpleNamespace())
 
-    assert executor.model_engine is model_engine
-    model_engine.warmup.assert_called_once_with()
-
-
-def test_batch_forward_hands_the_packed_batch_to_the_engine() -> None:
+def test_batch_forward_hands_the_packed_batch_to_the_runner() -> None:
     expected = {"logits": torch.tensor([1.0, 2.0])}
-    model_engine = Mock()
-    model_engine.forward.return_value = expected
+    runner = Mock()
+    runner.forward_packed.return_value = expected
     executor = object.__new__(EncoderExecutor)
-    executor.model_engine = model_engine
+    executor._runner = runner
     inputs = {
         "input_ids": torch.tensor([11, 12, 21, 22, 23]),
         "seq_lens": torch.tensor([2, 3]),
@@ -44,7 +46,7 @@ def test_batch_forward_hands_the_packed_batch_to_the_engine() -> None:
         "multi_item_part_lens",
         "token_type_ids",
     }
-    model_engine.forward.assert_called_once_with(
+    runner.forward_packed.assert_called_once_with(
         PackedInputs(
             input_ids=[11, 12, 21, 22, 23],
             sequence_lengths=[2, 3],

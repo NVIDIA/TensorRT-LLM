@@ -191,7 +191,8 @@ def _register_fake():
           buffer_flags,
           rmsnorm_fusion,
           scale=None,
-          fusion_op: int = 0):
+          fusion_op: int = 0,
+          fp8_payload: bool = False):
         from tensorrt_llm.functional import AllReduceFusionOp
         op = AllReduceFusionOp(fusion_op)
         if op == AllReduceFusionOp.NONE and rmsnorm_fusion:
@@ -283,10 +284,13 @@ def _register_fake():
     @torch.library.register_fake("trtllm::attn_res_add_rmsnorm_persistent_fwd")
     def _(layer_residual: torch.Tensor,
           layer_residual_add: Optional[torch.Tensor],
-          block_residual: torch.Tensor, res_weight: torch.Tensor,
-          rms_weight: torch.Tensor, output_rms_weight: torch.Tensor,
+          block_residual: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          output_rms_weight: torch.Tensor,
           rms_eps: float,
-          output_rms_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+          output_rms_eps: float,
+          sm_reserve: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
         # Returns (updated_layer_residual, output), both [T, B, H]. The eager
         # implementation returns layer_residual itself as the first result when
         # layer_residual_add is None; that conditional aliasing cannot be
@@ -446,7 +450,13 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::dwdp_fabric_gather")
-    def _(dst_ptrs, src_ptrs, lines, row_starts, blocks_per_row, threads):
+    def _(dst_ptrs,
+          src_ptrs,
+          lines,
+          row_starts,
+          blocks_per_row,
+          threads,
+          use_tma=False):
         # Copies through raw device pointers; no return value.
         pass
 
@@ -1190,6 +1200,29 @@ def _register_fake():
     ) -> None:
         pass
 
+    @torch.library.register_fake("trtllm::gdn_verify")
+    def _(
+        qkv: torch.Tensor,
+        z: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        norm_weight: torch.Tensor,
+        fp8_scale: Optional[torch.Tensor],
+        norm_eps: float,
+        ssm_states: torch.Tensor,
+        state_indices: torch.Tensor,
+        old_u: torch.Tensor,
+        old_k: torch.Tensor,
+        old_g: torch.Tensor,
+        cache_buf_idx: torch.Tensor,
+        prev_num_accepted_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        dtype = torch.float8_e4m3fn if fp8_scale is not None else qkv.dtype
+        return qkv.new_empty((qkv.shape[0], z.shape[1] * z.shape[2]),
+                             dtype=dtype)
+
     @torch.library.register_fake("trtllm::causal_conv1d_update")
     def _(
         x: torch.Tensor,
@@ -1695,6 +1728,19 @@ def _register_fake():
         return b_q_weight.new_empty(
             (size_k // tile_size, size_n * tile_size // pack_factor),
             dtype=b_q_weight.dtype)
+
+    @torch.library.register_fake("trtllm::reorder_helix_mla_kv")
+    def _(gathered: torch.Tensor, cu_global: torch.Tensor,
+          global_offsets: torch.Tensor, cu_local: torch.Tensor,
+          local_offsets: torch.Tensor, rank_offsets: torch.Tensor,
+          tokens_per_block: int, lora_size: int,
+          rope_size: int) -> List[torch.Tensor]:
+        # One output row per gathered row: the compressed KV and k_pe parts.
+        num_tokens = gathered.shape[0]
+        return [
+            gathered.new_empty((num_tokens, lora_size)),
+            gathered.new_empty((num_tokens, rope_size)),
+        ]
 
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(

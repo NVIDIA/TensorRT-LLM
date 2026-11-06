@@ -53,6 +53,7 @@ server_configs:
       mamba_ssm_cache_dtype: float16
       mamba_ssm_stochastic_rounding: true
       mamba_ssm_philox_rounds: 5
+      host_cache_size: 0
     moe_config:
       backend: 'TRTLLM'
       max_num_tokens: 16384

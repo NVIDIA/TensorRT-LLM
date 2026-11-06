@@ -76,6 +76,10 @@ scheduler_config:
 
 ### Selecting the KV Cache Manager
 
+```{warning}
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+```
+
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
 selects between them and defaults to `true`, which selects the V2 manager. Set it
 to `false` to select the V1 C++ manager for models that support it. Set it to
@@ -143,17 +147,17 @@ kv_cache_config:
 
 The first part of the dtype names the history storage (NVFP4 values with one
 FP8 scale per 16 elements); the second part is the dtype attention computes
-in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+in and the first/last tokens are stored in. Like `dtype: fp8`, it overrides the
 checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
-select the unquantized model dtype. Retention follows the
-cache page granularity, and at least one of `mixed_precision_first_n` and
+select the unquantized model dtype. The first/last tokens are kept in
+whole cache pages, and at least one of `mixed_precision_first_n` and
 `mixed_precision_last_n` must be positive.
 
-Each mixed-precision layer owns two pools: its original pool holds the NVFP4
-history, and a second layer group, appended after the model's own layer
-groups, holds the retained tokens. When `pool_ratio` is set it must therefore
-carry one more entry than the model has layer groups, with the retained-token
-group last; leave it unset to size all groups automatically. Sliding-window
+Each mixed-precision layer keeps two pools: the mixed-precision low pool holds
+the NVFP4 history and the mixed-precision high pool holds the first/last tokens.
+The mixed-precision high pools form one extra layer group after the model's own,
+so a `pool_ratio` must carry one more entry than the model has layer groups, with
+the mixed-precision high group last; leave it unset to size all groups automatically. Sliding-window
 layers and layers whose KV is shared with another layer stay native.
 
 Before a mixed-precision layer runs, the attention metadata gathers the two
@@ -167,9 +171,18 @@ forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
-The prototype requires the TRTLLM or FlashInfer attention backend with
-`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
-beam search, sparse attention, cold-page compression or context parallelism.
+The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
+FlashInfer attention backend. It supports the standard V2 manager (dense
+models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA
+backends (DSA, DeepSeek-V4), and the speculative decoding modes below. Beam
+search, cold-page compression, KV connectors and context parallelism are not
+supported.
+
+| Speculative decoding | Status | KV cache of the drafter layers |
+|---|---|---|
+| MTP (one-model) | Supported | Mixed-precision high and low pools, like the model's own layers |
+| EAGLE3 (one-model) and other drafters with their own architecture | Supported | Plain cache: the mixed-precision high dtype on dense backends, NVFP4 (the mixed-precision low dtype) on DSA and DeepSeek-V4 |
+| Dynamic-tree drafting | Not supported | Rejected at startup |
 
 ### SWA Endpoint Retention
 
@@ -323,6 +336,13 @@ prompt = TextPrompt(
 
 V2 derives `mm_keys` directly from the cached token sequence. Each entry identifies a continuous multimodal segment within that block: `hash` is the item's digest, optional `uuid` is the externally supplied identity, and `start_offset` is the segment's first token offset within the item. An item spanning multiple blocks retains the same digest and UUID with increasing offsets. Text may separate segments of the same item. Items are processed in prompt order; one item cannot resume after another item has started. The item digest is distinct from `block_hash`, which also depends on the preceding token sequence. Clients that require the externally supplied identity must read `uuid`; truncating or otherwise deriving an identity from `hash` does not recover the UUID.
 
+For multimodal blocks, the optional `BlockStored.trtllm_image_routing` extension
+provides the routing format version and token-ID offset. The extension can accompany
+video and audio keys as well as image keys; the OpenEngine capability flag advertises
+only the currently validated image-routing support. See the
+[OpenEngine image routing contract](source:tensorrt_llm/grpc/openengine/README.md#image-routing-metadata)
+for capability requirements and consumer handling.
+
 
 ### Enable Offloading to Host Memory
 
@@ -400,14 +420,16 @@ Events are buffered per rank, gathered onto rank 0 under attention data parallel
 exposed through `LLM.get_kv_cache_events()` / `LLM.get_kv_cache_events_async()`, or over the
 `/kv_cache_events` endpoint of `trtllm-serve`.
 
+Reset does not flush buffered events; they are published at a subsequent iteration boundary.
+
 #### Streaming path (prototype)
 
 Configured with ```kv_cache_config.kv_events_config```. Streaming is intended to reduce event
 publishing overhead under attention data parallelism: each emitting rank publishes its own
 events over a ZeroMQ `PUB` socket, removing the rank-0 gather and the consumer pull through the
-LLM API. Each emitting rank still drains its local native event source, converts the events to
-wire structs and enqueues one batch at the iteration boundary. A background thread performs
-msgpack encoding and socket I/O.
+LLM API. Each emitting rank drains its local native event source, converts the events to wire
+structs and attempts to enqueue a batch at iteration boundaries and when a prefix-cache reset
+completes. A background thread performs msgpack encoding and socket I/O.
 
 ```python
 from tensorrt_llm.llmapi import KvCacheConfig, KVEventsConfig
@@ -426,10 +448,22 @@ kv_cache_config = KvCacheConfig(
 no events while streaming is enabled. Draft models and KV-cache-size estimation do not publish
 events. Use buffered mode for cache-tier, priority, and other lifecycle updates.
 
+A successful prefix-cache reset emits ordered `AllBlocksCleared` after preceding stored or
+removed events. A populated reset also emits `BlockRemoved` for previously published resident
+blocks before `AllBlocksCleared`; consumers should accept both even though the reset marker
+already invalidates the whole index. Each rank attempts to enqueue its reset events without
+waiting for another inference iteration, including while inference is idle or paused, and
+without a cross-rank event gather. Publishing happens asynchronously. A successfully
+published marker is retained in bounded replay history and does not change the engine
+lifetime ID.
+Orderly engine shutdown also clears the reuse tree and queues a final `AllBlocksCleared`
+before publisher teardown.
+The best-effort delivery guarantees below apply to reset and shutdown events too.
+
 Streaming exposes only the full-block residency information external routers need, using the
-attention lifecycle with the largest window. Conversion to `BlockStored`/`BlockRemoved` is
-centralized at the once-per-iteration publisher boundary, keeping internal lifecycle details
-contained and avoiding Python callbacks from native cache operations.
+attention lifecycle with the largest window. Conversion to `BlockStored`, `BlockRemoved`, and
+`AllBlocksCleared` is centralized at iteration and reset publication boundaries, keeping
+internal lifecycle details contained and avoiding Python callbacks from native cache operations.
 
 **Multimodal payloads.** `token_ids` can contain integers and hexadecimal digest strings;
 integer-only consumers are incompatible. Each `mm_keys[i]` describes the multimodal segments
@@ -454,18 +488,23 @@ have no port, each rank appends a `_dp<rank>` suffix instead.
 
 **Wire format.** Each batch is sent as three ZeroMQ frames: the subscription ```topic```,
 an 8-byte big-endian sequence number, and a msgpack payload
-`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key —
-`BlockStored` or `BlockRemoved` — carrying int64 block hashes derived from the V2 radix block
-keys. This is the format documented for custom router backends; it differs from vLLM's
-positional-array encoding of the individual events, though the batch envelope is positional in
-both.
+`[timestamp, [events], data_parallel_rank]`. Each event is a map tagged with a `type` key:
+`BlockStored`, `BlockRemoved`, or `AllBlocksCleared`. Stored and removed events carry int64
+block hashes derived from the V2 radix block keys. `AllBlocksCleared` has no additional
+fields. This is the format documented for custom router backends; it differs from vLLM's
+positional-array encoding of the individual events, though the batch envelope is positional
+in both.
 
 **Delivery guarantees.** Delivery is best effort, and batch loss is observable. Every accepted
 batch reserves a sequence number up front, so a batch dropped by a full publisher queue
 (```max_queue_size```) or by a failed send leaves a hole in the sequence. Subscribers must
 treat any gap as lost KV-cache state and resynchronize rather than assuming continuity. A
 producer-side safety-cap drop is reported in the producer's logs and counters but does not
-create a sequence gap.
+create a sequence gap. If the last batch is dropped while the engine remains idle, a
+subscriber cannot detect its sequence gap until a later batch arrives. The
+[Dynamo TensorRT-LLM sidecar](https://github.com/ai-dynamo/dynamo/blob/e5a2ef3fcc2cc6e12a9185e39c98141a983eaeab/lib/llm/src/kv_router/publisher/zmq_listener.rs#L183-L208)
+currently logs source sequence gaps without automatically resynchronizing, so a lost reset
+marker can leave its routing index stale even after later events arrive.
 
 **Replay.** If ```replay_endpoint``` is set, the publisher also binds a `ROUTER` socket. A
 subscriber sends an empty delimiter frame plus an 8-byte big-endian start sequence, and

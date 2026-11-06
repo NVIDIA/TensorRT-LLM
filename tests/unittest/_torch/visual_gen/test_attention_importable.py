@@ -58,7 +58,7 @@ def test_import_order_is_free(first, second):
         f"import {MODULES} as m, {ATTENTION} as a; "
         "assert m.Attention is a.Attention and m.QKVMode is a.QKVMode"
     )
-    subprocess.run([sys.executable, "-c", code], check=True)
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=120)
 
 
 def test_modules_reexport_is_canonical():
