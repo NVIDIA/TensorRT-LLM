@@ -16,6 +16,7 @@
 import array
 import os
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -42,8 +43,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _update_kv_cache_draft_token_location,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata, DFlashWorker
 from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
@@ -53,6 +56,7 @@ from tensorrt_llm.bindings.internal.batch_manager import CacheType, LinearCacheT
 from tensorrt_llm.conversation_params import ConversationParams
 from tensorrt_llm.llmapi.llm_args import (
     BlockReuseConfig,
+    CapacitySchedulerPolicy,
     DecodingBaseConfig,
     DFlashDecodingConfig,
     DraftTargetDecodingConfig,
@@ -3207,6 +3211,119 @@ def test_generation_dummy_uses_available_capacity(draft_len: int) -> None:
         assert not manager.kv_cache_map
     finally:
         manager.shutdown()
+
+
+@pytest.mark.parametrize("path", ["plain", "transactional", "empty_batch"])
+def test_adp_dummy_holds_paired_draft_kv(path: str) -> None:
+    """An idle attention-DP rank's dummy needs a cache in both paired pools.
+
+    Under joint KV cache reuse the scheduler admits a generation request in
+    the target and the draft pool together, so a dummy holding only a target
+    cache is never scheduled and the fleet cannot run a forward. Each padding
+    path must allocate the dummy in both pools, and a vetoed iteration must
+    release both so the singleton dummy ID can be allocated again.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.cuda.init()
+    spec = DFlashDecodingConfig(max_draft_len=3, speculative_model="draft")
+    with ExitStack() as cleanup:
+        managers = {}
+        for resource_type, is_draft in (
+            (ResourceManagerType.KV_CACHE_MANAGER, False),
+            (ResourceManagerType.DRAFT_KV_CACHE_MANAGER, True),
+        ):
+            manager = KVCacheManagerV2(
+                KvCacheConfig(enable_block_reuse=True, max_gpu_total_bytes=4 << 20),
+                CacheType.SELF,
+                num_layers=1,
+                num_kv_heads=2,
+                head_dim=64,
+                tokens_per_block=4,
+                max_seq_len=128,
+                max_batch_size=4,
+                max_num_tokens=128,
+                mapping=Mapping(),
+                spec_config=spec,
+                is_draft=is_draft,
+                joint_kv_cache_reuse=True,
+            )
+            cleanup.callback(manager.shutdown)
+            managers[resource_type] = manager
+
+        executor = object.__new__(PyExecutor)
+        executor.resource_manager = ResourceManager(managers)
+        executor.kv_cache_manager = managers[ResourceManagerType.KV_CACHE_MANAGER]
+        executor.draft_kv_cache_manager = managers[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
+        executor.scheduler = KVCacheV2Scheduler(
+            max_batch_size=4,
+            max_num_tokens=128,
+            kv_cache_manager=executor.kv_cache_manager,
+            draft_kv_cache_manager=executor.draft_kv_cache_manager,
+            scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
+        )
+        executor.enable_attention_dp = True
+        # Two attention-DP ranks: a single-rank group skips dummy padding.
+        executor.dist = SimpleNamespace(tp_size=2)
+        executor.kv_cache_transceiver = object() if path == "transactional" else None
+        executor.adp_router = SimpleNamespace(exclude_retiring_requests=False)
+        executor.active_requests = []
+        executor.expected_num_active_requests = 1
+        executor.max_num_active_requests = 4
+        executor.max_total_draft_tokens = spec.max_draft_len
+        executor._adp_dummy_is_gen = True
+        executor._pending_adp_dummy_request = None
+        executor._enable_adp_dummy_fixes = True
+        executor._enable_scheduler_aware_adp_dummy = False
+        executor._enable_non_overlap_adp_forward_intent = False
+        executor._benchmark_fill_phase_active = False
+        executor._is_kv_manager_v2 = True
+        executor.enable_joint_kv_cache_reuse = True
+
+        def assert_dummy_in_both_pools(dummy: LlmRequest) -> None:
+            for manager in managers.values():
+                assert manager.kv_cache_map[dummy.py_request_id].is_active
+
+        def assert_dummy_released(dummy: LlmRequest) -> None:
+            assert executor.active_requests == []
+            for manager in managers.values():
+                assert dummy.py_request_id not in manager.kv_cache_map
+
+        if path == "empty_batch":
+            # The dummy joins the already scheduled batch directly; a vetoed
+            # iteration rolls it back, and the next one pads again.
+            for can_queue in (False, True):
+                scheduled = ScheduledRequests()
+                executor._pad_empty_attention_dp_batch(scheduled)
+                (dummy,) = scheduled.generation_requests
+                assert executor.active_requests == [dummy]
+                assert_dummy_in_both_pools(dummy)
+                executor._finalize_adp_dummy_allocation(can_queue)
+                if not can_queue:
+                    assert_dummy_released(dummy)
+            executor.resource_manager.free_resources(dummy)
+            for manager in managers.values():
+                assert dummy.py_request_id not in manager.kv_cache_map
+            return
+
+        # A rejected fleet vote must release both pools and permit the same
+        # singleton dummy ID to be allocated and admitted on the next pass.
+        for attempt in range(2 if path == "transactional" else 1):
+            executor._pad_attention_dp_dummy_request()
+            (dummy,) = executor.active_requests
+            scheduled = executor.scheduler.schedule_request(executor.active_requests, set())
+            assert scheduled.generation_requests == [dummy]
+            assert scheduled.paused_requests == []
+            assert_dummy_in_both_pools(dummy)
+            if path == "transactional" and attempt == 0:
+                executor._revert_gen_alloc(scheduled)
+                executor._finalize_adp_dummy_allocation(False)
+                assert_dummy_released(dummy)
+            else:
+                executor._finalize_adp_dummy_allocation(True)
+                executor.resource_manager.free_resources(dummy)
+                for manager in managers.values():
+                    assert dummy.py_request_id not in manager.kv_cache_map
 
 
 def test_generation_dummy_does_not_reuse_real_request_prefix() -> None:

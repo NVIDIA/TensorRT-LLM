@@ -5167,14 +5167,17 @@ class PyExecutor:
             self.active_requests.remove(dummy_request)
             return
 
-        # Before prepare_resources(), only the KV and speculative managers have
-        # allocated anything for the dummy. Do not run the full teardown path:
-        # other resource managers may require a prior prepare call.
+        # Before prepare_resources(), only the KV (target and paired draft)
+        # and speculative managers have allocated anything for the dummy. Do
+        # not run the full teardown path: other resource managers may require
+        # a prior prepare call.
         spec_resource_manager = self.resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER)
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
         self.kv_cache_manager.free_resources(dummy_request)
+        if self.enable_joint_kv_cache_reuse:
+            self.draft_kv_cache_manager.free_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -9395,6 +9398,11 @@ class PyExecutor:
                 key="attention_dp_dummy_insufficient_kv_capacity")
             return
 
+        # A paired draft pool admits every scheduled request together with the
+        # target pool, so the dummy needs a cache in both.
+        draft_kv_cache_manager = (self.draft_kv_cache_manager
+                                  if self.enable_joint_kv_cache_reuse else None)
+
         if (not self._enable_adp_dummy_fixes
                 or self.kv_cache_transceiver is None):
             try:
@@ -9403,6 +9411,7 @@ class PyExecutor:
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    draft_kv_cache_manager=draft_kv_cache_manager,
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -9421,7 +9430,13 @@ class PyExecutor:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
-                spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                try:
+                    spec_resource_manager.add_dummy_requests(dummy_request_ids)
+                except NoFreeSlotsError:
+                    self.kv_cache_manager.free_resources(llm_request)
+                    if draft_kv_cache_manager is not None:
+                        draft_kv_cache_manager.free_resources(llm_request)
+                    return
             self.active_requests.append(llm_request)
             return
 
@@ -9438,6 +9453,7 @@ class PyExecutor:
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -9454,6 +9470,8 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
                 self.kv_cache_manager.free_resources(dummy_request)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(dummy_request)
                 return
 
         assert dummy_request is not None
@@ -9529,6 +9547,11 @@ class PyExecutor:
             return
 
         dummy_request_ids = [ATTENTION_DP_DUMMY_REQUEST_ID]
+        # Allocate the paired draft cache with the dummy, where a shortage
+        # degrades to an empty batch, rather than leaving it to the draft
+        # manager's prepare_resources mirror, which raises on one.
+        draft_kv_cache_manager = (self.draft_kv_cache_manager
+                                  if self.enable_joint_kv_cache_reuse else None)
         try:
             # Degrade to an empty batch rather than propagate: the ranks have
             # yet to agree on can_queue, so a rank-local raise would strand the
@@ -9539,6 +9562,7 @@ class PyExecutor:
                 is_gen=not context_dummy,
                 max_num_draft_tokens=(0 if context_dummy else
                                       self.max_total_draft_tokens),
+                draft_kv_cache_manager=draft_kv_cache_manager,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
@@ -9557,6 +9581,8 @@ class PyExecutor:
                 spec_resource_manager.add_dummy_requests(dummy_request_ids)
             except NoFreeSlotsError:
                 self.kv_cache_manager.free_resources(dummy_request)
+                if draft_kv_cache_manager is not None:
+                    draft_kv_cache_manager.free_resources(dummy_request)
                 return
 
         dummy_request.is_attention_dp_dummy = True
