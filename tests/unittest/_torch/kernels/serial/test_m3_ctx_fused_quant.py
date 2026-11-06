@@ -66,16 +66,27 @@ def test_ctx_residual_rmsnorm_mxfp8_matches_the_unfused_ops(rows: int, fp4: bool
     not torch.cuda.is_available() or get_sm_version() < 100,
     reason="MXFP8 quantization needs an SM100-family GPU",
 )
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("rows", [8192, 8197])
 @pytest.mark.parametrize("d", [1536, 6144])
 @pytest.mark.parametrize(
     "limit, alpha, beta", [(7.0, 1.702, 1.0), (None, None, None)], ids=["oai", "plain"]
 )
 def test_swiglu_mxfp8_is_bitwise_the_quantized_swiglu(
-    rows: int, d: int, limit, alpha, beta
+    rows: int, d: int, limit, alpha, beta, dtype: torch.dtype
 ) -> None:
     gen = torch.Generator(device="cuda").manual_seed(rows * d)
-    x = (4.0 * torch.randn((rows, 2 * d), generator=gen, device="cuda")).to(torch.bfloat16)
+    x = (4.0 * torch.randn((rows, 2 * d), generator=gen, device="cuda")).to(dtype)
+    # Sample the FP16 neighbors of a BF16 rounding midpoint as well as random inputs.
+    boundary = torch.tensor([1.00390625], dtype=dtype, device=x.device)
+    neighbors = torch.cat(
+        (
+            torch.nextafter(boundary, torch.zeros_like(boundary)),
+            boundary,
+            torch.nextafter(boundary, torch.full_like(boundary, 2.0)),
+        )
+    )
+    x[:3, d:] = neighbors[:, None]
     q, sf = swiglu_mxfp8(x, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta)
     ref_q, ref_sf = torch.ops.trtllm.mxfp8_quantize(
         swiglu(x, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta), True

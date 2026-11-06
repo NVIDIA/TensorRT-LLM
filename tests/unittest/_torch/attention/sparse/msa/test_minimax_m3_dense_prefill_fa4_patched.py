@@ -76,6 +76,7 @@ def test_dense_prefill_fa4_patched_accuracy_suite() -> None:
                 capture_output=True,
                 text=True,
                 check=False,
+                timeout=300,
             )
             assert prepared.returncode == 0, prepared.stdout + prepared.stderr
         env["PYTHONPATH"] = os.pathsep.join(
@@ -113,6 +114,7 @@ def test_dense_prefill_fa4_patched_accuracy_suite() -> None:
             capture_output=True,
             text=True,
             check=False,
+            timeout=1800,
         )
         output = completed.stdout + completed.stderr
         assert completed.returncode == 0, output

@@ -148,7 +148,7 @@ class DrafterLastRowContextFmha(FlashInferTrtllmGenFmha):
     ) -> None:
         batch = params.batch_size
         if self._kv_tail_zero(params.meta):
-            _zero_kv_tails(kv_pool, block_tables, params.sequence_lengths, batch)
+            _zero_kv_tails(kv_pool, block_tables, params.sequence_lengths, batch, kv_scale_pool)
             logger.info_once(
                 f"[CTX] drafter_kv_tail_zero taken (seqs={batch}, pages={2 * batch})",
                 key="minimax_m3_drafter_kv_tail_zero",
@@ -232,12 +232,17 @@ def _v_tail_zero_safe(kv_cache_manager) -> bool:
 
 
 def _zero_kv_tails(
-    kv_pool: torch.Tensor, block_tables: torch.Tensor, kv_lens: torch.Tensor, batch: int
+    kv_pool: torch.Tensor,
+    block_tables: torch.Tensor,
+    kv_lens: torch.Tensor,
+    batch: int,
+    kv_scale_pool: Optional[torch.Tensor] = None,
 ) -> None:
     """Zero the K and V rows at and past each sequence's kv_len on its partial last page, on the device (no host sync).
 
     kv_pool is the flat sub-block pool [blocks, kv_heads, page, d]; block_tables[b, 0 / 1, i] the K / V sub-block of
-    sequence b's page i; kv_lens the sequences' K/V lengths. A sequence whose last page is full is left as it is.
+    sequence b's page i; kv_lens the sequences' K/V lengths. NVFP4 scales have the same page axes and must also
+    be zeroed: zero packed data multiplied by a NaN scale is still NaN. Full last pages are left as they are.
     """
     page_size = int(kv_pool.shape[2])
     kv = kv_lens[:batch].to(torch.long)
@@ -249,10 +254,12 @@ def _zero_kv_tails(
     past = (torch.arange(page_size, device=kv_pool.device)[None, :] >= first_free[:, None]) & (
         first_free[:, None] > 0
     )
-    pool = kv_pool.view(torch.uint8)
-    pages = pool[blocks]
-    pages.masked_fill_(past[:, None, :, None], 0)
-    pool[blocks] = pages
+    for tensor in (kv_pool, kv_scale_pool):
+        if tensor is not None:
+            pool = tensor.view(torch.uint8)
+            pages = pool[blocks]
+            pages.masked_fill_(past[:, None, :, None], 0)
+            pool[blocks] = pages
 
 
 def mark_drafter_last_row_attention(draft_model: torch.nn.Module) -> int:

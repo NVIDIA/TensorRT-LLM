@@ -140,6 +140,62 @@ def test_rows_past_batch_are_untouched():
 
 
 @pytest.mark.parametrize(
+    "device",
+    [
+        pytest.param("cpu", marks=pytest.mark.cpu_only),
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("batch", [1, 2, 3])
+def test_nvfp4_tail_zeroes_packed_data_and_nan_scales(device: str, batch: int) -> None:
+    """Zero both NVFP4 pools without changing live tokens, full pages, or inactive requests."""
+    lengths = [PAGE + 5, PAGE, 9]
+    tables = torch.tensor(
+        [[[3, 5], [7, 1]], [[6, 0], [2, 0]], [[4, 0], [8, 0]]],
+        dtype=torch.int32,
+        device=device,
+    )
+    lens = torch.tensor(lengths, dtype=torch.int32, device=device)
+    packed = torch.full((10, HEADS, PAGE, D // 2), 0x22, dtype=torch.uint8, device=device)
+    scale_bytes = torch.full((10, HEADS, PAGE, D // 16), 0x7F, dtype=torch.uint8, device=device)
+    scales = scale_bytes.view(torch.float8_e4m3fn)
+    for b, length in enumerate(lengths):
+        for token in range(length):
+            for half in (0, 1):
+                scale_bytes[int(tables[b, half, token // PAGE]), :, token % PAGE] = 0x38
+    expected_data = packed.clone()
+    expected_scales = scale_bytes.clone()
+    for b, length in enumerate(lengths[:batch]):
+        if length % PAGE:
+            for half in (0, 1):
+                block = int(tables[b, half, (length - 1) // PAGE])
+                tail = slice(length % PAGE, None)
+                expected_data[block, :, tail] = 0
+                expected_scales[block, :, tail] = 0
+                assert torch.isnan(scales[block, :, tail].float()).all()
+
+    drafter_last_row._zero_kv_tails(packed, tables, lens, batch, scales)
+
+    assert torch.equal(packed, expected_data)
+    assert torch.equal(scale_bytes, expected_scales)
+    for b, length in enumerate(lengths[:batch]):
+        if length % PAGE:
+            for half in (0, 1):
+                block = int(tables[b, half, (length - 1) // PAGE])
+                tail = slice(length % PAGE, None)
+                data = packed[block, :, tail]
+                assert torch.count_nonzero(data) == 0
+                # Both E2M1 nibbles are zero, so dequantization must remain finite.
+                expanded_scales = scales[block, :, tail].float().repeat_interleave(16, -1)
+                dequantized = torch.zeros_like(expanded_scales) * expanded_scales
+                assert torch.isfinite(dequantized).all()
+                assert torch.count_nonzero(dequantized) == 0
+
+
+@pytest.mark.parametrize(
     "manager,safe",
     [
         (types.SimpleNamespace(enable_block_reuse=False, enable_partial_reuse=True), True),

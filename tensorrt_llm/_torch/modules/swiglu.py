@@ -134,7 +134,7 @@ def silu_and_mul_mxfp8_kernel(q_ptr, sf_ptr, x_ptr, x_stride, rows, d,
                               swiglu_beta: tl.constexpr,
                               BLOCK_SIZE: tl.constexpr, ROWS: tl.constexpr,
                               HAS_SWIGLU_LIMIT: tl.constexpr) -> None:
-    """silu_and_mul_kernel's math (BF16 result) followed by mxfp8_quantize(result, swizzled=True) of the same
+    """silu_and_mul_kernel's math (input-dtype result) followed by mxfp8_quantize(result, swizzled=True) of the same
     ROWS x BLOCK_SIZE tile: K32 UE8M0 scales in the 128x4 swizzled layout, E4M3 values, both bitwise those of the
     CUDA quantizer (cvt_warp_fp16_to_mxfp8). Rows from `rows` up to the 128-row padding write zero scales only."""
     NUM_GROUPS: tl.constexpr = BLOCK_SIZE // 32
@@ -152,7 +152,8 @@ def silu_and_mul_mxfp8_kernel(q_ptr, sf_ptr, x_ptr, x_stride, rows, d,
         b = tl.clamp(b, -swiglu_limit, swiglu_limit)
     result = a * tl.sigmoid(swiglu_alpha * a) * (b + swiglu_beta)
     v = tl.reshape(
-        result.to(tl.bfloat16).to(tl.float32), (ROWS, NUM_GROUPS, 32))
+        result.to(x_ptr.dtype.element_ty).to(tl.float32),
+        (ROWS, NUM_GROUPS, 32))
     vec_max = tl.max(tl.abs(v), axis=2)
     sf_bits = _ue8m0_round_up(
         vec_max * _rcp_approx_ftz(tl.full(
