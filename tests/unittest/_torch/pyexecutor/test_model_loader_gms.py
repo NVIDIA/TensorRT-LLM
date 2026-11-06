@@ -14,6 +14,8 @@ from torch import nn
 
 from tensorrt_llm._torch import memory as memory_mod
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
@@ -27,6 +29,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformTransferScope,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.mapping import Mapping
 
 pytestmark = pytest.mark.cpu_only
 
@@ -51,7 +54,8 @@ class _TinyModel(nn.Module):
     def __init__(self, events, *, include_draft=False):
         super().__init__()
         self.model_config = SimpleNamespace(
-            pretrained_config=SimpleNamespace(architectures=["TinyForCausalLM"], model_type="tiny")
+            pretrained_config=SimpleNamespace(architectures=["TinyForCausalLM"], model_type="tiny"),
+            mapping=Mapping(),
         )
         self._weights_transformed = False
         self._events = events
@@ -396,6 +400,49 @@ def test_gms_ro_does_not_retransform_materialized_slice_weights(monkeypatch):
     assert loaded_model is model
     assert model.projection.cache_rebuilt
     assert model.projection._weights_transformed
+
+
+def test_gms_ro_marks_moe_backend_behind_removed_wrapper_transformed(monkeypatch):
+    """RO materialization marks routed-expert owners transformed without transforming them.
+
+    The RW writer already transformed the expert bytes in the pool. A MoE
+    backend behind the `_weights_removed` `ConfigurableMoE` wrapper never loads
+    on the RO path, so only its guard declared before any load lets
+    `_mark_weights_transformed` mark it, and a later transform walk must then
+    leave it alone.
+    """
+    events = []
+    loader = _make_loader(monkeypatch, events=events)
+    backend = _build_gms_backend(is_rw=False, events=events)
+    _install_gms_backend(monkeypatch, backend)
+
+    # `__new__`: the guard is a class-level declaration and needs no kernels or
+    # weights; set only the EPLB state that qualification reads and the
+    # quantization method that the derived-state walk calls.
+    experts = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
+    nn.Module.__init__(experts)
+    experts.layer_load_balancer = None
+    experts.quant_method = MagicMock(name="quant_method")
+    experts.transform_weights = MagicMock(name="transform_weights")
+    wrapper = ConfigurableMoE.__new__(ConfigurableMoE)
+    nn.Module.__init__(wrapper)
+    wrapper.layer_load_balancer = None
+    wrapper._weights_removed = True
+    wrapper.backend = experts
+    model = model_loader_mod.AutoModelForCausalLM.from_config.return_value
+    model.experts = wrapper
+    checkpoint_loader = MagicMock(name="checkpoint_loader")
+    checkpoint_loader.checkpoint_format = "HF"
+
+    loaded_model, _ = loader.load("/ckpt", checkpoint_loader)
+
+    assert loaded_model is model
+    backend.materialize_module.assert_called_once_with(model)
+    assert experts._weights_transformed is True
+    assert wrapper._weights_transformed is False
+    experts.quant_method.cache_derived_state.assert_called_once_with(experts)
+    ModelLoader._walk_transform(loaded_model)
+    experts.transform_weights.assert_not_called()
 
 
 def test_gms_rw_post_load_runs_inside_pool_before_finalize(monkeypatch):

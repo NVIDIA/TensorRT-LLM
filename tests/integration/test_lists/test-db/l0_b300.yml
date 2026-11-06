@@ -25,6 +25,8 @@ l0_b300:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_mma_split_k_deterministic
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_small_m_fma_candidates_agree
   # Covers the GPU cases of tests/unittest/_torch/attention/ on B300, except the paths
   # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
   # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
@@ -142,7 +144,7 @@ l0_b300:
   # TIMEOUT measured: 3122 cases in 13m54s on one GB300 (the cpu_only files run on the CPU
   # stage instead), so 30 is 2.2x headroom.
   - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/kimi_k3_vl --ignore=unittest/_torch/modeling_v2/models/minimax_m3 TIMEOUT (30)
-  - unittest/_torch/modeling_v2/models/minimax_m3 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/minimax_m3 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__* TIMEOUT (30)
   # K3 single-GPU kernel and wrapper checks.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_cluster_waits.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv.py

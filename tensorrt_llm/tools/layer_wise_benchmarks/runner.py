@@ -531,8 +531,14 @@ class Runner:
             block_residual = residual
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
+                # As in KimiLinearModel.forward: a MoE layer may leave its residual update to the
+                # next layer's attention-residual mix; the last one returns it applied.
                 hidden_states, num_snapshots = layer(
-                    hidden_states, block_residual, num_snapshots, attn_metadata
+                    hidden_states,
+                    block_residual,
+                    num_snapshots,
+                    attn_metadata,
+                    defer_moe_residual=layer_idx != layer_indices[-1],
                 )
             return hidden_states, block_residual
 
