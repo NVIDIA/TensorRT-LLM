@@ -978,15 +978,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # MTP layers of a mixed-precision draft manager run on its own
             # staging copy.
             self.swap_for_draft("mixed_precision_staging", draft)
-        # A drafter appended to the target cache reads through the target's redirected block
-        # offsets, so it keeps the target's tables and its new rows are copied back as well; a
-        # separate draft manager has its own, and the sparse backends keep the draft one.
-        if (self.draft_kv_cache_manager is not None
-                or not self.mixed_precision_block_offsets_redirect):
-            self.swap_for_draft("mixed_precision_high_block_table",
-                                self.draft_mixed_precision_high_block_table)
-            self.swap_for_draft("mixed_precision_low_block_offsets",
-                                self.draft_mixed_precision_low_block_offsets)
+        # MTP layers of a cold-page draft manager use its mixed-precision high page table.
+        self.swap_for_draft("mixed_precision_high_block_table",
+                            self.draft_mixed_precision_high_block_table)
+        self.swap_for_draft("mixed_precision_low_block_offsets",
+                            self.draft_mixed_precision_low_block_offsets)
         return None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
