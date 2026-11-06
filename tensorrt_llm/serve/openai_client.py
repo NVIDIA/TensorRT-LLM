@@ -109,11 +109,15 @@ def _encode_request_body(request: _SerializableRequest) -> bytes:
     """Encode a request forwarded to a worker.
 
     Fields go out under their wire names, e.g. ``schema``, which the model
-    holds as ``schema_``.
+    holds as ``schema_``. Only fields that were set go out, except a Responses
+    request's ``request_id``, which always does, even when it is the default
+    generated when the request was parsed: a worker names its response after
+    it, so every worker answers under the id this server holds.
     """
-    return _msgpack_encoder.encode(
-        request.model_dump(mode="json", exclude_unset=True, by_alias=True)
-    )
+    body = request.model_dump(mode="json", exclude_unset=True, by_alias=True)
+    if isinstance(request, ResponsesRequest):
+        body["request_id"] = request.request_id
+    return _msgpack_encoder.encode(body)
 
 
 _ResponseT = TypeVar("_ResponseT", bound=BaseModel)

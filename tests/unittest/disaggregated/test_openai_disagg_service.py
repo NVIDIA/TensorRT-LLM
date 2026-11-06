@@ -967,6 +967,43 @@ async def test_send_disagg_request_leaves_streaming_usage_to_gen_server(schedule
 
 
 @pytest.mark.asyncio
+async def test_context_cancellation_releases_conditional_generation_reservation(monkeypatch):
+    """Cancelling CTX must release the generation server reserved before it."""
+    monkeypatch.delenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", raising=False)
+    service = _make_service("context_first")
+    service._config.conditional_disagg_config = ConditionalDisaggConfig(max_local_prefill_length=32)
+    service._coordinator.get_disagg_request_id = AsyncMock(return_value=101)
+    service._ctx_client = AsyncMock()
+    service._gen_client = AsyncMock()
+    router = KvCacheAwareRouter(server_role=ServerRole.GENERATION, servers=[])
+    router.get_next_server = AsyncMock(
+        return_value=("gen:9001", {"match_length": 0, "num_tokens": 96})
+    )
+    router.finish_request = AsyncMock()
+    service._gen_router = router
+    service._ctx_router.get_next_server = AsyncMock(return_value=("ctx:9000", {}))
+    context_started = asyncio.Event()
+
+    async def context_response(request, **kwargs):
+        context_started.set()
+        await asyncio.Event().wait()
+
+    service._ctx_client.send_request = AsyncMock(side_effect=context_response)
+    request = CompletionRequest(model="model", prompt=[1] * 96, stream=True)
+    pending = asyncio.create_task(service._send_disagg_request(request))
+    try:
+        await asyncio.wait_for(context_started.wait(), 2)
+    finally:
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+    router.get_next_server.assert_awaited_once_with(request, req_id=101)
+    router.finish_request.assert_awaited_once_with(request, success=False, req_id=101)
+    service._gen_client.send_request.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_context_retry_preserves_generation_reservation_id():
     service = _make_service("context_first")
     service._ctx_client = AsyncMock()
