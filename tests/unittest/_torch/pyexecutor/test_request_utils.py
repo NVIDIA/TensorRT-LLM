@@ -1829,7 +1829,9 @@ def test_broadcaster_transports_complete_envelopes(
     route: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     wire = {}
-    monkeypatch.setenv("TRTLLM_PP_REQ_SEND_ASYNC", "1" if route == "pp_async" else "0")
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.request_utils._PP_REQ_SEND_ASYNC", route == "pp_async"
+    )
 
     class PickleDist:
         world_size = 2
