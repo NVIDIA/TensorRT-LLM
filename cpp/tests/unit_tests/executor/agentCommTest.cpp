@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +17,11 @@
 
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <gtest/gtest.h>
+#include <sstream>
 
 using namespace tensorrt_llm::batch_manager::kv_cache_manager;
 using namespace tensorrt_llm::runtime;
@@ -230,6 +234,62 @@ TEST_P(AgentCommTest, AgentConnectionManagerConnect)
         ASSERT_EQ(recvData[i], 'a');
     }
     TLLM_LOG_INFO("after finish");
+}
+
+TEST_P(AgentCommTest, MalformedNotificationRecovery)
+{
+    std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    AgentConnectionManager sender(bufferManagers, *mCacheState, backend);
+    AgentConnectionManager receiver(bufferManagers, *mCacheState, backend);
+    auto const* connection = sender.getConnections(receiver.getCommState()).at(0);
+    auto* agentConnection = const_cast<AgentConnection*>(dynamic_cast<AgentConnection const*>(connection));
+    ASSERT_NE(agentConnection, nullptr);
+    auto const senderName = sender.getAgentName();
+    auto const receiverName = receiver.getAgentName();
+    constexpr uint64_t kRequestId = 2;
+    tensorrt_llm::executor::DataTransceiverState state{*mCacheState, sender.getCommState()};
+    tensorrt_llm::batch_manager::RequestInfo request{kRequestId, state};
+    constexpr auto kTimeout = std::chrono::seconds{5};
+    std::atomic<bool> terminate{false};
+
+    // A truncated variant index must be removed before the valid request is processed.
+    sender.getAgent()->notifySyncMessage(receiverName, "x");
+    // A well-formed payload with a mismatched sender must also be discarded.
+    RequestAndBufferInfo invalidRequest{"different-agent", "address", request, {}, "", 0, {}};
+    std::ostringstream invalidRequestStream;
+    NotificationInfo::serialize(NotificationInfo{invalidRequest}, invalidRequestStream);
+    sender.getAgent()->notifySyncMessage(receiverName, invalidRequestStream.str());
+    agentConnection->sendRequestAndBufferInfo(request, {std::optional<size_t>{0}}, 0);
+    tensorrt_llm::batch_manager::RequestInfo received;
+    auto requestFuture = std::async(std::launch::async,
+        [&]()
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(0));
+            return receiver.recvConnectionAndRequestInfo(received, terminate);
+        });
+    auto const requestStatus = requestFuture.wait_for(kTimeout);
+    terminate.store(true);
+    ASSERT_EQ(requestStatus, std::future_status::ready);
+    ASSERT_NE(requestFuture.get(), nullptr);
+    EXPECT_EQ(received.getRequestId(), kRequestId);
+
+    // Exercise the separate waitForNotification loop with another malformed-then-valid pair.
+    sender.getAgent()->notifySyncMessage(receiverName, "x");
+    NotificationSyncInfo expected{senderName, DataContext{static_cast<int>(kRequestId)}};
+    std::ostringstream os;
+    NotificationInfo::serialize(NotificationInfo{expected}, os);
+    sender.getAgent()->notifySyncMessage(receiverName, os.str());
+    terminate.store(false);
+    auto syncFuture = std::async(std::launch::async,
+        [&]()
+        {
+            TLLM_CUDA_CHECK(cudaSetDevice(0));
+            return receiver.waitForSyncInfo(senderName, expected, terminate);
+        });
+    auto const syncStatus = syncFuture.wait_for(kTimeout);
+    terminate.store(true);
+    ASSERT_EQ(syncStatus, std::future_status::ready);
+    EXPECT_TRUE(syncFuture.get());
 }
 
 INSTANTIATE_TEST_SUITE_P(AvailableBackends, AgentCommTest, ::testing::ValuesIn(getAvailableBackends()),

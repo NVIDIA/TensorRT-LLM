@@ -276,6 +276,10 @@ TEST(BounceMessageCodec, HandshakeTruncatedRejected)
     in.endpoint = "tcp://10.0.0.1:5555";
     auto blob = b::encodeHandshake(in);
     b::BounceHandshake out;
-    EXPECT_FALSE(b::decodeHandshake(blob.substr(0, blob.size() - 4), out)); // endpoint cut short
-    EXPECT_FALSE(b::decodeHandshake(blob.substr(0, 10), out));              // fixed part cut short
+    for (std::size_t length = 0; length < blob.size(); ++length)
+    {
+        EXPECT_FALSE(b::decodeHandshake(blob.substr(0, length), out)) << "Truncated at byte " << length;
+    }
+    EXPECT_TRUE(b::decodeHandshake(blob, out));
+    EXPECT_EQ(out.endpoint, in.endpoint);
 }

@@ -109,6 +109,18 @@ add_tllm_gtest(
   TIMEOUT
   60)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
+
+find_package(PkgConfig)
+if(PKG_CONFIG_FOUND)
+  pkg_check_modules(UCX_TEST_ZMQ libzmq)
+endif()
+if(UCX_TEST_ZMQ_FOUND AND EXISTS ${CMAKE_BINARY_DIR}/_deps/cppzmq-src)
+  target_compile_definitions(ucxCommTest PRIVATE TEST_UCX_ZMQ_AVAILABLE=1)
+  target_include_directories(
+    ucxCommTest PRIVATE ${CMAKE_BINARY_DIR}/_deps/cppzmq-src
+                        ${UCX_TEST_ZMQ_INCLUDE_DIRS})
+  target_link_libraries(ucxCommTest PRIVATE ${UCX_TEST_ZMQ_LIBRARIES})
+endif()
 target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
 
 # NIXL bounce-buffer v2 KV-cache transfer tests live in their own subdirectory
