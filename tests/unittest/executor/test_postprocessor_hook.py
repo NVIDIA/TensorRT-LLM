@@ -4,10 +4,12 @@
 
 import pytest
 
+from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor.postprocessor_hook import (
     PostProcessorHookChunk,
     apply_post_processor_hook,
     emit,
+    end_post_processor_hook,
     load_post_processor_hook,
     suppress,
     terminate,
@@ -225,6 +227,24 @@ def test_per_request_state_is_keyed_by_request_id():
     assert 1 not in hook.state
 
 
+def test_chunk_carries_the_disaggregated_request_id():
+    """``disagg_request_id`` comes from the result's disaggregated params, else None."""
+    seen = []
+
+    def hook(chunk):
+        seen.append(chunk.disagg_request_id)
+        return emit(chunk.text_diff)
+
+    result = _FakeResult([_make_output("x")])
+    apply_post_processor_hook(hook, result, streaming=True)
+    result.disaggregated_params = DisaggregatedParams()
+    apply_post_processor_hook(hook, result, streaming=True)
+    result.disaggregated_params = DisaggregatedParams(disagg_request_id=42)
+    apply_post_processor_hook(hook, result, streaming=True)
+
+    assert seen == [None, None, 42]
+
+
 def test_unknown_verdict_action_rejected_at_construction():
     """An unknown action cannot be smuggled: the verdict rejects it on build."""
     from tensorrt_llm.executor.postprocessor_hook import PostProcessorHookVerdict
@@ -318,3 +338,32 @@ def test_harmony_model_rejects_post_processor_hook():
     guard(use_harmony=False, post_processor_hook="my_pkg.guardrail.Hook")
     guard(use_harmony=True, post_processor_hook=None)
     guard(use_harmony=False, post_processor_hook=None)
+
+
+class _EndingHook:
+    def __init__(self, fail=False):
+        self.ended = []
+        self.fail = fail
+
+    def __call__(self, chunk):
+        return emit(chunk.text_diff)
+
+    def on_request_end(self, request_id, reason):
+        if self.fail:
+            raise RuntimeError("cleanup failed")
+        self.ended.append((request_id, reason))
+
+
+def test_end_hook_calls_on_request_end_when_the_hook_defines_it():
+    hook = _EndingHook()
+    end_post_processor_hook(hook, 7, "error")
+    assert hook.ended == [(7, "error")]
+
+
+def test_end_hook_leaves_hooks_without_it_and_no_hook_alone():
+    end_post_processor_hook(lambda chunk: emit(chunk.text_diff), 7, "error")
+    end_post_processor_hook(None, 7, "error")
+
+
+def test_end_hook_never_raises():
+    end_post_processor_hook(_EndingHook(fail=True), 7, "error")
