@@ -8,13 +8,21 @@ same size, saving the ~50-65s worker spawn+import per reuse. This delivers the
 same reuse the explicit fixtures in this PR provide, but through shared test
 infrastructure only: no test signature changes, no wrapper functions.
 
-Eligibility is automatic:
+Pool isolation and reuse rules:
 - size mismatch            -> incompatible cached pools drained before handout
 - env/sys.path mismatch    -> cached pool retired (workers froze that state
                               at spawn; a stale pool would silently miss it)
-- RPC executors            -> keep a private, never-cached pool; their seam
-                              drains the cache first (their engine build
-                              cannot share GPUs with cached idle pools)
+- RPC-owned pools          -> private, never cached; their construction seam
+                              drains the cache first
+- LLM tests using RPC      -> require ``private_mpi_session``: LLM creates its
+                              pool before the RPC executor, bypassing the RPC
+                              construction seam. Reused IPC workers have
+                              thread-local allreduce state incompatible with
+                              RPC's rank-0 engine-setup thread.
+- child processes          -> a test starting one drains the cache first:
+                              the child cannot use cached pools but shares
+                              their GPUs (nvidia-smi is exempt; os.fork and
+                              os.posix_spawn are not intercepted)
 - tests passing their own ``_mpi_session`` (the explicit fixtures) -> never
   reach the patched seam
 - ``@pytest.mark.private_mpi_session`` -> explicit opt-out: the cache is
@@ -57,9 +65,9 @@ _PATCH_TARGETS = (
     "tensorrt_llm.executor.proxy",
     "tensorrt_llm.llmapi.llm",
 )
-# RPC executors keep a PRIVATE pool (never cached), but their engine build
-# cannot share GPUs with cached idle pools (observed init hang), so their
-# seam gets a drain-then-build factory instead of the cache.
+# RPC executors that construct their own pool use a drain-then-build factory.
+# LLM creates its pool earlier and needs the per-test opt-out described above
+# to avoid carrying IPC thread-local state into RPC engine setup.
 _RPC_PATCH_TARGET = "tensorrt_llm.executor.rpc_proxy"
 _ALL_PATCH_TARGETS = _PATCH_TARGETS + (_RPC_PATCH_TARGET,)
 
@@ -467,7 +475,7 @@ class SessionReuseCache:
         """Bypass the cache for the current test (private_mpi_session)."""
         self._suspended = suspended
 
-    def drain(self, timeout: float = 60.0) -> None:
+    def drain(self, timeout: float = 60.0, reason: str | None = None) -> None:
         """Shut down all cached pools in parallel (frees GPU/CPU footprint).
 
         Also reaps in-flight retire threads: drain runs at natural rendezvous
@@ -480,6 +488,8 @@ class SessionReuseCache:
             pools, self._pools = list(self._pools.values()), {}
         if not pools:
             return
+        if reason:
+            print(f"[session-reuse] draining before {reason}", flush=True)
 
         threads = [
             # daemon: a wedged pool shutdown must not keep the interpreter

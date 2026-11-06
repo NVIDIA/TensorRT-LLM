@@ -669,6 +669,9 @@ def run(
     # Initialize Stream
     current_stream = cutlass_torch.default_stream()
 
+    # Read only by kernels built with use_expert_counts=True, which this driver does not set.
+    expert_capacity = cutlass.Int32(0)
+
     # Compile gemm kernel
     compiled_gemm = cute.compile(
         gemm,
@@ -681,6 +684,7 @@ def run(
         num_non_exiting_tiles,
         tile_idx_to_mn_limit,
         alpha,
+        expert_capacity,
         max_active_clusters,
         current_stream,
         permuted_idx_to_expanded_idx,
@@ -701,6 +705,7 @@ def run(
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha,
+            expert_capacity,
             current_stream,
             permuted_idx_to_expanded_idx,
             token_final_scales,
@@ -826,6 +831,7 @@ def run(
             num_non_exiting_tiles,
             tile_idx_to_mn_limit,
             alpha,
+            expert_capacity,
             current_stream,
             permuted_idx_to_expanded_idx,
             token_final_scales,

@@ -42,7 +42,7 @@ _CONFIG_DIR = Path(__file__).parent / "configs"
 # Marathon configurations exercised by the parametrized test below.
 # Add a new entry here to wire an additional YAML into the suite.
 _MARATHON_CONFIGS: list[str] = [
-    "marathon_python_v1_deepseek.yaml",
+    "marathon_python_v2_deepseek.yaml",
 ]
 
 # ``trtllm-llmapi-launch`` exports these so an LLM created in the pytest process
@@ -143,7 +143,7 @@ def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> Non
             f"""\
             mode: {mode}
             duration_min: 1
-            kv_cache_manager: v1
+            kv_cache_manager: v2
             transceiver: python
             """,
         )
@@ -157,6 +157,12 @@ def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> Non
 def test_stress_config_defaults_to_python(tmp_path: Path) -> None:
     cfg = StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, "mode: log_only"))
     assert cfg.transceiver == "python"
+    assert cfg.kv_cache_manager == "v2"
+
+
+def test_stress_config_rejects_v1_with_python(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="kv_cache_manager must be 'v2'"):
+        StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, "kv_cache_manager: v1"))
 
 
 @pytest.mark.parametrize("runtime", ["cpp", "auto", "unknown"])
@@ -174,7 +180,7 @@ def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
                 """\
                 mode: accidental
                 duration_min: 1
-                kv_cache_manager: v1
+                kv_cache_manager: v2
                 transceiver: python
                 """,
             )
@@ -191,7 +197,7 @@ def test_log_only_thread_sends_probe_and_stops(
             """\
             mode: log_only
             duration_min: 1
-            kv_cache_manager: v1
+            kv_cache_manager: v2
             transceiver: python
             log_only_probe:
               interval_s: 0.01

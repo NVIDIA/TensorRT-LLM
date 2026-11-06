@@ -110,7 +110,8 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_fwd_kernel(C
     }
     input_t* conv_states = params.conv_states_ptr == nullptr ? nullptr
                                                              : reinterpret_cast<input_t*>(params.conv_states_ptr)
-            + cache_index * params.conv_states_batch_stride + channel_id * params.conv_states_c_stride;
+            + static_cast<int64_t>(cache_index) * params.conv_states_batch_stride
+            + channel_id * params.conv_states_c_stride;
 
     // Thread 0 will load the last elements of the previous chunk, so we initialize those to 0.
     if (tidx == 0)
@@ -282,9 +283,10 @@ void causal_conv1d_fwd_launch(ConvParamsBase& params, cudaStream_t stream)
 {
     static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
     bool const kVarlen = params.query_start_loc_ptr != nullptr;
-    // Enable vectorized 128-bit loads when total tokens are aligned. For varlen with
-    // batch==1 (common prefill), seq_start is always 0 so alignment is guaranteed.
-    bool const canVecLoad = params.seqlen % kNElts == 0 && (!kVarlen || params.batch == 1);
+    // 128-bit vector loads need aligned token counts. Varlen takes the element-wise path: per-sequence lengths from
+    // query_start_loc can be shorter than a padded params.seqlen (GDN prefill CUDA graph), and the vector path would
+    // drop each sequence's len % kNElts tail.
+    bool const canVecLoad = params.seqlen % kNElts == 0 && !kVarlen;
     BOOL_SWITCH(canVecLoad, kIsVecLoad,
         [&]
         {
@@ -1013,7 +1015,8 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
         conv_state_batch_coord = batch_id;
     }
     input_t* conv_state = reinterpret_cast<input_t*>(params.conv_state_ptr)
-        + conv_state_batch_coord * params.conv_state_batch_stride + channel_id * params.conv_state_c_stride;
+        + static_cast<int64_t>(conv_state_batch_coord) * params.conv_state_batch_stride
+        + channel_id * params.conv_state_c_stride;
 
     weight_t* weight = reinterpret_cast<weight_t*>(params.weight_ptr) + channel_id * params.weight_c_stride;
     input_t* out = reinterpret_cast<input_t*>(params.out_ptr) + batch_id * params.out_batch_stride
@@ -1129,7 +1132,8 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
     }
 
     input_t* conv_state = reinterpret_cast<input_t*>(params.conv_state_ptr)
-        + conv_state_batch_coord * params.conv_state_batch_stride + channel_id * params.conv_state_c_stride;
+        + static_cast<int64_t>(conv_state_batch_coord) * params.conv_state_batch_stride
+        + channel_id * params.conv_state_c_stride;
     weight_t* weight = reinterpret_cast<weight_t*>(params.weight_ptr) + channel_id * params.weight_c_stride;
     input_t* x
         = reinterpret_cast<input_t*>(params.x_ptr) + batch_id * params.x_batch_stride + channel_id * params.x_c_stride;

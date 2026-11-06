@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, Union
 
@@ -5,8 +8,10 @@ import torch
 from torch import nn
 
 from ..attention.backends import AttentionMetadata
+from ..nccl_window_tensor_scope import nccl_window_tensor_scoped_module
 
 
+@nccl_window_tensor_scoped_module
 class DecoderLayer(nn.Module, ABC):
 
     @abstractmethod

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 '''
 This script is used to start the MPICommSession in the rank0 and wait for the
 MPI Proxy process to connect and get the MPI task to run.

@@ -290,7 +290,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
         result_queue_addr=("result", b"key"),
     )
     worker_module.worker_main(
-        engine=object(),
         worker_queues=worker_queues,
         log_level=worker_module.logger.level,
         worker_cls=_FailingWorker,
@@ -307,7 +306,6 @@ def test_worker_publishes_identities_before_backend_construction(monkeypatch):
     init_status_queue.succeeds = False
     with pytest.raises(RuntimeError, match="Failed to deliver worker process identities to proxy"):
         worker_module.worker_main(
-            engine=object(),
             worker_queues=worker_queues,
             log_level=worker_module.logger.level,
             worker_cls=_FailingWorker,
@@ -455,32 +453,6 @@ def test_remote_worker_death_roundtrip():
     assert isinstance(exc, RuntimeError)
     assert "ValueError" in str(exc)
     assert "rank 3 exploded" in str(exc)
-
-
-def test_server_async_callback_forwards_only_failures():
-    from concurrent.futures import Future
-
-    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionServer, RemoteWorkerDeath
-
-    server = object.__new__(RemoteMpiCommSessionServer)
-    sent = []
-    server.queue = type("Q", (), {"put": lambda self, m: sent.append(m)})()
-
-    ok = Future()
-    ok.set_result(42)
-    server.mpi_async_error_callback(ok)
-    assert sent == []
-
-    cancelled = Future()
-    cancelled.cancel()
-    server.mpi_async_error_callback(cancelled)
-    assert sent == []
-
-    failed = Future()
-    failed.set_exception(RuntimeError("worker segfault"))
-    server.mpi_async_error_callback(failed)
-    assert len(sent) == 1 and isinstance(sent[0], RemoteWorkerDeath)
-    assert sent[0].message == "worker segfault"
 
 
 class _FakeZmqQueue:
@@ -715,6 +687,16 @@ def test_abandon_mpi_pool_threads_tolerates_missing_pool():
 
     _abandon_mpi_pool_threads(None)
     _abandon_mpi_pool_threads(object())  # no _pool attribute
+
+
+def test_pool_session_reports_dead_manager_thread():
+    from tensorrt_llm.llmapi.mpi_session import MpiPoolSession
+
+    session = object.__new__(MpiPoolSession)
+    session.mpi_pool = _Mock(_shutdown=False)
+    session.mpi_pool._pool.thread.is_alive.return_value = False
+    assert isinstance(session.check_worker_error(), RuntimeError)
+    session.mpi_pool = None  # keep __del__ from shutting down the fake pool
 
 
 def test_mark_engine_dead_releases_exit_joins_immediately():

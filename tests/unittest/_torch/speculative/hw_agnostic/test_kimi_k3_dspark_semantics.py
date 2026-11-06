@@ -27,13 +27,11 @@ from typing import Optional
 import pytest
 import torch
 import torch.nn.functional as F
+from _torch.helpers import dspark_markov_chain_logits_reference
 
 from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM, dspark_layer_window_size
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
-from tensorrt_llm._torch.models.modeling_speculative import (
-    dspark_markov_chain_logits,
-    dspark_markov_step_bias,
-)
+from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
 from tensorrt_llm._torch.speculative.dflash import dflash_draft_slot_ids
 
 needs_cuda = pytest.mark.skipif(
@@ -118,7 +116,7 @@ def test_markov_chain_matches_deepspec_reference():
     w1, w2, base, anchor = _random_markov()
     ref_tokens, ref_logits = _RefVanillaMarkov(w1, w2).sample_block_tokens(base, anchor)
 
-    out = dspark_markov_chain_logits(base, anchor, w1, w2)
+    out = dspark_markov_chain_logits_reference(base, anchor, w1, w2)
     assert torch.equal(out, ref_logits)
     # Greedy per-position argmax of the corrected logits reproduces the
     # reference sequentially-sampled chain (what sample_draft_tokens does).
@@ -128,7 +126,7 @@ def test_markov_chain_matches_deepspec_reference():
 def test_markov_chain_empty_block_is_noop():
     w1, w2, base, anchor = _random_markov()
     empty = base[:, :0, :]
-    assert dspark_markov_chain_logits(empty, anchor, w1, w2) is empty
+    assert dspark_markov_chain_logits_reference(empty, anchor, w1, w2) is empty
 
 
 def test_markov_chain_sharded_matches_full_vocab():
@@ -136,7 +134,7 @@ def test_markov_chain_sharded_matches_full_vocab():
     contiguous markov_w2/logits vocab shard, chained through a global
     argmax over all shards — reassembles to the full-vocab chain."""
     w1, w2, base, anchor = _random_markov()
-    full = dspark_markov_chain_logits(base, anchor, w1, w2)
+    full = dspark_markov_chain_logits_reference(base, anchor, w1, w2)
 
     tp = 4
     shard_w = VOCAB // tp
@@ -200,6 +198,35 @@ def test_swa_window_conventions():
     assert dspark_layer_window_size(False, 1024, sliding, 0) == (-1, -1)
     # No layer_types declared + use_swa -> window on every layer.
     assert dspark_layer_window_size(True, 8, None, 0) == (7, 7)
+
+
+def test_swa_window_all_full_attention_layer_types():
+    """use_swa with no sliding layer declared windows every layer.
+
+    Some windowed DFlash 2 drafters list every layer as `full_attention` and
+    carry the window in `dflash_config`; reading those layer types literally
+    would serve them with full attention and lose acceptance silently.
+    """
+    full = ["full_attention"] * 5
+    for layer_idx in range(len(full)):
+        assert dspark_layer_window_size(True, 2048, full, layer_idx) == (2047, 2047)
+
+    # Without use_swa the same layer types keep flash-attn's default.
+    for layer_idx in range(len(full)):
+        assert dspark_layer_window_size(False, 2048, full, layer_idx) == (-1, -1)
+    assert dspark_layer_window_size(False, 0, None, 0) == (-1, -1)
+
+    # A checkpoint that tells sliding layers from full ones keeps the per-layer windows.
+    mixed = ["sliding_attention", "full_attention", "sliding_attention"]
+    assert dspark_layer_window_size(True, 512, mixed, 0) == (511, 511)
+    assert dspark_layer_window_size(True, 512, mixed, 1) == (-1, -1)
+    assert dspark_layer_window_size(True, 512, mixed, 2) == (511, 511)
+
+    # Layer types built in Python can be named objects; they are classified the
+    # way the attention mask classifies them.
+    named = [SimpleNamespace(name="SLIDING_ATTENTION"), "full_attention"]
+    assert dspark_layer_window_size(True, 512, named, 0) == (511, 511)
+    assert dspark_layer_window_size(True, 512, named, 1) == (-1, -1)
 
 
 # ---------------------------------------------------------------------------
