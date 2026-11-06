@@ -89,8 +89,7 @@ target_compile_features(tllm_common_cublas PUBLIC cxx_std_20)
 set_target_properties(tllm_common_cublas PROPERTIES POSITION_INDEPENDENT_CODE
                                                     ON)
 if(ENABLE_CUBLASLT_FP4_GEMM)
-  target_compile_definitions(tllm_common_cublas
-                             PRIVATE ENABLE_CUBLASLT_FP4_GEMM)
+  target_compile_definitions(tllm_common_cublas PUBLIC ENABLE_CUBLASLT_FP4_GEMM)
 endif()
 
 add_library(
