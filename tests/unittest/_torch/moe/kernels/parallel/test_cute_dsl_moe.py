@@ -5790,16 +5790,22 @@ def test_mxfp8_fused_fc12_sparse_gather_selection() -> None:
 
 
 @pytest.mark.cpu_only
-def test_mxfp8_moe_tuning_buckets_cover_decode_shapes() -> None:
+def test_mxfp8_moe_tuning_buckets_cover_decode_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
     """The MXFP8 MoE tuning buckets must not depend on the warmup forward's token count.
 
     The engine's autotuner warmup runs one forward at whatever token count the
     KV cache allows. With ``tune_max_num_tokens`` the module anchors its
     power-of-two token buckets to the saturation token count, so decode shapes
     (a few tokens per DP rank) are profiled regardless of that warmup shape.
-    Profile generation only reads tensor shapes, so this runs on CPU tensors.
+    Profile generation only reads tensor shapes, so this runs on CPU tensors,
+    with a tuner of its own: the profiling cache reads the device name and
+    capability at construction, which a GPU-less node cannot answer.
     """
     from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoEMxfp8Runner
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args, **kwargs: "cpu")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (0, 0))
+    tuner = AutoTuner()
 
     num_experts, top_k, hidden = 128, 10, 4096
     warmup_tokens = 3  # an odd shape: last_positive_power_of_2(3) == 2
@@ -5820,7 +5826,7 @@ def test_mxfp8_moe_tuning_buckets_cover_decode_shapes() -> None:
             torch.empty(warmup_tokens, hidden // 32, dtype=torch.uint8),
             torch.empty(warmup_tokens, hidden, dtype=torch.bfloat16),
         ]
-        profiles = AutoTuner.get()._optimization_profiles(runner.get_tuning_config(), inputs)
+        profiles = tuner._optimization_profiles(runner.get_tuning_config(), inputs)
         return {p.get_opt_shapes()[0][0] for p in profiles}
 
     anchored = profiled_token_counts(tune_max_num_tokens=8192)
