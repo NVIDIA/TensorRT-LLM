@@ -23,6 +23,7 @@ arbitrary user-supplied names.
 
 PUBLIC_MODEL_ARCHITECTURES = frozenset(
     {
+        "VDNMiniMaxH3Transformer3DModel",
         "AfmoeForCausalLM",
         "BartForConditionalGeneration",
         "BertForSequenceClassification",
