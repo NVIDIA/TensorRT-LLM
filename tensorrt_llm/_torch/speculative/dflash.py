@@ -17,7 +17,7 @@ import os
 import weakref
 from collections import deque
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 from torch import nn
@@ -713,6 +713,15 @@ class DFlashSpecMetadata(SpecMetadata):
 VocabParallelDraftTokens = Callable[[nn.Module, torch.Tensor, dict], torch.Tensor]
 
 
+class _ContextSide(NamedTuple):
+    """The step's context latents, computed on a side stream (see
+    :meth:`DFlashWorker._launch_context_side`)."""
+
+    latent: torch.Tensor  # [G * (K + 1), L, 1, D], what precompute_context_kv returns
+    positions_read: torch.cuda.Event  # recorded once the side stream has read _ctx_len
+    done: torch.cuda.Event  # recorded after the latents
+
+
 @dataclass
 class VocabParallelSelection:
     """The tokens a DFlash worker selects from this rank's vocab shard of the
@@ -772,6 +781,12 @@ class DFlashWorker(SpecWorkerBase):
         # last launch (kept alive until the next step, after the drafter joined it).
         self._ctx_store_stream: Optional[torch.cuda.Stream] = None
         self._ctx_store_operands: tuple = ()
+        # The stream the step's context latents are computed on beside the
+        # target-token selection and acceptance, its constant offsets, and the
+        # pending launch the fused preparation joins.
+        self._ctx_side_stream: Optional[torch.cuda.Stream] = None
+        self._ctx_side_offsets: Optional[torch.Tensor] = None
+        self._ctx_side: Optional[_ContextSide] = None
         self._resolved_mask_token_id = None
         self._resolved_block_size = None
         self._compute_block_size = None
@@ -2038,6 +2053,10 @@ class DFlashWorker(SpecWorkerBase):
             self._saved_req_ctx_pos = dict(self._req_ctx_pos)
             self._ctx_len_restore_pending = True
 
+        self._ctx_side = self._launch_context_side(
+            draft_model, spec_metadata, attn_metadata, input_ids.shape[0]
+        )
+
         self._execute_guided_decoder_if_present(logits)
 
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -2110,6 +2129,10 @@ class DFlashWorker(SpecWorkerBase):
             if drafts
             else None
         )
+        if self._ctx_side is not None:
+            # Joined by the fused preparation; never left forked past it.
+            torch.cuda.current_stream().wait_event(self._ctx_side.done)
+            self._ctx_side = None
 
         vocab_size = None
         if num_gens > 0 and drafts:
@@ -2266,6 +2289,60 @@ class DFlashWorker(SpecWorkerBase):
             "next_draft_tokens": next_draft_tokens,
             "next_new_tokens": next_new_tokens,
         }
+
+    def _launch_context_side(
+        self, draft_model, spec_metadata, attn_metadata, total_target_tokens: int
+    ) -> Optional[_ContextSide]:
+        """Start the step's context latents on a side stream.
+
+        They need only the captured target hidden states and the context
+        lengths before this step's advance, so the projection (with its TP
+        all-reduce), the all-layer latent GEMM and the RoPE run beside the
+        target-token selection and acceptance. The fused preparation waits on
+        ``positions_read`` before it advances ``_ctx_len`` and on ``done``
+        before it stores the latents. Same operations on the same inputs as
+        the main-stream projection there.
+
+        None (the fused preparation projects on the main stream) unless the
+        step is generation-only, the fused preparation covers it and the
+        drafter can project beside the main stream's all-reduces.
+        """
+        num_gens = attn_metadata.num_seqs
+        if (
+            draft_model is None
+            or draft_model.context_kv_only
+            or attn_metadata.num_contexts != 0
+            or num_gens == 0
+            or not self._fused_gen_prepare_applies(spec_metadata)
+        ):
+            return None
+        width = self._draft_tokens_per_req
+        rows = num_gens * width
+        if not draft_model.projects_context_beside(rows):
+            return None
+        if self._ctx_side_stream is None or self._ctx_side_offsets.numel() != width:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._ctx_side_stream = torch.cuda.Stream()
+            self._ctx_side_offsets = torch.arange(width, dtype=torch.long, device="cuda")
+        main = torch.cuda.current_stream()
+        side = self._ctx_side_stream
+        side.wait_stream(main)
+        positions_read = torch.cuda.Event()
+        done = torch.cuda.Event()
+        with torch.cuda.stream(side):
+            slots = self._batch_to_slot_buffer.tensor[:num_gens]
+            positions = (
+                self._ctx_len.index_select(0, slots).unsqueeze(1) + self._ctx_side_offsets
+            ).view(-1)
+            positions_read.record()
+            captured = spec_metadata.get_hidden_states(total_target_tokens)[:rows]
+            projected = draft_model.project_target_hidden_beside(captured)
+            latent, _ = draft_model.precompute_context_kv(projected.to(self._ctx_dtype), positions)
+            done.record()
+        # Allocated on the side stream, read on the main one after ``done``.
+        latent.record_stream(main)
+        return _ContextSide(latent, positions_read, done)
 
     def _draft_block_width(self, draft_model) -> int:
         """Block slots the draft forward must compute for K draft tokens.
@@ -2698,6 +2775,10 @@ class DFlashWorker(SpecWorkerBase):
         block_size = self._compute_block_size
         slots = self._batch_to_slot_buffer.tensor[num_contexts : num_contexts + num_gens]
         helix = self._ctx_helix
+        side, self._ctx_side = self._ctx_side, None
+        if side is not None:
+            # The side stream reads _ctx_len before the preparation advances it.
+            torch.cuda.current_stream().wait_event(side.positions_read)
         prep = dflash_paged_latent_prepare(
             num_accepted_tokens,
             accepted_tokens,
@@ -2733,13 +2814,18 @@ class DFlashWorker(SpecWorkerBase):
             block_size,
             trained_mask_embedding,
         )
-        gen_start = attn_metadata.num_ctx_tokens
-        captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
-        gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
-        projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
-        latent, _ = draft_model.precompute_context_kv(
-            projected.to(self._ctx_dtype), prep.ctx_positions
-        )
+        if side is not None:
+            # The same latents, from the same hidden states at the same positions.
+            torch.cuda.current_stream().wait_event(side.done)
+            latent = side.latent
+        else:
+            gen_start = attn_metadata.num_ctx_tokens
+            captured_hs = spec_metadata.get_hidden_states(total_target_tokens)
+            gen_hs = captured_hs[gen_start : gen_start + num_gens * width]
+            projected = draft_model.project_target_hidden(gen_hs.reshape(-1, gen_hs.shape[-1]))
+            latent, _ = draft_model.precompute_context_kv(
+                projected.to(self._ctx_dtype), prep.ctx_positions
+            )
         store_args = (
             latent[:, :, 0],
             self._ctx_kv_buf,

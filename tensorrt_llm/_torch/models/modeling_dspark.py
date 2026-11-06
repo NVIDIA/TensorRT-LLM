@@ -104,6 +104,7 @@ from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.kernels.dspark import write_dspark_context
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams
+from ..distributed.ops import MnnvlOwnWorkspace
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -2980,6 +2981,11 @@ _DSPARK_HEAD_WEIGHT_ALIASES = {
 _MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
 
 
+# Context-projection rows (generation requests x (K + 1)) the side all-reduce of an MLA drafter
+# serves: four requests at K = 7.
+_CTX_SIDE_MAX_ROWS = 32
+
+
 class _MLABlockFixup(NamedTuple):
     """Layer-invariant state for the MLA block-decode fixup.
 
@@ -3580,6 +3586,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     _side_stream: Optional[torch.cuda.Stream] = None
     # Scratch row indices of the fused block store, per (tokens, device).
     _scratch_index: Optional[Dict] = None
+    # The context projection's TP all-reduce on an MNNVL workspace of its own, for the worker's
+    # side stream (project_target_hidden_beside); None where the shared one is not MNNVL.
+    _ctx_side_all_reduce: Optional[AllReduce] = None
     waits_for_ctx_store = True
 
     def __init__(
@@ -4290,6 +4299,45 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         )
 
     # -- context cache -----------------------------------------------------
+
+    def _load_target_projection(self, weights: Dict) -> None:
+        super()._load_target_projection(weights)
+        shared = self._fc_all_reduce
+        if self.context_kv_only or shared is None or shared.mnnvl_allreduce is None:
+            return
+        mapping = self.model_config.mapping
+        dtype = self.fc.weight.dtype
+        workspace = MnnvlOwnWorkspace(
+            "dspark_context_projection",
+            _CTX_SIDE_MAX_ROWS * self.fc.weight.shape[0] * mapping.tp_size * dtype.itemsize,
+        )
+        side = AllReduce(
+            mapping, strategy=shared.strategy, dtype=dtype, mnnvl_own_workspace=workspace
+        )
+        self._ctx_side_all_reduce = side if side.mnnvl_allreduce is not None else None
+
+    def projects_context_beside(self, num_rows: int) -> bool:
+        """Whether :meth:`project_target_hidden_beside` serves ``num_rows`` rows."""
+        if self._fc_input_slice is None:
+            return True
+        return self._ctx_side_all_reduce is not None and 0 < num_rows <= _CTX_SIDE_MAX_ROWS
+
+    def project_target_hidden_beside(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """:meth:`project_target_hidden` for a stream running beside the main stream's
+        all-reduces: the TP partial sums reduce (with ``hidden_norm``) on the projection's own
+        MNNVL workspace, in the one-shot kernel. Rows as :meth:`projects_context_beside` allows."""
+        hidden_states = hidden_states.to(self.fc.weight.dtype)
+        if self._fc_input_slice is None:
+            return self.hidden_norm(self.fc(hidden_states))
+        partial = self.fc(hidden_states[:, self._fc_input_slice])
+        return self._ctx_side_all_reduce.mnnvl_allreduce(
+            partial,
+            all_reduce_params=AllReduceParams(
+                fusion_op=AllReduceFusionOp.RMS_NORM,
+                norm_weight=self.hidden_norm.weight,
+                eps=self.hidden_norm.eps,
+            ),
+        )
 
     def precompute_context_kv(self, projected_hidden, positions):
         """Post-norm / post-RoPE MLA latent for ALL drafter layers in one GEMM.

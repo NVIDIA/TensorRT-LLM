@@ -519,6 +519,11 @@ class DFlashForCausalLM(nn.Module):
     # draft-pool write, so the worker may store the context latents on a side stream.
     waits_for_ctx_store = False
 
+    def projects_context_beside(self, num_rows: int) -> bool:
+        """Whether ``project_target_hidden_beside`` projects ``num_rows`` captured
+        rows on a stream running beside the main stream's all-reduces."""
+        return False
+
     @property
     def reads_helix_sharded_ctx_pages(self) -> bool:
         """Whether the block decode reads a context whose pages are sharded over

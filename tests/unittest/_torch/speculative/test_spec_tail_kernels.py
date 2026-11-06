@@ -297,6 +297,89 @@ def test_paged_latent_prepare_matches_eager(draft_len, side_stream, helix_rank):
         assert torch.equal(placement.owned, fixup.owned)
 
 
+@pytest.mark.parametrize("helix_rank", [None, 1], ids=["no_helix", "helix_r1"])
+def test_context_side_stream_matches_main_stream(helix_rank):
+    """The step's context latents computed on the worker's side stream (beside
+    the target-token selection) give the fused preparation the same outputs,
+    context lengths and pool contents as computing them on the main stream."""
+    draft_len, vocab, hidden, features, layers, head_dim = 7, 100, 64, 128, 3, 96
+    page_size, max_blocks, num_slots, max_ctx = 16, 6, 6, 70
+    num_gens, width = 4, draft_len + 1
+    gen = torch.Generator(device="cuda").manual_seed(11)
+    worker, storage = _paged_worker(
+        draft_len, page_size, max_blocks, num_slots, layers, head_dim, max_ctx, gen
+    )
+    worker._ctx_dtype = torch.bfloat16
+    if helix_rank is not None:
+        worker._ctx_helix = HelixDraftShard(2, helix_rank, page_size)
+    drafter = _LatentDrafter(vocab, hidden, features, layers, head_dim, mask_token_id=3)
+    drafter.context_kv_only = False
+    drafter.projects_context_beside = lambda rows: True
+    drafter.project_target_hidden_beside = drafter.project_target_hidden
+
+    slots = torch.tensor([3, 0, 2, worker._dummy_slot], device="cuda")
+    worker._batch_to_slot_buffer.tensor[:num_gens] = slots
+    worker._ctx_len[:4] = torch.tensor([10, 3, 33, 50], device="cuda")
+    worker._ctx_block_counts[:num_gens] = torch.tensor([4, 2, 6, 1], device="cuda")
+    num_accepted = torch.tensor([1, width, 3, 1], dtype=torch.int32, device="cuda")
+    accepted = torch.randint(
+        0, vocab, (num_gens, width), dtype=torch.int32, device="cuda", generator=gen
+    )
+    captured = torch.randn(num_gens * width + 3, features, device="cuda", generator=gen)
+    spec_metadata = SimpleNamespace(
+        runtime_draft_len=draft_len,
+        hidden_size=0,
+        captured_hidden_states=captured,
+        get_hidden_states=lambda n: captured[:n],
+    )
+
+    def prepare(side):
+        w = copy.copy(worker)
+        w._ctx_len = worker._ctx_len.clone()
+        pool_storage = storage.clone()
+        w._ctx_kv_buf = [pool_storage[:, layer] for layer in range(layers)]
+        w._ctx_kv_ptrs = torch.tensor([p.data_ptr() for p in w._ctx_kv_buf], device="cuda")
+        w._fused_gen_prepare_applies = lambda *_: True
+        md = SimpleNamespace(
+            num_contexts=0,
+            num_seqs=num_gens,
+            num_ctx_tokens=0,
+            _seq_lens_cuda=torch.full((num_gens,), 99, dtype=torch.int32, device="cuda"),
+            _seq_lens=torch.full((num_gens,), 99, dtype=torch.int32),
+        )
+        w._ctx_side = (
+            w._launch_context_side(drafter, spec_metadata, md, captured.shape[0]) if side else None
+        )
+        assert (w._ctx_side is not None) == side
+        inputs = w.prepare_1st_drafter_inputs(
+            input_ids=None,
+            position_ids=None,
+            hidden_states=captured,
+            accepted_tokens=accepted,
+            num_accepted_tokens=num_accepted,
+            attn_metadata=md,
+            spec_metadata=spec_metadata,
+            draft_model=drafter,
+            total_target_tokens=captured.shape[0],
+        )
+        assert w._ctx_side is None
+        torch.cuda.synchronize()
+        return inputs, w._ctx_len, md, pool_storage
+
+    main, main_len, main_md, main_pool = prepare(False)
+    side, side_len, side_md, side_pool = prepare(True)
+    for key in ("noise_embedding", "query_positions", "num_ctx_per_req", "first_prev_tokens"):
+        assert torch.equal(side[key], main[key]), key
+    for field in ("pages", "offsets", "seq_lens", "kv_bounds"):
+        assert torch.equal(
+            getattr(side["block_placement"], field), getattr(main["block_placement"], field)
+        ), field
+    assert torch.equal(side_len, main_len)
+    assert torch.equal(side_md._seq_lens_cuda, main_md._seq_lens_cuda)
+    assert torch.equal(side_pool.view(torch.int16), main_pool.view(torch.int16))
+    assert not torch.equal(main_pool.view(torch.int16), storage.view(torch.int16))
+
+
 def test_store_context_latents_saturates_into_an_fp8_pool():
     from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
     from tensorrt_llm._torch.speculative.spec_tail_kernels import store_context_latents

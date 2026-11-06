@@ -275,6 +275,19 @@ def _check(tp):
         gathered = MPI.COMM_WORLD.allgather(out.float().cpu())
         assert all(torch.equal(o, gathered[0]) for o in gathered)
 
+        # The side-stream projection reduces on its own workspace where the shared all-reduce
+        # is MNNVL, and matches the main-stream one (both one-shot at 8 rows).
+        side = sharded._ctx_side_all_reduce
+        assert single.projects_context_beside(8)
+        assert sharded.projects_context_beside(8) == (side is not None)
+        assert not sharded.projects_context_beside(33)
+        if side is not None:
+            assert side.mnnvl_allreduce.own_workspace is not None
+            rows = captured[0, :8]
+            with discard_nccl_window_tensor_outputs(rows), torch.inference_mode():
+                beside = sharded.project_target_hidden_beside(rows).clone()
+            assert torch.equal(beside, _project(sharded, rows))
+
         # An fc input width that does not split over tp_size keeps the whole fc
         # and projects exactly as the unsharded drafter does.
         weights = _weights()
