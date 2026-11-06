@@ -1348,6 +1348,11 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
+        # Likewise drop the warmup steps from the shared-prefix attention counters.
+        sampling_shared_prefix = self._shared_prefix_attn_library()
+        if (sampling_shared_prefix is not None
+                and self.kv_cache_manager is not None):
+            sampling_shared_prefix.reset_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -3567,6 +3572,9 @@ class PyExecutor:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
+            shared_prefix_attn_stats = self._shared_prefix_attn_stats()
+            if shared_prefix_attn_stats is not None:
+                local_dict["sharedPrefixAttnStats"] = shared_prefix_attn_stats
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
             self._pending_iter_stats_dict = local_dict
@@ -3583,6 +3591,9 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] shared_prefix_attn_stats: Optional[Dict[str, int]]
+        shared_prefix_attn_stats = self._shared_prefix_attn_stats(
+            attention_dp_rank)
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -3590,7 +3601,36 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, shared_prefix_attn_stats))
+
+    @staticmethod
+    def _shared_prefix_attn_library():
+        """The shared-prefix attention module when that FMHA library is enabled, else None."""
+        from tensorrt_llm._torch.attention.backends.fmha.registry import \
+            is_fmha_lib_enabled
+        if not is_fmha_lib_enabled("sampling_shared_prefix"):
+            return None
+        from tensorrt_llm._torch.attention.backends.fmha import \
+            sampling_shared_prefix
+        return sampling_shared_prefix
+
+    def _shared_prefix_attn_stats(
+            self,
+            attention_dp_rank: Optional[int] = None) -> Optional[Dict[str, int]]:
+        """Cumulative shared-prefix attention counters of this executor's KV cache.
+
+        Cumulative, so a consumer that misses records (a bounded stats buffer)
+        still reads exact totals. None unless that FMHA library is enabled, and
+        for records this rank appends on behalf of another attention-DP rank
+        (the counters are local to each rank; TLLM_METRICS_ALL_RANKS=1 reports
+        every rank's own).
+        """
+        if attention_dp_rank not in (None, self.dist.tp_rank):
+            return None
+        sampling_shared_prefix = self._shared_prefix_attn_library()
+        if sampling_shared_prefix is None or self.kv_cache_manager is None:
+            return None
+        return sampling_shared_prefix.step_stats(self.kv_cache_manager).as_dict()
 
     def _process_iter_stats(
         self,
@@ -5843,6 +5883,16 @@ class PyExecutor:
         if not getattr(self, "_is_kv_manager_v2", False):
             return False
         return self.kv_cache_manager.is_preemption_pending(request)
+
+    def _has_pending_preemption(self) -> bool:
+        """True while any victim is parked mid-preemption (V2 only).
+
+        Lets per-request loops skip `_is_preemption_pending` in the common
+        case where nothing is parked.
+        """
+        if not getattr(self, "_is_kv_manager_v2", False):
+            return False
+        return self.kv_cache_manager.has_pending_preemption()
 
     def _resume_preempted_request(self, request: LlmRequest) -> bool:
         """Complete a preemption whose connector saves have now retired.
@@ -11177,6 +11227,8 @@ class PyExecutor:
 
         batch_token_time = self.perf_manager.get_timestamp()
         gpu_times_cache = {}
+        check_preemption = self._has_pending_preemption()
+        perf_metrics_enabled = self.perf_manager.enabled
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -11189,7 +11241,7 @@ class PyExecutor:
             # Responding would hand the client a final response for a request
             # about to re-prefill, and dropping it from active_requests would
             # leave _resume_preempted_request nothing to put back.
-            if self._is_preemption_pending(request):
+            if check_preemption and self._is_preemption_pending(request):
                 new_active_requests.append(request)
                 continue
 
@@ -11237,8 +11289,12 @@ class PyExecutor:
             request.draft_tokens = request.py_draft_tokens or []
             request.decoding_iter = request.py_decoding_iter
 
-            self.perf_manager.append_step_metrics(
-                request, self.iter_counter, batch_token_time=batch_token_time)
+            # append_step_metrics returns immediately while metrics are off.
+            if perf_metrics_enabled:
+                self.perf_manager.append_step_metrics(
+                    request,
+                    self.iter_counter,
+                    batch_token_time=batch_token_time)
 
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
@@ -11258,8 +11314,18 @@ class PyExecutor:
             # for stream_interval after the context-side first token.
             first_gen_emit = (request.is_generation_only_request
                               and not request.py_gen_first_emitted)
-            if self._should_emit_response(request, emit_first_iter,
-                                          first_gen_emit):
+            should_emit = self._should_emit_response(request, emit_first_iter,
+                                                     first_gen_emit)
+            # A non-streaming request yields no result until it finishes
+            # (LlmRequest::createResult), so creating a response for it on
+            # every earlier step only costs a native call. Requests that
+            # return perf metrics keep the call: it finalizes their ctx GPU
+            # totals.
+            if (should_emit and not request.is_finished
+                    and not request.streaming
+                    and not request.return_perf_metrics):
+                should_emit = False
+            if should_emit:
                 if request.return_perf_metrics:
                     # Response creation may finalize and copy scalar ctx GPU totals.
                     self.perf_manager.compute_batch_gpu_times(

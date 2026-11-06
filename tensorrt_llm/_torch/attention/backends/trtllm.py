@@ -55,6 +55,10 @@ from ...utils import (compute_swizzled_sf_shape, get_global_attrs,
 from ..kernels.sage_quant import SageQuantized, sage_quantize
 from .fmha.fp4_mla import Fp4MlaFmha
 from .fmha.manager import FmhaManager
+from .fmha.registry import is_fmha_lib_enabled
+from .fmha.sampling_shared_prefix import LIB_NAME as SAMPLING_SHARED_PREFIX_LIB
+from .fmha.sampling_shared_prefix import \
+    plan_step as sampling_shared_prefix_plan_step
 from .fp4_mla import (can_fuse_fp4_mla_q_quant, load_fp4_mla_chunked_kv_cache,
                       populate_helix_spec_buffers, scatter_fp4_mla_kv_cache)
 from .fp4_mla.state import Fp4MlaState
@@ -191,6 +195,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # workspaces that CUDA graphs capture, so it lives exactly as long as this
     # metadata; every layer that runs with this metadata reuses it.
     fmha_plan_caches: Dict[str, dict] = field(default_factory=dict,
+                                              init=False,
+                                              repr=False)
+    # Per-step device tensors that FMHA libraries derive once and share across
+    # the layers of a forward (e.g. page tables); emptied by every prepare().
+    fmha_step_caches: Dict[str, dict] = field(default_factory=dict,
                                               init=False,
                                               repr=False)
     # Context-only plan shared by the layers of one forward (TrtllmAttention.cache_context_plan).
@@ -426,6 +435,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         # CUDA-graph metadata is a shallow copy that re-runs this method; give it
         # its own plan caches so each captured batch size plans its own wrappers.
         self.fmha_plan_caches = {}
+        self.fmha_step_caches = {}
         # Each copy records and restores its own draft swaps.
         self.draft_replay_swapped_attrs = {}
         self._post_init_with_buffers(self.cuda_graph_buffers)
@@ -1053,6 +1063,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def prepare(self) -> None:
         super().prepare()
         self.context_plan = None
+        self.fmha_step_caches = {}
         # Recomputed on first use this iteration; see mla_prepare_scheduler_buffers.
         self._invalidate_mla_scheduler_buffers()
         self._steady_block_table_keys = (None, None)
@@ -1228,6 +1239,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))
 
+        # Per-step host planning of the opt-in shared-prefix generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        if is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB):
+            sampling_shared_prefix_plan_step(self)
+
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
         batch = len(view.page_counts)
@@ -1320,14 +1337,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
         prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        mixed-precision KV, full generation page table or shared-prefix step plan) and prepare() is this
+        class's."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
                 and self.kv_cache_manager is not None
                 and not self.enable_flash_mla and not self.enable_helix
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
-                and not self.kv_cache_params.use_full_generation_page_table)
+                and not self.kv_cache_params.use_full_generation_page_table
+                # The shared-prefix library plans every step in prepare().
+                and not is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB))
 
     def key_prepared_block_offsets(self) -> None:
         """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips

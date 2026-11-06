@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import os
 from typing import TypeAlias
 
 from .cute_dsl_mla import CuteDslMlaFmha
 from .fallback import FallbackFmha
+from .flash_attn4_generation import FlashAttn4GenerationFmha
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
 from .fp4_mla import Fp4MlaFmha
 from .interface import Fmha
 from .prims_ts import PrimsTSFmha
+from .sampling_shared_prefix import SamplingSharedPrefixFmha
 from .triton_custom_mask import TritonCustomMaskFmha
 
 FmhaCls: TypeAlias = type[Fmha]
@@ -64,6 +67,15 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
         # DeepSeek-V4 on SM100, so every other model and architecture never
         # sees it; everything else keeps the TRTLLM-Gen libraries below.
         "prims_ts_sparse_mla": PrimsTSSparseMlaFmha,
+        # Opt-in shared-prefix generation path (TLLM_FMHA_LIBS=+sampling_shared_prefix).
+        # It must precede flashinfer_trtllm_gen, which takes every generation
+        # batch it supports. It declines eager batches without a shared prefix
+        # but serves every n-sample batch a CUDA graph is captured for.
+        "sampling_shared_prefix": SamplingSharedPrefixFmha,
+        # Opt-in FlashAttention-4 generation path on SM90 (TLLM_FMHA_LIBS=+flash_attn4_generation):
+        # decode and linear speculative verification. After sampling_shared_prefix, which takes the
+        # n-sample batches it plans.
+        "flash_attn4_generation": FlashAttn4GenerationFmha,
         # GQA decode layers (GqaDecodeSetup) only: dedicated generation kernels in order of precedence, then
         # trtllm-gen with the module's KV append / deferred prologue.
         "gqa_kv_replica_fused": GqaKvReplicaFusedFmha,
@@ -77,14 +89,25 @@ def init_fmha_libs() -> dict[str, "FmhaCls"]:
 
 
 FMHA_LIBS: dict[str, FmhaCls] = init_fmha_libs()
-_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset({"prims_ts"})
+# Libraries left out of the default set and enabled explicitly through
+# TLLM_FMHA_LIBS: dense PrimTS can add host overhead; sampling_shared_prefix is a
+# narrow-scope n-sample path (KV cache manager V2); flash_attn4_generation is an SM90 generation
+# path under evaluation.
+_OPT_IN_FMHA_LIBS: frozenset[str] = frozenset(
+    {"prims_ts", "sampling_shared_prefix", "flash_attn4_generation"}
+)
 DEFAULT_FMHA_LIBS: tuple[str, ...] = tuple(
     name for name in FMHA_LIBS if name not in _OPT_IN_FMHA_LIBS
 )
 
 
 def _parse_fmha_libs_env() -> tuple[str, ...]:
-    value = os.environ.get("TLLM_FMHA_LIBS")
+    return _parse_fmha_libs_value(os.environ.get("TLLM_FMHA_LIBS"))
+
+
+@functools.lru_cache(maxsize=8)
+def _parse_fmha_libs_value(value: str | None) -> tuple[str, ...]:
+    """Parse a ``TLLM_FMHA_LIBS`` value; cached because per-step host code queries it."""
     if value is None or not value.strip():
         return DEFAULT_FMHA_LIBS
 
@@ -128,10 +151,16 @@ def get_enabled_fmha_lib_classes() -> list[FmhaCls]:
     return [FMHA_LIBS[name] for name in _parse_fmha_libs_env()]
 
 
+def is_fmha_lib_enabled(name: str) -> bool:
+    """Whether ``TLLM_FMHA_LIBS`` (or the default set) enables ``name``."""
+    return name in _parse_fmha_libs_env()
+
+
 __all__ = [
     "DEFAULT_FMHA_LIBS",
     "FMHA_LIBS",
     "FmhaCls",
     "get_enabled_fmha_lib_classes",
     "init_fmha_libs",
+    "is_fmha_lib_enabled",
 ]

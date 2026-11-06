@@ -87,6 +87,9 @@ class FallbackFmha(PhasedFmha):
     NEEDS_BLOCK_EXTENT = False
     supports_skip_correction = True
     supports_workspace_reclamation = True
+    # thop.attention runs its context and generation stages separately and skips the
+    # generation stage for AttentionInputType.context_only (attentionOp.cpp).
+    serves_context_only_input = True
 
     # Head sizes whose fused context FMHA kernel is proven absent for at
     # least one KV cache dtype, per SM version. This is a blocklist of

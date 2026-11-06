@@ -274,6 +274,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._no_schedule_until_state_value = no_schedule_until_state.value
         self._no_schedule_after_state_value = no_schedule_after_state.value
         self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
+        # Prefix-aware skip bookkeeping: first-chunk contributors of the previous schedule
+        # (block key -> request id), and keys whose deferral did not pay (see
+        # ``_deferral_paid``).
+        self._prev_first_chunk_contributors: dict = {}
+        self._unpaid_prefix_keys: dict = {}
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
         self._gen_to_complete_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
@@ -503,14 +508,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Use indexed iteration (while + req_it_end) so that MAX_UTIL
         # eviction can shrink the range from the tail.
         requests_list = self._filter_remote_tail_phase_requests(list(active_requests))
+        # Only context requests can carry an exclusive mode, so test the state
+        # first: during decode every request fails it, one cheap compare each.
         exclusive_remote_mode = next(
             (
                 getattr(req, "py_csa2_remote_tail_mode", None)
                 for req in requests_list
-                if not defer_remote_tail_context
+                if req.state_value == self._context_init_state_value
+                and not defer_remote_tail_context
                 and self.remote_tail_phase is not RemoteTailPhase.DECODE
                 and req.request_id not in inflight_request_ids
-                and req.state_value == self._context_init_state_value
                 and getattr(req, "py_csa2_remote_tail_mode", None) is not None
             ),
             None,
@@ -554,9 +561,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         # empty and context requests with a different adapter could be
         # admitted, causing ensure_batch to crash when it can't evict the
         # still-active adapter.
-        for req in requests_list:
-            if req.state_value == self._gen_to_complete_state_value:
-                budget.pre_claim_peft(req)
+        if self.peft_cache_manager is not None:
+            for req in requests_list:
+                if req.state_value == self._gen_to_complete_state_value:
+                    budget.pre_claim_peft(req)
 
         # --- Phase 1: generation / disagg only ---
         while req_it < req_it_end:
@@ -742,6 +750,16 @@ class KVCacheV2Scheduler(RequestScheduler):
         deferred_behind_contributor = False
         # Only context-only batches take Mamba snapshots inside the forward.
         self._inforward_snapshot_rows_left = 0 if scheduled_gen else self._inforward_snapshot_rows
+        first_chunk_contributors: dict = {}
+        context_init_ids = (
+            {
+                r.py_request_id
+                for r in requests_list
+                if r.state_value == self._context_init_state_value
+            }
+            if contributed_blocks is not None and self._prev_first_chunk_contributors
+            else frozenset()
+        )
 
         if self._ctx_shortest_first and len(pending_ctx) > 1:
             pending_ctx = self._order_ctx_shortest_first(pending_ctx)
@@ -839,6 +857,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                         req.is_first_context_chunk
                         and first_new_block is not None
                         and first_new_block in contributed_blocks
+                        and self._deferral_paid(first_new_block, context_init_ids)
                     ):
                         logger.debug(
                             f"Deferring context request {req.py_request_id}: its first new "
@@ -895,6 +914,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                     # real deadlock.
                     if first_new_block is not None:
                         contributed_blocks.add(first_new_block)
+                        if req.is_first_context_chunk:
+                            first_chunk_contributors[first_new_block] = req.py_request_id
+
+        self._prev_first_chunk_contributors = first_chunk_contributors
 
         made_progress = bool(
             scheduled_gen
@@ -1074,6 +1097,29 @@ class KVCacheV2Scheduler(RequestScheduler):
         return shares
 
     # ---- Prefix-aware skip ----
+
+    _MAX_UNPAID_PREFIX_KEYS = 4096
+
+    def _deferral_paid(self, key, context_init_ids) -> bool:
+        """Whether deferring behind the contributor of ``key`` can still be repaid by a reuse hit.
+
+        The skip assumes the contributor commits ``key`` while it runs, so the deferred duplicate
+        matches it on the next pass. When a request contributed ``key`` on the previous schedule,
+        has since left the context phase, and ``key`` is still the first new block of a
+        duplicate, the block was not committed by that context step (e.g. the block reaches into
+        the tokens the request recomputes or reads ahead, so it is only filled during generation)
+        and every further deferral is pure delay: with n samples of one prompt this admitted one
+        sample per prompt per iteration. Such keys stop deferring.
+        """
+        if key in self._unpaid_prefix_keys:
+            return False
+        contributor = self._prev_first_chunk_contributors.get(key)
+        if contributor is not None and contributor not in context_init_ids:
+            if len(self._unpaid_prefix_keys) >= self._MAX_UNPAID_PREFIX_KEYS:
+                self._unpaid_prefix_keys.pop(next(iter(self._unpaid_prefix_keys)))
+            self._unpaid_prefix_keys[key] = None
+            return False
+        return True
 
     def _is_prefix_skip_candidate(self, req: LlmRequest) -> bool:
         """Whether *req* may be deferred in favour of a duplicate prefix.

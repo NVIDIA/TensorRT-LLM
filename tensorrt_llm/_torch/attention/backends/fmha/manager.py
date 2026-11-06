@@ -39,6 +39,7 @@ from .combined import CombinedFmha
 from .interface import Fmha, FmhaPhase
 from .phased import PhasedFmha
 from .registry import get_enabled_fmha_lib_classes
+from .sampling_shared_prefix import has_active_plan
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.trtllm import (
@@ -141,6 +142,9 @@ class _FmhaCacheKey(NamedTuple):
     output_sf_dtype: torch.dtype | None
     # The query is the raw projection of a deferred prologue (Fmha.supports_deferred_prologue).
     deferred_prologue: bool
+    # Whether the batch was planned for the shared-prefix library, which
+    # supports a batch only when it was.
+    shared_prefix_plan: bool
 
 
 _FmhaCacheInputs = dict[str, str]
@@ -425,6 +429,7 @@ class FmhaManager:
             deferred_prologue=(
                 forward_args.kv_append is not None and forward_args.kv_append.fold is not None
             ),
+            shared_prefix_plan=has_active_plan(metadata),
         )
 
     def select(
@@ -508,6 +513,20 @@ class FmhaManager:
         generation_fmha = None
         for fmha in self.fmha_libs:
             if fmha.is_supported(q, k, v, metadata, forward_args):
+                # A higher-priority phased library that opted in already took the
+                # generation rows of this mixed batch: let this library serve only the
+                # context requests rather than the whole batch.
+                if (
+                    context_fmha is None
+                    and generation_fmha is not None
+                    and generation_fmha.pairs_with_whole_batch_context
+                    and forward_args.attention_input_type == AttentionInputType.mixed
+                    and generation_fmha is not fmha
+                    and self._serves_context_phase(fmha, q, k, v, metadata, forward_args)
+                ):
+                    combined_fmha = CombinedFmha(attn)
+                    combined_fmha.set_fmha_impls(fmha, generation_fmha, whole_batch_context=True)
+                    return combined_fmha
                 return fmha
 
             if not isinstance(fmha, PhasedFmha):
@@ -549,6 +568,20 @@ class FmhaManager:
             combined_fmha.set_fmha_impls(context_fmha, generation_fmha)
             return combined_fmha
         return None
+
+    @staticmethod
+    def _serves_context_phase(
+        fmha: Fmha,
+        q: torch.Tensor,
+        k: torch.Tensor | None,
+        v: torch.Tensor | None,
+        metadata: TrtllmAttentionMetadata,
+        forward_args: AttentionForwardArgs,
+    ) -> bool:
+        """Whether ``fmha``, which supports a whole mixed batch, can serve its context phase alone."""
+        if not (isinstance(fmha, PhasedFmha) or fmha.serves_context_only_input):
+            return False
+        return fmha.is_supported(q, k, v, metadata, forward_args, phase=FmhaPhase.CONTEXT)
 
     def _select_mla(
         self,
