@@ -37,10 +37,9 @@ l0_h100:
   - unittest/others/test_lora_manager.py
   - unittest/_torch/misc
   # ------------- modules (non-MoE) ---------------
-  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  # fused quant and AWQ are skip_pre_blackwell / SM<100. They run from
+  # l0_b200.yml, l0_b300.yml, and l0_gb300_multi_gpus.yml.
   - unittest/_torch/modules/test_rms_norm_fp8_per_token.py
-  - unittest/_torch/modules/test_fused_activation_quant.py
-  - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
   - unittest/_torch/modules/mamba
