@@ -4187,6 +4187,23 @@ class KVCacheManagerV2(BaseResourceManager):
         self.mixed_precision_high_block_deltas: dict[int, int | None] = {}
         if self.mixed_precision_low_dtype != self.mixed_precision_high_dtype:
             return
+        # Dense attention redirects the block offsets of a whole pool, so every layer of a pool
+        # that holds a mixed-precision layer must have a high layer itself; a layer that takes no
+        # mixed precision (one whose KV cache another layer shares) would read and write the high
+        # pages without its rows ever being copied back.
+        source_layers = {
+            int(self._mixed_precision_layer_page(local_layer)[0])
+            for local_layer in self.mixed_precision_high_layers
+        }
+        for source_layer in sorted(source_layers):
+            pool_id = int(self.impl.get_layer_group_id(source_layer))
+            for layer_id in self.impl.layer_grouping[pool_id]:
+                if int(layer_id) not in source_layers:
+                    raise ValueError(
+                        f"Layer {int(layer_id)} takes no first/last-N mixed precision but shares KV "
+                        f"cache pool {pool_id} with layers that do (for example a layer whose KV "
+                        "cache another layer shares). This model is not supported."
+                    )
         for local_layer, high_layer in self.mixed_precision_high_layers.items():
             source_layer, row_role = self._mixed_precision_layer_page(local_layer)
             source_converter = self.impl.get_page_index_converter(source_layer, row_role)
@@ -4204,15 +4221,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 or int(high_converter.expansion) != 1
                 or high_address != pool_base + int(high_converter.layer_offset) * page_stride
             ):
-                # The high layers copy their layers' pages, so they share a pool with them only
-                # when every KV layer of that pool has a high layer; a layer that takes no
-                # mixed precision (one whose KV cache another layer shares) breaks that, and
-                # dense attention would redirect its block offsets without copying its rows back.
                 raise ValueError(
-                    f"Mixed-precision high layer {high_layer} is not in the pool of layer "
-                    f"{source_layer}: every KV layer of that pool must take the first/last-N "
-                    "mixed precision, which a layer whose KV cache another layer shares does "
-                    "not. This model is not supported."
+                    f"Mixed-precision high layer {high_layer} must be in the pool of layer "
+                    f"{source_layer} with the same page layout."
                 )
             self.mixed_precision_high_layer_offsets[local_layer] = int(high_converter.layer_offset)
             block_delta = int(high_converter.layer_offset) - int(source_converter.layer_offset)
