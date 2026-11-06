@@ -353,8 +353,9 @@ order:
 * ``context_kv_fork``, which re-classes the worker on top of those, binds the
   fork point on the LM head's GEMM call and is armed per decode step by
   ``DecodeTarget``;
-* ``verify_fold`` and ``path_walk_tail`` on top of that (on a folded step its
-  prepare takes the context-K/V fork's side chain);
+* ``verify_fold`` (with ``rejection_fold``, also on rejection-sampled steps) and
+  ``path_walk_tail`` on top of that (on a folded step its prepare takes the context-K/V
+  fork's side chain);
 * ``drafter_hops`` on the drafter's block decode;
 * ``drafter_pdl_chain``;
 * ``drafter_window_compact`` last, on the worker the others left (and after
@@ -911,6 +912,7 @@ _TEP4_BITWISE_PATHS = frozenset(
         "model_boundary",
         "fused_accept",
         "verify_fold",
+        "rejection_fold",
         "draft_head",
         "path_walk_tail",
         "drafter_block_conv",
