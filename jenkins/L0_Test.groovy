@@ -4219,7 +4219,7 @@ def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, no
             if (stageIsFailed && !suppressTestReporting) {
                 if (stageIsInterrupted) {
                     echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
-                } else if (!fileExists("${stageName}/results-timeout.xml")) {
+                } else {
                     // Generate timeout test result xml if there are terminated unexpectedly tests
                     generateTimeoutTestResultXml(pipeline, stageName)
                 }
@@ -4772,20 +4772,47 @@ def generateTimeoutTestResultXml(pipeline, stageName) {
         script: "find -L . -name generate_timeout_xml.py | head -n 1 | xargs --no-run-if-empty realpath",
         returnStdout: true
     ).trim()
+    def curPath = sh(script: "realpath .", returnStdout: true).trim()
+    def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
+    // grep: 0 = a test is listed, 1 = the list is empty, 2 = the list is missing or unreadable.
+    def listRc = sh(script: "grep -qs '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true)
+    def hasUnfinished = listRc == 0
+    if (listRc > 1) {
+        // An unreadable list is not an empty one: keep the existing report.
+        echo "${stageName}/unfinished_test.txt cannot be read; keeping the existing ${stageName}/results-timeout.xml"
+        return fileExists(outputFilePath)
+    }
     if (!scriptPath) {
         // Without the script no results-timeout.xml is written, but the tests that did not
         // finish must still fail the stage.
-        def hasUnfinished = sh(script: "grep -q '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true) == 0
         echo "generate_timeout_xml.py not found (source tree may have been cleaned up); skipping timeout XML generation" +
             (hasUnfinished ? ", but ${stageName}/unfinished_test.txt lists unfinished tests." : ".")
+        if (!hasUnfinished) {
+            sh "rm -f '${outputFilePath}'"
+        }
         return hasUnfinished
     }
-    def curPath = sh(script: "realpath .", returnStdout: true).trim()
-    def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
-    sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
-    if (fileExists(outputFilePath)) {
+    // Rebuild from the current unfinished_test.txt into a temporary file, then replace the
+    // existing results-timeout.xml with it. An earlier snapshot may have written the file for
+    // a test that a later rerun finished (its teardown removes the nodeid), so an empty list
+    // must remove it. The temporary name does not match junit()'s "results*.xml" glob.
+    def tmpOutputFilePath = "${outputFilePath}.tmp"
+    sh "rm -f '${tmpOutputFilePath}'"
+    def rc = sh(
+        script: """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${tmpOutputFilePath}'""",
+        returnStatus: true
+    )
+    if (rc != 0) {
+        // Keep the previous results-timeout.xml rather than lose the record.
+        echo "generate_timeout_xml.py failed (rc=${rc}); keeping the existing ${stageName}/results-timeout.xml"
+        sh "rm -f '${tmpOutputFilePath}'"
+        return fileExists(outputFilePath) || hasUnfinished
+    }
+    if (fileExists(tmpOutputFilePath)) {
+        sh "mv -f '${tmpOutputFilePath}' '${outputFilePath}'"
         return true
     }
+    sh "rm -f '${outputFilePath}'"
     return false
 }
 
@@ -6038,6 +6065,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         // (isRerunFailed=true), and unfinished_test.txt is the only
                         // record of that crash. junit()'s "results*.xml" glob picks up
                         // results-timeout.xml directly, so this is what surfaces it.
+                        // The file is rebuilt from unfinished_test.txt as it stands after
+                        // the rerun: tests that never finished (not rerun, or crashed
+                        // again) stay listed, while a test whose rerun finished has
+                        // already been cleared by its teardown and is not reported.
                         def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
                         if (rerunResult.failed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
@@ -6046,7 +6077,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             rerunFailed = true
                             rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
                         } else if (hadUnfinishedTests) {
-                            // Rerun passed but the first run had a timeout: mark this
+                            // Rerun passed but some tests are still unfinished (typically
+                            // a first-run crash or timeout that was not rerun): mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
                             // not just the enclosing parent stage.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
@@ -6126,7 +6158,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
-        if (fileExists("${stageName}/results-timeout.xml") || generateTimeoutTestResultXml(pipeline, stageName)) {
+        if (generateTimeoutTestResultXml(pipeline, stageName)) {
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
