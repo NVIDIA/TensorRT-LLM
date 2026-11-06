@@ -1697,6 +1697,40 @@ def test_cold_codec_provider_rejects_mixed_layer_spec_dtypes(
     codec_provider.create_cold_page_codec.assert_not_called()
 
 
+@pytest.mark.cpu_only
+def test_cold_codec_provider_keeps_draft_layers_lossless() -> None:
+    """A drafter's layers may differ in dtype from the target's: they stay lossless."""
+    codec_provider = Mock()
+    layer_specs = [
+        KVCacheLayerSpec(
+            global_layer_id=layer_id,
+            owner=owner,
+            dtype=layer_dtype,
+            num_kv_heads=1,
+            head_dim=1,
+            buffer_roles=(Role.KEY,),
+        )
+        for layer_id, (owner, layer_dtype) in enumerate(
+            [
+                (KVCacheLayerOwner.TARGET, DataType.FP8),
+                (KVCacheLayerOwner.TARGET, DataType.FP8),
+                (KVCacheLayerOwner.DRAFT, DataType.BF16),
+            ]
+        )
+    ]
+    _make_manager_for_cache_tier_test(
+        KvCacheConfig(max_gpu_total_bytes=16 << 20),
+        [Mock()],
+        cold_page_codec_provider=codec_provider,
+        layer_specs=layer_specs,
+    )
+
+    codec_provider.create_cold_page_codec.assert_called_once()
+    kwargs = codec_provider.create_cold_page_codec.call_args.kwargs
+    assert kwargs["runtime_dtype"] == DataType.FP8
+    assert kwargs["lossless_layers"] == frozenset({2})
+
+
 def test_extra_tokens_are_in_context_capacity() -> None:
     config = _make_cache_config_for_test(
         KvCacheConfig(avg_seq_len=264),
