@@ -6625,7 +6625,6 @@ index 21c777e..fa48c96 100644
              v_q.global_scale,
              k2q_row_ptr,
 diff --git a/python/fmha_sm100/jit.py b/python/fmha_sm100/jit.py
-index fa63a02..2d2aa2b 100644
 --- a/python/fmha_sm100/jit.py
 +++ b/python/fmha_sm100/jit.py
 @@ -1,4 +1,5 @@
@@ -6648,7 +6647,7 @@ index fa63a02..2d2aa2b 100644
  import logging
  import os
  import shutil
-@@ -22,11 +24,54 @@ import jinja2
+@@ -22,11 +24,54 @@
  
  logger = logging.getLogger(__name__)
  
@@ -6706,7 +6705,7 @@ index fa63a02..2d2aa2b 100644
      # Different build configs get separate cache dirs to avoid conflicts
      suffix = ""
      if os.environ.get("GPU_TRACE") is not None:
-@@ -35,12 +80,58 @@ def _compute_cache_base():
+@@ -35,12 +80,58 @@
          suffix += "_sm_timing"
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          suffix += "_gmem_check"
@@ -6719,6 +6718,9 @@ index fa63a02..2d2aa2b 100644
 +    if suffix and not explicit:
          base = base.parent / (base.name + suffix)
 -    return base
+-
+-
+-CACHE_BASE = _compute_cache_base()
 +
 +    # Hash templates, bindings and headers together; jit.py also covers changes
 +    # to dispatch and compiler flags. Use relative names so installs share keys.
@@ -6738,9 +6740,8 @@ index fa63a02..2d2aa2b 100644
 +        "diagnostic modes require recompilation)", cache_base,
 +    )
 +    return cache_base
- 
- 
--CACHE_BASE = _compute_cache_base()
++
++
 +class _LazyCacheBase:
 +    """The cache root, computed on first use: its suffix depends on the device (see _proxy_modes)."""
 +
@@ -6768,7 +6769,7 @@ index fa63a02..2d2aa2b 100644
  
  
  def _acquire_file_lock(lock_path):
-@@ -55,13 +146,6 @@ def _release_file_lock(fd):
+@@ -55,13 +146,6 @@
      os.close(fd)
  
  
@@ -6782,17 +6783,92 @@ index fa63a02..2d2aa2b 100644
  
  _PACK_FACTORS = [1,2,4,6,8,16]
  # _PACK_FACTORS = [1, 6]
-@@ -187,7 +271,8 @@ def _get_cuda_home():
+@@ -187,7 +271,83 @@
      raise RuntimeError("Cannot find CUDA toolkit. Set CUDA_HOME.")
  
  
 -_ALL_VARIANTS_SO = CACHE_BASE / "_all_variants" / "all_variants.so"
 +def _all_variants_so() -> Path:
 +    return CACHE_BASE / "_all_variants" / "all_variants.so"
++
++_JIT_TARGET_UNSET = object()
++_jit_target_value = _JIT_TARGET_UNSET
++
++
++def _resolve_jit_target():
++    """The SM100-family target to build for: the visible devices', else None.
++
++    A JIT build only has to run on this process's GPUs, so when they all share
++    one architecture it targets that alone (one device compile instead of
++    three). MINFER_FMHA_CUDA_ARCH (e.g. ``103a``) overrides it; with no CUDA
++    device, devices outside the family, or visible devices of different
++    architectures, it is None and the build keeps the portable three-target
++    image. A resolved target is exported to MINFER_FMHA_CUDA_ARCH, so child
++    processes build for, and look in, the same target. Resolved on the first
++    build, not at import, so importing initializes no CUDA context.
++    """
++    global _jit_target_value
++    if _jit_target_value is not _JIT_TARGET_UNSET:
++        return _jit_target_value
++    target = os.environ.get("MINFER_FMHA_CUDA_ARCH") or None
++    if target is None:
++        try:
++            import torch
++            if torch.cuda.is_available():
++                caps = {
++                    torch.cuda.get_device_capability(i)
++                    for i in range(torch.cuda.device_count())
++                }
++                if len(caps) == 1 and caps <= {(10, 0), (10, 3)}:
++                    major, minor = caps.pop()
++                    target = f"{major}{minor}a"
++        except (ImportError, RuntimeError):  # keep the portable image
++            target = None
++        if target is not None:
++            os.environ["MINFER_FMHA_CUDA_ARCH"] = target
++    _jit_target_value = target
++    return target
++
++
++def _jit_base():
++    """Root of what JIT builds: per target, so images for one GPU are never
++    loaded on another; the portable image keeps the shared root."""
++    target = _resolve_jit_target()
++    return CACHE_BASE / f"sm_{target}" if target else CACHE_BASE
++
++
++def _built_dir(name, so_name):
++    """Where module ``name`` is loaded from and built: this target's directory,
++    unless only the shared CACHE_BASE holds a build of it, a portable image
++    from scripts/warmup_fmha_sm100.py or from a process that built without a
++    target (no usable CUDA device, or GPUs of different architectures)."""
++    target_dir = _jit_base() / name
++    shared_dir = CACHE_BASE / name
++    if not (target_dir / so_name).exists() and (shared_dir / so_name).exists():
++        return shared_dir
++    return target_dir
++
++
++def _select_gencode(nvcc_flags, cache_dir):
++    """nvcc_flags with its -gencode targets replaced, in place, by the one of
++    _resolve_jit_target(), for a build in that target's directory
++    (_jit_base()). Builds elsewhere, such as scripts/warmup_fmha_sm100.py
++    writing to the shared CACHE_BASE, keep every target, so any GPU can load
++    what they write."""
++    target = _resolve_jit_target()
++    first = next((i for i, flag in enumerate(nvcc_flags)
++                  if flag.startswith("-gencode=")), None)
++    if (not target or first is None
++            or not Path(cache_dir).is_relative_to(_jit_base())):
++        return nvcc_flags
++    rest = [flag for flag in nvcc_flags if not flag.startswith("-gencode=")]
++    return (rest[:first] + [f"-gencode=arch=compute_{target},code=sm_{target}"]
++            + rest[first:])
++
  
  def _get_nvcc_flags(cache_dir, fmha=True):
      tvm_include = _get_tvm_ffi_include()
-@@ -199,6 +284,9 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -199,6 +359,9 @@
          "--expt-relaxed-constexpr", "--expt-extended-lambda",
          "-gencode=arch=compute_100a,code=sm_100a",
          "-gencode=arch=compute_103a,code=sm_103a",
@@ -6802,19 +6878,21 @@ index fa63a02..2d2aa2b 100644
          "-static-global-template-stub=false",
          "-DFLASHINFER_ENABLE_BF16",
          "-DFLASHINFER_ENABLE_FP8_E4M3",
-@@ -225,6 +313,11 @@ def _get_nvcc_flags(cache_dir, fmha=True):
+@@ -225,7 +388,12 @@
          nvcc_flags.append("-DSM_TIMING_ENABLED")
      if os.environ.get("FMHA_GMEM_CHECK") is not None:
          nvcc_flags.append("-DFMHA_GMEM_BOUNDS_CHECK")
+-    return " ".join(nvcc_flags)
 +    proxy_chain, proxy_single_s = _proxy_modes()
 +    if proxy_chain:
 +        nvcc_flags.append("-DFMHA_ONLYSCORE_PER_TILE_CORRECTION")
 +    if proxy_single_s:
 +        nvcc_flags.append("-DFMHA_ONLYSCORE_SINGLE_S")
-     return " ".join(nvcc_flags)
++    return " ".join(_select_gencode(nvcc_flags, cache_dir))
  
  class _VariantWrapper:
-@@ -257,9 +350,10 @@ class FMHAVariantManager:
+     """Wraps a TVM-FFI function to look like a module with .run()."""
+@@ -257,9 +425,10 @@
      def _ensure_all_module(self):
          if not self._all_module_checked:
              self._all_module_checked = True
@@ -6827,6 +6905,141 @@ index fa63a02..2d2aa2b 100644
  
      def get_variant(self, dtype_code, qo_tile_size, single_wg,
                      sparse_mode, page_size, split_kv, pack_factor):
+@@ -289,12 +458,12 @@
+                     pass
+ 
+             # Try per-variant .so
+-            cache_dir = CACHE_BASE / variant_name
++            cache_dir = _built_dir(variant_name, f"{variant_name}.so")
+             so_path = cache_dir / f"{variant_name}.so"
+             lock_fd = _acquire_file_lock(cache_dir / ".compile.lock")
+             try:
+                 if not so_path.exists():
+-                    self._compile_only(variant_name, params)
++                    self._compile_only(variant_name, params, cache_dir)
+ 
+                 import tvm_ffi
+                 module = tvm_ffi.load_module(str(so_path))
+@@ -304,9 +473,14 @@
+             self._loaded[variant_name] = _VariantWrapper(fn)
+             return self._loaded[variant_name]
+ 
+-    def _compile_only(self, variant_name, params):
+-        """Compile a variant without loading. Safe to call from subprocesses."""
+-        cache_dir = CACHE_BASE / variant_name
++    def _compile_only(self, variant_name, params, cache_dir=None):
++        """Compile a variant without loading. Safe to call from subprocesses.
++
++        ``cache_dir`` is where to build, so a caller that already chose the
++        directory it will load from builds into that one; by default
++        _built_dir() chooses."""
++        if cache_dir is None:
++            cache_dir = _built_dir(variant_name, f"{variant_name}.so")
+         so_path = cache_dir / f"{variant_name}.so"
+ 
+         if so_path.exists():
+@@ -363,7 +537,7 @@
+ 
+     def _run_ninja(self, cache_dir):
+         result = subprocess.run(
+-            ["ninja", "-j1"],
++            ["ninja", "-j2"],
+             cwd=str(cache_dir),
+             capture_output=True,
+             text=True,
+@@ -395,9 +569,11 @@
+ _plan_lock = threading.Lock()
+ 
+ 
+-def _do_compile_plan():
+-    """Generate and compile plan kernel. No TVM loading."""
+-    cache_dir = CACHE_BASE / "plan"
++def _do_compile_plan(cache_dir=None):
++    """Generate and compile plan kernel. No TVM loading. ``cache_dir``: where
++    to build; by default _built_dir() chooses."""
++    if cache_dir is None:
++        cache_dir = _built_dir("plan", "fmha_sm100_plan.so")
+     so_path = cache_dir / "fmha_sm100_plan.so"
+ 
+     if so_path.exists():
+@@ -455,11 +631,14 @@
+ 
+ def _compile_plan_module():
+     """Compile and load plan kernel."""
+-    lock_fd = _acquire_file_lock(CACHE_BASE / "plan.lock")
++    # Build and load in one directory, under the lock every process building
++    # there takes.
++    cache_dir = _built_dir("plan", "fmha_sm100_plan.so")
++    lock_fd = _acquire_file_lock(cache_dir.parent / "plan.lock")
+     try:
+-        _do_compile_plan()
++        _do_compile_plan(cache_dir)
+         import tvm_ffi
+-        so_path = CACHE_BASE / "plan" / "fmha_sm100_plan.so"
++        so_path = cache_dir / "fmha_sm100_plan.so"
+         return tvm_ffi.load_module(str(so_path))
+     finally:
+         _release_file_lock(lock_fd)
+@@ -486,8 +665,9 @@
+ _sparse_topk_lock = threading.Lock()
+ 
+ 
+-def _do_compile_sparse_topk():
+-    cache_dir = CACHE_BASE / "sparse_topk"
++def _do_compile_sparse_topk(cache_dir=None):
++    if cache_dir is None:
++        cache_dir = _built_dir("sparse_topk", "sparse_topk_select.so")
+     so_path = cache_dir / "sparse_topk_select.so"
+ 
+     if so_path.exists():
+@@ -553,11 +733,14 @@
+     with _sparse_topk_lock:
+         if _sparse_topk_module is not None:
+             return _sparse_topk_module
+-        lock_fd = _acquire_file_lock(CACHE_BASE / "sparse_topk.lock")
++        # Build and load in one directory, under the lock every process
++        # building there takes.
++        cache_dir = _built_dir("sparse_topk", "sparse_topk_select.so")
++        lock_fd = _acquire_file_lock(cache_dir.parent / "sparse_topk.lock")
+         try:
+-            _do_compile_sparse_topk()
++            _do_compile_sparse_topk(cache_dir)
+             import tvm_ffi
+-            so_path = CACHE_BASE / "sparse_topk" / "sparse_topk_select.so"
++            so_path = cache_dir / "sparse_topk_select.so"
+             _sparse_topk_module = tvm_ffi.load_module(str(so_path))
+         finally:
+             _release_file_lock(lock_fd)
+@@ -572,8 +755,9 @@
+ _reduction_lock = threading.Lock()
+ 
+ 
+-def _do_compile_reduction():
+-    cache_dir = CACHE_BASE / "reduction"
++def _do_compile_reduction(cache_dir=None):
++    if cache_dir is None:
++        cache_dir = _built_dir("reduction", "fmha_sm100_reduction.so")
+     so_path = cache_dir / "fmha_sm100_reduction.so"
+ 
+     if so_path.exists():
+@@ -638,11 +822,14 @@
+     with _reduction_lock:
+         if _reduction_module is not None:
+             return _reduction_module
+-        lock_fd = _acquire_file_lock(CACHE_BASE / "reduction.lock")
++        # Build and load in one directory, under the lock every process
++        # building there takes.
++        cache_dir = _built_dir("reduction", "fmha_sm100_reduction.so")
++        lock_fd = _acquire_file_lock(cache_dir.parent / "reduction.lock")
+         try:
+-            _do_compile_reduction()
++            _do_compile_reduction(cache_dir)
+             import tvm_ffi
+-            so_path = CACHE_BASE / "reduction" / "fmha_sm100_reduction.so"
++            so_path = cache_dir / "fmha_sm100_reduction.so"
+             _reduction_module = tvm_ffi.load_module(str(so_path))
+         finally:
+             _release_file_lock(lock_fd)
 diff --git a/python/fmha_sm100/sparse.py b/python/fmha_sm100/sparse.py
 index 7006fcd..9a09324 100644
 --- a/python/fmha_sm100/sparse.py

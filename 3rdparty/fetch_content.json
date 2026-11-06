@@ -96,8 +96,7 @@
       "git_submodules": "",
       "source_subdir": "dont-add-this-project-with-add-subdirectory",
       "patch_file": [
-        "patches/msa_strided_paged_kv.patch",
-        "patches/msa_jit_device_arch.patch"
+        "patches/msa_strided_paged_kv.patch"
       ]
     },
     {
