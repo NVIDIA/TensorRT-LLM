@@ -7,11 +7,11 @@ SPDX-License-Identifier: Apache-2.0
 
 These rules summarize findings that came up again and again in reviews of
 AI-assisted KV-cache work in this repository. The areas covered are:
-- the compression framework;
+- the KV cache compression framework;
 - token eviction and physical compaction;
 - cold-page compression;
 - the mixed-precision KV cache;
-- KV Cache Manager V2 reuse;
+- KV cache manager V2 reuse;
 - performance and accuracy validation for all of the above.
 
 Each entry is a rule followed by its rationale. The skills cite these rules;
@@ -33,7 +33,9 @@ read the category you are working in before starting.
    scope.
 8. Never shrink or expand the scope, and never change experiment settings,
    without asking.
-9. Name things by behavior, write plain comments, and use no internal jargon.
+9. Name things by behavior and give each concept one full name, used
+   everywhere. Write plain comments, define every abbreviation at first use,
+   and use no internal jargon.
 10. Answer the question that was asked, first.
 
 ## 1. Design and Architecture
@@ -48,18 +50,20 @@ read the category you are working in before starting.
   "representation" layers, or wrappers around a single hook add review cost
   and are removed again in review.
 - **Methods are subclasses with hooks.** A compression method subclasses the
-  framework's manager base and overrides only the hooks it needs. It never
-  gets a parallel manager or an owner class outside the framework.
+  KV cache compression manager (`KVCacheCompressionManager`) and overrides
+  only the hooks it needs. It never gets a parallel manager or an owner class
+  outside the KV cache compression framework.
 - **Shared core stays generic.**
   - Method logic lives in the method's package and configuration.
-  - Shared code, KVCM, attention, and C++ never branch on a method's or
-    model's name.
+  - Shared code, KV cache manager V2, attention, and C++ never branch on a
+    method's or model's name.
   - Native code exposes one generic hook. Policy, layout, and kernel launches
     stay in the method.
   - One callback per migration batch, never per page.
-- **Prefer the executor-side layer over the native core.** The KVCM V2 core is
-  C++. Configuration, the executor-side wrapper, and existing callbacks are
-  where features belong. Change the core only for an algorithm-neutral
+- **Prefer the executor-side layer over the KV cache manager V2 native
+  core.** The KV cache manager V2 native core is C++. Configuration, the
+  executor-side wrapper, and existing callbacks are where features belong.
+  Change the KV cache manager V2 native core only for an algorithm-neutral
   contract and with evidence, such as a profile.
 - **Respect ownership.** "Do not touch" means another component's core and
   storage logic. Adapt on your side, put code where it belongs, and write
@@ -74,7 +78,7 @@ read the category you are working in before starting.
   take algorithm scores or an opaque dictionary of everything.
 - **Bookkeeping code does not launch kernels.** Management code switches state
   and calls the owner's API. It does not allocate tensors or run per-step
-  framework ops.
+  PyTorch ops.
 - **Branch on the feature's state, not on a dtype, shape, or model name.**
   Checks keyed to today's format or pool count broke when a second format
   arrived. Design interfaces keyed by format so the next one plugs in without
@@ -92,12 +96,13 @@ read the category you are working in before starting.
 - **Extend through existing hooks.** Disaggregated support for the
   mixed-precision KV cache needed one override of the transfer-layer-id hook
   and no change to transfer code.
-- **Methods hold a manager; they do not become one.** A compression method
-  holds a normal KVCM V2. It never subclasses KVCM, writes its private fields,
-  or puts its name into the core.
+- **Methods hold a KV cache manager; they do not become one.** A compression
+  method holds a normal KV cache manager V2. It never subclasses KV cache
+  manager V2, writes its private fields, or puts its name into the KV cache
+  manager V2 native core.
 - **Fix bad state where it is produced.** A `-1` page index that crashed a
-  kernel came from the manager's capacity accounting. Making the kernel
-  tolerate it would have hidden the bug.
+  kernel came from the KV cache manager's capacity accounting. Making the
+  kernel tolerate it would have hidden the bug.
 - **Fix every reader of a contract.** A page-index scale fix applied to one
   page-table getter missed the flat variant that another attention backend
   reads, which caused an illegal memory access.
@@ -122,17 +127,25 @@ read the category you are working in before starting.
 - **No internal shorthand anywhere.** No variant codes, round numbers, version
   labels for kernels, milestone names, or run bookkeeping in code, docs,
   reports, or replies.
-- **One production path.** No fallbacks, version sniffing, legacy-manager
-  paths, hard caps, or eager/graph twin implementations. Shapes derive from
-  the deployment's configuration.
+- **One full name per concept, in code and in text.** Names cut down to a
+  fragment keep coming back in review: a variable called `window` for the
+  mixed-precision high window, or "FP8" and "KV" in test names and
+  explanations where the FP8 KV cache is meant. The reader cannot tell which
+  window, or which FP8, is meant. Write the full name every time, in the
+  identifier, the comment, and the explanation. Abbreviate only with common
+  knowledge (LLM, GPU, CUDA, `attn`) or after writing "full name (ABBR)" at
+  first use.
+- **One production path.** No fallbacks, version sniffing, KV cache manager
+  V1 paths, hard caps, or separate eager-mode and CUDA-graph implementations.
+  Shapes derive from the deployment's configuration.
 - **Fail fast, at configuration or initialization time.** A missing parameter
   that surfaces later as a shape mismatch, a calibration path that silently
   produces identity scales, or an early `return` that skips an unsupported
-  manager all hide errors from the user.
-- **Validate once, in one place.** Delete checks for states the framework
-  already rules out, such as the manager version, architecture, alignment, or
-  null pointers, especially on hot paths. Do not repeat a compatibility check
-  inside an attention backend.
+  KV cache manager all hide errors from the user.
+- **Validate once, in one place.** Delete checks for states that earlier
+  validation already rules out, such as the KV cache manager version,
+  architecture, alignment, or null pointers, especially on hot paths. Do not
+  repeat a compatibility check inside an attention backend.
 - **Use explicit contracts.** Access attributes directly, put typed fields on
   the owning class, and keep internals out of the public API. Do not churn
   existing `getattr` code outside your change.
@@ -155,8 +168,9 @@ read the category you are working in before starting.
 
 - **Production configuration only.** Keep CUDA graphs and the overlap
   scheduler on, use the recommended serving settings, and limit
-  instrumentation to NVTX. A "profiling configuration" with graphs off
-  misstates step time by multiples, and its results have to be redone.
+  instrumentation to NVIDIA Tools Extension (NVTX). A "profiling
+  configuration" with CUDA graphs off misstates step time by multiples, and
+  its results have to be redone.
 - **Benchmark the workload the feature is for.**
   - Use large batches with continuous batching, long inputs and outputs, and
     distinct prompts.
@@ -170,8 +184,9 @@ read the category you are working in before starting.
     from shared costs.
   - Use the full kernel list; truncated lists produced phantom negative costs.
 - **Compare like with like.** Keep the GPU type, model, parallelism, and
-  build the same, and change one knob at a time. Understand each knob, such as
-  the difference between chunk size and token limits, before sweeping it.
+  build the same, and change one setting at a time. Understand each setting,
+  such as the difference between chunk size and token limits, before
+  sweeping it.
 - **Never perturb the baseline.** A harness that adds per-step work, or a
   control call that serializes migrations, invalidates the comparison.
 - **Prove the tested path ran.** File names and labels are not evidence. A
@@ -181,7 +196,7 @@ read the category you are working in before starting.
 - **Separate kernel claims from system claims.** Check a kernel's share of
   end-to-end time before optimizing it. Per-transfer or per-kernel claims need
   a controlled test with fixed shapes, not an end-to-end replay window where
-  each arm sees different requests.
+  each arm (one configuration being compared) sees different requests.
 - **Turn savings into capacity.** Eviction must physically free blocks, so
   that saved memory becomes a larger batch. Report the largest batch each arm
   can run, and check peak memory.
@@ -217,25 +232,27 @@ read the category you are working in before starting.
   every combination in one place before any manager is created, and reject
   with a clear message.
 - **Keep the high-value combinations.** CUDA graphs, block reuse,
-  disaggregated serving, all main attention backends, and MLA/GQA/MHA must keep
-  working. Only feature-local fused shortcuts may be disabled. Do not
-  blanket-disable reuse: a generation-only eviction method does not conflict
-  with prefix reuse of prompt blocks.
-- **Overlap differences are bugs.** Outputs must match with the overlap
-  scheduler on and off. Never conclude that a method "cannot use overlap", and
-  never turn overlap off as a fix. When a step must wait, make only that step
-  wait.
+  disaggregated serving, all main attention backends, and multi-head latent
+  attention (MLA), grouped-query attention (GQA), and multi-head attention
+  (MHA) must keep working. Only feature-local fused shortcuts may be
+  disabled. Do not blanket-disable reuse: a generation-only eviction method
+  does not conflict with prefix reuse of prompt blocks.
+- **Overlap-scheduler differences are bugs.** Outputs must match with the
+  overlap scheduler on and off. Never conclude that a method "cannot use the
+  overlap scheduler", and never turn the overlap scheduler off as a fix. When
+  a step must wait, make only that step wait.
 - **Stay inside the existing CUDA-graph capture.**
   - Add no method-specific capture or warm-up machinery.
   - Keep captured regions free of host syncs and data-dependent branches.
-  - Make kernels stop at the real length on padded graph slots.
+  - Make kernels stop at the real length on padded CUDA-graph slots.
   - Fill spare pages with NaN to prove they are never read.
 - **Chunked prefill: accumulate per chunk, decide once.** Score or evict only
   after the last chunk. A chunked run that scores better than an unchunked one
   is a bug, not a feature.
-- **Speculative decoding: decide draft handling once, when the manager is
-  created.**
-  - Draft layers with the target's KV geometry follow the target's policy.
+- **Speculative decoding: decide draft handling once, when the KV cache
+  manager is created.**
+  - Draft layers with the target model's KV cache geometry follow the target
+    model's policy.
   - Drafters with their own architecture keep a plain cache, or the
     combination is rejected.
   - Respect an explicitly pinned draft dtype.
@@ -244,10 +261,10 @@ read the category you are working in before starting.
   newest code before saying it is unsupported. Make it work through correct
   base configuration and layer-id mapping, not special cases. Layer-id mapping
   for new layers broke it once.
-- **Sliding-window layers need explicit handling.** Use the existing window
-  conventions. Mask out-of-window entries instead of zero-filling them: a
-  `-1` entry reached a kernel as an address. Decide skip rules by layer or
-  page type before dtype.
+- **Sliding-window layers need explicit handling.** Use the existing
+  sliding-window conventions. Mask out-of-window entries instead of
+  zero-filling them: a `-1` entry reached a kernel as an address. Decide skip
+  rules by layer or page type before dtype.
 - **Never delete a feature from a configuration to get past a rejection.** An
   experiment that drops speculative decoding to avoid a rejection no longer
   measures the intended setup.
@@ -264,12 +281,13 @@ read the category you are working in before starting.
   Kernel-numeric references with tolerances, accuracy thresholds, and
   model-quality checks stay out of unit tests. Small end-to-end smoke tests
   that only prove activation belong in the integration tests; see
-  `trtllm-kv-cache-compat-testing`.
+  `trtllm-kv-cache-compat-testing`
+  (`../../trtllm-kv-cache-compat-testing/SKILL.md`).
 - **Run end to end on real models before pushing a feature change**, and after
-  every merge or refactor. Use one leg per execution path, for example two
-  model families and a speculative-decoding model, with CUDA graphs and
-  overlap on. Green unit tests alone miss interactions such as overlap with
-  eviction.
+  every merge or refactor. Use one run per execution path, for example two
+  model families and a speculative-decoding model, with CUDA graphs and the
+  overlap scheduler on. Green unit tests alone miss interactions such as the
+  overlap scheduler with eviction.
 - **Deliver the validation matrix you planned.** Unit tests are not a
   substitute for planned end-to-end and profiling cells.
 - **Tests fail loudly.** Do not skip, waive, revert, or disable your way past a
@@ -317,28 +335,28 @@ read the category you are working in before starting.
   Examples: a lossier arm scoring higher, more disk hits with compression, or
   a runtime-length average above the output length.
 - **Prove the mechanism engaged at the intended level.** For example, report
-  the share of reused KV that came from compressed pages. Arms labeled with a
-  pressure level they never reached are invalid.
+  the share of reused KV cache that came from compressed pages. Arms labeled
+  with a pressure level they never reached are invalid.
 - **When porting a method, compare stage by stage, bitwise.** Compare scores,
   selections, eviction decisions, and the first generated token against the
   reference implementation, starting from a single deterministic request.
-- **Tie every score to a recorded, clean tree and recipe.** Record the commit,
-  uncommitted changes, build, configuration, and time. Copy rerun commands
-  verbatim from the original log; a command retyped from memory can drop a
-  setting such as the chat template.
-- **Test lossy codecs over repeated round trips.** Offload is a move, so every
-  round trip re-encodes. Compare raw bit patterns after 1, 2, 4, and 8 round
-  trips.
-- **A configured feature that does nothing must change nothing.** With a codec
-  configured but no page moved, outputs must be token-identical to the lossless
-  control.
+- **Tie every score to a recorded, clean source tree and recipe.** Record the
+  commit, uncommitted changes, build, configuration, and time. Copy rerun
+  commands verbatim from the original log; a command retyped from memory can
+  drop a setting such as the chat template.
+- **Test lossy cold-page codecs over repeated round trips.** Offload is a
+  move, so every round trip re-encodes. Compare raw bit patterns after 1, 2,
+  4, and 8 round trips.
+- **A configured feature that does nothing must change nothing.** With a
+  cold-page codec configured but no page moved, outputs must be
+  token-identical to the lossless control.
 - **When a benchmark saturates, add a harder one** instead of over-reading
   small differences.
 
 ## 7. PR and Review Hygiene
 
 - **One purpose per PR.**
-  - A framework PR carries no method kernels.
+  - A KV cache compression framework PR carries no method kernels.
   - Independent fixes go on their own branch off main.
   - Documentation can go separately.
   - Revert unrelated edits, comment rewording, and copyright churn.
@@ -398,9 +416,9 @@ read the category you are working in before starting.
   answer every sub-question.
 - **Speak plainly.** Principle first, then the design idea, then details, in
   the codebase's own terms.
-- **Find the root cause.** Do not work around a problem: disabling overlap,
-  masking instead of evicting, zero-filling, waiving, and calling something
-  noise are all workarounds.
+- **Find the root cause.** Do not work around a problem: disabling the
+  overlap scheduler, masking instead of evicting, zero-filling, waiving, and
+  calling something noise are all workarounds.
 - **Check the branch, the build, and the configuration before running.** Stale
   builds and forgotten instructions wasted days.
 - **Estimate runtime and results before launching.** When something is far
@@ -417,23 +435,26 @@ read the category you are working in before starting.
   suspiciously clean need a spot check against the raw evidence. When a
   long chain fails, rerun the last known-good end-to-end path first.
 - **One engine per GPU set.** Launching the LLM API script under `mpirun -n N`
-  started N engines on the same GPUs, and produced false reports of KV
+  started N engines on the same GPUs, and produced false reports of KV cache
   corruption.
 
 ## 9. Subsystem Lessons
 
-### Compression framework
+### KV cache compression framework
 
 - Compression is a memory-lifecycle operation. Sparse attention is a compute
   optimization. They are separate configurations, and there is one compression
   method per instance.
-- The compression manager talks to KVCM V2, never to attention metadata.
-- The compression manager runs after KVCM has updated lengths for the step.
-  Its five hooks map onto the executor's resource callbacks.
+- The KV cache compression manager talks to KV cache manager V2, never to
+  attention metadata.
+- The KV cache compression manager runs after KV cache manager V2 has updated
+  lengths for the step. Its five hooks map onto the executor's resource
+  callbacks.
 - Store per-request results, such as compressed-token counts, on the request,
   so the engine reads correct lengths without engine changes.
-- Generic pieces belong to the framework: a compaction mover that knows only
-  the layout and the keep list, and the codec hooks for tier migration.
+- Generic pieces belong to the KV cache compression framework: a compaction
+  mover that knows only the layout and the keep list, and the cold-page codec
+  hooks for tier migration.
 - Calibration is offline, and the runtime only loads artifacts.
 
 ### Eviction and compaction
@@ -447,9 +468,9 @@ read the category you are working in before starting.
   claiming equivalence.
 - Score normalization that is global over a row cannot be tile-fused without
   changing semantics.
-- Do not score sliding-window layers. Compact them to the latest window plus
-  the protected tail, as `compaction.py` does. Wait on the compaction event
-  before freeing or reusing tail pages.
+- Do not score sliding-window layers. Compact them to the latest sliding
+  window plus the protected tail, as `compaction.py` does. Wait on the
+  compaction event before freeing or reusing tail pages.
 - Reduce the method to its essential kernels: score, top-k, compact. Launch
   across layers, not in a per-layer loop. Reuse the repository's top-k and
   compaction kernels.
@@ -457,45 +478,51 @@ read the category you are working in before starting.
 
 ### Cold pages
 
-- Runtime KV stays at native precision. Pages are compressed only at the tier
-  boundary, so a page carries at most one lossy rounding per offload.
-- The codec's input is the hot cache, which may already be FP8. A
-  higher-precision cold format cannot recover information that is already
-  lost.
+- The runtime KV cache stays at native precision. Pages are compressed only
+  at the tier boundary, so a page carries at most one lossy rounding per
+  offload.
+- The cold-page codec's input is the hot KV cache, which may already be an
+  FP8 KV cache. A higher-precision cold-page format cannot recover
+  information that is already lost.
 - Fuse quantization into the tier transfer. The encode must not be slower
   than the copy it replaces.
 - Store only what the format needs. Padding inherited from GPU-kernel
   alignment wasted the space compression saved.
 - Partial pages work because scale groups stay within one token and global
   scales are calibrated offline.
-- RoPE precision options must match the naming, accepted values, and defaults
-  of equivalent active-KV options. Check that a switch reaches every path.
+- Rotary position embedding (RoPE) precision options must match the naming,
+  accepted values, and defaults of equivalent active KV cache options. Check
+  that a switch reaches every path.
 - Compress the large non-RoPE latent of MLA caches. Leave indexer keys,
   compressor state, and recurrent state lossless.
 - A commit path that adopts an existing same-prefix page must not let a
-  lower-precision copy replace freshly computed higher-precision KV.
+  lower-precision copy replace freshly computed higher-precision KV cache
+  entries.
 
 ### Mixed-precision KV cache
 
-- Build the high-precision copy on the sliding-window-with-sinks life cycle,
-  and reuse `pool_ratio`. Do not add a new ratio knob or a manager subclass.
+- Build the mixed-precision high pool on the sliding-window-with-sinks life
+  cycle, and reuse `pool_ratio`. Do not add a new ratio setting or a KV cache
+  manager subclass.
 - Separate the storage format from the compute dtype: the feature converts
-  storage, and attention computes in the high dtype.
-- On main, the high copy holds only KV that attention computed, never
-  dequantized low-precision data. A design that fills high pages from the low
-  pool changes this property; make that an explicit decision, and evaluate
-  its accuracy.
+  storage, and attention computes in the high-precision dtype.
+- On main, the mixed-precision high pool holds only KV cache entries that
+  attention computed, never dequantized low-precision data. A design that
+  fills mixed-precision high pages from the mixed-precision low pool changes
+  this property; make that an explicit decision, and evaluate its accuracy.
 - Gate everything on the feature, and name things "mixed-precision high/low".
-- Zero staging once after allocation. Confirm rebuild frequency from the
-  call-site guard.
-- For sparse models, reuse the existing top-k gather so staging scales with
-  top-k, not with the maximum length.
-- Reject unsupported managers explicitly instead of skipping them silently.
+- Zero the mixed-precision staging copy once after allocation. Confirm its
+  rebuild frequency from the call-site guard.
+- For sparse models, reuse the existing top-k gather, as the high-row overlay
+  path does, so the converted rows scale with top-k, not with the maximum
+  length.
+- Reject unsupported KV cache managers explicitly instead of skipping them
+  silently.
 
-### KVCM V2 reuse
+### KV cache manager V2 reuse
 
 - Model reuse exactly as the implementation does it:
-  - radix match, then pruning by REQUIRED life cycles;
+  - radix tree match, then pruning by REQUIRED life cycles;
   - the commit policy and its default;
   - adoption of existing pages on commit;
   - release of retained pages under per-conversation retention.
@@ -511,10 +538,10 @@ read the category you are working in before starting.
 
 ### Sparse attention
 
-- Algorithms that read q/k content need post-RoPE values, so they turn RoPE
-  fusion off with a per-method flag.
+- Algorithms that read query and key content need post-RoPE values, so they
+  turn RoPE fusion off with a per-method flag.
 - Methods that need attention metadata are attention-modifying methods, not
-  lifecycle methods.
+  KV cache compression methods.
 - Using global addresses as page indices risks 32-bit overflow.
 
 ## 10. Recurring Agent Failure Modes
@@ -526,8 +553,8 @@ read the category you are working in before starting.
 | Over-engineering, then defending it | New managers, wrappers, kernels, fallbacks, and checks; diffs that grow under "simplify" | Extension ladder; diff measured each round |
 | Scope creep and silent changes | Edits to other owners' code; changed configs, ratios, layouts, or numerics | Change only what was asked; propose deviations |
 | Silent scope shrinking | Subsets, single runs, dropped cells, simulated variants | Full matrix and full datasets |
-| Workarounds instead of fixes | Disabling overlap, zero-filling, waiving, reverting, "it's noise" | Root cause first |
-| Weakened experiments | Graphs off, crafted inputs, identical prompts with reuse, features that never triggered | Production config; activation evidence |
+| Workarounds instead of fixes | Disabling the overlap scheduler, zero-filling, waiving, reverting, "it's noise" | Root cause first |
+| Weakened experiments | CUDA graphs off, crafted inputs, identical prompts with block reuse, features that never triggered | Production config; activation evidence |
 | Rationalizing anomalies | Stories for impossible results; blaming the model | Treat as a setup bug |
-| Jargon and buried answers | Coined labels; answers to a different question | Plain language; answer first |
+| Jargon and buried answers | Coined labels, names cut to a fragment, undefined abbreviations; answers to a different question | One full name per concept; abbreviations defined at first use; answer first |
 | Repeating corrected mistakes | The same layer, subset, or format reappearing after correction | Write the rule down and re-read it |

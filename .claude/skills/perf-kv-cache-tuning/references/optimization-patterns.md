@@ -12,8 +12,8 @@ the speedup.
 ## Attribution Before Optimization
 
 - **Use one ruler for every overhead chart.** Put the baseline (feature off, or
-  FP8 KV) and the feature on the same axis. Break the feature's cost into the
-  same named components in every chart.
+  FP8 KV cache) and the feature on the same axis. Break the feature's cost
+  into the same named components in every chart.
 - **List every kernel.** Do not label kernels "other". Before calling a kernel
   generic or unrelated, open its source and confirm who launches it.
 - **Time a transfer or migration in a controlled test.** Use a fixed batch
@@ -27,11 +27,11 @@ the speedup.
 
 | Pattern | Do | Guardrail |
 |---|---|---|
-| Allocate once | Size scratch and staging buffers at initialization from the configured maxima, and account for them in the KV budget profiling run | Check every caller: an object rebuilt per step re-runs its constructor, which turns a "once" memset of a large staging buffer into a per-step memset |
+| Allocate once | Size scratch and staging buffers at initialization from the configured maxima, and account for them in the profiling run that sizes the KV cache memory budget | Check every caller: an object rebuilt per step re-runs its constructor, which turns a "once" memset of a large staging buffer into a per-step memset |
 | Zero only what is read uninitialized | Drop blanket per-step `zero_()` when every element read is written first | Prove the read set is covered, for example with a sentinel-fill test. Do not rely on luck with stale data |
-| Precompute static metadata | Build page-index maps, layer tables, and per-bucket metadata once, then update in place | Graph-captured tensors must keep their addresses; update contents, never rebind |
+| Precompute static metadata | Build page-index maps, layer tables, and per-bucket metadata once, then update in place | Tensors captured in a CUDA graph must keep their addresses; update contents, never rebind |
 | Stage host metadata in pinned memory | Write per-step metadata into pinned host buffers and copy it with one non-blocking transfer | Allocate pinned memory through the repository helpers (`maybe_pin_memory`, `prefer_pinned` in `tensorrt_llm/_utils.py`); a pre-commit check rejects raw pinned-memory calls in runtime code |
-| Batch across requests and layers | One launch over all requests or layers instead of a Python loop of small launches | Keep per-request semantics identical; test against a per-request CPU oracle |
+| Batch across requests and layers | One launch over all requests or layers instead of a Python loop of small launches | Keep per-request semantics identical; test against a per-request CPU reference implementation |
 | Remove synchronization from the step loop | Replace `.item()`, `.tolist()`, and host-side checks with device-side logic or checks done once at setup | Validation that matters moves to initialization or to an explicit debug mode, not into the hot path |
 | Audit the hot path | Remove defensive clones, redundant copies, asserts that synchronize, and unnecessary protections | Remove only what a test proves redundant, and never a supported mode or feature |
 
@@ -48,25 +48,27 @@ the speedup.
 
 ## Configuration and Kernel Selection
 
-- A new KV dtype or layout can route attention to another kernel library, or
+- A new KV cache dtype or layout can route attention to another kernel library, or
   to a library without a kernel for the required output dtype. Read the
   selected kernels in the profile or the startup log; the configured backend
   name is not enough.
 - Fixing a regression by changing the experiment configuration, such as page
   size, pool ratios, the reuse policy, or a per-request option, is a design
-  change, not an optimization. Propose it, measure it as its own arm, and keep
-  the standard configuration as the reported baseline.
+  change, not an optimization. Propose it, measure it as its own arm (one
+  configuration being compared), and keep the standard configuration as the
+  reported baseline.
 - Make policy changes, such as retention priority or eviction order, through
   the existing Python callbacks and configuration before touching the native
-  manager. Measure them as their own arm.
+  core of KV cache manager V2. Measure them as their own arm.
 
 ## Validation After Every Optimization
 
 1. Outputs identical to before for lossless changes, compared bit for bit or
    token for token. For lossy paths, compare against the accepted accuracy
    contract.
-2. Same-shape A/B in the production configuration, repeated, with variation
-   reported.
-3. Peak memory and KV budget unchanged, or the change reported.
+2. A comparison at the same batch size and sequence lengths, in the
+   production configuration, repeated, with variation reported.
+3. Peak memory and KV cache memory budget unchanged, or the change reported.
 4. The compatibility combinations the feature claims (reuse, CUDA graph,
-   overlap, disaggregated serving, speculative decoding) still pass.
+   overlap scheduler, disaggregated serving, speculative decoding) still
+   pass.

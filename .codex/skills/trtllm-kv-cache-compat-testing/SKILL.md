@@ -2,15 +2,17 @@
 name: trtllm-kv-cache-compat-testing
 description: >-
   Decide and prove how a TensorRT-LLM KV-cache feature combines with the rest
-  of the system, and design its tests. Use when adding or changing a KV Cache
-  Manager V2 behavior, reuse policy, KV cache compression method, cold-page
-  codec, mixed-precision KV path, or sparse/evicting attention, and whenever
-  the user asks whether a KV-cache feature works with block reuse, partial reuse, CUDA
-  graphs, the overlap scheduler, chunked prefill, disaggregated serving,
-  speculative decoding, tensor/attention-DP/pipeline parallelism, beam search,
-  sliding-window or hybrid models, MLA or sparse backends, or KV offload tiers.
-  Covers the compatibility decision per axis, the test layers, what belongs
-  in pytest, CI test-list registration, waives, and which tests to run.
+  of the system, and design its tests. Use when adding or changing a KV cache
+  manager V2 behavior, reuse policy, KV cache compression method, cold-page
+  codec, mixed-precision KV cache path, or sparse/evicting attention, and
+  whenever the user asks whether a KV-cache feature works with block reuse,
+  partial reuse, CUDA graphs, the overlap scheduler, chunked prefill,
+  disaggregated serving, speculative decoding, tensor parallelism, attention
+  data parallelism, pipeline parallelism, beam search, sliding-window or
+  hybrid models, multi-head latent attention or sparse attention backends, or
+  KV cache offload tiers. Covers the compatibility decision per axis, the test
+  layers, what belongs in pytest, CI test-list registration, waives, and which
+  tests to run.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -21,7 +23,8 @@ metadata:
 KV-cache features rarely fail on their own. They fail when they meet reuse,
 CUDA graphs, the overlap scheduler, disaggregated serving, or speculative
 decoding. Decide each combination up front, test what you claim, and reject
-the rest before execution. Load `trtllm-kv-cache-develop` first.
+the rest before execution. Load `trtllm-kv-cache-develop`
+(`../trtllm-kv-cache-develop/SKILL.md`) first.
 
 ## Step 1: Decide the Compatibility Table Up Front
 
@@ -37,15 +40,15 @@ tests are in `references/compatibility-matrix.md`.
 | Overlap scheduler | | |
 | Chunked prefill | | |
 | Request abort, preemption, suspend/resume | | |
-| Disaggregated serving (Python transceiver, `backend: NIXL`, KVCM V2 on both workers) | | |
-| TP / attention DP / CP / PP | | |
+| Disaggregated serving (Python transceiver, `backend: NIXL`, KV cache manager V2 on both workers) | | |
+| Tensor, attention data, context, and pipeline parallelism | | |
 | Speculative decoding (each mode) | | |
 | Beam search | | |
-| Sliding-window, VSWA, hybrid recurrent models | | |
-| MLA and sparse attention backends | | |
-| KV offload tiers and connectors | | |
-| Reuse identity: LoRA, cache salt, multimodal inputs | | |
-| KV cache events and KV-aware routing | | |
+| Sliding-window attention, variable sliding-window attention (VSWA), hybrid recurrent models | | |
+| Multi-head latent attention (MLA) and sparse attention backends | | |
+| KV cache offload tiers and connectors | | |
+| Reuse identity: low-rank adaptation (LoRA), cache salt, multimodal inputs | | |
+| KV cache events and KV-cache-aware routing | | |
 | Pool rebalance (`enable_kv_pool_rebalance`) | | |
 | Prefill CUDA graphs (`prefill_cuda_graph_backend`) | | |
 | Feature-off invariance | always required | |
@@ -57,15 +60,16 @@ Rules for the decision:
   must be a reasoned decision written in the PR, never a silent fallback.
 - **Reject early.** Put every unsupported combination in the feature's
   validator, with an actionable message: at configuration time, or at
-  executor construction before KVCM allocation when the check needs the
-  device or the engine. Do not branch at runtime into a degraded path.
+  executor construction before KV cache manager V2 allocation when the check
+  needs the device or the engine. Do not branch at runtime into a degraded
+  path.
 - **Admission predicates are not fallbacks.** A `supports_*()` method reports
   a capability. It must not switch the feature off quietly.
 - **Untested means rejected, for new work.** A combination nobody ran is not
   "supported", and a new feature rejects it. Combinations that existing code
   already allows but nobody has validated are labeled "Untested" in docs and
   matrices. Say plainly when a path works but is unvalidated, for example
-  draft caches that are transformed but whose accuracy was never measured.
+  draft KV caches that are transformed but whose accuracy was never measured.
 - **Never edit a feature out of a configuration to get past a rejection.**
   Dropping speculative decoding, reuse, or CUDA graphs from an experiment or
   test so that it runs changes what is being measured. Add minimal support,
@@ -74,21 +78,22 @@ Rules for the decision:
   update the feature page and, if relevant,
   `docs/source/features/feature-combination-matrix.md`.
 - **Re-derive, do not copy, the general matrix.** The general combination
-  table does not distinguish KVCM V1 from V2, or the transceiver runtimes. Some
-  of its cells are wrong for the V2 default; for example, V2 rejects block
-  reuse with context-parallel Helix. Confirm each cell you rely on in the
-  current code.
+  table does not distinguish KV cache manager V1 from KV cache manager V2, or
+  the transceiver runtimes. Some of its cells are wrong for the default
+  KV cache manager V2; for example, KV cache manager V2 rejects block reuse
+  with context-parallel Helix. Confirm each cell you rely on in the current
+  code.
 
 ## Step 2: Layer the Tests
 
 | Layer | Purpose | Typical location |
 |---|---|---|
 | CPU configuration and admission | Parsing, defaults, serialization, rejection of unsupported combinations with the right error | `tests/unittest/llmapi/`, the feature's CPU tests |
-| Manager and bookkeeping | Pools, page counts, lengths, reuse counts, hook cadence, state release, item by item | `tests/unittest/_torch/pyexecutor/kv_cache/`, `tests/unittest/kv_cache_manager_v2_tests/` |
-| Kernels and data movement | Byte-exact movement, compaction, encode/decode against a CPU oracle; non-contiguous, partial and large batches | `tests/unittest/_torch/kv_cache_compression/`, C++ unit tests |
+| KV cache manager and bookkeeping | Pools, page counts, lengths, reuse counts, hook cadence, state release, item by item | `tests/unittest/_torch/pyexecutor/kv_cache/`, `tests/unittest/kv_cache_manager_v2_tests/` |
+| Kernels and data movement | Byte-exact movement, compaction, encode/decode against a CPU reference implementation; non-contiguous, partial and large batches | `tests/unittest/_torch/kv_cache_compression/`, C++ unit tests |
 | Small end-to-end smoke | The production executor runs with the feature, activation is proven, and the claimed combinations run | The feature's integration tests |
-| Accuracy | Model-quality contract | Separate evaluation (`trtllm-kv-cache-accuracy-eval`), not pytest |
-| Performance | Throughput and latency contract | Separate measurement (`perf-kv-cache-tuning`), not pytest |
+| Accuracy | Model-quality contract | Separate evaluation with `trtllm-kv-cache-accuracy-eval` (`../trtllm-kv-cache-accuracy-eval/SKILL.md`), not pytest |
+| Performance | Throughput and latency contract | Separate measurement with `perf-kv-cache-tuning` (`../perf-kv-cache-tuning/SKILL.md`), not pytest |
 
 ## What Belongs in pytest
 
@@ -137,8 +142,9 @@ Rules for the decision:
     when your change touches them.
 - **Run, at minimum**:
   1. the tests you added or changed;
-  2. the neighbor tests of every module you touched. For a KVCM V2 change, run
-     its suites under `tests/unittest/kv_cache_manager_v2_tests/` and
+  2. the neighbor tests of every module you touched. For a
+     KV cache manager V2 change, run its suites under
+     `tests/unittest/kv_cache_manager_v2_tests/` and
      `tests/unittest/_torch/pyexecutor/kv_cache/`, and the disaggregated tests
      if transfer metadata changed;
   3. the tests of the features that share the code you changed, such as reuse,
@@ -148,11 +154,11 @@ Rules for the decision:
 - **End-to-end gate.** Green unit tests alone do not justify a push. Before
   pushing a feature change, and after every merge from main or refactor, run
   the feature end to end on real models, with CUDA graphs (padding on) and
-  the overlap scheduler on, and show activation in every leg. Run each leg
-  below, or reject the combination in the validator:
+  the overlap scheduler on, and show activation in every run. Run each
+  configuration below, or reject the combination in the validator:
   1. two model families, one per execution path;
   2. block reuse: a second request that shares a long prefix, with reused
-     blocks reported for both arms;
+     blocks reported for both arms (the configurations being compared);
   3. disaggregated serving: a context and generation pair on the Python
      transceiver, compared with aggregated serving on the same requests;
   4. each speculative-decoding mode the feature claims.
@@ -167,7 +173,7 @@ Rules for the decision:
 Run the touched suites with the feature disabled, and compare with main. With
 the feature off, the following must be unchanged:
 - outputs;
-- memory and KV budget;
+- memory use and the KV cache memory budget;
 - speed;
 - error messages;
 - the public API.

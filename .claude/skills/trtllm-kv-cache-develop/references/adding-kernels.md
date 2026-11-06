@@ -6,9 +6,9 @@ SPDX-License-Identifier: Apache-2.0
 # Adding Kernels for KV-Cache Features
 
 This guide covers kernels for compression methods, cold-page codecs,
-mixed-precision conversion, and KVCM V2 data movement. The rule underneath
-it: the manager or provider owns policy, and the kernel owns one batched
-transform.
+mixed-precision KV cache conversion, and KV cache manager V2 data movement.
+The rule underneath it: the calling manager or compression provider owns
+policy, and the kernel owns one batched transform.
 
 ## 1. Decide Whether a New Kernel Is Needed
 
@@ -26,7 +26,7 @@ Go through these in order and stop at the first that works:
 4. **A new kernel.** Write one only when a profile of the production
    configuration shows the gap, and say so in the design gate.
 
-Do not replace a kernel with a chain of framework ops to avoid writing one.
+Do not replace a kernel with a chain of PyTorch ops to avoid writing one.
 Per-step chains of small ops cost more than the kernel did.
 
 ## 2. Choose the Implementation Path
@@ -35,7 +35,7 @@ Per-step chains of small ops cost more than the kernel did.
 |---|---|---|---|
 | Triton | The method's Python package | Gathers, packing, index math, simple elementwise transforms | `_pack_move_sources_kernel` in `kv_cache_compression/compaction.py`; `triattention/triattention_kernels.py` |
 | CuTe DSL | The method's package, or `tensorrt_llm/_torch/attention/kernels/blackwell/` for attention-adjacent conversion | Blackwell-specific fused scoring, selection, and conversion | `triattention/triattention_cute_score_fused.py`; `attention/kernels/blackwell/mixed_precision_kv.py` |
-| CUDA C++ | `cpp/tensorrt_llm/kernels/`, registered with `add_tllm_kernel_library(...)` in `kernelComponents.cmake` | Performance-critical transforms on raw pointers, such as codecs on migration streams | `nvfp4ColdPageKernels.cu` (`tllm_kernel_nvfp4_cold_page`) |
+| CUDA C++ | `cpp/tensorrt_llm/kernels/`, registered with `add_tllm_kernel_library(...)` in `kernelComponents.cmake` | Performance-critical transforms on raw pointers, such as cold-page codecs on migration streams | `nvfp4ColdPageKernels.cu` (`tllm_kernel_nvfp4_cold_page`) |
 
 A C++ kernel is exposed to Python in one of two ways:
 
@@ -47,14 +47,15 @@ A C++ kernel is exposed to Python in one of two ways:
   If the op runs inside a `torch.compile` region, add its fake (meta)
   implementation in `tensorrt_llm/_torch/custom_ops/cpp_custom_ops.py`.
 - **As a nanobind function** in the feature's binding module. Use this when
-  the caller passes raw pointers, a stream, and scalars, as a codec launcher
-  does. Example: `nvfp4_cold_page_encode` in
+  the caller passes raw pointers, a stream, and scalars, as a cold-page codec
+  launcher does. Example: `nvfp4_cold_page_encode` in
   `cpp/tensorrt_llm/nanobind/kvCacheCompression/bindings.cpp`, imported
-  locally by the provider as
+  locally by the compression provider as
   `from tensorrt_llm.bindings.internal import kv_cache_compression as native`.
 
 Keep imports of method kernels local to the factory branch or launcher, so
-that other features do not pay their import or JIT cost.
+that other features do not pay their import or just-in-time (JIT)
+compilation cost.
 
 ## 3. Contract Checklist
 
@@ -81,14 +82,14 @@ that other features do not pay their import or JIT cost.
   addresses, lengths read from device memory. Compile every JIT variant during
   warm-up, before capture.
 - **Workspaces.** Allocate them once, at bind or initialization time, from
-  the configured maxima. Count them in the KV budget.
+  the configured maxima. Count them in the KV cache memory budget.
 - **Shared memory and launch limits.** Large selection widths can exceed
   shared-memory limits. Bound the parameters at configuration time.
 
 ## 4. Wire It Into the Pipeline
 
-- The manager or provider decides what to transform; the launcher turns that
-  decision into one call; the kernel does the transform.
+- The calling manager or compression provider decides what to transform; the
+  launcher turns that decision into one call; the kernel does the transform.
 - Pass layouts and keep decisions to generic kernels, not algorithm scores or
   opaque dictionaries.
 - Order the work on the stream that the next consumer uses. Record a
@@ -99,10 +100,10 @@ that other features do not pay their import or JIT cost.
 
 ## 5. Test It
 
-1. **Standalone.** Compare against a CPU oracle. Use byte-exact comparisons
-   where the operation is exact, and invariants where it is lossy: spans,
-   scale groups, lossless parts, round-trip stability. Cover non-contiguous,
-   partial, and large batches, and non-default streams.
+1. **Standalone.** Compare against a CPU reference implementation. Use
+   byte-exact comparisons where the operation is exact, and invariants where
+   it is lossy: spans, scale groups, lossless parts, round-trip stability.
+   Cover non-contiguous, partial, and large batches, and non-default streams.
 2. **C++ gtest.** For C++ kernels, register it with `add_tllm_gtest(<name>
    OWNER ... SOURCES ... LINK_LIBRARIES ... LABELS "unit;kernels;...;gpu")` in
    `cpp/tests/unit_tests/kernels/CMakeLists.txt`. Make sure a CI stage runs
@@ -111,9 +112,11 @@ that other features do not pay their import or JIT cost.
 3. **Python tests.** Add them under the feature's test directory, and register
    new files in the test-db.
 4. **In the pipeline.** Run under CUDA graphs and the overlap scheduler, with
-   the KVCM debug fills on, and compare against the feature-off path.
+   the KV cache manager V2 debug fills on, and compare against the
+   feature-off path.
 5. **Performance.** Do a microbenchmark for kernel development, then the
-   end-to-end A/B in `perf-kv-cache-tuning`. The microbenchmark alone proves
+   end-to-end comparison in `perf-kv-cache-tuning`
+   (`../../perf-kv-cache-tuning/SKILL.md`). The microbenchmark alone proves
    nothing about the feature.
 
 ## 6. Pitfalls Seen Before

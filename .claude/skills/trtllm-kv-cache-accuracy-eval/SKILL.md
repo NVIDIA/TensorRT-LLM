@@ -2,15 +2,16 @@
 name: trtllm-kv-cache-accuracy-eval
 description: >-
   Plan, run, and report accuracy evaluations for lossy or state-changing
-  TensorRT-LLM KV-cache features: KV quantization and mixed-precision KV,
+  TensorRT-LLM KV-cache features: KV cache quantization and mixed-precision KV cache,
   cold-page compression, token eviction or compaction (for example
-  TriAttention), sparse attention that drops KV, and reuse policies that
-  rebuild or approximate reused prefixes. Use before claiming such a KV-cache
-  feature preserves accuracy, when comparing it against FP8 or full-KV
-  references, when its score drops or looks too good, and when writing the
-  accuracy section of its PR or design doc. Covers protocol alignment, reference
-  arms, activation evidence, seeds and standard errors, truncation and
-  extraction artifacts, run hygiene, and the report format.
+  TriAttention), sparse attention that drops KV cache entries, and reuse
+  policies that rebuild or approximate reused prefixes. Use before claiming
+  such a KV-cache feature preserves accuracy, when comparing it against
+  FP8 KV cache or full KV cache references, when its score drops or looks too
+  good, and when writing the accuracy section of its PR or design doc. Covers
+  protocol alignment, reference arms (the configurations a feature is
+  compared against), activation evidence, seeds and standard errors,
+  truncation and extraction artifacts, run hygiene, and the report format.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -25,7 +26,8 @@ workflow with a written protocol, not as one number.
 
 Functional tests, accuracy evaluation, and performance measurement are
 separate tasks. Do the one that was asked, and label the evidence honestly.
-Load `trtllm-kv-cache-develop` first for the general rules.
+Load `trtllm-kv-cache-develop` (`../trtllm-kv-cache-develop/SKILL.md`) first
+for the general rules.
 
 ## Step 1: Fix the Protocol Before Running
 
@@ -47,7 +49,8 @@ drift between runs is the most common reason scores cannot be compared.
 - Greedy decoding for a model whose official protocol samples is not a valid
   reference, even if the score looks better.
 - When a paper's harness differs from the model's official recipe, choose one
-  deliberately, say which, and keep it for every arm.
+  deliberately, say which, and keep it for every arm (one configuration being
+  compared).
 - When the comparison is against an external reference implementation, run
   that implementation's own code. Reuse its prompts, sampling, and scorer for
   the TensorRT-LLM arms instead of re-implementing its logic.
@@ -74,17 +77,17 @@ library):
 
 - **Reference arms**: the full or uncompressed path with the same model,
   backend, sampling, and limits. For precision features, include the model
-  dtype or FP8 KV, and the closest existing lossy option, for example pure
-  NVFP4 KV next to mixed precision.
-- **Tasks that exercise the feature.** A decode-time eviction method on a task
-  with short outputs never evicts, so it measures the dense path. A reuse
+  dtype or the FP8 KV cache, and the closest existing lossy option, for
+  example the pure NVFP4 KV cache next to the mixed-precision KV cache.
+- **Tasks that exercise the feature.** A generation-time eviction method on a
+  task with short outputs never evicts, so it measures the dense path. A reuse
   feature on prompts with no shared prefix never reuses. Pick tasks by the
   feature's risk:
 
 | Feature risk | Task family |
 |---|---|
-| Losing distant context (quantized history, eviction, cold pages) | Long-context retrieval and multi-needle tasks: MRCR-style, needle-in-a-haystack, RULER-style |
-| Error accumulating over long generation | Long reasoning: competition math, science QA with long chains of thought |
+| Losing distant context (quantized history, eviction, cold pages) | Long-context retrieval and multi-needle tasks, in the style of multi-round coreference resolution (MRCR), needle-in-a-haystack, and RULER |
+| Error accumulating over long generation | Long reasoning: competition math, science question answering with long chains of thought |
 | Reused or rebuilt prefixes (reuse policies, restored cold pages) | Multi-turn or forced-reuse variants, where the second turn must read the reused prefix |
 | Tokens near the start or end of the context (first-N/last-N policies) | Tasks whose answer depends on instructions at the start and the most recent turn |
 
@@ -96,25 +99,25 @@ library):
 A configuration that parses is not activation evidence. For every arm, record
 proof that the intended path ran and that its result was consumed:
 
-- the resolved configuration from the startup log: KV dtype, pools, method,
+- the resolved configuration from the startup log: KV cache dtype, pools, method,
   window sizes;
 - method counters: compression rounds, evicted tokens, encoded and decoded
-  pages, staging conversions;
+  pages, conversions into the mixed-precision staging copy;
 - for reuse features, reuse ratios per request. In a forced-reuse evaluation,
   confirm that the reused fraction is what the design predicts, and treat an
   arm whose reuse collapsed as a different experiment.
 
 Control and report how much the mechanism engaged in each run: the fraction
 of tokens evicted, pages offloaded and restored, tokens served from the
-low-precision store. The knob you vary must move that number. An arm
+mixed-precision low pool. The setting you vary must move that number. An arm
 labeled "30% compressed" that measured 10% is a 10% arm. Count only the
 benchmark's own requests, not filler traffic.
 
 ## Step 4: Run Hygiene
 
 - One engine per GPU set, one output directory per arm and seed, and the
-  launch line checked before the wave starts. See `perf-kv-cache-tuning` for
-  the engine rules.
+  launch line checked before the runs start. See `perf-kv-cache-tuning`
+  (`../perf-kv-cache-tuning/SKILL.md`) for the engine rules.
 - Start with a quick probe: a few prompts, end to end, checking lengths,
   finish reasons, parse success, and runtime. Then run the full set.
   Final numbers come from the full dataset, never a convenient subset.
@@ -131,8 +134,8 @@ benchmark's own requests, not filler traffic.
 ## Step 5: Treat Noise and Artifacts Correctly
 
 - **Seeds and standard errors.** Run several seeds per arm. Report the mean,
-  the standard error, and paired differences against the reference on the same
-  prompts. Differences inside about two standard errors are "no measurable
+  the standard error (SE), and paired differences against the reference on
+  the same prompts. Differences inside about two SEs are "no measurable
   difference". Add seeds before claiming a gap.
 - **Truncation.** Count `finish_reason == length` per arm. An apparent drop
   that comes from hitting the output limit is a truncation artifact. Fix the
@@ -154,9 +157,10 @@ benchmark's own requests, not filler traffic.
   dates, confirm they used the same scorer, extraction, and harness version.
   Keep the provenance (commit, settings) for every reference band you quote.
 - **Repeated lossy transforms.** If production can re-apply the transform, as
-  with re-offloaded pages, repeated eviction rounds, or rebuilt windows,
-  evaluate that path too. For codecs, compare raw bit patterns after 1, 2, 4,
-  and 8 round trips, on real KV and on extreme values.
+  with re-offloaded pages, repeated eviction rounds, or rebuilt
+  mixed-precision high windows, evaluate that path too. For cold-page codecs,
+  compare raw bit patterns after 1, 2, 4, and 8 round trips, on real KV cache
+  data and on extreme values.
 - **Configured but inactive changes nothing.** With the feature configured but
   never triggered (no page moved, no round due), outputs must be
   token-identical to the control. If they are not, there is a bug in setup
@@ -178,7 +182,7 @@ benchmark's own requests, not filler traffic.
 ```markdown
 ## Accuracy: <feature> vs <reference arms>
 - Build: <commit>; local changes: <none | diff hash>
-- Model and checkpoint, backend, KV dtype, feature settings
+- Model and checkpoint, backend, KV cache dtype, feature settings
 - Harness and version, dataset and split, prompt template and thinking mode
 - Sampling, samples per prompt, seeds, maximum input and output lengths
 - Activation evidence: <counters or log lines, reuse ratios>

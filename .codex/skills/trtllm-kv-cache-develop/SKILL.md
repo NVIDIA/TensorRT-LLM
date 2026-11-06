@@ -2,16 +2,18 @@
 name: trtllm-kv-cache-develop
 description: >-
   Entry point for designing, implementing, debugging, reviewing, or
-  refactoring KV-cache features in the TensorRT-LLM PyTorch backend: KV Cache
-  Manager V2 (KVCM V2) layer groups, pools, life cycles, block and partial
+  refactoring KV-cache features in the TensorRT-LLM PyTorch backend:
+  KV cache manager V2 layer groups, pools, life cycles, block and partial
   reuse, reuse policies and retention, the KV cache compression framework,
   cold-page compression, mixed-precision KV cache, and sparse or evicting
-  attention that changes KV state, plus the executor, attention-metadata, and
-  disaggregated-transfer code they touch. Use before writing or reviewing any
-  such change. Gives the required reading, owner boundaries, design workflow
-  and gate, the engineering rules that reviews keep enforcing, agent working
-  rules, and how to add kernels, and routes to the KVCM V2, method-specific,
-  compatibility, performance, and accuracy skills.
+  attention that changes KV cache state, plus the executor,
+  attention-metadata, and disaggregated-transfer code they touch. Read it
+  first, before writing or reviewing any such change; every other KV-cache
+  skill assumes it. Gives the hard rules, required reading, owner boundaries,
+  design workflow and gate, the engineering and naming rules that reviews
+  keep enforcing, agent working rules, and how to add kernels, and routes to
+  the KV cache manager V2, method-specific, compatibility, performance, and
+  accuracy skills.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
@@ -26,8 +28,7 @@ KV-cache stack does. This skill is the workflow on top of them:
 - how to design and gate a change;
 - the rules that reviews of KV-cache work keep enforcing.
 
-It is the entry point. The other KV-cache skills assume it. In these skills,
-"KVCM" means KV Cache Manager V2 unless V1 is named.
+It is the entry point. The other KV-cache skills assume it.
 
 Four failure patterns recur in AI-assisted KV-cache work. Every section below
 exists to prevent one of them:
@@ -39,20 +40,51 @@ exists to prevent one of them:
 3. **Messy code.** New abstraction layers, dead paths, silent fallbacks, and
    jargon pile up.
 4. **No performance check.** A feature is called done without an end-to-end
-   A/B in the production configuration.
+   comparison in the production configuration.
+
+## Hard Rules
+
+Follow all of these in every KV-cache task. The sections below and
+`references/design-principles.md` explain each one.
+
+1. Read the required context below before designing or editing.
+2. Reuse an existing mechanism before building a new one: configuration,
+   then an existing extension point, then the feature's own package. Native
+   code comes last, with a written reason.
+3. Build only on current paths (KV cache manager V2, the Python cache
+   transceiver, `tensorrt_llm/_torch/attention/`), never on deprecated ones.
+4. With the feature off, outputs, memory, speed, errors, and API stay
+   identical to main.
+5. Reject unsupported combinations at configuration time. Never fall back
+   silently.
+6. Decide and test every compatibility axis, including block reuse, CUDA
+   graphs, the overlap scheduler, disaggregated serving, speculative
+   decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`).
+7. Measure performance end to end in the production configuration before
+   calling a change done (`../perf-kv-cache-tuning/SKILL.md`).
+8. Never remove a feature, mode, or optimization to make code smaller, and
+   never change an experiment's settings to make a result pass.
+9. Give each concept one full name and use it everywhere: identifiers, test
+   names, comments, docs, PR text, and replies to people. Write
+   "mixed-precision high window", never "window"; "FP8 KV cache", never
+   "FP8" or "KV". Abbreviate only with common knowledge (LLM, GPU, CUDA,
+   `attn`) or after writing "full name (ABBR)" at first use.
+10. Say "done", "passed", or "pushed" only with evidence you can show.
 
 ## Route the Task
 
-| Task | Load next |
+Paths are relative to this file.
+
+| Task | Read next |
 |---|---|
-| Add or change a compression method: iteration-driven (eviction, compaction) or storage-bound | `trtllm-kv-cache-compression` |
-| Cold-page codecs, the NVFP4 cold format, RoPE precision for cold pages | `trtllm-kv-cache-cold-page` |
-| The mixed-precision KV cache (`mixed_nvfp4_*` dtypes, first/last N tokens) | `trtllm-kv-cache-mixed-precision` |
-| Whether a feature works with reuse, CUDA graphs, overlap, disaggregated serving, speculative decoding, or parallelism; test design | `trtllm-kv-cache-compat-testing` |
-| Throughput, latency, memory, profiling, tuning | `perf-kv-cache-tuning` |
-| Accuracy of a lossy or state-changing feature | `trtllm-kv-cache-accuracy-eval` |
-| Change KVCM V2 itself: life cycles, reuse or retention rules, buffers, pool sizing, tiers, or its C++ core | `trtllm-kv-cache-manager-v2` |
-| A sparse attention algorithm that selects or skips KV inside attention (`SparseAttentionConfig`) | `docs/source/developer-guide/sparse-attention-development-guide.md`, then the compatibility, performance, and accuracy skills above |
+| Add or change a compression method: iteration-driven (eviction, compaction) or storage-bound | `../trtllm-kv-cache-compression/SKILL.md` |
+| Cold-page codecs, the NVFP4 cold-page format, rotary position embedding (RoPE) precision for cold pages | `../trtllm-kv-cache-cold-page/SKILL.md` |
+| The mixed-precision KV cache (`mixed_nvfp4_*` dtypes, first/last N tokens) | `../trtllm-kv-cache-mixed-precision/SKILL.md` |
+| Whether a feature works with reuse, CUDA graphs, the overlap scheduler, disaggregated serving, speculative decoding, or parallelism; test design | `../trtllm-kv-cache-compat-testing/SKILL.md` |
+| Throughput, latency, memory, profiling, tuning | `../perf-kv-cache-tuning/SKILL.md` |
+| Accuracy of a lossy or state-changing feature | `../trtllm-kv-cache-accuracy-eval/SKILL.md` |
+| Change KV cache manager V2 itself: life cycles, reuse or retention rules, buffers, pool sizing, tiers, or its native core | `../trtllm-kv-cache-manager-v2/SKILL.md` |
+| A sparse attention algorithm that selects or skips KV cache entries inside attention (`SparseAttentionConfig`) | `docs/source/developer-guide/sparse-attention-development-guide.md` in the repository, then the compatibility, performance, and accuracy skills above |
 
 ## Required Context
 
@@ -64,8 +96,9 @@ Read before proposing a design or editing code:
 3. `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md`, at least
    "KV-cache and decode-time semantics", "Evaluating New Attention", and
    "Anti-Patterns".
-4. Before touching the KVCM V2 core, `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md`
-   and `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md`. The
+4. Before touching the KV cache manager V2 native core,
+   `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md` and
+   `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md`. The
    latter covers ownership, invariants, the concurrency model, and high-risk
    areas.
 5. `docs/source/features/feature-combination-matrix.md`.
@@ -83,25 +116,26 @@ Read before proposing a design or editing code:
 When docs and code disagree, the code and its tests win. Say so in the change,
 and either fix the doc in the same PR or report it as a follow-up. Known
 stale spots to read past:
-- some docs still mention a pure-Python KVCM V2 backend, or ask for tests on
-  "both backends". There is one backend, the C++ core;
+- some docs still mention a pure-Python KV cache manager V2 backend, or ask
+  for tests on "both backends". There is one backend: the C++ native core;
 - the sparse-attention development guide still offers KV cache manager V1
-  for auxiliary pools. Put side buffers on KVCM V2 through
+  for auxiliary pools. Put side buffers on KV cache manager V2 through
   `_extra_buffers_per_layer` instead;
-- the root `AGENTS.md` lists NIXL, UCX, or MPI for KV exchange, and
+- the root `AGENTS.md` lists NIXL, UCX, or MPI for KV cache exchange, and
   `kv-transfer.md` says a V1 context worker can talk to a V2 generation
   worker. Both predate the deprecation: the current transceiver uses NIXL,
-  with KVCM V2 on both sides;
+  with KV cache manager V2 on both sides;
 - the opening sections of `kvcache.md` ("The Basics", "Reuse Across
-  Requests") describe V1 pools. V2 sizes one pool per layer group, from
-  `pool_ratio` or `avg_seq_len`;
+  Requests") describe KV cache manager V1 pools. KV cache manager V2 sizes
+  one pool per layer group, from `pool_ratio` or `avg_seq_len`;
 - the "Multi-backend Support" overview in `disagg-serving.md` describes the
   deprecated C++ transceiver. Use its transceiver configuration section
   instead;
-- the "Required KVCM Refactoring" section of the cold-page codec design is
-  already implemented. Read it as invariants, not as open work;
+- the cold-page codec design's section on the KV cache manager refactoring
+  it requires (titled "Required KVCM Refactoring") is already implemented.
+  Read it as invariants, not as open work;
 - the note in `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md` that
-  streaming KV events have no implementation predates the native streaming
+  streaming KV cache events have no implementation predates the native streaming
   path. The "KV Cache Events" section of `kvcache.md` is current;
 - line anchors in GitHub links can drift. Locate symbols by name.
 
@@ -109,16 +143,16 @@ stale spots to read past:
 
 | Build on | Do not build on (deprecated, removed, or legacy) |
 |---|---|
-| KV Cache Manager V2 (`use_kv_cache_manager_v2: true`, the default) | KV cache manager V1. It is deprecated and scheduled for removal, together with its V1-based subclasses, such as the hybrid managers in `kv_cache/mamba_cache_manager/legacy.py`. A few features still depend on V1 while they gain V2 support; new features target V2 and do not reuse V1-specific code paths |
-| The Python cache transceiver (`transceiver_runtime: PYTHON`) on the NIXL backend, with KVCM V2 on both workers | The deprecated C++ cache transceiver, which is selected by `transceiver_runtime: CPP`, by an explicit null, or by `auto` when it falls back. Also the UCX, MPI and MOONCAKE transceiver backends, `backend: DEFAULT`, and the `TRTLLM_USE_*_KVCACHE` backend selectors. New features target the Python transceiver |
+| KV cache manager V2 (`use_kv_cache_manager_v2: true`, the default) | KV cache manager V1. It is deprecated and scheduled for removal, together with its V1-based subclasses, such as the hybrid managers in `kv_cache/mamba_cache_manager/legacy.py`. A few features still depend on V1 while they gain V2 support; new features target V2 and do not reuse V1-specific code paths |
+| The Python cache transceiver (`transceiver_runtime: PYTHON`) on the NIXL backend, with KV cache manager V2 on both workers | The deprecated C++ cache transceiver, which is selected by `transceiver_runtime: CPP`, by an explicit null, or by `auto` when it falls back. Also the `UCX`, `MPI`, and `MOONCAKE` transceiver backends, `backend: DEFAULT`, and the `TRTLLM_USE_*_KVCACHE` backend selectors. New features target the Python transceiver |
 | Explicit settings in recipes and tests (`use_kv_cache_manager_v2: true`, `transceiver_runtime: PYTHON`) | `auto` values that can resolve to a deprecated path, and example or curated configurations that pin `use_kv_cache_manager_v2: false` |
-| Current speculative-decoding configurations (MTP, EAGLE3, and the other one-model modes) | The deprecated `NGramDecodingConfig` and `UserProvidedDecodingConfig` |
-| The C++ KVCM V2 core, driven through `tensorrt_llm/_torch/pyexecutor/kv_cache/` | A pure-Python KVCM V2 core. Main has none, and no code reads the `TLLM_KV_CACHE_MANAGER_V2_BACKEND` variable that some docs and tests still mention |
-| `tensorrt_llm/_torch/attention/` (`backends/`, `attention.py`, `ATTENTION_DEVELOPER_GUIDE.md`) | The deprecated compatibility shims `tensorrt_llm._torch.attention_backend` and `tensorrt_llm._torch.modules.attention` |
+| Current speculative-decoding configurations: multi-token prediction (MTP), EAGLE3, and the other one-model modes | The deprecated `NGramDecodingConfig` and `UserProvidedDecodingConfig` |
+| The KV cache manager V2 native core (C++), driven through `tensorrt_llm/_torch/pyexecutor/kv_cache/` | A pure-Python KV cache manager V2 core. Main has none, and no code reads the `TLLM_KV_CACHE_MANAGER_V2_BACKEND` variable that some docs and tests still mention |
+| `tensorrt_llm/_torch/attention/` (`backends/`, `attention.py`, `ATTENTION_DEVELOPER_GUIDE.md`) | The deprecated compatibility modules `tensorrt_llm._torch.attention_backend` and `tensorrt_llm._torch.modules.attention`, which only re-export the new location |
 | `tensorrt_llm/_torch/pyexecutor/kv_cache/` and `tensorrt_llm/_torch/disaggregation/` | Flat module paths from before the KV cache managers and the transceiver were regrouped |
-| The KV cache compression framework (`KvCacheCompressionConfig`) for work between steps or at tier boundaries | Sparse-attention hooks for KV reduction that does not change the attention computation |
+| The KV cache compression framework (`KvCacheCompressionConfig`) for work between steps or at tier boundaries | Sparse-attention hooks for KV cache reduction that does not change the attention computation |
 | Current field names: `cold_tier_offload_min_priority`, `block_reuse_config.policy`, `block_reuse_config.enable_branch_snapshot`, `mamba_state_config.periodic_snapshot_interval` | Old names: `secondary_offload_min_priority` (alias of `cold_tier_offload_min_priority`); `block_reuse_config.block_reuse_policy` (rejected; renamed to `policy`); `mamba_state_config.enable_branch_snapshot` (alias of `block_reuse_config.enable_branch_snapshot`); `mamba_state_cache_interval` (alias of `mamba_state_config.periodic_snapshot_interval`); `sink_token_length` (ignored on the PyTorch backend) |
-| `tests/unittest/_torch/pyexecutor/` for executor tests, `tests/unittest/_torch/pyexecutor/kv_cache/` for the KVCM V2 wrapper, `tests/unittest/kv_cache_manager_v2_tests/` for KVCM V2 core behavior | `tests/unittest/_torch/executor/`, the name from before the executor tests were renamed |
+| `tests/unittest/_torch/pyexecutor/` for executor tests, `tests/unittest/_torch/pyexecutor/kv_cache/` for the KV cache manager V2 wrapper, `tests/unittest/kv_cache_manager_v2_tests/` for KV cache manager V2 core behavior | `tests/unittest/_torch/executor/`, the name from before the executor tests were renamed |
 
 Before relying on any path, confirm it on the current main. Search open pull
 requests for planned removals or renames of the files you will touch.
@@ -127,13 +161,13 @@ requests for planned removals or renames of the files you will touch.
 
 | Layer | Location | Owns | Must not |
 |---|---|---|---|
-| User configuration | `tensorrt_llm/llmapi/llm_args.py` (`KvCacheConfig`, `KvCacheCompressionConfig` subclasses, `SparseAttentionConfig`) | Knobs, defaults, validation, rejection of unsupported combinations | Hold runtime state; switch features off silently |
-| Executor construction | `tensorrt_llm/_torch/pyexecutor/_util.py`, `py_executor_creator.py` | Building managers in the right order, compatibility admission, KV budget estimation | Contain method-specific runtime logic |
+| User configuration | `tensorrt_llm/llmapi/llm_args.py` (`KvCacheConfig`, `KvCacheCompressionConfig` subclasses, `SparseAttentionConfig`) | Settings, defaults, validation, rejection of unsupported combinations | Hold runtime state; switch features off silently |
+| Executor construction | `tensorrt_llm/_torch/pyexecutor/_util.py`, `py_executor_creator.py` | Building managers in the right order, compatibility admission, KV cache memory budget estimation | Contain method-specific runtime logic |
 | Executor loop and resource managers | `tensorrt_llm/_torch/pyexecutor/py_executor.py`, `resource_manager.py` | Request lifecycle, scheduling, the order of resource callbacks | Know a KV layout or a method's name |
-| KVCM V2, executor side | `tensorrt_llm/_torch/pyexecutor/kv_cache/` (`kv_cache_manager_v2.py`, `mixed_precision_staging.py`, `mamba_cache_manager/mamba_cache_manager_v2.py` for hybrid models), plus model- and backend-specific subclasses under `tensorrt_llm/_torch/attention/backends/` that declare side buffers through `_extra_buffers_per_layer` | Mapping layers to layer groups, pools, life cycles, priorities and reuse policies; extra buffers; the page tables that mixed-precision staging reads (the staging copy itself belongs to the attention metadata) | Make algorithm decisions; branch on one method |
-| KVCM V2 core | `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`, surfaced by `tensorrt_llm/runtime/kv_cache_manager_v2/` | Pages, slots, pools, the radix tree, eviction, migration, events, publication, release | Know models or methods |
-| Compression methods | `tensorrt_llm/_torch/kv_cache_compression/`, plus the manager base in `resource_manager.py` | Cadence, request-local state, selection, transforms, method kernels | Allocate or publish pages; release capacity except through the KVCM API after publishing completion |
-| Attention | `tensorrt_llm/_torch/attention/` (backends, metadata) | Consuming the published active representation; per-step metadata; declaring backend side buffers through the manager hooks | Own storage policy beyond those declarations; grow per-feature kernel branches |
+| KV cache manager V2, executor side | `tensorrt_llm/_torch/pyexecutor/kv_cache/` (`kv_cache_manager_v2.py`, `mixed_precision_staging.py`, `mamba_cache_manager/mamba_cache_manager_v2.py` for hybrid models), plus model- and backend-specific subclasses under `tensorrt_llm/_torch/attention/backends/` that declare side buffers through `_extra_buffers_per_layer` | Mapping layers to layer groups, pools, life cycles, priorities and reuse policies; extra buffers; the page tables that the mixed-precision staging copy reads (the mixed-precision staging copy itself belongs to the attention metadata) | Make algorithm decisions; branch on one method |
+| KV cache manager V2 native core | `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`, surfaced by `tensorrt_llm/runtime/kv_cache_manager_v2/` | Pages, slots, pools, the radix tree, eviction, migration, events, publication, release | Know models or methods |
+| Compression methods | `tensorrt_llm/_torch/kv_cache_compression/`, plus the KV cache compression manager base class (`KVCacheCompressionManager`) in `resource_manager.py` | Cadence, request-local state, selection, transforms, method kernels | Allocate or publish pages; release capacity except through the KV cache manager V2 API after publishing completion |
+| Attention | `tensorrt_llm/_torch/attention/` (backends, metadata) | Consuming the published active representation; per-step metadata; declaring backend side buffers through the KV cache manager V2 hooks | Own storage policy beyond those declarations; grow per-feature kernel branches |
 | Disaggregated transfer | `tensorrt_llm/_torch/disaggregation/` (Python transceiver, NIXL backend) | Moving published state between context and generation workers; resolving layout and transfer ids on both sides | Assume layouts the sender did not publish; target the deprecated C++ transceiver |
 
 ## Design Workflow
@@ -141,22 +175,25 @@ requests for planned removals or renames of the files you will touch.
 1. **Behavior contract.** What changes for the user. Also state what stays
    identical when the feature is off: everything.
 2. **Survey.** Find the existing mechanisms that already do most of the job:
-   life cycles and window pools, retention priorities, reuse policies, extra
-   buffers, lifecycle hooks, cold-page codecs, sparse-attention hooks,
-   metadata staging, transceiver layout resolution. See
+   life cycles (including sliding-window ones), retention priorities, reuse
+   policies, extra buffers, the KV cache compression manager's lifecycle
+   hooks, cold-page codecs, sparse-attention hooks, the attention metadata's
+   mixed-precision staging copy, transceiver layout resolution. See
    `references/design-principles.md`, section 2.
 3. **Extension level.** Use the highest level that works: configuration,
    then a field, then an existing extension point, then the feature's own
-   package, then shared Python core, then native code. Write a reason for every
-   step down. For shared-core or native changes, list every function you will
-   change, by layer.
+   package, then shared Python runtime code, then native code. Write a
+   reason for every step down. For changes to shared Python runtime code or
+   native code, list every function you will change, by layer.
 4. **Owner boundaries.** Place each responsibility in a row of the owner map.
-5. **Compatibility.** Decide each axis in `trtllm-kv-cache-compat-testing` as
-   supported, rejected, or n/a.
+5. **Compatibility.** Decide each axis in
+   `../trtllm-kv-cache-compat-testing/SKILL.md` as supported, rejected, or
+   n/a.
 6. **Performance budget.** List the per-step costs the feature adds and the
-   expected benefit, and pick the baselines (`perf-kv-cache-tuning`).
+   expected benefit, and pick the baselines
+   (`../perf-kv-cache-tuning/SKILL.md`).
 7. **Validation plan.** Follow the order in the compression development
-   guide:
+   guide (`docs/source/developer-guide/kv-cache-compression-development.md`):
    1. the accuracy or output-quality contract against the uncompressed path;
    2. real end-to-end activation and the claimed compatibility combinations;
    3. end-to-end performance;
@@ -174,13 +211,15 @@ Write the gate before editing:
 - Behavior contract: <what changes; "feature off = identical to main">
 - Existing mechanisms surveyed: <mechanism -> reused | why not>
 - Extension level: <config | field | extension point | feature package |
-  shared Python core | native>; reason for each step down: <...>
+  shared Python runtime code | native>; reason for each step down: <...>
 - Shared functions touched (layer x function): <table, or "none">
 - Owner placement: <responsibility -> owner-map row>
 - Compatibility table: <axis -> supported / rejected (where) / n/a>
 - Per-step cost and expected benefit: <...>; baselines: <...>
-- Validation plan: <accuracy contract / e2e activation and compatibility /
-  e2e perf / regression tests>
+- Validation plan: <accuracy contract / end-to-end activation and
+  compatibility / end-to-end performance / regression tests>
+- Names: <the full name of each new concept, used unchanged in code,
+  tests, docs, and the PR>
 - Docs and config artifacts to update: <...>
 ```
 
@@ -193,10 +232,11 @@ Be strict about reuse and open to real innovation. If a valuable idea cannot
 be expressed with existing mechanisms:
 1. prototype it in your own package and measure it;
 2. write down why each rung of the extension ladder fails;
-3. propose an algorithm-neutral seam (hook, capability, buffer role,
+3. propose an algorithm-neutral extension point (hook, capability, buffer role,
    life-cycle property, codec interface) that defaults to today's behavior;
 4. get the owners' decision;
-5. land the seam with unchanged-behavior tests, then the method on top.
+5. land the extension point with unchanged-behavior tests, then the method
+   on top.
 
 Section 11 of `references/design-principles.md` has the criteria and examples
 from main. Kernels follow `references/adding-kernels.md`.
@@ -209,17 +249,17 @@ behind them are in `references/lessons-learned.md`.
 - **Reuse before building.** Configuration first, then existing extension
   points, then the feature package. Do not add a new abstraction layer for a
   small feature. Do not route around an owner's component with a fallback.
-- **Keep method logic out of shared code.** The runtime, KVCM, attention
-  kernels, and C++ never branch on a method's or model's name. Shared changes
-  extend an algorithm-neutral contract.
+- **Keep method logic out of shared code.** The runtime, KV cache manager
+  V2, attention kernels, and C++ never branch on a method's or model's name.
+  Shared changes extend an algorithm-neutral contract.
 - **Feature-off invariance.** With the feature disabled, outputs, memory, speed,
   errors, and API are identical to main. Gate every new path on the feature's
   configuration. A bookkeeping fix that would change disabled runs is
   proposed separately.
 - **Fail fast.** Reject unsupported combinations at configuration time, or at
-  executor construction before KVCM allocation when the check needs the device
-  or the engine. No version sniffing, no try/except-import fallbacks, no
-  half-applied state. Load offline artifacts at initialization, never
+  executor construction before KV cache manager V2 allocation when the check
+  needs the device or the engine. No version sniffing, no try/except-import
+  fallbacks, no half-applied state. Load offline artifacts at initialization, never
   calibrate during inference.
 - **Preserve algorithm semantics.** Do not change selection rules or
   granularity, and do not remove modes for convenience. Parallel runs must
@@ -227,8 +267,17 @@ behind them are in `references/lessons-learned.md`.
 - **Hot-path discipline.** No per-step host loops, synchronizations,
   allocations, or blanket memsets. Allocate once, update in place, and keep
   CUDA-graph inputs static.
-- **Names and text.** Name things by behavior, not mechanism. Comments explain
-  the code as it stands; history goes in the PR. Use no internal jargon,
+- **Names and text.** Name things by behavior, not mechanism. Give each
+  concept one name, preferably the one the code or the public docs already
+  use, and write it in full everywhere: identifiers, test names and
+  parameter IDs, comments, log and error messages, docs, PR text, and
+  replies to people. Never cut it to a fragment. The mixed-precision high
+  window is `mixed_precision_high_window` in code and "mixed-precision high
+  window" in text, never `window`; a test of the FP8 KV cache says "FP8 KV
+  cache" (`fp8_kv_cache`), never just "FP8" or "KV". Use an abbreviation only
+  if it is common knowledge (LLM, GPU, CUDA, `attn`) or after writing "full
+  name (ABBR)" at its first use in each document. Comments explain the code
+  as it stands; history goes in the PR. Use no internal jargon, codenames,
   version labels, or milestone names anywhere.
 - **Code size is a consideration, not a target.** Before adding a feature,
   check whether an existing mechanism can carry it, or whether it can merge
@@ -245,7 +294,7 @@ behind them are in `references/lessons-learned.md`.
 | Rule | Enforced by | Reviewer action |
 |---|---|---|
 | Formatting, lint, spelling | pre-commit (ruff, yapf, clang-format, codespell, and others) | None if the hooks ran on commit |
-| DCO sign-off | commit-msg hook (`scripts/dco_check.py`) | Use `git commit -s`; no AI attribution lines |
+| Developer Certificate of Origin (DCO) sign-off | commit-msg hook (`scripts/dco_check.py`) | Use `git commit -s`; no AI attribution lines |
 | New config fields have descriptions | `tests/unittest/llmapi/test_llm_args.py` | None |
 | LLM-args golden manifest is current | `tests/unittest/usage/test_llmapi_config_telemetry_docs.py` | Regenerate with `scripts/generate_llm_args_golden_manifest.py`, and review the diff |
 | Serve schema snapshots are current | `scripts/generate_trtllm_serve_schemas.py --check`, CPU schema tests | Regenerate; never hand-edit |
@@ -253,14 +302,15 @@ behind them are in `references/lessons-learned.md`.
 | Test-list entries exist | pre-commit `scripts/check_test_list.py --validate` | Also check the test is on a stage with the right GPU |
 | No raw pinned-memory calls in runtime code | pre-commit `scripts/check_pinned_memory_usage.py` | Use `maybe_pin_memory()` or `prefer_pinned()` from `tensorrt_llm/_utils.py` |
 | NVIDIA copyright header on new files, year updated on modified files | Nothing | Check every new and touched file (`CODING_GUIDELINES.md`) |
-| User-facing config classes follow the Pydantic rules | Partly (field descriptions are tested) | `StrictBaseModel`, `Field(description=...)`, `Literal` for closed sets, validators raising `ValueError`, `status="prototype"` on new experimental knobs (`CODING_GUIDELINES.md`) |
+| User-facing config classes follow the Pydantic rules | Partly (field descriptions are tested) | `StrictBaseModel`, `Field(description=...)`, `Literal` for closed sets, validators raising `ValueError`, `status="prototype"` on new experimental settings (`CODING_GUIDELINES.md`) |
 | Feature-off invariance | Nothing | Read every new branch; run touched suites with the feature off |
 | Reuse of existing mechanisms; no new layers | Nothing | Compare with the design gate's survey |
 | No method or model branches in shared code or C++ | Nothing | Grep the diff outside the feature package |
 | No silent fallbacks, no version sniffing | Nothing | Read every `except`, `getattr` default, and capability check |
 | Per-step host work, syncs, memsets | Nothing | Read the call sites and their guards |
 | Compatibility decided and tested | Nothing | Check the compatibility table against the tests |
-| Activation proven, performance and accuracy measured | Nothing | Ask for the evidence (`perf-kv-cache-tuning`, `trtllm-kv-cache-accuracy-eval`) |
+| Activation proven, performance and accuracy measured | Nothing | Ask for the evidence (`../perf-kv-cache-tuning/SKILL.md`, `../trtllm-kv-cache-accuracy-eval/SKILL.md`) |
+| One full name per concept; abbreviations defined at first use | Nothing | Read new identifiers, test IDs, comments, and docs for fragments and undefined abbreviations |
 
 ## Agent Working Rules
 
@@ -302,6 +352,10 @@ behind them are in `references/lessons-learned.md`.
 - **Answer the question that was asked, first.** Put the answer before any
   progress narrative. If the question cannot be answered yet, say what is
   missing.
+- **Talk in the same full names.** In answers, reports, and review replies,
+  use the full names the code and docs use, define an abbreviation at its
+  first use, and never use a label you coined during the work. If the reader
+  would have to ask what a word means, replace it.
 - **Test the code you ship.** Use the latest code on a matching build. Run
   long experiments from a frozen snapshot of code and wheel, not from a
   branch that is still changing.
@@ -328,10 +382,10 @@ behind them are in `references/lessons-learned.md`.
 - **CI timing.** Do not push while the PR's CI is running or about to rerun.
   A new head commit restarts the whole pipeline. Documentation-only and
   waive changes can wait until CI passes.
-- **Clean branch.** Debug probes, extra NVTX ranges, micro-benchmarks, and
-  design notes stay out of the PR branch.
+- **Clean branch.** Debug probes, extra NVIDIA Tools Extension (NVTX)
+  ranges, micro-benchmarks, and design notes stay out of the PR branch.
 - **Order of work.** Before pushing a feature change, run the required hooks
-  and the end-to-end gate (`trtllm-kv-cache-compat-testing`). For
+  and the end-to-end gate (`../trtllm-kv-cache-compat-testing/SKILL.md`). For
   documentation-only changes and small agreed review fixes, the hooks are
   enough: push, then run the remaining checks and report them as pending.
   Never call a change done before the checks that matter pass, such as CUDA
@@ -374,7 +428,7 @@ behind them are in `references/lessons-learned.md`.
 ## Evidence
 - Compatibility: <axis -> test | rejection>
 - Activation: <how shown>
-- Performance: <A/B summary or "missing">
+- Performance: <comparison summary or "missing">
 - Accuracy: <summary or "n/a: lossless" or "missing">
 ```
 
