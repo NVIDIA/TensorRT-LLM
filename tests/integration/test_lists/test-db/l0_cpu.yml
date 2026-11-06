@@ -82,6 +82,7 @@ l0_cpu:
   # derivation and attention-call arguments, its routed-expert scalars and its weight table.
   # The rest of unittest/_torch/modeling_v2 needs a GPU.
   - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
@@ -99,6 +100,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_draft_block_rows.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_drafter_comm.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_uncertified_generic_calls.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.

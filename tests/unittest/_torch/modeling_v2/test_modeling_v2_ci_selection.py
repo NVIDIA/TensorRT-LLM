@@ -313,9 +313,6 @@ def _qa_entries(repo: Path) -> list[str]:
 # Unit tests that need hardware no CI stage provides, by test-db path, with what they
 # wait for. No test-db entry may run them.
 _NO_CI_STAGE = {
-    "unittest/_torch/modeling_v2/models/minimax_m3/ops/comm": (
-        "2, 4 or 8 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
-    ),
     "unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/comm": (
         "2 ranks on sm_107; CI has only the single-GPU GR100 stage (auto:gr100-x1)"
     ),

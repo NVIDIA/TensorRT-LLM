@@ -58,7 +58,9 @@ MAX_JOBS = 3
 #: Where a change reaches only the files that import it: the catalog's entries, the targets.
 SCOPED_SOURCE_DIRS: tuple[str, ...] = (f"{CATALOG_DIR}/", f"{MODELING_V2_PACKAGE}/models/")
 #: Test files every check runs: the package's source-level gates read every entry.
-ALWAYS_RUN = re.compile(r"(?:^|/)test_modeling_v2_(?:[a-z_]*claims[a-z_]*|ci_selection)\.py$")
+ALWAYS_RUN = re.compile(
+    r"(?:^|/)test_modeling_v2_(?:[a-z_]*claims[a-z_]*|ci_selection|contracts)\.py$"
+)
 
 #: Runs one command line in a tree on the run's devices; returns its exit code and output tail.
 RunJob = Callable[[str, Path], tuple[int, str]]

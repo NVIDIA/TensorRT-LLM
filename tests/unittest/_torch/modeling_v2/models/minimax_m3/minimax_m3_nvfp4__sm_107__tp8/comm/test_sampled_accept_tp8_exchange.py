@@ -7,7 +7,7 @@ import json
 
 import pytest
 import torch
-from _torch.modeling_v2.models.minimax_m3.ops.comm._sampled_accept_tp8 import (
+from _torch.modeling_v2.models.minimax_m3.minimax_m3_nvfp4__sm_107__tp8.comm._sampled_accept_tp8 import (
     _CALLS,
     _CASES,
     _DRAFT,
