@@ -24,6 +24,7 @@ import triton.language as tl
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
     CUDA_GRAPH_DUMMY_REQUEST_ID
+from tensorrt_llm._torch.pyexecutor.input_commit import active_input_commit
 from tensorrt_llm._utils import prefer_pinned
 
 REPLAY_WORK_POSITION_IN_DECODE_BATCH = 0
@@ -376,6 +377,9 @@ class Mamba2Metadata:
         # detect cache-manager buffer reallocation that would silently break
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
+        # Whether prepare() handed the state indices to a batched input commit
+        # (written right before the CUDA graph replay) instead of copying them.
+        self.state_indices_staged = False
 
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
@@ -392,6 +396,16 @@ class Mamba2Metadata:
         self._cu_seqlens_long = torch.zeros(max_batch_size + 1,
                                             dtype=torch.long,
                                             device="cuda")
+
+    def _copy_state_indices_to_device(self, batch_size: int,
+                                      input_commit) -> None:
+        if input_commit is not None:
+            input_commit.stage(self.state_indices[:batch_size],
+                               self.state_indices_cpu[:batch_size])
+            self.state_indices_staged = True
+        else:
+            self.state_indices[:batch_size].copy_(
+                self.state_indices_cpu[:batch_size], non_blocking=True)
 
     def _prepare_replay_work_items(self, kv_cache_manager, batch_size: int,
                                    num_contexts: int):
@@ -454,6 +468,14 @@ class Mamba2Metadata:
         kv_cache_manager = attn_metadata.kv_cache_manager
         request_ids = attn_metadata.request_ids
 
+        # A batched input commit writes the state indices later, so it must not
+        # be used when the replay work items below read them on the device.
+        input_commit = active_input_commit()
+        if (input_commit is not None and getattr(
+                kv_cache_manager, 'use_replay_state_update', False)):
+            input_commit = None
+        self.state_indices_staged = False
+
         if (kv_cache_manager is not None
                 and hasattr(kv_cache_manager, 'get_state_indices')
                 and request_ids is not None):
@@ -491,8 +513,7 @@ class Mamba2Metadata:
             elif isinstance(indices, torch.Tensor):
                 # CPU tensor → bulk H2D
                 self.state_indices_cpu[:batch_size].copy_(indices[:batch_size])
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._copy_state_indices_to_device(batch_size, input_commit)
             else:
                 # indices is a Python sequence (e.g. List[int]); data
                 # already lives on host, CPU staging is fine. One bulk
@@ -503,8 +524,7 @@ class Mamba2Metadata:
                 self.state_indices_cpu[:batch_size].copy_(
                     torch.as_tensor(indices,
                                     dtype=self.state_indices_cpu.dtype))
-                self.state_indices[:batch_size].copy_(
-                    self.state_indices_cpu[:batch_size], non_blocking=True)
+                self._copy_state_indices_to_device(batch_size, input_commit)
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)

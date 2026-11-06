@@ -92,6 +92,10 @@ from .cuda_graph_runner import (ENC_DEC_CUDA_GRAPH_DUMMY_TOKEN_NUM,
                                 EncoderCUDAGraphRunner,
                                 EncoderCUDAGraphRunnerConfig)
 from .guided_decoder import CapturableGuidedDecoder
+from .input_commit import (InputCommit, active_input_commit, bundle_census,
+                           disable_gen_host_bundle,
+                           gen_host_bundle_kernels_enabled, input_commit_scope,
+                           warmup_input_commit_kernels)
 from .kv_cache_manager_v2 import KVCacheManagerV2
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import (LlmRequest, LlmRequestState,
@@ -914,6 +918,18 @@ class PyTorchModelEngine(ModelEngine):
         self.position_ids_cuda = torch.empty((self.max_num_tokens, ),
                                              dtype=torch.int,
                                              device='cuda')
+        # TRTLLM_GEN_HOST_BUNDLE=1: the host->device input copies of a
+        # CUDA-graph decode step (and the overlap-scheduler gathers) are
+        # written by one kernel right before the replay; see input_commit.py.
+        # The bundle was measured on tensor-parallel GEN workers only.
+        if self.enable_attention_dp:
+            disable_gen_host_bundle("attention DP is enabled; the bundle was "
+                                    "measured without it")
+        self._input_commit: Optional[InputCommit] = (
+            InputCommit()
+            if gen_host_bundle_kernels_enabled() and prefer_pinned() else None)
+        if gen_host_bundle_kernels_enabled():
+            warmup_input_commit_kernels(self._input_commit)
         # Steady-state generation-only prepare cache (non-speculative overlap
         # decode). Holds the per-request lists that are invariant while the
         # scheduled generation batch keeps the same composition, plus a pinned
@@ -1043,6 +1059,10 @@ class PyTorchModelEngine(ModelEngine):
         )
         self.cuda_graph_runner = CUDAGraphRunner(cuda_graph_runner_config)
         self.breakable_cuda_graph_runner = None
+        # A model whose captured prefill body only serves batches of context
+        # requests (its row-wise stages are captured around eager breaks that
+        # read context-only metadata) opts in with this attribute on its body.
+        self._breakable_cuda_graph_context_only = False
         if self.prefill_cuda_graph_backend == PrefillCudaGraphBackend.BREAKABLE:
             decoder_model = (self.model if isinstance(
                 self.model, DecoderModelForCausalLM) else getattr(
@@ -1053,6 +1073,8 @@ class PyTorchModelEngine(ModelEngine):
                 )
             self.breakable_cuda_graph_runner = BreakableCUDAGraphRunner(
                 decoder_model.model)
+            self._breakable_cuda_graph_context_only = (
+                self._declares_context_only_breakable_body(decoder_model.model))
 
         # Initialize CUDA Graph LoRA manager if LoRA is enabled
         self.cuda_graph_lora_manager: Optional[CudaGraphLoraManager] = None
@@ -3656,6 +3678,9 @@ class PyTorchModelEngine(ModelEngine):
         if getattr(self, "_cleanup_done", False):
             return
 
+        if getattr(self, "_input_commit", None) is not None:
+            bundle_census().log(final=True)
+
         # Cleanup is not truly atomic: released CUDA/GMS resources cannot be
         # rolled back.  Keep each handle live until its own release succeeds,
         # so a failed cleanup can be retried without double-freeing resources
@@ -3974,6 +3999,25 @@ class PyTorchModelEngine(ModelEngine):
             return self.dist.tp_allgather_int64([num_tokens])[:, 0].tolist()
         return None
 
+    def _declares_context_only_breakable_body(self,
+                                              body: torch.nn.Module) -> bool:
+        """Whether the captured prefill ``body`` serves context-only batches.
+
+        Under attention DP every rank pads and replays or none does, decided
+        from the per-rank context request counts. That decision cannot keep
+        such a body away from a rank whose batch also has generation
+        requests, so the combination is refused.
+        """
+        context_only = bool(
+            getattr(body, "breakable_cuda_graph_context_only", False))
+        if context_only and self.enable_attention_dp:
+            raise ValueError(
+                "The breakable prefill CUDA graph of this model serves batches "
+                "of context requests only, which attention DP cannot "
+                "guarantee on every rank: disable attention DP or the "
+                "breakable prefill CUDA graph.")
+        return context_only
+
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
             return self.dist.tp_allgather_int64([num_ctx_requests])[:,
@@ -4058,9 +4102,17 @@ class PyTorchModelEngine(ModelEngine):
         total_num_tokens: int,
         num_ctx_requests: int,
         attn_all_rank_num_tokens: Optional[List[int]],
+        has_generation_requests: bool = False,
     ) -> Tuple[int, bool, Optional[List[int]]]:
         """
         Get the padding parameters for tensor padding.
+        Args:
+            total_num_tokens: the number of tokens of the batch
+            num_ctx_requests: the number of context requests of the batch
+            attn_all_rank_num_tokens: the number of tokens of each rank
+            has_generation_requests: whether the batch also has generation
+                requests; a body that only serves context-only batches
+                runs such a batch eagerly and unpadded
         Return:
             padded_num_tokens: the padded number of tokens
             can_run_prefill_cuda_graph: whether a prefill CUDA graph can run
@@ -4100,7 +4152,13 @@ class PyTorchModelEngine(ModelEngine):
                         "Not all ranks can run prefill CUDA graph, disable prefill CUDA graph"
                     )
                     return total_num_tokens, False, attn_all_rank_num_tokens
-            elif num_ctx_requests != 0 and total_num_tokens <= max_captured_num_tokens:
+            elif (num_ctx_requests != 0
+                  and total_num_tokens <= max_captured_num_tokens
+                  and not (has_generation_requests
+                           and self._breakable_cuda_graph_context_only)):
+                # A body that only serves context-only batches runs a mixed
+                # batch eagerly and unpadded (attention DP refuses such a
+                # body at init, so the branch above needs no such check).
                 padded_num_tokens = get_padded_prefill_tokens(total_num_tokens)
                 logger.debug(
                     f"Pad tensor with {total_num_tokens} tokens to {padded_num_tokens} tokens"
@@ -6160,12 +6218,18 @@ class PyTorchModelEngine(ModelEngine):
         assert total_num_tokens <= self.max_num_tokens, (
             f"total_num_tokens ({total_num_tokens}) should be less than or equal to max_num_tokens ({self.max_num_tokens})"
         )
+        # Set by forward() for a batched input commit (see input_commit.py).
+        input_commit = active_input_commit()
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
-            input_ids = torch.tensor(input_ids,
-                                     dtype=torch.int,
-                                     pin_memory=prefer_pinned())
-            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.input_ids_cuda[:num_tokens], input_ids)
+            else:
+                input_ids = torch.tensor(input_ids,
+                                         dtype=torch.int,
+                                         pin_memory=prefer_pinned())
+                self.input_ids_cuda[:num_tokens].copy_(input_ids,
+                                                       non_blocking=True)
 
             # Update input_ids_cuda with new tokens from new_tensors_device (draft model only)
             if self.is_draft_model and num_accepted_tokens_device is not None:
@@ -6242,18 +6306,28 @@ class PyTorchModelEngine(ModelEngine):
                             draft_first_draft_seq_slots_cuda[:total_tokens], 0]
 
         if num_draft_tokens > 0:
-            draft_tokens = torch.tensor(draft_tokens,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
-                                                             non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.draft_tokens_cuda[:num_draft_tokens],
+                                   draft_tokens)
+            else:
+                draft_tokens = torch.tensor(draft_tokens,
+                                            dtype=torch.int,
+                                            pin_memory=prefer_pinned())
+                self.draft_tokens_cuda[:len(draft_tokens)].copy_(
+                    draft_tokens, non_blocking=True)
         if self.is_spec_decode and len(num_accepted_draft_tokens) > 0:
-            num_accepted_draft_tokens = torch.tensor(num_accepted_draft_tokens,
-                                                     dtype=torch.int,
-                                                     pin_memory=prefer_pinned())
-            self.num_accepted_draft_tokens_cuda[:len(
-                num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
-                                                  non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(
+                    self.num_accepted_draft_tokens_cuda[:len(
+                        num_accepted_draft_tokens)], num_accepted_draft_tokens)
+            else:
+                num_accepted_draft_tokens = torch.tensor(
+                    num_accepted_draft_tokens,
+                    dtype=torch.int,
+                    pin_memory=prefer_pinned())
+                self.num_accepted_draft_tokens_cuda[:len(
+                    num_accepted_draft_tokens)].copy_(num_accepted_draft_tokens,
+                                                      non_blocking=True)
 
             # Update num_accepted_draft_tokens_cuda for first_draft_requests directly from num_accepted_tokens_device (draft model only)
             if self.is_draft_model and len(first_draft_seq_slots) > 0:
@@ -6282,7 +6356,40 @@ class PyTorchModelEngine(ModelEngine):
                     self.
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] = accepted_tokens
-        if next_draft_tokens_device is not None:
+        if next_draft_tokens_device is not None and input_commit is not None:
+            # Same values as the branch below, written by the commit kernel.
+            runtime_tokens_per_gen_step = self.get_runtime_tokens_per_gen_step(
+                self.runtime_draft_len)
+            previous_batch_tokens = (previous_batch_len *
+                                     runtime_tokens_per_gen_step)
+            num_extend_reqeust_wo_dummy = len(extend_requests) - len(
+                extend_dummy_requests)
+            if previous_batch_len > 0:
+                input_commit.stage(
+                    self.previous_batch_indices_cuda[:previous_batch_len],
+                    previous_batch_indices)
+                input_commit.stage(
+                    self.previous_pos_indices_cuda[:previous_batch_tokens],
+                    previous_pos_indices)
+            input_commit.set_overlap_fixup(
+                previous_slots=previous_batch_indices,
+                tokens_per_req=runtime_tokens_per_gen_step,
+                draft_width=runtime_tokens_per_gen_step - 1,
+                new_tokens=new_tokens_device,
+                new_tokens_lens=new_tokens_lens_device,
+                next_draft_tokens=next_draft_tokens_device,
+                input_ids=self.input_ids_cuda,
+                input_ids_start=num_tokens,
+                draft_tokens=self.draft_tokens_cuda,
+                draft_tokens_start=num_draft_tokens,
+                pos_offsets=self.previous_pos_id_offsets_cuda,
+                pos_offsets_start=(num_extend_reqeust_wo_dummy -
+                                   previous_batch_len) *
+                runtime_tokens_per_gen_step,
+                kv_offsets=self.previous_kv_lens_offsets_cuda,
+                kv_offsets_start=num_extend_reqeust_wo_dummy -
+                previous_batch_len)
+        elif next_draft_tokens_device is not None:
             # Initialize these two values to zeros
             self.previous_pos_id_offsets_cuda *= 0
             self.previous_kv_lens_offsets_cuda *= 0
@@ -6433,19 +6540,27 @@ class PyTorchModelEngine(ModelEngine):
             final_position_ids = self.mrope_position_ids_cuda[:, :, :
                                                               total_num_tokens]
         else:
-            position_ids = torch.tensor(position_ids,
-                                        dtype=torch.int,
-                                        pin_memory=prefer_pinned())
-            self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
-                                                            non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.position_ids_cuda[:total_num_tokens],
+                                   position_ids)
+            else:
+                position_ids = torch.tensor(position_ids,
+                                            dtype=torch.int,
+                                            pin_memory=prefer_pinned())
+                self.position_ids_cuda[:total_num_tokens].copy_(
+                    position_ids, non_blocking=True)
             final_position_ids = self.position_ids_cuda[:
                                                         total_num_tokens].unsqueeze(
                                                             0)
 
         if self.enable_spec_decode:
-            self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
-                gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
-                                                         non_blocking=True)
+            if input_commit is not None:
+                input_commit.stage(self.gather_ids_cuda[:len(gather_ids)],
+                                   gather_ids)
+            else:
+                self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
+                    gather_ids, dtype=torch.int, pin_memory=prefer_pinned()),
+                                                             non_blocking=True)
 
             # Update gather_ids for first_draft_requests on GPU (draft model only)
             if self.is_draft_model and len(first_draft_seq_slots) > 0:
@@ -6606,7 +6721,11 @@ class PyTorchModelEngine(ModelEngine):
                 attn_metadata)
         (padded_num_tokens, can_run_prefill_cuda_graph,
          attn_all_rank_num_tokens) = self._get_padding_params(
-             total_num_tokens, num_ctx_requests, attn_all_rank_num_tokens)
+             total_num_tokens,
+             num_ctx_requests,
+             attn_all_rank_num_tokens,
+             has_generation_requests=bool(
+                 scheduled_requests.generation_requests))
         set_per_request_prefill_cuda_graph_flag(can_run_prefill_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != total_num_tokens else None
 
@@ -7353,6 +7472,82 @@ class PyTorchModelEngine(ModelEngine):
 
         return lora_params
 
+    def _input_commit_for_step(
+            self, scheduled_requests: ScheduledRequests,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            attn_metadata: AttentionMetadata, can_run_graph: bool,
+            promoted_context_request_ids: frozenset[int]
+    ) -> Optional[InputCommit]:
+        """The batched input commit for this step, or None to copy one by one.
+
+        Also the census point of the GEN host bundle: every live (non warm-up)
+        step is counted there, with the reason when the commit is not used.
+        """
+        if self._input_commit is None:
+            return None
+        if self.is_warmup:
+            reason = "warmup"
+        else:
+            reason = self._input_commit_skip_reason(
+                scheduled_requests, kv_cache_manager, attn_metadata,
+                can_run_graph, promoted_context_request_ids)
+        bundle_census().begin_step(live=not self.is_warmup, skipped=reason)
+        return None if reason is not None else self._input_commit
+
+    def _input_commit_skip_reason(
+            self, scheduled_requests: ScheduledRequests,
+            kv_cache_manager: Union[KVCacheManager, KVCacheManagerV2],
+            attn_metadata: AttentionMetadata, can_run_graph: bool,
+            promoted_context_request_ids: frozenset[int]) -> Optional[str]:
+        """Why this step cannot use the batched input commit (None: it can).
+
+        Limited to the input-preparation path whose device-side reads of the
+        staged buffers were audited: a CUDA-graph replay of a generation-only
+        batch without padding dummies, on a one-model speculative-decoding
+        engine, using TRT-LLM attention without FlashMLA, FP4 MLA pools or
+        uGPU fork-join, and without mrope inputs, beam search, LoRA, guided
+        decoding, attention DP, helix or star context parallelism, or an
+        encoder-decoder model.
+        """
+        if not can_run_graph:
+            return "no_graph"
+        if (scheduled_requests.num_context_requests > 0
+                or promoted_context_request_ids):
+            return "context"
+        if scheduled_requests.num_generation_requests == 0:
+            return "no_generation"
+        if self.use_mrope or self.use_beam_search:
+            return "mrope_or_beam"
+        if self.is_draft_model:
+            return "draft_model"
+        if self.enable_attention_dp:
+            return "attention_dp"
+        if (self.lora_model_config is not None
+                or getattr(self, "guided_decoder", None) is not None):
+            return "lora_or_guided"
+        if self._is_encoder_decoder_model():
+            return "encoder_decoder"
+        if (not self.enable_spec_decode or self.spec_config is None
+                or self.spec_config.spec_dec_mode.has_draft_model()):
+            return "not_one_model_spec"
+        if (self.mapping is not None
+                and self.mapping.cp_config.get('cp_type', None) == CpType.STAR):
+            return "star_cp"
+        if self.mapping is not None and self.mapping.has_cp_helix():
+            return "helix"
+        if type(attn_metadata) is not TrtllmAttentionMetadata:
+            return "attn_backend"
+        if attn_metadata.enable_flash_mla:
+            return "flash_mla"
+        if attn_metadata.high_precision_kv_pool is not None:
+            return "high_precision_kv"
+        if _ugpu_forkjoin_enabled(kv_cache_manager):
+            return "ugpu_forkjoin"
+        if any(request.is_dummy
+               for request in scheduled_requests.generation_requests):
+            return "dummy_requests"
+        return None
+
     @nvtx_range("_prepare_inputs")
     def _prepare_inputs(
         self,
@@ -7983,11 +8178,31 @@ class PyTorchModelEngine(ModelEngine):
                     execution_requests.generation_requests,
                 )
 
-            inputs, gather_ids = self._prepare_inputs(
+            input_commit = self._input_commit_for_step(
                 execution_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer,
-                num_accepted_tokens_device, req_id_to_old_request,
-                resource_manager, can_run_graph, execution_promoted_context_ids)
+                can_run_graph, execution_promoted_context_ids)
+            if input_commit is None:
+                inputs, gather_ids = self._prepare_inputs(
+                    execution_requests, kv_cache_manager, attn_metadata,
+                    spec_metadata, new_tensors_device, cache_indirection_buffer,
+                    num_accepted_tokens_device, req_id_to_old_request,
+                    resource_manager, can_run_graph,
+                    execution_promoted_context_ids)
+            else:
+                input_commit.begin()
+                try:
+                    with input_commit_scope(input_commit):
+                        inputs, gather_ids = self._prepare_inputs(
+                            execution_requests, kv_cache_manager, attn_metadata,
+                            spec_metadata, new_tensors_device,
+                            cache_indirection_buffer,
+                            num_accepted_tokens_device, req_id_to_old_request,
+                            resource_manager, can_run_graph,
+                            execution_promoted_context_ids)
+                except BaseException:
+                    input_commit.abort()
+                    raise
+                input_commit.commit()
             speculative_model = self.get_speculative_model()
             spec_worker = (speculative_model.spec_worker
                            if speculative_model is not None else None)

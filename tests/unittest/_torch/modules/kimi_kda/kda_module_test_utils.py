@@ -12,6 +12,7 @@ from unittest import mock
 if TYPE_CHECKING:
     import torch
 
+    from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
 
 
@@ -22,11 +23,14 @@ def make_attention(
     weight_seed: int = 17,
     bf16_weights: bool = False,
     flashinfer: bool = True,
+    model_config: ModelConfig | None = None,
 ) -> KimiKDALinearAttention:
     """Build an attention module with reproducible synthetic checkpoint values.
 
     ``flashinfer`` selects the opt-in FlashInfer prefill (``TLLM_KDA_FLASHINFER_PREFILL=1``)
-    or the default in-tree prefill; the weights depend on ``weight_seed`` only.
+    or the default in-tree prefill; the weights depend on ``weight_seed`` only. A given
+    ``model_config`` (with the quantization the weights need) is shared with the caller, e.g.
+    to build several layers of one model.
     """
     import torch
 
@@ -47,10 +51,14 @@ def make_attention(
             gate_lower_bound=-5.0,
         ),
     )
-    config = ModelConfig(
-        quant_config=QuantConfig()
-        if bf16_weights
-        else QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+    config = (
+        model_config
+        if model_config is not None
+        else ModelConfig(
+            quant_config=QuantConfig()
+            if bf16_weights
+            else QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+        )
     )
     with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
         torch.manual_seed(weight_seed)

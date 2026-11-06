@@ -158,6 +158,15 @@ _K3_MERGED_MOE_AR = os.environ.get("TRTLLM_K3_MERGED_MOE_AR", "0") == "1"
 # the reduction is bandwidth-bound, so merging saves little, and it loses the overlap of the
 # shared expert's own all-reduce with the routed experts when that chain is the longer one.
 _K3_MERGED_MOE_AR_MAX_TOKENS = int(os.environ.get("TRTLLM_K3_MERGED_MOE_AR_MAX_TOKENS", "128"))
+# TRTLLM_K3_DEFER_SHARED_AR=1: the shared expert's row-parallel all-reduce (auxiliary stream) waits for the routed
+# experts before it launches, as it already does with the fused-communication MegaMoE backend; this extends the
+# ordering to the routed backends whose outer all-reduce runs after the streams join. Without the wait the
+# all-reduce launches as soon as the shared chain finishes, possibly while the routed finalize GEMM is still
+# running. Only the launch order changes; no kernel and no arithmetic.
+_K3_DEFER_SHARED_AR = os.environ.get("TRTLLM_K3_DEFER_SHARED_AR", "0") == "1"
+# Token counts up to this value keep the unordered launch; TRTLLM_K3_DEFER_SHARED_AR applies above it (the
+# fused-communication backend always defers).
+_K3_DEFER_SHARED_AR_MIN_TOKENS = int(os.environ.get("TRTLLM_K3_DEFER_SHARED_AR_MIN_TOKENS", "0"))
 # TRTLLM_K3_LATENT_AR_QUANT=1: the routed latent all-reduce (MNNVL) also quantizes its RMSNorm output to FP8 1x128
 # with UE8M0 scales in the layout of the Rubin CuTe DSL MXFP8 GEMM, and the FP8 latent up-projection reads it
 # directly (``_Fp8BlockScaleWeightReadLinear.forward_prequantized``) instead of quantizing the BF16 norm output in a
@@ -1971,6 +1980,10 @@ def _k3_router_gemm_bf16(enable_attention_dp: bool) -> bool:
 class KimiK3MoERuntime(nn.Module):
     """Kimi K3 latent MoE block backed by ConfigurableMoE."""
 
+    # Token count above which the shared all-reduce is deferred when ``_defer_shared_allreduce`` is set
+    # (never in a compiled graph); ``None``: at every token count.
+    _defer_shared_ar_min_tokens: Optional[int] = None
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -2177,10 +2190,17 @@ class KimiK3MoERuntime(nn.Module):
         use_shared_tp = not attention_dp and model_config.mapping.tp_size > 1
         # CuteDSL is the validated scope, not a correctness dependency:
         # DeepGEMM rejects TP without attention DP.
-        self._defer_shared_allreduce = (
+        defer_shared_ar_always = (
             use_shared_tp
             and routed_moe_model_config.moe_backend == "MEGAMOE_CUTEDSL"
             and self.routed_experts.backend.scheduler_kind == MoESchedulerKind.FUSED_COMM
+        )
+        # TRTLLM_K3_DEFER_SHARED_AR extends the deferral to the other backends above a token count.
+        self._defer_shared_allreduce = defer_shared_ar_always or (
+            use_shared_tp and _K3_DEFER_SHARED_AR
+        )
+        self._defer_shared_ar_min_tokens = (
+            None if defer_shared_ar_always else _K3_DEFER_SHARED_AR_MIN_TOKENS
         )
         self._reduce_routed_output = (
             use_shared_tp
@@ -2252,6 +2272,16 @@ class KimiK3MoERuntime(nn.Module):
         self.routed_expert_norm = RMSNorm(
             hidden_size=self.moe_hidden_size, eps=cfg.rms_norm_eps, dtype=dtype
         )
+
+    def _defer_shared_ar_for(self, num_tokens: int) -> bool:
+        """Whether the shared all-reduce waits for the routed experts at this token count."""
+        if not self._defer_shared_allreduce:
+            return False
+        min_tokens = self._defer_shared_ar_min_tokens
+        if min_tokens is None:
+            return True
+        # A compiled graph keeps the default launch: the comparison would guard on the token count.
+        return not torch.compiler.is_compiling() and num_tokens > min_tokens
 
     def _shared_all_reduce(self) -> nn.Module:
         """The shared expert's row-parallel reduction (kept aside if its down projection is FP8)."""
@@ -2767,14 +2797,17 @@ class KimiK3MoERuntime(nn.Module):
             else:
                 router_logits = self.gate.compute_logits(hidden_states)
         moe_all_reduce = self.routed_experts.all_reduce if self._reduce_routed_output else None
+        num_tokens = hidden_states.shape[0]
+        merged = self._merged_reduce_buffers(hidden_states)
+        # The merged all-reduce carries the shared partial after both streams join, so no separate
+        # shared all-reduce is deferred.
+        defer_shared_ar = merged is None and self._defer_shared_ar_for(num_tokens)
         overlap_shared_allreduce = (
-            self._defer_shared_allreduce
+            defer_shared_ar
             and do_multi_stream()
             and self.shared_expert_stream is not None
             and not torch.compiler.is_compiling()
         )
-        num_tokens = hidden_states.shape[0]
-        merged = self._merged_reduce_buffers(hidden_states)
         routed_slot = shared_slot = None
         if merged is not None:
             split = num_tokens * self.moe_hidden_size
@@ -2831,7 +2864,7 @@ class KimiK3MoERuntime(nn.Module):
                 identity,
                 final_all_reduce_params=(
                     AllReduceParams(enable_allreduce=False)
-                    if self._defer_shared_allreduce or merged is not None
+                    if defer_shared_ar or merged is not None
                     else None
                 ),
             )
@@ -2844,7 +2877,7 @@ class KimiK3MoERuntime(nn.Module):
                 # Wait for all routed chunks, but overlap the norm/up tail.
                 self.moe_routed_event.wait()
                 shared_out = self._shared_all_reduce()(shared_out)
-            elif self.shared_down_all_reduce is not None and not self._defer_shared_allreduce:
+            elif self.shared_down_all_reduce is not None and not defer_shared_ar:
                 shared_out = self.shared_down_all_reduce(shared_out)
             return shared_out
 
@@ -2858,7 +2891,7 @@ class KimiK3MoERuntime(nn.Module):
             self.shared_expert_stream,
             disable_on_compile=True,
         )
-        if self._defer_shared_allreduce and not overlap_shared_allreduce:
+        if defer_shared_ar and not overlap_shared_allreduce:
             shared_out = self._shared_all_reduce()(shared_out)
         if merged is not None or self._reduce_routed_output:
             if merged is not None:
@@ -3649,6 +3682,11 @@ class KimiLinearDecoderLayer(nn.Module):
 
 
 class KimiLinearModel(DecoderModel):
+    # The prefill body captured by a breakable CUDA graph serves batches of context requests
+    # only (see ``KimiKDALinearAttention._forward_breakable``): the engine runs a batch that
+    # also carries generation requests eagerly.
+    breakable_cuda_graph_context_only = True
+
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = _get_text_config(model_config.pretrained_config)
@@ -3756,10 +3794,14 @@ class KimiLinearModel(DecoderModel):
         hidden_states = inputs_embeds
 
         num_tokens = attn_metadata.num_tokens
-        assert hidden_states.shape[0] == num_tokens, (
-            f"Kimi K3 does not support padded batches "
-            f"(got {hidden_states.shape[0]} rows, metadata says {num_tokens} "
-            "tokens); disable CUDA graphs and the overlap scheduler."
+        # Only a prefill CUDA graph batch carries padding rows: the engine pads it up to the
+        # graph's token count (``attn_metadata.padded_num_tokens``), and the attention layers
+        # leave those rows as zeros. Any other row count is a mismatch.
+        assert hidden_states.shape[0] in (num_tokens, attn_metadata.padded_num_tokens), (
+            f"Kimi K3 does not support padded batches other than the token padding of a "
+            f"prefill CUDA graph (got {hidden_states.shape[0]} rows, metadata says "
+            f"{num_tokens} tokens, padded to {attn_metadata.padded_num_tokens}); disable CUDA "
+            "graphs and the overlap scheduler."
         )
 
         block_residual = hidden_states.new_empty(

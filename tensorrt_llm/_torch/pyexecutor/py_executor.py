@@ -65,6 +65,7 @@ from .adp_iter_stats import ADPIterStatsBuffer
 from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .error_classification import ErrorBudget
+from .executor_phase_log import ExecutorPhaseLog, phase_log_threshold_ms
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -1226,6 +1227,12 @@ class PyExecutor:
         # _pop_from_waiting_queue).  0 = uninitialised; first throttled iter
         # seeds it to tp_size and each subsequent iter doubles it.
         self._fill_admit_cap: int = 0
+        # TRTLLM_EXECUTOR_PHASE_LOG: per-rank host phase timing of overlap
+        # executor iterations with request events (see executor_phase_log.py).
+        phase_log_ms = phase_log_threshold_ms()
+        self._phase_log = (ExecutorPhaseLog(phase_log_ms, self.global_rank,
+                                            logger.info)
+                           if phase_log_ms is not None else None)
 
         # Initialize disagg PP termination handler if needed
         self._disagg_pp_termination_handler = None
@@ -5444,11 +5451,15 @@ class PyExecutor:
             target_inputs = None
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
+            phase_log = self._phase_log
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
+                if phase_log is not None:
+                    phase_log.begin()
+                    num_fetched_before = self.num_fetch_requests
 
                 if self._resource_governor_enabled:
                     self._sync_and_process_resource_governor_queue()
@@ -5465,6 +5476,11 @@ class PyExecutor:
                 # be pushed later, e.g. before model_engine._prepare_inputs().
                 self._wait_for_model_engine_input_copy()
                 scheduled_batch, iter_stats = self._prepare_and_schedule_batch()
+                if phase_log is not None:
+                    phase_log.mark("schedule")
+                    phase_log.count(
+                        "admitted",
+                        self.num_fetch_requests - num_fetched_before)
 
                 if scheduled_batch is None:
                     self._flush_pending_transfer_responses()
@@ -5500,9 +5516,17 @@ class PyExecutor:
 
                 if can_queue:
                     if self.kv_cache_transceiver:
+                        if phase_log is not None:
+                            phase_log.count(
+                                "first",
+                                sum(1 for req in
+                                    scheduled_batch.generation_requests if req.
+                                    is_disagg_generation_transmission_complete))
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
+                        if phase_log is not None:
+                            phase_log.mark("first_step")
 
                     has_draft_batch = self.drafter is not None and self.previous_batch is not None and self.use_spec_decode and self.drafter.should_forward_draft_model(
                         scheduled_batch)
@@ -5523,6 +5547,8 @@ class PyExecutor:
                     self._handle_dynamic_draft_len(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+                    if phase_log is not None:
+                        phase_log.mark("resources")
 
                 if self.kv_connector_manager:
                     self.kv_connector_manager.handle_metadata()
@@ -5560,6 +5586,8 @@ class PyExecutor:
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+                        if phase_log is not None:
+                            phase_log.mark("first_token")
 
                     # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
                     if self.guided_decoder is not None and self.kv_cache_transceiver:
@@ -5615,6 +5643,8 @@ class PyExecutor:
                         batch_outputs = self._forward_step(
                             scheduled_batch, previous_tensors_device,
                             num_accepted_tokens_device)
+                    if phase_log is not None:
+                        phase_log.mark("forward")
 
                     self._maybe_prefetch_next_iter_mm_encoders(scheduled_batch)
 
@@ -5630,6 +5660,8 @@ class PyExecutor:
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
+                    if phase_log is not None:
+                        phase_log.mark("wait_previous")
 
                 if self.enable_early_first_token_response:
                     if self.previous_batch is not None and should_process_previous_batch:
@@ -5647,6 +5679,8 @@ class PyExecutor:
                 # participate in the tp_gather collective even when
                 # should_process_previous_batch differs between ranks.
                 self._flush_pending_transfer_responses()
+                if phase_log is not None:
+                    phase_log.mark("flush")
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
                     # Cleanup previous draft resources used in the draft model
@@ -5691,6 +5725,8 @@ class PyExecutor:
                     if (self._is_kv_manager_v2
                             and scheduled_batch.context_requests):
                         self._update_v2_context_resources(scheduled_batch)
+                    if phase_log is not None:
+                        phase_log.mark("sample")
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._commit_kv_cache_stats(
@@ -5699,9 +5735,16 @@ class PyExecutor:
                     # generation KV caches, both of which can mutate V2 page
                     # indices used by the current batch's input preparation.
                     self._wait_for_model_engine_input_copy()
+                    if phase_log is not None:
+                        num_active_before = len(self.active_requests)
                     self._process_previous_batch()
                     self.perf_manager.compute_batch_gpu_times(
                         self.previous_batch.scheduled_requests.all_requests())
+                    if phase_log is not None:
+                        phase_log.mark("process_previous")
+                        phase_log.count(
+                            "finished",
+                            num_active_before - len(self.active_requests))
                 else:
                     self._enqueue_responses([])
 
@@ -5754,6 +5797,9 @@ class PyExecutor:
 
                 self._kv_connector_terminate_requests()
 
+                if phase_log is not None:
+                    phase_log.mark("tail")
+                    phase_log.end(self.iter_counter)
                 self.iter_counter += 1
 
     @nvtx_range("_accept_draft_tokens")
@@ -7774,6 +7820,8 @@ class PyExecutor:
                         for req in cache_trans_complete_requests
                     ])
 
+        rejection_on = getattr(self.model_engine.spec_config,
+                               "use_rejection_sampling", False)
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -7795,6 +7843,14 @@ class PyExecutor:
                         0
                     ] * self.model_engine.max_total_draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
+                if req.py_draft_tokens and not any(req.py_draft_tokens):
+                    # Placeholder drafts (zeros: the context server sent none,
+                    # or its drafter returned zeros for the context step) have
+                    # no draft-probability row on this side. With rejection
+                    # sampling, the first verify step would read an unwritten
+                    # row and could accept token 0, so use the one-hot row, as
+                    # for a generation request that enters without drafts.
+                    req.py_needs_onehot_draft_probs |= rejection_on
                 beam_width = req.py_beam_width
                 if not self._update_sampler_state_for_disagg_gen_request(
                         req, beam_width, first_gen_tokens):

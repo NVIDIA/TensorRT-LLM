@@ -154,7 +154,10 @@ class PeerRegistrar:
             return False
 
         AttentionPolicy.validate_peer_compatible(
-            self._self_ext_cache.page_table, peer_ri.page_table
+            self._self_ext_cache.page_table,
+            peer_ri.page_table,
+            self._ri.attention.tokens_per_block,
+            peer_ri.attention.tokens_per_block,
         )
 
         # Recurrent-state (Mamba/KDA) layout gate. Raises ValueError with a

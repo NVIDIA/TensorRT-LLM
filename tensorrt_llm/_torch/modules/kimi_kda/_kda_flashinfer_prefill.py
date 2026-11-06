@@ -20,7 +20,7 @@ import importlib
 import math
 import os
 from types import ModuleType
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -237,47 +237,14 @@ def _convolve(
     return kda_layout_qkv(packed, mixer.num_heads, mixer.head_dim, normalize_qk=False)
 
 
-def forward_prefill_flashinfer(
-    mixer: KimiKDALinearAttention,
-    x2d: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    mamba_metadata,
-    num_prefills: int,
-    conv_pool: torch.Tensor,
-    ssm_pool: torch.Tensor,
-    slot_indices: torch.Tensor,
-    layer_cache=None,
-) -> torch.Tensor:
-    """``KimiKDALinearAttention.forward_prefill`` on the FlashInfer prefill.
+def project_gate_beta(
+    mixer: KimiKDALinearAttention, x: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Forget-gate logits ``[1, T, H, D]`` and beta logits ``[1, T, H]`` of ``x``.
 
-    Same contract as the in-tree path: packed context tokens in, the gated o_proj output
-    out; the selected rows of the recurrent and convolution pools hold each request's
-    state after its last token.
+    ``x`` is ``[1, T, hidden]``. Row-wise in ``T``: nothing here reads the batch metadata.
     """
     from einops import rearrange
-
-    if x2d.shape[0] == 0:
-        return x2d.new_empty((0, mixer.hidden_size))
-    x = x2d.unsqueeze(0)  # [1, T, hidden]
-    # The metadata owns stable int32 slot indices; never convert per layer.
-    slot_indices = mamba_metadata.state_indices[:num_prefills]
-    has_init = mamba_metadata.has_initial_states[:num_prefills]
-
-    conv_input, onorm_g = _project_conv_input(mixer, x, x2d)
-    if not can_use_indexed_flashinfer_prefill(
-        state_pool=ssm_pool,
-        state_indices=slot_indices,
-        has_initial_states=has_init,
-        cu_seqlens=cu_seqlens,
-        num_sequences=num_prefills,
-        num_tokens=x2d.shape[0],
-    ):
-        raise ValueError("Unsupported FlashInfer KDA state layout or prepared metadata")
-    # Fresh requests start from zero state; the recurrence then updates the rows in place.
-    reset_recurrent_state_rows(ssm_pool, slot_indices, has_init)
-    q, k, v = _convolve(
-        mixer, conv_input, slot_indices, has_init, conv_pool, mamba_metadata, num_prefills
-    )
 
     if mixer._bfa_proj_weight is not None:
         bfa = torch.nn.functional.linear(x, mixer._bfa_proj_weight)
@@ -288,6 +255,56 @@ def forward_prefill_flashinfer(
         g = mixer.f_b_proj(mixer.f_a_proj(x))
         beta = mixer.b_proj(x)
     g = rearrange(g, "... (h d) -> ... h d", d=mixer.head_dim)
+    return g, beta
+
+
+def run_prefill_core(
+    mixer: KimiKDALinearAttention,
+    conv_input: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    mamba_metadata,
+    num_prefills: int,
+    conv_pool: torch.Tensor,
+    ssm_pool: torch.Tensor,
+    layer_cache=None,
+    num_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    """The batch-dependent part of the FlashInfer prefill: reset, convolution, chunk recurrence.
+
+    ``conv_input`` ``[T, 3D or 4D]`` (or ``[3D, T]`` on the unfused convolution), ``g``
+    ``[1, T, H, D]`` and ``beta`` ``[1, T, H]`` are the row-wise projections of the context
+    tokens. With ``num_tokens`` set, only that many leading token rows are real and the rest
+    is padding: the unfused ``[3D, T]`` layout is not supported then. Returns the recurrence
+    output ``[1, num_tokens, H, D]`` (BF16); the selected rows of the recurrent and convolution
+    pools hold each request's state after its last token.
+    """
+    # The metadata owns stable int32 slot indices; never convert per layer.
+    slot_indices = mamba_metadata.state_indices[:num_prefills]
+    has_init = mamba_metadata.has_initial_states[:num_prefills]
+    if num_tokens is not None and num_tokens != g.shape[1]:
+        if num_tokens > g.shape[1]:
+            raise ValueError(f"{num_tokens} KDA prefill tokens exceed the {g.shape[1]} rows given")
+        if not mixer._kda_fi_fuse_conv:
+            raise ValueError("Padded KDA prefill rows need the fused token-major convolution")
+        conv_input = conv_input[:num_tokens]
+        g = g[:, :num_tokens]
+        beta = beta[:, :num_tokens]
+    if not can_use_indexed_flashinfer_prefill(
+        state_pool=ssm_pool,
+        state_indices=slot_indices,
+        has_initial_states=has_init,
+        cu_seqlens=cu_seqlens,
+        num_sequences=num_prefills,
+        num_tokens=g.shape[1],
+    ):
+        raise ValueError("Unsupported FlashInfer KDA state layout or prepared metadata")
+    # Fresh requests start from zero state; the recurrence then updates the rows in place.
+    reset_recurrent_state_rows(ssm_pool, slot_indices, has_init)
+    q, k, v = _convolve(
+        mixer, conv_input, slot_indices, has_init, conv_pool, mamba_metadata, num_prefills
+    )
 
     a_log = mixer._A_log_f32 if mixer._A_log_f32 is not None else mixer.A_log
     dt_bias = mixer._dt_bias_f32 if mixer._dt_bias_f32 is not None else mixer.dt_bias
@@ -312,4 +329,61 @@ def forward_prefill_flashinfer(
     # Fused-verify replay caches: seed the committed conv window so the first verify
     # round convolves the correct history.
     mixer._sync_kda_replay_conv_window(layer_cache, slot_indices, conv_pool)
+    return o
+
+
+def forward_prefill_flashinfer(
+    mixer: KimiKDALinearAttention,
+    x2d: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    mamba_metadata,
+    num_prefills: int,
+    conv_pool: torch.Tensor,
+    ssm_pool: torch.Tensor,
+    slot_indices: torch.Tensor,
+    layer_cache=None,
+) -> torch.Tensor:
+    """``KimiKDALinearAttention.forward_prefill`` on the FlashInfer prefill.
+
+    Same contract as the in-tree path: packed context tokens in, the gated o_proj output
+    out; the selected rows of the recurrent and convolution pools hold each request's
+    state after its last token.
+    """
+    if x2d.shape[0] == 0:
+        return x2d.new_empty((0, mixer.hidden_size))
+    x = x2d.unsqueeze(0)  # [1, T, hidden]
+    conv_input, onorm_g = _project_conv_input(mixer, x, x2d)
+    g, beta = project_gate_beta(mixer, x)
+    o = run_prefill_core(
+        mixer,
+        conv_input,
+        g,
+        beta,
+        cu_seqlens,
+        mamba_metadata,
+        num_prefills,
+        conv_pool,
+        ssm_pool,
+        layer_cache,
+    )
+    return mixer._output_gate_and_proj(x, o, onorm_g)
+
+
+def forward_prefill_flashinfer_breakable(
+    mixer: KimiKDALinearAttention,
+    x2d: torch.Tensor,
+    run_core: Callable[[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor], None],
+) -> torch.Tensor:
+    """``forward_prefill_flashinfer`` split for a breakable CUDA graph, before the all-reduce.
+
+    ``x2d`` ``[T, hidden]`` holds the context tokens, possibly followed by padding rows. The
+    input projections, the output gate and ``o_proj`` are row-wise and meant to be captured;
+    ``run_core(conv_input, g, beta, o)`` is the eager break that fills the leading rows of the
+    zero-initialized ``o`` ``[1, T, H, D]`` from the batch metadata (``run_prefill_core``).
+    """
+    x = x2d.unsqueeze(0)  # [1, T, hidden]
+    conv_input, onorm_g = _project_conv_input(mixer, x, x2d)
+    g, beta = project_gate_beta(mixer, x)
+    o = x2d.new_zeros((1, x2d.shape[0], mixer.num_heads, mixer.head_dim))
+    run_core(conv_input, g, beta, o)
     return mixer._output_gate_and_proj(x, o, onorm_g)

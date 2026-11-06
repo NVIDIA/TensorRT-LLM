@@ -25,7 +25,9 @@ from ....quantization import QuantAlgo
 from ...attention_backend import AttentionMetadata, TrtllmAttention
 from ...attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ...model_config import ModelConfig
+from ...pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ...utils import AuxStreamType
+from ..attention import extract_extra_attrs
 from ..linear import Linear, TensorParallelMode
 from ..mla import MLA
 from ..multi_stream_utils import maybe_execute_in_parallel
@@ -48,6 +50,53 @@ _K3_MLA_GATE_OVERLAP = bool(get_env_flag("TRTLLM_K3_MLA_GATE_OVERLAP", False))
 _K3_MLA_FUSE_GATE_A_ENV = "TRTLLM_K3_MLA_FUSE_GATE_A"
 
 
+# TRTLLM_K3_MLA_FUSED_QKV=1: a decode batch of at most 32 tokens builds its FP8 attention query and
+# its new KV rows in one kernel after the fused [g_proj; q_a/kv_a] GEMM
+# (cute_dsl_kernels/rubin/k3_mla_fused_qkv.py: q_a and kv_a RMSNorm, the 1x128 FP8 quantization,
+# q_b_proj with the in-cluster K split of its GEMM tactic, the FP8 absorption, the KV append with the
+# scale and scheduler buffers); the same bytes as the stock chain of norm, quantize, GEMM, concat,
+# absorption and RoPE / KV-append kernels. Other batches (context, larger decode batches, a q_b
+# tactic without an in-cluster K split, other KV / attention configurations) take the stock path.
+_K3_MLA_FUSED_QKV = bool(get_env_flag("TRTLLM_K3_MLA_FUSED_QKV", False))
+
+
+def _qb_gemm_k_splits(q_b_proj: torch.nn.Module, num_tokens: int) -> Optional[int]:
+    """The K partition of the GEMM tactic ``q_b_proj`` would run for ``num_tokens`` tokens: 1 for
+    the unsplit base kernel (and the untuned default), ``cluster_k`` for an in-cluster K split, None
+    for any other tactic (mixed clusters, split-K, B-stationary), which the fused kernel does not
+    reproduce.
+
+    Makes the same ``AutoTuner.choose_one`` call as ``cute_dsl_mxfp8_gemm_rubin`` with
+    ``fine_grained_m`` (so under ``autotune()`` it tunes the GEMM exactly as the stock path would).
+    """
+    from ...autotuner import AutoTuner
+    from ...custom_ops import cute_dsl_custom_ops as cdo
+
+    weight = q_b_proj.weight
+    k = weight.shape[1]
+    padded_m = (num_tokens + 127) // 128 * 128
+    act = torch.empty((num_tokens, k), dtype=torch.float8_e4m3fn, device=weight.device)
+    act_scale = torch.empty((padded_m * (k // 32),), dtype=torch.uint8, device=weight.device)
+    runner = cdo.CuteDSLKimiK3MXFP8RubinLinear(output_dtype=torch.bfloat16, use_tvm_ffi=True)
+    inputs = [
+        act,
+        weight,
+        act_scale,
+        q_b_proj.weight_scale,
+        cdo._get_mxfp8_gemm_alpha(weight.device),
+    ]
+    _, tactic = AutoTuner.get().choose_one(
+        "trtllm::cute_dsl_mxfp8_gemm_rubin", [runner], runner.__class__.tuning_config, inputs
+    )
+    if not isinstance(tactic, tuple) or not tactic:
+        return 1  # the runner's default: the unsplit base kernel
+    if tactic[0] == "base":
+        return 1
+    if tactic[0] == "streamk" and len(tactic) == 9 and isinstance(tactic[8], int):
+        return tactic[8]
+    return None
+
+
 def _check_gate_flags() -> None:
     """Reject ``TRTLLM_K3_MLA_FUSE_GATE_A=1`` together with ``TRTLLM_K3_MLA_GATE_OVERLAP=1``."""
     if _K3_MLA_GATE_OVERLAP and get_env_flag(_K3_MLA_FUSE_GATE_A_ENV, False):
@@ -57,6 +106,30 @@ def _check_gate_flags() -> None:
             "on a side stream during the attention. Set at most one of them; "
             "TRTLLM_K3_MLA_GATE_FP8=1 works with either."
         )
+
+
+def k3_mla_attention_inplace(
+    hidden_states: torch.Tensor,
+    layer_idx: str,
+    output: torch.Tensor,
+    fused_a_output: Optional[torch.Tensor] = None,
+) -> None:
+    """Run the shared MLA attention of one K3 layer eagerly into ``output``.
+
+    The eager break of the breakable prefill CUDA graph: the attention reads the live batch
+    metadata and writes the first ``attn_metadata.num_tokens`` rows of ``output``.
+    """
+    metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
+    mla_layer.forward_impl(
+        None,
+        hidden_states,
+        metadata,
+        attn_output=[output],
+        fused_a_output=fused_a_output,
+    )
+
+
+maybe_bcg_k3_mla_attention_inplace = eager_on_graph(k3_mla_attention_inplace)
 
 
 # Deliberate divergence from upstream, which defaults this to "cute-dsl".
@@ -405,6 +478,263 @@ class KimiK3MLAAttention(MLA):
             return self.o_proj.forward_prequantized(*gate_mul_fp8_r128c4(attn_out, gate))
         return self.o_proj(attn_out * gate.sigmoid())
 
+    def _fused_qkv_norms_supported(self, device: torch.device) -> bool:
+        """Both latent RMSNorms run FlashInfer's CuTe DSL kernel, whose arithmetic the fused kernel
+        reproduces (no cuda-tile / Gemma / fused NVFP4 variant, no CUDA-JIT fallback)."""
+        cached = getattr(self, "_fused_qkv_norms_ok", None)
+        if cached is not None:
+            return cached
+        from ...flashinfer_utils import IS_FLASHINFER_AVAILABLE
+        from ...utils import is_nvfp4_marlin_enabled
+
+        ok = (
+            IS_FLASHINFER_AVAILABLE
+            and not is_nvfp4_marlin_enabled()
+            and self._resolve_qa_fused_scale() is None
+        )
+        for norm in (self.q_a_layernorm, self.kv_a_layernorm):
+            ok = ok and not (
+                getattr(norm, "use_cuda_tile", False)
+                or getattr(norm, "use_gemma", False)
+                or getattr(norm, "return_hp_output", False)
+                or (
+                    getattr(norm, "is_nvfp4", False)
+                    and getattr(norm, "nvfp4_scale", None) is not None
+                )
+                or norm.weight.dtype != torch.bfloat16
+            )
+        if ok:
+            try:
+                from flashinfer.norm import _use_cuda_norm
+            except ImportError:
+                ok = False
+            else:
+                ok = not _use_cuda_norm(device)
+        self._fused_qkv_norms_ok = ok
+        return ok
+
+    def _fused_qkv_plan(
+        self, attn_metadata: AttentionMetadata, fused_a_output: Optional[torch.Tensor]
+    ) -> Optional[tuple]:
+        """``(k_splits, kv_view)`` for ``TRTLLM_K3_MLA_FUSED_QKV`` on this batch (the q_b K partition
+        and ``_kv_page_view``), or None to run the stock path (see ``_K3_MLA_FUSED_QKV``)."""
+        from ...cute_dsl_kernels.rubin import k3_mla_fused_qkv as fqkv
+
+        num_tokens = attn_metadata.num_tokens
+        num_gens = attn_metadata.num_generations
+        mqa = self.mqa
+        if not (
+            fused_a_output is not None
+            and attn_metadata.num_contexts == 0
+            and 0 < num_gens
+            and 0 < num_tokens <= fqkv.MAX_TOKENS
+            and num_tokens % num_gens == 0
+            and getattr(attn_metadata, "beam_width", 1) == 1
+            and self.fp8_nope_q_absorb
+            and getattr(mqa, "has_fp8_kv_cache", False)
+            and not getattr(mqa, "uses_fp4_mla_attention", False)
+            # The CuTe DSL FP8 decode, which reads only quant_q_buffer and the scheduler buffers.
+            and getattr(mqa, "flashinfer_mla_backend", None) == "cute-dsl"
+            and getattr(mqa, "mla_backend_policy", None) is None
+            and getattr(mqa, "rotary_cos_sin", None) is not None
+            and mqa.rotary_cos_sin.dtype == torch.float32
+            and self.sparse_attn_hooks is None
+            and not self.mapping.has_cp_helix()
+            and not self.apply_rotary_emb
+            and not self.llama_4_scaling
+            and self.num_heads_tp == fqkv.NUM_HEADS
+            and self.q_lora_rank == fqkv.Q_LORA
+            and self.kv_lora_rank == fqkv.KV_LORA
+            and self.qk_nope_head_dim == fqkv.NOPE_DIM
+            and self.qk_rope_head_dim == fqkv.ROPE_DIM
+            and getattr(self, "k_b_proj_trans_dequant", None) is not None
+            and self.k_b_proj_trans_dequant.dtype == torch.bfloat16
+            and tuple(self.k_b_proj_trans_dequant.shape)
+            == (fqkv.NUM_HEADS, fqkv.KV_LORA, fqkv.NOPE_DIM)
+            and self.k_b_proj_trans_dequant.is_contiguous()
+            and self.k_b_proj_trans_dequant.data_ptr() % 16 == 0
+            and getattr(self.q_b_proj, "supports_prequantized_input", False)
+            and getattr(self.q_b_proj, "weight_scale", None) is not None
+            and self.q_b_proj.weight_scale.dtype == torch.uint8
+            and getattr(attn_metadata.kv_cache_manager, "tokens_per_block", None)
+            == fqkv.PAGE_TOKENS
+            and self._fused_qkv_norms_supported(fused_a_output.device)
+        ):
+            return None
+        kv_view = self._kv_page_view(attn_metadata)
+        if kv_view is None:
+            return None
+        k_splits = _qb_gemm_k_splits(self.q_b_proj, num_tokens)
+        if k_splits not in fqkv.SUPPORTED_K_SPLITS:
+            return None
+        return k_splits, kv_view
+
+    def _kv_page_view(self, attn_metadata: AttentionMetadata) -> Optional[tuple]:
+        """``(byte address of page 0, page byte stride, page table, layer slot)`` of this layer's FP8
+        KV pool, addressed as the CuTe DSL MLA decode addresses it
+        (``CuteDslMlaFmha._run_mla_decode``), or None for a pool layout the fused kernel does not
+        write (it needs pages of 64 rows of 576 contiguous bytes)."""
+        from ...cute_dsl_kernels.rubin import k3_mla_fused_qkv as fqkv
+
+        kv_pool = attn_metadata.kv_cache_manager.get_buffers(self.mqa.layer_idx)
+        if (
+            kv_pool.element_size() != 1
+            or kv_pool.dim() != 5
+            or tuple(kv_pool.shape[1:]) != (1, fqkv.PAGE_TOKENS, 1, fqkv.KV_ROW)
+            or kv_pool.stride(4) != 1
+            or kv_pool.stride(2) != fqkv.KV_ROW
+        ):
+            return None
+        packed_block = fqkv.PAGE_TOKENS * fqkv.KV_ROW
+        block_stride = kv_pool.stride(0)
+        layers_in_pool = block_stride // packed_block
+        if layers_in_pool > 1 and block_stride == layers_in_pool * packed_block:
+            # One pool interleaving several layers: pages of the combined-slot view, this layer's
+            # slot added to the page ids (as the CuTe DSL decode folds it into its page table).
+            layer_in_pool = kv_pool.storage_offset() // packed_block
+            base = kv_pool.data_ptr() - kv_pool.storage_offset() * kv_pool.element_size()
+            page_bytes = packed_block
+        else:
+            layer_in_pool = 0
+            base = kv_pool.data_ptr()
+            page_bytes = block_stride
+        local_layer_idx = self.mqa.get_local_layer_idx(attn_metadata)
+        pool_idx = int(attn_metadata.host_kv_cache_pool_mapping[local_layer_idx, 0])
+        page_table = attn_metadata.kv_cache_block_offsets[
+            pool_idx, attn_metadata.num_contexts :, 0, :
+        ]
+        if page_table.dtype != torch.int32 or page_table.stride(-1) != 1:
+            return None
+        return base, page_bytes, page_table, layer_in_pool
+
+    def _forward_fused_qkv(
+        self,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        fused_a_output: torch.Tensor,
+        plan: tuple,
+    ) -> None:
+        """Decode attention with the FP8 query and the KV rows from ``k3_mla_fused_qkv``."""
+        from ...cute_dsl_kernels.rubin import k3_mla_fused_qkv as fqkv
+
+        num_tokens = attn_metadata.num_tokens
+        num_seqs = attn_metadata.num_seqs
+        q_len = num_tokens // attn_metadata.num_generations
+        fused_a = fused_a_output[:num_tokens]
+        device = fused_a.device
+        mqa = self.mqa
+        mqa._ensure_rope_table_size(attn_metadata.max_seq_len)
+        k_splits, (kv_base, kv_page_bytes, page_table, layer_in_pool) = plan
+        quant_q_buffer = torch.empty(
+            (num_tokens, self.num_heads_tp, self.kv_lora_rank + self.qk_rope_head_dim),
+            dtype=torch.uint8,
+            device=device,
+        )
+        cu_q_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+        cu_kv_seqlens = torch.empty(num_seqs + 1, dtype=torch.int32, device=device)
+        fmha_scheduler_counter = torch.empty(1, dtype=torch.uint32, device=device)
+        mla_bmm1_scale = torch.empty(2, dtype=torch.float32, device=device)
+        mla_bmm2_scale = torch.empty(1, dtype=torch.float32, device=device)
+        fqkv.run_k3_mla_fused_qkv(
+            fused_a,
+            self.q_a_layernorm.weight,
+            self.kv_a_layernorm.weight,
+            self.q_a_layernorm.variance_epsilon,
+            self.kv_a_layernorm.variance_epsilon,
+            self.q_b_proj.weight,
+            self.q_b_proj.weight_scale,
+            self.k_b_proj_trans_dequant,
+            quant_q_buffer,
+            kv_base,
+            kv_page_bytes,
+            page_table,
+            layer_in_pool,
+            attn_metadata.kv_lens_cuda_runtime[:num_seqs],
+            mqa.rotary_cos_sin,
+            mla_bmm1_scale,
+            mla_bmm2_scale,
+            cu_q_seqlens,
+            cu_kv_seqlens,
+            fmha_scheduler_counter,
+            fqkv.host_bmm1_scale(mqa.q_scaling, self.qk_nope_head_dim + self.qk_rope_head_dim),
+            q_len,
+            k_splits,
+        )
+        # The FP8 decode reads quant_q_buffer; the BF16 query only carries its shape.
+        fused_q = torch.empty(
+            (num_tokens, self.num_heads_tp * (self.kv_lora_rank + self.qk_rope_head_dim)),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        self._attend_absorbed_generation(
+            fused_q,
+            attn_metadata,
+            output[:num_tokens],
+            position_ids=None,
+            latent_cache=None,
+            q_pe=None,
+            cu_q_seqlens=cu_q_seqlens,
+            cu_kv_seqlens=cu_kv_seqlens,
+            fmha_scheduler_counter=fmha_scheduler_counter,
+            mla_bmm1_scale=mla_bmm1_scale,
+            mla_bmm2_scale=mla_bmm2_scale,
+            quant_q_buffer=quant_q_buffer,
+        )
+
+    def _forward_impl(
+        self,
+        position_ids: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache_gen: Optional[torch.Tensor] = None,
+        fused_a_output: Optional[torch.Tensor] = None,
+    ) -> None:
+        if _K3_MLA_FUSED_QKV and latent_cache_gen is None:
+            plan = self._fused_qkv_plan(attn_metadata, fused_a_output)
+            if plan is not None:
+                self._forward_fused_qkv(attn_metadata, output, fused_a_output, plan)
+                return
+        super()._forward_impl(
+            position_ids,
+            hidden_states,
+            attn_metadata,
+            output,
+            latent_cache_gen=latent_cache_gen,
+            fused_a_output=fused_a_output,
+        )
+
+    def _run_attention(
+        self,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        attn_outputs: list[torch.Tensor],
+        fused_a_output: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Run the shared MLA attention into ``attn_outputs``: an eager break in a breakable graph.
+
+        A prefill CUDA graph batch has ``hidden_states`` padded to the graph's token count, and
+        the attention fills only the first ``attn_metadata.num_tokens`` rows of its output. The
+        padding rows are zeroed (inside a breakable graph by the graph, ahead of the break), so
+        they stay finite for the gate, ``o_proj`` and everything after them.
+        """
+        if not is_in_breakable_cuda_graph():
+            super().forward_impl(
+                None,
+                hidden_states,
+                attn_metadata,
+                attn_output=attn_outputs,
+                fused_a_output=fused_a_output,
+            )
+            num_tokens = attn_metadata.num_tokens
+            if attn_outputs[0].shape[0] != num_tokens:
+                attn_outputs[0][num_tokens:].zero_()
+            return
+        attn_outputs[0].zero_()
+        maybe_bcg_k3_mla_attention_inplace(
+            hidden_states, self.layer_idx_str, attn_outputs[0], fused_a_output
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -424,21 +754,16 @@ class KimiK3MLAAttention(MLA):
             gate, fused_a_output = self.g_fused_a_proj(hidden_states).split(
                 [gate_width, self.g_fused_a_proj.out_features - gate_width], -1
             )
-            super().forward_impl(
-                None,
-                hidden_states,
-                attn_metadata,
-                attn_output=attn_outputs,
-                fused_a_output=fused_a_output,
-            )
+            self._run_attention(hidden_states, attn_metadata, attn_outputs, fused_a_output)
             return self._apply_output_gate_and_o_proj(hidden_states, attn_outputs[0], gate)
-        forward_impl = super().forward_impl
 
         def attention() -> torch.Tensor:
-            forward_impl(None, hidden_states, attn_metadata, attn_output=attn_outputs)
+            self._run_attention(hidden_states, attn_metadata, attn_outputs)
             return attn_outputs[0]
 
-        if self._gate_stream is None:
+        # A side-stream fork cannot span the eager break of a breakable CUDA graph: there the gate
+        # runs after the attention, on the main stream.
+        if self._gate_stream is None or is_in_breakable_cuda_graph():
             return self._apply_output_gate_and_o_proj(hidden_states, attention())
         attn_out, gate = maybe_execute_in_parallel(
             attention,

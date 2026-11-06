@@ -181,11 +181,39 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         topK: int = 1,
         die_local: bool = False,
         weight_evict_first: bool = False,
+        compact_epilogue: bool = False,
+        pdl_preload_weights: bool = False,
     ):
         self.sf_vec_size = sf_vec_size
+        # Programmatic dependent launch with the weights of the first tile loaded before the dependency
+        # wait. The kernel is launched while the kernel before it (the FC1 GEMM, built to let its
+        # dependents launch early) still runs; a CTA that starts on an SM the previous kernel has
+        # released sets up, and its TMA warp loads the weights and weight scales of its first tile, then
+        # waits for the previous kernel before its first load of A or of A's scale factors, the only
+        # inputs the previous kernel writes. The scheduler warp reads the tile tables before that wait,
+        # so they must be complete when this kernel launches, as in the MoE, where the FC1 GEMM waits
+        # for the sort that writes them before it lets this kernel launch. The epilogue reads the
+        # routing maps and token scales, and adds into the output, only once the first accumulator is
+        # ready, i.e. after the wait. No value changes.
+        self.pdl_preload_weights = bool(pdl_preload_weights)
+        if self.pdl_preload_weights and (die_local or mma_inst_shape[0] != 128):
+            raise ValueError(
+                "pdl_preload_weights needs a 1-CTA tactic (mma_inst_m 128) without die_local"
+            )
         # L2 evict-first hint on the TMA loads of the expert weights (B) and their block scales (SFB): each is
         # read once per call and the stream is far larger than L2, so it should not displace the activations.
         self.weight_evict_first = weight_evict_first
+        # Compact epilogue for tiles with few valid rows: the default epilogue gives every thread one of
+        # the tile's 128 rows, so its scale-and-convert time does not shrink with the number of valid rows.
+        # When a tile has at most `compact_rows` valid rows, the epilogue warp that owns them stages their
+        # accumulators in the (otherwise idle) C staging buffer, all epilogue threads scale and convert
+        # those rows only, eight columns per thread, with the same per-element arithmetic, and each valid
+        # row is then reduced into the output exactly as in the default path.
+        self.compact_epilogue = bool(compact_epilogue)
+        if self.compact_epilogue and (mma_inst_shape[0] != 128 or mma_tiler[0] != 128):
+            raise ValueError(
+                "compact_epilogue needs a 1-CTA tactic with a 128-row tile (mma_inst_m 128, mma_m 128)"
+            )
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
         self.mma_tiler = mma_tiler
@@ -455,6 +483,20 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 self.cta_tile_shape_mnk[0] * (self.cta_tile_shape_mnk[1] + 8),
             ),
         )
+        # Compact epilogue layout inside the C staging buffer (32-bit word offsets): the output rows
+        # 0..compact_rows-1 keep their place, followed by compact_rows f32 accumulator rows, one f32
+        # scale and one token index per row.
+        self.compact_rows = 0
+        if self.compact_epilogue:
+            c_bytes = self.c_dtype.width // 8
+            row_bytes = (self.cta_tile_shape_mnk[1] + swizzled_pad) * c_bytes
+            rows = 32
+            self.compact_acc_offset = (rows * row_bytes + 15) // 16 * 4
+            self.compact_scale_offset = self.compact_acc_offset + rows * self.cta_tile_shape_mnk[1]
+            self.compact_token_offset = self.compact_scale_offset + rows
+            need_bytes = (self.compact_token_offset + rows) * 4
+            if need_bytes <= cute.cosize(self.c_smem_layout_staged) * c_bytes:
+                self.compact_rows = rows
 
         # Compute TMEM layouts for SFA/SFB
         self.tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -649,6 +691,13 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
         # Setup attributes
         self._setup_attributes()
+        # The compact epilogue reuses the default reduce of one BF16 row (cp.reduce.async.bulk).
+        self.compact_active = (
+            self.compact_epilogue
+            and self.compact_rows > 0
+            and self.c_dtype == cutlass.BFloat16
+            and self.cta_tile_shape_mnk[0] == 128
+        )
 
         # Setup sfa/sfb tensor
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(a.shape, self.sf_vec_size)
@@ -907,8 +956,42 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            **({"use_pdl": True} if self.pdl_preload_weights else {}),
         )
         return
+
+    @cute.jit
+    def _compact_scale_store_row_chunk(
+        self,
+        sCompact: cute.Tensor,
+        sC: cute.Tensor,
+        row: cutlass.Int32,
+        col: cutlass.Int32,
+    ):
+        """Compact epilogue, one thread: columns [col, col + 8) of staged row ``row`` times the row
+        scale, converted to the output type (the default path's ``(alpha * acc).to(c_dtype)``) and
+        stored at the row's place in the output staging rows ``sC``."""
+        acc = cute.make_rmem_tensor((8,), cutlass.Float32)
+        for q in cutlass.range_constexpr(2):
+            chunk = (col // 4 + q) ^ (row % 8)
+            v4 = cute.make_rmem_tensor((4,), cutlass.Float32)
+            cute.autovec_copy(
+                cute.make_tensor(
+                    sCompact.iterator
+                    + cute.assume(
+                        self.compact_acc_offset + row * self.cta_tile_shape_mnk[1] + chunk * 4,
+                        divby=4,
+                    ),
+                    cute.make_layout((4,)),
+                ),
+                v4,
+            )
+            for j in cutlass.range_constexpr(4):
+                acc[4 * q + j] = v4[j]
+        row_scale = sCompact[self.compact_scale_offset + row]
+        out = cute.make_rmem_tensor((8,), self.c_dtype)
+        out.store((row_scale * acc.load()).to(self.c_dtype))
+        cute.autovec_copy(out, cute.local_tile(sC[row, None, 0], (8,), (col // 8,)))
 
     @cute.kernel
     def kernel(
@@ -1349,6 +1432,43 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            # Programmatic launch: weights and weight scales of the first tile's first stages before
+            # the dependency wait; their A and SFA loads follow the wait in the tile loop below.
+            preloaded = cutlass.Int32(0)
+            if cutlass.const_expr(self.pdl_preload_weights):
+                if is_valid_tile:
+                    pre_n = tile_info[1]
+                    pre_l = tile_info[2]
+                    pre_sfb_n = pre_n
+                    if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
+                        pre_sfb_n = pre_n // 2
+                    pre_gB = tBgB[(None, pre_n, None, pre_l)]
+                    pre_gSFB = tBgSFB[(None, pre_sfb_n, None, pre_l)]
+                    preloaded = cutlass.min(k_tile_cnt, cutlass.Int32(self.num_ab_stage))
+                    pre_state = pipeline.make_pipeline_state(
+                        pipeline.PipelineUserType.Producer, self.num_ab_stage
+                    )
+                    for k_pre in cutlass.range(0, preloaded, 1, unroll=1):
+                        ab_pipeline.producer_acquire(pre_state)
+                        cute.copy(
+                            tma_atom_b,
+                            pre_gB[(None, k_pre)],
+                            tBsB[(None, pre_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                            mcast_mask=b_full_mcast_mask,
+                            **b_cache_kw,
+                        )
+                        cute.copy(
+                            tma_atom_sfb,
+                            pre_gSFB[(None, k_pre)],
+                            tBsSFB[(None, pre_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(pre_state),
+                            mcast_mask=sfb_full_mcast_mask,
+                            **b_cache_kw,
+                        )
+                        pre_state.advance()
+                cute.arch.griddepcontrol_wait()
+
             while is_valid_tile:
                 mma_tile_coord_mnl = (
                     tile_info[0] // cute.size(tiled_mma.thr_id.shape),
@@ -1383,7 +1503,13 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    if cutlass.const_expr(self.pdl_preload_weights):
+                        # Stages below `preloaded` were acquired and given their B / SFB loads
+                        # before the dependency wait.
+                        if k_tile >= preloaded:
+                            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                    else:
+                        ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
 
                     cute.copy(
                         tma_atom_a,
@@ -1392,14 +1518,25 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=a_full_mcast_mask,
                     )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, ab_producer_state.count)],
-                        tBsB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=b_full_mcast_mask,
-                        **b_cache_kw,
-                    )
+                    if cutlass.const_expr(self.pdl_preload_weights):
+                        if k_tile >= preloaded:
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_slice[(None, ab_producer_state.count)],
+                                tBsB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                mcast_mask=b_full_mcast_mask,
+                                **b_cache_kw,
+                            )
+                    else:
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_slice[(None, ab_producer_state.count)],
+                            tBsB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                            mcast_mask=b_full_mcast_mask,
+                            **b_cache_kw,
+                        )
                     cute.copy(
                         tma_atom_sfa,
                         tAgSFA_slice[(None, ab_producer_state.count)],
@@ -1407,19 +1544,33 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfa_full_mcast_mask,
                     )
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_slice[(None, ab_producer_state.count)],
-                        tBsSFB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=sfb_full_mcast_mask,
-                        **b_cache_kw,
-                    )
+                    if cutlass.const_expr(self.pdl_preload_weights):
+                        if k_tile >= preloaded:
+                            cute.copy(
+                                tma_atom_sfb,
+                                tBgSFB_slice[(None, ab_producer_state.count)],
+                                tBsSFB[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                                mcast_mask=sfb_full_mcast_mask,
+                                **b_cache_kw,
+                            )
+                    else:
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_slice[(None, ab_producer_state.count)],
+                            tBsSFB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
+                            mcast_mask=sfb_full_mcast_mask,
+                            **b_cache_kw,
+                        )
 
                     ab_producer_state.advance()
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if ab_producer_state.count < k_tile_cnt:
                         peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
+
+                if cutlass.const_expr(self.pdl_preload_weights):
+                    preloaded = cutlass.Int32(0)
 
                 # Get next tile
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
@@ -1663,6 +1814,23 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tRS_sC = thr_copy_r2s.partition_D(sC)
             tRS_rC = tiled_copy_r2s.retile(tTR_rC)
 
+            if cutlass.const_expr(self.compact_active):
+                # f32 view of the C staging buffer (compact epilogue): accumulator rows at
+                # compact_acc_offset (16-byte chunks XOR-swizzled by row % 8), row scales at
+                # compact_scale_offset; the output rows keep their default place.
+                sCompact = storage.sC.get_tensor(
+                    cute.make_layout((self.compact_token_offset,)),
+                    dtype=cutlass.Float32,
+                )
+                sCompactToken = storage.sC.get_tensor(
+                    cute.make_layout((self.compact_token_offset + self.compact_rows,)),
+                    dtype=cutlass.Int32,
+                )
+                # (row, col) of every accumulator register of this thread in an epilogue subtile.
+                tTR_cAcc = tiled_copy_t2r.get_slice(epi_tidx).partition_D(
+                    cute.make_identity_tensor((cute.size(epi_tile[0]), self.epi_tile_n))
+                )
+
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
@@ -1719,9 +1887,64 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 m_iter_cnt = cute.size(tTR_tAcc.shape[3], mode=[0])
                 n_subtile_cnt = cute.size(tTR_tAcc.shape[3], mode=[1])
 
+                # Row iterations left to the default path (all of them unless the compact
+                # epilogue takes the tile).
+                stock_m_iter_cnt = m_iter_cnt
+                if cutlass.const_expr(self.compact_active):
+                    stock_m_iter_cnt = cutlass.Int32(m_iter_cnt)
+                    tile_valid_rows = tile_info[4] - tile_m_start
+                    if tile_valid_rows <= self.compact_rows:
+                        stock_m_iter_cnt = cutlass.Int32(0)
+                        # Second epilogue warp: token and scale (alpha * token scale, as in the
+                        # default path) of every valid row.
+                        cpt_row = epi_tidx - 32
+                        if warp_idx == self.epilog_warp_id[1] and cpt_row < tile_valid_rows:
+                            cpt_expanded = permuted_idx_to_expanded_idx[tile_m_start + cpt_row]
+                            sCompactToken[self.compact_token_offset + cpt_row] = (
+                                cpt_expanded // self.topK
+                            )
+                            sCompact[self.compact_scale_offset + cpt_row] = (
+                                alpha_val
+                                * token_final_scales[
+                                    (cpt_expanded // self.topK, cpt_expanded % self.topK)
+                                ]
+                            )
+                        # Stage: the first epilogue warp reads TMEM lanes 0-31, which hold the
+                        # tile's valid rows; register i holds column i of the subtile.
+                        if warp_idx == self.epilog_warp_id[0]:
+                            for n_iter_idx in cutlass.range_constexpr(n_subtile_cnt):
+                                cute.copy(
+                                    tiled_copy_t2r,
+                                    tTR_tAcc[(None, None, None, (0, n_iter_idx))],
+                                    tTR_rAcc,
+                                )
+                                cute.arch.fence_view_async_tmem_load()
+                                if epi_tidx < tile_valid_rows:
+                                    for q in cutlass.range_constexpr(self.epi_tile_n // 4):
+                                        cpt_v4 = cute.make_rmem_tensor((4,), cutlass.Float32)
+                                        for j in cutlass.range_constexpr(4):
+                                            assert tTR_cAcc[4 * q + j][1] == 4 * q + j
+                                            cpt_v4[j] = tTR_rAcc[4 * q + j]
+                                        cpt_chunk = (n_iter_idx * (self.epi_tile_n // 4) + q) ^ (
+                                            epi_tidx % 8
+                                        )
+                                        cute.autovec_copy(
+                                            cpt_v4,
+                                            cute.make_tensor(
+                                                sCompact.iterator
+                                                + cute.assume(
+                                                    self.compact_acc_offset
+                                                    + epi_tidx * self.cta_tile_shape_mnk[1]
+                                                    + cpt_chunk * 4,
+                                                    divby=4,
+                                                ),
+                                                cute.make_layout((4,)),
+                                            ),
+                                        )
+
                 # TODO:How could reduction be done with a better perf?
                 # Process all m-iterations and n-subtiles
-                for m_iter_idx in cutlass.range(m_iter_cnt):
+                for m_iter_idx in cutlass.range(stock_m_iter_cnt):
                     # Compute row indices for this m-iteration
                     # Each thread handles row: tile_m_start + m_iter_idx * 128 + epi_tidx
                     permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
@@ -1765,9 +1988,37 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
+                if cutlass.const_expr(self.compact_active):
+                    if stock_m_iter_cnt == 0:
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        # Scale and convert: thread -> (row, 8 columns) of the valid rows, written
+                        # to the row's place in the output staging rows.
+                        cpt_per_row = self.cta_tile_shape_mnk[1] // 8
+                        for cpt_item in cutlass.range(
+                            epi_tidx, tile_valid_rows * cpt_per_row, 32 * len(self.epilog_warp_id)
+                        ):
+                            self._compact_scale_store_row_chunk(
+                                sCompact, sC, cpt_item // cpt_per_row, (cpt_item % cpt_per_row) * 8
+                            )
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        self.epilog_sync_barrier.arrive_and_wait()
+                        if epi_tidx < tile_valid_rows:
+                            blk_reduce_bf16(
+                                cute.domain_offset(
+                                    (
+                                        sCompactToken[self.compact_token_offset + epi_tidx],
+                                        mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1],
+                                        0,
+                                    ),
+                                    c,
+                                ),
+                                sC[epi_tidx, None, 0],
+                                cutlass.Int32(self.copy_size),
+                            )
+
                 # TODO:Currently finish all sts and do all reduce, do we have a better way for epilogue overlapping?
                 # Block reduce for all m-iterations
-                for m_iter_idx in cutlass.range(m_iter_cnt):
+                for m_iter_idx in cutlass.range(stock_m_iter_cnt):
                     permuted_row = tile_m_start + m_iter_idx * 128 + epi_tidx
                     is_valid_row = permuted_row < tile_info[4]
 

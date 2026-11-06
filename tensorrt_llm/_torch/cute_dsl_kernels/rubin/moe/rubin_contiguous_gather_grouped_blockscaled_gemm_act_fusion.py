@@ -226,11 +226,27 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         die_local: bool = False,
         situ_fast: bool = False,
         weight_evict_first: bool = False,
+        compact_epilogue: bool = False,
+        early_launch_dependents: bool = False,
     ):
         self.a_path = a_path
+        # Let a dependent kernel launched with programmatic dependent launch (the FC2 GEMM) start right
+        # after this kernel's own dependency wait instead of at its end: its CTAs then set up on the SMs
+        # this kernel's CTAs release while the others still run. The dependent must wait for this kernel
+        # before it reads this kernel's output.
+        self.early_launch_dependents = bool(early_launch_dependents)
         # L2 evict-first hint on the TMA loads of the expert weights (B) and their block scales (SFB): each is
         # read once per call and the stream is far larger than L2, so it should not displace the activations.
         self.weight_evict_first = weight_evict_first
+        # Compact epilogue for tiles with few valid rows: the default epilogue gives every thread one of
+        # the tile's 128 rows, so its activation and quantization time does not shrink with the number of
+        # valid rows. When a tile has at most `compact_rows` valid rows, the epilogue warp that owns them
+        # stages their up/gate accumulators in the (otherwise idle) C staging buffer, and the epilogue
+        # warps then compute the activation and the FP4 quantization of those rows only, one warp per
+        # staged row and two output columns per lane, with the same per-element arithmetic as the default
+        # path, and store the results directly to global memory. Rows past the valid range are not
+        # written. Tiles with more valid rows take the default path.
+        self.compact_epilogue = bool(compact_epilogue)
         # uGPU half-GEMM: two partitions write their N-half into a shared
         # full-width C/SFC buffer at a column offset (see wrapper/__call__).
         self.ugpu_half_gemm = ugpu_half_gemm
@@ -277,6 +293,13 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             raise ValueError(
                 "die_local needs a 1-CTA tactic (mma_inst_m 128, mma_n 128/256, "
                 "cluster (1, 1)) without uGPU half-GEMM"
+            )
+        if self.compact_epilogue and (
+            not self.is_gated or ugpu_half_gemm or mma_inst_shape[0] != 128 or mma_tiler[0] != 128
+        ):
+            raise ValueError(
+                "compact_epilogue needs a gated activation and a 1-CTA tactic with a 128-row tile "
+                "(mma_inst_m 128, mma_m 128) without uGPU half-GEMM"
             )
         self.acc_dtype = cutlass.Float32
         self.mma_inst_shape = mma_inst_shape
@@ -613,6 +636,17 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             self.epi_tile,
             self.num_c_stage,
         )
+        # Compact epilogue: valid rows per tile it handles. Each staged row holds the up and gate
+        # accumulators of one output subtile in f32 (in the C staging buffer), and the 128 epilogue
+        # threads cover one row with epi_tile_n / 8 threads.
+        self.compact_rows = 0
+        if self.compact_epilogue:
+            c_stage_bytes = cute.cosize(self.c_smem_layout_staged.outer) * self.c_dtype.width // 8
+            self.compact_rows = min(
+                c_stage_bytes // (2 * self.epi_tile_n * 4),
+                32 * len(self.epilog_warp_id) // (self.epi_tile_n // 8),
+                32,
+            )
 
         # Compute TMEM layouts for SFA/SFB (Rubin precomputed)
         self.tCtSFA_layout = blockscaled_utils.make_tmem_layout_sfa(
@@ -877,6 +911,15 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             sfc_shape = c.shape if full_c_shape is None else full_c_shape
             sfc_layout = blockscaled_utils.tile_atom_to_shape_SF(sfc_shape, self.sf_vec_size)
             sfc_tensor = cute.make_tensor(sfc_tensor.iterator, sfc_layout)
+        # The compact epilogue writes FP4 rows with scale factors (N-major C) directly.
+        self.compact_active = (
+            self.compact_epilogue
+            and self.generate_sfc
+            and self.c_dtype == cutlass.Float4E2M1FN
+            and self.c_layout.is_n_major_c()
+            and self.epi_tile[0] == self.cta_tile_shape_mnk_c[0]
+            and self.compact_rows > 0
+        )
 
         atom_layout_mnk = (1, 1, 1)
         permutation_mnk = self._get_mma_permutation_mnk()
@@ -1199,6 +1242,10 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         else:  # "tma"
             self.shared_storage = SharedStorageTma
 
+        mC_direct = None
+        if cutlass.const_expr(self.compact_active):
+            mC_direct = c
+
         # Launch the kernel synchronously
         self.kernel(
             tiled_mma,
@@ -1237,6 +1284,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             c_sf_n_tile_offset,
             die_tab,
             die_ws,
+            mC_direct,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1330,9 +1378,12 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         c_sf_n_tile_offset: cutlass.Int64 = cutlass.Int64(0),
         die_tab: Optional[cute.Tensor] = None,
         die_ws: Optional[cute.Tensor] = None,
+        mC_direct: Optional[cute.Tensor] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        ``mC_direct`` (compact epilogue only) is the C tensor itself, for the direct row stores.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1710,6 +1761,8 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.early_launch_dependents):
+            cute.arch.griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule Warp
@@ -3044,6 +3097,18 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 )
                 tCrSFC_pvscale = cute.make_rmem_tensor_like(tCrSFC, cutlass.Float32)
 
+            if cutlass.const_expr(self.compact_active):
+                # f32 view of the C staging buffer: compact_rows rows of [up | gate] of one output
+                # subtile, word index XOR-swizzled by the row (conflict-free row-parallel stores).
+                sCompact = storage.sC.get_tensor(
+                    cute.make_layout((self.compact_rows * 2 * self.epi_tile_n,)),
+                    dtype=cutlass.Float32,
+                )
+                # (row, col) of every accumulator register of this thread in an epilogue subtile.
+                tTR_cAcc = tiled_copy_t2r.get_slice(epi_tidx).partition_D(
+                    cute.make_identity_tensor((self.epi_tile[0], self.epi_tile[1]))
+                )
+
             #
             # Persistent tile scheduling loop
             #
@@ -3072,10 +3137,12 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             )
 
             # Get the first tile info
-            tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+            # The compact epilogue also reads the tile's valid-row limit (entry 4).
+            n_tile_info = 4 + int(self.compact_active)
+            tile_info = cute.make_rmem_tensor((n_tile_info,), cutlass.Int32)
 
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-            for idx in cutlass.range(4, unroll_full=True):
+            for idx in cutlass.range(n_tile_info, unroll_full=True):
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[3] == 1
             cute.arch.fence_proxy(
@@ -3160,8 +3227,100 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 acc_n_subtile_cnt = cute.size(tTR_tAcc.shape, mode=[4])
                 out_n_subtile_cnt = acc_n_subtile_cnt // 2 if self.is_gated else acc_n_subtile_cnt
 
+                # Output subtiles left to the default path below (all of them unless the
+                # compact epilogue takes the tile).
+                stock_n_subtile_cnt = out_n_subtile_cnt
+                if cutlass.const_expr(self.compact_active):
+                    stock_n_subtile_cnt = cutlass.Int32(out_n_subtile_cnt)
+                    tile_valid_rows = tile_info[4] - tile_info[0] * self.cta_tile_shape_mnk_c[0]
+                    if tile_valid_rows <= self.compact_rows:
+                        stock_n_subtile_cnt = cutlass.Int32(0)
+                        cpt_row_words = 2 * self.epi_tile_n
+                        # Compute mapping: one warp per staged row, two output columns per lane.
+                        cpt_col = (epi_tidx % 32) * 2
+                        for cpt_n in cutlass.range_constexpr(out_n_subtile_cnt):
+                            # Same output-subtile order as the default path.
+                            cpt_out_n = cutlass.Int32(cpt_n)
+                            if cutlass.const_expr(self.use_overlap_accum):
+                                if reverse_subtile:
+                                    cpt_out_n = cutlass.Int32(out_n_subtile_cnt - 1 - cpt_n)
+                            cpt_up_n = (
+                                cpt_out_n // gate_offset
+                            ) * 2 * gate_offset + cpt_out_n % gate_offset
+                            cpt_gate_n = cpt_up_n + gate_offset
+                            # Stage: the first epilogue warp reads TMEM lanes 0-31, which hold
+                            # the tile's valid rows, and stores each as one [up | gate] f32 row.
+                            if warp_idx == self.epilog_warp_id[0]:
+                                if cutlass.const_expr(cpt_n == 0):
+                                    # The staging rows alias the TMA-store buffer.
+                                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                                    cute.arch.sync_warp()
+                                cute.copy(
+                                    tiled_copy_t2r,
+                                    tTR_tAcc[(None, None, None, 0, cpt_up_n)],
+                                    tTR_rAcc_up,
+                                )
+                                cute.copy(
+                                    tiled_copy_t2r,
+                                    tTR_tAcc[(None, None, None, 0, cpt_gate_n)],
+                                    tTR_rAcc_gate,
+                                )
+                                cute.arch.fence_view_async_tmem_load()
+                                if epi_tidx < tile_valid_rows:
+                                    # Register i holds column i of this thread's row (checked at
+                                    # trace time); 16-byte chunks go to chunk ^ (row % 8).
+                                    for q in cutlass.range_constexpr(self.epi_tile_n // 4):
+                                        for h in cutlass.range_constexpr(2):
+                                            cpt_src = tTR_rAcc_up if h == 0 else tTR_rAcc_gate
+                                            cpt_v4 = cute.make_rmem_tensor((4,), cutlass.Float32)
+                                            for j in cutlass.range_constexpr(4):
+                                                assert tTR_cAcc[4 * q + j][1] == 4 * q + j
+                                                cpt_v4[j] = cpt_src[4 * q + j]
+                                            cpt_chunk = (h * (self.epi_tile_n // 4) + q) ^ (
+                                                epi_tidx % 8
+                                            )
+                                            cute.autovec_copy(
+                                                cpt_v4,
+                                                cute.make_tensor(
+                                                    sCompact.iterator
+                                                    + cute.assume(
+                                                        epi_tidx * cpt_row_words + cpt_chunk * 4,
+                                                        divby=4,
+                                                    ),
+                                                    cute.make_layout((4,)),
+                                                ),
+                                            )
+                            if cutlass.const_expr(self.use_overlap_accum and cpt_n == 0):
+                                # Overlap mode: release acc as the default path does after its
+                                # first subtile load.
+                                with cute.arch.elect_one():
+                                    acc_pipeline.consumer_release(acc_consumer_state)
+                                acc_consumer_state.advance()
+                            self.epilog_sync_barrier.arrive_and_wait()
+                            # Compute: warp w takes the staged rows w, w + 4, ... (warp-uniform).
+                            for cpt_row in cutlass.range(
+                                epi_tidx // 32, tile_valid_rows, len(self.epilog_warp_id)
+                            ):
+                                self._compact_act_quant_store(
+                                    sCompact,
+                                    cpt_row,
+                                    cpt_col,
+                                    cpt_row_words,
+                                    tile_info[0] * self.cta_tile_shape_mnk_c[0] + cpt_row,
+                                    tile_info[1] * self.cta_tile_shape_mnk_c[1]
+                                    + cpt_out_n * self.epi_tile_n
+                                    + cpt_col,
+                                    epi_tidx % (self.sf_vec_size // 2) == 0,
+                                    alpha_val,
+                                    norm_const,
+                                    mC_direct,
+                                    mSFC_mnl,
+                                    epilogue_op,
+                                )
+                            self.epilog_sync_barrier.arrive_and_wait()
+
                 for epi_m_idx in cutlass.range(epi_m_cnt):
-                    for out_n_idx in cutlass.range(out_n_subtile_cnt):
+                    for out_n_idx in cutlass.range(stock_n_subtile_cnt):
                         # Map output N subtile → acc N subtile. Each
                         # interleave block of 2*gate_offset subtiles is
                         # [up*gate_offset, gate*gate_offset]. acc[0] in
@@ -3401,7 +3560,7 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
                 # Advance to next tile
                 #
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
-                for idx in cutlass.range(4, unroll_full=True):
+                for idx in cutlass.range(n_tile_info, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[3] == 1
                 cute.arch.fence_proxy(
@@ -3422,6 +3581,111 @@ class Sm107BlockScaledContiguousGatherGroupedGemmActFusionKernel:
             c_pipeline.producer_tail()
 
         cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _compact_act_quant_store(
+        self,
+        sCompact: cute.Tensor,
+        row: cutlass.Int32,
+        col: cutlass.Int32,
+        row_words: cutlass.Constexpr,
+        g_row: cutlass.Int32,
+        g_col: cutlass.Int32,
+        store_sf: cutlass.Boolean,
+        alpha_val,
+        norm_const,
+        mC_direct: cute.Tensor,
+        mSFC_mnl: cute.Tensor,
+        epilogue_op: cutlass.Constexpr,
+    ):
+        """Compact epilogue, one lane: activation, FP4 quantization and stores of output columns
+        [col, col + 2) of staged row ``row`` (global ``(g_row, g_col)``).
+
+        The element-wise arithmetic is the default epilogue's (same activation helper, same scale
+        computation and rounding steps); a scale group of ``sf_vec_size`` (16) columns spans 8 lanes,
+        which combine their absolute maxima by butterfly shuffles. Must be called by all lanes of a
+        warp; the scale factor is stored by the group's first lane (``store_sf``).
+        """
+        # Staged row: 16-byte chunk c of [up | gate] at chunk position c ^ (row % 8).
+        r_up = cute.make_rmem_tensor((2,), cutlass.Float32)
+        r_gate = cute.make_rmem_tensor((2,), cutlass.Float32)
+        for h in cutlass.range_constexpr(2):
+            r_dst = r_up if h == 0 else r_gate
+            chunk = (h * (self.epi_tile_n // 4) + col // 4) ^ (row % 8)
+            cute.autovec_copy(
+                cute.make_tensor(
+                    sCompact.iterator + cute.assume(row * row_words + chunk * 4 + col % 4, divby=2),
+                    cute.make_layout((2,)),
+                ),
+                r_dst,
+            )
+        r_act = cute.make_rmem_tensor((2,), self.acc_dtype)
+        vec_up = r_up.load()
+        vec_gate = r_gate.load()
+        if cutlass.const_expr(self.activation_type == ActivationType.Swiglu):
+            self._apply_swiglu_epilogue(vec_up, vec_gate, alpha_val, r_act)
+        elif cutlass.const_expr(self.activation_type == ActivationType.SiTu):
+            if cutlass.const_expr(self.situ_fast):
+                self._apply_situ_epilogue_fast(vec_up, vec_gate, alpha_val, r_act)
+            else:
+                self._apply_situ_epilogue(vec_up, vec_gate, alpha_val, r_act)
+
+        # Scale factor of the 16-column group: absolute max over the group's 8 lanes.
+        act = epilogue_op(r_act.load())
+        abs_act = type(act)(math.absf(act.ir_value()), act.shape, act.dtype)
+        group_max = abs_act.reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+        pair_max = cute.make_rmem_tensor((2,), cutlass.Float32)
+        for k in cutlass.range_constexpr(3):
+            pair_max[0] = group_max
+            pair_max[1] = cute.arch.shuffle_sync_bfly(group_max, 1 << k)
+            group_max = pair_max.load().reduce(cute.ReductionOp.MAX, cutlass.Float32(0.0), 0)
+        rcp_limit = self.get_dtype_rcp_limits(self.c_dtype)
+        # A 4-wide vector, as the default path converts the four scales of a 64-column subtile at once.
+        r_pvscale = cute.make_rmem_tensor((4,), cutlass.Float32)
+        if cutlass.const_expr(self.vectorized_f32):
+            pvscale = cute.arch.mul_packed_f32x2((group_max, group_max), (rcp_limit, rcp_limit))
+            pvscale = cute.arch.mul_packed_f32x2(pvscale, (norm_const, norm_const))
+            for j in cutlass.range_constexpr(4):
+                r_pvscale[j] = pvscale[0]
+        else:
+            for j in cutlass.range_constexpr(4):
+                r_pvscale[j] = group_max * rcp_limit * norm_const
+        r_sf = cute.make_rmem_tensor((4,), self.sf_dtype)
+        r_sf.store(r_pvscale.load().to(self.sf_dtype))
+
+        # Quantize by the reciprocal of the stored scale.
+        sf_f32 = r_sf.load().to(cutlass.Float32)
+        fp32_max = cutlass.Float32(3.40282346638528859812e38)
+        if cutlass.const_expr(self.vectorized_f32):
+            acc_scale = cute.arch.mul_packed_f32x2(
+                (cute.arch.rcp_approx(sf_f32[0]), cute.arch.rcp_approx(sf_f32[1])),
+                (norm_const, norm_const),
+            )
+            acc_scale_min = fmin(acc_scale[0], fp32_max, nan=True)
+            r_act[0], r_act[1] = cute.arch.mul_packed_f32x2(
+                (r_act[0], r_act[1]), (acc_scale_min, acc_scale_min)
+            )
+        else:
+            acc_scale_min = fmin(norm_const * cute.arch.rcp_approx(sf_f32[0]), fp32_max, nan=True)
+            for j in cutlass.range_constexpr(2):
+                r_act[j] = r_act[j] * acc_scale_min
+        # FP4 conversion in a 32-bit word as the default path converts it; the pair is its first byte.
+        r_q = cute.make_rmem_tensor((8,), cutlass.Float32)
+        r_q.fill(0.0)
+        r_q[0] = r_act[0]
+        r_q[1] = r_act[1]
+        r_c = cute.make_rmem_tensor((8,), self.c_dtype)
+        r_c.store(r_q.load().to(self.c_dtype))
+
+        # N-major C: the pair (col even) is one byte.
+        c_byte = cute.crd2idx((g_row, g_col, 0), mC_direct.layout) // 2
+        c_dst = cute.make_tensor(
+            cute.recast_ptr(mC_direct.iterator, dtype=cutlass.Uint8) + c_byte,
+            cute.make_layout((1,)),
+        )
+        c_dst[0] = cute.recast_tensor(r_c, cutlass.Uint8)[0]
+        if store_sf:
+            mSFC_mnl[(g_row, g_col, 0)] = r_sf[0]
 
     @cute.jit
     def _apply_swiglu_epilogue(

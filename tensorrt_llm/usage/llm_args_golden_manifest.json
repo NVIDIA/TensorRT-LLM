@@ -1876,6 +1876,23 @@
     },
     {
       "allowed_values": [
+        "auto",
+        "fp8"
+      ],
+      "annotation": "Literal['auto', 'fp8']",
+      "converter": "",
+      "kind": "categorical",
+      "path": "speculative_config.context_kv_dtype"
+    },
+    {
+      "allowed_values": [],
+      "annotation": "<class 'bool'>",
+      "converter": "",
+      "kind": "value",
+      "path": "speculative_config.context_kv_only"
+    },
+    {
+      "allowed_values": [
         "AUTO",
         "DFlash",
         "DSpark",

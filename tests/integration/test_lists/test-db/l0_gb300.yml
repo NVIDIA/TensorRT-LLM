@@ -24,6 +24,7 @@ l0_gb300:
   # Kimi K3 KDA unit tests (single GPU, random weights, no checkpoint).
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill_optin.py
+  - unittest/_torch/modules/kimi_kda/test_kda_breakable_cuda_graph.py
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_schedule.py
   - unittest/_torch/modules/kimi_kda/test_kda_fused_prefill_conv.py
   - unittest/_torch/modules/kimi_kda/test_kda_prefill_no_recompile.py

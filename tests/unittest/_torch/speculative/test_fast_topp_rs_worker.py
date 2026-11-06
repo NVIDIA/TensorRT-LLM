@@ -240,6 +240,8 @@ def test_gate_and_dispatch_follow_the_sampling_mode(monkeypatch, mode, variant):
     disqualifiers (guided decoding, a draft-to-target map, a synthetic acceptance override,
     vocab-sharded logits) and the flag keep the reference in every mode."""
     monkeypatch.setenv(frs.FAST_RS_ENV_VAR, "1")
+    # Block verification would replace the temperature verifier this test spies on.
+    monkeypatch.delenv("TLLM_SPEC_BLOCK_VERIFY", raising=False)
     calls = []
     for name in (
         "fast_rs_verify",

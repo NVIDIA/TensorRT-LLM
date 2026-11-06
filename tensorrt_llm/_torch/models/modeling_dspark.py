@@ -102,8 +102,10 @@ from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
+from ..modules.multi_stream_utils import do_multi_stream
 from ..modules.rms_norm import RMSNorm
 from ..pyexecutor.config_utils import is_mla
+from ..speculative.dflash_attention import DRAFT_FP8_KV_SCALE, to_draft_fp8
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import (
     draft_fusion_enabled,
@@ -146,6 +148,218 @@ if IS_CUTLASS_DSL_AVAILABLE:
         cute_dsl_dspark_rmsnorm_rope_page_write,
         is_fused_dspark_rmsnorm_rope_supported,
     )
+
+
+# TLLM_DSPARK_MLA_SPLIT_QKV_STREAMS=1, read per call (a CUDA graph keeps what was
+# read at capture), cute_dsl block decode over a BF16 pool only: every MLA drafter
+# layer runs its kv path (block latents -> RMSNorm/RoPE -> block write into the
+# pool) beside its q path (q_a_layernorm -> q_b -> rope_into -> k absorption),
+# joined before attention. With the fused q_a / kv_a GEMM the fork follows that
+# GEMM. The RMSNorm/RoPE kernel stores the block latents straight into the pool
+# instead of a staging buffer and a scatter. Same arithmetic as the
+# sequential path, so bit-exact with it. Two streams are used only where
+# multi-stream is on (do_multi_stream(): the CUDA graph runner's warmup and
+# capture); other steps run the two halves one after the other.
+_SPLIT_QKV_STREAMS_ENV_VAR = "TLLM_DSPARK_MLA_SPLIT_QKV_STREAMS"
+
+
+def _split_qkv_streams_on() -> bool:
+    return os.environ.get(_SPLIT_QKV_STREAMS_ENV_VAR, "0") == "1"
+
+
+def _split_qkv_use_aux_stream() -> bool:
+    """The two-stream half of the split (a seam: tests turn it off to measure the pool write alone)."""
+    return True
+
+
+def _split_qkv_direct_pool_write() -> bool:
+    """The direct pool-write half of the split (a seam: tests turn it off to measure the streams alone)."""
+    return True
+
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..cute_dsl_kernels.blackwell.dspark_rmsnorm_rope import DSparkRMSNormRoPEKernel
+
+    try:
+        from cuda.bindings import driver as _cuda_driver
+    except ImportError:
+        from cuda import cuda as _cuda_driver
+
+    class _RMSNormRoPEPoolWriteKernel(DSparkRMSNormRoPEKernel):
+        """``DSparkRMSNormRoPEKernel`` (weight, RMSNorm over ``norm_dim``, one head)
+        whose row ``r`` lands in ``pool[pages[r], offsets[r]]`` instead of
+        ``output[r]``. The body is the base kernel's; only the store index differs."""
+
+        def __init__(self, hidden_dim: int, rope_dim: int, eps: float, norm_dim: int):
+            super().__init__(hidden_dim, rope_dim, 1, eps, True, True, False, norm_dim=norm_dim)
+
+        @cute.jit
+        def __call__(
+            self,
+            x: cute.Tensor,
+            weight: cute.Tensor,
+            freqs: cute.Tensor,
+            pool: cute.Tensor,
+            pages: cute.Tensor,
+            offsets: cute.Tensor,
+            stream: _cuda_driver.CUstream,
+        ):
+            self.kernel(x, weight, freqs, pool, pages, offsets).launch(
+                grid=[x.shape[0], 1, 1],
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            x: cute.Tensor,
+            weight: cute.Tensor,
+            freqs: cute.Tensor,
+            pool: cute.Tensor,
+            pages: cute.Tensor,
+            offsets: cute.Tensor,
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            row, _, _ = cute.arch.block_idx()
+            page = pages[row]
+            off = offsets[row]
+
+            inverse_rms = cutlass.Float32(1.0)
+            if cutlass.const_expr(self.apply_rmsnorm):
+                sum_sq = cutlass.Float32(0.0)
+                for item in cutlass.range_constexpr(self.norm_elements_per_thread):
+                    dim = tidx + item * self.num_threads
+                    value = cutlass.Float32(x[row, dim])
+                    sum_sq += value * value
+                sum_sq = cute.arch.warp_reduction_sum(sum_sq)
+                inverse_rms = cute.math.rsqrt(sum_sq / self.norm_dim + self.eps)
+
+            if cutlass.const_expr(self.write_nope):
+                for item in cutlass.range_constexpr(self.nope_elements_per_thread):
+                    dim = tidx + item * self.num_threads
+                    value = cutlass.Float32(x[row, dim]) * inverse_rms
+                    if cutlass.const_expr(self.apply_weight):
+                        value *= cutlass.Float32(weight[dim])
+                    pool[page, off, dim] = value.to(pool.element_type)
+
+            if cutlass.const_expr(self.rope_pairs > 0):
+                freq_row = row // self.num_heads
+                for item in cutlass.range_constexpr(self.pairs_per_thread):
+                    pair = tidx + item * self.num_threads
+                    real_dim = self.nope_dim + pair * 2
+                    imag_dim = real_dim + 1
+                    out_real = self.out_rope_offset + pair * 2
+                    out_imag = out_real + 1
+                    real = cutlass.Float32(x[row, real_dim])
+                    imag = cutlass.Float32(x[row, imag_dim])
+                    if cutlass.const_expr(self.norm_covers_rope):
+                        real *= inverse_rms
+                        imag *= inverse_rms
+                        if cutlass.const_expr(self.apply_weight):
+                            real *= cutlass.Float32(weight[real_dim])
+                            imag *= cutlass.Float32(weight[imag_dim])
+                    cos = cutlass.Float32(freqs[freq_row, pair, 0])
+                    sin = cutlass.Float32(freqs[freq_row, pair, 1])
+                    if cutlass.const_expr(self.inverse_rope):
+                        sin = -sin
+                    pool[page, off, out_real] = (real * cos - imag * sin).to(pool.element_type)
+                    pool[page, off, out_imag] = (imag * cos + real * sin).to(pool.element_type)
+
+    @lru_cache(maxsize=None)
+    def _compile_rmsnorm_rope_pool_write(
+        hidden_dim: int, rope_dim: int, eps: float, norm_dim: int, strided_rows: bool
+    ):
+        """Compile ``_RMSNormRoPEPoolWriteKernel``. ``strided_rows`` compiles ``x``
+        with a runtime row stride: with the fused q_a / kv_a GEMM the block
+        latents are the kv columns of each row of that GEMM's output."""
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DSpark RMSNorm/RoPE pool write must be warmed up before CUDA graph capture"
+            )
+        rows = cute.sym_int()
+        if strided_rows:
+            x_fake = cute.runtime.make_fake_tensor(
+                cutlass.BFloat16, (rows, hidden_dim), stride=(cute.sym_int64(), 1)
+            )
+        else:
+            x_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.BFloat16, (rows, hidden_dim), stride_order=(1, 0)
+            )
+        weight_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.BFloat16, (norm_dim,), stride_order=(0,)
+        )
+        freqs_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32, (cute.sym_int(), cute.sym_int(), 2), stride_order=(2, 1, 0)
+        )
+        pool_fake = cute.runtime.make_fake_tensor(
+            cutlass.BFloat16,
+            (cute.sym_int(), cute.sym_int(), hidden_dim),
+            stride=(cute.sym_int64(), hidden_dim, 1),
+        )
+        pages_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int64, (rows,), stride_order=(0,)
+        )
+        offsets_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Int64, (rows,), stride_order=(0,)
+        )
+        stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        kernel = _RMSNormRoPEPoolWriteKernel(hidden_dim, rope_dim, eps, norm_dim)
+        return cute.compile(
+            kernel,
+            x_fake,
+            weight_fake,
+            freqs_fake,
+            pool_fake,
+            pages_fake,
+            offsets_fake,
+            stream_fake,
+            options="--opt-level 2 --enable-tvm-ffi",
+        )
+
+
+def _rmsnorm_rope_pool_write(
+    blk_latent, weight, eps, rope_head_dim, freqs_cis, layer_cache, fixup, norm_dim
+) -> bool:
+    """``_rmsnorm_rope_batched(blk_latent, ..., norm_dim=norm_dim)`` stored at
+    ``pool[fixup.pages, fixup.offsets]`` in one kernel.
+
+    Returns False, writing nothing, when the inputs do not fit the kernel (a
+    BF16 pool, BF16 rows of unit inner stride, int64 pages / offsets).
+    """
+    if not (IS_CUTLASS_DSL_AVAILABLE and is_sm_100f()):
+        return False
+    freqs_real = torch.view_as_real(freqs_cis).reshape(-1, freqs_cis.shape[-1], 2)
+    if not is_fused_dspark_rmsnorm_rope_supported(
+        blk_latent, weight, freqs_real, 1, rope_head_dim, norm_dim
+    ):
+        return False
+    pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
+    x = blk_latent.view(-1, blk_latent.shape[-1])
+    pages, offsets = fixup.pages.reshape(-1), fixup.offsets.reshape(-1)
+    if not (
+        x.stride(-1) == 1
+        and x.stride(0) >= x.shape[-1]
+        and freqs_real.shape[0] == x.shape[0]
+        and pool.dtype == x.dtype == torch.bfloat16
+        and pool.shape[-1] == x.shape[-1]
+        and pool.stride(1) == pool.shape[-1]
+        and pool.stride(2) == 1
+        and pages.dtype == offsets.dtype == torch.int64
+        and pages.is_contiguous()
+        and offsets.is_contiguous()
+        and pages.numel() == x.shape[0]
+        and x.shape[0] > 0
+    ):
+        return False
+    _compile_rmsnorm_rope_pool_write(
+        x.shape[-1], rope_head_dim, eps, norm_dim, x.stride(0) != x.shape[-1]
+    )(x, weight, freqs_real, pool, pages, offsets)
+    return True
+
 
 # ----------------------------------------------------------------------------
 # Captured-context attention primitives.
@@ -2420,6 +2634,14 @@ _LN2 = math.log(2.0)
 # consumer here and 256 MiB is what the DFlash TRTLLM buffers already reserve.
 _MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
 _DSPARK_MLA_MAX_SPLIT_KV_ENV = "TLLM_DSPARK_MLA_MAX_SPLIT_KV"
+_DSPARK_MLA_SPLIT_PLAN_ENV = "TLLM_DSPARK_MLA_SPLIT_PLAN"
+# Fixed cost of one split-KV piece, in KV tiles, in the per-request split plan
+# of the cute-dsl block decode (launch_mla_split_kv_plan): fitted on sweeps over
+# long contexts and small batches of equal and mixed lengths, for 64 heads folded
+# two tokens per M tile; other head counts start from it. An FP8 KV tile is half
+# the bytes of a BF16 one, so the same fixed cost is twice the tiles.
+_MLA_SPLIT_PLAN_PIECE_COST_TILES = 30
+_MLA_SPLIT_PLAN_PIECE_COST_TILES_FP8 = 60
 
 
 def _dspark_mla_max_split_kv() -> int:
@@ -2444,6 +2666,19 @@ def _dspark_mla_max_split_kv() -> int:
             f"got {value!r}"
         )
     return cap
+
+
+def _dspark_mla_split_plan_enabled() -> bool:
+    """``TLLM_DSPARK_MLA_SPLIT_PLAN=1``: plan the cute-dsl drafter attention's split-KV per request.
+
+    Unset keeps the kernel's uniform split, sized from the batch alone. The
+    plan is launched once per step from the step's KV lengths and gives each
+    request as many of the split slots as its KV length is worth, for a drafter
+    that attends a long context (the unified draft cache) over a batch of mixed
+    lengths. A request's result depends on its split only through the order of
+    its FP32 partial sums, so draft tokens can differ in near-ties.
+    """
+    return os.environ.get(_DSPARK_MLA_SPLIT_PLAN_ENV, "0") == "1"
 
 
 class _MLABlockFixup(NamedTuple):
@@ -2760,6 +2995,11 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                  degrade to on the unpaged arena, where there are no page
                  tables to hand a kernel.
 
+    ``context_kv_dtype="fp8"`` stores the latents as FP8 E4M3 at a unit
+    per-tensor scale (``to_draft_fp8``), 2880 instead of 5760 B/token/rank, and
+    the CUTEDSL decode then reads them with an FP8 query through the FP8 MLA
+    decode; the other two backends read BF16 only.
+
     Reference: arXiv 2607.05147; deepseek-ai/DeepSpec.
     """
 
@@ -2784,7 +3024,16 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
     # backend field, which is why either value of it works here.
     _paged_ctx_cache = True
 
-    def __init__(self, draft_config, *, dflash_attention_backend: str = "AUTO"):
+    def __init__(
+        self,
+        draft_config,
+        *,
+        dflash_attention_backend: str = "AUTO",
+        context_kv_only: bool = False,
+        context_kv_dtype: str = "auto",
+    ):
+        if context_kv_dtype not in ("auto", "fp8"):
+            raise ValueError(f"context_kv_dtype must be 'auto' or 'fp8', got {context_kv_dtype!r}")
         cfg = draft_config.pretrained_config
         # Pin the backbone instead of relying on the model_type-derived name
         # (the Laguna precedent in modeling_dflash.py): the checkpoint labels
@@ -2792,6 +3041,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         cfg.architectures = ["K3DsparkForCausalLM"]
         super().__init__(draft_config, dflash_attention_backend=dflash_attention_backend)
         self._init_dspark_heads(cfg)
+        self.context_kv_only = context_kv_only
 
         attn0 = self.model.layers[0].self_attn
         self.qk_nope_head_dim = attn0.qk_nope_head_dim
@@ -2815,9 +3065,14 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         rope = _resolve_dspark_mla_rope_params(cfg, draft_config)
         self._mla_rope_params = rope
         self._mla_workspace = None
-        self._mla_freqs = None
+        # (device, table length) -> table; see _mla_freqs_cis.
+        self._mla_freqs_cache: Dict = {}
+        self._mla_fp8_scales = None
         self._cute_dsl_checked_shape = None
         self._mla_max_split_kv = _dspark_mla_max_split_kv()
+        self._mla_split_plan_enabled = _dspark_mla_split_plan_enabled()
+        # (fixup, fp8, plan) of the last _mla_split_kv_plan.
+        self._mla_split_plan = None
         # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
         # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
         # the absorbed product reproduces the 192-dim un-absorbed score.
@@ -2828,13 +3083,55 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # Raise here rather than five layers into the first draft step, and name
         # the reason. Reached for an explicit CUTEDSL and for the AUTO default
         # alike -- neither degrades.
-        if self.dflash_attention_backend == "CUTEDSL":
+        if self.dflash_attention_backend == "CUTEDSL" and not context_kv_only:
             reason = cute_dsl_mla_decode_unavailability_reason()
             if reason is not None:
                 raise ValueError(
                     f"attention_backend='CUTEDSL' was requested but the cute-dsl "
                     f"MLA decode is unavailable: {reason}."
                 )
+        # The pool's dtype is what the decode keys on; this flag is what sizes
+        # the pool (KvCacheCreator) and what rejects a backend that reads BF16.
+        self.context_kv_fp8 = context_kv_dtype == "fp8"
+        if (
+            self.context_kv_fp8
+            and not context_kv_only
+            and self.dflash_attention_backend != "CUTEDSL"
+        ):
+            raise ValueError(
+                "speculative_config.context_kv_dtype='fp8' is read by the CUTEDSL block decode "
+                f"only, but attention_backend resolved to {self.dflash_attention_backend!r}."
+            )
+        if self.context_kv_fp8 and not context_kv_only and self._mla_max_split_kv:
+            raise ValueError(
+                f"{_DSPARK_MLA_MAX_SPLIT_KV_ENV} caps the split of the BF16 decode; the FP8 "
+                "decode has no such cap, so unset it with speculative_config.context_kv_dtype='fp8'."
+            )
+        if context_kv_only:
+            self._keep_context_kv_modules()
+
+    def _keep_context_kv_modules(self) -> None:
+        """Drop every module the context KV build does not read.
+
+        A disaggregated context server only stores the drafter's context KV:
+        the target hidden states through ``fc`` / ``hidden_norm``, then each
+        layer's ``kv_a_proj_with_mqa`` and ``kv_a_layernorm`` plus RoPE
+        (``precompute_context_kv``). The embedding, the query / output
+        projections, the MLPs, the LM head and the DSpark heads are never read
+        there. Construction runs under meta init, so dropped modules never
+        allocate device memory.
+        """
+        backbone = self.draft_model_full.model
+        backbone.embed_tokens = None
+        backbone.norm = None
+        for layer in backbone.layers:
+            layer.mlp = None
+            layer.input_layernorm = None
+            layer.post_attention_layernorm = None
+            for name in ("q_a_proj", "q_a_layernorm", "q_b_proj", "kv_b_proj", "o_proj"):
+                setattr(layer.self_attn, name, None)
+        self.draft_model_full.lm_head = None
+        self.lm_head = None
 
     # -- shape / buffers ---------------------------------------------------
 
@@ -2902,7 +3199,24 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self._mla_workspace = torch.zeros(want, dtype=torch.uint8, device=device)
         return self._mla_workspace
 
-    def _assert_cute_dsl_can_implement(self, batch, block_size, page_size, dtype) -> None:
+    def _mla_fp8_decode_scales(self, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """The FP8 decode's device scales, the target FP8 MLA's at unit q / kv scales.
+
+        ``bmm1 = softmax_scale * dq_q * dq_kv`` and ``bmm2 = dq_kv`` (mlaKernels.cu),
+        with both dequant scales ``DRAFT_FP8_KV_SCALE``. Built on first use, which
+        the eager warmup reaches before any graph capture.
+        """
+        if self._mla_fp8_scales is None or self._mla_fp8_scales[0].device != device:
+            dq = DRAFT_FP8_KV_SCALE
+            self._mla_fp8_scales = (
+                torch.full((1,), self.softmax_scale * dq * dq, dtype=torch.float32, device=device),
+                torch.full((1,), dq, dtype=torch.float32, device=device),
+            )
+        return self._mla_fp8_scales
+
+    def _assert_cute_dsl_can_implement(
+        self, batch, block_size, page_size, dtype, out_dtype=None
+    ) -> None:
         """Reject a shape the kernel cannot serve, here, naming the reason.
 
         Without this the rejection is silent until it is not: ``get_valid_tactics``
@@ -2914,15 +3228,28 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
 
         Page size is the only operand here that is not fixed by the checkpoint,
         and it comes from the draft KV pool, so this cannot move to __init__.
+        ``dtype`` is the kernel input dtype and ``out_dtype`` the dtype of the
+        output the decode allocates (the query's); by default an FP8 input
+        writes BF16 and the others write their own dtype.
         """
-        key = (batch, block_size, page_size, dtype)
+        key = (batch, block_size, page_size, dtype, out_dtype)
         if self._cute_dsl_checked_shape == key:
             return
         import cutlass
 
         from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
 
-        in_dtype = cutlass.Float16 if dtype == torch.float16 else cutlass.BFloat16
+        fp8 = dtype == torch.float8_e4m3fn
+        if out_dtype is None:
+            out_dtype = torch.bfloat16 if fp8 else dtype
+        in_dtype = (
+            cutlass.Float8E4M3FN
+            if fp8
+            else cutlass.Float16
+            if dtype == torch.float16
+            else cutlass.BFloat16
+        )
+        out_dtype = cutlass.Float16 if out_dtype == torch.float16 else cutlass.BFloat16
         runner = CuteDSLNVMlaDecodeBlackwellRunner
         # Mirror the runner's own probe (cute_dsl_custom_ops.py:8542) through its
         # own constants, so this cannot drift from the tactic it will pick. Its
@@ -2935,7 +3262,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             self.kv_lora_rank,
             self.qk_rope_head_dim,
             in_dtype,
-            in_dtype,
+            out_dtype,
             cutlass.Float32,
             cutlass.Float32,
             (128, 128),
@@ -2947,14 +3274,67 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             page_size,
         )
         if not ok:
+            if fp8:
+                hint = (
+                    "The FP8 decode (speculative_config.context_kv_dtype='fp8') writes BF16, so "
+                    "it needs a BF16 drafter, and kv_cache_config.tokens_per_block a divisor of "
+                    "128 other than 1."
+                )
+            else:
+                hint = (
+                    "Use attention_backend='TRTLLM', or set kv_cache_config.tokens_per_block "
+                    "to a divisor of 128 other than 1."
+                )
             raise ValueError(
                 f"attention_backend='CUTEDSL' cannot serve this shape: batch={batch}, "
                 f"block_size={block_size}, page_size={page_size}, "
-                f"num_heads={self._num_heads}, dtype={dtype}. Use "
-                f"attention_backend='TRTLLM', or set kv_cache_config.tokens_per_block "
-                f"to a divisor of 128 other than 1."
+                f"num_heads={self._num_heads}, dtype={dtype}. {hint}"
             )
         self._cute_dsl_checked_shape = key
+
+    def _mla_split_kv_plan(self, fixup, block_size, fp8) -> Optional[torch.Tensor]:
+        """Per-request split-KV counts for the block decode of ``fixup``'s step.
+
+        The decode kernel's grid holds the uniform split of its tactic, sized
+        from the batch alone; the plan lets each request use as many of those
+        slots as its KV length is worth (cute_dsl_mla.launch_mla_split_kv_plan,
+        the target MLA decode's planner, at this decode's piece cost). Every
+        layer of a step decodes the same lengths, so the first layer launches
+        the plan and the others reuse it; a new fixup -- the next step, or a
+        CUDA graph capture -- plans again. None (the uniform split) for a
+        batch beyond the planner's request capacity.
+        """
+        cached = self._mla_split_plan
+        if cached is not None and cached[0] is fixup and cached[1] == fp8:
+            return cached[2]
+        from ..attention_backend.fmha.cute_dsl_mla import (
+            _SPLIT_PLAN_MAX_REQUESTS,
+            launch_mla_split_kv_plan,
+        )
+        from ..custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+        seq_lens = fixup.seq_lens_i32
+        batch = seq_lens.shape[0]
+        plan = None
+        if batch <= _SPLIT_PLAN_MAX_REQUESTS:
+            rows, wave_clusters = CuteDSLNVMlaDecodeBlackwellRunner.get_split_plan_geometry(
+                self._num_heads, block_size
+            )
+            plan = torch.empty(batch, dtype=torch.int32, device=seq_lens.device)
+            launch_mla_split_kv_plan(
+                seq_lens,
+                plan,
+                num_requests=batch,
+                rows_per_request=rows,
+                wave_clusters=wave_clusters,
+                piece_cost=(
+                    _MLA_SPLIT_PLAN_PIECE_COST_TILES_FP8
+                    if fp8
+                    else _MLA_SPLIT_PLAN_PIECE_COST_TILES
+                ),
+            )
+        self._mla_split_plan = (fixup, fp8, plan)
+        return plan
 
     def _cute_dsl_block_decode(self, query, layer_cache, fixup, block_size):
         """One cute-dsl MLA decode over context AND block, no fixup.
@@ -2972,6 +3352,15 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ``cute_dsl_mla_decode_unavailability_reason``; the shape depends on the
         draft pool's page size, which is not known until here, so it is checked
         on the first call.
+
+        An FP8 pool (``context_kv_dtype="fp8"``) is read by the FP8 decode with
+        the query quantized the same way (``to_draft_fp8``); the output stays in
+        the query's dtype.
+
+        With ``TLLM_DSPARK_MLA_SPLIT_PLAN=1`` each request splits its KV as the
+        step's plan says (``_mla_split_kv_plan``), which the kernel clamps to
+        the tactic's split; the output stays the uniform launch's up to the
+        order of the FP32 partial sums.
         """
         import cutlass
 
@@ -2982,7 +3371,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
         page_size = pool.shape[1]
         d_latent = self.kv_lora_rank
-        self._assert_cute_dsl_can_implement(batch, block_size, page_size, query.dtype)
+        fp8 = pool.dtype == torch.float8_e4m3fn
+        self._assert_cute_dsl_can_implement(
+            batch, block_size, page_size, pool.dtype if fp8 else query.dtype, query.dtype
+        )
 
         # stride[1] == 1 is the kernel's only layout demand (mla_decode_fp16.py:465-470);
         # a 576-wide row sliced at 512 keeps that on both halves, so no copy.
@@ -2991,8 +3383,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # inference_mode so nothing here carries grad, but the in-place pool
         # write above pulls the pool into the autograd graph whenever a caller
         # does not -- a unit test, for one. Views, so no copy.
-        q_latent = query.detach()[..., :d_latent].permute(2, 3, 1, 0)
-        q_rope = query.detach()[..., d_latent:].permute(2, 3, 1, 0)
+        kernel_query = to_draft_fp8(query.detach()) if fp8 else query.detach()
+        q_latent = kernel_query[..., :d_latent].permute(2, 3, 1, 0)
+        q_rope = kernel_query[..., d_latent:].permute(2, 3, 1, 0)
         c_latent = pool.detach()[..., :d_latent].permute(1, 2, 0)
         c_rope = pool.detach()[..., d_latent:].permute(1, 2, 0)
 
@@ -3001,7 +3394,20 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             num_heads, block_size, d_latent, batch, cutlass.Float32
         )
         workspace = self._mla_decode_workspace(device, workspace_numel)
-        torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell(
+        if fp8:
+            decode = torch.ops.trtllm.cute_dsl_mla_decode_fp8_blackwell
+            softmax_scale, output_scale = self._mla_fp8_decode_scales(device)
+            decode_kwargs = {}
+        else:
+            decode = torch.ops.trtllm.cute_dsl_mla_decode_fp16_blackwell
+            softmax_scale, output_scale = self.softmax_scale, 1.0
+            decode_kwargs = {"max_split_kv": self._mla_max_split_kv}
+        plan = (
+            self._mla_split_kv_plan(fixup, block_size, fp8)
+            if self._mla_split_plan_enabled
+            else None
+        )
+        decode(
             q_latent,
             q_rope,
             c_latent,
@@ -3019,17 +3425,93 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             num_heads,
             block_size,
             page_size,
-            self.softmax_scale,
-            1.0,
+            softmax_scale,
+            output_scale,
             batch,
             None,
             # Every block token sees the whole block, not just its causal prefix.
             fixup.kv_bounds_i32,
-            max_split_kv=self._mla_max_split_kv,
+            plan,
+            **decode_kwargs,
         )
         return out
 
-    def _mla_paged_attention(self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len):
+    @staticmethod
+    def _write_block_latents(blk_kv, layer_cache, fixup) -> None:
+        """The block's own latents into the pool at ``fixup.pages`` / ``fixup.offsets``."""
+        pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
+        pages, offsets = fixup.pages.reshape(-1), fixup.offsets.reshape(-1)
+        blk_rows = blk_kv.reshape(-1, blk_kv.shape[-1])
+        fused_store = spec_tail_fusion_enabled() and blk_kv.is_contiguous()
+        if pool.dtype == torch.float8_e4m3fn and not fused_store:
+            # Stored like the context latents; byte views because index_put
+            # support for FP8 varies across builds.
+            pool, blk_rows = pool.view(torch.uint8), to_draft_fp8(blk_rows).view(torch.uint8)
+        if fused_store:
+            scatter_rows_to_pool(blk_kv.view(-1, blk_kv.shape[-1]), pool, pages, offsets)
+        else:
+            pool[pages, offsets] = blk_rows
+
+    def _block_kv_to_pool(
+        self,
+        attn,
+        blk_latent_rows,
+        hs_normed,
+        batch,
+        block_size,
+        blk_freqs,
+        layer_cache,
+        fixup,
+        variant,
+    ):
+        """The kv path of one drafter layer: block latents -> RMSNorm/RoPE -> pool.
+
+        ``blk_latent_rows`` are the kv columns of the fused q_a / kv_a GEMM, or
+        None to run kv_a here. Returns ``blk_kv``, or None when the cute_dsl
+        variant stored it straight into the pool (that decode reads the block
+        back from the pool only).
+        """
+        if blk_latent_rows is None:
+            blk_latent_rows = attn.kv_a_proj_with_mqa(hs_normed)
+        blk_latent = blk_latent_rows.view(batch, block_size, -1)
+        if (
+            variant == "cute_dsl"
+            and _split_qkv_direct_pool_write()
+            and _rmsnorm_rope_pool_write(
+                blk_latent,
+                attn.kv_a_layernorm.weight,
+                attn.kv_a_layernorm.variance_epsilon,
+                self.qk_rope_head_dim,
+                blk_freqs,
+                layer_cache,
+                fixup,
+                self.kv_lora_rank,
+            )
+        ):
+            return None
+        blk_kv = _rmsnorm_rope_batched(
+            blk_latent,
+            attn.kv_a_layernorm.weight,
+            attn.kv_a_layernorm.variance_epsilon,
+            self.qk_rope_head_dim,
+            blk_freqs,
+            norm_dim=self.kv_lora_rank,
+        )
+        self._write_block_latents(blk_kv, layer_cache, fixup)
+        return blk_kv
+
+    def _split_qkv_stream(self, device) -> Optional[torch.cuda.Stream]:
+        """The aux stream of the q / kv split, created outside graph capture (None
+        until then, which keeps that step on one stream)."""
+        stream = getattr(self, "_kv_path_stream", None)
+        if stream is None and not torch.cuda.is_current_stream_capturing():
+            stream = self._kv_path_stream = torch.cuda.Stream(device=device)
+            self._kv_path_events = (torch.cuda.Event(), torch.cuda.Event())
+        return stream
+
+    def _mla_paged_attention(
+        self, query, blk_kv, layer_cache, fixup, block_size, max_kv_len, block_written=False
+    ):
         """Absorbed-MLA block attention: paged kernel + a block-local fixup.
 
         The kernel is causal across the query block and takes no mask (measured,
@@ -3051,6 +3533,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         clamped to physical block 0 -- another request's.
 
         Returns the latent-space output ``[B, block, heads, kv_lora_rank]``.
+        ``block_written``: the caller already stored the block (the q / kv split);
+        ``blk_kv`` may then be None on the cute_dsl variant.
         """
         decode = self._mla_decode_op()
         batch, _, num_heads, _ = query.shape
@@ -3059,21 +3543,13 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # --- the block's own latents into the pool, then one causal pass ---
         # Must precede BOTH decode paths: each reads the block back out of the
         # pool, so writing it afterwards would attend uninitialised slots.
-        pool = layer_cache[:, 0, 0]  # [pages, page_size, head_dim]
-        if spec_tail_fusion_enabled() and blk_kv.is_contiguous():
-            scatter_rows_to_pool(
-                blk_kv.view(-1, blk_kv.shape[-1]),
-                pool,
-                fixup.pages.reshape(-1),
-                fixup.offsets.reshape(-1),
-            )
-        else:
-            pool[fixup.pages.reshape(-1), fixup.offsets.reshape(-1)] = blk_kv.reshape(
-                -1, blk_kv.shape[-1]
-            )
+        if not block_written:
+            self._write_block_latents(blk_kv, layer_cache, fixup)
 
         if self._mla_block_decode_variant(paged=True) == "cute_dsl":
             return self._cute_dsl_block_decode(query, layer_cache, fixup, block_size)
+        if layer_cache.dtype == torch.float8_e4m3fn:
+            raise NotImplementedError("An FP8 MLA DSpark context needs the CUTEDSL decode.")
         out_lower = torch.empty(
             batch, block_size, num_heads, self.kv_lora_rank, dtype=query.dtype, device=device
         )
@@ -3122,7 +3598,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         return merged.to(query.dtype)
 
     def _mla_freqs_cis(self, device):
-        """Adjacent-pair YaRN table, cached. See build_dspark_mla_yarn_freqs_cis.
+        """Adjacent-pair YaRN table, cached per ``(device, length)``. See
+        build_dspark_mla_yarn_freqs_cis.
 
         Sized from the ceiling the worker publishes once it knows the runtime
         one (_runtime_position_ceiling, set in DFlashWorker._lazy_init_ctx_buffers
@@ -3130,18 +3607,30 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         it is strictly above model_config.max_seq_len whenever spec decoding is
         on. The config-derived cap is the fallback for direct construction in
         tests, where no worker runs.
+
+        The ceiling is read on every call, and the table follows it. The worker
+        publishes a new one whenever the draft KV cache manager is replaced: KV
+        cache estimation runs against a probe whose max_seq_len is only what the
+        probe pool holds, and a context server's estimation warmup already
+        builds this table from a prompt batch. A table kept from that pass
+        would be indexed past its end by the first prompt longer than the
+        probe, and the out-of-range gather is a device-side assertion rather
+        than an exception. The tables built earlier stay cached: a captured
+        graph may still read one.
         """
-        if self._mla_freqs is None:
-            rope = dict(self._mla_rope_params)
-            runtime_cap = getattr(self, "_runtime_position_ceiling", None)
-            if runtime_cap is not None:
-                # Outright, not max(): the published ceiling is already
-                # min(runtime, max_position_embeddings) + lookahead, so it is
-                # both sufficient and the only thing that keeps the table small
-                # when max_seq_len is unset and the config cap is the
-                # checkpoint's advertised 1,048,576.
-                rope["max_positions"] = int(runtime_cap)
-            self._mla_freqs = build_dspark_mla_yarn_freqs_cis(
+        rope = dict(self._mla_rope_params)
+        runtime_cap = getattr(self, "_runtime_position_ceiling", None)
+        if runtime_cap is not None:
+            # Outright, not max(): the published ceiling is already
+            # min(runtime, max_position_embeddings) + lookahead, so it is
+            # both sufficient and the only thing that keeps the table small
+            # when max_seq_len is unset and the config cap is the
+            # checkpoint's advertised 1,048,576.
+            rope["max_positions"] = int(runtime_cap)
+        key = (str(device), rope["max_positions"])
+        table = self._mla_freqs_cache.get(key)
+        if table is None:
+            table = build_dspark_mla_yarn_freqs_cis(
                 dim=self.qk_rope_head_dim,
                 base=rope["theta"],
                 scaling_factor=rope["scaling_factor"],
@@ -3153,7 +3642,8 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 mscale_all_dim=rope["mscale_all_dim"],
                 device=device,
             )
-        return self._mla_freqs
+            self._mla_freqs_cache[key] = table
+        return table
 
     def _build_fused_kv_buffers(self) -> None:
         """Stack the per-layer latent projection and its RMSNorm weight.
@@ -3176,9 +3666,9 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._use_fused_qk_norm_rope = False
 
         # Split kv_b_proj into the absorption operands once. K absorbs into the
-        # query, V un-absorbs the attention output.
+        # query, V un-absorbs the attention output. Block decode only.
         nh = attn0.num_heads_tp
-        for a in layers_attn:
+        for a in layers_attn if not self.context_kv_only else ():
             w = a.kv_b_proj.weight.view(nh, self.qk_nope_head_dim + self.v_head_dim, -1)
             a._k_b_proj = w[:, : self.qk_nope_head_dim].contiguous()
             a._v_b_proj = w[:, self.qk_nope_head_dim :].contiguous()
@@ -3322,6 +3812,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         # page tables, so the eager gather also covers the private arena.
         variant = self._mla_block_decode_variant(paged)
         use_kernel = variant != "eager"
+        if paged and ctx_kv_cache[0].dtype == torch.float8_e4m3fn and variant != "cute_dsl":
+            raise NotImplementedError(
+                f"An FP8 MLA DSpark context needs the CUTEDSL paged decode; got {variant!r}."
+            )
         # Context pages for this batch, resolved once: rows are batch positions
         # when bound to the manager's per-request block table and slots on the
         # private arena, which is exactly what ctx_cache_batch_idx already is.
@@ -3401,8 +3895,44 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 q_a = q_kv_a[:, : attn.q_lora_rank]
                 blk_latent_rows = q_kv_a[:, attn.q_lora_rank :]
             else:
-                q_a = attn.q_a_proj(hs_normed)
+                q_a = None
                 blk_latent_rows = None
+            # TLLM_DSPARK_MLA_SPLIT_QKV_STREAMS: the kv path beside the q path, on two
+            # streams where multi-stream is on (CUDA graph warmup and capture).
+            # Everything the kv path reads exists before the fork and everything it
+            # writes is read after the join; the next layer's fork orders the aux
+            # stream after this layer's main-stream work. Only the cute_dsl decode
+            # over a BF16 pool takes the split; other variants and pools keep the
+            # sequential path.
+            split_qkv = (
+                variant == "cute_dsl"
+                and ctx_kv_cache[layer_idx].dtype == torch.bfloat16
+                and _split_qkv_streams_on()
+            )
+            aux_stream = (
+                self._split_qkv_stream(device)
+                if split_qkv and _split_qkv_use_aux_stream() and do_multi_stream()
+                else None
+            )
+            if aux_stream is not None:
+                kv_start, kv_done = self._kv_path_events
+                kv_start.record()
+                with torch.cuda.stream(aux_stream):
+                    kv_start.wait()
+                    blk_kv = self._block_kv_to_pool(
+                        attn,
+                        blk_latent_rows,
+                        hs_normed,
+                        batch,
+                        block_size,
+                        blk_freqs,
+                        ctx_kv_cache[layer_idx],
+                        fixup,
+                        variant,
+                    )
+                    kv_done.record()
+            if q_a is None:
+                q_a = attn.q_a_proj(hs_normed)
             q = attn.q_b_proj(attn.q_a_layernorm(q_a))
             q = q.view(batch, block_size, num_heads, self.qk_nope_head_dim + self.qk_rope_head_dim)
             # The 576-wide query is assembled in one buffer rather than
@@ -3452,23 +3982,42 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                 .transpose(0, 1),
             )
 
-            # The block's own latent comes from the draft hidden; the context's
-            # from the projected target hidden (precompute_context_kv). That
-            # dual-source split is the DFlash contract, not an MLA detail.
-            if blk_latent_rows is None:
-                blk_latent_rows = attn.kv_a_proj_with_mqa(hs_normed)
-            blk_latent = blk_latent_rows.view(batch, block_size, -1)
-            # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
-            # k_pe out of the reduction, which is what DeepSeek-style MLA wants
-            # and what DSpark's own convention (whole row) does not do.
-            blk_kv = _rmsnorm_rope_batched(
-                blk_latent,
-                attn.kv_a_layernorm.weight,
-                attn.kv_a_layernorm.variance_epsilon,
-                self.qk_rope_head_dim,
-                blk_freqs,
-                norm_dim=latent_dim,
-            )
+            if aux_stream is not None:
+                kv_done.wait()
+                if blk_kv is not None and not torch.cuda.is_current_stream_capturing():
+                    # Allocated on the aux stream, read here: keep its memory from the
+                    # aux stream's next allocations until this stream is done with it.
+                    blk_kv.record_stream(torch.cuda.current_stream())
+            elif split_qkv:
+                blk_kv = self._block_kv_to_pool(
+                    attn,
+                    blk_latent_rows,
+                    hs_normed,
+                    batch,
+                    block_size,
+                    blk_freqs,
+                    ctx_kv_cache[layer_idx],
+                    fixup,
+                    variant,
+                )
+            else:
+                # The block's own latent comes from the draft hidden; the context's
+                # from the projected target hidden (precompute_context_kv). That
+                # dual-source split is the DFlash contract, not an MLA detail.
+                if blk_latent_rows is None:
+                    blk_latent_rows = attn.kv_a_proj_with_mqa(hs_normed)
+                blk_latent = blk_latent_rows.view(batch, block_size, -1)
+                # RMSNorm over the latent, RoPE over k_pe, one kernel. norm_dim keeps
+                # k_pe out of the reduction, which is what DeepSeek-style MLA wants
+                # and what DSpark's own convention (whole row) does not do.
+                blk_kv = _rmsnorm_rope_batched(
+                    blk_latent,
+                    attn.kv_a_layernorm.weight,
+                    attn.kv_a_layernorm.variance_epsilon,
+                    self.qk_rope_head_dim,
+                    blk_freqs,
+                    norm_dim=latent_dim,
+                )
             if use_kernel:
                 ctx_out = self._mla_paged_attention(
                     query,
@@ -3477,6 +4026,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
                     fixup,
                     block_size,
                     capacity,
+                    block_written=split_qkv,
                 )
             else:
                 if page_tables is None:
@@ -3614,12 +4164,23 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         ones use ``fc`` / ``hidden_norm`` / ``norm``. Everything below that is
         already HF-standard MLA.
         """
-        weights, _ = self._take_dspark_head_weights(weights)
         renames = {
             "context_proj.weight": "fc.weight",
             "context_norm.weight": "hidden_norm.weight",
             "final_norm.weight": "norm.weight",
         }
+        if self.context_kv_only:
+            # Only the tensors _keep_context_kv_modules left a home for.
+            weights = {renames.get(k, k): v for k, v in weights.items()}
+            weights = {
+                k: v
+                for k, v in weights.items()
+                if k in self.WRAPPER_OWNED_WEIGHTS
+                or ".self_attn.kv_a_proj_with_mqa." in k
+                or ".self_attn.kv_a_layernorm." in k
+            }
+            return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
+        weights, _ = self._take_dspark_head_weights(weights)
         weights = {renames.get(k, k): v for k, v in weights.items()}
         return super().load_weights(weights, weight_mapper=weight_mapper, **kwargs)
 
@@ -3630,7 +4191,10 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         the target's, so adopting the target's would feed the block decode
         embeddings it was not distilled against -- silently, at some acceptance
         cost. The GQA drafters ship no embedding and keep the base behavior.
+        A context-KV-only drafter has no LM head.
         """
+        if self.context_kv_only:
+            return
         self.draft_model_full.lm_head = target_model.lm_head
         self.lm_head = target_model.lm_head
 
@@ -3672,6 +4236,18 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     Returns:
         The draft ``nn.Module`` for this drafter.
     """
+    context_kv_only = model_config.spec_config.context_kv_only
+    context_kv_dtype = getattr(model_config.spec_config, "context_kv_dtype", "auto")
+    for name, is_set in (
+        ("context_kv_only", context_kv_only),
+        ("context_kv_dtype", context_kv_dtype != "auto"),
+    ):
+        if is_set and (
+            draft_is_embedded_in_target(model_config) or not is_mla(draft_config.pretrained_config)
+        ):
+            raise ValueError(
+                f"speculative_config.{name} is implemented for standalone MLA DSpark drafters only."
+            )
     if draft_is_embedded_in_target(model_config):
         num_stages = count_dspark_stages(model_config.spec_config.speculative_model)
         validate_dspark_eplb_layer_base(model_config, draft_config)
@@ -3687,12 +4263,15 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     # (``DFlashForCausalLM.__init__``) already resolves the backbone through the
     # model registry, so keying on model_type a second time would force a new
     # entry for every GQA family that already works.
-    drafter_cls = (
-        MLADSparkForCausalLM if is_mla(draft_config.pretrained_config) else GQADSparkForCausalLM
-    )
-    return drafter_cls(
+    if not is_mla(draft_config.pretrained_config):
+        return GQADSparkForCausalLM(
+            draft_config, dflash_attention_backend=model_config.spec_config.attention_backend
+        )
+    return MLADSparkForCausalLM(
         draft_config,
         dflash_attention_backend=model_config.spec_config.attention_backend,
+        context_kv_only=context_kv_only,
+        context_kv_dtype=context_kv_dtype,
     )
 
 

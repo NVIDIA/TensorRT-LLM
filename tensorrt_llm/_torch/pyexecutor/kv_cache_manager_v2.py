@@ -87,6 +87,11 @@ from ...mapping import CpType, Mapping
 from ..utils import maybe_compile
 from .config_utils import uses_vswa_kv_cache_layout
 from .connectors.kv_cache_connector import KvCacheConnectorManager
+from .input_commit import (
+    block_offsets_copy_job,
+    copy_batch_block_offsets_from_host,
+    gen_host_bundle_kernels_enabled,
+)
 from .kv_cache_stats import (
     KVCacheV2IterationStatsReport,
     KVCacheV2LifeCycleIterationStats,
@@ -107,7 +112,13 @@ from .resource_manager import (
     request_context,
 )
 from .scheduler import ScheduledRequests
-from .standalone_draft_cache import StandaloneDraftHistory
+from .standalone_draft_cache import (
+    DRAFT_CONTEXT_WINDOW_ENV,
+    DraftContextWindow,
+    DraftContextWindowMove,
+    StandaloneDraftHistory,
+    draft_context_window_from_env,
+)
 
 if KV_CACHE_MANAGER_V2_BACKEND == "cpp":
     from tensorrt_llm.runtime.kv_cache_manager_v2 import CacheDomain
@@ -194,6 +205,42 @@ def compute_decode_only_draft_kv_slack(spec_config, tokens_per_block: int) -> in
     max_draft_len = spec_config.max_total_draft_tokens
     block_size = getattr(spec_config, "block_size", None) or (max_draft_len + 1)
     return 2 * tokens_per_block + block_size + 2 * (max_draft_len + 1)
+
+
+#: Opt-in (default unset): the longest prompt whose transferred drafter context a disaggregated
+#: generation worker drafts from (see :func:`draft_context_limit_from_env`).
+DRAFT_CONTEXT_LIMIT_ENV = "TLLM_DSPARK_DRAFT_CONTEXT_LIMIT"
+
+
+def draft_context_limit_from_env() -> int | None:
+    """Longest prompt whose transferred drafter context a generation worker drafts from.
+
+    A standalone drafter that keeps its context in the unified draft cache attends to the context
+    the context worker built from the prompt, and its acceptance falls off beyond the range it was
+    trained for. A request whose prompt is longer than this limit starts from an empty drafter
+    context instead, as with the legacy drafter state (:meth:`KVCacheManagerV2.restore_draft_history`).
+    Only the generation worker acts on the limit: the context worker keeps building, committing and
+    reusing the drafter context of every prompt, so a value set there changes nothing.
+
+    The decision is taken once, when the request is handed off. A request whose prompt is within the
+    limit keeps its transferred context while it decodes, and that context grows with every
+    accepted token: the limit has to be lower than the range the drafter drafts well over by at
+    least the longest output.
+
+    Returns:
+        The limit in tokens, or None when ``TLLM_DSPARK_DRAFT_CONTEXT_LIMIT`` is unset, which keeps
+        the transferred context of every prompt.
+    """
+    raw = os.environ.get(DRAFT_CONTEXT_LIMIT_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        limit = int(raw)
+    except ValueError:
+        limit = 0
+    if limit <= 0:
+        raise ValueError(f"{DRAFT_CONTEXT_LIMIT_ENV} must be a positive integer, got {raw!r}")
+    return limit
 
 
 def _create_gpu_cache_tier_config(quota: int, enable_ugpu: bool) -> GpuCacheTierConfig:
@@ -1155,6 +1202,10 @@ class KVCacheManagerV2(BaseResourceManager):
     _draft_layer_sizes: tuple[int, ...] = ()
     cp_as_tp_layer_ids: frozenset[int] = frozenset()
     draft_window_size: int | None = None
+    # TLLM_DSPARK_DRAFT_CONTEXT_LIMIT, read in __init__ and applied by restore_draft_history.
+    draft_context_limit: int | None = None
+    # TLLM_DSPARK_DRAFT_CONTEXT_WINDOW / _SINK, read in __init__ and applied with the limit.
+    draft_context_window: DraftContextWindow | None = None
     draft_layer_ids: tuple[int, ...] = ()
     _standalone_draft_reserve: int = 0
     _draft_registered_as_model_layers: bool = False
@@ -1230,6 +1281,14 @@ class KVCacheManagerV2(BaseResourceManager):
         self.draft_window_size = draft_window_size
         self.draft_attention_backend = draft_attention_backend
         self.draft_max_position_embeddings = draft_max_position_embeddings
+        self.draft_context_limit = (
+            draft_context_limit_from_env() if self._draft_layer_sizes else None
+        )
+        self.draft_context_window = (
+            draft_context_window_from_env() if self._draft_layer_sizes else None
+        )
+        # Restored histories whose kept window the generation worker has not moved yet.
+        self._draft_context_moves: dict[int, DraftContextWindowMove] = {}
         self.draft_layer_ids: tuple[int, ...] = ()
         self.draft_history: dict[int, StandaloneDraftHistory] = {}
         self._draft_dummy_request_ids: set[int] = set()
@@ -2852,11 +2911,12 @@ class KVCacheManagerV2(BaseResourceManager):
         if not 0 < draft_ratio < 1:
             raise ValueError("Unified KV cache quota must leave room for target and draft pools")
 
-        # Appended draft layers share one lifecycle, after all target groups.
+        # The draft layers share one lifecycle and form one pool group; the storage
+        # layout puts standalone-draft pool groups before the target groups.
         return replace(
             config,
-            initial_pool_ratio=[ratio * (1 - draft_ratio) for ratio in target_ratios]
-            + [draft_ratio],
+            initial_pool_ratio=[draft_ratio]
+            + [ratio * (1 - draft_ratio) for ratio in target_ratios],
         )
 
     def _extra_buffers_per_layer(
@@ -3045,11 +3105,10 @@ class KVCacheManagerV2(BaseResourceManager):
             or self.num_kv_heads_per_layer[local_layer_idx],
             "head_dim": self.head_dim_per_layer[local_layer_idx],
             "dtype": str(binding_to_torch_dtype(self.dtype_per_layer[local_layer_idx])),
-            "attention_backend": (
-                "VANILLA"
-                if self.draft_attention_backend == "TRTLLM"
-                else self.draft_attention_backend
-            ),
+            # Standalone drafters page their context the same way under every
+            # attention backend (dtype, heads and kv_factor carry the format);
+            # only embedded DSpark (DSv4) stores a different history.
+            "attention_backend": ("DSv4" if self.draft_attention_backend == "DSv4" else "VANILLA"),
             "kv_factor": self.kv_factor_per_layer[local_layer_idx],
             "window_size": self.draft_window_size,
         }
@@ -3154,8 +3213,12 @@ class KVCacheManagerV2(BaseResourceManager):
         }
 
     def restore_draft_history(self, request_id: int, metadata: dict) -> None:
-        if not self.draft_layer_ids or metadata.get("layout") != self.get_draft_transfer_identity():
-            raise ValueError("Standalone draft transfer layout does not match the receiving worker")
+        expected = self.get_draft_transfer_identity() if self.draft_layer_ids else None
+        if expected is None or metadata.get("layout") != expected:
+            raise ValueError(
+                "Standalone draft transfer layout does not match the receiving worker: "
+                f"sent {metadata.get('layout')}, expected {expected}"
+            )
         valid_length = metadata.get("valid_length")
         position = metadata.get("position")
         if self._draft_history_uses_kv_history():
@@ -3172,9 +3235,63 @@ class KVCacheManagerV2(BaseResourceManager):
             self.get_draft_block_table([request_id])
             return
         history = StandaloneDraftHistory(valid_length, position)
+        move = None
+        # The transceiver checked that position is the prompt length.
+        limit = self.draft_context_limit
+        if limit is not None and self.draft_window_size is None and history.position > limit:
+            window = self.draft_context_window
+            # Only a complete prompt context has a known last window to keep.
+            if window is not None and history.valid_length == history.position:
+                if self.enable_block_reuse:
+                    raise ValueError(
+                        f"{DRAFT_CONTEXT_WINDOW_ENV} needs a generation worker without block "
+                        f"reuse: request {request_id} moves the last {window.recent} tokens of "
+                        f"its {history.position}-token prompt to the start of the received "
+                        "draft pages, which block reuse would share with other requests."
+                    )
+                logger.info_once(
+                    f"{DRAFT_CONTEXT_LIMIT_ENV}={limit}: request {request_id} has a "
+                    f"{history.position}-token prompt; prompts above the limit are drafted from "
+                    f"their first {window.sink} and last {window.recent} tokens "
+                    f"({DRAFT_CONTEXT_WINDOW_ENV})",
+                    key="dspark_draft_context_window_engaged",
+                )
+                move = DraftContextWindowMove(
+                    source_start=history.position - window.recent,
+                    dest_start=window.sink,
+                    length=window.recent,
+                )
+                history = StandaloneDraftHistory(window.length, history.position)
+            else:
+                if self.enable_block_reuse:
+                    raise ValueError(
+                        f"{DRAFT_CONTEXT_LIMIT_ENV} needs a generation worker without block reuse: "
+                        f"request {request_id} drafts its {history.position}-token prompt from an "
+                        "empty context that overwrites the received draft pages from their start, "
+                        "which block reuse would share with other requests."
+                    )
+                # The pages came with the prompt KV but nothing in them is drafted from.
+                logger.info_once(
+                    f"{DRAFT_CONTEXT_LIMIT_ENV}={limit}: request {request_id} has a "
+                    f"{history.position}-token prompt; prompts above the limit are drafted from an "
+                    "empty context",
+                    key="dspark_draft_context_limit_engaged",
+                )
+                history = StandaloneDraftHistory(0, history.position)
         # Validate receiver-local allocation before publishing history.
         self.get_draft_block_table([request_id], [history])
-        self.set_draft_history(request_id, valid_length, position)
+        self.set_draft_history(request_id, history.valid_length, history.position)
+        if move is not None:
+            # Taken by the generation worker before it first drafts the request.
+            self._draft_context_moves[request_id] = move
+
+    def take_draft_context_move(self, request_id: int) -> DraftContextWindowMove | None:
+        """The window move :meth:`restore_draft_history` left for a request, handed out once.
+
+        The generation worker moves the kept latents before it first drafts the request; until
+        then its draft history already describes the moved context.
+        """
+        return self._draft_context_moves.pop(request_id, None)
 
     def get_index_k_buffer(
         self,
@@ -5168,6 +5285,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self._allocated_draft_lens.pop(request.py_request_id, None)
         if self.draft_layer_ids:
             self.draft_history.pop(request.py_request_id, None)
+            self._draft_context_moves.pop(request.py_request_id, None)
             self._draft_dummy_request_ids.discard(request.py_request_id)
         if self.decode_only_draft_kv:
             self._decode_only_offsets.pop(request.py_request_id, None)
@@ -5431,6 +5549,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_map.clear()
         if self.draft_layer_ids:
             self.draft_history.clear()
+            self._draft_context_moves.clear()
             self._draft_dummy_request_ids.clear()
         self.impl.shutdown()
         if self.conversation_manager is not None:
@@ -5679,6 +5798,17 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             return
 
+        # TRTLLM_GEN_HOST_BUNDLE=1: same copy split over many CTAs (the C++ kernel
+        # uses one CTA per pool and sequence, which is bound by host-read latency).
+        if gen_host_bundle_kernels_enabled() and copy_batch_block_offsets_from_host(
+            self.host_kv_cache_block_offsets,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
+        ):
+            return
+
         copy_batch_block_offsets_to_device(
             self.host_kv_cache_block_offsets,
             dst_tensor,
@@ -5686,6 +5816,37 @@ class KVCacheManagerV2(BaseResourceManager):
             self.index_scales,
             self.kv_offset,
             torch.cuda.current_stream().cuda_stream,
+        )
+
+    def block_offsets_copy_job(
+        self,
+        dst_tensor: torch.Tensor,
+        request_ids: List[int],
+        beam_width: int,
+        num_contexts: int,
+        num_seqs: int,
+    ) -> Optional[tuple]:
+        """Arguments of the Triton copy that copy_batch_block_offsets would launch, or None.
+
+        None when copy_batch_block_offsets would not take the Triton path (TRTLLM_GEN_HOST_BUNDLE
+        off, beam search, per-layer SWA scratch reuse, or a layout / size the Triton copy does not
+        handle). The copy index is computed here, as in copy_batch_block_offsets, into this manager's
+        index-mapper buffer, which the kernel reads when it runs.
+        """
+        if (
+            beam_width != 1
+            or self.enable_swa_scratch_reuse
+            or not gen_host_bundle_kernels_enabled()
+        ):
+            return None
+        copy_idx = self.index_mapper.get_copy_index(request_ids, num_contexts, beam_width)
+        assert copy_idx.shape[0] == num_seqs
+        return block_offsets_copy_job(
+            self.host_kv_cache_block_offsets,
+            dst_tensor,
+            copy_idx,
+            self.index_scales,
+            self.kv_offset,
         )
 
     @staticmethod
