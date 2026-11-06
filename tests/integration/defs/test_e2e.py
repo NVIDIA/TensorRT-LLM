@@ -781,11 +781,15 @@ def parse_output(text):
     pytest.param('Qwen3.6-35B-A3B-nvfp4',
                  'Qwen3.6-35B-A3B-NVFP4',
                  marks=skip_pre_blackwell),
+    ("Nemotron-3-Nano-4B-bf16", "NVIDIA-Nemotron-3-Nano-4B-BF16"),
+    pytest.param('Nemotron-3-Nano-4B-fp8',
+                 'NVIDIA-Nemotron-3-Nano-4B-FP8',
+                 marks=skip_pre_hopper),
 ])
 def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
     print(f"Testing {model_name}.")
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    if model_name == "Nemotron-Nano-9B-v2-nvfp4":
+    if model_name.startswith(("Nemotron-Nano-9B-v2", "Nemotron-3-Nano-4B")):
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
             "--disable_kv_cache_reuse",
