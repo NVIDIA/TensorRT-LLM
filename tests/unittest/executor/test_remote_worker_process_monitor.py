@@ -277,3 +277,76 @@ def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_sig
     assert monitor._wake.is_set(), "Continuous traffic suppressed heartbeat expiry"
     assert monitor.failure["rank"] == 1
     assert monitor.failure["reason"] == "heartbeat timed out"
+
+
+def _paused_receiver(monkeypatch, buffered_until_first_wait):
+    """Build a receiver whose first poll returns stale data after a long pause.
+
+    During the pause, the libzmq I/O thread keeps queueing reports without the
+    GIL. A paused thread's poll result still says nothing is readable.
+    """
+    from collections import deque
+    from types import SimpleNamespace
+
+    clock = [100.0]
+    monkeypatch.setattr(remote.time, "monotonic", lambda: clock[0])
+    monitor = remote.RemoteWorkerProcessMonitor.__new__(remote.RemoteWorkerProcessMonitor)
+    monitor._world_size = 2
+    monitor._wake = threading.Event()
+    monitor._lock = threading.Lock()
+    monitor._stopped = threading.Event()
+    monitor._failure = None
+    reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
+    monitor._seen = {r["rank"]: (r, clock[0]) for r in reports}
+    frames = deque()
+    paused = []
+    empty_polls = []
+
+    def poll(timeout):
+        if not paused:
+            # This thread waits seven seconds for the GIL after its wait ends.
+            paused.append(True)
+            clock[0] += 7.0
+            if not buffered_until_first_wait:
+                frames.extend(monitor.fresh_reports)
+            return False
+        if timeout and not frames and buffered_until_first_wait:
+            # A stopped process resumes; the I/O thread then reads its socket.
+            frames.extend(monitor.fresh_reports)
+        if not frames:
+            # Stop on the next wait, after this pass has checked its leases.
+            empty_polls.append(True)
+            if len(empty_polls) > 1:
+                monitor._stopped.set()
+        return bool(frames)
+
+    monitor.fresh_reports = [dict(r, sequence=1) for r in reports]
+    monitor._queue = SimpleNamespace(
+        poll=poll,
+        get=frames.popleft,
+        close=lambda: None,
+        socket=SimpleNamespace(setsockopt=lambda *_args: None),
+    )
+    return monitor
+
+
+@pytest.mark.parametrize("buffered_until_first_wait", [False, True])
+def test_reports_received_during_a_receiver_pause_prevent_false_death(
+    monkeypatch, buffered_until_first_wait
+):
+    # Regression: after a GIL or process pause, the receiver trusted its stale
+    # poll result, skipped the drain and expired every live rank.
+    monitor = _paused_receiver(monkeypatch, buffered_until_first_wait)
+    monitor._run()
+    assert monitor.failure is None
+    assert not monitor._wake.is_set()
+    assert all(report["sequence"] == 1 for report, _seen in monitor._seen.values())
+
+
+def test_silent_rank_still_expires_after_a_receiver_pause(monkeypatch):
+    monitor = _paused_receiver(monkeypatch, buffered_until_first_wait=False)
+    monitor.fresh_reports = monitor.fresh_reports[:1]
+    monitor._run()
+    assert monitor._wake.is_set()
+    assert monitor.failure["rank"] == 1
+    assert monitor.failure["reason"] == "heartbeat timed out"
