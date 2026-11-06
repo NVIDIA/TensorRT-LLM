@@ -153,6 +153,51 @@ def test_musespark_declared_string_is_never_retyped(musespark_parser, musespark_
     assert musespark_calls_as_dicts(r.calls) == [(0, "get_weather", {"city": "123", "code": '"q"'})]
 
 
+def _musespark_page_tools(cursor_schema):
+    return [
+        ChatCompletionToolsParam(
+            function=FunctionDefinition(
+                name="page",
+                parameters={
+                    "type": "object",
+                    "properties": {"cursor": cursor_schema, "label": {"type": "string"}},
+                },
+            )
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "cursor_schema",
+    [
+        {"type": ["string", "null"]},
+        {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        {"oneOf": [{"type": "string"}, {"type": "null"}]},
+    ],
+    ids=["type_list", "any_of", "one_of"],
+)
+def test_musespark_nullable_string_reads_bare_null_as_none(cursor_schema):
+    """The template writes a `None` argument as a bare `null`.
+
+    A string parameter that admits `null` reads it back as `None`; a plain
+    string parameter keeps the text, and any other text stays a string.
+    """
+    tools = _musespark_page_tools(cursor_schema)
+    expected = [
+        ("null", "null", {"cursor": None, "label": "null"}),
+        ("None", "x", {"cursor": "None", "label": "x"}),
+        ('"null"', "x", {"cursor": '"null"', "label": "x"}),
+    ]
+    for cursor, label, arguments in expected:
+        text = musespark_block(musespark_invoke("page", cursor=cursor, label=label))
+        whole = MuseSparkToolParser().detect_and_parse(text, tools)
+        assert musespark_calls_as_dicts(whole.calls) == [(0, "page", arguments)]
+        _, streamed = musespark_stream_chunks(
+            MuseSparkToolParser(), tools, text, [5] * (len(text) // 5)
+        )
+        assert [(i, n, json.loads(a)) for i, n, a in streamed] == [(0, "page", arguments)]
+
+
 def test_musespark_parameter_value_not_trimmed(musespark_parser):
     text = musespark_block(
         '<atem:invoke name="f"><atem:parameter name="a"> x \n</atem:parameter></atem:invoke>'
@@ -347,6 +392,23 @@ def test_musespark_bare_json_invoke_body_from_structural_tag(
     text = info.begin + '{"city": "Paris", "days": 2}' + info.end
     r = musespark_parser.detect_and_parse(text, musespark_sample_tools)
     assert musespark_calls_as_dicts(r.calls) == [(0, "get_weather", {"city": "Paris", "days": 2})]
+
+
+def test_musespark_forced_call_prompt_opens_the_call_message(musespark_sample_tools):
+    """A named `tool_choice` starts generation inside the call it forces.
+
+    The chat template opens each call message with `<|start|>assistant to=NAME<|message|>`
+    and the generation prompt ends at `<|start|>assistant`, so the prompt
+    prefix must carry the routing header before the block opener.
+    """
+    from tensorrt_llm.serve.openai_server import _build_forced_tool_call_decoding
+
+    begin_prefix, guided = _build_forced_tool_call_decoding(
+        musespark_sample_tools, "musespark", "get_weather"
+    )
+    begin = MuseSparkToolParser().structure_info()("get_weather").begin
+    assert begin_prefix == f" to=get_weather{MS_M}{begin}"
+    assert guided.json == musespark_sample_tools[0].function.parameters
 
 
 def test_musespark_malformed_tool_header_returns_text(musespark_parser, musespark_sample_tools):

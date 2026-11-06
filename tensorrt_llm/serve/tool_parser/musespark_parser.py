@@ -27,8 +27,8 @@ from tensorrt_llm.serve.tool_parser.utils import infer_type_from_json_schema
 _NAME = r"[A-Za-z0-9_.\-]+"
 
 
-def _declared_type(param_name: str, func_name: str, tools: List[Tool]) -> Optional[str]:
-    """JSON-schema type declared for `param_name` of `func_name`, if any."""
+def _declared_schema(param_name: str, func_name: str, tools: List[Tool]) -> Optional[dict]:
+    """JSON schema declared for `param_name` of `func_name`, if any."""
     for tool in tools or ():
         if tool.function.name != func_name:
             continue
@@ -37,11 +37,35 @@ def _declared_type(param_name: str, func_name: str, tools: List[Tool]) -> Option
             continue
         properties = parameters.get("properties")
         if isinstance(properties, dict) and param_name in properties:
-            return infer_type_from_json_schema(properties[param_name])
+            schema = properties[param_name]
+            return schema if isinstance(schema, dict) else None
     return None
 
 
-def _parse_param_value(raw: str, declared: Optional[str]) -> Any:
+def _admits_null(schema: Any) -> bool:
+    """Whether a JSON schema accepts `null`: `Optional[str]` and its kin.
+
+    Covers a `null` type or type-list member, an `anyOf`/`oneOf` branch that
+    admits it (pydantic writes `Optional[str]` as `anyOf[string, null]`), and
+    a `null` enum value.
+    """
+    if not isinstance(schema, dict):
+        return False
+    declared = schema.get("type")
+    if declared == "null" or (isinstance(declared, list) and "null" in declared):
+        return True
+    enum = schema.get("enum")
+    if isinstance(enum, list) and None in enum:
+        return True
+    return any(
+        _admits_null(branch)
+        for key in ("anyOf", "oneOf")
+        if isinstance(schema.get(key), list)
+        for branch in schema[key]
+    )
+
+
+def _parse_param_value(raw: str, schema: Optional[dict]) -> Any:
     """Type a parameter value the way the reference does.
 
     `json.loads` on the raw text, else keep the raw string (no trimming).
@@ -51,8 +75,14 @@ def _parse_param_value(raw: str, declared: Optional[str]) -> Any:
     `true`), so the model's string is not re-typed; and a value holding
     `NaN`, `Infinity` or an overflowing number such as `1e999` stays text,
     because the arguments must be valid JSON and those are not.
+
+    A string parameter whose schema also admits `null` reads a bare `null`
+    as `None`: the chat template writes a `None` argument that way, so it is
+    how the model says "no value".
     """
-    if declared == "string":
+    if schema is not None and infer_type_from_json_schema(schema) == "string":
+        if raw.strip() == "null" and _admits_null(schema):
+            return None
         return raw
     try:
         value = json.loads(raw)
@@ -184,7 +214,7 @@ class MuseSparkToolParser(BaseToolParser):
                 # The first value wins: streamed arguments only ever extend, so a
                 # repeated name cannot replace a value a client already has.
                 continue
-            params[name] = _parse_param_value(m.group(4), _declared_type(name, func_name, tools))
+            params[name] = _parse_param_value(m.group(4), _declared_schema(name, func_name, tools))
         return params
 
     def _parse_invoke_content(
@@ -571,6 +601,11 @@ class MuseSparkToolParser(BaseToolParser):
     # ------------------------------------------------------- structural tags
     def supports_structural_tag(self) -> bool:
         return True
+
+    def forced_call_prefix(self, name: str) -> str:
+        # The template opens each call message with its routing header, and the
+        # generation prompt stops at `<|start|>assistant`.
+        return f" to={name}{self.MESSAGE}"
 
     def structure_info(self) -> _GetInfoFunc:
         # Guided decoding fills a JSON object between begin and end;

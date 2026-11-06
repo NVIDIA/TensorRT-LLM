@@ -119,6 +119,8 @@ RUN_TOOL = {
                 "days": {"type": "integer"},
                 "metric": {"type": "boolean"},
                 "opts": {"type": "object"},
+                "cursor": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "note": {"type": ["string", "null"]},
             },
         },
     },
@@ -132,6 +134,10 @@ RUN_TOOL = {
         # Strings whose text is also valid JSON stay strings, quotes included.
         {"city": "123", "code": '"q"'},
         {"days": 3, "metric": True, "opts": {"units": ["c", "f"]}},
+        # A `None` argument is written as a bare `null`, which a string
+        # parameter that admits null reads back as `None`.
+        {"cursor": None, "note": None},
+        {"cursor": "next", "note": "n"},
     ],
 )
 def test_tool_call_arguments_round_trip_through_the_template(resources, arguments):
@@ -164,3 +170,39 @@ def test_tool_call_arguments_round_trip_through_the_template(resources, argument
         text[start:end], [ChatCompletionToolsParam(**RUN_TOOL)]
     )
     assert [(c.name, json.loads(c.parameters)) for c in parsed.calls] == [("run", arguments)]
+
+
+def test_forced_call_prompt_continues_the_call_as_the_template_writes_it(resources):
+    """A named `tool_choice` starts the model where the template's own call text goes on.
+
+    The generation prompt ends at `<|start|>assistant`; the forced prefix
+    must take it to the same point a call in the history reaches before its
+    arguments.
+    """
+    from tensorrt_llm.serve.openai_server import _build_forced_tool_call_decoding
+
+    prompt = _render(resources, messages=[{"role": "user", "content": "go"}], tools=[RUN_TOOL])
+    assert prompt.endswith("<|start|>assistant")
+    history = _render(
+        resources,
+        tools=[RUN_TOOL],
+        messages=[
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "run", "arguments": '{"city": "Paris"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "content": "done", "tool_call_id": "call_1"},
+        ],
+    )
+    begin_prefix, _ = _build_forced_tool_call_decoding(
+        [ChatCompletionToolsParam(**RUN_TOOL)], "musespark", "run"
+    )
+    assert "<|start|>assistant" + begin_prefix + '<atem:parameter name="city">Paris' in history
