@@ -437,7 +437,7 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
 def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCacheCreator:
     """A creator for an NVFP4 MiniMax-M3 target with a BF16 standalone DSpark drafter."""
 
-    def model_config(kv_quant_algo=None) -> SimpleNamespace:
+    def model_config(kv_quant_algo: Optional[QuantAlgo] = None) -> SimpleNamespace:
         return SimpleNamespace(
             pretrained_config=SimpleNamespace(
                 num_hidden_layers=2,
@@ -491,7 +491,7 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("is_disagg", [False, True])
-def test_m3_unifies_a_dspark_drafter(monkeypatch, is_disagg: bool) -> None:
+def test_m3_unifies_a_dspark_drafter(monkeypatch: pytest.MonkeyPatch, is_disagg: bool) -> None:
     """MiniMax-M3's manager hosts a DSpark drafter that reads its 128-token pages."""
     monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
     assert _dspark_creator(is_disagg=is_disagg)._dflash_unify_blocker() is None
@@ -535,7 +535,7 @@ def test_nvfp4_target_with_bf16_draft_needs_a_hosting_manager() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("is_disagg", [False, True])
-def test_m3_shares_draft_kv_by_default(monkeypatch, is_disagg: bool) -> None:
+def test_m3_shares_draft_kv_by_default(monkeypatch: pytest.MonkeyPatch, is_disagg: bool) -> None:
     """Unset, the switch shares a hosting manager's draft KV; a plain V2 manager stays opt-in."""
     monkeypatch.delenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", raising=False)
     assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache()
@@ -551,7 +551,9 @@ def test_m3_shares_draft_kv_by_default(monkeypatch, is_disagg: bool) -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("is_disagg", [False, True])
-def test_gate_keeps_layouts_the_hosting_manager_refuses(monkeypatch, is_disagg: bool) -> None:
+def test_gate_keeps_layouts_the_hosting_manager_refuses(
+    monkeypatch: pytest.MonkeyPatch, is_disagg: bool
+) -> None:
     """Layouts MiniMax-M3's manager refuses at construction keep the separate draft KV cache."""
     monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
     creator = _dspark_creator(is_disagg=is_disagg)
@@ -578,3 +580,31 @@ def test_gate_keeps_layouts_the_hosting_manager_refuses(monkeypatch, is_disagg: 
         assert "HND K/V layout" in blocker
     else:
         assert blocker is None
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_hosting_manager_without_a_drafter(is_disagg: bool) -> None:
+    """Without speculative decoding the MiniMax-M3 manager stays target-only."""
+    creator = _dspark_creator(is_disagg=is_disagg)
+    creator._speculative_config = None
+    assert creator._should_unify_dflash_kv_cache() is False
+
+
+@pytest.mark.cpu_only
+def test_disagg_needs_equal_global_kv_heads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disaggregated workers unify only when draft and target have the same global KV heads.
+
+    With 4 target and 2 draft heads, TP 4 sees 1 head per rank on both sides but TP 2 does not, so
+    context and generation workers with different TP would choose different layouts.
+    """
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
+    for is_disagg in (False, True):
+        creator = _dspark_creator(is_disagg=is_disagg)
+        creator._mapping.tp_size = 4
+        creator._get_draft_kv_model_config().pretrained_config.num_key_value_heads = 2
+        blocker = creator._dflash_unify_blocker()
+        if is_disagg:
+            assert "2 KV heads, the target 4" in blocker
+        else:
+            assert blocker is None

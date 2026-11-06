@@ -1856,10 +1856,10 @@ def test_peer_registrar_requires_matching_unified_draft_layers(
     [(4, 1, False), (2, 2, True)],
     ids=["tp_mismatch", "attention_dp_mismatch"],
 )
-def test_peer_registrar_reshards_unified_draft_layers(
+def test_peer_registrar_accepts_unified_draft_layers_across_tp_and_attention_dp(
     peer_tp_size: int, peer_kv_heads: int, peer_attention_dp: bool
 ) -> None:
-    """Draft layers of a unified KV cache reshard with the target's across TP and attention DP."""
+    """Peers sharing draft KV register across a TP or attention-DP mismatch; the views reshard."""
     self_rankinfo = make_rankinfo(instance_name="local")
     self_rankinfo.num_draft_layers = 1
     reg = _make_peer_registrar(self_rankinfo)

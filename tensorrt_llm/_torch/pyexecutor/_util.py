@@ -2338,7 +2338,9 @@ class KvCacheCreator:
         """
         blocker = self._dflash_unify_blocker()
         if blocker is not None:
-            if self._kv_cache_manager_hosts_draft_layers():
+            if (self._speculative_config is not None
+                    and self._unified_drafter_attention_backend() is not None
+                    and self._kv_cache_manager_hosts_draft_layers()):
                 logger.info_once(
                     f"{self._unified_drafter_name()}: keeping a separate draft "
                     f"KV cache: {blocker}.",
@@ -2457,6 +2459,15 @@ class KvCacheCreator:
                                                     draft_windows)
             if blocker is not None:
                 return blocker
+            target_heads, draft_heads = (getattr(
+                config.pretrained_config, "num_key_value_heads",
+                None) for config in (self._model_engine.model.model_config,
+                                     draft_model_config))
+            if self._is_disagg and target_heads != draft_heads:
+                # Rank-local head counts can match on one worker's TP layout
+                # and not the other's; both workers must make the same choice.
+                return (f"the drafter has {draft_heads} KV heads, the target "
+                        f"{target_heads}")
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout,
                 draft_layout,
