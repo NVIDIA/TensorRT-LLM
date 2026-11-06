@@ -306,9 +306,12 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self.await_response_thread.join()
 
             self.engine.shutdown()
-            local_cleanup = getattr(self.engine, "local_cleanup", None)
-            if local_cleanup is not None:
-                local_cleanup()
+            # Call the hook without binding it to a local: a bound method
+            # would keep the engine reachable through the gc.collect() below,
+            # so its reference cycles, and the GPU memory they hold, would
+            # outlive this shutdown.
+            if getattr(self.engine, "local_cleanup", None) is not None:
+                self.engine.local_cleanup()
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"
