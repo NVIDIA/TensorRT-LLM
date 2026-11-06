@@ -430,6 +430,15 @@ def main(argv: list[str] | None = None) -> None:
     if lock is None:
         _claim_workspace(Path(args.workspace))
 
+    # `environment.local_trees`: the trees the run and its agents make go under one
+    # node-local root, and each job against one makes it on its own node.
+    local_trees = (task_data.get("environment") or {}).get("local_trees")
+    if local_trees:
+        from .infra.compute import localtree
+
+        root = localtree.root_for(os.path.expandvars(str(local_trees)), args.workspace)
+        os.environ[localtree.ROOT_ENV] = str(root)
+
     # A driver watching the run tells a crashed orchestrator from a busy one by it.
     heartbeat = start_orchestrator_heartbeat(args.workspace, ORCHESTRATOR_HEARTBEAT_S)
 

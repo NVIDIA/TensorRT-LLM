@@ -71,7 +71,7 @@ from .requests import (
 from .schema import campaign_max_hours, validate_perf_block
 from .sol_consensus import METHODS, TOLERANCE, read_rulings, reconcile
 from .spec import TuneSpec
-from .worktree import measured_tree, open_candidate, tree_in_use
+from .worktree import measured_tree, open_candidate, tree_in_use, trees_root
 
 PACKAGE = Path(__file__).resolve().parent.parent
 
@@ -224,7 +224,7 @@ class TuneStage:
     ) -> dict[str, Measurement | None]:
         if tree:
             commit = git_checked(Path(tree), "rev-parse", "HEAD")
-            tree = str(measured_tree(self.spec.repo, self.spec.workdir / "worktrees", commit))
+            tree = str(measured_tree(self.spec.repo, trees_root(self.spec.workdir), commit))
         return MeasurementRunner(
             bench=self.spec.bench(),
             data=self.data,
@@ -261,7 +261,7 @@ class TuneStage:
         s = self.spec
         return open_candidate(
             s.repo,
-            s.workdir / "worktrees",
+            trees_root(s.workdir),
             "best",
             s.base_commit or "HEAD",
             prefix=self.branch_prefix,
@@ -644,7 +644,7 @@ class TuneStage:
             self._invalidate_profile("campaign evidence changed")
             self.keep_gate = camp.keep_gate
             self.checkpoint()
-        worktrees = s.workdir / "worktrees"
+        worktrees = trees_root(s.workdir)
         if not camp.state.best_tree:
             camp.state.best_tree = str(self._best_tree())
             camp.state.best_commit = git_checked(Path(camp.state.best_tree), "rev-parse", "HEAD")
@@ -964,9 +964,7 @@ class TuneStage:
     def _ask_variant(self, st: CandidateState, variant: str, standings: str, attempts: str) -> str:
         """One tuner turn: ``st``'s change gated on the mode it lost in, at its measured tree."""
         s, base = self.spec, str(st.split["base"])
-        wt = open_candidate(
-            s.repo, s.workdir / "worktrees", variant, base, prefix=self.branch_prefix
-        )
+        wt = open_candidate(s.repo, trees_root(s.workdir), variant, base, prefix=self.branch_prefix)
         req = render_split_request(
             self._context(standings, attempts), slug=st.slug, variant=variant, worktree=wt, base=base,
             branch=f"{self.branch_prefix}/{variant}", best_branch=f"{self.branch_prefix}/best",
@@ -1163,7 +1161,7 @@ class TuneStage:
     def _final_on_spool(self, spool: str, label: str, commit: str) -> Measurement:
         """One serialized serving measurement, with a clean immutable snapshot and receipt."""
         bench = self.spec.bench()
-        tree = measured_tree(self.spec.repo, self.spec.workdir / "worktrees", commit)
+        tree = measured_tree(self.spec.repo, trees_root(self.spec.workdir), commit)
         self.perf.adopt(label, active_only=True)
         while True:
             if not self.perf.queued(label):
@@ -1396,7 +1394,7 @@ class TuneStage:
             return "tune-failed:accuracy"
         if self.t["phase"] == "ground":
             source = measured_tree(
-                self.spec.repo, self.spec.workdir / "worktrees", str(self.t["source_commit"])
+                self.spec.repo, trees_root(self.spec.workdir), str(self.t["source_commit"])
             )
             if not self.ground(tree=source):
                 raise MeasurementUnavailable(str(self.t.pop("failure", "baseline unavailable")))

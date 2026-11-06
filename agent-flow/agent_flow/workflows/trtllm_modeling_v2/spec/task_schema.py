@@ -13,6 +13,7 @@ into the workspace is fully explicit.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -331,6 +332,10 @@ ENVIRONMENT_KEYS: tuple[str, ...] = (
     # How long the orchestrator waits for a gate session that stopped
     # heart-beating before it closes the run resumably.
     "session_wait",
+    # A directory on each node's own disk (`/tmp`, `$TMPDIR`): the run's snapshots,
+    # task worktrees and tune trees go there instead of the workspace
+    # (infra/compute/localtree.py).
+    "local_trees",
 )
 
 ENVIRONMENT_KINDS: tuple[str, ...] = ("local", "session_spool")
@@ -651,6 +656,15 @@ def _validate_environment(block: Any, errors: list[str]) -> None:
         not isinstance(mounts, list) or not all(isinstance(m, str) for m in mounts)
     ):
         errors.append(f"'{ENVIRONMENT_FIELD}.mounts' must be a list of strings")
+
+    local_trees = block.get("local_trees")
+    if local_trees is not None and not (
+        isinstance(local_trees, str) and os.path.expandvars(local_trees).startswith("/")
+    ):
+        errors.append(
+            f"'{ENVIRONMENT_FIELD}.local_trees' must be an absolute directory on each node's "
+            f"own disk (`/tmp`, `$TMPDIR`), got {local_trees!r}"
+        )
 
     memory = block.get("gpu_memory_gib")
     if memory is not None and not (_number(memory) and memory > 0):

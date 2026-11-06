@@ -119,7 +119,11 @@ class SpoolCommandExecutor(CommandExecutor):
         self.priority = priority
         #: The checkout a job runs against (its working directory and first ``PYTHONPATH``
         #: entry); the session refuses a result that imported the package from anywhere else.
-        self.tree = str(Path(tree).resolve()) if tree else None
+        #: A node-local worktree is frozen into a commit tree here, as it is at submission
+        #: (``spoolctl.tree_fields``), which the node that runs the job makes.
+        fields = spoolctl.tree_fields(Path(tree).resolve()) if tree else {}
+        self.tree = fields.get("tree")
+        self.tree_source = fields.get("source")
         #: Allowance past a job's own deadline for the session to stop it.
         self.grace_s = 180.0
         self._seq = itertools.count(1)
@@ -207,6 +211,7 @@ class SpoolCommandExecutor(CommandExecutor):
             "owner": self.name_prefix,
             "token": token,
             "tree": self.tree if self.tree and not spec.cwd else None,
+            "source": self.tree_source if self.tree and not spec.cwd else None,
             "priority": self.priority or None,
         }
         script = spoolctl.render_job(spec.rendered, header=header, cwd=spec.cwd, env=spec.env)

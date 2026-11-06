@@ -58,6 +58,7 @@ from ..agents.turns import InProcessTurnExecutor, TurnRequest, TurnTimeout
 from ..checks import boot as boot_checks
 from ..checks import check_runtime
 from ..checks import verdict as check_result
+from ..infra.compute import localtree
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.compute.rebuild import LIBRARY_PATTERNS
@@ -334,9 +335,14 @@ class TrtllmModelingV2Workflow:
         """What a role writes outside the workspace: the checkout and the run's spools.
 
         A task's worktree commits into the checkout's ``.git``, and its work is
-        submitted to the spools.
+        submitted to the spools. Node-local worktrees live under the run's
+        node-local root (``environment.local_trees``).
         """
         roots = [self.task_data.get("trtllm_repo_path")]
+        local = localtree.local_root()
+        if local is not None:
+            local.mkdir(parents=True, exist_ok=True)
+            roots.append(str(local))
         if self.environment is not None:
             env = self.environment
             roots += [env.spool, *(session.spool for session in env.sessions), *env.dev_spools]

@@ -515,7 +515,13 @@ def add_worktree(repo: Path, tree: Path, *args: str) -> None:
     Only the registration holds the lock (``--no-checkout``); the checkout, the slow part, runs
     outside it against the worktree's own index, so several candidates check out at once.
     """
+    from .compute import localtree
+
+    local = localtree.is_mutable_tree(tree)
     with repo_lock(repo):
+        if local:
+            # Registered, locked, by a copy on a node that is gone.
+            localtree.forget_worktree(repo, tree)
         for attempt in (1, 2):
             out = subprocess.run(
                 ["git", "-C", str(repo), "worktree", "add", "--no-checkout", *args],
@@ -524,12 +530,15 @@ def add_worktree(repo: Path, tree: Path, *args: str) -> None:
             )
             if out.returncode == 0:
                 break
-            git_checked(repo, "worktree", "remove", "--force", str(tree), check=False)
+            git_checked(repo, "worktree", "remove", "--force", "--force", str(tree), check=False)
             git_checked(repo, "worktree", "prune", check=False)
             if attempt == 2:
                 raise RuntimeError(f"git worktree add {' '.join(args)}: {out.stderr.strip()}")
             time.sleep(5)
     git_checked(tree, "reset", "--hard", "-q")
+    if local:
+        # Its files are on this node only: a prune on another node must keep it.
+        localtree.lock_worktree(repo, tree)
 
 
 def link_native(repo: Path, tree: Path) -> None:

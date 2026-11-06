@@ -7,14 +7,31 @@ Python-only edits need nothing else: the spool runs a job against the worktree
 by putting it first on ``PYTHONPATH`` (``#spool: tree=<worktree>``), and the
 linked native artifacts make ``import tensorrt_llm`` resolve there. A
 candidate that needs a native rebuild is ``BLOCKED``, not a worktree edit.
+
+With node-local trees (``environment.local_trees``) a campaign's worktrees are
+on this node's disk (:func:`trees_root`), and a measurement's tree is a
+node-local commit tree that each job's node makes for itself
+(``infra/compute/localtree.py``).
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
 import shutil
 from pathlib import Path
 
+from ..infra.compute import localtree
 from ..infra.git import add_worktree, git_checked, link_native
+
+
+def trees_root(workdir: Path) -> Path:
+    """Where a campaign's worktrees go: its workdir, or the run's node-local root."""
+    local = localtree.local_root()
+    if local is None:
+        return Path(workdir) / "worktrees"
+    digest = hashlib.sha1(os.path.realpath(workdir).encode("utf-8")).hexdigest()[:10]
+    return local / "tune" / f"{Path(workdir).name}-{digest}"
 
 
 def _complete(tree: Path) -> bool:
@@ -45,6 +62,9 @@ def tree_in_use(tree: Path, spools: list[str]) -> bool:
 def measured_tree(repo: Path, root: Path, commit: str) -> Path:
     """A detached worktree dedicated to one full commit; reuse never changes its checkout."""
     sha = git_checked(repo, "rev-parse", "--verify", f"{commit}^{{commit}}")
+    local = localtree.local_root()
+    if local is not None:
+        return localtree.materialize(localtree.commit_tree(local, "commits", sha), repo, None)
     tree = root / f"measured-{sha}"
     if tree.exists():
         if (
@@ -75,7 +95,7 @@ def open_candidate(
         # A worktree add killed part way (an orchestrator stopped mid-checkout) leaves the tree
         # locked "initializing" without an index. Rebuild it rather than hand it out.
         git_checked(repo, "worktree", "unlock", str(tree), check=False)
-        git_checked(repo, "worktree", "remove", "--force", str(tree), check=False)
+        git_checked(repo, "worktree", "remove", "--force", "--force", str(tree), check=False)
         git_checked(repo, "worktree", "prune", check=False)
         shutil.rmtree(tree, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)

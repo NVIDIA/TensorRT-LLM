@@ -19,6 +19,13 @@ commit pins, is void. What each process imported of the tree is read too (the
 rank hook's reads files): a verdict holds on a later commit whose Python files
 it read, and every file of the tree that is not Python, are unchanged
 (``run/workflow.py:_commit_marker``).
+
+With node-local trees (``environment.local_trees``), each snapshot is a commit
+tree at ``<local root>/snapshots/<commit>`` instead (``infra/compute/localtree.py``):
+a standalone checkout on this node's disk that borrows the checkout's objects;
+a job on another node makes its own copy before it starts. What the commands
+read is still written beside the workspace's ``snapshots`` directory, which
+every node sees.
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ from typing import Any, Callable, Collection, Iterable, Iterator, Mapping
 from ...checks import check_runtime
 from ...checks import verdict as check_result
 from ...checks.harness import workload_io
+from ...infra.compute import localtree
 from ...infra.compute.provenance import checkout_root
 from ...infra.git import git_output, link_native, repo_lock
 from .integration import _CHECKOUT, SPARSE_ON, _drop_cone, _last_line, cone
@@ -83,9 +91,16 @@ class Snapshots:
         *,
         cone_paths: Iterable[str] = (),
         log: Callable[[str], None] | None = None,
+        local_root: str | Path | None = None,
     ) -> None:
         self.repo = Path(repo)
-        self.root = Path(root)
+        #: On the shared filesystem: where the commands' reads are written.
+        self.shared = Path(root)
+        #: The node-local root, when the snapshots are node-local commit trees
+        #: (default: ``$MV2FLOW_LOCAL_TREES``); ``None``: worktrees under ``root``.
+        self.local = Path(local_root) if local_root else localtree.local_root()
+        self.root = self.local / "snapshots" if self.local else self.shared
+        self.reads_root = self.shared / READS_DIRNAME
         #: What each snapshot checks out: a task worktree's cone and the
         #: directories of ``cone_paths`` (the files the gates read); None for
         #: the whole tree.
@@ -104,8 +119,12 @@ class Snapshots:
         """
         tree = self.tree(commit)
         with self._locked(commit):
-            if not _ready(tree, commit):
+            if not self._ready(tree, commit):
                 self._make(commit, tree)
+            elif self.local:
+                # In use: a node-local sweep keeps it.
+                with contextlib.suppress(OSError):
+                    os.utime(tree / localtree.READY_FILENAME)
             holder = f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
             lease = self.root / _LEASES / commit / holder
             lease.parent.mkdir(parents=True, exist_ok=True)
@@ -197,12 +216,24 @@ class Snapshots:
                     lease.unlink()
         return held
 
+    def _ready(self, tree: Path, commit: str) -> bool:
+        if self.local:
+            return localtree.ready(tree) is not None
+        return _ready(tree, commit)
+
     def _make(self, commit: str, tree: Path) -> None:
         """Check ``commit`` out at ``tree``: detached, sparse, its native build linked, read-only.
 
         Only registering the worktree holds the repository's lock; checking
-        its files out runs beside other work.
+        its files out runs beside other work. A node-local snapshot is a
+        commit tree of its own instead, its cone recorded for other nodes.
         """
+        if self.local:
+            try:
+                localtree.materialize(tree, self.repo, self.dirs, log=self.log)
+            except (localtree.LocalTreeError, OSError) as exc:
+                raise SnapshotError(f"snapshot of {commit[:10]}: {exc}") from exc
+            return
         self._discard(tree)
         self.root.mkdir(parents=True, exist_ok=True)
         with repo_lock(self.repo):
@@ -238,6 +269,9 @@ class Snapshots:
         prune`` then drops the registration of a worktree whose files are gone.
         """
         if not tree.exists():
+            return
+        if self.local:
+            localtree.remove(tree)
             return
         shutil.rmtree(tree, ignore_errors=True)
         with repo_lock(self.repo):
@@ -313,7 +347,8 @@ class CheckTree:
         inside = check_runtime.in_tree(runner, self.tree)
 
         def run(command: str, env: Mapping[str, str] | None = None, timeout: int = 1800) -> Any:
-            reads = self.tree.parent / READS_DIRNAME / uuid.uuid4().hex
+            shared = self.snapshots.reads_root if self.snapshots is not None else None
+            reads = (shared or self.tree.parent / READS_DIRNAME) / uuid.uuid4().hex
             hook = shlex.quote(str(check_runtime.RANK_HOOK_DIR))
             prefix = (
                 f"export {READS_DIR_ENV}={shlex.quote(str(reads))} "
