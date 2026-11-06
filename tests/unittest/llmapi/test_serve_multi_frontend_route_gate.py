@@ -25,7 +25,15 @@ from types import SimpleNamespace
 import pytest
 from fastapi import FastAPI
 from starlette.routing import Match
+from test_common.serve.routes import effective_routes
 
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
+from tensorrt_llm.serve.api.anthropic.serving import (
+    AnthropicBatchesServing,
+    AnthropicCountTokensServing,
+    AnthropicMessagesServing,
+)
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import FORWARDED_ROUTES
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -73,10 +81,23 @@ def _llm_server_routes() -> list[tuple[str, str]]:
     server._enable_rl_control_endpoints = True
     server._enable_runtime_control_endpoints = True
     server.resource_governor = None
+    # As OpenAIServer.__init__ does: the routers (the system router for every
+    # role, the Anthropic router for the LLM role) are attached before the
+    # role's own table. The routes are enumerated, never called, so the
+    # serving objects get collaborators that are never used.
+    server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    server.app.state.anthropic_serving_messages = AnthropicMessagesServing(backend=None)
+    server.app.state.anthropic_serving_count_tokens = AnthropicCountTokensServing(
+        render_resources=lambda: None
+    )
+    server.app.state.anthropic_serving_batches = AnthropicBatchesServing(runner=None)
+    attach_routers(server.app, ServerCapabilities.for_role(None))
     server.register_routes()
+    # effective_routes walks included routers, which FastAPI 0.139 keeps as
+    # objects without .path or .methods in app.routes.
     return sorted(
-        (method, route.path)
-        for route in server.app.routes
+        (method, path)
+        for path, route in effective_routes(server.app)
         if getattr(route, "methods", None)
         for method in route.methods
         if method != "HEAD"

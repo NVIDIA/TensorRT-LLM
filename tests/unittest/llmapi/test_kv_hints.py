@@ -662,11 +662,15 @@ def test_http_handlers_forward_hints(request_kind: str, with_hints: bool) -> Non
         )
         handler = server.chat_harmony if request_kind == "harmony" else server.openai_chat
 
+    # The request FastAPI would pass, reduced to what the handlers read before
+    # the engine boundary. The chat handler wraps it in a RequestContext, which
+    # needs an object to delegate to.
+    raw_request = SimpleNamespace(state=SimpleNamespace(), headers={})
     with patch(
         "tensorrt_llm.serve.openai_server.responses_api_request_preprocess",
         new=AsyncMock(return_value=([1, 2], SamplingParams(max_tokens=4))),
     ):
-        response = asyncio.run(handler(request, None))
+        response = asyncio.run(handler(request, raw_request))
     server.generator.generate_async.assert_called_once()
     assert server.generator.generate_async.call_args.kwargs["kv_hints"] == hints
     assert b"captured at engine boundary" in response.body
@@ -739,9 +743,9 @@ def test_http_ingress_policy_before_nested_validation(
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
     from tensorrt_llm.serve.kv_hints import KvHintsRoute
     from tensorrt_llm.serve.openai_protocol import CompletionRequest, ResponsesRequest
-    from tensorrt_llm.serve.openai_server import _MsgspecRoute
 
     hints = _wire()
     if hint_kind == "unknown":
@@ -832,9 +836,9 @@ def test_ignored_hints_do_not_relax_http_request_validation(
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    from tensorrt_llm.serve._base.msgspec_route import _MsgspecRoute
     from tensorrt_llm.serve.kv_hints import KvHintsRoute
     from tensorrt_llm.serve.openai_protocol import CompletionRequest
-    from tensorrt_llm.serve.openai_server import _MsgspecRoute
 
     app = FastAPI()
     app.state.trust_kv_hints = True

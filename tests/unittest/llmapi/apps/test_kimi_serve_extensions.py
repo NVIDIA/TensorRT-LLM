@@ -506,8 +506,8 @@ class TestKimiAnthropicThinkingControls:
     """Anthropic ``thinking`` / ``output_config.effort`` reach the K3 template kwargs."""
 
     def convert(self, **fields) -> ChatCompletionRequest:
-        from tensorrt_llm.serve.anthropic_adapter import convert_anthropic_request
-        from tensorrt_llm.serve.anthropic_protocol import AnthropicMessagesRequest
+        from tensorrt_llm.serve.api.anthropic.adapter import convert_anthropic_request
+        from tensorrt_llm.serve.api.anthropic.protocol import AnthropicMessagesRequest
 
         req = convert_anthropic_request(
             AnthropicMessagesRequest(model="m", max_tokens=4096, messages=[USER_MSG], **fields)

@@ -35,7 +35,14 @@ from starlette.routing import Match
 from tensorrt_llm._utils import AdjustedSteadyClock
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
+from tensorrt_llm.serve._base.routing import ServerCapabilities, attach_routers
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
+from tensorrt_llm.serve.api.anthropic.serving import (
+    AnthropicBatchesServing,
+    AnthropicCountTokensServing,
+    AnthropicMessagesServing,
+)
+from tensorrt_llm.serve.api.ops.system.serving import SystemServing
 from tensorrt_llm.serve.multi_frontend import (
     FORWARDED_ROUTES,
     AttachedFrontendWatchdog,
@@ -111,8 +118,18 @@ def _attached_server(forwarder: LauncherForwarder) -> OpenAIServer:
     server._enable_runtime_control_endpoints = False
     server.resource_governor = None
     server._launcher_forwarder = forwarder
-    # The order OpenAIServer.__init__ registers them in.
+    # The order OpenAIServer.__init__ registers them in: the launcher
+    # forwarding routes first, then the routers (system, Anthropic), then the
+    # local table. The routes are enumerated and forwarded, never served
+    # locally, so the Anthropic serving objects get unused collaborators.
+    server.app.state.ops_serving_system = SystemServing(model="m", health_probe=lambda: True)
+    server.app.state.anthropic_serving_messages = AnthropicMessagesServing(backend=None)
+    server.app.state.anthropic_serving_count_tokens = AnthropicCountTokensServing(
+        render_resources=lambda: None
+    )
+    server.app.state.anthropic_serving_batches = AnthropicBatchesServing(runner=None)
     server._register_launcher_forwarding_routes()
+    attach_routers(server.app, ServerCapabilities.for_role(None))
     server.register_routes()
     return server
 

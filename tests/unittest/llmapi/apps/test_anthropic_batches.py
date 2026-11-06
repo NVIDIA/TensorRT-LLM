@@ -23,12 +23,12 @@ import json
 
 import pytest
 
-from tensorrt_llm.serve.anthropic_batches import (
+from tensorrt_llm.serve.api.anthropic.batches import (
     AnthropicBatchStore,
     BatchStoreFullError,
     results_to_jsonl,
 )
-from tensorrt_llm.serve.anthropic_protocol import (
+from tensorrt_llm.serve.api.anthropic.protocol import (
     AnthropicBatchRequestItem,
     AnthropicCreateBatchRequest,
 )

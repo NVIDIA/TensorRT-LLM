@@ -12,7 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Route-level tests for the Anthropic Messages compatibility handlers."""
+"""Route-level tests for the Anthropic Messages compatibility handlers.
+
+The servers are built through the real constructors with the fake generator
+from ``tests/test_common/serve/``, so every request goes through the real app:
+its validation handler, its routers and the serving classes. Only the chat core
+(aggregated) or the service entry point (disaggregated) is stubbed.
+"""
 
 import asyncio
 import json
@@ -22,12 +28,17 @@ from unittest.mock import AsyncMock, Mock
 
 import aiohttp
 import pytest
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.testclient import TestClient
+from fastapi.responses import StreamingResponse
+from test_common.serve.app_factory import AggConfig, DisaggConfig, isolated_serve_env
+from test_common.serve.routes import effective_routes
 
 from tensorrt_llm.inputs.chat_template_guard import UnusedChatTemplateKwargsError
-from tensorrt_llm.serve import openai_server as openai_server_module
+from tensorrt_llm.serve._base import sse as sse_module
+from tensorrt_llm.serve.api.anthropic.protocol import AnthropicCreateBatchRequest
+from tensorrt_llm.serve.api.anthropic.serving import (
+    AnthropicBatchesServing,
+    AnthropicCountTokensServing,
+)
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -40,6 +51,7 @@ from tensorrt_llm.serve.openai_protocol import (
     UsageInfo,
 )
 from tensorrt_llm.serve.openai_server import OpenAIServer
+from tensorrt_llm.serve.render import RenderResources
 from tensorrt_llm.serve.render import chat as render_chat_module
 
 # These tests are CPU-only (no GPU, engine or sockets) and run in the
@@ -47,6 +59,15 @@ from tensorrt_llm.serve.render import chat as render_chat_module
 pytestmark = pytest.mark.cpu_only
 
 MODEL = "test-model"
+COUNTER_NAMES = (
+    "total_requests",
+    "stream_requests",
+    "nonstream_requests",
+    "validation_exceptions",
+    "http_exceptions",
+    "internal_errors",
+    "total_responses",
+)
 
 
 def _request(**overrides):
@@ -82,14 +103,8 @@ def _chat_response(*, tool_arguments=None):
     )
 
 
-def _json_chat_response(*, tool_arguments=None, status_code=200):
-    return JSONResponse(
-        content=_chat_response(tool_arguments=tool_arguments).model_dump(),
-        status_code=status_code,
-    )
-
-
-def _streaming_chat_response():
+def _streaming_chat_result(server_kind):
+    """The chat pipeline's stream: SSE strings on the aggregated server, the worker's bytes on the disaggregated one."""
     chunks = [
         ChatCompletionStreamResponse(
             model=MODEL,
@@ -111,40 +126,46 @@ def _streaming_chat_response():
             usage=UsageInfo(prompt_tokens=3, completion_tokens=2, total_tokens=5),
         ),
     ]
+    frames = [f"data: {chunk.model_dump_json()}\n\n" for chunk in chunks] + ["data: [DONE]\n\n"]
 
     async def source():
-        for chunk in chunks:
-            yield f"data: {chunk.model_dump_json()}\n\n"
-        yield "data: [DONE]\n\n"
+        for frame in frames:
+            yield frame if server_kind == "standard" else frame.encode()
 
-    return StreamingResponse(source(), media_type="text/event-stream")
+    return source()
 
 
-def _make_route_client(server_kind, openai_response):
-    app = FastAPI()
-    # Body validation fails before the route function runs, so without the
-    # server's own handler these tests would see FastAPI's 422 instead of the
-    # 400 + Anthropic envelope a client actually gets.
-    _anthropic_validation_handler(app)
+def _counters():
+    return SimpleNamespace(
+        **{name: SimpleNamespace(inc=Mock()) for name in COUNTER_NAMES},
+        queue_latency_seconds=SimpleNamespace(observe=Mock()),
+    )
+
+
+def _route_client(env, server_kind, result):
+    """A client over the real app of one server, its chat pipeline stubbed to answer ``result``.
+
+    Returns the client and the stub; the stub's first positional argument is
+    the chat request the Anthropic request was converted to.
+    """
+    core = AsyncMock(return_value=result)
     if server_kind == "standard":
-        server = object.__new__(OpenAIServer)
-        server.model = MODEL
-        backend = AsyncMock(return_value=openai_response)
-        server.openai_chat = backend
-    else:
-        server = object.__new__(OpenAIDisaggServer)
-        server._service = SimpleNamespace(openai_chat_completion=object())
-        backend = AsyncMock(return_value=openai_response)
-        server._wrap_entry_point = Mock(return_value=backend)
-    app.add_api_route("/v1/messages", server.anthropic_messages, methods=["POST"])
-    return TestClient(app), backend
+        server = env.build_openai_server(AggConfig(model_name=MODEL))
+        server.create_chat_completion = core
+        return env.client(server.app), core
+    server = env.build_disagg_server(DisaggConfig())
+    server._perf_metrics_collector = _counters()
+    server._service = SimpleNamespace(openai_chat_completion=core)
+    # The disaggregated lifespan connects to workers; these tests never run it.
+    return env.client(server.app, lifespan=False), core
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_converts_nonstream_response(server_kind):
-    client, backend = _make_route_client(server_kind, _json_chat_response())
+def test_messages_route_converts_nonstream_response(server_kind, tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client, core = _route_client(env, server_kind, _chat_response())
 
-    response = client.post("/v1/messages", json=_request())
+        response = client.post("/v1/messages", json=_request())
 
     assert response.status_code == 200
     assert response.json() | {"id": "ignored"} == {
@@ -156,47 +177,49 @@ def test_messages_route_converts_nonstream_response(server_kind):
         "stop_reason": "end_turn",
         "usage": {"input_tokens": 3, "output_tokens": 2},
     }
-    chat_request = backend.await_args.args[0]
+    chat_request = core.await_args.args[0]
     assert chat_request.model == MODEL
     assert chat_request.max_completion_tokens == 64
     assert not chat_request.stream
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_accepts_thinking_display(server_kind):
+def test_messages_route_accepts_thinking_display(server_kind, tmp_path):
     """The thinking config Claude Code sends is served, not answered with a 400."""
-    client, backend = _make_route_client(server_kind, _json_chat_response())
+    with isolated_serve_env(tmp_path) as env:
+        client, core = _route_client(env, server_kind, _chat_response())
 
-    response = client.post(
-        "/v1/messages",
-        json=_request(max_tokens=4096, thinking={"type": "adaptive", "display": "updates"}),
-    )
+        response = client.post(
+            "/v1/messages",
+            json=_request(max_tokens=4096, thinking={"type": "adaptive", "display": "updates"}),
+        )
 
     assert response.status_code == 200
-    assert backend.await_args.args[0].chat_template_kwargs["enable_thinking"] is True
+    assert core.await_args.args[0].chat_template_kwargs["enable_thinking"] is True
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_rejects_anthropic_server_tools(server_kind):
-    client, backend = _make_route_client(server_kind, _json_chat_response())
+def test_messages_route_rejects_anthropic_server_tools(server_kind, tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client, core = _route_client(env, server_kind, _chat_response())
 
-    response = client.post(
-        "/v1/messages",
-        json=_request(
-            tools=[
-                {
-                    "name": "web_search",
-                    "type": "web_search_20250305",
-                }
-            ]
-        ),
-    )
+        response = client.post(
+            "/v1/messages",
+            json=_request(
+                tools=[
+                    {
+                        "name": "web_search",
+                        "type": "web_search_20250305",
+                    }
+                ]
+            ),
+        )
 
     assert response.status_code == 400
     assert response.json()["type"] == "error"
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert "server tool" in response.json()["error"]["message"]
-    backend.assert_not_awaited()
+    core.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -214,7 +237,7 @@ def test_messages_route_rejects_anthropic_server_tools(server_kind):
         ),
     ],
 )
-def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
+def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field, tmp_path):
     """A known type with bad fields must fail as that type, not as the catch-all.
 
     The union is tagged on `type`, so the block is checked against the model the
@@ -223,14 +246,17 @@ def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
     the adapter's dispatch on `type`, and raise AttributeError on an attribute
     the block never had -- a 500 for a plain client error.
 
-    Errors carry `loc` as a tuple, so the tag and field appear adjacent.
+    Errors carry `loc` as a tuple, so the tag and field appear adjacent. The
+    400 and the Anthropic envelope come from the server's own validation
+    handler, which the real app carries.
     """
-    client, backend = _make_route_client("standard", _json_chat_response())
+    with isolated_serve_env(tmp_path) as env:
+        client, core = _route_client(env, "standard", _chat_response())
 
-    response = client.post(
-        "/v1/messages",
-        json=_request(messages=[{"role": "user", "content": [block]}]),
-    )
+        response = client.post(
+            "/v1/messages",
+            json=_request(messages=[{"role": "user", "content": [block]}]),
+        )
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
@@ -238,33 +264,37 @@ def test_malformed_known_block_is_a_400_against_its_own_type(block, tag, field):
     assert f"'{tag}', '{field}'" in message
     # The catch-all must not have absorbed it; that is the regression itself.
     assert "'unknown'," not in message
-    backend.assert_not_awaited()
+    core.assert_not_awaited()
 
 
-def test_unknown_block_type_still_reaches_the_adapter():
+def test_unknown_block_type_still_reaches_the_adapter(tmp_path):
     """The catch-all exists for types this server does not model; keep it working.
 
     Tagging the union must not close it: an unmodelled type has to validate and
     be named by the adapter, rather than returning a wall of failed members.
     """
-    client, backend = _make_route_client("standard", _json_chat_response())
+    with isolated_serve_env(tmp_path) as env:
+        client, core = _route_client(env, "standard", _chat_response())
 
-    response = client.post(
-        "/v1/messages",
-        json=_request(messages=[{"role": "user", "content": [{"type": "document", "source": {}}]}]),
-    )
+        response = client.post(
+            "/v1/messages",
+            json=_request(
+                messages=[{"role": "user", "content": [{"type": "document", "source": {}}]}]
+            ),
+        )
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
     assert "document" in response.json()["error"]["message"]
-    backend.assert_not_awaited()
+    core.assert_not_awaited()
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
-    client, _ = _make_route_client(server_kind, _json_chat_response(tool_arguments="{not-json"))
+def test_messages_route_hides_invalid_generated_tool_arguments(server_kind, tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client, _ = _route_client(env, server_kind, _chat_response(tool_arguments="{not-json"))
 
-    response = client.post("/v1/messages", json=_request())
+        response = client.post("/v1/messages", json=_request())
 
     assert response.status_code == 500
     assert response.json() == {
@@ -274,10 +304,11 @@ def test_messages_route_hides_invalid_generated_tool_arguments(server_kind):
 
 
 @pytest.mark.parametrize("server_kind", ["standard", "disagg"])
-def test_messages_route_reframes_streaming_response(server_kind):
-    client, backend = _make_route_client(server_kind, _streaming_chat_response())
+def test_messages_route_reframes_streaming_response(server_kind, tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client, core = _route_client(env, server_kind, _streaming_chat_result(server_kind))
 
-    response = client.post("/v1/messages", json=_request(stream=True))
+        response = client.post("/v1/messages", json=_request(stream=True))
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
@@ -285,7 +316,7 @@ def test_messages_route_reframes_streaming_response(server_kind):
     assert "event: content_block_delta\n" in response.text
     assert '"text":"hello"' in response.text
     assert response.text.rstrip().endswith('event: message_stop\ndata: {"type":"message_stop"}')
-    assert backend.await_args.args[0].stream
+    assert core.await_args.args[0].stream
 
 
 class _StreamedGeneration:
@@ -371,8 +402,9 @@ async def _chat_stream(monkeypatch, generation):
 
 @pytest.fixture
 def server_logger(monkeypatch):
+    """The logger of the chat SSE generator, which lives in serve/_base/sse.py."""
     log = Mock()
-    monkeypatch.setattr(openai_server_module, "logger", log)
+    monkeypatch.setattr(sse_module, "logger", log)
     return log
 
 
@@ -450,61 +482,19 @@ def test_chat_stream_logs_a_failure_and_raises_it(monkeypatch, server_logger):
     assert "engine failed" in server_logger.error.call_args.args[0]
 
 
-@pytest.fixture
-def prometheus_multiproc_dir(tmp_path, monkeypatch):
-    """PROMETHEUS_MULTIPROC_DIR for one test.
-
-    prometheus_client picks and caches its value class the first time a metric
-    is built with the variable set, so the class is restored as well as the
-    environment; otherwise later metrics in the process fail without a
-    directory.
-    """
-    import prometheus_client.values
-
-    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
-    saved_value_class = prometheus_client.values.ValueClass
-    try:
-        yield tmp_path
-    finally:
-        prometheus_client.values.ValueClass = saved_value_class
+def _paths(app) -> set:
+    return {path for path, _ in effective_routes(app)}
 
 
-def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
-    # register_routes mounts a prometheus multiprocess collector, which needs a
-    # real PROMETHEUS_MULTIPROC_DIR; object.__new__ skips the startup that
-    # creates one.
+def test_standard_and_disagg_register_messages_route(tmp_path):
+    # One server per environment: both register collectors in the default
+    # Prometheus registry, which the environment restores on exit.
+    with isolated_serve_env(tmp_path / "standard") as env:
+        standard_paths = _paths(env.build_openai_server(AggConfig()).app)
+    with isolated_serve_env(tmp_path / "disagg") as env:
+        disagg_paths = _paths(env.build_disagg_server(DisaggConfig()).app)
 
-    standard = object.__new__(OpenAIServer)
-    standard.app = FastAPI()
-    standard.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
-    )
-    standard.use_harmony = False
-    # register_routes() reads these to decide whether to mount the optional
-    # control endpoints. Building the server with object.__new__ skips
-    # __init__, so anything register_routes() touches has to be supplied.
-    standard._enable_runtime_control_endpoints = False
-    standard._enable_rl_control_endpoints = False
-    standard.register_routes()
-
-    disagg = object.__new__(OpenAIDisaggServer)
-    disagg.app = FastAPI()
-    disagg._service = SimpleNamespace(
-        openai_completion=AsyncMock(),
-        openai_chat_completion=AsyncMock(),
-        anthropic_count_tokens=AsyncMock(),
-        openai_responses=AsyncMock(),
-    )
-    disagg._perf_metrics_collector = SimpleNamespace(get_perf_metrics=AsyncMock())
-    disagg._disagg_cluster_storage = None
-    # register_routes reads this; the server is built with object.__new__ here,
-    # so every attribute it touches has to be stubbed explicitly.
-    disagg._coordinator = None
-    disagg.register_routes()
-
-    for server in (standard, disagg):
-        paths = {route.path for route in server.app.routes}
+    for paths in (standard_paths, disagg_paths):
         assert "/v1/messages" in paths
 
     # Claude Code calls count_tokens before most turns to size its context.
@@ -512,42 +502,22 @@ def test_standard_and_disagg_register_messages_route(prometheus_multiproc_dir):
     # so registration is asserted separately from /v1/messages -- and on both
     # servers, because a client pointed at a disaggregated deployment cannot
     # tell the difference and must not lose the endpoint.
-    for server in (standard, disagg):
-        paths = {route.path for route in server.app.routes}
+    for paths in (standard_paths, disagg_paths):
         assert "/v1/messages/count_tokens" in paths
 
-    disagg_paths = {route.path for route in disagg.app.routes}
     assert "/v1/responses" in disagg_paths
     assert "/v1/models" in disagg_paths
 
 
-def _batch_client(runner=None):
-    """A TestClient over just the batch routes, with a stubbed item runner."""
-    from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
+def _batch_client(env, runner=None):
+    """A client over the real app, with the batch serving's item runner stubbed."""
 
     async def ok(request):
         return "succeeded", {"type": "message", "role": "assistant", "content": []}
 
-    app = FastAPI()
-    _anthropic_validation_handler(app)
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
-    server._anthropic_batch_store = AnthropicBatchStore(runner=runner or ok)
-    app.add_api_route("/v1/messages/batches", server.anthropic_create_batch, methods=["POST"])
-    app.add_api_route("/v1/messages/batches", server.anthropic_list_batches, methods=["GET"])
-    app.add_api_route(
-        "/v1/messages/batches/{batch_id}", server.anthropic_get_batch, methods=["GET"]
-    )
-    app.add_api_route(
-        "/v1/messages/batches/{batch_id}", server.anthropic_delete_batch, methods=["DELETE"]
-    )
-    app.add_api_route(
-        "/v1/messages/batches/{batch_id}/cancel", server.anthropic_cancel_batch, methods=["POST"]
-    )
-    app.add_api_route(
-        "/v1/messages/batches/{batch_id}/results", server.anthropic_batch_results, methods=["GET"]
-    )
-    return TestClient(app)
+    server = env.build_openai_server(AggConfig(model_name=MODEL))
+    server.app.state.anthropic_serving_batches = AnthropicBatchesServing(runner=runner or ok)
+    return env.client(server.app)
 
 
 def _batch_body(*custom_ids):
@@ -566,22 +536,10 @@ def _batch_body(*custom_ids):
     }
 
 
-def test_batch_routes_are_registered_on_the_standard_server():
-    standard = object.__new__(OpenAIServer)
-    standard.app = FastAPI()
-    standard.generator = SimpleNamespace(
-        _executor=SimpleNamespace(resource_governor_queue=None),
-        args=SimpleNamespace(return_perf_metrics=False),
-    )
-    standard.use_harmony = False
-    # register_routes() reads these to decide whether to mount the optional
-    # control endpoints. Building the server with object.__new__ skips
-    # __init__, so anything register_routes() touches has to be supplied.
-    standard._enable_runtime_control_endpoints = False
-    standard._enable_rl_control_endpoints = False
-    standard.register_routes()
+def test_batch_routes_are_registered_on_the_standard_server(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        paths = _paths(env.build_openai_server(AggConfig()).app)
 
-    paths = {route.path for route in standard.app.routes}
     for path in (
         "/v1/messages/batches",
         "/v1/messages/batches/{batch_id}",
@@ -591,9 +549,10 @@ def test_batch_routes_are_registered_on_the_standard_server():
         assert path in paths, f"{path} not registered"
 
 
-def test_create_batch_returns_an_in_progress_batch():
-    client = _batch_client()
-    response = client.post("/v1/messages/batches", json=_batch_body("a", "b"))
+def test_create_batch_returns_an_in_progress_batch(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client = _batch_client(env)
+        response = client.post("/v1/messages/batches", json=_batch_body("a", "b"))
 
     assert response.status_code == 200
     body = response.json()
@@ -603,18 +562,20 @@ def test_create_batch_returns_an_in_progress_batch():
     assert body["request_counts"]["processing"] + body["request_counts"]["succeeded"] == 2
 
 
-def test_create_batch_rejects_duplicate_custom_ids():
-    client = _batch_client()
-    response = client.post("/v1/messages/batches", json=_batch_body("same", "same"))
+def test_create_batch_rejects_duplicate_custom_ids(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client = _batch_client(env)
+        response = client.post("/v1/messages/batches", json=_batch_body("same", "same"))
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
-def test_unknown_batch_says_it_is_not_found_and_explains_why():
+def test_unknown_batch_says_it_is_not_found_and_explains_why(tmp_path):
     """The in-memory limitation is the likeliest cause, so name it."""
-    client = _batch_client()
-    response = client.get("/v1/messages/batches/msgbatch_nope")
+    with isolated_serve_env(tmp_path) as env:
+        client = _batch_client(env)
+        response = client.get("/v1/messages/batches/msgbatch_nope")
 
     assert response.status_code == 404
     error = response.json()["error"]
@@ -625,13 +586,10 @@ def test_unknown_batch_says_it_is_not_found_and_explains_why():
 def test_results_of_an_unfinished_batch_are_400_not_404():
     """404 would tell a polling client the batch never existed.
 
-    Driven directly rather than through TestClient: each TestClient call runs
-    in its own portal, so the batch's background task is not guaranteed to
-    still be in flight by the time the second request arrives, and the batch
-    would have already ended.
+    Driven on the serving class directly rather than through a client, so the
+    batch's background task is still in flight when the results are asked for.
     """
-    from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
-    from tensorrt_llm.serve.anthropic_protocol import AnthropicBatchRequestItem
+    from tensorrt_llm.serve.api.anthropic.protocol import AnthropicBatchRequestItem
 
     async def scenario():
         blocked = asyncio.Event()
@@ -640,8 +598,7 @@ def test_results_of_an_unfinished_batch_are_400_not_404():
             await blocked.wait()
             return "succeeded", {"type": "message"}
 
-        server = object.__new__(OpenAIServer)
-        server._anthropic_batch_store = AnthropicBatchStore(runner=never_finishes)
+        serving = AnthropicBatchesServing(runner=never_finishes)
         item = AnthropicBatchRequestItem(
             custom_id="a",
             params={
@@ -650,15 +607,15 @@ def test_results_of_an_unfinished_batch_are_400_not_404():
                 "messages": [{"role": "user", "content": "hi"}],
             },
         )
-        batch = server._anthropic_batch_store.create([item])
+        batch = serving._batch_store().create([item])
         await asyncio.sleep(0)  # let the worker start and block
 
-        response = await server.anthropic_batch_results(batch.id)
+        response = await serving.anthropic_batch_results(batch.id)
         assert response.status_code == 400
         assert "still processing" in json.loads(response.body)["error"]["message"]
 
         # An id that was never issued is a genuine 404, and must stay distinct.
-        missing = await server.anthropic_batch_results("msgbatch_nope")
+        missing = await serving.anthropic_batch_results("msgbatch_nope")
         assert missing.status_code == 404
 
         blocked.set()
@@ -673,8 +630,8 @@ def test_interrupted_batch_still_reports_counts_that_sum():
     end the batch with fewer results than requests - and request_counts is the
     number clients use to decide whether every request was accounted for.
     """
-    from tensorrt_llm.serve.anthropic_batches import AnthropicBatchStore
-    from tensorrt_llm.serve.anthropic_protocol import AnthropicBatchRequestItem
+    from tensorrt_llm.serve.api.anthropic.batches import AnthropicBatchStore
+    from tensorrt_llm.serve.api.anthropic.protocol import AnthropicBatchRequestItem
 
     async def scenario():
         blocked = asyncio.Event()
@@ -714,29 +671,32 @@ def test_interrupted_batch_still_reports_counts_that_sum():
     asyncio.run(scenario())
 
 
-def test_finished_batch_serves_ndjson_results():
-    client = _batch_client()
-    created = client.post("/v1/messages/batches", json=_batch_body("a", "b")).json()
+def test_finished_batch_serves_ndjson_results(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client = _batch_client(env)
+        created = client.post("/v1/messages/batches", json=_batch_body("a", "b")).json()
 
-    for _ in range(200):
-        if (
-            client.get(f"/v1/messages/batches/{created['id']}").json()["processing_status"]
-            == "ended"
-        ):
-            break
-        time.sleep(0.01)
+        for _ in range(200):
+            if (
+                client.get(f"/v1/messages/batches/{created['id']}").json()["processing_status"]
+                == "ended"
+            ):
+                break
+            time.sleep(0.01)
 
-    response = client.get(f"/v1/messages/batches/{created['id']}/results")
+        response = client.get(f"/v1/messages/batches/{created['id']}/results")
+
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/x-ndjson")
     lines = [json.loads(line) for line in response.text.splitlines()]
     assert {line["custom_id"] for line in lines} == {"a", "b"}
 
 
-def test_list_batches_returns_a_page():
-    client = _batch_client()
-    client.post("/v1/messages/batches", json=_batch_body("a"))
-    body = client.get("/v1/messages/batches").json()
+def test_list_batches_returns_a_page(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client = _batch_client(env)
+        client.post("/v1/messages/batches", json=_batch_body("a"))
+        body = client.get("/v1/messages/batches").json()
 
     assert isinstance(body["data"], list) and body["data"]
     assert body["first_id"] == body["data"][0]["id"]
@@ -840,125 +800,104 @@ class _FakeTokenizer:
         return text.split()
 
 
-def _anthropic_validation_handler(app):
-    """Mirror the server's handler so boundary rejections keep the envelope.
+def _count_tokens_client(env, resources):
+    """A client over the real app, counting over ``resources`` (what the renderer reads off a server).
 
-    Model-level validation fails before the route function runs, so without
-    this a bare test app answers with FastAPI's 422 shape while the real
-    server answers 400 with the Anthropic envelope -- the test would pin the
-    fixture's behaviour instead of the product's.
+    Transitional: the resources get built directly once the server assembly
+    stops reading them off the server per request.
     """
-    from fastapi.exceptions import RequestValidationError
-
-    from tensorrt_llm.serve.anthropic_adapter import anthropic_error_response
-
-    @app.exception_handler(RequestValidationError)
-    async def _handler(request, exc):  # noqa: ANN001
-        if request.url.path.startswith("/v1/messages"):
-            return anthropic_error_response(str(exc), "invalid_request_error", 400)
-        raise exc
-
-
-def _count_tokens_client():
-    app = FastAPI()
-    _anthropic_validation_handler(app)
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
-    server.tokenizer = _FakeTokenizer()
-    app.add_api_route("/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"])
-    return TestClient(app)
-
-
-def test_count_tokens_route_returns_a_count():
-    client = _count_tokens_client()
-
-    response = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "one two three"}],
-        },
+    server = env.build_openai_server(AggConfig(model_name=MODEL))
+    server.app.state.anthropic_serving_count_tokens = AnthropicCountTokensServing(
+        render_resources=lambda: RenderResources.from_server(resources)
     )
+    return env.client(server.app)
+
+
+def _count_resources(chat_template=None):
+    return SimpleNamespace(tokenizer=_FakeTokenizer(), chat_template=chat_template)
+
+
+def test_count_tokens_route_returns_a_count(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client = _count_tokens_client(env, _count_resources())
+
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "one two three"}],
+            },
+        )
 
     assert response.status_code == 200
     assert response.json() == {"input_tokens": 3}
 
 
-def test_count_tokens_counts_the_rendered_prompt_not_the_raw_messages():
+def test_count_tokens_counts_the_rendered_prompt_not_the_raw_messages(tmp_path):
     """Tools inflate the real prompt, so they have to inflate the count."""
-    client = _count_tokens_client()
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": "one two three"}],
     }
+    with isolated_serve_env(tmp_path) as env:
+        client = _count_tokens_client(env, _count_resources())
 
-    bare = client.post("/v1/messages/count_tokens", json=body).json()
-    with_tools = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            **body,
-            "tools": [
-                {
-                    "name": "get_weather",
-                    "input_schema": {"type": "object"},
-                }
-            ],
-        },
-    ).json()
+        bare = client.post("/v1/messages/count_tokens", json=body).json()
+        with_tools = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                **body,
+                "tools": [
+                    {
+                        "name": "get_weather",
+                        "input_schema": {"type": "object"},
+                    }
+                ],
+            },
+        ).json()
 
     assert with_tools["input_tokens"] > bare["input_tokens"]
 
 
-def test_count_tokens_honours_the_server_chat_template():
+def test_count_tokens_honours_the_server_chat_template(tmp_path):
     """A server started with --chat_template must count the prompt it renders.
 
-    The renderer only consults request.chat_template; openai_chat resolves
+    The renderer only consults request.chat_template; the chat route resolves
     `request.chat_template or self.chat_template`. Without the same resolution
     here, count_tokens reports a prompt the server never builds - the exact
     drift this endpoint exists to remove.
     """
-    app = FastAPI()
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
-    server.tokenizer = _FakeTokenizer()
     # A template that measurably inflates the rendered prompt.
-    server.chat_template = "SERVER-TEMPLATE-MARKER {{ messages }}"
-    app.add_api_route("/v1/messages/count_tokens", server.anthropic_count_tokens, methods=["POST"])
-    client = TestClient(app)
+    resources = _count_resources(chat_template="SERVER-TEMPLATE-MARKER {{ messages }}")
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "one two three"}],
+    }
+    with isolated_serve_env(tmp_path) as env:
+        client = _count_tokens_client(env, resources)
 
-    with_template = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "one two three"}],
-        },
-    ).json()
+        with_template = client.post("/v1/messages/count_tokens", json=body).json()
 
-    server.chat_template = None
-    without = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "one two three"}],
-        },
-    ).json()
+        resources.chat_template = None
+        without = client.post("/v1/messages/count_tokens", json=body).json()
 
     assert with_template["input_tokens"] != without["input_tokens"], (
         "server chat_template had no effect on the count, so it was ignored"
     )
 
 
-def test_count_tokens_rejects_a_malformed_request():
-    client = _count_tokens_client()
+def test_count_tokens_rejects_a_malformed_request(tmp_path):
+    with isolated_serve_env(tmp_path) as env:
+        client = _count_tokens_client(env, _count_resources())
 
-    response = client.post(
-        "/v1/messages/count_tokens",
-        json={
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "thinking": {"type": "bogus"},
-        },
-    )
+        response = client.post(
+            "/v1/messages/count_tokens",
+            json={
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "bogus"},
+            },
+        )
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
@@ -983,7 +922,7 @@ def _disagg_service(servers, post_json=None):
 
 def test_count_tokens_forwards_to_a_context_worker():
     """The disagg server has no tokenizer, so the count must come from a worker."""
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1004,7 +943,7 @@ def test_count_tokens_forwards_to_a_context_worker():
 
 def test_count_tokens_spreads_over_context_workers():
     """Round-robin: one worker must not absorb every count."""
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1029,7 +968,7 @@ def test_count_tokens_without_context_workers_is_an_error_not_a_zero():
     Returning 0 would read as an empty prompt and silently skew a client's
     context budgeting.
     """
-    from tensorrt_llm.serve.anthropic_protocol import AnthropicCountTokensRequest
+    from tensorrt_llm.serve.api.anthropic.protocol import AnthropicCountTokensRequest
 
     service = _disagg_service([])
     request = AnthropicCountTokensRequest(model=MODEL, messages=[{"role": "user", "content": "hi"}])
@@ -1085,7 +1024,7 @@ def test_post_json_sends_msgpack_the_worker_can_decode():
     """
     import msgspec
 
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1117,7 +1056,7 @@ def test_post_json_raises_on_an_error_status():
     """
     import aiohttp
 
-    from tensorrt_llm.serve.anthropic_protocol import (
+    from tensorrt_llm.serve.api.anthropic.protocol import (
         AnthropicCountTokensRequest,
         AnthropicCountTokensResponse,
     )
@@ -1190,29 +1129,28 @@ def test_create_batch_at_capacity_is_429_not_400():
     instead of surfacing a hard failure to the user.
 
     This pins the status mapping only. Whether the store actually refuses at
-    capacity is store policy, covered in test_anthropic_batches.py -- driving a
-    real store to its limit through TestClient is not possible anyway, since
-    each request runs in its own event loop and a batch's task does not
-    survive between them.
+    capacity is store policy, covered in test_anthropic_batches.py. Driven on
+    the serving class directly: the mapping needs no server.
     """
-    from tensorrt_llm.serve.anthropic_batches import BatchStoreFullError
+    from tensorrt_llm.serve.api.anthropic.batches import BatchStoreFullError
 
-    app = FastAPI()
-    server = object.__new__(OpenAIServer)
-    server.model = MODEL
+    async def ok(request):
+        return "succeeded", {"type": "message"}
 
     def full(_requests):
         raise BatchStoreFullError(
             "the server is holding 100 unfinished batches (limit 100); retry once one of them ends"
         )
 
-    server._anthropic_batch_store = SimpleNamespace(create=full)
-    app.add_api_route("/v1/messages/batches", server.anthropic_create_batch, methods=["POST"])
+    serving = AnthropicBatchesServing(runner=ok)
+    serving._anthropic_batch_store = SimpleNamespace(create=full)
 
-    response = TestClient(app).post("/v1/messages/batches", json=_batch_body("a"))
+    response = asyncio.run(
+        serving.anthropic_create_batch(AnthropicCreateBatchRequest(**_batch_body("a")))
+    )
 
     assert response.status_code == 429
-    body = response.json()
+    body = json.loads(response.body)
     assert body["type"] == "error"
     assert body["error"]["type"] == "rate_limit_error"
     # The message has to say what to do about it; an "invalid request" shape
@@ -1220,46 +1158,17 @@ def test_create_batch_at_capacity_is_429_not_400():
     assert "retry" in body["error"]["message"].lower()
 
 
-def test_await_disconnected_returns_immediately_for_a_synthetic_request():
-    """A batched request has no socket, so the watchdog must not poll on it.
-
-    is_disconnected() can never become true for a synthesised request, so
-    without an explicit opt-out this coroutine loops at 1Hz for the life of
-    the process -- one live task per batched request, each holding its Request
-    and RequestOutput.
-    """
-    server = object.__new__(OpenAIServer)
-    raw_request = OpenAIServer._synthetic_request(
-        {
-            "model": MODEL,
-            "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hi"}],
-        }
-    )
-    promise = SimpleNamespace(finished=False, request_id="req", abort=Mock())
-
-    async def run():
-        # A real socket-backed request would never let this return; a bounded
-        # wait keeps the failure a clear timeout rather than a hung suite.
-        await asyncio.wait_for(
-            OpenAIServer.await_disconnected(server, raw_request, promise),
-            timeout=5.0,
-        )
-
-    asyncio.run(run())
-    # Returning early must not be mistaken for a disconnect.
-    promise.abort.assert_not_called()
-
-
 @pytest.mark.parametrize("limit", [0, -1, 101])
-def test_list_batches_rejects_out_of_range_limit(limit):
+def test_list_batches_rejects_out_of_range_limit(limit, tmp_path):
     """Clamping hid both a client error and a surprising page size.
 
     limit=0 became 1 rather than an error, and the page was bounded by the
     retention limit -- how many batches are kept, which has nothing to do with
-    how many fit on a page.
+    how many fit on a page. The 400 and the envelope come from the server's own
+    validation handler.
     """
-    response = _batch_client().get(f"/v1/messages/batches?limit={limit}")
+    with isolated_serve_env(tmp_path) as env:
+        response = _batch_client(env).get(f"/v1/messages/batches?limit={limit}")
 
     assert response.status_code == 400, response.text
     assert response.json()["error"]["type"] == "invalid_request_error"

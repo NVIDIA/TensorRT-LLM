@@ -344,7 +344,7 @@ AnthropicBatchProcessingStatus = Literal["in_progress", "canceling", "ended"]
 AnthropicBatchResultType = Literal["succeeded", "errored", "canceled", "expired"]
 
 # Anthropic's documented ceiling. Enforced because every request in a batch is
-# held in memory here (see anthropic_batches), so an unbounded batch is a way
+# held in memory here (see batches), so an unbounded batch is a way
 # to exhaust the server's memory with a single call.
 ANTHROPIC_BATCH_MAX_REQUESTS = 100_000
 
