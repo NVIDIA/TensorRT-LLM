@@ -38,7 +38,7 @@ from .bindings import (
 )
 from .capabilities import supported_guides, supports_image_routing
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
-from .errors import AbortFailedError
+from .errors import ENCODER_TRANSFER_REJECTED_METADATA, AbortFailedError, EncoderTransferRejected
 from .kv_events import data_parallel_size, events_config
 from .request_mapping import conversation_affinity_enabled, token_ids_input_supported
 
@@ -157,10 +157,14 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         task.add_done_callback(completed)
         try:
             await asyncio.shield(task)
-        except ValueError as error:
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+        except EncoderTransferRejected as error:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                str(error),
+                trailing_metadata=(ENCODER_TRANSFER_REJECTED_METADATA,),
+            )
             return
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
             return
         return generation_pb2.TransferEncoderCacheResponse()

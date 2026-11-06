@@ -5,13 +5,17 @@ import asyncio
 import threading
 from types import SimpleNamespace
 
+import grpc
 import pytest
 from conftest import AbortError, FakeServicerContext
+from test_control import MODEL, _inference, _servicer
 from test_encoder import model, native_result, request
 
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.grpc.openengine import servicer
+from tensorrt_llm.grpc.openengine.bindings import model_pb2
+from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities
 from tensorrt_llm.grpc.openengine.control import OpenEngineControlServicer
 
 pytestmark = pytest.mark.cpu_only
@@ -197,3 +201,95 @@ async def test_cancelled_encode_reclaims_native_exports(tmp_path, monkeypatch):
     assert handle.disaggregated_params.mrope_position_ids_handle is None
     assert not list(tmp_path.glob("*.safetensors"))
     assert not inference._encoder_cleanup_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["", "encode", "consume"])
+@pytest.mark.parametrize("backend", ["trtllm-shared-safetensors-v1", "trtllm-nixl-encoder-v1"])
+async def test_encoder_capability_discovery_is_typed_and_role_specific(role, backend):
+    inference = _inference()
+    inference.encoder_role = role
+    inference._encoder_cache = SimpleNamespace(backend=backend)
+    inference._media_capabilities = MediaCapabilities({"image": "<image_{}>"})
+    info = await _servicer(inference=inference).GetModelInfo(
+        model_pb2.GetModelInfoRequest(model=MODEL), FakeServicerContext()
+    )
+    assert info.HasField("encoder") is bool(role)
+    if role:
+        assert info.encoder.schema_version == 1
+        assert info.encoder.encoder_only is (role == "encode")
+        assert info.encoder.accepts_cache is (role == "consume")
+        assert list(info.encoder.transfer_backends) == [backend]
+    if role == "encode":
+        assert info.generation.output_logprobs.supported is False
+        assert info.generation.guided_decoding.supported is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_encoder_transfer_keeps_native_work_alive():
+    import asyncio
+    import threading
+
+    from tensorrt_llm.grpc.openengine.bindings import generation_pb2
+
+    started, finish = threading.Event(), threading.Event()
+
+    def transfer(cache, destination):
+        started.set()
+        assert finish.wait(10)
+
+    inference = _inference()
+    inference.encoder_role = "encode"
+    inference._encoder_cache = SimpleNamespace(transfer=transfer)
+    control = _servicer(inference=inference)
+    task = asyncio.create_task(
+        control.TransferEncoderCache(
+            generation_pb2.TransferEncoderCacheRequest(), FakeServicerContext()
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(inference._encoder_cleanup_tasks) == 1
+        assert not next(iter(inference._encoder_cleanup_tasks)).done()
+    finally:
+        finish.set()
+        await asyncio.gather(*tuple(inference._encoder_cleanup_tasks))
+    assert not inference._encoder_cleanup_tasks
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejected", [True, False])
+async def test_transfer_rejection_marker_requires_proven_prewrite_failure(rejected):
+    from tensorrt_llm.grpc.openengine.bindings import generation_pb2
+    from tensorrt_llm.grpc.openengine.errors import (
+        ENCODER_TRANSFER_REJECTED_METADATA,
+        EncoderTransferRejected,
+    )
+
+    error = EncoderTransferRejected("expired reference") if rejected else ValueError("write failed")
+
+    def transfer(cache, destination):
+        raise error
+
+    inference = _inference()
+    inference.encoder_role = "encode"
+    inference._encoder_cache = SimpleNamespace(transfer=transfer)
+    context = FakeServicerContext()
+    with pytest.raises(AbortError):
+        await _servicer(inference=inference).TransferEncoderCache(
+            generation_pb2.TransferEncoderCacheRequest(), context
+        )
+    assert context.abort_code == (
+        grpc.StatusCode.INVALID_ARGUMENT if rejected else grpc.StatusCode.UNAVAILABLE
+    )
+    assert context.trailing_metadata == ((ENCODER_TRANSFER_REJECTED_METADATA,) if rejected else ())
+
+
+@pytest.mark.asyncio
+async def test_uncertain_encoder_transport_withdraws_health():
+    inference = _inference()
+    inference._encoder_cache = SimpleNamespace(failed=True)
+    assert not _servicer(inference=inference)._engine_is_healthy()

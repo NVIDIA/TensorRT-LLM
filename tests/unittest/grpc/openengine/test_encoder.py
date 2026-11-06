@@ -156,18 +156,40 @@ def test_expiry_wrong_inputs_and_cross_host_are_rejected(tmp_path):
     wrong.prompt = "Another image prompt"
     with pytest.raises(ValueError, match="does not match"):
         cache.prepare(ref, wrong, llm, None)
+    cache.prepare(ref, request(), llm, None)
     result, _ = native_result()
     llm._hf_model_dir = tmp_path / "checkpoint-a"
     ref = cache.publish(result, request(), llm)
     llm._hf_model_dir = tmp_path / "checkpoint-b"
     with pytest.raises(ValueError, match="another model"):
         cache.prepare(ref, request(), llm, None)
+    llm._hf_model_dir = tmp_path / "checkpoint-a"
+    cache.prepare(ref, request(), llm, None)
     result, _ = native_result()
     ref = cache.publish(result, request(), llm)
     path = next(tmp_path.glob("*.safetensors"))
     os.utime(path, (1, 1))
     with pytest.raises(ValueError, match="expired"):
         cache.prepare(ref, request(), llm, None)
+
+
+def test_lossy_prompt_decoding_preserves_the_handoff(tmp_path):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, seen = model()
+    llm.tokenizer = SimpleNamespace(
+        decode=lambda ids, **kwargs: "decoded prompt", encode=lambda prompt, **kwargs: [9]
+    )
+    req = request()
+    req.token_ids.ids.extend([1, 2])
+    result, _ = native_result()
+    ref = cache.publish(result, req, llm)
+    with pytest.raises(ValueError, match="lossless prompt token decoding"):
+        cache.prepare(ref, req, llm, None)
+    llm.tokenizer.encode = lambda prompt, **kwargs: [1, 2]
+    cache.prepare(ref, req, llm, None)
+    assert seen["prompt"] == "decoded prompt"
+    assert not list(tmp_path.glob("*.safetensors"))
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_quota_counts_actual_serialized_bytes(tmp_path, monkeypatch):

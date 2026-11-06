@@ -400,13 +400,22 @@ The image-only and TP/PP/CP=1 restrictions still apply. In E+P+D, the encoder
 cache is transferred only to P; D receives the native KV handoff and does not
 request another encoder transfer.
 
-The encoder imports native exports locally and registers owned GPU tensors with
-TRT-LLM's NIXL agent. Its single-use reference includes layout, dtype, shape,
+The encoder imports native exports into owned GPU tensors. Its single-use
+reference includes layout, dtype, shape,
 input/model identity and the producer endpoint, not source memory addresses.
 The consumer allocates/registers receive tensors and invokes
 `Control.TransferEncoderCache`; the producer writes to those buffers and returns
 only after native completion. Dynamo carries the opaque reference only. Metadata
 and mRoPE tensors are carried along with the image embeddings.
+
+Each send and receive owns its native agent and registrations through completion.
+Independent handoffs do not share imported peer metadata or hold the cache-state
+lock during network waits. Shutdown closes admission and drains active handoffs.
+Proven pre-WRITE rejections carry `INVALID_ARGUMENT` and trailing metadata
+`trtllm-encoder-write: not-started`; consumers release their receive buffers and
+report invalid input. Unmarked failures remain uncertain, including failures from
+older peers. Failed receiver setup preserves the source reference only after its
+request-owned agent has been retired.
 
 Language engines release transport request references after native enqueue
 accepts ownership. Context-only KV transfers continue making progress while the
@@ -420,7 +429,7 @@ this is not a public tensor-upload API. Deployment networking must make the
 advertised gRPC and NIXL endpoints reachable across hosts.
 
 Pending exports expire after five minutes when the cache is collected, and
-registered tensor storage is bounded to 256 MiB per engine (64 MiB per request).
+owned tensor storage is bounded to 256 MiB per engine (64 MiB per request).
 An uncertain transfer stops admission and retains affected registrations and
 buffers until process exit. A missing RPC reply does not establish that a remote
 write stopped. Restart an unhealthy engine; do not retry a consumed handoff.

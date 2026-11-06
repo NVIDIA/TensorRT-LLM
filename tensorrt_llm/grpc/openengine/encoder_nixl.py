@@ -10,8 +10,8 @@ import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
 
 import grpc
 import torch
@@ -27,6 +27,7 @@ from .encoder import (
     _release,
     take_encoder_exports,
 )
+from .errors import ENCODER_TRANSFER_REJECTED_METADATA, EncoderTransferRejected
 from .preparation import _config_digest, _input_digest
 
 BACKEND = "trtllm-nixl-encoder-v1"
@@ -96,8 +97,6 @@ def _descriptors(tensors, name):
 @dataclass
 class _Export:
     tensors: list
-    registration: Any
-    descriptors: Any
     metadata: dict
     created: float
     size: int
@@ -119,24 +118,41 @@ class NixlEncoderCache:
         self.model_revision = model_revision
         self.device = torch.device(device)
         self.name = f"openengine-encoder-{uuid.uuid4().hex}"
-        self.agent = agent_factory(self.name)
-        self._lock = threading.RLock()
+        self._agent_factory = agent_factory
+        # Fail startup before advertising a backend that cannot initialize.
+        probe = agent_factory(f"{self.name}-probe")
+        probe.shutdown()
+        self._lock = threading.Condition()
+        self._active = 0
         self._exports = {}
         self._used = 0
         self.failed = False
         self._closed = False
+        self._closing = False
+        self._close_error = None
+
+    @contextmanager
+    def _operation(self):
+        with self._lock:
+            self._healthy()
+            self._active += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._active -= 1
+                self._lock.notify_all()
+
+    def _quarantine(self, *resources):
+        with self._lock:
+            self.failed = True
+            _QUARANTINED.append(resources)
 
     def _model_digest(self, llm):
         # The immutable revision is deployment-provided, independent of host paths.
         return hashlib.sha256(_encode([_config_digest(llm), self.model_revision])).hexdigest()
 
     def _discard(self, item):
-        try:
-            self.agent.deregister_memory(item.registration)
-        except Exception:
-            self.failed = True
-            _QUARANTINED.append((self.agent, item))
-            raise
         self._used -= item.size
 
     def _collect(self):
@@ -146,61 +162,65 @@ class NixlEncoderCache:
                 del self._exports[identity]
 
     def _healthy(self):
-        if self.failed or self._closed:
+        if self.failed or self._closed or self._closing:
             raise RuntimeError("encoder NIXL transport unavailable; restart the engine")
 
     def publish(self, result, request, llm):
-        if not self.endpoint:
-            raise ValueError("encoder producer requires an advertised endpoint")
-        handles, mrope = take_encoder_exports(result.disaggregated_params)
-        pending = [*handles, *(h for h in mrope if h is not None)]
-        tensors = []
-        try:
-            if not handles or (mrope[0] is None) != (mrope[1] is None):
-                raise ValueError("incomplete encoder output")
-            if len(pending) > _MAX_TENSORS:
-                raise ValueError("too many encoder output tensors")
-            total = 0
-            for handle in list(pending):
-                tensor = SharedTensorContainer.from_dict(handle).get_local_view()
-                pending.pop(0)
-                total += tensor.numel() * tensor.element_size()
-                if total > _MAX_TENSOR_BYTES:
-                    raise ValueError("encoder output exceeds the tensor limit")
-                tensors.append(tensor.detach().to(self.device).contiguous().clone())
-            if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-        finally:
-            _release(pending)
-        metadata = {
-            "input_digest": _input_digest(request),
-            "model_digest": self._model_digest(llm),
-            "hashes": result.disaggregated_params.multimodal_hashes,
-            "embedding_metadata": [h.get("metadata") for h in handles],
-            "has_mrope": mrope[0] is not None,
-            "tensors": [{"shape": list(t.shape), "dtype": str(t.dtype)} for t in tensors],
-        }
-        identity = uuid.uuid4().hex
-        state = _encode(
-            {"version": 1, "endpoint": self.endpoint, "id": identity, "metadata": metadata}
-        )
-        registration, descriptors, _ = _descriptors(tensors, self.name)
-        with self._lock:
-            self._healthy()
-            self._collect()
-            if self._used + total > _MAX_CACHE_BYTES:
-                raise RuntimeError("encoder NIXL cache is full")
+        with self._operation():
+            if not self.endpoint:
+                raise ValueError("encoder producer requires an advertised endpoint")
+            handles, mrope = take_encoder_exports(result.disaggregated_params)
+            pending = [*handles, *(h for h in mrope if h is not None)]
+            tensors = []
+            reserved = False
             try:
-                self.agent.register_memory(registration)
+                if not handles or (mrope[0] is None) != (mrope[1] is None):
+                    raise ValueError("incomplete encoder output")
+                if len(pending) > _MAX_TENSORS:
+                    raise ValueError("too many encoder output tensors")
+                views = []
+                total = 0
+                for handle in list(pending):
+                    tensor = SharedTensorContainer.from_dict(handle).get_local_view()
+                    pending.pop(0)
+                    total += tensor.numel() * tensor.element_size()
+                    if total > _MAX_TENSOR_BYTES:
+                        raise ValueError("encoder output exceeds the tensor limit")
+                    views.append(tensor)
+                with self._lock:
+                    self._healthy()
+                    self._collect()
+                    if self._used + total > _MAX_CACHE_BYTES:
+                        raise RuntimeError("encoder NIXL cache is full")
+                    self._used += total
+                    reserved = True
+                tensors = [view.detach().to(self.device).contiguous().clone() for view in views]
+                if self.device.type == "cuda":
+                    torch.cuda.synchronize(self.device)
+                metadata = {
+                    "input_digest": _input_digest(request),
+                    "model_digest": self._model_digest(llm),
+                    "hashes": result.disaggregated_params.multimodal_hashes,
+                    "embedding_metadata": [h.get("metadata") for h in handles],
+                    "has_mrope": mrope[0] is not None,
+                    "tensors": [{"shape": list(t.shape), "dtype": str(t.dtype)} for t in tensors],
+                }
+                identity = uuid.uuid4().hex
+                state = _encode(
+                    {"version": 1, "endpoint": self.endpoint, "id": identity, "metadata": metadata}
+                )
+                reference = pb.EncoderCacheRef(transfer_backend=BACKEND, opaque_state=state)
+                with self._lock:
+                    self._healthy()
+                    self._exports[identity] = _Export(tensors, metadata, time.monotonic(), total)
+                return reference
             except Exception:
-                self.failed = True
-                _QUARANTINED.append((self.agent, tensors, registration))
+                if reserved:
+                    with self._lock:
+                        self._used -= total
                 raise
-            self._exports[identity] = _Export(
-                tensors, registration, descriptors, metadata, time.monotonic(), total
-            )
-            self._used += total
-        return pb.EncoderCacheRef(transfer_backend=BACKEND, opaque_state=state)
+            finally:
+                _release(pending)
 
     @staticmethod
     def _reference(reference):
@@ -221,8 +241,50 @@ class NixlEncoderCache:
             raise ValueError("invalid encoder endpoint")
         return value
 
+    def _claim(self, reference, destination):
+        """Reserve a single-use export before importing any receiver metadata."""
+        try:
+            value = self._reference(reference)
+            peer = _decode(destination)
+            with self._lock:
+                self._healthy()
+                self._collect()
+                item = self._exports.get(value["id"])
+                if item is None:
+                    raise ValueError("encoder handoff expired or was already consumed")
+                if value.get("metadata") != item.metadata or value["endpoint"] != self.endpoint:
+                    raise ValueError("encoder handoff metadata mismatch")
+                descs = peer.get("descs")
+                if not isinstance(descs, list) or len(descs) != len(item.tensors):
+                    raise ValueError("invalid encoder receive descriptors")
+                for desc, tensor in zip(descs, item.tensors):
+                    if (
+                        not isinstance(desc, list)
+                        or len(desc) != 3
+                        or any(type(n) is not int for n in desc)
+                        or desc[0] <= 0
+                        or desc[1] != tensor.numel() * tensor.element_size()
+                        or desc[2] < 0
+                    ):
+                        raise ValueError("encoder receive buffer size mismatch")
+                if (
+                    peer.get("memory_type") not in ("VRAM", "DRAM")
+                    or not isinstance(peer.get("name"), str)
+                    or not peer["name"]
+                ):
+                    raise ValueError("invalid encoder receiver")
+                try:
+                    agent_desc = base64.b64decode(peer["agent"], validate=True)
+                except (KeyError, ValueError, TypeError) as error:
+                    raise ValueError("invalid encoder receiver agent") from error
+                # Claimed exports stay charged to quota and cannot expire during preflight.
+                del self._exports[value["id"]]
+            return value["id"], item, peer, agent_desc
+        except ValueError as error:
+            raise EncoderTransferRejected(str(error)) from error
+
     def transfer(self, reference, destination):
-        """Write an export once; an uncertain transfer poisons the transport."""
+        """Write once with request-owned agent, registration, and completion status."""
         from tensorrt_llm._torch.disaggregation.base.agent import (
             MemoryDescs,
             MemoryType,
@@ -230,52 +292,51 @@ class NixlEncoderCache:
             TransferRequest,
         )
 
-        value = self._reference(reference)
-        peer = _decode(destination)
-        with self._lock:
-            self._healthy()
-            self._collect()
-            item = self._exports.get(value["id"])
-            if item is None:
-                raise ValueError("encoder handoff expired or was already consumed")
-            if value.get("metadata") != item.metadata or value["endpoint"] != self.endpoint:
-                raise ValueError("encoder handoff metadata mismatch")
-            descs = peer.get("descs")
-            if not isinstance(descs, list) or len(descs) != len(item.tensors):
-                raise ValueError("invalid encoder receive descriptors")
-            for desc, tensor in zip(descs, item.tensors):
-                if (
-                    not isinstance(desc, list)
-                    or len(desc) != 3
-                    or any(type(n) is not int for n in desc)
-                    or desc[0] <= 0
-                    or desc[1] != tensor.numel() * tensor.element_size()
-                    or desc[2] < 0
-                ):
-                    raise ValueError("encoder receive buffer size mismatch")
-            kind = peer.get("memory_type")
-            if kind not in ("VRAM", "DRAM") or not isinstance(peer.get("name"), str):
-                raise ValueError("invalid encoder receiver")
+        with self._operation():
+            identity, item, peer, agent_desc = self._claim(reference, destination)
+            agent = None
+            status = None
+            registered = False
+            submitted = False
             try:
-                agent_desc = base64.b64decode(peer["agent"], validate=True)
-            except (KeyError, ValueError, TypeError) as error:
-                raise ValueError("invalid encoder receiver agent") from error
-            del self._exports[value["id"]]
-            # No producer pointers leave this process: an expired/replayed
-            # reference cannot issue a READ into recycled memory.
-            try:
-                self.agent.load_remote_agent(peer["name"], agent_desc)
-                target = MemoryDescs(getattr(MemoryType, kind), [tuple(d) for d in descs])
-                transfer = TransferRequest(TransferOp.WRITE, item.descriptors, target, peer["name"])
-                status = self.agent.submit_transfer_requests(transfer)
+                name = f"{self.name}-send-{uuid.uuid4().hex}"
+                agent = self._agent_factory(name)
+                registration, source, _ = _descriptors(item.tensors, name)
+                agent.register_memory(registration)
+                registered = True
+                agent.load_remote_agent(peer["name"], agent_desc)
+                target = MemoryDescs(
+                    getattr(MemoryType, peer["memory_type"]), [tuple(d) for d in peer["descs"]]
+                )
+                transfer = TransferRequest(TransferOp.WRITE, source, target, peer["name"])
+                # Submission can post a WRITE and then raise before returning status.
+                submitted = True
+                status = agent.submit_transfer_requests(transfer)
                 if not status.wait(_TIMEOUT_SECONDS * 1000):
                     raise RuntimeError("encoder NIXL write did not complete")
-                self.agent.invalidate_remote_agent(peer["name"])
-                self._discard(item)
-            except Exception:
-                self.failed = True
-                _QUARANTINED.append((self.agent, item))
-                raise
+                status = None
+                agent.invalidate_remote_agent(peer["name"])
+                agent.deregister_memory(registration)
+                registered = False
+                agent.shutdown()
+                with self._lock:
+                    self._discard(item)
+            except Exception as error:
+                if submitted:
+                    self._quarantine(agent, item, status)
+                    raise
+                try:
+                    if registered:
+                        agent.deregister_memory(registration)
+                    if agent is not None:
+                        # Retire all imported peer names, including a partial failed import.
+                        agent.shutdown()
+                except Exception:
+                    self._quarantine(agent, item)
+                    raise
+                with self._lock:
+                    self._exports[identity] = item
+                raise EncoderTransferRejected(f"invalid encoder receiver: {error}") from error
 
     def _receive(self, reference, value):
         metadata = value.get("metadata")
@@ -299,23 +360,35 @@ class NixlEncoderCache:
                 raise ValueError("invalid encoder tensor shape or dtype")
             total += math.prod(shape) * torch.empty((), dtype=dtype).element_size()
             shapes.append((shape, dtype))
-        if total > _MAX_TENSOR_BYTES or self._used + total > _MAX_CACHE_BYTES:
-            raise ValueError("encoder receive exceeds the memory limit")
-        tensors = [torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in shapes]
-        if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        registration, _, descs = _descriptors(tensors, self.name)
-        attempted = False
+        with self._lock:
+            self._healthy()
+            if total > _MAX_TENSOR_BYTES or self._used + total > _MAX_CACHE_BYTES:
+                raise ValueError("encoder receive exceeds the memory limit")
+            self._used += total
+        tensors = []
+        agent = None
+        registration = None
+        registration_attempted = False
         registered = False
-        self._used += total
+        attempted = False
+        uncertain = False
         try:
-            self.agent.register_memory(registration)
+            tensors = [
+                torch.empty(shape, dtype=dtype, device=self.device) for shape, dtype in shapes
+            ]
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+            # NIXL metadata includes all registrations; isolate overlapping receives.
+            name = f"{self.name}-receive-{uuid.uuid4().hex}"
+            agent = self._agent_factory(name)
+            registration, _, descs = _descriptors(tensors, name)
+            registration_attempted = True
+            agent.register_memory(registration)
             registered = True
-            # Native agent metadata must include the just-registered buffers.
             destination = _encode(
                 {
-                    "name": self.name,
-                    "agent": base64.b64encode(self.agent.get_local_agent_desc()).decode(),
+                    "name": name,
+                    "agent": base64.b64encode(agent.get_local_agent_desc()).decode(),
                     "memory_type": "VRAM" if self.device.type == "cuda" else "DRAM",
                     "descs": descs,
                 }
@@ -326,23 +399,32 @@ class NixlEncoderCache:
                     pb.TransferEncoderCacheRequest(cache=reference, destination=destination),
                     timeout=_TIMEOUT_SECONDS + 10,
                 )
-            self.agent.deregister_memory(registration)
-            registered = False
-            self._used -= total
-            return tensors
-        except Exception:
-            if attempted or not registered:
-                # A lost RPC reply does not prove the remote WRITE stopped.
-                self.failed = True
-                _QUARANTINED.append((self.agent, tensors, registration))
+        except Exception as error:
+            rejected = (
+                isinstance(error, grpc.RpcError)
+                and error.code() == grpc.StatusCode.INVALID_ARGUMENT
+                and ENCODER_TRANSFER_REJECTED_METADATA in (error.trailing_metadata() or ())
+            )
+            uncertain = (attempted and not rejected) or (registration_attempted and not registered)
+            if rejected:
+                raise EncoderTransferRejected(error.details()) from error
+            raise
+        finally:
+            if uncertain:
+                self._quarantine(agent, tensors, registration)
             else:
                 try:
-                    self.agent.deregister_memory(registration)
-                    self._used -= total
+                    if registered:
+                        agent.deregister_memory(registration)
+                    if agent is not None:
+                        agent.shutdown()
                 except Exception:
-                    self.failed = True
-                    _QUARANTINED.append((self.agent, tensors, registration))
-            raise
+                    self._quarantine(agent, tensors, registration)
+                    raise
+                else:
+                    with self._lock:
+                        self._used -= total
+        return tensors
 
     def prepare(
         self,
@@ -373,8 +455,7 @@ class NixlEncoderCache:
             prompt = llm.tokenizer.decode(ids, skip_special_tokens=False)
             if llm.tokenizer.encode(prompt, add_special_tokens=False) != ids:
                 raise ValueError("encoder handoff requires lossless prompt token decoding")
-        with self._lock:
-            self._healthy()
+        with self._operation():
             tensors = self._receive(reference, value)
         exports = []
         try:
@@ -412,13 +493,28 @@ class NixlEncoderCache:
 
     def close(self):
         with self._lock:
+            if self._closing:
+                self._lock.wait_for(lambda: self._closed)
             if self._closed:
+                if self._close_error is not None:
+                    raise RuntimeError("encoder NIXL shutdown failed") from self._close_error
                 return
-            self._closed = True
-            if self.failed:
-                _QUARANTINED.append(self)
-                return
-            for item in self._exports.values():
-                self._discard(item)
-            self._exports.clear()
-            self.agent.shutdown()
+            self._closing = True
+            try:
+                if not self._lock.wait_for(lambda: not self._active, _TIMEOUT_SECONDS + 10):
+                    self.failed = True
+                    raise RuntimeError("encoder NIXL operations did not drain during shutdown")
+                if self.failed:
+                    return
+                for item in self._exports.values():
+                    self._discard(item)
+                self._exports.clear()
+            except Exception as error:
+                self.failed = True
+                self._close_error = error
+                raise
+            finally:
+                if self.failed:
+                    _QUARANTINED.append(self)
+                self._closed = True
+                self._lock.notify_all()

@@ -256,23 +256,31 @@ class EncoderCache:
         exports = []
         claimed = self.root / f"{identity}-{uuid.uuid4().hex}.tmp"
         try:
+            if request.WhichOneof("input") == "prompt":
+                prompt = request.prompt
+            else:
+                ids = list(request.token_ids.ids)
+                prompt = llm.tokenizer.decode(ids, skip_special_tokens=False)
+                if llm.tokenizer.encode(prompt, add_special_tokens=False) != ids:
+                    raise ValueError("encoder handoff requires lossless prompt token decoding")
             with self._lock():
                 self._collect()
                 if not path.is_file() or path.is_symlink():
                     raise ValueError("encoder handoff expired or was already consumed")
                 if path.stat().st_size > _MAX_TENSOR_BYTES + _MAX_METADATA_BYTES:
                     raise ValueError("encoder handoff exceeds the size limit")
+                with safe_open(str(path), framework="pt", device="cpu") as stored:
+                    encoded_metadata = stored.metadata()["handoff"]
+                    if len(encoded_metadata.encode()) > _MAX_METADATA_BYTES:
+                        raise ValueError("encoder handoff metadata exceeds the size limit")
+                    metadata = json.loads(encoded_metadata)
+                    if metadata["input_digest"] != _input_digest(request):
+                        raise ValueError("encoder handoff does not match the request inputs")
+                    if metadata["config_digest"] != _model_digest(llm):
+                        raise ValueError("encoder handoff belongs to another model configuration")
                 path.rename(claimed)
                 opened = safe_open(str(claimed), framework="pt", device="cpu")
             with opened as stored:
-                encoded_metadata = stored.metadata()["handoff"]
-                if len(encoded_metadata.encode()) > _MAX_METADATA_BYTES:
-                    raise ValueError("encoder handoff metadata exceeds the size limit")
-                metadata = json.loads(encoded_metadata)
-                if metadata["input_digest"] != _input_digest(request):
-                    raise ValueError("encoder handoff does not match the request inputs")
-                if metadata["config_digest"] != _model_digest(llm):
-                    raise ValueError("encoder handoff belongs to another model configuration")
                 handles = []
                 for i, item_metadata in enumerate(metadata["embedding_metadata"]):
                     handle = SharedTensorContainer.from_tensor(
@@ -294,13 +302,6 @@ class EncoderCache:
                         handle = SharedTensorContainer.from_tensor(tensor).dump_to_dict()
                         exports.append(handle)
                         mrope[field] = handle
-            if request.WhichOneof("input") == "prompt":
-                prompt = request.prompt
-            else:
-                ids = list(request.token_ids.ids)
-                prompt = llm.tokenizer.decode(ids, skip_special_tokens=False)
-                if llm.tokenizer.encode(prompt, add_special_tokens=False) != ids:
-                    raise ValueError("encoder handoff requires lossless prompt token decoding")
             params.multimodal_embedding_handles = handles
             params.multimodal_hashes = metadata["hashes"]
             params.mrope_position_ids_handle = mrope.get("mrope_position_ids_handle")
