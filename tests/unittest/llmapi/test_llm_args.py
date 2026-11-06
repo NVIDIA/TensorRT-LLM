@@ -5846,6 +5846,22 @@ class TestDSparkConfidenceScheduling:
         c = self._cfg()
         assert c.enable_confidence_scheduling is False
         assert c.confidence_min_predicted_gain == pytest.approx(0.04)
+        assert c.enable_fused_confidence_scheduler is True
+
+    def test_device_reranking_can_be_turned_off(self):
+        c = self._scheduled(enable_fused_confidence_scheduler=False)
+        assert c.enable_confidence_scheduling is True
+        assert c.enable_fused_confidence_scheduler is False
+
+    @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+    def test_device_reranking_needs_the_overlap_scheduler(
+            self, disable_overlap_scheduler):
+        from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+            _rank_dspark_on_host_without_overlap
+        c = self._scheduled()
+        _rank_dspark_on_host_without_overlap(c, disable_overlap_scheduler)
+        assert c.enable_fused_confidence_scheduler is (
+            not disable_overlap_scheduler)
 
     def test_confidence_paths_are_ignored_when_scheduling_is_off(self):
         # A static config copied from a dynamic one keeps working.

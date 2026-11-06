@@ -1849,6 +1849,11 @@
     {
       "capture_policy": "bool",
       "kind": "value",
+      "path": "speculative_config.enable_fused_confidence_scheduler"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
       "path": "speculative_config.enable_global_pool"
     },
     {
