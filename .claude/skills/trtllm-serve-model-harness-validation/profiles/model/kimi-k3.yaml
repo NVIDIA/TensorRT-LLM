@@ -73,6 +73,7 @@ markers:
 vocab_size: 163840                          # resolves id: last_vocab_id (M-02 on token ids)
 degenerate:
   - {token: "[PAD]", id: last_vocab_id, run: 20}   # vocab_size 163840; seen in runaway loops
+                                                   # from a numerical bug, fixed at its source
 
 reasoning:
   channel: think tag

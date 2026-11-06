@@ -131,10 +131,15 @@ tests, and the harness profile is measured. Then the question is whether the pai
 end, not how to write a layer, and a cell may go from S0 straight to real traffic:
 
 1. **S0 audit.** Read main against the harness contract and the model's format card, read-only.
-   List each gap with its code path. Look for an existing fix first (section 4, step 4).
-2. **One PR per gap.** Each comes with a test that fails on the old code. Pure logic also gets a
-   property with its mutation gate (`references/verify-logic.md`). Opening each PR is the
-   human's call (section 4, step 7).
+   List each candidate gap with its code path. A gap read from code is a candidate, not a
+   defect (section 5).
+2. **Confirm, then one PR per confirmed gap.** Replay what the harness was recorded sending, or
+   what the model was recorded writing, through main's code path. A gap that fails there is
+   confirmed: look for an existing fix first (section 4, step 4), then open a PR with a test that
+   fails on the old code. Pure logic also gets a property with its mutation gate
+   (`references/verify-logic.md`). Opening each PR is the human's call (section 4, step 7). A
+   candidate nothing confirms goes into the cell log with what would show it (a task, a probe,
+   a check); the real traffic of step 4 then decides.
 3. **A trial build:** main, plus the PRs the cell needs, plus the capture changes
    (`references/smoke.md` section 3d). Run every item's unit tests on it.
 4. **Real traffic.** S4 on local tasks, or an S5 run, judged like any run: the fast tier, then
@@ -256,8 +261,20 @@ when its job ends, not a timer. Take one step per iteration.
   `provenance.txt`. A moved checkout proves nothing.
 - **A regression test must fail on the old code.** A collection error on the old code is not a
   failure.
+- **Fix only what is shown to fail.** A fix needs evidence that the failure happens:
+  - a check that FAILs or flags on recorded traffic, with its locator;
+  - or a reproducer on the build under test that replays recorded input (a request the
+    harness sent, an output the model wrote) through the real code path.
+
+  A code reading, synthetic input nobody was seen to send or write, or a case that only
+  *would* happen is a candidate: log it with what would show it, and let the next run decide.
+  A PR's description states its evidence, never a hypothetical. This applies to fixes of code
+  that exists; a new layer (S1) is still built against the fault matrix.
 - **Do not hide model behavior in serving.** Attribute with the raw generation first, and keep
-  a conversation on one model.
+  a conversation on one model. A failure inside the model's generation, e.g. a degenerate token
+  run from a numerical or kernel bug, is detected and reported (M-02, R-04, the raw output) and
+  fixed at its source. Never stop, cut or rewrite it in serving: that hides the symptom that
+  leads to the bug.
 
 ## 6. Map
 

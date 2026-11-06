@@ -87,7 +87,8 @@ markers:
   - "<|end_of_box|>"
 
 vocab_size: 154880                          # GLM-5.3-NVFP4 config.json
-degenerate:                                 # from the GLM-5.3-NVFP4 tokenizer; read on token ids
+degenerate:                                 # from the GLM-5.3-NVFP4 tokenizer; read on token ids. A
+                                            # precaution: no GLM run has shown one (M-02 counted 0)
   - {id_range: [154821, 154826], run: 20}   # [MASK] [gMASK] [sMASK] <sop> <eop> <|system|>
   - {id: 154828, run: 20}                   # <|assistant|>
   - {id_range: [154830, 154837], run: 20}   # media and transcription markers

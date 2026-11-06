@@ -63,7 +63,8 @@ special_tokens:
   think_close: "</think>"
 
 vocab_size: 129280                          # resolves id: last_vocab_id (M-02 on token ids)
-degenerate:                                 # from the tokenizer (vocab 129280)
+degenerate:                                 # from the tokenizer (vocab 129280), as a precaution: no
+                                            # V4.1 run has shown one (M-02 counted 0 in every cell)
   - {token: "<｜▁pad▁｜>", id: 2, run: 20}                            # config pad_token_id
   - {token: "<|place_holder_mm_span_0442|>", id: last_vocab_id, run: 20}
   - '(?:<\|place_holder_mm_span_\d+\|>){20,}'                    # a run of any placeholder

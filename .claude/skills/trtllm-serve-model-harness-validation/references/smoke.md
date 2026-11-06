@@ -339,6 +339,10 @@ the server delivered.
 
 ## 3b. Fix a serving defect and prove it (A/B)
 
+**Show the defect first** (`SKILL.md` section 5). Start from a check that failed on recorded
+traffic, or reproduce the failure on the build under test by replaying recorded input through
+the real code path. A defect found by reading code stays a candidate until one of them shows it.
+
 **Look for an existing fix first.**
 - Open upstream PRs on the same code: list them (`gh pr list --state open --limit 1500`) and
   grep the titles. A port must not collide with one; extend that PR or stack on it.
@@ -367,6 +371,9 @@ the server delivered.
 - Opening the PR is the human's call (`SKILL.md` section 4). Write its body from the A/B in public
   terms: the model, the harness versions, the build and the counts. No internal system or cluster
   names.
+- State the evidence: where the failure was seen (model, harness, check, count) or the
+  reproducer and its recorded input. Never motivate a change with a case that only would happen,
+  and never extend a fix to a model that was not seen to fail.
 - Once it is open, track the PR's CI and reviews until it merges, merge conflicts included.
 - Before reporting a PR's state, read it from GitHub, not from memory.
 
