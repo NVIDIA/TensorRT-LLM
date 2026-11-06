@@ -65,7 +65,7 @@ def _decode(value):
         raise ValueError("invalid encoder transfer metadata size")
     try:
         result = json.loads(value)
-    except (ValueError, UnicodeError) as error:
+    except (ValueError, UnicodeError, RecursionError) as error:
         raise ValueError("invalid encoder transfer metadata") from error
     if not isinstance(result, dict):
         raise ValueError("encoder transfer metadata must be an object")
@@ -100,6 +100,7 @@ class _Export:
     metadata: dict
     created: float
     size: int
+    discard_requested: bool = False
 
 
 class NixlEncoderCache:
@@ -125,6 +126,7 @@ class NixlEncoderCache:
         self._lock = threading.Condition()
         self._active = 0
         self._exports = {}
+        self._claims = {}
         self._used = 0
         self.failed = False
         self._closed = False
@@ -241,6 +243,25 @@ class NixlEncoderCache:
             raise ValueError("invalid encoder endpoint")
         return value
 
+    def discard(self, reference):
+        value = self._reference(reference)
+        with self._lock:
+            if value["endpoint"] != self.endpoint:
+                raise ValueError("encoder handoff belongs to another producer")
+            identity = value["id"]
+            claimed = identity in self._claims
+            item = self._claims.get(identity) if claimed else self._exports.get(identity)
+            if item is None:
+                return False
+            if value.get("metadata") != item.metadata:
+                raise ValueError("encoder handoff metadata mismatch")
+            if claimed:
+                item.discard_requested = True
+                return False
+            del self._exports[identity]
+            self._discard(item)
+            return True
+
     def _claim(self, reference, destination):
         """Reserve a single-use export before importing any receiver metadata."""
         try:
@@ -279,6 +300,7 @@ class NixlEncoderCache:
                     raise ValueError("invalid encoder receiver agent") from error
                 # Claimed exports stay charged to quota and cannot expire during preflight.
                 del self._exports[value["id"]]
+                self._claims[value["id"]] = item
             return value["id"], item, peer, agent_desc
         except ValueError as error:
             raise EncoderTransferRejected(str(error)) from error
@@ -320,6 +342,7 @@ class NixlEncoderCache:
                 registered = False
                 agent.shutdown()
                 with self._lock:
+                    self._claims.pop(identity)
                     self._discard(item)
             except Exception as error:
                 if submitted:
@@ -335,8 +358,15 @@ class NixlEncoderCache:
                     self._quarantine(agent, item)
                     raise
                 with self._lock:
-                    self._exports[identity] = item
+                    self._claims.pop(identity)
+                    if item.discard_requested:
+                        self._discard(item)
+                    else:
+                        self._exports[identity] = item
                 raise EncoderTransferRejected(f"invalid encoder receiver: {error}") from error
+            finally:
+                with self._lock:
+                    self._claims.pop(identity, None)
 
     def _receive(self, reference, value):
         metadata = value.get("metadata")

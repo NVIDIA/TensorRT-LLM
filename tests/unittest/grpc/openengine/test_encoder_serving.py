@@ -243,6 +243,7 @@ async def test_encoder_capability_discovery_is_typed_and_role_specific(role, bac
         assert info.encoder.schema_version == 1
         assert info.encoder.encoder_only is (role == "encode")
         assert info.encoder.accepts_cache is (role == "consume")
+        assert info.extra["trtllm_encoder_cache_release"] is True
         assert list(info.encoder.transfer_backends) == [backend]
     if role == "encode":
         assert info.generation.output_logprobs.supported is False
@@ -317,3 +318,72 @@ async def test_uncertain_encoder_transport_withdraws_health():
     inference = _inference()
     inference._encoder_cache = SimpleNamespace(failed=True)
     assert not _servicer(inference=inference)._engine_is_healthy()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_publish_reclaims_the_completed_cache(tmp_path, monkeypatch):
+    llm, _ = model()
+    result, _ = native_result()
+    llm.args = SimpleNamespace(mm_encoder_only=True, guided_decoding_backend=None)
+    llm.tokenizer = None
+
+    class Handle:
+        disaggregated_params = result.disaggregated_params
+        finished = True
+        error = None
+
+        async def __aiter__(self):
+            yield self
+
+        async def aresult(self):
+            return self
+
+        def abort(self):
+            pass
+
+    llm.generate_async = lambda **kwargs: Handle()
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        servicer,
+        "_prepare_input_from_request",
+        lambda *args: SimpleNamespace(media=(), inputs="prompt"),
+    )
+    inference = servicer.OpenEngineInferenceServicer(llm, "qwen")
+    publish = inference._encoder_cache.publish
+    discard = inference._encoder_cache.discard
+    entered, reclaimed = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def delayed_publish(*args):
+        reference = publish(*args)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(5)
+        return reference
+
+    def record_discard(reference):
+        removed = discard(reference)
+        loop.call_soon_threadsafe(reclaimed.set)
+        return removed
+
+    monkeypatch.setattr(inference._encoder_cache, "publish", delayed_publish)
+    monkeypatch.setattr(inference._encoder_cache, "discard", record_discard)
+    req = request()
+    req.encoder.encode_only = True
+
+    async def consume():
+        return [value async for value in inference.Generate(req, FakeServicerContext())]
+
+    rpc = asyncio.create_task(consume())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert list(tmp_path.glob("*.safetensors"))
+        rpc.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await rpc
+    finally:
+        release.set()
+        await asyncio.gather(rpc, return_exceptions=True)
+    await asyncio.wait_for(reclaimed.wait(), 2)
+    assert not list(tmp_path.glob("*.safetensors"))
+    assert not inference._encoder_cleanup_failed

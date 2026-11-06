@@ -65,7 +65,8 @@ from .streaming import (
 class _PreprocessingWork:
     """Own exports until submission, including results from abandoned worker threads."""
 
-    def __init__(self) -> None:
+    def __init__(self, release: Callable[[Any], None] | None = None) -> None:
+        self._release_result = release or self._release
         self._lock = threading.Lock()
         self._abandoned = False
         self._result = None
@@ -85,7 +86,7 @@ class _PreprocessingWork:
             if not self._abandoned:
                 self._result = result
                 return result
-        self._release(result)
+        self._release_result(result)
         return None
 
     def transfer(self) -> None:
@@ -96,7 +97,7 @@ class _PreprocessingWork:
         with self._lock:
             self._abandoned = True
             result, self._result = self._result, None
-        self._release(result)
+        self._release_result(result)
 
 
 class _PreparationLease:
@@ -747,22 +748,35 @@ class OpenEngineInferenceServicer(openengine_pb2_grpc.InferenceServicer):
                     if result.finished:
                         await self._media_admission.acquire()
                         lease = _PreparationLease(self._media_admission)
+
+                        def discard_publication(reference: Any) -> None:
+                            if reference is None:
+                                return
+                            try:
+                                self._encoder_cache.discard(reference)
+                            except Exception as error:
+                                self._encoder_cleanup_failed = True
+                                logger.error(f"Failed to reclaim abandoned encoder cache: {error}")
+
+                        publication = _PreprocessingWork(discard_publication)
                         try:
                             cache = await lease.run(
                                 self._input_executor,
-                                self._encoder_cache.publish,
-                                result,
-                                request,
-                                self._llm,
+                                publication.run,
+                                partial(self._encoder_cache.publish, result, request, self._llm),
                             )
+                            if context.cancelled():
+                                return
+                            responses.append(
+                                generation_pb2.GenerateResponse(
+                                    request_id=request_id,
+                                    encoder_ready=generation_pb2.EncoderReady(cache=cache),
+                                )
+                            )
+                            publication.transfer()
                         finally:
+                            publication.abandon()
                             lease.close()
-                        responses.append(
-                            generation_pb2.GenerateResponse(
-                                request_id=request_id,
-                                encoder_ready=generation_pb2.EncoderReady(cache=cache),
-                            )
-                        )
                 else:
                     responses = _format_result(result, format_state)
                 for resp in responses or ():

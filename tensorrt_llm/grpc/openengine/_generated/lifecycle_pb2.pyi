@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from . import generation_pb2 as _generation_pb2
 from . import kv_pb2 as _kv_pb2
 from . import server_pb2 as _server_pb2
 from google.protobuf.internal import containers as _containers
@@ -71,14 +72,16 @@ class HealthCheck(_message.Message):
     def __init__(self, name: _Optional[str] = ..., state: _Optional[_Union[HealthState, str]] = ..., message: _Optional[str] = ...) -> None: ...
 
 class AbortRequest(_message.Message):
-    __slots__ = ("request_id", "kv_session", "all_requests")
+    __slots__ = ("request_id", "kv_session", "all_requests", "encoder_cache")
     REQUEST_ID_FIELD_NUMBER: _ClassVar[int]
     KV_SESSION_FIELD_NUMBER: _ClassVar[int]
     ALL_REQUESTS_FIELD_NUMBER: _ClassVar[int]
+    ENCODER_CACHE_FIELD_NUMBER: _ClassVar[int]
     request_id: str
     kv_session: _kv_pb2.KvSessionRef
     all_requests: AllRequests
-    def __init__(self, request_id: _Optional[str] = ..., kv_session: _Optional[_Union[_kv_pb2.KvSessionRef, _Mapping]] = ..., all_requests: _Optional[_Union[AllRequests, _Mapping]] = ...) -> None: ...
+    encoder_cache: _generation_pb2.EncoderCacheRef
+    def __init__(self, request_id: _Optional[str] = ..., kv_session: _Optional[_Union[_kv_pb2.KvSessionRef, _Mapping]] = ..., all_requests: _Optional[_Union[AllRequests, _Mapping]] = ..., encoder_cache: _Optional[_Union[_generation_pb2.EncoderCacheRef, _Mapping]] = ...) -> None: ...
 
 class AllRequests(_message.Message):
     __slots__ = ()

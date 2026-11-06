@@ -7,6 +7,7 @@ syntax = "proto3";
 
 package openengine.v1;
 
+import "openengine/v1/generation.proto";
 import "openengine/v1/kv.proto";
 import "openengine/v1/server.proto";
 
@@ -47,6 +48,9 @@ message AbortRequest {
     string request_id = 1;
     KvSessionRef kv_session = 2;
     AllRequests all_requests = 3;
+    // Release an unclaimed single-use encoder export at its producer. This never
+    // interrupts a claimed transfer or releases buffers still in use by it.
+    EncoderCacheRef encoder_cache = 4;
   }
 }
 

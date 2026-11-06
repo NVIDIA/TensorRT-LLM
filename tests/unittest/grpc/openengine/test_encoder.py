@@ -280,3 +280,44 @@ def test_encoder_role_validation_fails_closed():
     req.encoder.cache.transfer_backend = oe.BACKEND
     with pytest.raises(UnsupportedFeatureError, match="must not consume an encoder cache"):
         oe.validate_encoder(req, "consume")
+
+
+def test_discard_is_idempotent_and_never_releases_a_claimed_handoff(tmp_path):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, _ = model()
+    ref = cache.publish(native_result()[0], request(), llm)
+    assert cache.discard(ref)
+    assert not cache.discard(ref)
+    assert not list(tmp_path.glob("*.safetensors"))
+    with pytest.raises(ValueError, match="already consumed"):
+        cache.prepare(ref, request(), llm, None)
+
+    ref = cache.publish(native_result()[0], request(), llm)
+    preprocess = llm.preprocess
+
+    def prepare_claimed(*args):
+        assert list(tmp_path.glob("*.tmp"))
+        assert not cache.discard(ref)
+        assert list(tmp_path.glob("*.tmp"))
+        return preprocess(*args)
+
+    llm.preprocess = prepare_claimed
+    cache.prepare(ref, request(), llm, None)
+    assert not cache.discard(ref)
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_discard_rejects_foreign_and_malformed_references(tmp_path):
+    cache = oe.EncoderCache(str(tmp_path))
+    llm, _ = model()
+    ref = cache.publish(native_result()[0], request(), llm)
+    value = json.loads(ref.opaque_state)
+    for key, replacement in (("namespace", "foreign"), ("host", "foreign"), ("id", "../file")):
+        malformed = pb.EncoderCacheRef(
+            transfer_backend=oe.BACKEND,
+            opaque_state=json.dumps({**value, key: replacement}).encode(),
+        )
+        with pytest.raises(ValueError):
+            cache.discard(malformed)
+        assert len(list(tmp_path.glob("*.safetensors"))) == 1
+    assert cache.discard(ref)
