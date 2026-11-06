@@ -3964,7 +3964,12 @@ class M3Eagle3Worker(Eagle3OneModelWorker):
         accepted_tokens,
         pre_draft_seq_lens,
     ):
-        """The fused draft loop on a step it covers (``_m3_fused_loop_ok``), else the in-tree loop."""
+        """Run the fused draft loop on a covered step, otherwise the in-tree loop.
+
+        Returns:
+            (next_draft_tokens, next_new_tokens): the fused loop's draft and next-input
+            buffers, or the in-tree loop's pair. A None next-input buffer is built by the caller.
+        """
         if self._m3_fused_loop_ok(attn_metadata, spec_metadata, batch_size, draft_model):
             next_draft_tokens = self._m3_fused_draft_loop(
                 inputs,
