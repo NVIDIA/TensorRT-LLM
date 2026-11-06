@@ -36,6 +36,7 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
 from fastapi.responses import JSONResponse
 
+from tensorrt_llm.executor.utils import RequestError, context_length_exceeded_counts
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicContentBlockDeltaEvent,
@@ -95,6 +96,99 @@ def anthropic_error_response(
 ) -> JSONResponse:
     envelope = AnthropicErrorResponse(error=AnthropicError(type=error_type, message=message))
     return JSONResponse(content=envelope.model_dump(exclude_none=True), status_code=status_code)
+
+
+def prompt_too_long_message(message: str) -> Optional[str]:
+    """Anthropic's wording for this server's over-length rejection, or None.
+
+    Anthropic answers a prompt longer than the context window with an
+    ``invalid_request_error`` that reads ``prompt is too long: N tokens > M
+    maximum``, and Claude Code compacts its conversation on that wording. The
+    server's own rejection (``context_length_exceeded_message``) is recognized
+    anywhere in ``message``. M is the longest prompt the server accepts, one
+    token below its context length, so the inequality also holds for a prompt
+    that fills the context exactly.
+    """
+    counts = context_length_exceeded_counts(message)
+    if counts is None:
+        return None
+    max_context_length, num_prompt_tokens = counts
+    return f"prompt is too long: {num_prompt_tokens} tokens > {max_context_length - 1} maximum"
+
+
+def anthropic_chat_error_response(message: str, status_code: int) -> JSONResponse:
+    """The Anthropic error for a failure the chat pipeline reported.
+
+    A 4xx is the client's ``invalid_request_error`` and anything else an
+    ``api_error``. A prompt longer than the context is answered as Anthropic
+    answers it: a 400 ``invalid_request_error`` in Anthropic's wording.
+    """
+    too_long = prompt_too_long_message(message)
+    if too_long is not None:
+        return anthropic_error_response(too_long, "invalid_request_error", 400)
+    error_type = "invalid_request_error" if 400 <= status_code < 500 else "api_error"
+    return anthropic_error_response(message, error_type, status_code)
+
+
+# Seconds a streamed request is held before its response starts, for the
+# engine's verdict on its prompt. The engine rejects a prompt longer than its
+# context when it admits the request, well within this; a first token can take
+# far longer, and the stream then starts without waiting for it.
+STREAM_ADMISSION_WAIT_S = 1.0
+
+
+async def wait_for_stream_start(
+    openai_sse: AsyncIterator[Union[str, bytes]],
+) -> Union[JSONResponse, AsyncIterator[Union[str, bytes]]]:
+    """Wait up to ``STREAM_ADMISSION_WAIT_S`` for the first frame of a chat stream.
+
+    An engine in a worker process rejects a prompt longer than its context only
+    as the failure of the stream's first frame, when a response started at once
+    would already be under way. Anthropic answers such a prompt with HTTP 400
+    before any stream, and Claude Code compacts its conversation on that error,
+    so the rejection is returned here as that 400. Otherwise the stream is
+    returned with its first frame, to be read as before; a rejection that
+    arrives after the wait ends the stream with an error event in the same
+    wording.
+    """
+    first = asyncio.ensure_future(openai_sse.__anext__())
+    try:
+        await asyncio.wait((first,), timeout=STREAM_ADMISSION_WAIT_S)
+    except asyncio.CancelledError:
+        first.cancel()
+        raise
+    if first.done() and not first.cancelled() and isinstance(first.exception(), RequestError):
+        too_long = prompt_too_long_message(str(first.exception()))
+        if too_long is not None:
+            return anthropic_error_response(too_long, "invalid_request_error", 400)
+    return _resume_stream(first, openai_sse)
+
+
+async def _resume_stream(
+    first: asyncio.Future, rest: AsyncIterator[Union[str, bytes]]
+) -> AsyncIterator[Union[str, bytes]]:
+    """Yield the frame ``first`` reads from ``rest``, then the remaining frames of ``rest``.
+
+    Cancelling a read that waits on ``first`` cancels ``first`` too, and
+    closing this stream closes ``rest``.
+    """
+    try:
+        try:
+            frame = await first
+        except StopAsyncIteration:
+            return
+        except RequestError as e:
+            too_long = prompt_too_long_message(str(e))
+            if too_long is None:
+                raise
+            raise AnthropicResponseError(too_long) from e
+        yield frame
+        async for frame in rest:
+            yield frame
+    finally:
+        aclose = getattr(rest, "aclose", None)
+        if aclose is not None:
+            await aclose()
 
 
 # ---------------------------------------------------------------------------
