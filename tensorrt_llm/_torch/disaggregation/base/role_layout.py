@@ -188,7 +188,9 @@ class RoleLayout:
     @property
     def dtype(self) -> str | None:
         """The type of the elements by name, such as ``"bfloat16"``, or None where the layout
-        states none; peers whose elements differ in type do not correspond."""
+        states none. Where both peers' layouts state one, peers whose elements differ in type do
+        not correspond (``space``); a layout stating none leaves the element type to the manager's
+        spec as a whole (``quant_mode``, ``mixed_precision``) and peers' byte sizes."""
         return None
 
     def resolve(self, site: Any) -> RoleLayout:
@@ -213,9 +215,9 @@ class RoleLayout:
         raise NotImplementedError(f"role layout {self.name!r} gives no space")
 
     def even(self, ranks: int) -> bool:
-        """Whether pieces over ``ranks`` ranks name the same bytes under every rank count that
-        divides it or that it divides, so that ranks of those counts holding the same bytes may
-        share names: yes by default."""
+        """Whether pieces over ``ranks`` ranks fall on the layout's own boundaries (for a head
+        split, whether its total and ``ranks`` divide one another), so that ranks holding the
+        same bytes under another such count may share names: yes by default."""
         return True
 
     def positions(self, page: int, end: int, tokens_per_page: int) -> range:
@@ -387,9 +389,9 @@ class ByHead(RoleLayout):
     states their bytes (``head_bytes``), and for attention their total over all ranks
     (``total``); recurrent state's total is its heads on this rank times the ranks. A spec states
     the total alone where the layer's KV heads over all ranks are not it, as MLA's one latent head,
-    which every rank holds whole (``total=1``). A buffer whose heads are unknown, or whose size
-    they do not divide, is this rank's own share (``Own``); with a stated total, ``resolve``
-    refuses it (ValueError).
+    which every rank holds whole (``total=1``). A buffer whose heads are unknown (for attention,
+    also their total over all ranks), or whose size they do not divide, is this rank's own share
+    (``Own``); with a stated total, ``resolve`` refuses it (ValueError).
 
     Attributes:
         token_major: Tokens outermost ([token, head, ...], NHD) rather than heads (HND).
@@ -436,17 +438,20 @@ class ByHead(RoleLayout):
                 f"heads of {head_bytes} bytes are an attention buffer's own; state how many lie "
                 "over all tensor ranks (total)"
             )
-        if head_bytes is None or site.size % head_bytes:
+        if head_bytes is None or site.size % head_bytes or (total is None and not site.state):
             if self.total is not None:
                 raise ValueError(
                     f"a split of {self.total} heads states heads a buffer of {site.size} bytes "
                     "does not hold whole"
                 )
             return Own(site.split)
+        if total is None:
+            # Recurrent state: as many heads on every rank of the split.
+            total = site.size // head_bytes * site.ranks
         return dataclasses.replace(
             self,
             head_bytes=head_bytes,
-            total=total or site.size // head_bytes * site.ranks,
+            total=total,
             tokens=site.tokens if self.token_major else None,
             split=site.split,
         )

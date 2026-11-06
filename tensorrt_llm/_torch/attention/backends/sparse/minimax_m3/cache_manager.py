@@ -889,8 +889,9 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         }
 
     def page_table_spec(self) -> PageTableSpec:
-        """K/V and their block scales split by head as the backend writes them, head-major (MSA)
-        or token-major (Triton); index-K alike on every rank."""
+        """K/V and their block scales split by head as the backend writes them: token-major for
+        the Triton backend over an FP8 or NVFP4 cache, else head-major (``_main_kv_mapper_kind``);
+        index-K alike on every rank."""
         return replace(
             super().page_table_spec(),
             role_layouts={Role.INDEX_KEY: Replicated()},

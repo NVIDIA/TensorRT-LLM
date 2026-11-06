@@ -1623,14 +1623,21 @@ class DeepseekV4CacheManager(SparseOffloadCacheMixin, KVCacheManagerV2):
         latents of one KV head, which every tensor rank holds whole: split by that one head as the
         base manager splits an MLA cache. Storage-only NVFP4 alignment pages hold no state a peer
         needs and never move. FP8 pages carrying their own scales are quantized as
-        ``"fp8_ds_mla"``."""
+        ``"fp8_ds_mla"``. NVFP4 KV compresses the compressed cache to NVFP4 with its block scales
+        and keeps the other caches in FP8; the spec names it ``"nvfp4"``, as configured."""
         spec = super().page_table_spec()
         head_split = (COMPRESS_BLOCK_SCALE_ROLE, *_ATTENTION_TYPE_ROLES)
+        if self.use_fp8_ds_mla:
+            quant_mode = "fp8_ds_mla"
+        elif self._use_nvfp4_compress:
+            quant_mode = "nvfp4"
+        else:
+            quant_mode = spec.quant_mode
         return replace(
             spec,
             role_layouts={**spec.role_layouts, **{role: ByHead(total=1) for role in head_split}},
             untransferred_roles=spec.untransferred_roles | self._disagg_ignored_roles,
-            quant_mode="fp8_ds_mla" if self.use_fp8_ds_mla else spec.quant_mode,
+            quant_mode=quant_mode,
         )
 
     def get_disagg_ignored_roles(self) -> frozenset[DataRole]:

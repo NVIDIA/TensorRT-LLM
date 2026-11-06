@@ -139,7 +139,7 @@ from ..resource_manager import (
     scan_kv_buffer_for_invalid_values,
 )
 from ..scheduler import ScheduledRequests
-from .page_table import ByHead, PageTableSpec, kv_dtype_name
+from .page_table import ByHead, PageTableSpec, kv_dtype_name, layer_groups
 from .regions import RegionLayout, RegionProvider, lay_out_regions
 from .sparse_offload_memory import (
     HostHistoryReservations,
@@ -5049,29 +5049,38 @@ class KVCacheManagerV2(BaseResourceManager):
                 "mixed_precision_last_n."
             )
 
-    def _mixed_precision_global_layer_ids(self, layer_group_id: int) -> List[int]:
-        """Return the global layer ids of a layer group under mixed-precision KV.
+    def _mixed_precision_layer_names(self) -> dict[int, tuple[int, int]]:
+        """Internal layer id -> (global layer id, model layer) of every layer under mixed-precision
+        KV.
 
         A mixed-precision high layer of global model layer L gets 2L + 1 and every other layer
         gets twice the id it has without mixed-precision KV, so the ids are collision-free and the
-        same on every pipeline rank. Disaggregated transfer and KV cache sharing read these ids.
+        same on every pipeline rank. A layer's id is its own, whichever layer group holds it; a
+        high layer's model layer is that of the local layer it belongs to.
         """
-        high = {
-            int(high_layer): 2 * int(self.pp_layers[local]) + 1
-            for local, high_layer in self.mixed_precision_high_layers.items()
-        }
-        layer_ids = self._layer_ids_by_group[layer_group_id]
+        names = {}
         virtual = getattr(self, "_layer_attn_to_layer_id", None)
         if virtual:
             # The disaggregation extractor's encoding: model layer x attention types + attention type.
             num_types = max(member.value for member in type(next(iter(virtual))[1])) + 1
-            own = {}
             for (model_layer, attn_type), layer_id in virtual.items():
-                own.setdefault(int(layer_id), model_layer * num_types + attn_type.value)
+                own = int(model_layer) * num_types + attn_type.value
+                names.setdefault(int(layer_id), (2 * own, int(model_layer)))
         else:
             # By model layer, as the hybrid manager names them too (it has no FP4 MLA layout here).
-            own = {local: int(model_layer) for local, model_layer in enumerate(self.pp_layers)}
-        return [high[layer_id] if layer_id in high else 2 * own[layer_id] for layer_id in layer_ids]
+            for local, model_layer in enumerate(self.pp_layers):
+                names[local] = (2 * int(model_layer), int(model_layer))
+        for local, high_layer in self.mixed_precision_high_layers.items():
+            model_layer = int(self.pp_layers[local])
+            names[int(high_layer)] = (2 * model_layer + 1, model_layer)
+        return names
+
+    def _mixed_precision_global_layer_ids(self, layer_group_id: int) -> List[int]:
+        """Return the global layer ids of a layer group under mixed-precision KV
+        (``_mixed_precision_layer_names``). Disaggregated transfer and KV cache sharing read these
+        ids."""
+        names = self._mixed_precision_layer_names()
+        return [names[layer_id][0] for layer_id in self._layer_ids_by_group[layer_group_id]]
 
     def _get_mixed_precision_buffers(
         self, layer_offset: int, kv_layout: str, mixed_precision_pool: str
@@ -5205,7 +5214,8 @@ class KVCacheManagerV2(BaseResourceManager):
         head_split = ByHead(total=1) if self.kv_factor == 1 else ByHead()
         layer_ids = mixed_precision = None
         if self.mixed_precision_low_dtype is not None:
-            layer_ids = self._mixed_precision_page_layer_ids()
+            names = self._mixed_precision_layer_names()
+            layer_ids = {layer: names[layer] for layers in layer_groups(self) for layer in layers}
             mixed_precision = (
                 str(self.mixed_precision_low_dtype.name).lower(),
                 str(self.mixed_precision_high_dtype.name).lower(),
@@ -5216,26 +5226,6 @@ class KVCacheManagerV2(BaseResourceManager):
             quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
             mixed_precision=mixed_precision,
         )
-
-    def _mixed_precision_page_layer_ids(self) -> dict[int, tuple[int, int]]:
-        """Internal layer id -> (global layer id, model layer) of every layer under
-        mixed-precision KV, the global layers those ``_mixed_precision_global_layer_ids`` gives;
-        a high layer's model layer is that of the local layer it belongs to."""
-        virtual = getattr(self, "_layer_attn_to_layer_id", None)
-        if virtual:
-            model_layers = {}
-            for (model_layer, _attn_type), layer_id in virtual.items():
-                model_layers.setdefault(int(layer_id), int(model_layer))
-        else:
-            model_layers = dict(enumerate(int(model_layer) for model_layer in self.pp_layers))
-        for local, high_layer in self.mixed_precision_high_layers.items():
-            model_layers[int(high_layer)] = int(self.pp_layers[local])
-        layer_ids = {}
-        for group, layers in enumerate(self.impl.layer_grouping):
-            global_layers = self._mixed_precision_global_layer_ids(group)
-            for layer_id, global_layer in zip(layers, global_layers, strict=True):
-                layer_ids[int(layer_id)] = (int(global_layer), model_layers[int(layer_id)])
-        return layer_ids
 
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:
         """Map native cache roles to disaggregation mapper kinds.
