@@ -29,6 +29,7 @@ import torch
 from transformers import LlamaConfig
 
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints import memory_init
 from tensorrt_llm._torch.modules.embedding import Embedding, LMHead
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_module
@@ -280,7 +281,7 @@ def test_model_loader_rejects_ignored_lm_head_output_dtype(
         max_seq_len=8,
     )
     monkeypatch.setattr(loader, "_load_and_validate_config", lambda *_args: config)
-    monkeypatch.setattr(model_loader_module, "MetaInitMode", nullcontext)
+    monkeypatch.setattr(memory_init, "MetaInitMode", nullcontext)
     monkeypatch.setattr(
         model_loader_module, "maybe_create_moe_load_balancer", lambda *_args: nullcontext()
     )
