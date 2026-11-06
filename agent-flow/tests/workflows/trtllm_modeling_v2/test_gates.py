@@ -234,6 +234,25 @@ def test_the_gate_reads_the_driver_and_names_the_member(tmp_path):
     assert result.summary().startswith("[PASS] serve@tp1: trtllm-serve healthy after 3.0s")
 
 
+def test_a_checked_boot_prompt_has_room_for_its_answer_at_boot_and_at_serve():
+    """A chat-templated reasoning model states the Natalia prompt's 72 after some 50 tokens."""
+    natalia = {
+        "prompt": "Natalia sold 48 clips in April and half as many in May.",
+        "keywords": ["72"],
+    }
+    task = {"checkpoint_path": "/ckpt/model", "accuracy": {"boot": {"prompts": [natalia]}}}
+    boot = boot_checks.resolve_boot_spec(task, "core")
+    assert [r["max_tokens"] for r in boot.requests(None)] == [128]
+    served = sg.serve_requests(task, sg.ServeSpec.from_task(task), boot)
+    assert [r["body"]["max_tokens"] for r in served] == [128, 128]
+    # A serve budget below the boot's still gives the boot's answer the boot's room.
+    task["accuracy"]["boot"]["max_tokens"] = 256
+    task["accuracy"]["serve"] = {"max_tokens": 16}
+    boot = boot_checks.resolve_boot_spec(task, "core")
+    served = sg.serve_requests(task, sg.ServeSpec.from_task(task), boot)
+    assert [(r["id"], r["body"]["max_tokens"]) for r in served] == [("text", 16), ("item0", 256)]
+
+
 NODE = "tests/integration/defs/accuracy/test_disaggregated_multinode.py::TestStep5::test_dep4"
 
 

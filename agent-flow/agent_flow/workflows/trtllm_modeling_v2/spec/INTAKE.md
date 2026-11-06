@@ -148,7 +148,10 @@ benchmark you start by hand runs captured too.
   unit's).
 - **Boot prompts.** One checked factual prompt and one checked arithmetic word problem (a
   benchmark-style question with its numeric answer as the keyword): cheap semantic signal at every
-  boot.
+  boot. Leave `max_tokens` at its default, 128, or above: a chat-templated or reasoning model
+  states the GSM8K "Natalia" prompt's 72 only after some 50 tokens, and a shorter budget fails a
+  working target on a missing keyword. The serve gate gives its answers to these prompts the
+  larger of `accuracy.serve.max_tokens` and the boot's.
 - **Boot boundaries** (`accuracy.envelope`). Off unless the request asks for them (prompts at
   `max_seq_len`, loaded batches). When on, one boot per unit runs them (`members` picks it), and a
   probe whose legs part on a near-tie (`tie_margin`) passes with a note. Give `probes` with one
