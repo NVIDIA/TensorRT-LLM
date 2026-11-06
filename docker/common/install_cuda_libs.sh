@@ -12,9 +12,9 @@ CUDA_VER="13.4" # the NGC PyTorch image's CUDA_VERSION, major.minor
 # included, then ends up on a cuDNN anyone can install, and the tests validate that combination
 # rather than one only NGC can reproduce. The version guard below will not match on NGC PyTorch,
 # so its cuDNN is deliberately purged and reinstalled at this version.
-CUDNN_VER="9.25.1.1-1"
-NCCL_VER="2.30.7-1+cuda13.3"
-CUBLAS_VER="13.7.0.27-1"
+CUDNN_VER="9.26.0.51-1"
+NCCL_VER="2.31.2-1+cuda13.4"
+CUBLAS_VER="13.8.0.4-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="13.4.59-1"

@@ -35,7 +35,8 @@ TensorRT LLM's sparse attention algorithms fall into two categories.
   shared `AttentionOp`, while a dedicated backend can own prediction and
   sparse computation end to end. Examples: **RocketKV** (token-level prompt
   eviction plus page-level MHA/MQA/GQA decode selection), **DSA**
-  (token-level MLA), and **MiniMax-M3** (block-level GQA).
+  (token-level MLA), **CSA2** (compressed sparse MLA with shared sources),
+  and **MiniMax-M3** (block-level GQA).
 - **Kernel-level**: sparsity is implemented entirely inside the
   attention kernel — there is no external prediction or gather step.
   The kernel decides what to skip from runtime values such as Softmax
@@ -137,6 +138,33 @@ The current capability matrix is:
 | Block-sparse MHA / MQA / GQA | sparse computation (block-level, contiguous Q/K/V without a KV cache) | sparse computation (block-level, paged) |
 
 Dynamic generation-phase KV eviction is tracked as future work.
+
+### CSA2 integration reference
+
+| Integration | CSA2 implementation |
+|---|---|
+| Public config / lowering | `CSA2SparseAttentionConfig(algorithm="csa2")` → `CSA2Params`, `CSA2MetadataParams`; checkpoint-owned `CSA2Layout` |
+| Registry | TRTLLM sparse backend → `CSA2TrtllmAttention`; cache manager → `CSA2CacheManager` (V2) |
+| Module | Typed MLA adapter in `sparse/csa2/module.py`; compression, shared KV/index source routing and per-phase prediction |
+| Metadata | `CSA2TrtllmMetadata`; SWA slots/visibility, owner page tables, compressor inputs, graph-stable index descriptors and query tiles |
+| Compute | SM100-family trtllm-gen; SM90 FlashMLA BF16 and SM120/121 FlashInfer BF16 helpers |
+
+CSA2 GLOBAL pages couple 288-byte main and 68-byte index records under one
+physical lifecycle and `REQUIRED` reuse policy. Encoder SWA is `REQUIRED` or
+`OPTIONAL` when Encoder recovery is enabled; eligible bounded Decoder replay
+uses `PRIVATE` SWA. Replay planning must preserve GLOBAL publication and refresh
+SWA read floors before attention. Graph capture owns its reserved buffers;
+eager shape changes evict only uncaptured tiles/arenas.
+
+The workspace contract has two parts: a complete-prefix index-gather rate
+with `runtime_workspace_is_chunked_prefill_bounded=False`, and fixed native
+index/radix arenas sized from serving batch, sequence and draft capacities.
+The estimator conservatively reserves the full fixed capacity alongside the
+profiled peak, covering a decode arena allocated after peak prefill. Do not
+use an attended-KV admission cap to bound a graph arena.
+See the [attention developer guide](../../../tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md#23-backend-contract)
+and [CSA2 implementation guide](../../../tensorrt_llm/_torch/attention/backends/sparse/csa2/README.md)
+for ownership, hardware/shape limits, replay flags and accuracy validation.
 
 ### Prediction hooks
 
@@ -330,6 +358,10 @@ three prediction methods. A `VanillaAttention` implementation instead overrides
   (BSR `block_indptr`/`block_indices` or a packed `exact_block_bits`
   bitmask), optional K/V summaries for proxy routes, and optional
   `kv_valid_bits` masking ragged KV tails.
+- **Summary contract**: both `k_summary` and `v_summary` are arithmetic means
+  over the tokens present in each KV block, excluding padding in a partial
+  final block. The kernel applies the represented token count to each proxy;
+  do not pass V sums or pre-weight the summaries.
 - **Default**: hands through `SparseBackendForwardArgs.block_sparse_inputs`,
   so modules that predict before the core forward do not override it.
   Override it to predict inside the backend from the flattened Q/K/V,

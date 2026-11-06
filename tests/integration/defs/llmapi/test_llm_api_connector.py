@@ -14,14 +14,18 @@
 # limitations under the License.
 
 import hashlib
+import json
 import logging
 import math
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
 from contextlib import ExitStack
+from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -30,17 +34,19 @@ import pytest
 
 from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
-    V2_RETENTION_IGNORED_LOG_KEY, KvCacheConnectorManager,
-    KvCacheConnectorWorker, PrefixLoad, SchedulerOutput)
+    KvCacheConnectorManager, KvCacheConnectorWorker, PrefixLoad,
+    SchedulerOutput)
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings.executor import KvCacheTransferMode
+from tensorrt_llm.llmapi import RequestError
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           CapacitySchedulerPolicy,
                                           KvCacheConfig, KvCacheConnectorConfig,
                                           NGramDecodingConfig, SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
-from tensorrt_llm.logger import logger as trtllm_logger_singleton
+from tensorrt_llm.llmapi.mpi_session import split_mpi_env
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
 
 from ..conftest import get_sm_version, llm_models_root
@@ -67,7 +73,7 @@ CONNECTOR_V1_ONLY_KV_CACHE_MANAGER_METHODS = (
     # `PyExecutor._maybe_init_kv_connector_manager`.
     "get_unique_primary_pool",
     # `KvCacheConnectorSchedulerOutputRequest.update_and_build_data` and
-    # `PyExecutor.kv_connector_request_finished`.
+    # `PyExecutor._start_connector_async_save`.
     "get_cache_indices",
     # `update_and_build_data`, for `RequestData.block_hashes`.
     "commit_and_get_block_hashes",
@@ -117,6 +123,7 @@ def model_with_connector(use_kv_cache_manager_v2):
         mock_worker = MagicMock()
         mock_scheduler.request_finished.return_value = False
         mock_worker.get_finished.return_value = [], []
+        mock_worker.capacity_only = False
 
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
@@ -261,13 +268,9 @@ def generate_and_wait(model, scheduler, worker, *args, **kwargs):
 def test_v2_connector_contract_does_not_reuse_the_v1_methods():
     """The V2 connector path implements none of the V1 accessors, by design.
 
-    Something depends on that, and it does not ask: `update_and_build_data`
-    reports `block_hashes` and `priorities` empty on V2 by branching on
-    `isinstance(manager, KVCacheManagerV2)`, not on `hasattr`. Those
-    short-circuits are only correct while V2 genuinely has no such accessor -
-    the day one is added (retention priorities are a known gap; see
-    `test_connector_priorities`) the branch keeps reporting nothing while the
-    data exists, and this is what says so.
+    The V2 branch of `update_and_build_data` reads native page priorities and
+    reports page indices per layer group. It must not call the V1 accessors,
+    which assume one flat block-id space across all layers.
 
     A static check rather than an end-to-end run: under V2 the connector would
     die at the *first* method it reached, so no run can report more than one at
@@ -298,7 +301,7 @@ def test_v2_connector_contract_does_not_reuse_the_v1_methods():
 
     # The other half of the contract: what V2 offers instead. Every connector
     # path on V2 goes through this one accessor - `update_and_build_data`,
-    # `kv_connector_request_finished` and `_run_kv_connector_hooks` each call it
+    # `_start_connector_async_save` and `_run_kv_connector_hooks` each call it
     # and derive the flat list from `[0]` when there is a single layer group.
     assert hasattr(KVCacheManagerV2, "get_page_indices_by_layer_group"), (
         "KVCacheManagerV2.get_page_indices_by_layer_group is the V2 "
@@ -349,8 +352,10 @@ def test_connector_runs_on_kv_cache_manager_v2(enforce_single_worker,
                 "tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
         ) as importlib_mock:
             connector_module = importlib_mock.import_module.return_value
+            mock_worker = MagicMock()
+            mock_worker.capacity_only = False
             connector_module.KvConnectorScheduler.return_value = MagicMock()
-            connector_module.KvConnectorWorker.return_value = MagicMock()
+            connector_module.KvConnectorWorker.return_value = mock_worker
 
             try:
                 llm = LLM(
@@ -1072,6 +1077,13 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
     scheduler.get_num_new_matched_tokens.return_value = 0, False
     worker.get_finished.return_value = [], []
 
+    with pytest.raises(RequestError, match="retention.*multiple layer groups"):
+        model.generate([0] * SWA_NUM_INPUT_TOKENS,
+                       sampling_params=SamplingParams(max_tokens=4),
+                       kv_cache_retention_config=KvCacheRetentionConfig([]))
+    scheduler.update_state_after_alloc_by_layer_group.assert_not_called()
+    scheduler.request_finished_by_layer_group.assert_not_called()
+
     generate_and_wait(model, scheduler, worker, [0] * SWA_NUM_INPUT_TOKENS,
                       SamplingParams(max_tokens=4, ignore_eos=True))
 
@@ -1089,6 +1101,7 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
     req = sched_output.new_requests[0]
 
     assert req.new_block_ids == []
+    assert req.priorities is None
     assert len(req.new_block_ids_by_layer_group) == 2
     # Ordinals stay positionally aligned across groups: a block with no page in
     # the sliding group, or one the window has passed, reads back as
@@ -1122,24 +1135,45 @@ def test_connector_vswa_reports_page_indices_per_layer_group(
     )
 
 
-def _disagg_transceiver_config(use_kv_cache_manager_v2):
-    """The transceiver each KV cache manager can actually be driven by.
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
+                         ids=["kv_cache_manager_v2"],
+                         indirect=True)
+def test_capacity_only_connector_accepts_multigroup_retention(
+        enforce_single_worker, model_with_connector, use_kv_cache_manager_v2):
+    model_fn, scheduler, worker = model_with_connector
+    worker.capacity_only = True
+    model = model_fn(disable_overlap_scheduler=True,
+                     max_seq_len=SWA_MAX_SEQ_LEN,
+                     kv_cache_config=KvCacheConfig(
+                         free_gpu_memory_fraction=0.1,
+                         max_attention_window=[SWA_WINDOW, SWA_MAX_SEQ_LEN]))
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
+    layout = worker.register_kv_cache_layout.call_args.args[0]
+    assert len(layout.groups) == 2
 
-    `CacheTransceiverCpp` is bound to the V1 `BaseKVCacheManager`, while
-    `KVCacheManagerV2.impl` is the Python V2 core's manager, so V2 can only use
-    the Python transceiver -- which in turn only supports NIXL
-    (kv_cache_transceiver.py, `create_kv_cache_transceiver`). This is spelled
-    out per manager rather than left at the default because
-    `transceiver_runtime` defaults to "auto", and "auto" is resolved from the
-    *model's* preference (llm_utils._resolve_transceiver_runtime_auto), which
-    knows nothing about which cache manager will be built. Qwen2 declares no
-    preference, so the default resolves to the C++ transceiver, which V2 cannot
-    use.
+    result = model.generate([0] * SWA_NUM_INPUT_TOKENS,
+                            sampling_params=SamplingParams(max_tokens=4,
+                                                           ignore_eos=True),
+                            kv_cache_retention_config=KvCacheRetentionConfig(
+                                [], decode_retention_priority=80))
+    assert len(result.outputs[0].token_ids) == 4
+    scheduler.build_connector_meta.assert_not_called()
+    scheduler.update_state_after_alloc_by_layer_group.assert_not_called()
+    scheduler.request_finished_by_layer_group.assert_not_called()
+
+
+def _disagg_transceiver_config(use_kv_cache_manager_v2):
+    """Keep the explicit V2-manager route and exercise defaults for V1.
+
+    V1 uses the C++ transceiver. V2 uses the Python transceiver with NIXL.
+    Select each runtime explicitly so the default Python runtime does not
+    change the V1 test's manager/runtime pairing.
     """
     if use_kv_cache_manager_v2:
         return CacheTransceiverConfig(backend="NIXL",
                                       transceiver_runtime="PYTHON")
-    return CacheTransceiverConfig(backend="DEFAULT")
+    return CacheTransceiverConfig(backend="DEFAULT", transceiver_runtime="CPP")
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -1232,39 +1266,12 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [
-    pytest.param(False, id="kv_cache_manager_v1"),
-    pytest.param(
-        True,
-        id="kv_cache_manager_v2",
-        marks=pytest.mark.xfail(
-            strict=True,
-            reason=
-            "KvCacheRetentionConfig does not reach KVCacheManagerV2 at all "
-            "(per-page priority comes from custom_priority_callback, which "
-            "V2 never overrides), so the connector reports priorities=None."),
-    ),
-],
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True],
+                         ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
-def test_connector_priorities(enforce_single_worker, model_with_connector):
-    """Test that retention priorities flow through the connector correctly.
-
-    This test verifies that when KvCacheRetentionConfig is provided,
-    the RequestData.priorities field is populated with the correct
-    per-block priorities based on the token ranges.
-
-    KNOWN GAP -- `xfail(strict=True)` on `kv_cache_manager_v2`.
-    `KvCacheRetentionConfig` does not reach KVCacheManagerV2 at all: V2's
-    per-page priority comes from `custom_priority_callback`
-    (kv_cache_manager_v2/_core/_kv_cache_manager.py), which KVCacheManagerV2
-    never overrides, so every page carries the default priority and the
-    connector reports `priorities=None`. A user who sets a retention config on
-    V2 silently gets none of it -- not only through the connector. The
-    assertions below stay the correct expectation for both managers rather than
-    being relaxed per manager, so wiring retention into V2 turns this green
-    instead of needing the test rewritten; `strict=True` is what makes it fail
-    loudly on that day rather than passing silently.
-    """
+def test_connector_priorities(enforce_single_worker, model_with_connector,
+                              use_kv_cache_manager_v2):
+    """Native prompt/decode priorities reach the connector's offload filter."""
     BLOCK_SIZE = 32
     NUM_INPUT_TOKENS = 64  # 2 blocks
     NUM_TOKENS = 4
@@ -1274,6 +1281,7 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=True)
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
     worker.get_finished.return_value = [], []
@@ -1298,6 +1306,20 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     )
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
+
+    if use_kv_cache_manager_v2:
+        for mode in (KvCacheTransferMode.GDS,
+                     KvCacheTransferMode.POSIX_DEBUG_FALLBACK):
+            with pytest.raises(RequestError, match="per-request GDS/POSIX"):
+                model.generate([0] * NUM_INPUT_TOKENS,
+                               sampling_params=sampling_params,
+                               kv_cache_retention_config=KvCacheRetentionConfig(
+                                   [], transfer_mode=mode, directory="/tmp"))
+        with pytest.raises(RequestError, match="between 0 and 100"):
+            model.generate([0] * NUM_INPUT_TOKENS,
+                           sampling_params=sampling_params,
+                           kv_cache_retention_config=KvCacheRetentionConfig(
+                               [], decode_retention_priority=101))
 
     generate_and_wait(model,
                       scheduler,
@@ -1329,82 +1351,23 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     assert request.priorities[
         1] == LOW_PRIORITY, f"Expected priority {LOW_PRIORITY} for block 1, got {request.priorities[1]}"
 
-
-@pytest.mark.threadleak(enabled=False)
-@pytest.mark.parametrize("use_kv_cache_manager_v2", [True],
-                         ids=["kv_cache_manager_v2"],
-                         indirect=True)
-def test_connector_warns_that_retention_is_ignored_on_v2(
-        enforce_single_worker, model_with_connector, caplog):
-    """A retention config that has no effect must say so.
-
-    `KvCacheRetentionConfig` does not reach KVCacheManagerV2 at all, so the
-    connector reports `priorities=None` there. `test_connector_priorities`
-    pins that gap as `xfail(strict=True)`; this pins the diagnostic, which is
-    the only thing standing between a user's retention config and it being
-    dropped in silence.
-
-    V2 only: on V1 the config is honoured and there is nothing to warn about.
-    """
-    model_fn, scheduler, worker = model_with_connector
-    model = model_fn(disable_overlap_scheduler=True)
-
-    scheduler.get_num_new_matched_tokens.return_value = 0, False
-    worker.get_finished.return_value = [], []
-
-    retention_config = KvCacheRetentionConfig(token_range_retention_configs=[
-        KvCacheRetentionConfig.TokenRangeRetentionConfig(token_start=0,
-                                                         token_end=32,
-                                                         priority=80)
-    ],
-                                              decode_retention_priority=10)
-
-    # Two gates sit between `logger.warning_once` and `caplog`, and both are
-    # process-global rather than per-test:
-    #
-    # 1. The TensorRT-LLM logger defaults to `error` (tensorrt_llm/logger.py:163),
-    #    and `Logger.log` drops anything below that before it reaches Python
-    #    logging at all. The LLM constructor raises the level to `info` only
-    #    while it parses arguments and restores it afterwards, so a warning
-    #    emitted during `generate` is discarded unless the level is raised here.
-    # 2. `log_once` records its key before consulting the level, so the key is
-    #    consumed by whichever test drove this path first in the process --
-    #    `test_connector_priorities[kv_cache_manager_v2]` above sets a
-    #    retention config on V2 too, and it runs first.
-    #
-    # Raise the level and clear the key so the assertion below observes this
-    # test's own emission instead of the leftovers of test ordering.
-    previous_level = trtllm_logger_singleton.level
-    trtllm_logger_singleton.set_level("warning")
-    trtllm_logger_singleton._appeared_keys.discard(V2_RETENTION_IGNORED_LOG_KEY)
-
-    # The TensorRT-LLM logger sets `propagate = False`, so caplog only sees its
-    # records once its handler is attached to that logger by name.
-    trtllm_logger = logging.getLogger(TRTLLM_LOGGER_NAME)
-    trtllm_logger.addHandler(caplog.handler)
-    try:
-        with caplog.at_level(logging.WARNING, logger=TRTLLM_LOGGER_NAME):
-            generate_and_wait(model,
-                              scheduler,
-                              worker, [0] * 64,
-                              sampling_params=SamplingParams(max_tokens=4,
-                                                             ignore_eos=True),
-                              kv_cache_retention_config=retention_config)
-    finally:
-        trtllm_logger.removeHandler(caplog.handler)
-        trtllm_logger_singleton.set_level(previous_level)
-
-    assert "KvCacheRetentionConfig has no effect" in caplog.text, (
-        "A retention config was set on KVCacheManagerV2 and nothing said it "
-        "would be ignored. The user's configuration is silently dropped:\n"
-        f"{caplog.text}")
-
-    # The other half: the warning describes what actually happened.
-    request = scheduler.build_connector_meta.call_args_list[0].args[
-        0].new_requests[0]
-    assert request.priorities is None, (
-        "priorities are populated on V2 after all, so the warning is now "
-        "wrong -- revisit it together with `test_connector_priorities`.")
+    # A connector can select blocks from actual scheduler metadata by priority.
+    selected = [
+        block_id
+        for block_id, priority in zip(request.new_block_ids, request.priorities)
+        if priority >= HIGH_PRIORITY
+    ]
+    assert selected == [request.new_block_ids[0]]
+    decode_requests = [
+        request_data
+        for meta_call in scheduler.build_connector_meta.call_args_list[1:]
+        for request_data in meta_call.args[0].cached_requests
+        if request_data.new_block_ids
+    ]
+    assert decode_requests, "generation must allocate a new decode block"
+    for request_data in decode_requests:
+        assert request_data.priorities == [LOW_PRIORITY] * len(
+            request_data.new_block_ids)
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -1412,11 +1375,13 @@ def test_connector_warns_that_retention_is_ignored_on_v2(
                          ids=["kv_cache_manager_v1", "kv_cache_manager_v2"],
                          indirect=True)
 def test_connector_priorities_default(enforce_single_worker,
-                                      model_with_connector):
+                                      model_with_connector,
+                                      use_kv_cache_manager_v2):
     """Test that priorities are None when no retention config is provided."""
     model_fn, scheduler, worker = model_with_connector
 
     model = model_fn(disable_overlap_scheduler=True)
+    assert_kv_caches_registered(worker, use_kv_cache_manager_v2)
 
     scheduler.get_num_new_matched_tokens.return_value = 0, False
     worker.get_finished.return_value = [], []
@@ -1576,7 +1541,7 @@ def test_connector_max_utilization_is_rejected_on_v1_only(
         pytest.param(
             dict(enable_attention_dp=True),
             "attention data parallelism",
-            "attention data parallelism",
+            "supports_attention_dp=True",
             id="attention_dp",
         ),
     ],
@@ -1999,6 +1964,189 @@ def test_connector_cancel_drains_real_prefix_load(controlled_prefix_connector,
     finally:
         control.allow_copy.set()
         warm.shutdown()
+
+
+# Sizes for the cancelled-save test below, in a 6-page pool (192 / 32). The
+# cancelled request holds 3 of them, so the traffic that follows cannot run
+# without touching the held pages unless the hold is real.
+CANCELLED_SAVE_TOKENS_PER_BLOCK = 32
+CANCELLED_SAVE_KV_TOKENS = 192
+CANCELLED_SAVE_PROMPT_TOKENS = 96
+# Generation long enough that the run exceeds the pool on its own. A failed
+# abort then stalls for lack of pages rather than finishing quietly and
+# handing this test the ordinary end-of-request save in place of the
+# cancellation it means to exercise.
+CANCELLED_SAVE_MAX_TOKENS = 128
+# Forward passes with the request in `cached_requests` before it is aborted.
+# One is enough to put KV in its pages; two keeps the abort clear of the
+# prefill pass itself.
+CANCELLED_SAVE_DECODE_PASSES = 2
+
+
+@pytest.fixture
+def controlled_save_connector(enforce_single_worker, monkeypatch, tmp_path):
+    """Hold one request's connector save open until the test releases it."""
+    examples_dir = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", "..",
+                     "examples", "llm-api"))
+    monkeypatch.syspath_prepend(examples_dir)
+    monkeypatch.setenv("CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    import llm_kv_cache_connector as persistent
+
+    control = SimpleNamespace(decoding=Event(),
+                              handed_over=Event(),
+                              allow_save=Event(),
+                              transmitted=Event(),
+                              freed=Event(),
+                              request_id=None,
+                              slots=None,
+                              at_handover=None,
+                              at_transmission=None,
+                              decode_passes=0)
+
+    class SavingLeader(persistent.PersistentKvCacheConnectorLeader):
+
+        def build_connector_meta(self, scheduler_output):
+            if scheduler_output.cached_requests:
+                control.decode_passes += 1
+                if control.decode_passes >= CANCELLED_SAVE_DECODE_PASSES:
+                    control.decoding.set()
+            return super().build_connector_meta(scheduler_output)
+
+        def request_finished(self, request, cache_block_ids):
+            # Only the first request saves asynchronously. The traffic that
+            # follows has to be free to finish and reclaim its own pages,
+            # which is what puts the held ones under pressure.
+            if control.request_id is not None:
+                return False
+            control.request_id = request.request_id
+            control.slots = [
+                slot for slot in cache_block_ids if slot != BAD_PAGE_INDEX
+            ]
+            assert control.slots, "The cancelled request held no readable pages"
+            return True
+
+    class SavingWorker(persistent.PersistentKvCacheConnectorWorker):
+
+        def _read_source(self):
+            return [self.kv_cache_tensor[slot].cpu() for slot in control.slots]
+
+        def get_finished(self, finished_gen_req_ids, started_loading_req_ids):
+            if control.request_id in finished_gen_req_ids:
+                # The source as the transfer first sees it. Whatever the test
+                # does between here and the read below has to leave it alone.
+                control.at_handover = self._read_source()
+                control.handed_over.set()
+            if (not control.handed_over.is_set()
+                    or not control.allow_save.is_set()
+                    or control.transmitted.is_set()):
+                return [], []
+            control.at_transmission = self._read_source()
+            control.transmitted.set()
+            return [control.request_id], []
+
+    original_free = KVCacheManagerV2.free_resources
+
+    def record_free(manager, request):
+        target = request.request_id == control.request_id
+        if target:
+            assert control.transmitted.is_set(), (
+                "Source pages were freed before the save read them")
+        result = original_free(manager, request)
+        if target:
+            control.freed.set()
+        return result
+
+    monkeypatch.setattr(persistent, "SavingLeader", SavingLeader, raising=False)
+    monkeypatch.setattr(persistent, "SavingWorker", SavingWorker, raising=False)
+    monkeypatch.setattr(KVCacheManagerV2, "free_resources", record_free)
+    yield persistent, control
+    control.allow_save.set()
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_cancel_holds_pages_until_the_save_reads_them(
+        controlled_save_connector, use_overlap_scheduler):
+    """Cancellation retains a request's pages until its save has read them.
+
+    The response pass frees a request's pages as soon as it reads as
+    finished, so cancelling mid-flight has to offer the connector the same
+    save handshake a finished request gets. Without it the next allocation
+    overwrites bytes the transfer is still reading - and the pool here is
+    small enough that the traffic below wants exactly those pages.
+    """
+    import torch
+
+    persistent, control = controlled_save_connector
+    model = LLM(model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+                backend="pytorch",
+                cuda_graph_config=None,
+                disable_overlap_scheduler=not use_overlap_scheduler,
+                max_seq_len=256,
+                max_num_tokens=128,
+                max_batch_size=2,
+                enable_chunked_prefill=False,
+                kv_cache_config=KvCacheConfig(
+                    max_tokens=CANCELLED_SAVE_KV_TOKENS,
+                    tokens_per_block=CANCELLED_SAVE_TOKENS_PER_BLOCK,
+                    use_kv_cache_manager_v2=True),
+                kv_connector_config=KvCacheConnectorConfig(
+                    connector_module=persistent.__name__,
+                    connector_scheduler_class="SavingLeader",
+                    connector_worker_class="SavingWorker"))
+    try:
+        cancelled = model.generate_async(
+            [100] * CANCELLED_SAVE_PROMPT_TOKENS,
+            SamplingParams(max_tokens=CANCELLED_SAVE_MAX_TOKENS,
+                           ignore_eos=True),
+            kv_cache_retention_config=KvCacheRetentionConfig(
+                token_range_retention_configs=[
+                    KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                        0, None, 0)
+                ],
+                decode_retention_priority=0))
+        assert control.decoding.wait(60), "Request never reached generation"
+        cancelled.abort()
+
+        assert control.handed_over.wait(
+            60), "Cancellation never offered the connector a save"
+        assert not control.freed.is_set()
+
+        # Cache pressure, with the held pages making up half the pool. These
+        # finish, so the allocator really is handing out and reclaiming pages
+        # while the save sits outstanding.
+        for first_token in (200, 300):
+            other = model.generate_async([first_token] * 32,
+                                         SamplingParams(max_tokens=2,
+                                                        ignore_eos=True))
+            assert len(other.result(timeout=60).outputs[0].token_ids) == 2
+        assert not control.freed.is_set()
+
+        control.allow_save.set()
+        assert control.transmitted.wait(60), "The held save never completed"
+        assert control.freed.wait(
+            60), "The completed save never released its pages"
+
+        # What the transfer read is what it was promised, byte for byte.
+        assert len(control.at_transmission) == len(control.at_handover)
+        for promised, read in zip(control.at_handover, control.at_transmission):
+            assert torch.equal(promised, read)
+
+        # The save was held on behalf of a cancellation, not of an ordinary
+        # end-of-request save that happened to arrive first.
+        assert cancelled.result(
+            timeout=60).outputs[0].finish_reason == "cancelled"
+
+        # The pages really did come back: this needs more than the pool had
+        # left while the save held them.
+        after = model.generate_async([400] * 128,
+                                     SamplingParams(max_tokens=2,
+                                                    ignore_eos=True))
+        assert len(after.result(timeout=60).outputs[0].token_ids) == 2
+    finally:
+        control.allow_save.set()
+        model.shutdown()
 
 
 # The VSWA end-to-end sizes. The window is deliberately larger than the whole
@@ -2889,3 +3037,220 @@ def test_connector_transfers_only_in_window_blocks_to_the_sliding_group(
         if examples_dir in sys.path:
             sys.path.remove(examples_dir)
         shutil.rmtree(cache_dir, ignore_errors=True)
+
+
+@pytest.fixture
+def recording_connector(monkeypatch: pytest.MonkeyPatch,
+                        tmp_path: Path) -> KvCacheConnectorConfig:
+    """Expose the backend and forward its TRTLLM-prefixed controls to MPI workers."""
+    examples_dir = Path(__file__).resolve().parents[4] / "examples/llm-api"
+    paths = [str(examples_dir), str(Path(__file__).resolve().parent)]
+    for path in paths:
+        monkeypatch.syspath_prepend(path)
+    monkeypatch.setenv(
+        "PYTHONPATH",
+        os.pathsep.join(paths + [os.environ.get("PYTHONPATH", "")]))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS",
+                       str(tmp_path / "producer-loads"))
+    monkeypatch.delenv("TRTLLM_TEST_CONNECTOR_ASYNC", raising=False)
+    monkeypatch.delenv("TRTLLM_TEST_CONNECTOR_STALL", raising=False)
+    return KvCacheConnectorConfig(
+        connector_module="connector_test_backend",
+        connector_scheduler_class="RecordingConnectorScheduler",
+        connector_worker_class="RecordingConnectorWorker",
+    )
+
+
+def _connector_event_count(folder: Path, rank: int, event: str) -> int:
+    path = folder / f"rank-{rank}.jsonl"
+    if not path.exists():
+        return 0
+    return sum(record["count"] for line in path.read_text().splitlines()
+               if (record := json.loads(line))["event"] == event)
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
+def test_connector_adp_persistent_pool(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        disable_overlap_scheduler: bool,
+        recording_connector: KvCacheConnectorConfig) -> None:
+    """Two ADP owners share persisted KV across executor restarts.
+
+    A single request exercises an idle owner; four equal requests exercise
+    balanced batches; unequal prompt lengths exercise uneven prefill work.
+    """
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER", str(tmp_path))
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        kv_connector_config=recording_connector,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                      use_kv_cache_manager_v2=True),
+        max_seq_len=4096,
+    )
+    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
+    short_prompt = "Explain how a computer stores information. " * 16
+    workloads = [[short_prompt], [short_prompt] * 4,
+                 [short_prompt * 4, short_prompt, short_prompt, short_prompt]]
+    expected = []
+    with LLM(**kwargs) as producer:
+        for prompts in workloads:
+            outputs = producer.generate(prompts, params)
+            expected.append([output.outputs[0].token_ids for output in outputs])
+    assert list(
+        tmp_path.glob("*.pt")), "The first executor must publish cache blocks"
+    consumer_records = tmp_path / "consumer-loads"
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(consumer_records))
+    with LLM(**kwargs) as consumer:
+        for prompts, token_ids in zip(workloads, expected):
+            outputs = consumer.generate(prompts, params)
+            # Different warm/cold ADP batches can change floating-point
+            # reduction order. The recording worker checks restored KV bytes;
+            # here verify that every request completes its generation.
+            assert [len(output.outputs[0].token_ids) for output in outputs
+                    ] == [len(tokens) for tokens in token_ids]
+    for rank in (0, 1):
+        assert _connector_event_count(consumer_records, rank, "v2_layout") == 1
+        assert _connector_event_count(consumer_records, rank,
+                                      "loaded_blocks") > 0
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
+def test_connector_adp_async_without_dummy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    disable_overlap_scheduler: bool,
+    recording_connector: KvCacheConnectorConfig,
+) -> None:
+    """An async owner at its slot cap must preserve its peer's prepared V2 batch."""
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER",
+                       str(tmp_path / "cache"))
+    kwargs = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        kv_connector_config=recording_connector,
+        max_batch_size=1,
+        max_seq_len=1024,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                      use_kv_cache_manager_v2=True),
+    )
+    prompt = "Explain how a computer stores information. " * 16
+    params = SamplingParams(max_tokens=8, ignore_eos=True, temperature=0)
+    with LLM(**kwargs) as producer:
+        expected = [
+            out.outputs[0].token_ids
+            for out in producer.generate([prompt] * 2, params)
+        ]
+    assert list((tmp_path / "cache").glob("*.pt"))
+
+    consumer_records = tmp_path / "consumer-loads"
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(consumer_records))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_ASYNC", "1")
+    with LLM(**kwargs) as consumer:
+        outputs = consumer.generate([prompt] * 2, params)
+        assert [len(out.outputs[0].token_ids)
+                for out in outputs] == [len(tokens) for tokens in expected]
+    assert _connector_event_count(consumer_records, 0, "loaded_blocks") > 0
+    assert _connector_event_count(consumer_records, 0, "async_finished") > 0
+    assert _connector_event_count(consumer_records, 1, "loaded_blocks") == 0
+    for rank in (0, 1):
+        assert _connector_event_count(consumer_records, rank, "v2_layout") == 1
+        assert _connector_event_count(consumer_records, rank,
+                                      "allocated_requests") == 1
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
+@pytest.mark.skip_less_device(2)
+def test_connector_adp_transfer_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    disable_overlap_scheduler: bool,
+    recording_connector: KvCacheConnectorConfig,
+) -> None:
+    """A real two-GPU executor fails when an owner withholds load completion."""
+    monkeypatch.delenv("TLLM_WORKER_USE_SINGLE_PROCESS", raising=False)
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_CACHE_FOLDER",
+                       str(tmp_path / "cache"))
+    prompt = "Explain how a computer stores information. " * 16
+    options = dict(
+        model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
+        backend="pytorch",
+        tensor_parallel_size=2,
+        enable_attention_dp=True,
+        max_batch_size=1,
+        max_seq_len=1024,
+        enable_chunked_prefill=False,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=None,
+        kv_cache_config=dict(free_gpu_memory_fraction=0.1,
+                             use_kv_cache_manager_v2=True),
+        kv_connector_config=recording_connector.model_dump(),
+    )
+    with LLM(**options) as producer:
+        producer.generate([prompt] * 2,
+                          SamplingParams(max_tokens=8, ignore_eos=True))
+    assert list((tmp_path / "cache").glob("*.pt"))
+    options["kv_connector_config"]["transfer_timeout_sec"] = 0.5
+    records = tmp_path / "timeout-records"
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_RECORDS", str(records))
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_ASYNC", "1")
+    monkeypatch.setenv("TRTLLM_TEST_CONNECTOR_STALL", "1")
+    log_path = tmp_path / "timeout-consumer.log"
+    # Give the fatal consumer its own MPI job; inheriting pytest's MPI identity
+    # would make its initialization or abort affect the parent test runner.
+    consumer_env, _ = split_mpi_env()
+    # Keep transport policy without restoring the parent MPI job's identity.
+    # Otherwise the isolated consumer may select an unavailable network device.
+    consumer_env.update({
+        key: value
+        for key, value in os.environ.items()
+        if key.startswith("UCX_") or key in ("OMPI_MCA_btl", "OMPI_MCA_pml")
+    })
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [
+                "mpirun", "--allow-run-as-root", "-n", "1", sys.executable,
+                "-m", "connector_test_backend",
+                json.dumps(options), prompt
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=consumer_env,
+            start_new_session=True,
+        )
+        try:
+            returncode = process.wait(timeout=300)
+        finally:
+            # Only this test's disposable process group; MPI failure must not
+            # leave worker processes holding GPUs for the next test.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+            # Preserve consumer diagnostics even when the wait raises before
+            # the assertions below can include them in a failure report.
+            output = log_path.read_text(errors="replace")
+            print(output)
+    assert _connector_event_count(records, 0,
+                                  "withheld_prefix_load") > 0, output
+    assert returncode != 0, output
+    assert "Timed out waiting for an ADP KV connector transfer" in output, output
+    assert "Process restart is required" in output, output

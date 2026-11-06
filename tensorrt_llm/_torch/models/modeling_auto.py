@@ -1,6 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+from dataclasses import replace
 from typing import Generic, Optional, Type
 
-from .._experimental.modeling_v2 import modeling_v2_resolve
+from tensorrt_llm.logger import logger
+
+from .._experimental.modeling_v2._router_index import (ModelingV2Mode, NoTarget,
+                                                       resolved_mode)
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
 from .modeling_utils import (DecoderModelForCausalLM, TConfig, TModel,
@@ -34,22 +40,19 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                                             "")  # Strip the appended EAGLE3
             model_arch = "EAGLE3" + model_arch
 
-        # ModelingV2 targets are keyed by a synthetic architecture name that no
-        # checkpoint declares -- the same shape as the Eagle3 rewrite above.
-        # Returns None unless `modeling_v2` is on and a target claims this
-        # exact (checkpoint, GPU arch, parallel topology), so the default path
-        # is byte-for-byte unchanged.
+        # Set by the model loader when a modeling_v2 target claims this
+        # deployment; None leaves the default path unchanged.
         #
         # Precedence, since this runs last and would override the rewrite
-        # above: modeling_v2 wins. It reads the *un-rewritten*
-        # architectures[0], so it decides on the checkpoint rather than on what
-        # that rewrite made of it, and a target that claims a configuration
-        # carries that configuration's draft path itself. Not reachable today
-        # -- Eagle3 needs draft_vocab_size, and no draft checkpoint matches a
-        # target's shape fingerprint -- so this note is the contract, not a
-        # description of observed behaviour.
-        if (modeling_v2_arch := modeling_v2_resolve(config)) is not None:
-            model_arch = modeling_v2_arch
+        # above: modeling_v2 wins. The decision was made on the *un-rewritten*
+        # architectures[0], so it is about the checkpoint rather than about
+        # what that rewrite made of it, and a target that claims a
+        # configuration carries that configuration's draft path itself. Not
+        # reachable today -- Eagle3 needs draft_vocab_size, and no draft
+        # checkpoint matches a target's shape fingerprint -- so this note is
+        # the contract, not a description of observed behaviour.
+        if config.modeling_v2_target is not None:
+            return config.modeling_v2_target
 
         return get_registered_model_class(model_arch)
 
@@ -76,7 +79,29 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             config.skip_create_weights_in_init = True
             config._frozen = True
         extra_attrs = config.extra_attrs
+        # What the loader put there, before a target that then refuses could
+        # add to it.
+        loader_attrs = dict(extra_attrs)
         with model_extra_attrs(extra_attrs):
-            model = cls(config)
+            try:
+                model = cls(config)
+            except NoTarget as why:
+                # A modeling_v2 target refuses, at construction, a runtime that
+                # routing does not see (set by engine arguments). Under auto
+                # that falls back to the built-in implementation,
+                # as a refusal in routing does; under require it is the error.
+                target = config.modeling_v2_target
+                if cls is not target or resolved_mode(
+                        target) is ModelingV2Mode.REQUIRE:
+                    raise
+                logger.info(
+                    f"modeling_v2: {target.__name__} refused this runtime ({why}); "
+                    "using the built-in implementation")
+                fallback = replace(config, modeling_v2_target=None)
+                # replace() starts init=False fields afresh; the built-in model
+                # reads the loader's settings (GEMM backends, allreduce sizes)
+                # from extra_attrs.
+                fallback.extra_attrs.update(loader_attrs)
+                return AutoModelForCausalLM.from_config(fallback)
         model.extra_attrs = extra_attrs
         return model

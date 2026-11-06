@@ -41,6 +41,8 @@ import torch
 
 from tensorrt_llm._torch.utils import ActType_TrtllmGen
 
+from .impl_contract import PreroutedRouting
+
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
 
@@ -170,8 +172,12 @@ class MoEOpBackend:
         output: Optional[torch.Tensor] = None,
         tune_max_num_tokens: int = 8192,
         use_dp: bool = False,
+        prerouted: Optional[PreroutedRouting] = None,
+        decode_tuning: bool = False,
     ) -> List[torch.Tensor]:
-        """Run FP4 block scale MoE computation."""
+        """Run FP4 block scale MoE computation. ``prerouted``: routing the caller
+        computed (native op backend only). ``decode_tuning``: the native NVFP4 op
+        tunes for the model's decode steps (``FP4BlockScaleMoERunner``)."""
         raise NotImplementedError
 
     def run_bf16_moe(
@@ -210,7 +216,9 @@ class TRTLLMOpBackend(MoEOpBackend):
     """TRTLLM native op backend implementation."""
 
     def __init__(self):
-        from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
+        from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
+
+        from .communication.nvlink_two_sided import MnnvlMoe
 
         self._MnnvlMemory = MnnvlMemory
         self._MnnvlMoe = MnnvlMoe
@@ -336,7 +344,15 @@ class TRTLLMOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
+        decode_tuning=False,
     ):
+        # The native runners take the block scales as one flat linear-layout
+        # tensor (``fp4BlockScaleMoe.cpp`` checks ``dim() == 1``); the
+        # framework hands them over token-major 2-D as ``quantize_input``
+        # produced them. Flattening is this provider's ABI detail.
+        if hidden_states_scale is not None:
+            hidden_states_scale = hidden_states_scale.flatten()
         hidden_size = gemm1_weights.shape[-1] * 2
         if gated_act_type == int(ActType_TrtllmGen.SiTu):
             # Fused SiTu FC1 cubins exist for two input formats: NVFP4
@@ -440,8 +456,22 @@ class TRTLLMOpBackend(MoEOpBackend):
                     output=output,
                     tune_max_num_tokens=tune_max_num_tokens,
                     use_dp=use_dp,
+                    prerouted_tables=None if prerouted is None else prerouted.tables,
+                    prerouted_ids=None if prerouted is None else prerouted.topk_ids,
+                    prerouted_weights=None if prerouted is None else prerouted.topk_weights,
+                    prerouted_tactic=None if prerouted is None else prerouted.tactic,
+                    decode_tuning=decode_tuning,
                 )
                 if not do_finalize:
+                    if prerouted is not None:
+                        # The op returns the FC2 rows; the top-k weights and the
+                        # expanded -> permuted index (head of the tables) are ours.
+                        num_tokens = prerouted.topk_ids.shape[0]
+                        outputs = [
+                            outputs[0],
+                            prerouted.topk_weights,
+                            prerouted.tables[: num_tokens * top_k].view(num_tokens, top_k),
+                        ]
                     return outputs
                 else:
                     final_hidden_states = outputs[0]
@@ -626,14 +656,17 @@ class FlashinferOpBackend(MoEOpBackend):
         is_sf_8x4_layout: bool = False,
         enable_pdl: Optional[bool] = None,
     ):
+        # Keyword binding: the provider inserts new options (e.g.
+        # ``is_global_scale_inversed``) ahead of ``enable_pdl`` in the
+        # positional signature, so positional calls misbind across releases.
         return self._fp4_quantize(
             input,
-            global_scale,
-            sf_vec_size,
-            sf_use_ue8m0,
-            is_sf_swizzled_layout,
-            is_sf_8x4_layout,
-            enable_pdl,
+            global_scale=global_scale,
+            sf_vec_size=sf_vec_size,
+            sf_use_ue8m0=sf_use_ue8m0,
+            is_sf_swizzled_layout=is_sf_swizzled_layout,
+            is_sf_8x4_layout=is_sf_8x4_layout,
+            enable_pdl=enable_pdl,
         )
 
     def mxfp8_quantize(
@@ -776,7 +809,15 @@ class FlashinferOpBackend(MoEOpBackend):
         output=None,
         tune_max_num_tokens=8192,
         use_dp=False,
+        prerouted=None,
+        decode_tuning=False,
     ):
+        del decode_tuning  # FlashInfer tunes its own way.
+        if prerouted is not None:
+            raise ValueError("prerouted routing needs the native TRT-LLM op backend")
+        # The framework hands the scales over token-major 2-D as
+        # ``quantize_input`` produced them, which is exactly what the
+        # FlashInfer API asserts (``shape[0] == num_tokens``). No reshape.
         if router_logits is not None:
             outputs = self._fused_moe.trtllm_fp4_block_scale_moe(
                 router_logits,

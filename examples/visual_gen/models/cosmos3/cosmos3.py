@@ -475,6 +475,15 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="HuggingFace Hub revision (branch, tag or commit) to download. "
+        "The static FP8 builds live on the 'fp8' branch of the Nano and Super "
+        "repos, so pass --revision fp8 to serve those from the Hub. Ignored "
+        "when --model is a local path.",
+    )
+
     # Guardrails
     parser.add_argument(
         "--disable_guardrails", action="store_true", help="NOT RECOMMENDED: Disable guardrails"
@@ -492,6 +501,9 @@ def main():
 
     # Engine config from shared YAML (optional); model-specific defaults apply otherwise.
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
+    if args.revision is not None:
+        extra_args = extra_args or VisualGenArgs()
+        extra_args.revision = args.revision
     visual_gen = VisualGen(model=args.model, args=extra_args)
 
     # --- Model-specific: T2V / TI2V request construction ---

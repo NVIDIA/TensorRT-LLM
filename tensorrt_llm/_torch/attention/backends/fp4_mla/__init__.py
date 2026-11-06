@@ -42,6 +42,7 @@ from .config import (
     FP4_MLA_KV_GLOBAL_SCALE,
     FP4_MLA_KV_STATIC_AMAX,
     FP4_MLA_P_GLOBAL_SCALE,
+    FP4_MLA_PACKED_Q_ENV,
     FP4_MLA_Q1_PREFIX_BLOCK_DIM,
     FP4_MLA_Q_GLOBAL_SCALE,
     FP4_MLA_Q_LOGICAL_DIM,
@@ -68,10 +69,8 @@ from .config import _fp4_mla_cutedsl_kernel_module as _fp4_mla_cutedsl_kernel_mo
 from .config import _fp4_mla_q1_kv_blocks_per_program as _fp4_mla_q1_kv_blocks_per_program
 from .config import _fp4_mla_q1_prefix_blocks_per_program as _fp4_mla_q1_prefix_blocks_per_program
 from .config import _HPUpdatePhase as _HPUpdatePhase
-from .decode import _SM_COUNT_CACHE as _SM_COUNT_CACHE
 from .decode import _cutedsl_pad_q_and_sf_kernel as _cutedsl_pad_q_and_sf_kernel
 from .decode import _cutedsl_swizzled_sf_offset as _cutedsl_swizzled_sf_offset
-from .decode import _get_sm_count as _get_sm_count
 from .decode import _run_triton_attention_decode as _run_triton_attention_decode
 from .decode import run_fp4_mla_attention_decode
 from .layout import _ensure_workspace_tensor as _ensure_workspace_tensor
@@ -115,7 +114,10 @@ from .metadata import (
     materialize_fp4_mla_device_page_table,
     populate_fp4_mla_append_metadata,
     populate_fp4_mla_generation_lengths,
+    populate_helix_spec_buffers,
 )
+from .packed_plan import _SM_COUNT_CACHE as _SM_COUNT_CACHE
+from .packed_plan import _get_sm_count as _get_sm_count
 from .v_cache import (
     _get_cutedsl_persistent_v_packed_cache as _get_cutedsl_persistent_v_packed_cache,
 )
@@ -150,6 +152,7 @@ __all__ = [
     "FP4_MLA_KV_GLOBAL_SCALE",
     "FP4_MLA_KV_STATIC_AMAX",
     "FP4_MLA_K_RESIDUAL_DIM",
+    "FP4_MLA_PACKED_Q_ENV",
     "FP4_MLA_P_GLOBAL_SCALE",
     "FP4_MLA_Q1_PREFIX_BLOCK_DIM",
     "FP4_MLA_Q_GLOBAL_SCALE",
@@ -172,6 +175,7 @@ __all__ = [
     "materialize_fp4_mla_device_page_table",
     "populate_fp4_mla_append_metadata",
     "populate_fp4_mla_generation_lengths",
+    "populate_helix_spec_buffers",
     "run_fp4_mla_attention_decode",
     "scatter_fp4_mla_kv_cache",
 ]

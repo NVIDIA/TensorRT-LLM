@@ -44,9 +44,17 @@ login context.
 
 ### `trtllm_initial_report`
 
-Sent once after the first successful LLM initialization. Contains system info
-and the first successfully reported LLM's serving configuration. A process that
-fails earlier can send a terminal report without an initial report.
+Normally sent after the first successful LLM initialization with system information
+and serving configuration. If startup fails, it can instead be sent alongside the
+exit report with as much information as is available (**partial context**).
+These partial reports are marked with
+`llmApiConfigMetaJson.report_context == "pre_initialization_exit"` and do not
+indicate successful initialization.
+
+For dashboards, the top-level event parameter `llmInstancesCreated >= 1`
+confirms successful LLM initialization; partial reports have `llmInstancesCreated == 0`.
+Do not count initial reports alone as successful deployments. Treat a missing
+counter in older records as unknown, not zero.
 
 #### System fields
 
@@ -69,6 +77,10 @@ fails earlier can send a terminal report without an initial report.
 
 #### Parallelism fields
 
+In partial reports, `0` for `tensorParallelSize`, `pipelineParallelSize`, or
+`contextParallelSize` means unknown (not captured), not a real parallelism degree;
+exclude these sentinel values from parallelism averages and distributions.
+
 | Field | Type | Description | Example |
 |-------|------|-------------|---------|
 | `tensorParallelSize` | PositiveInt | Tensor parallelism degree. | `8` |
@@ -83,7 +95,7 @@ fails earlier can send a terminal report without an initial report.
 |-------|------|-------------|---------|
 | `architectureClassName` | LongString | Public model architecture identifier when it appears in the checked-in allowlist; otherwise empty. The identifier may come from a public model checkpoint or a documented TensorRT-LLM runtime architecture. | `"LlamaForCausalLM"`, `"Qwen3ForTextEmbedding"`, `""` |
 | `architectureClassHash` | LongString | Pseudonymous, deterministic SHA-256 grouping key for a non-empty architecture outside the public allowlist; otherwise empty. | `"sha256:76873a...ccd04"`, `""` |
-| `backend` | ShortString | Execution backend. | `"pytorch"`, `"tensorrt"` |
+| `backend` | ShortString | Execution backend. | `"pytorch"` |
 | `dtype` | ShortString | Model data type. | `"float16"`, `"bfloat16"`, `"auto"` |
 | `quantizationAlgo` | ShortString | Quantization algorithm. Empty string if none. | `""`, `"fp8"`, `"w4a16_awq"` |
 | `kvCacheDtype` | ShortString | KV cache data type. Empty string if default. | `""`, `"fp8"`, `"auto"` |
@@ -97,7 +109,7 @@ fails earlier can send a terminal report without an initial report.
 | `llmApiConfigJson` | string | JSON-serialized sanitized, type-driven effective LLM API configuration. See [LLM API config capture](#llm-api-config-capture). | `'{"tensor_parallel_size":2,...}'` |
 | `llmApiConfigMetaJson` | string | JSON-serialized metadata for LLM API configuration capture. | `'{"capture_succeeded":true,...}'` |
 | `disaggRole` | ShortString | Disaggregated serving role. Empty if not disaggregated. | `""`, `"context"`, `"generation"`, `"coordinator"`, `"server_coordinator"`, `"ctx0"`, `"gen0"` |
-| `deploymentId` | ShortString | Shared ID across disaggregated workers. Empty if not disaggregated. | `""`, `"dep-abc123"` |
+| `deploymentId` | ShortString | Shared disaggregated deployment UUID, normalized to lowercase hex. Empty if unset or invalid. | `""`, `"7cd46f928e324879b82a7cabd3c0ecde"` |
 
 ##### Architecture privacy policy
 
@@ -116,12 +128,12 @@ The intended guarantee is only that the raw name is not transmitted while stable
 grouping remains possible; the hash must not be treated as anonymous or secret.
 
 Extraction uses the first `architectures` value from the pretrained
-configuration and also supports legacy singular values and nested engine
-configs. Encode-only models use the effective runtime configuration after
+configuration. Encode-only models use the effective runtime configuration after
 model overrides are applied, falling back to the checkpoint configuration if
 the runtime metadata is unavailable. Generation models use the checkpoint
 configuration; architecture overrides applied in their worker process are not
-currently reflected in telemetry. Invalid or empty values leave both fields empty.
+currently reflected in telemetry. If the list is absent or empty, the config
+class name is used. An invalid or empty first entry leaves both fields empty.
 The conservative allowlist is maintained manually. An identifier may be
 included when it is publicly documented by the upstream model provider or in
 TensorRT-LLM's supported-models table; custom names remain excluded until
@@ -151,7 +163,7 @@ exit, a terminal report, or telemetry opt-out, with no heartbeat-count limit.
 | `seq` | PositiveInt | Zero-based heartbeat sequence number, saturating at uint32 max. | `0`, `1`, `42` |
 | `ingressPoint` | ShortString | Invocation boundary for the process session. | `"cli_serve"` |
 | `disaggRole` | ShortString | Disaggregated role: `context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`. | `"context"` |
-| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. | `"dep-abc123"` |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment UUID. | `"7cd46f928e324879b82a7cabd3c0ecde"` |
 
 Every heartbeat also contains the five aggregate LLM lifecycle counters above.
 
@@ -171,7 +183,7 @@ outcome. Missing terminal events remain unknown; they are not confirmed crashes.
 | `reportingSource` | enum | `self`, `supervisor`, or `executor_proxy`. |
 | `ingressPoint` | ShortString | Entry point copied onto the terminal event so terminal-only early failures remain attributable. |
 | `disaggRole` | ShortString | Disaggregated role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy `ctx0`/`gen0`), or empty when unavailable/not applicable. |
-| `deploymentId` | ShortString | Optional shared disaggregated deployment ID. |
+| `deploymentId` | ShortString | Optional shared disaggregated deployment UUID. |
 
 Every terminal report also contains the five aggregate LLM lifecycle counters
 above. Delivery is best-effort and waits no more than 0.5 seconds; the local
@@ -266,7 +278,6 @@ The docs build renders the full table under **Developer Guide > Telemetry**.
 | `backend` | Execution backend. Captured as the `Literal["pytorch"]` value on the PyTorch args. |
 | `dtype` | Model dtype, captured through an explicit allowlist. |
 | `load_format` | Weight load format, captured as a low-cardinality enum/string value. |
-| `quant_config.quant_algo` | Quantization algorithm, captured as a closed `QuantAlgo` enum value (TRT args only). Empty/absent when unquantized. |
 | `kv_cache_config.dtype` | KV cache dtype, captured through an explicit allowlist. |
 | `kv_cache_config.enable_block_reuse` | Whether KV cache block reuse/prefix caching is enabled. |
 | `cuda_graph_config.batch_sizes` | CUDA graph batch sizes when configured. |
@@ -275,6 +286,7 @@ The docs build renders the full table under **Developer Guide > Telemetry**.
 | `torch_compile_config.enable_inductor` | Whether Torch Inductor compilation is enabled. |
 | `moe_config.backend` | MoE backend selection (`AUTO`, `CUTLASS`, `TRTLLM`, ...), an annotation-derived categorical. |
 | `speculative_config.decoding_type` | Speculative decoding mode discriminator (e.g. `User_Provided`); other arms expose their own numeric/boolean knobs under `speculative_config.*`. |
+| `speculative_config.spec_dec_variant` | Integer version of the algorithm within its `decoding_type` family (e.g. DFlash `1` vs. `2`); group by `decoding_type` first. `null` means the draft checkpoint was not read yet, e.g. a startup failure before a Hugging Face drafter finished downloading. |
 | `sparse_attention_config.algorithm` | Sparse attention algorithm discriminator; arm-specific knobs appear under `sparse_attention_config.*`. |
 | `reasoning_parser` | Reasoning parser selection, captured through an allowlist mirroring the `ReasoningParserFactory` registry. |
 
@@ -298,7 +310,13 @@ over time.
 | `TRTLLM_USAGE_HEARTBEAT_INTERVAL` | `600` | Heartbeat interval in seconds. |
 | `TRTLLM_USAGE_FORCE_ENABLED` | `0` | Set to `1` to force-enable telemetry in CI/test environments. |
 | `TRTLLM_DISAGG_ROLE` | unset | Disaggregated serving role (`context`, `generation`, `coordinator`, `server_coordinator`, or compatible legacy values such as `ctx0`/`gen0`). |
-| `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment ID across disaggregated workers. |
+| `TRTLLM_DISAGG_DEPLOYMENT_ID` | unset | Shared deployment UUID across disaggregated workers. Invalid values are reported as an empty ID. |
+
+The disaggregated launcher generates a random deployment UUID and shares it
+through the environment. Custom launchers can also supply a shared UUID via
+`TRTLLM_DISAGG_DEPLOYMENT_ID`. Telemetry validates it with `uuid.UUID` and emits
+32 lowercase hexadecimal characters, or an empty string if invalid. This checks
+format, not who generated the UUID or whether it contains encoded identifying data.
 
 ## For Developers: Adding a New Field
 

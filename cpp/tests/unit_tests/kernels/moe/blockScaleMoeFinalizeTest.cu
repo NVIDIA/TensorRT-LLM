@@ -42,7 +42,6 @@ using tensorrt_llm::runtime::BufferManager;
 using tensorrt_llm::runtime::CudaStream;
 using tensorrt_llm::runtime::ITensor;
 using tensorrt_llm::runtime::MemoryType;
-using tensorrt_llm::runtime::bufferCast;
 
 namespace
 {
@@ -143,16 +142,16 @@ TEST(BlockScaleMoeFinalizeTest, Bf16SinglePassMatchesReferenceAndGuardsDispatch)
     data.mDtypeExpW = tg::Dtype::Bfloat16;
     data.mUsePdl = false;
     data.mUseDeepSeekFp8 = false;
-    data.inPtr = bufferCast<__nv_bfloat16>(*input);
-    data.outPtr = bufferCast<__nv_bfloat16>(*output);
-    data.expertWeightsPtr = bufferCast<__nv_bfloat16>(*weights);
-    data.expandedIdxToPermutedIdx = bufferCast<int32_t>(*map);
+    data.inPtr = input->getBufferPtr<__nv_bfloat16>();
+    data.outPtr = output->getBufferPtr<__nv_bfloat16>();
+    data.expertWeightsPtr = weights->getBufferPtr<__nv_bfloat16>();
+    data.expandedIdxToPermutedIdx = map->getBufferPtr<int32_t>();
     data.numTokens = kNumTokens;
     data.numExperts = kNumRows;
     data.topK = kTopK;
     data.hiddenDim = kHiddenDim;
     data.hiddenDimPadded = kHiddenDim;
-    data.totalNumPaddedTokens = bufferCast<int32_t>(*totalRows);
+    data.totalNumPaddedTokens = totalRows->getBufferPtr<int32_t>();
 
     auto const targetNode = captureFinalizeNode(data, stream->get());
     // One thread per 128-bit vector of a row.
@@ -231,7 +230,7 @@ TEST(BlockScaleMoeFinalizeTest, Bf16SinglePassMatchesReferenceAndGuardsDispatch)
     stream->synchronize();
 
     auto padded = data;
-    padded.inPtr = bufferCast<__nv_bfloat16>(*paddedInput);
+    padded.inPtr = paddedInput->getBufferPtr<__nv_bfloat16>();
     padded.hiddenDimPadded = kHiddenDimPadded;
     auto const paddedNode = captureFinalizeNode(padded, stream->get());
     EXPECT_EQ(paddedNode.blockDim.x, kVecPerRow);

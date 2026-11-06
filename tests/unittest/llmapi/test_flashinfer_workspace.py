@@ -44,8 +44,7 @@ def _isolate_flashinfer_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _worker_flashinfer_env() -> tuple[str | None, str | None]:
-    mpi_session.mpi4py.MPI.COMM_WORLD.barrier()
-    return (os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV))
+    return os.environ.get(_FLASHINFER_WORKSPACE_ENV), os.environ.get(_FLASHINFER_CUBIN_ENV)
 
 
 def _run_worker_bootstrap(monkeypatch: pytest.MonkeyPatch, workspace_root: Path) -> None:
@@ -198,27 +197,30 @@ def test_worker_bootstrap_warns_when_unlock_fails(
     assert "could not unlock the FlashInfer workspace" in capfd.readouterr().err
 
 
+_PLAIN_WORKER_ARGS = [
+    "-c",
+    mpi_session._WORKER_ENV_BOOTSTRAP + mpi_session._WORKER_SERVER_MAIN,
+]
+_ISOLATED_WORKER_ARGS = [
+    "-c",
+    mpi_session._WORKER_ENV_BOOTSTRAP + mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
+    mpi_session._FLASHINFER_WORKSPACE_ROOT,
+]
+
+
 @pytest.mark.parametrize(
     "n_workers, env_overrides, expected",
     [
-        (1, {}, None),
-        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, None),
-        (
-            4,
-            {},
-            [
-                "-c",
-                mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
-                mpi_session._FLASHINFER_WORKSPACE_ROOT,
-            ],
-        ),
-        (4, {_FLASHINFER_ISOLATION_ENV: "0"}, None),
+        (1, {}, _PLAIN_WORKER_ARGS),
+        (1, {_FLASHINFER_ISOLATION_ENV: "1"}, _PLAIN_WORKER_ARGS),
+        (4, {}, _ISOLATED_WORKER_ARGS),
+        (4, {_FLASHINFER_ISOLATION_ENV: "0"}, _PLAIN_WORKER_ARGS),
         (
             4,
             {
                 _FLASHINFER_WORKSPACE_ENV: "/explicit",
             },
-            None,
+            _PLAIN_WORKER_ARGS,
         ),
     ],
 )
@@ -226,7 +228,7 @@ def test_mpi_pool_configures_worker_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
     n_workers: int,
     env_overrides: dict[str, str],
-    expected: list[str] | None,
+    expected: list[str],
 ) -> None:
     for name in (
         _FLASHINFER_WORKSPACE_ENV,
@@ -290,15 +292,7 @@ def test_mpi_pool_distinguishes_managed_and_explicit_workspaces(
 
     mpi_session.MpiPoolSession._start_mpi_pool(session)
 
-    expected_python_args = (
-        [
-            "-c",
-            mpi_session._FLASHINFER_WORKER_BOOTSTRAP,
-            mpi_session._FLASHINFER_WORKSPACE_ROOT,
-        ]
-        if expect_bootstrap
-        else None
-    )
+    expected_python_args = _ISOLATED_WORKER_ARGS if expect_bootstrap else _PLAIN_WORKER_ARGS
     assert captured["python_args"] == expected_python_args
     env = captured["env"]
     assert isinstance(env, dict)

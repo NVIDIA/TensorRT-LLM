@@ -133,6 +133,7 @@ struct ActivationParams
     float const* swiglu_alpha = nullptr;
     float const* swiglu_beta = nullptr;
     float const* swiglu_limit = nullptr;
+    bool swiglu_clamp_after_silu = false;
 
     explicit ActivationParams(ActivationType activation_type)
         : activation_type(activation_type)
@@ -141,17 +142,20 @@ struct ActivationParams
             "SwigluBias and SiTu are not supported in ActivationParams without alpha and beta");
     }
 
-    ActivationParams(
-        ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta, float const* swiglu_limit)
+    ActivationParams(ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta,
+        float const* swiglu_limit, bool swiglu_clamp_after_silu = false)
         : activation_type(activation_type)
         , swiglu_alpha(swiglu_alpha)
         , swiglu_beta(swiglu_beta)
         , swiglu_limit(swiglu_limit)
+        , swiglu_clamp_after_silu(swiglu_clamp_after_silu)
     {
         TLLM_CHECK_WITH_INFO(activation_type != ActivationType::SiTu || (swiglu_alpha && swiglu_beta),
             "SiTu requires both alpha and beta activation parameters");
         TLLM_CHECK_WITH_INFO(
             activation_type != ActivationType::SiTu || !swiglu_limit, "SiTu does not support a clamp limit");
+        TLLM_CHECK_WITH_INFO(
+            !swiglu_clamp_after_silu || swiglu_limit, "Post-SiLU clamping requires a SwiGLU clamp limit");
     }
 
     // TODO Port everything properly and get rid of these implicit conversions
@@ -1011,6 +1015,8 @@ private:
     ScaleBiasType* lora_fc1_result_{};
     ScaleBiasType* lora_add_bias_{};
     ScaleBiasType* lora_fc2_result_{};
+    size_t mLoraFc1ResultBytes{};
+    size_t mLoraFc2ResultBytes{};
     void* smoothed_act_{};
 
     TmaWarpSpecializedGroupedGemmInput tma_ws_grouped_gemm1_input_;

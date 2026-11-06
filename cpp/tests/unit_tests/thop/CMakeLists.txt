@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2023-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -14,7 +14,35 @@
 # the License.
 
 if(${BUILD_PYT})
-  add_gtest(thUtilsTest thUtilsTest.cpp)
-  target_link_libraries(thUtilsTest PUBLIC th_utils ${Python3_LIBRARIES}
-                                           ${TORCH_LIBRARIES})
+  add_tllm_gtest(
+    fmhaParamsTest
+    SOURCES
+    fmhaParamsTest.cpp
+    LINK_LIBRARIES
+    tllm::common_logging
+    trtllm_gen_fmha_interface
+    ${Python3_LIBRARIES}
+    ${TORCH_LIBRARIES}
+    OWNER
+    runtime
+    LABELS
+    "unit;runtime;host")
+  get_directory_property(
+    fmha_params_generated_include_dir
+    DIRECTORY "${PROJECT_SOURCE_DIR}/tensorrt_llm" DEFINITION
+              TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR)
+  target_include_directories(fmhaParamsTest
+                             PRIVATE ${fmha_params_generated_include_dir})
+
+  add_tllm_gtest(
+    thUtilsTest
+    OWNER
+    runtime
+    SOURCES
+    thUtilsTest.cpp
+    eagerMoeWorkspaceTest.cpp
+    LINK_LIBRARIES
+    tllm::torch_utils
+    LABELS
+    "unit;runtime;thop;gpu")
 endif()

@@ -45,6 +45,9 @@ std::optional<int32_t> getEnvXqaBlocksPerSequence();
 // Whether use tileSizeKv64 for multiCtasKvMode of trtllm-gen kernels.
 bool getEnvUseTileSizeKv64ForTrtllmGen();
 
+// Whether trtllm-gen context FMHA uses the static tile scheduler instead of the persistent one.
+bool getEnvUseStaticTileSchedulerForTrtllmGenContextFmha();
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();
 
@@ -169,12 +172,6 @@ bool getEnvDisaggBenchmarkGenOnly();
 
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
-
-// TODO: For DEV purpose temporarily.
-// Block size (threads per block) for MoE A2A Dispatch kernels (default 256 if unset or invalid)
-int getEnvMoeA2ADispatchBlockSize();
-// Block size (threads per block) for MoE A2A Combine kernels (default 256 if unset or invalid)
-int getEnvMoeA2ACombineBlockSize();
 
 bool getEnvKVCacheTransferAllBlocksForWindow();
 

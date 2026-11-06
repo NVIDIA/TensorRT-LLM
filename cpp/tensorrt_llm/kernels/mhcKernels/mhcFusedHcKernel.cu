@@ -17,7 +17,7 @@
 // Single-launch fused hyper-connection boundary op.
 //
 // This implementation wraps the SM100 tcgen05-based residual-out variant
-// (fused_tf32_pmap_gemm_rout_atomic_impl) to produce residual_cur, D, and
+// (fused_tf32_pmap_gemm_rout_impl) to produce residual_cur, D, and
 // sqr_sum in a single kernel launch; the big-fuse postlogue kernel then
 // consumes (D, sqr_sum, residual_cur) to emit (post_mix_cur, comb_mix_cur,
 // layer_input_cur). Semantically identical to
@@ -93,7 +93,48 @@ inline void fhcZeroWorkspaces(float* y_acc, uint32_t y_elems, float* r_acc, uint
         y_acc, y_elems, r_acc, r_elems, done_counter, done_elems);
 }
 
+// Zeroes only the done counters of the TF32 all-in-one path's Phase-3 barrier; its per-split workspaces need no
+// zeroing because each slot is written by exactly one CTA.
+inline void fhcZeroDoneCounters(int* done_counter, uint32_t done_elems, cudaStream_t stream)
+{
+    fhcZeroWorkspaces(
+        /*y_acc=*/nullptr, /*y_elems=*/0, /*r_acc=*/nullptr, /*r_elems=*/0, done_counter, done_elems, stream);
+}
+
 } // namespace
+
+// Mirrored by `_fused_hc_mma_k_splits` in tensorrt_llm/_torch/modules/mhc/mhc_cuda.py, which sizes the per-split
+// workspaces and passes the resolved count to the op; change both ladders together.
+int mhcFusedHcMmaKSplits(int M, int numKSplits, bool allInOne)
+{
+    if (numKSplits > 0)
+    {
+        return numKSplits;
+    }
+    if (allInOne)
+    {
+        return 1;
+    }
+    // Heuristic split-K selection driven by M. Keeps large-M waves compute-bound
+    // (low splits) and low-M waves fully occupied (high splits).
+    if (M <= 512)
+    {
+        return 16;
+    }
+    if (M <= 1024)
+    {
+        return 8;
+    }
+    if (M <= 2048)
+    {
+        return 4;
+    }
+    if (M <= 4096)
+    {
+        return 2;
+    }
+    return 1;
+}
 
 // ---- mHC fused kernel shape constants (mirrors the Python module) ----
 // HC_MULT * (2 + HC_MULT) = 4 * 6 = 24.
@@ -104,6 +145,7 @@ static constexpr uint32_t FHC_BLOCK_K = 64;
 #ifdef TRTLLM_MHC_ENABLE_FUSED_HC
 static constexpr uint32_t FHC_HIDDEN_FLASH = 4096;
 static constexpr uint32_t FHC_HIDDEN_PRO = 7168;
+static constexpr uint32_t FHC_HIDDEN_V41 = 5120; // DeepSeek-V4.1-Flash
 static constexpr uint32_t FHC_BLOCK_M = 64;
 static constexpr uint32_t FHC_BLOCK_N = 32;
 static constexpr uint32_t FHC_SWIZZLE_CD = 128;
@@ -120,12 +162,13 @@ static constexpr uint32_t FHC_NUM_PMAP_TH = 128;
 template <uint32_t Hidden>
 static constexpr bool isSupportedFhcHidden()
 {
-    return Hidden == FHC_HIDDEN_FLASH || Hidden == FHC_HIDDEN_PRO;
+    return Hidden == FHC_HIDDEN_FLASH || Hidden == FHC_HIDDEN_PRO || Hidden == FHC_HIDDEN_V41;
 }
 
 static bool isSupportedFhcHiddenRuntime(int hidden_size)
 {
-    return hidden_size == static_cast<int>(FHC_HIDDEN_FLASH) || hidden_size == static_cast<int>(FHC_HIDDEN_PRO);
+    return hidden_size == static_cast<int>(FHC_HIDDEN_FLASH) || hidden_size == static_cast<int>(FHC_HIDDEN_PRO)
+        || hidden_size == static_cast<int>(FHC_HIDDEN_V41);
 }
 
 // Validate the tcgen05 all-in-one fused-HC compile-time shape contract. Hidden
@@ -323,7 +366,7 @@ static FusedRoutFn fhcInstance()
 {
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
     static_assert(isSupportedFhcHalfMmaKS<Hidden, KS>(), "Unsupported fused-HC half-MMA kNumSplits for hidden size");
-    return &fused_mhc::fused_tf32_pmap_gemm_rout_atomic_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M, FHC_BLOCK_N,
+    return &fused_mhc::fused_tf32_pmap_gemm_rout_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M, FHC_BLOCK_N,
         FHC_BLOCK_K, FHC_SWIZZLE_CD, FHC_N_B_STAGES, FHC_N_INPUT_STG, FHC_NUM_MMA_TH, FHC_NUM_PMAP_TH, KS,
         /*kEarlyRelease=*/false>;
 }
@@ -350,6 +393,11 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 1: return fhcInstanceIfSupported<Hidden, 1>();
     case 2: return fhcInstanceIfSupported<Hidden, 2>();
     case 4: return fhcInstanceIfSupported<Hidden, 4>();
+    case 5: return fhcInstanceIfSupported<Hidden, 5>();
+    case 10: return fhcInstanceIfSupported<Hidden, 10>();
+    case 20: return fhcInstanceIfSupported<Hidden, 20>();
+    case 40: return fhcInstanceIfSupported<Hidden, 40>();
+    case 80: return fhcInstanceIfSupported<Hidden, 80>();
     case 7: return fhcInstanceIfSupported<Hidden, 7>();
     case 8: return fhcInstanceIfSupported<Hidden, 8>();
     case 14: return fhcInstanceIfSupported<Hidden, 14>();
@@ -363,27 +411,6 @@ static FusedRoutFn pickFhc(uint32_t ks)
     case 112: return fhcInstanceIfSupported<Hidden, 112>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
-}
-
-// Heuristic split-K selection driven by M. Keeps large-M waves compute-bound
-// (low splits) and low-M waves fully occupied (high splits).
-//
-// NOTE: split > 1 introduces atomic accumulation into D and sqr_sum. Atomic
-// ordering is non-deterministic across runs, which breaks CUDA-graph bit-exact
-// replay equality. Consumers that require bit-exact determinism should keep
-// M small enough to land in the splits=1 bucket, or supply an explicit
-// deterministic variant if needed.
-static uint32_t pickKSplits(int M)
-{
-    if (M <= 512)
-        return 16;
-    if (M <= 1024)
-        return 8;
-    if (M <= 2048)
-        return 4;
-    if (M <= 4096)
-        return 2;
-    return 1;
 }
 
 static int selectBigFuseBS(int M)
@@ -402,7 +429,7 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult,
     int num_k_splits, int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
     float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream, float const* pre_mix_ext, float* pre_mix_out)
 {
     if (M <= 0)
         return;
@@ -418,17 +445,11 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     uint32_t const m_u = static_cast<uint32_t>(M);
     int device_id = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    uint32_t const ks = (num_k_splits > 0) ? static_cast<uint32_t>(num_k_splits) : pickKSplits(M);
+    // Workspaces are per-split: y_acc [ks, M, SHAPE_N] and r_acc [ks, M]. Every slot is written by exactly
+    // one CTA (no atomics, no pre-zeroing), and the big-fuse step sums the splits in a fixed order (see
+    // mhcBigFuseKernel).
+    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*allInOne=*/false));
     int const bs = (bigfuse_block_size > 0) ? bigfuse_block_size : selectBigFuseBS(M);
-
-    // ---- Zero workspace buffers (atomic accumulators) ----
-    // KS=1 takes the direct-store path in the kernel epilogue (no atomicAdd,
-    // each (m,n) written by exactly one CTA), so pre-zeroing is unnecessary.
-    if (ks > 1)
-    {
-        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
-            static_cast<uint32_t>(M), /*done_counter=*/nullptr, /*done_elems=*/0, stream);
-    }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
     CUtensorMap desc_res = getCachedTma2D(const_cast<__nv_bfloat16*>(residual_prev), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
@@ -472,7 +493,8 @@ static void mhcFusedHcLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     // instantiating the mhcBigFuseKernel template in this TU.
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
         layer_input_cur, M, /*K=*/static_cast<int>(SHAPE_K), hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/1, /*block_size=*/bs, norm_weight, norm_eps, stream);
+        hc_post_mult_value, sinkhorn_repeat, /*num_splits=*/static_cast<int>(ks), /*block_size=*/bs, norm_weight,
+        norm_eps, stream, pre_mix_ext, pre_mix_out);
 }
 
 void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev, float const* post_mix_prev,
@@ -480,13 +502,14 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
+    float const* pre_mix_ext, float* pre_mix_out)
 {
     if (M <= 0)
         return;
 
     TLLM_CHECK_WITH_INFO(isSupportedFhcHiddenRuntime(hidden_size),
-        "mhcFusedHcLaunch: unsupported hidden_size=%d; supported hidden sizes are 4096 and 7168", hidden_size);
+        "mhcFusedHcLaunch: unsupported hidden_size=%d; supported hidden sizes are 4096, 5120 and 7168", hidden_size);
 
     switch (hidden_size)
     {
@@ -494,13 +517,19 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
         mhcFusedHcLaunchImpl<FHC_HIDDEN_FLASH>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
             hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, pre_mix_ext, pre_mix_out);
         return;
     case static_cast<int>(FHC_HIDDEN_PRO):
         mhcFusedHcLaunchImpl<FHC_HIDDEN_PRO>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
             hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, pre_mix_ext, pre_mix_out);
+        return;
+    case static_cast<int>(FHC_HIDDEN_V41):
+        mhcFusedHcLaunchImpl<FHC_HIDDEN_V41>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
+            hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, M,
+            hidden_size, hc_mult, num_k_splits, bigfuse_block_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, pre_mix_ext, pre_mix_out);
         return;
     default: return;
     }
@@ -561,7 +590,8 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int tile_n, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
+    float const* pre_mix_ext, float* pre_mix_out)
 {
     if (M <= 0)
         return;
@@ -587,15 +617,18 @@ void mhcFusedHcFmaLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* resid
     // ---- Step 2: big-fuse postlogue (reduces ks splits internally) ----
     mhcBigFuseLaunch(y_acc_workspace, r_acc_workspace, residual_cur, hc_scale, hc_base, post_mix_cur, comb_mix_cur,
         layer_input_cur, M, /*K=*/K, hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        sinkhorn_repeat, /*num_splits=*/num_k_splits, bigfuse_block_size, norm_weight, norm_eps, stream);
+        sinkhorn_repeat, /*num_splits=*/num_k_splits, bigfuse_block_size, norm_weight, norm_eps, stream, pre_mix_ext,
+        pre_mix_out);
 }
 
 // ===================================================================
 // All-in-one single-kernel fused hyper-connection launcher (TF32 tcgen05).
 //
 // Wraps fused_allinone_tf32_pmap_gemm_atomic_impl: pmap + GEMM + bigfuse
-// all fused into one kernel.  Phase 3 elects last-home CTA per m-block via
-// atomic done_counter; Phase 4 runs bigfuse inline on the elected CTA.
+// all fused into one kernel.  Each split CTA stores its partial into
+// y_acc [ks, M, SHAPE_N] / r_acc [ks, M]; Phase 3 is a per-m-block barrier on
+// done_counter, and Phase 4 sums the splits in split order and runs bigfuse
+// inline.
 // ===================================================================
 
 #ifdef TRTLLM_MHC_ENABLE_FUSED_HC
@@ -611,24 +644,24 @@ static constexpr uint32_t fhcAllInOneSmemSize()
 
 using FusedAllInOneFn = void (*)(uint32_t, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap, CUtensorMap,
     __nv_bfloat16 const*, __nv_bfloat16*, float*, float*, int*, float const*, float const*, float*, float*,
-    __nv_bfloat16 const*, float, float, float, float, float, uint32_t);
+    __nv_bfloat16 const*, float, float, float, float, float, uint32_t, float const*, float*);
 
-template <uint32_t Hidden, uint32_t KS, bool kFuseNorm>
+template <uint32_t Hidden, uint32_t KS, bool kFuseNorm, bool kLaggedPre>
 static FusedAllInOneFn fhcAllInOneInstance()
 {
     static_assert(isSupportedFhcHidden<Hidden>(), "Unsupported fused-HC hidden size");
     static_assert(isSupportedFhcMmaKS<Hidden, KS>(), "Unsupported fused-HC MMA kNumSplits for hidden size");
     return &fused_mhc::fused_allinone_tf32_pmap_gemm_atomic_impl<FHC_SHAPE_N, Hidden, FHC_HC_MULT, FHC_BLOCK_M,
         FHC_BLOCK_N, FHC_BLOCK_K, FHC_SWIZZLE_CD, FHC_N_B_STAGES, FHC_N_INPUT_STG, FHC_NUM_MMA_TH, FHC_NUM_PMAP_TH, KS,
-        kFuseNorm>;
+        kFuseNorm, kLaggedPre>;
 }
 
-template <uint32_t Hidden, uint32_t KS, bool kFuseNorm>
+template <uint32_t Hidden, uint32_t KS, bool kFuseNorm, bool kLaggedPre>
 static FusedAllInOneFn fhcAllInOneInstanceIfSupported()
 {
     if constexpr (isSupportedFhcMmaKS<Hidden, KS>())
     {
-        return fhcAllInOneInstance<Hidden, KS, kFuseNorm>();
+        return fhcAllInOneInstance<Hidden, KS, kFuseNorm, kLaggedPre>();
     }
     else
     {
@@ -638,25 +671,30 @@ static FusedAllInOneFn fhcAllInOneInstanceIfSupported()
     }
 }
 
-template <uint32_t Hidden, bool kFuseNorm>
+template <uint32_t Hidden, bool kFuseNorm, bool kLaggedPre>
 static FusedAllInOneFn pickFhcAllInOne(uint32_t ks)
 {
     switch (ks)
     {
-    case 1: return fhcAllInOneInstanceIfSupported<Hidden, 1, kFuseNorm>();
-    case 2: return fhcAllInOneInstanceIfSupported<Hidden, 2, kFuseNorm>();
-    case 4: return fhcAllInOneInstanceIfSupported<Hidden, 4, kFuseNorm>();
-    case 7: return fhcAllInOneInstanceIfSupported<Hidden, 7, kFuseNorm>();
-    case 8: return fhcAllInOneInstanceIfSupported<Hidden, 8, kFuseNorm>();
-    case 14: return fhcAllInOneInstanceIfSupported<Hidden, 14, kFuseNorm>();
-    case 16: return fhcAllInOneInstanceIfSupported<Hidden, 16, kFuseNorm>();
-    case 28: return fhcAllInOneInstanceIfSupported<Hidden, 28, kFuseNorm>();
-    case 32: return fhcAllInOneInstanceIfSupported<Hidden, 32, kFuseNorm>();
-    case 53: return fhcAllInOneInstanceIfSupported<Hidden, 53, kFuseNorm>();
-    case 56: return fhcAllInOneInstanceIfSupported<Hidden, 56, kFuseNorm>();
-    case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64, kFuseNorm>();
-    case 106: return fhcAllInOneInstanceIfSupported<Hidden, 106, kFuseNorm>();
-    case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112, kFuseNorm>();
+    case 1: return fhcAllInOneInstanceIfSupported<Hidden, 1, kFuseNorm, kLaggedPre>();
+    case 2: return fhcAllInOneInstanceIfSupported<Hidden, 2, kFuseNorm, kLaggedPre>();
+    case 4: return fhcAllInOneInstanceIfSupported<Hidden, 4, kFuseNorm, kLaggedPre>();
+    case 5: return fhcAllInOneInstanceIfSupported<Hidden, 5, kFuseNorm, kLaggedPre>();
+    case 10: return fhcAllInOneInstanceIfSupported<Hidden, 10, kFuseNorm, kLaggedPre>();
+    case 20: return fhcAllInOneInstanceIfSupported<Hidden, 20, kFuseNorm, kLaggedPre>();
+    case 40: return fhcAllInOneInstanceIfSupported<Hidden, 40, kFuseNorm, kLaggedPre>();
+    case 80: return fhcAllInOneInstanceIfSupported<Hidden, 80, kFuseNorm, kLaggedPre>();
+    case 7: return fhcAllInOneInstanceIfSupported<Hidden, 7, kFuseNorm, kLaggedPre>();
+    case 8: return fhcAllInOneInstanceIfSupported<Hidden, 8, kFuseNorm, kLaggedPre>();
+    case 14: return fhcAllInOneInstanceIfSupported<Hidden, 14, kFuseNorm, kLaggedPre>();
+    case 16: return fhcAllInOneInstanceIfSupported<Hidden, 16, kFuseNorm, kLaggedPre>();
+    case 28: return fhcAllInOneInstanceIfSupported<Hidden, 28, kFuseNorm, kLaggedPre>();
+    case 32: return fhcAllInOneInstanceIfSupported<Hidden, 32, kFuseNorm, kLaggedPre>();
+    case 53: return fhcAllInOneInstanceIfSupported<Hidden, 53, kFuseNorm, kLaggedPre>();
+    case 56: return fhcAllInOneInstanceIfSupported<Hidden, 56, kFuseNorm, kLaggedPre>();
+    case 64: return fhcAllInOneInstanceIfSupported<Hidden, 64, kFuseNorm, kLaggedPre>();
+    case 106: return fhcAllInOneInstanceIfSupported<Hidden, 106, kFuseNorm, kLaggedPre>();
+    case 112: return fhcAllInOneInstanceIfSupported<Hidden, 112, kFuseNorm, kLaggedPre>();
     default: TLLM_CHECK_WITH_INFO(false, "mhcFusedHcAllInOneLaunch: unsupported kNumSplits=%u", ks); return nullptr;
     }
 }
@@ -668,7 +706,7 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
     float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream, float const* pre_mix_ext, float* pre_mix_out)
 {
     if (M <= 0)
         return;
@@ -684,17 +722,15 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     uint32_t const m_u = static_cast<uint32_t>(M);
     int device_id = 0;
     TLLM_CUDA_CHECK(cudaGetDevice(&device_id));
-    uint32_t const ks = (num_k_splits > 0) ? static_cast<uint32_t>(num_k_splits) : 1u;
+    uint32_t const ks = static_cast<uint32_t>(mhcFusedHcMmaKSplits(M, num_k_splits, /*allInOne=*/true));
     uint32_t const m_tiles = (m_u + FHC_BLOCK_M - 1) / FHC_BLOCK_M;
 
-    // ---- Zero workspace buffers (atomic accumulators + done counter) ----
-    // KS=1 takes the direct-store path (no atomic on y_acc/r_acc) and skips
-    // the done_counter atomic election (Phase 3 just __threadfence_block +
-    // __syncthreads). All three buffers are unused at KS=1 → skip the zero.
+    // ---- Zero the per-m_block done counters (Phase-3 barrier) ----
+    // y_acc [ks, M, SHAPE_N] / r_acc [ks, M] hold per-split partials, each slot written by exactly one CTA,
+    // so they need no zeroing. KS=1 skips the barrier (Phase 3 is just __threadfence_block + __syncthreads).
     if (ks > 1)
     {
-        fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * FHC_SHAPE_N, r_acc_workspace,
-            static_cast<uint32_t>(M), done_counter_workspace, m_tiles, stream);
+        fhcZeroDoneCounters(done_counter_workspace, m_tiles, stream);
     }
 
     // ---- Build TMA descriptors (cached by ptr+shape) ----
@@ -726,9 +762,15 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     // Dispatch on `norm_weight != nullptr` to a kFuseNorm=true instance that
     // inlines the next-layer RMSNorm into Phase 4's layer_input write.
     bool const fuse_norm = (norm_weight != nullptr);
+    bool const lagged = (pre_mix_ext != nullptr);
+    TLLM_CHECK_WITH_INFO(lagged == (pre_mix_out != nullptr),
+        "mhcFusedHcAllInOneLaunch: pre_mix_ext and pre_mix_out must both be set (V4.1) or both be null (V4)");
     constexpr uint32_t fused_smem = fhcAllInOneSmemSize();
-    FusedAllInOneFn fa = fuse_norm ? pickFhcAllInOne<Hidden, /*kFuseNorm=*/true>(ks)
-                                   : pickFhcAllInOne<Hidden, /*kFuseNorm=*/false>(ks);
+    FusedAllInOneFn fa = nullptr;
+    if (fuse_norm)
+        fa = lagged ? pickFhcAllInOne<Hidden, true, true>(ks) : pickFhcAllInOne<Hidden, true, false>(ks);
+    else
+        fa = lagged ? pickFhcAllInOne<Hidden, false, true>(ks) : pickFhcAllInOne<Hidden, false, false>(ks);
     TLLM_CUDA_CHECK(cudaFuncSetAttribute(
         reinterpret_cast<void const*>(fa), cudaFuncAttributeMaxDynamicSharedMemorySize, fused_smem));
 
@@ -737,7 +779,7 @@ static void mhcFusedHcAllInOneLaunchImpl(__nv_bfloat16 const* x_prev, __nv_bfloa
     fa<<<grid, block, fused_smem, stream>>>(m_u, desc_res, desc_x, desc_b, desc_res_out, desc_post, desc_comb,
         residual_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, done_counter_workspace, hc_scale, hc_base,
         post_mix_cur, comb_mix_cur, norm_weight, norm_eps, rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value,
-        static_cast<uint32_t>(sinkhorn_repeat));
+        static_cast<uint32_t>(sinkhorn_repeat), pre_mix_ext, pre_mix_out);
 }
 
 void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual_prev,
@@ -746,13 +788,14 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
     float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream, float const* pre_mix_ext, float* pre_mix_out)
 {
     if (M <= 0)
         return;
 
     TLLM_CHECK_WITH_INFO(isSupportedFhcHiddenRuntime(hidden_size),
-        "mhcFusedHcAllInOneLaunch: unsupported hidden_size=%d; supported hidden sizes are 4096 and 7168", hidden_size);
+        "mhcFusedHcAllInOneLaunch: unsupported hidden_size=%d; supported hidden sizes are 4096, 5120 and 7168",
+        hidden_size);
 
     switch (hidden_size)
     {
@@ -760,13 +803,20 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
         mhcFusedHcAllInOneLaunchImpl<FHC_HIDDEN_FLASH>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t,
             hc_scale, hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace,
             r_acc_workspace, done_counter_workspace, M, hidden_size, hc_mult, num_k_splits, rms_eps, hc_pre_eps,
-            hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
+            hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, pre_mix_ext,
+            pre_mix_out);
         return;
     case static_cast<int>(FHC_HIDDEN_PRO):
         mhcFusedHcAllInOneLaunchImpl<FHC_HIDDEN_PRO>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
             hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace,
             done_counter_workspace, M, hidden_size, hc_mult, num_k_splits, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
-            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream);
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, pre_mix_ext, pre_mix_out);
+        return;
+    case static_cast<int>(FHC_HIDDEN_V41):
+        mhcFusedHcAllInOneLaunchImpl<FHC_HIDDEN_V41>(x_prev, residual_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale,
+            hc_base, residual_cur, post_mix_cur, comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace,
+            done_counter_workspace, M, hidden_size, hc_mult, num_k_splits, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+            hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, stream, pre_mix_ext, pre_mix_out);
         return;
     default: return;
     }
@@ -779,7 +829,8 @@ void mhcFusedHcLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* residual
     __nv_bfloat16* residual_cur, float* post_mix_cur, float* comb_mix_cur, __nv_bfloat16* layer_input_cur,
     float* y_acc_workspace, float* r_acc_workspace, int M, int hidden_size, int hc_mult, int num_k_splits,
     int bigfuse_block_size, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps, float hc_post_mult_value,
-    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream)
+    int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps, cudaStream_t stream,
+    float const* pre_mix_ext, float* pre_mix_out)
 {
     TLLM_CHECK_WITH_INFO(
         false, "mhcFusedHcLaunch requires BUILD_DEEP_GEMM=ON to compile the TF32 MMA fused-HC backend");
@@ -791,7 +842,7 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int num_k_splits, float rms_eps, float hc_pre_eps, float hc_sinkhorn_eps,
     float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight, float norm_eps,
-    cudaStream_t stream)
+    cudaStream_t stream, float const* pre_mix_ext, float* pre_mix_out)
 {
     TLLM_CHECK_WITH_INFO(
         false, "mhcFusedHcAllInOneLaunch requires BUILD_DEEP_GEMM=ON to compile the TF32 MMA fused-HC backend");
@@ -809,21 +860,26 @@ void mhcFusedHcAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 const* 
 
 using FmaAllInOneFn = void (*)(__nv_bfloat16 const*, __nv_bfloat16 const*, float const*, float const*, float const*,
     float const*, float const*, __nv_bfloat16*, float*, float*, __nv_bfloat16*, float*, float*, int*, int, int, int,
-    float, float, float, float, int, __nv_bfloat16 const*, float);
+    float, float, float, float, int, __nv_bfloat16 const*, float, float const*, float*);
 
-template <int TN, int KS, int TM, bool kFuseNorm>
+template <int TN, int KS, int TM, bool kFuseNorm, bool kLaggedPre>
 static FmaAllInOneFn fhcFmaAllInOneInstance()
 {
+    // Path F adds its split partials onto one zeroed slot with atomicAdd. Two partials sum the same in either
+    // order; with more, the float sum would depend on the order the CTAs finish.
+    static_assert(KS == 1 || KS == 2,
+        "Path F accumulates with atomicAdd: more than two partials per slot is "
+        "order-dependent");
     return &fused_fma_kernels::fused_pmap_gemm_fma_allinone<TN, KS, TM, /*FULL_N=*/24, /*BF16_VEC_OVERRIDE=*/0,
-        kFuseNorm>;
+        kFuseNorm, kLaggedPre>;
 }
 
-template <bool kFuseNorm>
+template <bool kFuseNorm, bool kLaggedPre>
 static FmaAllInOneFn pickFhcFmaAllInOne(int tile_n, int ks, int tile_m)
 {
 #define FHC_FMA_AIO_CASE(TN, KS, TM)                                                                                   \
     if (tile_n == (TN) && ks == (KS) && tile_m == (TM))                                                                \
-    return fhcFmaAllInOneInstance<TN, KS, TM, kFuseNorm>()
+    return fhcFmaAllInOneInstance<TN, KS, TM, kFuseNorm, kLaggedPre>()
 
     FHC_FMA_AIO_CASE(1, 1, 1);
     FHC_FMA_AIO_CASE(1, 2, 1);
@@ -867,7 +923,7 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     __nv_bfloat16* layer_input_cur, float* y_acc_workspace, float* r_acc_workspace, int* done_counter_workspace, int M,
     int hidden_size, int hc_mult, int tile_n, int num_k_splits, int tile_m, float rms_eps, float hc_pre_eps,
     float hc_sinkhorn_eps, float hc_post_mult_value, int sinkhorn_repeat, __nv_bfloat16 const* norm_weight,
-    float norm_eps, cudaStream_t stream)
+    float norm_eps, cudaStream_t stream, float const* pre_mix_ext, float* pre_mix_out)
 {
     if (M <= 0)
         return;
@@ -883,26 +939,34 @@ void mhcFusedHcFmaAllInOneLaunch(__nv_bfloat16 const* x_prev, __nv_bfloat16 cons
     int const N = static_cast<int>(FHC_SHAPE_N);
     int const m_batches = (M + tile_m - 1) / tile_m;
 
-    // ---- Zero workspace buffers (atomic accumulators + done counter) ----
-    // NOTE: Path F's kernel epilogue always uses atomicAdd into y_acc/r_acc
-    // (no KS=1 direct-store fast path like the MMA Path D in
-    // mhcFusedHcAllInOneLaunchImpl), so we cannot skip the zero even at
-    // num_k_splits == 1. Adding the direct-store branch would require kernel
-    // changes in fused_pmap_gemm_fma_allinone; deferred since Path F is the
-    // small-M (M <= 32) winner where the workspace zero is ~1 µs anyway.
+    // ---- Zero workspace buffers (split accumulators + done counter) ----
+    // Path F's epilogue stores its partial at num_k_splits == 1 and atomicAdds the two partials of
+    // num_k_splits == 2 onto the zeroed slot; two partials sum the same in either order, so the result is
+    // deterministic (fhcFmaAllInOneInstance rejects more splits). One launch zeroes the accumulators and the
+    // done counters together; at num_k_splits == 1 only the counters need it, at about 1 µs for Path F's
+    // small-M (M <= 32) shapes.
     fhcZeroWorkspaces(y_acc_workspace, static_cast<uint32_t>(M) * static_cast<uint32_t>(N), r_acc_workspace,
         static_cast<uint32_t>(M), done_counter_workspace, static_cast<uint32_t>(m_batches), stream);
 
     bool const fuse_norm = (norm_weight != nullptr);
-    FmaAllInOneFn fn = fuse_norm ? pickFhcFmaAllInOne</*kFuseNorm=*/true>(tile_n, num_k_splits, tile_m)
-                                 : pickFhcFmaAllInOne</*kFuseNorm=*/false>(tile_n, num_k_splits, tile_m);
+    bool const lagged = (pre_mix_ext != nullptr);
+    TLLM_CHECK_WITH_INFO(lagged == (pre_mix_out != nullptr),
+        "mhcFusedHcFmaAllInOneLaunch: pre_mix_ext and pre_mix_out must both be set (V4.1) or both be null (V4)");
+    FmaAllInOneFn fn = nullptr;
+    if (fuse_norm)
+        fn = lagged ? pickFhcFmaAllInOne<true, true>(tile_n, num_k_splits, tile_m)
+                    : pickFhcFmaAllInOne<true, false>(tile_n, num_k_splits, tile_m);
+    else
+        fn = lagged ? pickFhcFmaAllInOne<false, true>(tile_n, num_k_splits, tile_m)
+                    : pickFhcFmaAllInOne<false, false>(tile_n, num_k_splits, tile_m);
     dim3 const grid(
         static_cast<unsigned>(m_batches), static_cast<unsigned>(N / tile_n), static_cast<unsigned>(num_k_splits));
     dim3 const block(256);
     tensorrt_llm::common::launchWithPdlWhenEnabled("fused_pmap_gemm_fma_allinone", fn, grid, block, 0, stream,
         residual_prev, x_prev, post_mix_prev, comb_mix_prev, w_t, hc_scale, hc_base, residual_cur, post_mix_cur,
         comb_mix_cur, layer_input_cur, y_acc_workspace, r_acc_workspace, done_counter_workspace, M, K, hidden_size,
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps);
+        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat, norm_weight, norm_eps, pre_mix_ext,
+        pre_mix_out);
 }
 
 } // namespace kernels::mhc

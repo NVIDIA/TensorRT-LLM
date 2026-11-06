@@ -5,9 +5,9 @@
 
 from typing import Any
 
-import torch
 from torch import nn
 
+from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFeatures
 from tensorrt_llm._torch.distributed import Distributed
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -34,9 +34,15 @@ class PoolingRunner(NoKVCacheRunner):
         dist: Distributed | None,
         moe_load_balancer: MoeLoadBalancer | None,
         model_caller: ModelCaller,
+        attention_runtime_features: AttentionRuntimeFeatures,
     ) -> None:
         super().__init__(
-            model, config, mapping=mapping, dist=dist, moe_load_balancer=moe_load_balancer
+            model,
+            config,
+            mapping=mapping,
+            dist=dist,
+            moe_load_balancer=moe_load_balancer,
+            attention_runtime_features=attention_runtime_features,
         )
         self._model_caller = model_caller
 
@@ -46,28 +52,18 @@ class PoolingRunner(NoKVCacheRunner):
         inputs: dict[str, Any],
         scheduled_requests: ScheduledRequests,
         *,
-        gather_ids: torch.Tensor | None = None,
         gather_context_logits: bool = False,
     ) -> dict[str, Any]:
         attn_metadata = inputs.get("attn_metadata")
         if attn_metadata is not None:
             attn_metadata.on_update_kv_lens()
-        if inputs.get("spec_metadata") is not None:
-            gather_ids = inputs["spec_metadata"].gather_ids
 
         outputs = self._model_caller(
             **inputs,
-            return_context_logits=gather_ids is not None or gather_context_logits,
+            return_context_logits=gather_context_logits,
         )
         if self._config.without_logits:
             return outputs
-        if isinstance(outputs, dict):
-            logits = outputs.get("logits")
-            if logits is None:
-                return outputs
-        else:
-            logits = outputs
-            outputs = {"logits": logits}
-        if gather_ids is not None:
-            outputs["logits"] = logits[gather_ids]
+        if not isinstance(outputs, dict):
+            outputs = {"logits": outputs}
         return outputs

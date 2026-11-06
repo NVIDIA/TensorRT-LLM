@@ -61,7 +61,10 @@ void poisonOnExcept(char const* context, F&& func) noexcept
 }
 
 // ---------------------------------------------------------------------------
-// Exception hierarchy (mirrors _exceptions.py)
+// Exception hierarchy. The bindings make a Python class of each one
+// (nb::exception in nanobind/batch_manager/kvCacheManagerV2.cpp) and
+// runtime/kv_cache_manager_v2/__init__.py re-exports them, so the class a
+// Python caller catches is this one.
 // ---------------------------------------------------------------------------
 
 class OutOfMemoryError : public std::runtime_error
@@ -111,8 +114,8 @@ public:
 };
 
 // Mirrors a Python `assert` failure: the binding layer translates this to a
-// Python AssertionError so shared tests observe the same exception type as the
-// pure-Python backend.
+// Python AssertionError, so a configuration mistake surfaces to Python callers
+// as the exception type they would expect.
 class AssertionError : public std::logic_error
 {
 public:

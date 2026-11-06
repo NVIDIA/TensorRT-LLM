@@ -1,284 +1,339 @@
-# ModelingV2
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
 
-One self-contained modeling codebase per deployment target, beside the
-built-in model zoo rather than inside it.
+# Modeling V2
 
-Where `_torch/models/modeling_deepseekv3.py` is one class serving V3, V3-Lite,
-R1 and V3.2 across every GPU generation and parallel topology,
-`_torch/_experimental/modeling_v2/models/deepseek_v3/` is one flat forward per (checkpoint,
-GPU architecture, parallel topology) triple — assembled only from `catalog/`
-entries, sharing nothing with its siblings, and trusted through accuracy gates
-instead of shared abstractions. The one-to-one correspondence between
-`models/<x>/` here and `modeling_<x>.py` there is the point of the exercise.
+Modeling V2 is an experimental way to write models in TensorRT-LLM, where each
+model family and each deployment target owns its own code. With coding agents,
+writing specialized model code and kernels is cheap. Reviewing and maintaining
+changes to code that every model shares is the expensive part. Modeling V2
+keeps model-specific code inside its family or target, so a change to one model
+cannot break another, and it reuses TensorRT-LLM's serving runtime and shared
+operators for everything else. The trade-off is some duplicated code between
+models. For example, the DeepSeek R1 target loads its own weights and calls its
+MLA projections, normalization, RoPE and attention operations directly in its
+forward pass, so it can be optimized without affecting any other model.
 
 ## Using it
 
-```bash
-export TRTLLM_MODELING_V2=require        # off | auto | require
-```
+The `modeling_v2` LLM API option selects the implementation:
 
-| `TRTLLM_MODELING_V2` | Behaviour |
+| `modeling_v2` | Behavior |
 |---|---|
-| unset or `off` (default) | The resolver returns immediately. Nothing in this package is imported and behaviour is byte-for-byte what it is today. |
-| `auto` | Uses a target when one matches this exact configuration; falls back to the built-in implementation when none does. |
-| `require` | Raises instead of falling back, naming the criterion that did not match. |
+| `off` (default) | Use Modeling V1. No Modeling V2 routing or target code is loaded. |
+| `auto` | Use a Modeling V2 target if one matches this deployment; otherwise use Modeling V1. |
+| `require` | Use a Modeling V2 target, or raise an error that says why none matches. |
 
-**Use `require` for anything you will attribute to modeling_v2.** Under `auto`,
-a configuration that misses a target's criteria silently gets the built-in
-implementation — and a performance curve measured that way reads as
-modeling_v2's. That is the single most expensive mistake available here.
+Python API:
 
-**Export it before the ranks start**, not merely before `LLM(...)`. Worker
-ranks receive the environment as it stood when MPI initialized, and long-lived
-ranks under `trtllm-llmapi-launch` receive it once at launch, so a value set
-later reaches the driver and not them -- and a driver resolving a target while
-its workers resolve the built-in is the silent split this package exists to
-prevent.
-
-An environment variable rather than an LLM-API field is a deliberate trade: it
-keeps the entire concept inside this package, so the only change modeling_v2
-needs anywhere else is the `_resolve_class` hook. The cost is that the switch
-does not appear in a run's recorded `llm.args` and cannot be set through
-`--extra_llm_api_options`.
-
-The predecessor `MODELING_V2_TARGET` is gone. It named a *target*; this names
-only a mode, and routing picks the target from the configuration.
-
-The checkpoint is read exactly as published, with no target-owned
-`config.json`.
-
-## How a config finds its target
-
+```python
+LLM(model, modeling_v2="require")
 ```
-LLM(model=...)  ->  ModelLoader  ->  AutoModelForCausalLM._resolve_class
+
+`trtllm-serve` configuration:
+
+```yaml
+# trtllm-serve --config serve.yaml
+modeling_v2: require
+```
+
+Use `require` when you validate or benchmark a target, so the run cannot fall
+back to Modeling V1 without you noticing. A target can also read the mode with
+`resolved_mode()` when it is constructed. Under `require`, its own dispatch
+can then raise instead of falling back to a Modeling V1 code path.
+
+## Families and targets
+
+A **family** is a directory `models/<family>/`. It usually covers one Hugging
+Face architecture, the `architectures[0]` value in the checkpoint's
+`config.json`. It owns the routing for that architecture and any code its
+targets share. You can scope a family more broadly or more narrowly if that
+fits the models better.
+
+A **target** is a directory `models/<family>/<target>/` that holds one complete
+model implementation. Routing selects a target for a specific set of
+checkpoint, GPU and parallel configurations. A target does not import code
+from its sibling targets. It can use its family's shared code, the shared
+operation catalog and the TensorRT-LLM runtime.
+
+Target directories are usually named `<checkpoint>__<sm>__<parallel>`, with
+double underscores between the three parts:
+
+* `<checkpoint>` identifies the checkpoint, for example `r1_0528_nvfp4`.
+* `<sm>` is the GPU architecture, for example `sm_103`, or `sm_10x` for code
+  that runs on SM10x.
+* `<parallel>` is either one parallel layout, for example `tp4`, or `default`.
+  A `default` target derives its sharding from the engine's `Mapping` and runs
+  every layout its `route` admits.
+
+The target class name contains the same three parts in CamelCase, for example
+`ModelingV2DeepseekR10528Nvfp4Sm10xDefault` in
+[`r1_0528_nvfp4__sm_10x__default`](models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/).
+These names are conventions, not requirements.
+
+A target can contain several execution paths. The DeepSeek R1 target, for
+example, has separate `PrefillTarget` and `DecodeTarget` classes and picks one
+on each forward step. In this guide, "target" always means the whole directory.
+
+## Code layout
+
+```text
+modeling_v2/
+├── _router_index.py           # Route registration and target resolution
+├── _native.py                 # Loads family native libraries
+├── catalog/
+│   ├── _op.py                 # OpWrapper: the operation contract
+│   └── <category>/            # Operations used by more than one family
+└── models/
+    ├── __init__.py            # Imports every family's routing.py
+    └── <family>/
+        ├── routing.py         # route(): picks a target or raises NoTarget
+        ├── ops/, kernels/     # Optional: code shared by the family's targets
+        ├── csrc/, fake_ops.py # Optional: family native code
+        └── <target>/
+            ├── modeling.py    # Model construction and forward
+            ├── weights.py     # Checkpoint mapping, loading and sharding
+            ├── ops/, kernels/ # Optional: target-only operations and kernels
+            └── csrc/, fake_ops.py  # Optional: target native code
+```
+
+The layout inside a family is a convention that the existing families follow,
+not a requirement. Organize a family's files in whatever way suits its
+implementation. Native code is the exception: the build looks for it in fixed
+locations, described in the
+[native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
+
+Put code at the narrowest scope that uses it:
+
+| Scope | Put here | Location |
+|---|---|---|
+| Target | Code only this target uses | `models/<family>/<target>/` |
+| Family | Code shared by targets of one family | `models/<family>/` |
+| Catalog | Operations used by more than one family | `catalog/<category>/` |
+
+If two targets need the same code, move it to the family instead of importing
+it from a sibling target. Duplicating code between targets is fine. Whether to
+merge it is the family owners' decision.
+
+## Adding a family or a target
+
+1. **New family only:** create `models/<family>/routing.py` with a `route`
+   function decorated with `@routes("<Architecture>")`, and import that module
+   in [`models/__init__.py`](models/__init__.py). See [Routing](#routing).
+2. Create `models/<family>/<target>/` with `modeling.py` and `weights.py`,
+   following the naming in [Families and targets](#families-and-targets). See
+   [Model lifecycle](#model-lifecycle).
+3. In `route`, return the target class for the configurations it supports.
+4. Use catalog operations where they fit. Add new operations as `OpWrapper`s
+   with tests. See [Writing operations](#writing-operations).
+5. For C++/CUDA code, follow the [native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md).
+6. Add unit tests and a whole-model accuracy test, and add them to the CI test
+   lists. See [Testing and validation](#testing-and-validation).
+7. Add the new paths to [CODEOWNERS](../../../../.github/CODEOWNERS). Families
+   with their own owners list three paths: the package directory, the unit
+   test directory and the accuracy test file.
+
+## Model lifecycle
+
+A target plugs into TensorRT-LLM through the existing `DecoderModel` and
+`DecoderModelForCausalLM` interfaces. It can inherit, override or delegate any
+of these steps:
+
+* **Constructor:** builds the model structure and parameters.
+* **`load_weights`:** loads checkpoint weights into the model. Put weight
+  mapping, transformation and sharding in `weights.py`.
+* **`post_load_weights`:** prepares the loaded weights, for example by
+  transforming them or precomputing derived state. The default implementation
+  in `DecoderModelForCausalLM` runs alias setup, weight transforms and derived
+  state caching; override or extend it if the target needs more.
+* **`forward`:** runs the model on the inputs and attention metadata from the
+  engine.
+
+Keep the sequence of operator calls in `forward` easy to read, with the
+arguments passed explicitly. Helpers, modules and separate prefill and decode
+classes are fine when they make the code clearer or faster. The
+[GPT-OSS target](models/gpt_oss/gpt_oss_120b__sm_10x__default/modeling.py) and
+its [weight loader](models/gpt_oss/gpt_oss_120b__sm_10x__default/weights.py)
+are a small example.
+
+## Routing
+
+Each family's `routing.py` defines one `route` function, registered with
+`@routes(...)` for the architecture names it handles. `route` receives the
+`ModelConfig`, the LLM arguments and the GPU's compute capability. It returns
+a target class, or raises `NoTarget` with a message that names the requirement
+that failed. [DeepSeek R1 routing](models/deepseek_v3/routing.py) is an example.
+
+Each family decides what to route on, for example the checkpoint shape, GPU
+architecture, parallel layout, speculative decoding mode or KV cache dtype.
+Routing runs once, when the model is loaded, so per-step differences such as
+batch composition or prefill versus decode are handled inside the target.
+
+How the model loader resolves a target:
+
+```text
+LLM(model=..., modeling_v2=...)  ->  ModelLoader
+                                        |  model defaults applied to llm_args
                                         |
-                                        +-- modeling_v2_resolve(config)
+                                        +-- modeling_v2_resolve_on_all_ranks(config, llm_args)
                                               |
                     _router_index.py          +-- architectures[0] -> routing module
-                    models/<x>/routing.py     +-- one forward-reading decision tree
-                                              +-- returns a synthetic class name
+                    models/<x>/routing.py     +-- route(model_config, llm_args,
+                                              |         compute_capability)
+                                              |         -> target class, or NoTarget
                                         |
-                                     get_registered_model_class(name)
+                                     config.modeling_v2_target = class
+                                        |
+                    AutoModelForCausalLM._resolve_class(config)
+                                        |
+                                     returns that class; the registry is not consulted
 ```
 
-The synthetic name (`ModelingV2GptOss120bSm103Tp1`) is a registry key that no
-checkpoint declares. Upstream already does exactly this for `EAGLE3<Arch>`,
-which also exists only as a `_resolve_class` rewrite.
+## Writing operations
 
-To ask why a configuration landed where it did:
+Wrap each kernel call in a thin, stateless operation class that makes its
+contract explicit. Put the operation in the narrowest
+[scope](#code-layout) that uses it: the target's `ops/`, the family's `ops/`,
+or `catalog/` when more than one family uses it. The
+[`OpWrapper` base class](catalog/_op.py) defines:
 
-```
-python -m tensorrt_llm._torch._experimental.modeling_v2.explain \
-    --model /path/to/DeepSeek-R1-0528-NVFP4 --tp 4 --ep 4 --attention-dp
-```
-
-### What may decide a target
-
-A quantity may be a routing criterion only if it is known when
-`_resolve_class` runs **and** constant for the engine's life — and only if it
-changes the *structure of the forward*. Config shape, SM version, parallel
-topology qualify. `max_num_tokens` and `cuda_graph_config.max_batch_size` pass
-the first test and fail the second: they are tuning knobs — LLM API arguments,
-not identity. Batch composition and `num_contexts` fail the
-first outright — those move every step, and a target chosen from them would
-be chosen once and then be wrong. Per-step specialization is a separate
-mechanism (dispatch inside a target's `forward`), not a routing dimension.
-
-### Checkpoint identity is a shape fingerprint
-
-Routing recognizes a checkpoint by `(num_hidden_layers, hidden_size, ...)`,
-the same sniffing idiom as `is_mla` / `is_nemotron_hybrid` upstream. It cannot
-tell a fine-tune from the original. That is a deliberate trade, and it changes
-what a gate record means: not "this target passed" but "this modeling code
-passed **on the checkpoint the accuracy gate names**". Running it on any other
-checkpoint of the same shape is ungated.
-
-## Layout
-
-```
-_router_index.py    architectures[0] -> routing module. Small, stable, test-guarded.
-explain.py          why a configuration routed where it did
-models/<family>/
-  routing.py        one forward-reading decision tree per architecture family
-  <checkpoint>__<gpu arch>__<parallel>/
-                      modeling.py  weights.py
-catalog/            the kernel vocabulary: contract .md + wrapper .py
-```
-
-Accuracy anchors are not kept here. They live where every other model's do,
-`tests/integration/defs/accuracy/references/`, read by the gates CI runs.
-
-The third piece of a catalog entry, its GPU test, lives in the tests tree:
-
-```
-tests/unittest/_torch/modeling_v2/
-  test_modeling_v2_claims.py     routing tables vs the targets they name (no GPU)
-  test_modeling_v2_routing.py    what modeling_v2_resolve does (no GPU)
-  <category>/test_modeling_v2_<entry>.py
-  comm/_<entry>_op_matrix.py   the two collectives' 4-rank rank bodies
-  comm/_rank_job.py            starts one of those and asserts on its exit code
-```
-
-That split is not a preference; it is where this repo's CI collects from, and
-an in-package test is on no list. It costs one thing worth stating: a receipt
-is valid only if it post-dates the last write to *every* file of its entry, so
-that check now has to look in both trees.
-
-The two collectives' rank bodies sit in the tests tree with everything else
-that only tests run. Both halves are started by file path -- the launcher must
-not import `tensorrt_llm`, because that calls `MPI_Init` and an
-MPI-initialized process cannot start `mpirun`, and the ranks reach the catalog
-by absolute import -- so neither needs a package to live in. Neither those
-file names nor their `check_*` bodies match pytest's collection patterns:
-each is one fixed 4-rank sequence that cannot run as independent cases.
-
-Identity is the directory name, and it carries all three segments:
-`gpt_oss_120b__sm_103__tp1`. They were three nested directories once, which
-read as a hierarchy that was never one -- every level had exactly one child,
-and each needed an `__init__.py` whose only job was to exist. The class name
-carries the same triple; `test_modeling_v2_claims.py` asserts they agree.
-
-### Why beside `_torch/models/`, not inside it
-
-Two upstream mechanisms, and together they are the worst combination —
-inheriting the built-in constraints without inheriting the built-in guards:
-
-* `is_builtin_zoo_module` matches on the zoo's package prefix. Inside it,
-  modeling_v2 registrations would count as built-in and only fill *empty*
-  registry slots. Outside it they are external and always win their slot.
-* `test_lazy_model_zoo.py`'s scan of the zoo directory is **non-recursive**,
-  so decorators in a subpackage are invisible to it — putting synthetic names
-  in the built-in static index would fail its staleness assertion.
-
-Conceptually `models/` means "one architecture, one class, shared across
-checkpoints", which is the opposite of what this package is for.
-
-## Gates
-
-1. **Boot** — minutes, binary. `examples/llm-api/quickstart_advanced.py` with
-   the target's topology flags and `TRTLLM_MODELING_V2=require` exported. Engine
-   cold start, weight-manifest coverage, a handful of greedy continuations.
-   Catches catastrophes, not accuracy. A variant that changes the forward gets
-   its own minutes-scale gate on the same footing.
-2. **Accuracy** — the release criterion. `trtllm-eval` with the protocol from
-   `tests/integration/defs/accuracy/references/` and `TRTLLM_MODELING_V2=require`
-   exported. One-sided: measured >= reference − tol. This is the gate CI runs,
-   in the accuracy suite's modeling_v2 files.
-3. **Acceptance** — required whenever a variant is distribution-preserving by
-   construction, speculative decoding above all. Rejection sampling holds the
-   emitted distribution to the target model's, so a *miscomputed* draft path
-   produces correct text more slowly: boot passes, accuracy passes, only
-   speed moves. The detector is `acceptance_length` against the same
-   checkpoint under stock in-tree modeling at the same workload and the same
-   `speculative_config` — i.e. `TRTLLM_MODELING_V2=off` versus `=require`,
-   which is now one variable rather than two harnesses.
-
-Compare a variant against an identity run **in the same session**: one target
-measured 94.7688 and 95.0720 on a bit-identical forward a day apart, so a
-cross-session delta carries session variance into the judgement.
-
-Perf is measured, never gated.
-
-## Status of every record in this tree
-
-**The catalog is fully certified on sm_103. The targets construct but have
-never executed.**
-
-Two things voided every receipt in the move: each catalog test file was
-rewritten, and the targets moved from sm_100 (B200) to sm_103 (GB300), where
-certification is per architecture. The whole catalog was therefore re-run on
-GB300 -- **19 of 19 entries pass, 312 certified cells**, plus both 4-rank
-collective matrices. The sm_100 receipts were dropped rather than carried:
-they predate every file of the entries they sat in, and no sm_100 machine is
-in CI to re-take them on. A missing arch key reads as unknown, which is the
-honest state.
-
-Getting there surfaced four real differences. None was resolved by widening a
-tolerance, and each is written up in its own contract:
-
-* **Op schema drift** (`thop_attention`, `mla_rope_generation`,
-  `mla_rope_append_paged_kv_assign_q`). Parameters were renamed and added. The
-  wrappers now mirror their schemas argument for argument, so the next drift
-  fails loudly rather than shifting a positional list silently.
-* **The MoE FC1 epilogue changed block-scale recipe**, bit-exactly:
-  `floor(log2(amax))-8` on sm_100, `ceil(log2(amax/448))` on sm_103. The
-  reference is architecture-keyed and each arch refutes the other's recipe.
-* **torch 2.12 made fp32 matmul default to TF32**, so `cublas_mm`'s *reference*
-  was the imprecise side; the op is bit-identical to a TF32-disabled product.
-* **The MLA append op now accepts NVFP4 latent pools** as well as fp8 (accepted
-  by the op, not certified here).
-
-**gpt-oss-120b / sm_103 / tp1 is gated on GB300.** Both gates pass with
-`TRTLLM_MODELING_V2=require` in force, which is what rules out the built-in
-implementation having been measured instead:
-
-| Gate | Result |
+| Member | Purpose |
 |---|---|
-| boot, 10 greedy continuations | **10/10** keyword asserts |
-| gsm8k, full 1319 | **90.6748** (`exact_match,flexible-extract`) vs threshold 85.5989 -- pass by 5.08 |
+| `__call__` | Calls the kernel. Every argument is passed explicitly. |
+| `reference` | The expected result, computed in plain PyTorch. |
+| `is_valid` | Rejects inputs that the kernel accepts but computes incorrectly. |
+| `CELLS` | Input configurations the operation is tested on. |
+| `ARCHS` | GPU architectures those configurations were tested on. |
 
-**deepseek-r1-0528-nvfp4 / sm_103 / dep4 is gated too**, identity and the
-`mtp3` variant, on 4 GB300s through `trtllm-llmapi-launch`:
+Pass weights, state and configuration as call arguments, and keep persistent
+state in the target. An operation's tests compare it with its `reference` on
+its `CELLS`. If your target uses an operation with new shapes, layouts or
+dtypes, add those cases to the operation's tests. The existing
+[catalog entries](catalog/) and their tests under
+`tests/unittest/_torch/modeling_v2/` are examples.
 
-| Gate | Result |
+## Native code
+
+C++/CUDA code for a family or target lives in its `csrc/` directory and builds
+into one library per family. See the
+[native code guide](../../../../cpp/tensorrt_llm/modeling_v2/README.md) for
+build declarations, namespaces, op and fake registration, loading and errors.
+
+## Testing and validation
+
+Put tests under `tests/`, mirroring the scope of the code they test. Within a
+family or target, the test layout can follow the code layout.
+
+| Tests | Location |
 |---|---|
-| boot, 10 greedy continuations | **10/10** |
-| gsm8k, full 1319 | **95.0720** vs threshold 89.9962 -- pass by 5.08 |
-| boot, mtp3 | **10/10**, with the layer-61 MTP module loaded |
-| gsm8k, identity vs mtp3 **paired in one session** | delta **-0.3791** against a `\|delta\| < 1.2` criterion -- 0.63 sigma |
-| acceptance vs stock | `acceptance_length` **3.3514** vs **3.2752**, ratio **1.023** |
+| Routing, loader and CI selection | `tests/unittest/_torch/modeling_v2/test_modeling_v2_*.py` |
+| Catalog operations | `tests/unittest/_torch/modeling_v2/<category>/` |
+| Family-shared code | `tests/unittest/_torch/modeling_v2/models/<family>/` |
+| Target code | `tests/unittest/_torch/modeling_v2/models/<family>/<target>/` |
+| Whole-model accuracy | `tests/integration/defs/accuracy/modeling_v2/test_<family>.py` |
+| Accuracy references | `tests/integration/defs/accuracy/references/` |
 
-That last row is the one that matters for a speculative variant: rejection
-sampling makes a miscomputed draft layer *slower*, not wrong, so boot and
-accuracy are blind to it and only the acceptance rate against a reference can
-see it. Draft lengths 1 and 2 remain ungated -- they are the dominated end of
-the measured draft-length axis.
+CI selects tests per family: a change under `models/<family>/` runs the tests
+in `tests/unittest/_torch/modeling_v2/models/<family>/` and
+`tests/integration/defs/accuracy/modeling_v2/test_<family>.py`, so keep a
+family's tests there. Make sure a test list under
+`tests/integration/test_lists/test-db/` reaches every new unit test, either by
+file or by directory. CI does not run unlisted tests.
 
-### What replaced the version pin
+Typical whole-model checks for a target:
 
-Out of tree each target hard-asserted a pinned `tensorrt_llm` version at
-import, because a target reads private engine surface and a drifting engine
-silently voids its records. In tree that assert is meaningless — the target
-moves with the trunk — so it is gone, replaced by an SM assert, which is the
-part of the identity that does *not* move.
+* **Boot (local check):** build the engine, load the weights and generate a
+  few deterministic tokens. This catches missing weights and basic execution
+  errors before you run longer evaluations.
+* **Accuracy:** run the checkpoint's evaluation and compare against its
+  reference. Rerun it whenever a change affects numerics, weight loading or
+  execution.
 
-The same reasoning retires the version from the records themselves. A receipt
-is keyed by GPU architecture and nothing else: there is no external pin left to
-drift against, and a version written into a contract is a number that is wrong
-the next day with nothing to notice. What a receipt is still fresh against is
-its own entry's files, and that CI re-proves on every commit.
+Set `TRTLLM_MODELING_V2_VALIDATE=1` to make targets that support it check, on
+the first forward step, that the attention metadata fields they read still
+exist. The check is off by default. Tests pass the variable to all ranks
+through `env_overrides`.
 
-The pin was earning its keep out of tree, though, and the migration paid the
-bill immediately: the attention backends moved from
-`_torch/attention_backend/{interface,trtllm}.py` to
-`_torch/attention/backends/`. The compatibility shim left behind re-exports
-the names but not the submodule paths, so all five files importing them
-failed at import. They now use the canonical path.
+Record workload settings and results in the test or in the evaluation report.
 
-The lesson generalizes: with no pin, a target's contact with private engine
-surface is checked only by running it. Each target declares that surface as
-`REQUIRED_TRTLLM_OPS`, `test_modeling_v2_target_contract.py` asserts every name
-in it exists, and the first-forward metadata field check catches the rest --
-which turns a drifting engine from a wrong answer into a loud failure.
+## FAQ
 
-## Two facts this migration surfaced about upstream
+### Will duplicated code between models become unmanageable?
 
-* **`pip` is a runtime dependency of TensorRT-LLM itself.** `libtensorrt_llm.so`
-  locates its bundled kernel headers on the NVRTC JIT path by running
-  `pip show tensorrt_llm`. ModelingV2 was merely the first thing to write that
-  down (a `uv`-managed venv does not install `pip` by default), and it is not
-  a modeling_v2 dependency.
-* **The catalog contracts are now documentation of upstream ops.** For
-  example `_torch/modules/linear.py` calls `cublas_mm(input, module.weight.t(), ...)`
-  correctly, but nothing there says why the `.t()` is mandatory or that a
-  non-contiguous weight computes a silently wrong answer — `catalog/gemm/cublas_mm.md`
-  does. The reverse duty comes with it: if one of these ops changes and its
-  contract does not follow, the misleading is no longer confined to modeling_v2.
+Some duplication is expected, and Modeling V2 accepts it on purpose. Judge its
+cost over the whole life of the code: development, review, testing,
+optimization and maintenance.
 
-## Not migrated in this batch
+A target only has to handle the configurations it supports, so it has fewer
+branches and abstractions than a model class shared by many checkpoints. That
+makes it easier to read, test and optimize, even if similar code exists in
+another target. Coding agents also make it cheaper to port a fix or feature
+between similar implementations, though each ported change still needs testing
+in every implementation it touches. When code is common enough, move it to the
+family, or to the catalog if other families use it too.
 
-The 13 catalog entries no migrated target calls (listed in `catalog/index.yaml`),
-the five other targets, and the agent definitions. A later target that needs
-one of those entries must bring its contract **and** its receipt, not just the
-wrapper — otherwise that target consumes an op with no certification record at
-all.
+A model-specific optimization can stay local without first being generalized.
+A fix that clearly helps every user of shared code still goes into the shared
+code.
+
+### How does Modeling V2 make code review easier?
+
+It lets reviewers spend their effort where a change has the most impact.
+Agent-written model code is large: the
+[Kimi K3 integration (PR #20893)](https://github.com/NVIDIA/TensorRT-LLM/pull/20893)
+added more than 80,000 lines, including model-specific kernels, targets and
+tests. Reading every generated kernel line by line does not scale.
+
+* **Runtime interfaces and shared code:** review closely, because changes affect
+  other models. This includes model and runtime contracts, common runtime
+  behavior, and catalog or family operations.
+* **Target structure:** review the target's scope, routing, weight loading and
+  forward flow. Check that model-specific code stays inside the target and that
+  its dependencies on shared code are explicit.
+* **Isolated kernels in one target:** review the operation contracts, tests,
+  accuracy and performance results. Read the kernel code in depth where
+  assumptions are unclear or results look wrong.
+
+This lighter review applies only to code that is actually isolated. A shared
+change inside a large model PR still needs a full review. Keep shared changes
+easy to spot, and send them as a separate PR when you can.
+
+### Do I have to use a particular agent or workflow?
+
+No. There is a reference agent workflow for developing Modeling V2 targets, but
+it is only one option. Use any agent, skill or manual workflow, for the first
+implementation and for later fixes. What matters is the result: it uses the shared interfaces,
+keeps model-specific code isolated, has clear owners, and has tests and
+measurements that show it is correct and fast.
+
+### Who owns and reviews a family or target?
+
+The people who contribute a family or target maintain it, including its
+kernels and tests. Record them in [CODEOWNERS](../../../../.github/CODEOWNERS).
+
+Model owners review the model code. Modeling V2 maintainers review the shared
+design, interfaces and layout. Changes to shared runtime code or catalog
+operations also need approval from the owners of that code, as usual.
+
+### Does Modeling V2 replace Modeling V1 or change the user API?
+
+Not now. Modeling V1 and V2 exist side by side, and adding a V2 target does
+not require migrating any V1 model. We recommend Modeling V2 for new models
+whose implementation differs significantly from existing Modeling V1 models,
+and for optimizations specific to one model. Modeling V1 will eventually be
+deprecated, as the models it supports are deprecated, but not now.
+
+Users keep using the LLM API and `trtllm-serve`; the `modeling_v2` option,
+`off` by default, selects the implementation. See [Using it](#using-it).
+
+### Is Modeling V2 a separate inference engine?
+
+No. Modeling V2 targets run inside TensorRT-LLM and use its scheduler, KV cache
+manager, distributed execution, sampling and serving, along with its
+general-purpose operations. Families and targets own only their model code and
+specialized kernels.
+
+That boundary may move as models need more customization. Model-specific
+runtime policy can be split from shared services, but a change to common
+runtime behavior still has to work for every other model. How to specialize
+the runtime further is still being designed.

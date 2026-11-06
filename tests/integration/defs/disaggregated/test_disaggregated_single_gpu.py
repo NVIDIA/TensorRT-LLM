@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import asyncio
 import os
 import pickle
@@ -98,6 +101,9 @@ MODEL_PATHS = {
     "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
     "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     "Qwen3-8B-eagle3": "Qwen3/qwen3_8b_eagle3",
+    "Qwen3-0.6B": "Qwen3/Qwen3-0.6B",
+    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
+    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
     "Qwen3-8B": "Qwen3/Qwen3-8B",
 }
@@ -326,23 +332,34 @@ def worker_entry_point(kv_cache_config,
                    support_cancel=support_cancel))
 
 
-def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
-                         expected_output, expected_output_ids):
+def verify_disaggregated(model: str, generation_overlap: bool,
+                         enable_cuda_graph: bool, prompt: str) -> None:
     worker_pytorch_configs = []
 
     # Context worker
     worker_pytorch_configs.append(
-        dict(
-            disable_overlap_scheduler=True,
-            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
+        dict(disable_overlap_scheduler=True,
+             max_batch_size=1,
+             max_num_tokens=64,
+             max_seq_len=64,
+             cuda_graph_config=CudaGraphConfig(
+                 batch_sizes=[1]) if enable_cuda_graph else None))
 
     # Generation worker
     worker_pytorch_configs.append(
-        dict(
-            disable_overlap_scheduler=not generation_overlap,
-            cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
+        dict(disable_overlap_scheduler=not generation_overlap,
+             max_batch_size=1,
+             max_num_tokens=64,
+             max_seq_len=64,
+             cuda_graph_config=CudaGraphConfig(
+                 batch_sizes=[1]) if enable_cuda_graph else None))
 
-    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    # Both engines share one GPU and process one short request at a time.
+    # Disable prefix reuse so the reference cannot populate the transfer path.
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=128, enable_block_reuse=False)
+        for _ in range(2)
+    ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
@@ -377,11 +394,16 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
                 intercomm.recv(tag=MPI_READY)
                 print("Received ready signal.")
             max_tokens = 25
+            sampling_params = SamplingParams(max_tokens=max_tokens,
+                                             ignore_eos=True,
+                                             top_k=1)
+            reference = send_requests_to_worker(
+                [(prompt, sampling_params, None)], 0, intercomm)[0][0]
+            assert len(reference.token_ids) == max_tokens
 
             requests = []
-            requests.append(
-                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
-                 DisaggregatedParams(request_type="context_only")))
+            requests.append((prompt, sampling_params,
+                             DisaggregatedParams(request_type="context_only")))
 
             responses = send_requests_to_worker(requests, 0, intercomm)
             output = responses[0]
@@ -390,22 +412,19 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             assert output[0].disaggregated_params is not None
             print(f"Output: {output[0].disaggregated_params.request_type}")
             assert output[0].disaggregated_params.request_type == "context_only"
-            assert output[0].token_ids[0] == expected_output_ids[0]
+            assert output[0].token_ids[0] == reference.token_ids[0]
             assert len(output[0].token_ids) == 1
 
             generation_request_disagg_params = output[0].disaggregated_params
             generation_request_disagg_params.request_type = "generation_only"
             requests = []
             requests.append(
-                (prompt, SamplingParams(max_tokens=max_tokens, ignore_eos=True),
-                 generation_request_disagg_params))
+                (prompt, sampling_params, generation_request_disagg_params))
 
             responses = send_requests_to_worker(requests, 1, intercomm)
             output = responses[0]
-            assert output[0].text == expected_output
-            assert output[0].token_ids == expected_output_ids
-        except Exception as e:
-            print(f"Exception encountered: {e}", flush=True)
+            assert output[0].text == reference.text
+            assert output[0].token_ids == reference.token_ids
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)
@@ -417,52 +436,24 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
-@pytest.mark.parametrize("generation_overlap", [False, True])
-@pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_llama(model, generation_overlap,
-                                    enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        "What is the capital of Germany?",
-        "\n<|assistant|>\nThe capital of Germany is Berlin. \n<|user|>", [
-            2, 29871, 13, 29966, 29989, 465, 22137, 29989, 29958, 13, 1576,
-            7483, 310, 9556, 338, 5115, 29889, 2, 29871, 13, 29966, 29989, 1792,
-            29989, 29958
-        ])
-
-
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_deepseek(model, generation_overlap,
-                                       enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        "What is the capital of Germany?",
-        " | Berlin \nWhat is the capital of France? | Paris \nWhat is the capital of Italy? | Rome \nWhat is",
-        [
-            369, 17575, 539, 3085, 344, 270, 6102, 294, 8760, 33, 369, 11111,
-            539, 3085, 344, 270, 6102, 294, 14251, 33, 369, 16235, 539, 3085,
-            344
-        ])
+def test_disaggregated_simple_deepseek(model: str, generation_overlap: bool,
+                                       enable_cuda_graph: bool) -> None:
+    verify_disaggregated(model, generation_overlap, enable_cuda_graph,
+                         "What is the capital of Germany?")
 
 
 @skip_no_hopper
 @pytest.mark.parametrize("model", ["Qwen3-8B-FP8"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 @pytest.mark.parametrize("enable_cuda_graph", [False, True])
-def test_disaggregated_simple_qwen3(model, generation_overlap,
-                                    enable_cuda_graph):
-    verify_disaggregated(
-        model, generation_overlap, enable_cuda_graph,
-        " What is the capital of China?",
-        " The capital of China is Beijing. 2. What is the population of China? The population of China is about 1",
-        [
-            576, 6722, 315, 5616, 374, 26549, 13, 220, 17, 13, 3555, 374, 279,
-            7042, 315, 5616, 30, 576, 7042, 315, 5616, 374, 911, 220, 16
-        ])
+def test_disaggregated_simple_qwen3(model: str, generation_overlap: bool,
+                                    enable_cuda_graph: bool) -> None:
+    verify_disaggregated(model, generation_overlap, enable_cuda_graph,
+                         " What is the capital of China?")
 
 
 @skip_pre_hopper
@@ -677,7 +668,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logprobs(model, generation_overlap):
     """Verify that logprobs propagate correctly from prefill to decode.
@@ -784,7 +775,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
                 future.result()
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 def test_disaggregated_cancel_gen_requests(model):
     # Test that cancelling generation requests on a saturated generation
     # worker completes without hangs or resource leaks.
@@ -891,7 +882,7 @@ def test_disaggregated_cancel_gen_requests(model):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logits(model, generation_overlap):
     """Verify that generation logits propagate from prefill to decode in disagg."""
@@ -1026,7 +1017,7 @@ def test_disaggregated_logits(model, generation_overlap):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_arbitrary_kv_cache_transfer(model, generation_overlap):
     """Test KV cache transfer from the reuse tree.
@@ -1050,8 +1041,9 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
              cuda_graph_config=CudaGraphConfig()))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [
@@ -1177,7 +1169,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print("All workers terminated.")
 
 
-@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("model", ["Qwen3-0.6B"])
 @pytest.mark.parametrize("generation_overlap", [False])
 def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
     """Test that missing-block transfers fail.
@@ -1210,8 +1202,9 @@ def test_arbitrary_kv_cache_transfer_missing_blocks(model, generation_overlap):
              cuda_graph_config=CudaGraphConfig()))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=2048 * 8, enable_block_reuse=True)
-        for _ in range(2)
+        KvCacheConfig(max_tokens=2048 * 8,
+                      enable_block_reuse=True,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     # Arbitrary transfer uses the C++ serialized DataTransceiverState protocol.
     cache_transceiver_configs = [

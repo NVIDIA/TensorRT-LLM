@@ -18,6 +18,7 @@
 #pragma once
 
 #include "kv_cache_manager_v2/common.h"
+#include "kv_cache_manager_v2/eventData.h"
 #include "kv_cache_manager_v2/eventSink.h"
 
 #include <condition_variable>
@@ -40,7 +41,6 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 using EventBlockHash = std::variant<uint64_t, std::string>;
-using EventTokenId = std::variant<int64_t, std::string>;
 using EventLayerGroupId = std::optional<int>;
 
 struct UniqueToken
@@ -61,20 +61,6 @@ struct KVCacheCreatedData
     bool operator==(KVCacheCreatedData const& other) const
     {
         return numBlocksPerCacheLevel == other.numBlocksPerCacheLevel;
-    }
-};
-
-struct MmKey
-{
-    std::string hash;
-    int startOffset = 0;
-    std::optional<std::string> uuid;
-    bool hasUuidField = false;
-
-    bool operator==(MmKey const& other) const
-    {
-        return hash == other.hash && startOffset == other.startOffset && uuid == other.uuid
-            && hasUuidField == other.hasUuidField;
     }
 };
 
@@ -192,6 +178,9 @@ public:
         return mHashAlgoName;
     }
 
+    //! Salt hashing used by the V1 BlockKeyHasher; independent of radix-tree identity.
+    static uint64_t hashV1CacheSalt(std::string const& salt);
+
     static uint64_t hashV1BlockKey(std::vector<TokenId> const& tokens, uint64_t parentHash = 0,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt,
         std::optional<std::uint64_t> cacheSaltId = std::nullopt);
@@ -202,6 +191,8 @@ public:
     void addRemovedLifeCycle(Digest const& blockKey, LifeCycleId lifeCycle) override;
     void addCacheLevelUpdated(
         Digest const& blockKey, CacheLevel oldLevel, CacheLevel newLevel, LifeCycleId lifeCycle) override;
+    void addPriorityUpdated(
+        Digest const& blockKey, Priority oldPriority, Priority newPriority, LifeCycleId lifeCycle) override;
 
 private:
     enum class HashAlgorithm
@@ -220,7 +211,6 @@ private:
     using V1RootAttrs = std::pair<std::optional<LoraTaskIdType>, std::optional<std::uint64_t>>;
 
     static std::pair<HashAlgorithm, std::string> parseHashAlgorithm(std::string const& hashAlgo);
-    static std::string digestToHex(Digest const& digest);
     static uint64_t truncateDigestToInt64(Digest const& digest);
     static std::vector<KVCacheEvent> trimEvents(std::vector<KVCacheEvent> events, int maxKvEventEntries);
 

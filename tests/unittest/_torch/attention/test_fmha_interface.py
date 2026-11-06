@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from contextlib import nullcontext
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock, patch
 
@@ -46,6 +48,43 @@ class _MinimalFmha(Fmha):
         pass
 
 
+@pytest.mark.parametrize(
+    "is_cross,update_kv_cache,expected",
+    [(False, False, False), (False, True, True), (True, False, True)],
+)
+def test_fallback_support_matches_thop_kv_update_contract(
+    is_cross: bool, update_kv_cache: bool, expected: bool
+) -> None:
+    attn = FakeAttention()
+    fmha = FallbackFmha(attn)
+    metadata = SimpleNamespace(is_cross=is_cross, helix_position_offsets=None, num_contexts=0)
+    forward_args = AttentionForwardArgs(is_fused_qkv=True, update_kv_cache=update_kv_cache)
+    assert fmha.is_supported(None, None, None, metadata, forward_args) is expected
+
+
+def test_fallback_rejects_raw_fp8_input() -> None:
+    attn = FakeAttention()
+    fmha = FallbackFmha(attn)
+    metadata = SimpleNamespace(is_cross=False, helix_position_offsets=None, num_contexts=0)
+    q = torch.empty((1, 128), dtype=torch.float8_e4m3fn)
+    assert not fmha.is_supported(q, None, None, metadata, AttentionForwardArgs(is_fused_qkv=True))
+
+
+@pytest.mark.parametrize("mode", ["ordinary", "mla", "cross", "sage"])
+def test_fallback_separate_qkv_support(mode: str) -> None:
+    attn = FakeAttention()
+    attn.is_mla_enable = mode == "mla"
+    fmha = FallbackFmha(attn)
+    metadata = SimpleNamespace(
+        is_cross=mode == "cross", helix_position_offsets=None, num_contexts=0
+    )
+    forward_args = AttentionForwardArgs(
+        is_fused_qkv=False, sage_attn_num_elts_per_blk_q=2 if mode == "sage" else 0
+    )
+    q = torch.empty((1, 128), dtype=torch.bfloat16)
+    assert fmha.is_supported(q, q, q, metadata, forward_args) is (mode != "ordinary")
+
+
 @pytest.mark.parametrize("initial_fused_qkv", [False, True])
 @pytest.mark.parametrize(
     "input_type,sparse",
@@ -76,6 +115,7 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn.qk_nope_head_dim = 4
     attn.qk_rope_head_dim = 2
     attn.print_skip_softmax_stat = False
+    attn.cache_context_plan = False
     attn.kv_scale_orig_quant = None
     attn.kv_scale_quant_orig = None
     attn.get_local_layer_idx.return_value = 0
@@ -85,6 +125,8 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
     attn._fmha_manager.select.return_value = fmha
 
     metadata = Mock(spec=TrtllmAttentionMetadata)
+    metadata.token_major_gen_view.return_value = None
+    metadata.presented_token_major.return_value = nullcontext()
     metadata.is_cross = False
     metadata.enable_flash_mla = False
     metadata.spec_bl_tree_first_sparse_mask_offset_kv = None
@@ -112,8 +154,10 @@ def test_mla_forward_clears_fused_qkv_before_fmha_selection(
 
     output = TrtllmAttention.forward(attn, q, k, v, metadata, forward_args)
 
+    metadata.presented_token_major.assert_called_once_with(None)
     attn._fmha_manager.select.assert_called_once_with(attn, q, k, v, metadata, forward_args)
     fmha.forward.assert_called_once_with(q, k, v, metadata, forward_args)
+    assert forward_args.sparse_runtime_params is sparse_params
     assert not forward_args.is_fused_qkv
     assert forward_args.update_kv_cache
     assert output is forward_args.output
@@ -178,29 +222,39 @@ def test_inherited_availability_hook_uses_subclass_capabilities() -> None:
     assert _SkipCorrectionFmha.is_available(attn)
 
 
-@pytest.mark.parametrize("has_block_sparse_inputs", [False, True])
+@pytest.mark.parametrize(
+    ("capability", "request_args"),
+    [
+        (
+            "supports_block_sparse_inputs",
+            {
+                "sparse_runtime_params": SparseRuntimeParams(
+                    block_sparse_inputs=BlockSparseForwardInputs(
+                        q_block_size=64,
+                        kv_block_size=64,
+                        exact_block_bits=torch.zeros((1, 1, 1, 1), dtype=torch.int32),
+                    )
+                )
+            },
+        ),
+        ("supports_per_tensor_fp8", {"qk_fp8_per_tensor": True}),
+        ("supports_per_tensor_fp8", {"v_fp8_per_tensor": True}),
+    ],
+)
+@pytest.mark.parametrize("requested", [False, True])
 @pytest.mark.parametrize("supported", [False, True])
-def test_support_checks_block_sparse_capability_before_implementation(
-    has_block_sparse_inputs: bool, supported: bool
+def test_support_checks_capabilities_before_implementation(
+    capability: str, request_args: dict, requested: bool, supported: bool
 ) -> None:
-    class _BlockSparseFmha(_MinimalFmha):
-        supports_block_sparse_inputs = True
+    _CapableFmha = type("_CapableFmha", (_MinimalFmha,), {capability: True})
 
     attn = cast(TrtllmAttention, FakeAttention())
     q, k, v = (torch.empty((2, 4)) for _ in range(3))
     metadata = Mock(spec=TrtllmAttentionMetadata)
-    forward_args = AttentionForwardArgs()
-    if has_block_sparse_inputs:
-        forward_args.sparse_runtime_params = SparseRuntimeParams(
-            block_sparse_inputs=BlockSparseForwardInputs(
-                q_block_size=64,
-                kv_block_size=64,
-                exact_block_bits=torch.zeros((1, 1, 1, 1), dtype=torch.int32),
-            )
-        )
+    forward_args = AttentionForwardArgs(**request_args) if requested else AttentionForwardArgs()
 
-    for fmha in (_MinimalFmha(attn), _BlockSparseFmha(attn)):
-        capability_supported = not has_block_sparse_inputs or fmha.supports_block_sparse_inputs
+    for fmha in (_MinimalFmha(attn), _CapableFmha(attn)):
+        capability_supported = not requested or getattr(fmha, capability)
         with patch.object(fmha, "_is_supported", return_value=supported) as hook:
             assert fmha.is_supported(q, k, v, metadata, forward_args) is (
                 capability_supported and supported

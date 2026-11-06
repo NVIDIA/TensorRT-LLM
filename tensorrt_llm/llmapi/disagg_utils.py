@@ -8,15 +8,19 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Annotated, Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
 from mpi4py.util import pkl5
+from pydantic import (ConfigDict, Field, TypeAdapter, ValidationError,
+                      model_validator)
 
 from .._utils import global_mpi_rank, global_mpi_size
+from .utils import StrictBaseModel
 
 __all__ = [
+    'InternalRequestAuthKey',
     'ServerConfig',
     'parse_disagg_config_file',
     'extract_server_configs',
@@ -24,7 +28,12 @@ __all__ = [
     'get_usage_tokens_from_ctx',
     'rewrite_usage_info_from_ctx',
     'rewrite_usage_response_from_ctx',
+    'validate_internal_request_auth_key',
 ]
+
+_AuthKey = Annotated[str, Field(strict=True, min_length=1)]
+InternalRequestAuthKey = _AuthKey | None
+_AUTH_KEY_ADAPTER = TypeAdapter(InternalRequestAuthKey)
 
 
 def validate_config_bool(value: Any, field_name: str) -> bool:
@@ -41,16 +50,19 @@ def validate_config_non_negative_int(value: Any, field_name: str) -> int:
     return value
 
 
-def _validate_internal_request_auth_key(value: Optional[str]) -> Optional[str]:
-    if value is not None and (not isinstance(value, str) or not value):
-        raise ValueError("internal_request_auth_key must be a non-empty string")
-    return value
+def validate_internal_request_auth_key(value: object) -> str | None:
+    """Validate the serving auth key without including its value in errors."""
+    try:
+        return _AUTH_KEY_ADAPTER.validate_python(value)
+    except ValidationError:
+        raise ValueError(
+            "internal_request_auth_key must be a non-empty string") from None
 
 
 def _extract_internal_request_auth_key(
         top_level_key: Optional[str], context_servers: dict,
         generation_servers: dict) -> Optional[str]:
-    top_level_key = _validate_internal_request_auth_key(top_level_key)
+    top_level_key = validate_internal_request_auth_key(top_level_key)
     section_keys = []
     for server_type, servers in (("context_servers", context_servers),
                                  ("generation_servers", generation_servers)):
@@ -58,7 +70,7 @@ def _extract_internal_request_auth_key(
         if section_key is None:
             continue
         section_keys.append(
-            (server_type, _validate_internal_request_auth_key(section_key)))
+            (server_type, validate_internal_request_auth_key(section_key)))
 
     for server_type, section_key in section_keys:
         if top_level_key is not None and section_key != top_level_key:
@@ -135,6 +147,7 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
+    bounded_replay_on_generation: bool = False
     otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
@@ -174,15 +187,74 @@ class DisaggServerConfig():
     conversation_affinity_header_for_subagents: Optional[str] = None
     # Apply parent affinity to context only (default), or context and generation.
     subagent_affinity_scope: Literal['context', 'both'] = 'context'
+    # (num_serve_frontends, serve_frontend_affinity_port_stride) of the context
+    # servers when they expose per-frontend affinity ports: context requests
+    # with a conversation id go to the port of one frontend.
+    ctx_frontend_affinity: Optional[Tuple[int, int]] = None
 
 
-@dataclass
-class MetadataServerConfig():
-    server_type: Literal['etcd']
-    hostname: str = "localhost"
-    port: int = 2379
-    health_check_timeout: float = 5.0
-    refresh_interval: float = 10.0
+class MetadataServerConfig(StrictBaseModel):
+    """Settings of the metadata server that context and generation servers register with."""
+
+    # Keeps the values of rejected fields, such as credentials, out of errors.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    server_type: Literal['etcd'] = Field(
+        description="Type of the metadata server.")
+    hostname: str = Field(default="localhost",
+                          description="Host of the metadata server.")
+    port: int = Field(default=2379, description="Port of the metadata server.")
+    health_check_timeout: float = Field(
+        default=5.0,
+        description="Seconds without a healthy response after which a server "
+        "is considered dead.")
+    refresh_interval: float = Field(
+        default=10.0,
+        description="Seconds between fetches of the latest server list.")
+    user: Optional[str] = Field(
+        default=None,
+        description="User name for the metadata server. Requires `password` "
+        "and `ca_cert`.")
+    password: Optional[str] = Field(
+        default=None,
+        repr=False,
+        description="Password for the metadata server. Requires `user` and "
+        "`ca_cert`.")
+    ca_cert: Optional[str] = Field(
+        default=None,
+        description="Path to the CA certificate used to verify the metadata "
+        "server. Enables TLS.")
+    cert_key: Optional[str] = Field(
+        default=None,
+        description="Path to the client key. Requires `cert_cert` and "
+        "`ca_cert`.")
+    cert_cert: Optional[str] = Field(
+        default=None,
+        description="Path to the client certificate. Requires `cert_key` and "
+        "`ca_cert`.")
+    record_auth_key: Optional[_AuthKey] = Field(
+        default=None,
+        repr=False,
+        description="Shared secret used to sign and verify server records. "
+        "When set, records without a valid signature are ignored by readers.")
+
+    @model_validator(mode="after")
+    def _validate_credentials(self) -> "MetadataServerConfig":
+        if (self.user is None) != (self.password is None):
+            raise ValueError(
+                "metadata server user and password must be set together")
+        if self.user is not None and self.ca_cert is None:
+            raise ValueError(
+                "metadata server user and password require ca_cert: the etcd "
+                "client sends its authentication token only over a TLS "
+                "connection")
+        if (self.cert_key is None) != (self.cert_cert is None):
+            raise ValueError(
+                "metadata server cert_key and cert_cert must be set together")
+        if self.cert_key is not None and self.ca_cert is None:
+            raise ValueError(
+                "metadata server cert_key and cert_cert require ca_cert")
+        return self
 
 
 def get_usage_tokens_from_ctx(
@@ -253,6 +325,7 @@ def extract_disagg_cfg(
         context_servers: Optional[dict] = None,
         generation_servers: Optional[dict] = None,
         conditional_disagg_config: Optional[dict] = None,
+        bounded_replay_on_generation: bool = False,
         otlp_config: Optional[dict] = None,
         disagg_cluster: Optional[dict] = None,
         node_id: Optional[int] = None,
@@ -273,7 +346,11 @@ def extract_disagg_cfg(
     internal_request_auth_key = _extract_internal_request_auth_key(
         internal_request_auth_key, context_servers, generation_servers)
 
-    inherited_args = dict(kwargs)
+    bounded_replay_on_generation = validate_config_bool(
+        bounded_replay_on_generation, "bounded_replay_on_generation")
+    inherited_args = {
+        **kwargs, "bounded_replay_on_generation": bounded_replay_on_generation
+    }
 
     # If parameters are specified outside the context_severs and generation_servers sections,
     # make sure they match
@@ -290,6 +367,12 @@ def extract_disagg_cfg(
             else:
                 # Inherit the value from the top-level
                 servers[key] = value
+
+    ctx_frontend_affinity = None
+    ctx_num_frontends = context_servers.get("num_serve_frontends", 1)
+    ctx_port_stride = context_servers.get("serve_frontend_affinity_port_stride")
+    if ctx_num_frontends > 1 and ctx_port_stride is not None:
+        ctx_frontend_affinity = (ctx_num_frontends, ctx_port_stride)
 
     server_configs = []
     disagg_cluster_config = None
@@ -316,6 +399,7 @@ def extract_disagg_cfg(
         ctx_router_config=ctx_router_config,
         gen_router_config=gen_router_config,
         conditional_disagg_config=conditional_disagg_config,
+        bounded_replay_on_generation=bounded_replay_on_generation,
         otlp_config=otlp_config,
         max_retries=max_retries,
         perf_metrics_max_requests=perf_metrics_max_requests,
@@ -350,6 +434,7 @@ def extract_disagg_cfg(
             "subagent_affinity_scope must be 'context' or 'both', got "
             f"{subagent_affinity_scope!r}")
     config.subagent_affinity_scope = subagent_affinity_scope
+    config.ctx_frontend_affinity = ctx_frontend_affinity
     _warn_if_subagent_affinity_inactive(config)
     return config
 
@@ -437,7 +522,7 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 def extract_router_config(server_cfg: dict) -> RouterConfig:
 
     args = server_cfg.pop("router", {})
-    router_type = args.pop("type", "round_robin")
+    router_type = args.pop("type", RouterConfig.type)
 
     if router_type == "kv_cache_aware" and "model_path" not in args:
         model_path = server_cfg.get("model")
@@ -445,7 +530,9 @@ def extract_router_config(server_cfg: dict) -> RouterConfig:
             args["model_path"] = model_path
 
     # add fields that are not specific to router
-    extract_keys = ["max_batch_size", "max_num_tokens"]
+    extract_keys = [
+        "max_batch_size", "max_num_tokens", "enable_tokenization_cache"
+    ]
     for key in extract_keys:
         if key in server_cfg:
             args[key] = server_cfg[key]

@@ -29,7 +29,7 @@ try:
 except ImportError:
     from cuda import cuda
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import (
     MoEDeployment,
     MoEProblem,

@@ -310,6 +310,7 @@ def _model(
     nn.Module.__init__(model)
     model._fp8_weight_read_moe_mlp = False
     model.model_config = config
+    model.spec_config = config.spec_config
     model._repurposed_tp_mapping = config.mapping if cp_size > 1 else None
     model.model = nn.Module()
     model.model.layers = nn.ModuleList([layer])
@@ -380,10 +381,6 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
         assert isinstance(module, _Fp8BlockScaleWeightReadLinear)
         expected = checkpoint[f"model.layers.0.self_attn.{name}.weight"]
         expected = expected.chunk(tp_size, dim=1 if name == "o_proj" else 0)[tp_rank]
-        assert torch.equal(
-            module.weight[: module.out_features].view(torch.uint8), expected.view(torch.uint8)
-        )
-        assert module.weight.dtype == torch.float8_e4m3fn
         scales = checkpoint[f"model.layers.0.self_attn.{name}.weight_scale"][:, 0, :, 0]
         axis = 1 if name == "o_proj" else 0
         width = module.in_features if axis == 1 else module.out_features
@@ -391,6 +388,14 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
         indices = [slice(None), slice(None)]
         indices[axis] = slice(start // 128, (end + 127) // 128)
         scales = scales[tuple(indices)]
+        if module._fused_projection is not None:
+            # q/k/v/g are fused into qkvg_proj and prepared at load, so their
+            # checkpoint shard is held in its GEMM-ready (UE8M0) form.
+            expected, scales = _Fp8BlockScaleWeightReadLinear._prepare_weights(expected, scales)
+        assert torch.equal(
+            module.weight[: module.out_features].view(torch.uint8), expected.view(torch.uint8)
+        )
+        assert module.weight.dtype == torch.float8_e4m3fn
         torch.testing.assert_close(module.weight_scale, scales, rtol=0, atol=0)
     for module in model.modules():
         if isinstance(module, (Linear, _Fp8BlockScaleWeightReadLinear)):
@@ -406,6 +411,8 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
         actual_bfa[:, : expected_bfa.shape[1]], expected_bfa, rtol=0.02, atol=0.02
     )
     assert attention._bfa_proj_weight.dtype == torch.bfloat16
+    # The loader tells the mixer for which row counts the fused projection takes an MXFP8 input.
+    assert attention._qkvg_takes_prequantized == attention.qkvg_proj.takes_prequantized_input
     for name in _KDA_PROJECTIONS[:4]:
         assert (
             getattr(attention, name).weight.untyped_storage().data_ptr()

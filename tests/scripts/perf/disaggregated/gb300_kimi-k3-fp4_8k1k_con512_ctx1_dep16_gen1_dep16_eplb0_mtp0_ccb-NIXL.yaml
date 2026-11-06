@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 metadata:
   model_name: kimi_k3
   precision: fp4
@@ -37,14 +40,12 @@ environment:
   trtllm_repo: ''
   build_wheel: false
   work_dir: <full_path_to_work_dir>
-  # TLLM_KV_CACHE_MANAGER_V2_BACKEND / TRTLLM_ENABLE_PDL /
-  # NCCL_GRAPH_MIXING_SUPPORT act on the model runtime, so
+  # TRTLLM_ENABLE_PDL / NCCL_GRAPH_MIXING_SUPPORT act on the model runtime, so
   # they belong on the ctx and gen workers only; the disagg proxy server does
   # not read them. TRTLLM_SERVER_DISABLE_GC / TRTLLM_WORKER_DISABLE_GC are set
   # on both sides.
   worker_env_var: TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1
-    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 TLLM_KV_CACHE_MANAGER_V2_BACKEND=cpp
-    ENROOT_ALLOW_DEV=yes
+    TRTLLM_ENABLE_PDL=1 NCCL_GRAPH_MIXING_SUPPORT=0 ENROOT_ALLOW_DEV=yes
   server_env_var: TRTLLM_SERVER_DISABLE_GC=1
 profiling:
   nsys_on: false
@@ -62,7 +63,7 @@ accuracy:
 worker_config:
   # K3 constraints applied to both sides (see examples/kimi_k3/disagg/README.md):
   # EP-only DEP16 with matched ctx/gen parallelism, no chunked prefill, no KV
-  # block reuse, tokens_per_block 64, NIXL with the Python V2 transceiver.
+  # block reuse, tokens_per_block 64, NIXL with the Python transceiver.
   gen:
     print_iter_log: true
     max_batch_size: 32
@@ -92,14 +93,8 @@ worker_config:
       backend: MEGAMOE_DEEPGEMM
     cache_transceiver_config:
       backend: NIXL
-      # PYTHON is mandatory: the C++ transceiver throws at construction for
-      # K3's MixedMambaHybridCacheManager.
+      # Only the Python transceiver can move the KDA state.
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
-      # Must hold one full request payload (433 MiB KDA state + ~27 KB/token
-      # MLA latent = 649 MiB at 8k ISL); undersizing silently falls back to
-      # the host-staged tcp path.
-      kv_cache_bounce_size_mb: 1024
     disable_overlap_scheduler: false
     trust_remote_code: true
   ctx:
@@ -123,8 +118,7 @@ worker_config:
       backend: MEGAMOE_DEEPGEMM
     cache_transceiver_config:
       backend: NIXL
+      # Only the Python transceiver can move the KDA state.
       transceiver_runtime: PYTHON
-      max_tokens_in_buffer: 8448
-      kv_cache_bounce_size_mb: 1024
     disable_overlap_scheduler: true
     trust_remote_code: true

@@ -63,11 +63,12 @@ private:
             {
                 float score;
                 int16_t newIdx = static_cast<int16_t>(ie);
-                score = static_cast<float>(bufferCast<float>(*this->mPtrScoresHost)[it * param.numExperts + ie]);
+                score = static_cast<float>(
+                    this->mPtrScoresHost->template getBufferPtr<float>()[it * param.numExperts + ie]);
                 score = sigmoid_accurate(score);
                 scoreSigmoid[ie] = score;
 
-                auto biasVal = bufferCast<T>(*this->mPtrRoutingBiasHost)[ie];
+                auto biasVal = this->mPtrRoutingBiasHost->template getBufferPtr<T>()[ie];
                 auto scoreBias = score + static_cast<float>(biasVal);
 
                 PackedFloat si{static_cast<float>(scoreBias), newIdx};
@@ -135,19 +136,21 @@ private:
             {
                 if (param.useTopKAsInput)
                 {
-                    bufferCast<int32_t>(*this->mPtrTopKIdsHost)[it * param.topK + ie]
+                    this->mPtrTopKIdsHost->template getBufferPtr<int32_t>()[it * param.topK + ie]
                         = static_cast<int32_t>(finalTopkExperts[ie].idx);
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie]
+                    this->mPtrTopKWeightsHost->template getBufferPtr<T>()[it * param.topK + ie]
                         = static_cast<T>(finalTopkExperts[ie].score);
                 }
                 else if (param.getExpWeights)
                 {
-                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie]
+                    this->mPtrTopKWeightsHost->template getBufferPtr<T>()[it * param.topK + ie]
                         = static_cast<T>(finalTopkExperts[ie].score);
                 }
 
                 PackedType si{static_cast<T>(finalTopkExperts[ie].score), finalTopkExperts[ie].idx};
-                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
+                reinterpret_cast<PackedType*>(
+                    this->mPtrTopKPackedHost->template getBufferPtr<int8_t>())[it * param.topK + ie]
+                    = si;
             }
         }
     }
@@ -168,11 +171,11 @@ protected:
 
     void setupBuffers(RoutingKernelTestParam const& param) override
     {
-        float* scoresHostPtr = bufferCast<float>(*this->mPtrScoresHost);
+        float* scoresHostPtr = this->mPtrScoresHost->template getBufferPtr<float>();
         initData(scoresHostPtr, param.numTokens * param.numExperts, mSeed);
         mBufferManager->copy(*this->mPtrScoresHost, *this->mPtrScoresDevice);
 
-        T* biasHostPtr = bufferCast<T>(*mPtrRoutingBiasHost);
+        T* biasHostPtr = mPtrRoutingBiasHost->getBufferPtr<T>();
         initData(biasHostPtr, param.numExperts, mSeed);
         mBufferManager->copy(*mPtrRoutingBiasHost, *mPtrRoutingBiasDevice);
     }
@@ -183,7 +186,7 @@ protected:
         RoutingKernelTest<T>::setCommonParams(param, routingData);
         routingData.mDtypeOutput = btg::Dtype::Bfloat16;
 
-        routingData.mPtrRoutingBias = bufferCast<T>(*this->mPtrRoutingBiasDevice);
+        routingData.mPtrRoutingBias = this->mPtrRoutingBiasDevice->template getBufferPtr<T>();
         // Bias dtype matches T (the test's type parameter)
         routingData.mDtypeBias = (sizeof(T) == 4) ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;
 
@@ -194,7 +197,7 @@ protected:
 
         if (param.useTopKAsInput)
         {
-            routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrTopKIds = this->mPtrTopKIdsDevice->template getBufferPtr<int32_t>();
             routingData.mPtrScores = nullptr;
         }
         else if (param.useTopKPackedAsInput)
@@ -206,7 +209,7 @@ protected:
         else
         {
             routingData.mPtrTopKIds = nullptr;
-            routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
+            routingData.mPtrScores = this->mPtrScoresDevice->template getBufferPtr<float>();
         }
     }
 
@@ -434,8 +437,8 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelWithFloat32Bias)
         = this->mBufferManager->pinned(ITensor::makeShape({param.numExperts}), tensorrt_llm::DataType::kFLOAT);
     auto float32BiasDevice
         = this->mBufferManager->gpu(ITensor::makeShape({param.numExperts}), tensorrt_llm::DataType::kFLOAT);
-    auto fp32BiasPtr = bufferCast<float>(*float32BiasHost);
-    auto tBiasPtr = bufferCast<TypeParam>(*this->mPtrRoutingBiasHost);
+    auto fp32BiasPtr = float32BiasHost->template getBufferPtr<float>();
+    auto tBiasPtr = this->mPtrRoutingBiasHost->template getBufferPtr<TypeParam>();
     for (int i = 0; i < param.numExperts; i++)
     {
         fp32BiasPtr[i] = static_cast<float>(tBiasPtr[i]);
@@ -449,8 +452,8 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelWithFloat32Bias)
     moe::dev::routing::routingDeepSeek::Data routingData;
     this->setCommonParams(param, routingData);
     routingData.mDtypeOutput = btg::Dtype::Bfloat16;
-    routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
-    routingData.mPtrRoutingBias = bufferCast<float>(*float32BiasDevice);
+    routingData.mPtrScores = this->mPtrScoresDevice->template getBufferPtr<float>();
+    routingData.mPtrRoutingBias = float32BiasDevice->template getBufferPtr<float>();
     routingData.mDtypeBias = btg::Dtype::Fp32;
     routingData.mNumExpertGroups = param.nGroup;
     routingData.mNumLimitedGroups = param.topkGroup;

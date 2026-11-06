@@ -17,8 +17,9 @@ from tensorrt_llm._torch.utils import gelu_tanh
 
 # Importing the models package applies the Qwen-Image registration side effect.
 from tensorrt_llm._torch.visual_gen import models  # noqa: F401
-from tensorrt_llm._torch.visual_gen import modules as visual_gen_modules
-from tensorrt_llm._torch.visual_gen.attention_backend.parallel import (
+from tensorrt_llm._torch.visual_gen.attention import attention as visual_gen_attention
+from tensorrt_llm._torch.visual_gen.attention.attention import QKVMode, apply_rotary_emb
+from tensorrt_llm._torch.visual_gen.attention.backends.parallel import (
     Attention2DAttention,
     RingAttention,
     UlyssesAttention,
@@ -44,7 +45,6 @@ from tensorrt_llm._torch.visual_gen.models.qwen_image.transformer_qwen_image imp
     qwen_complex_freqs_to_cos_sin,
     qwen_joint_freqs_to_cos_sin,
 )
-from tensorrt_llm._torch.visual_gen.modules.attention import QKVMode, apply_rotary_emb
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -259,7 +259,7 @@ def test_qwen_joint_attention_wraps_separate_qkv_self_attention(
         return attn
 
     monkeypatch.setattr(
-        visual_gen_modules.attention,
+        visual_gen_attention,
         "wrap_parallel_attention",
         capture_parallel_attention,
     )

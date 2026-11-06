@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
+#include "tensorrt_llm/kernels/quantization.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
 
 #include <algorithm>
@@ -25,12 +26,11 @@
 
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
 #include "tensorrt_llm/kernels/moe/cutlass/include/moe_kernels.h"
-#include <tensorrt_llm/kernels/quantization.h>
 #else
 #include "moe_kernels.h"
-#include "quantization.h"
 #endif
 #include "tensorrt_llm/kernels/cutlass_kernels/include/cutlass_kernel_selector.h"
+#include "tensorrt_llm/kernels/moe/cutlass/include/moe_gemm_kernels.h"
 
 #include "tensorrt_llm/common/tllmDataType.h"
 #include "tensorrt_llm/runtime/bufferManager.h"
@@ -42,7 +42,10 @@ using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
 using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
-using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
+using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+using MoeGemmId = GemmProfilerBackend::GemmToProfile;
+#endif
 using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
 using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
 using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::ActivationParams;
@@ -50,6 +53,15 @@ using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 constexpr static float FP8_MAX = 448.f;
 constexpr static float FP4_MAX = 6.f;
+
+constexpr bool supportsUnpaddedMoeOutput()
+{
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
+    return true;
+#else
+    return false;
+#endif
+}
 
 __host__ __device__ constexpr float applyExpertShift(float weight_value, int expert)
 {
@@ -321,6 +333,7 @@ protected:
     float mSwigluAlphaValue{0.5f};
     float mSwigluBetaValue{MX_QUANT_ACT ? 0.0f : 1.f};
     float mSwigluLimitValue{MX_QUANT_ACT ? FP8_MAX / 4 : NVFP4 ? 2.f : 0.5f};
+    bool mSwigluClampAfterSilu{false};
     float* mSwigluAlpha{};
     float* mSwigluBeta{};
     float* mSwigluLimit{};
@@ -342,19 +355,12 @@ protected:
     using ElementSF = TmaWarpSpecializedGroupedGemmInput::ElementSF;
     constexpr static int FP4VecSize = MX_QUANT_WEIGHT ? TmaWarpSpecializedGroupedGemmInput::MXFPXBlockScaleVectorSize
                                                       : TmaWarpSpecializedGroupedGemmInput::NVFP4BlockScaleVectorSize;
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
     constexpr static int MinNDimAlignmentFP4 = MX_QUANT_WEIGHT
         ? TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentMXFPX
         : TmaWarpSpecializedGroupedGemmInput::MinNDimAlignmentNVFP4;
     constexpr static int MinKDimAlignmentFP4 = MX_QUANT_WEIGHT
         ? TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentMXFPX
         : TmaWarpSpecializedGroupedGemmInput::MinKDimAlignmentNVFP4;
-#else
-    constexpr static int MinNDimAlignmentFP4 = MX_QUANT_WEIGHT
-        ? TmaWarpSpecializedGroupedGemmInput::MinNumRowsAlignmentMXFPX
-        : TmaWarpSpecializedGroupedGemmInput::MiNumRowsAlignmentNVFP4;
-    constexpr static int MinKDimAlignmentFP4 = FP4VecSize * 4; // Hardcode the correct value
-#endif
     ElementSF* mFP4ScalingFactorsW1 = nullptr;
     ElementSF* mFP4ScalingFactorsW2 = nullptr;
 
@@ -799,15 +805,9 @@ protected:
         int64_t padded_in_dim = TmaWarpSpecializedGroupedGemmInput::alignToSfDim(in_shape, MinKDimAlignmentFP4);
         check_cuda_error(cudaMemsetAsync(scaling_factors, 0x00,
             num_experts * padded_out_dim * padded_in_dim / FP4VecSize * sizeof(ElementSF), mStream->get()));
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
         invokeFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights, global_scales,
             reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors), MX_QUANT_WEIGHT,
             tensorrt_llm::QuantizationSFLayout::SWIZZLED, mMultiProcessorCount, mStream->get());
-#else
-        invokeBatchedFP4Quantization<WeightRawType, FP4VecSize>(num_experts, out_shape, in_shape, raw_weights,
-            global_scales, reinterpret_cast<int64_t*>(quant_weights), reinterpret_cast<int32_t*>(scaling_factors),
-            MX_QUANT_WEIGHT, mMultiProcessorCount, mStream->get());
-#endif
 
         // auto sf_data = getDataFromDevice<ElementSF>(scaling_factors, num_experts * padded_out_dim * padded_in_dim /
         // FP4VecSize); auto unquant_data = getDataFromDevice<WeightRawType>(raw_weights, num_experts * out_shape *
@@ -1236,7 +1236,11 @@ protected:
 
     auto getFilteredConfigs(int sm, MoeGemmId gemm_id)
     {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         auto tactics = mMoERunner.getTactics(gemm_id);
+#else
+        auto tactics = mMoERunner.getTactics();
+#endif
         if (sm == 89 || sm >= 120)
         {
             // Filter some unsupported configs for L40S
@@ -1305,6 +1309,18 @@ protected:
 
     using ConfigsToTestVec = std::vector<std::pair<tensorrt_llm::cutlass_extensions::CutlassGemmConfig,
         tensorrt_llm::cutlass_extensions::CutlassGemmConfig>>;
+
+    bool isFinalizeFused(tensorrt_llm::cutlass_extensions::CutlassGemmConfig const& gemm2) const
+    {
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
+        return gemm2.epilogue_fusion_type
+            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+#else
+        // The bundled runner controls finalize fusion with its runtime flag,
+        // rather than the tactic's epilogue_fusion_type metadata.
+        return gemm2.is_tma_warp_specialized && mUseFusedFinalizeInternal && !W4A8_AWQ;
+#endif
+    }
 
     auto getAllTileConfigsToTest()
     {
@@ -1403,8 +1419,12 @@ protected:
             }
             else if constexpr (MXFP8_MXFP4)
             {
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
                 quant_params = QuantParams::MXFP8MXFP4(mFP4ScalingFactorsW1, static_cast<float const*>(scale1_ptr),
                     mFP4ScalingFactorsW2, static_cast<float const*>(scale3_ptr));
+#else
+                static_assert(!MXFP8_MXFP4, "MXFP8 x MXFP4 requires the open-source CUTLASS MoE kernels");
+#endif
             }
         }
 
@@ -1428,17 +1448,17 @@ protected:
         mMoERunner.setTactic(tactic1, tactic2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
-            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mTotalTokens, mHiddenSize, mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize,
-            mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
-            parallelism_config, enable_alltoall, mUseLora, lora_params, useFp8BlockScales, minLatencyMode,
-            min_latency_params, stream);
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit, mSwigluClampAfterSilu), weight2_ptr,
+            bias2_ptr, quant_params, mTotalTokens, mTotalTokens, mHiddenSize,
+            mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize, mInterSize / parallelism_config.tp_size,
+            mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall,
+            mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 #else
-        mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
+        mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
             ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK,
-            mWorkspace, mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params,
-            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
+            mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params, useFp8BlockScales,
+            minLatencyMode, min_latency_params, stream);
 #endif
 
         check_cuda_error(cudaStreamSynchronize(stream));
@@ -1527,6 +1547,12 @@ protected:
         case ActivationType::Swiglu: return actfn(gate, 0.0f, ActivationType::Silu) * linear;
         case ActivationType::SwigluBias:
             linear = std::min(std::max(linear, -mSwigluLimitValue), mSwigluLimitValue);
+            if (mSwigluClampAfterSilu)
+            {
+                gate = std::min(
+                    actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue, mSwigluLimitValue);
+                return gate * (linear + mSwigluBetaValue);
+            }
             gate = std::min(gate, mSwigluLimitValue);
             // silu(gate * alpha) / alpha = gate * sigmoid(gate * alpha)
             return actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue
@@ -1655,8 +1681,19 @@ protected:
     {
         if (mActType == ActivationType::SwigluBias)
         {
-            ASSERT_GT(mMaxInput * std::max(mExpertWDiag1, mExpertWDiagGated), mSwigluLimitValue)
-                << "SwigluBias limit values don't change the result";
+            float const maxGate = mMaxInput * std::max(mExpertWDiag1, mExpertWDiagGated);
+            ASSERT_GT(maxGate, mSwigluLimitValue) << "SwigluBias limit values don't change the result";
+            if (mSwigluClampAfterSilu)
+            {
+                float const postSiluGate
+                    = actfn(maxGate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue;
+                float const preSiluGate
+                    = actfn(std::min(maxGate, mSwigluLimitValue) * mSwigluAlphaValue, 0.0f, ActivationType::Silu)
+                    / mSwigluAlphaValue;
+                ASSERT_GT(postSiluGate, mSwigluLimitValue) << "Post-SiLU clamp order is not observable";
+                ASSERT_NE(std::min(postSiluGate, mSwigluLimitValue), preSiluGate)
+                    << "Pre- and post-SiLU clamp orders produce the same reference value";
+            }
         }
 
         ASSERT_EQ(expected_experts.size(), token_final_scales.size());
@@ -1713,8 +1750,10 @@ protected:
         // 1 expert per rank
         ParallelismTest(k, 1, num_experts, hidden_size, num_experts, num_tokens);
 
+#if defined(USING_OSS_CUTLASS_MOE_GEMM)
         // 2 expert per rank, enable alltoall optimised finalize
         ParallelismTest(k, 1, num_experts / 2, hidden_size, num_experts, num_tokens, true);
+#endif
     }
 
     // Tensor parallel tests default to inter_size_fraction = 1.0f so that all ranks have interesting values (i.e. a
@@ -1780,7 +1819,9 @@ using Types = ::testing::Types<
 
 #ifdef ENABLE_BF16
 #ifdef ENABLE_FP8
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
     WeightParams<SafeFP8, cutlass::uint4b_t, __nv_bfloat16, void, __nv_bfloat16>,
+#endif
 #endif
 #endif
     WeightParams<half>, WeightParams<float>
@@ -1849,8 +1890,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool is_finalize_fusion = gemm2.epilogue_fusion_type
-            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+        bool is_finalize_fusion = isFinalizeFused(gemm2);
         bool should_be_deterministic = !is_finalize_fusion || mK < 3;
         if (should_be_deterministic && !mIsLongTest)
         {
@@ -1965,6 +2005,25 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluBias)
     this->mActType = ActivationType::SwigluBias;
     this->BasicPermuteTest();
     this->BasicPermuteTest(2);
+    this->BasicPermuteTest(3);
+}
+
+TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluPostSiluClamp)
+{
+#if !defined(USING_OSS_CUTLASS_MOE_GEMM)
+    GTEST_SKIP() << "Post-SiLU SwiGLU clamping requires the open-source CUTLASS MoE kernels";
+#endif
+    if (this->W4A8_AWQ)
+    {
+        GTEST_SKIP() << "W4A8 does not support gated activations";
+    }
+    this->mActType = ActivationType::SwigluBias;
+    // MX uses a much larger clamp limit, so keep alpha small enough that the
+    // pre-SiLU reference does not round back to the same limit.
+    this->mSwigluAlphaValue = this->MX_QUANT_ACT ? 0.02f : 0.25f;
+    this->mSwigluBetaValue = this->MX_QUANT_ACT ? 0.0f : 1.25f;
+    this->mSwigluClampAfterSilu = true;
+    this->BasicPermuteTest();
     this->BasicPermuteTest(3);
 }
 
@@ -2162,8 +2221,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
-                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
-                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                    bool is_finalize_fusion = isFinalizeFused(gemm2);
                     bool should_be_deterministic
                         = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -2180,8 +2238,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
-                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
-                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                    bool is_finalize_fusion = isFinalizeFused(gemm2);
                     bool should_be_deterministic
                         = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -2319,6 +2376,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
     {                                                                                                                  \
+        if (!supportsUnpaddedMoeOutput())                                                                              \
+        {                                                                                                              \
+            GTEST_SKIP() << "Unpadded MoE output requires the open-source CUTLASS MoE kernels";                        \
+        }                                                                                                              \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = true;                                                                                         \
         this->mActType = ActivationType::Swiglu;                                                                       \
@@ -2625,12 +2686,16 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
 #define GET_WS_PTR(type, name) auto* name = reinterpret_cast<type>(workspace + workspaces.at(#name).second)
 
             GET_WS_PTR(int64_t*, expert_first_token_offset);
+#ifdef USING_OSS_CUTLASS_MOE_GEMM
             GET_WS_PTR(int*, unpermuted_row_to_permuted_row);
             GET_WS_PTR(int*, permuted_row_to_unpermuted_row);
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
             GET_WS_PTR(int*, token_selected_experts);
 #else
+            GET_WS_PTR(int*, source_to_dest);
+            GET_WS_PTR(int*, dest_to_source);
             GET_WS_PTR(int*, unpermuted_selected_experts);
+            auto* unpermuted_row_to_permuted_row = source_to_dest;
+            auto* permuted_row_to_unpermuted_row = dest_to_source;
 #endif
 #undef GET_WS_PTR
 
@@ -2708,11 +2773,7 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
                         int64_t idx = token_idx * k + k_idx;
                         int64_t expert_idx = host_token_selected_experts[idx];
 
-#ifdef USING_OSS_CUTLASS_MOE_GEMM
                         if (expert_idx < num_experts_per_node)
-#else
-                        if (expert_idx < num_experts)
-#endif
                         {
                             int64_t unpermuted_row = k_idx * num_tokens + token_idx;
                             int64_t permuted_row = host_expert_first_token_offset_size[expert_idx]

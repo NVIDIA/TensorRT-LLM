@@ -14,6 +14,7 @@ from tensorrt_llm._torch.attention.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 
+from ..mixed_precision_high_rows import store_mixed_precision_high_compressed_rows
 from .params import DeepseekV4AttentionType
 
 if TYPE_CHECKING:
@@ -253,7 +254,12 @@ class Compressor(nn.Module):
 
         if num_generations > 0:
             gen_kv_lens = kv_lens[num_contexts:]
+            # Uniform batches: every request appended next_n tokens. Ragged
+            # batches: next_n is only the batch maximum (the kernel's loop
+            # bound) and the real per-request counts come through
+            # new_tokens_per_seq.
             next_n = metadata.num_gen_tokens_per_seq
+            new_tokens_per_seq = metadata.gen_new_tokens_per_seq
             # Pass full kv_score (not sliced) with the generation portion of
             # cu_seq_lens so the kernel reads at the correct absolute offsets.
             torch.ops.trtllm.compressor_paged_kv_compress(
@@ -272,6 +278,7 @@ class Compressor(nn.Module):
                 self.head_dim,
                 self.compress_ratio,
                 next_n,
+                new_tokens_per_seq,
             )
 
         # Scatter to cache with appropriate quantization (all modes fused)
@@ -346,6 +353,19 @@ class Compressor(nn.Module):
             scale_output,
         )
 
+        # Write the mixed-precision high layer with the same scatter.
+        if not self.is_indexer and metadata.has_mixed_precision_high_rows:
+            store_mixed_precision_high_compressed_rows(
+                self,
+                metadata,
+                kv_comp,
+                position_ids,
+                num_comp_tokens,
+                cu_new_comp_kv,
+                start_pos,
+                compressed_mask,
+                bsz,
+            )
         if quant_output is not None:
             if self.kv_cache_dtype == KVCacheDtype.MXFP4_BLOCKWISE:
                 return quant_output.view(torch.float4_e2m1fn_x2), scale_output

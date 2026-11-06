@@ -25,7 +25,6 @@ set(SRCS
     userbuffers/bindings.cpp
     thop/bindings.cpp
     visual_gen/coordinatorWatchdog.cpp
-    ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -51,7 +50,8 @@ endif()
 # compilation of kvCacheManagerV2.cpp.
 target_include_directories(
   ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-
+target_include_directories(${TRTLLM_NB_MODULE}
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_link_directories(${TRTLLM_NB_MODULE} PUBLIC

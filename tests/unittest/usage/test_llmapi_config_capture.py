@@ -500,7 +500,7 @@ def test_failure_meta_uses_new_contract_keys_and_versions():
     meta = rc._failure_meta(args_class="X")
     assert meta["capture_version"] == "2"
     assert meta["api_contract_version"] == "0.2.0"
-    assert meta["field_policy_version"] == "3"
+    assert meta["field_policy_version"] == "4"
     assert meta["excluded_field_count"] == 0  # renamed from the old marked-count key
     assert meta["payload_truncated"] is False
     assert meta["sequence_truncated"] is False
@@ -709,6 +709,24 @@ def test_collect_llm_api_config_captures_decoding_type_for_every_arm():
     assert _walk_captured_keys(auto) >= {"decoding_type"}
 
 
+def test_collect_llm_api_config_captures_spec_dec_variant_with_decoding_type():
+    """The algorithm version is captured next to its decoding_type family."""
+    from tensorrt_llm.llmapi.llm_args import NGramDecodingConfig
+
+    args = TorchLlmArgs(
+        model="/customer/private/Llama",
+        skip_tokenizer_init=True,
+        speculative_config=NGramDecodingConfig(max_draft_len=2),
+    )
+    config, _ = _loads_payloads(args)
+    assert config["speculative_config.decoding_type"] == "NGram"
+    assert config["speculative_config.spec_dec_variant"] == 1
+
+    args.speculative_config.spec_dec_variant = 2
+    config, _ = _loads_payloads(args)
+    assert config["speculative_config.spec_dec_variant"] == 2
+
+
 def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
     """Inherited safe fields remain capturable on concrete model arms."""
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -720,6 +738,7 @@ def test_collect_llm_api_config_captures_max_total_draft_tokens_for_every_arm():
 def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
     """Every reachable sparse algorithm Literal is captured from its active model arm."""
     from tensorrt_llm.llmapi.llm_args import (
+        CSA2SparseAttentionConfig,
         DeepSeekSparseAttentionConfig,
         DeepSeekV4SparseAttentionConfig,
         MiniMaxM3SparseAttentionConfig,
@@ -733,6 +752,7 @@ def test_collect_llm_api_config_captures_sparse_algorithm_for_every_arm():
         QSASparseAttentionConfig(),
         DeepSeekSparseAttentionConfig(),
         DeepSeekV4SparseAttentionConfig(),
+        CSA2SparseAttentionConfig(),
         RocketSparseAttentionConfig(),
         SkipSoftmaxAttentionConfig(),
         MiniMaxM3SparseAttentionConfig(),
@@ -788,7 +808,7 @@ def test_background_reporter_keeps_initial_report_when_config_capture_fails(
 
     assert usage_lib.apply_usage_session_config()
 
-    monkeypatch.setattr(usage_lib._REPORTER_STOP, "wait", lambda timeout: True)
+    monkeypatch.setattr(usage_lib._HEARTBEAT_STOP, "wait", lambda timeout: True)
     monkeypatch.setattr(usage_lib, "_get_trtllm_version", lambda: "0.0.0-test")
     monkeypatch.setattr(
         usage_lib,
@@ -864,15 +884,18 @@ def test_collect_llm_api_config_honors_raw_json_schema_extra_exclude():
     assert config == {"kept": 1}
 
 
-def test_manifest_excludes_loosely_typed_model_children():
-    # B-1 regression: moe_config.load_balancer is Optional[Union[object, str]];
-    # a validator coerces it into a MoeLoadBalancerConfig at runtime, but the
-    # annotation names no BaseModel, so its children must NOT be capturable.
+def test_manifest_includes_safe_load_balancer_fields():
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
     from tensorrt_llm.usage.llmapi_config import build_capture_manifest
 
-    paths = {e.path for e in build_capture_manifest(TorchLlmArgs)}
-    assert not any(p.startswith("moe_config.load_balancer.") for p in paths)
+    paths = {entry.path for entry in build_capture_manifest(TorchLlmArgs)}
+    assert {
+        "moe_config.load_balancer.auxiliary_sms",
+        "moe_config.load_balancer.layer_updates_per_iter",
+        "moe_config.load_balancer.mode",
+        "moe_config.load_balancer.num_slots",
+    } <= paths
+    assert "moe_config.load_balancer.initial_global_assignments" not in paths
 
 
 def test_collect_llm_api_config_caps_total_payload_size(monkeypatch):

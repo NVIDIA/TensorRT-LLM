@@ -20,6 +20,8 @@ from typing import Literal, Optional, Protocol, runtime_checkable
 
 import torch
 
+from ..cpp_schema import cpp_field
+
 _INDEXER_MQA_LOGITS_DEFAULT_ELEM_BUDGET = 1 << 31
 _INDEXER_MQA_LOGITS_BYTES_PER_ELEMENT = 4
 
@@ -101,7 +103,7 @@ class SparseBackendForwardArgs:
     """Sparse inputs passed from an attention module to its backend."""
 
     # Shared by algorithms that accept precomputed top-k indices.
-    topk_indices: Optional[torch.Tensor] = None
+    topk_indices: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     # Complete block-sparse routing payload predicted by the module before the
     # core forward; the default backend hook hands it through unchanged.
     block_sparse_inputs: Optional["BlockSparseForwardInputs"] = None
@@ -114,7 +116,8 @@ class BlockSparseForwardInputs:
     Exactly one routing representation is present. Canonical BSR uses
     ``block_indptr`` and ``block_indices``; packed bitmask routing uses
     ``exact_block_bits``. Paired K/V summaries enable proxy routes without
-    encoding an algorithm name in this shared carrier.
+    encoding an algorithm name in this shared carrier. Both summaries are
+    block means over the tokens present, including a partial final block.
     """
 
     q_block_size: int
@@ -154,14 +157,14 @@ class SparseRuntimeParams:
     """Complete per-attention sparse runtime state consumed by FMHA/``AttentionOp``."""
 
     # Sparse index inputs shared by multiple algorithms.
-    sparse_kv_indices: Optional[torch.Tensor] = None
-    sparse_kv_offsets: Optional[torch.Tensor] = None
-    sparse_attn_indices: Optional[torch.Tensor] = None
+    sparse_kv_indices: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    sparse_kv_offsets: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
+    sparse_attn_indices: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     # Per-query offsets, or backend-specific secondary sparse indices
     # (DeepSeek-V4 fp8_ds_mla compressed-pool indices).
-    sparse_attn_offsets: Optional[torch.Tensor] = None
+    sparse_attn_offsets: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     sparse_attn_indices_block_size: int = 0
-    sparse_attn_kv_lens: Optional[torch.Tensor] = None
+    sparse_attn_kv_lens: Optional[torch.Tensor] = cpp_field(dtype=torch.int32)
     aux_kv_cache_pool_ptr: Optional[int] = None
 
     # SkipSoftmax prefill threshold; kernels divide it by context length.

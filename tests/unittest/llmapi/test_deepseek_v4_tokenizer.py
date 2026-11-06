@@ -447,3 +447,64 @@ def test_deepseek_v4_server_chat_template_path_forwards_tools():
 
     assert "<｜DSML｜tool_calls>" in prompt
     assert '"name": "search"' in prompt
+
+
+def test_deepseek_v4_server_chat_template_path_leaves_pending_media_alone():
+    """An image chat request reaches the renderer as the OpenAI server parsed it.
+
+    That is the text (with the model's image placeholder already inserted) plus a "media" list
+    of pending loads, which are coroutines and cannot be deep-copied. The renderer must neither
+    copy nor consume them; the server awaits them after rendering.
+    """
+
+    async def pending_image_load():
+        return None
+
+    pending = pending_image_load()
+    message = {
+        "role": "user",
+        "content": "<｜deepseek_image｜>\n\nWhat is shown?",
+        "media": [{"modality": "image", "data": pending, "is_embedding": False}],
+        "content_parts": [{"type": "image", "media_index": 0}, "What is shown?"],
+    }
+    try:
+        prompt = apply_chat_template(
+            model_type="deepseek_v41",
+            tokenizer=DeepseekV4Tokenizer(_DummyTokenizer()),
+            processor=None,
+            conversation=[message],
+            add_generation_prompt=True,
+            mm_placeholder_counts=[{"<｜deepseek_image｜>": 1}],
+            chat_template_kwargs={"thinking": False},
+        )
+        assert prompt == (
+            "<｜begin▁of▁sentence｜><｜User｜><｜deepseek_image｜>\n\nWhat is shown?"
+            "<｜Assistant｜></think>"
+        )
+        assert message["media"][0]["data"] is pending
+    finally:
+        pending.close()
+
+
+def test_deepseek_v4_tools_argument_joins_the_leading_system_message():
+    """Tools render on the leading system or developer message, after its content."""
+    tokenizer = DeepseekV4Tokenizer(_DummyTokenizer())
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {"type": "object"},
+            },
+        }
+    ]
+
+    for role in ("system", "developer"):
+        conversation = [{"role": role, "content": "Be brief."}, {"role": "user", "content": "hi"}]
+
+        prompt = tokenizer.apply_chat_template(conversation, tools=tools, tokenize=False)
+
+        assert prompt.count("## Tools") == 1
+        assert prompt.index("Be brief.") < prompt.index("## Tools")
+        assert "tools" not in conversation[0]

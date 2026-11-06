@@ -16,7 +16,7 @@
 import math
 from dataclasses import replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
@@ -39,6 +39,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -70,6 +71,8 @@ class _TensorSpec:
 
 
 class _Attention:
+    out_head_size = TrtllmAttention.out_head_size
+
     def __init__(
         self,
         *,
@@ -86,6 +89,7 @@ class _Attention:
         self.qk_rope_head_dim = 64 if is_mla else None
         self.qk_nope_head_dim = 128 if is_mla else None
         self.v_head_dim = 128 if is_mla else None
+        self.rope_append = True
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
         self.skip_correction_threshold = 0.0
@@ -947,7 +951,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         )
     )
     context_postprocess = Mock()
-    wrapper = Mock()
+    wrapper = create_autospec(prims_context_module.BatchPrefillPagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -1034,7 +1038,8 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "num_kv_heads": attn.num_kv_heads,
         "head_dim": attn.head_dim,
         "q_dtype": torch.bfloat16,
-        "kv_dtype": torch.bfloat16,
+        "k_dtype": torch.bfloat16,
+        "v_dtype": torch.bfloat16,
         "out_dtype": torch.bfloat16,
         "page_size": 32,
         "mask_type": "causal",
@@ -1155,7 +1160,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
             False,
         )
     )
-    wrapper = Mock()
+    wrapper = create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
     wrapper._plan_state = SimpleNamespace(
         policy=(
             ("use_split_kv", use_split_kv),
@@ -1323,7 +1328,10 @@ def test_decode_layer_adapters_bind_the_same_shared_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_decode_module,
@@ -1409,7 +1417,10 @@ def test_decode_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_decode_module,
@@ -1509,7 +1520,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         dtype=torch.int32,
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -1703,7 +1714,10 @@ def test_mla_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
     fmha = PrimsTSFmha(attn)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_mla_module,
@@ -1769,7 +1783,7 @@ def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
         "is_current_stream_capturing",
         lambda: capturing,
     )
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_mla_module,
@@ -1815,7 +1829,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         dtype=torch.int32,
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -2330,3 +2344,54 @@ def test_phased_forward_routes_query_and_qkv_by_phase(
             assert params.value_input is None
         assert params.output.shape == (params.num_tokens, attn.num_heads, out_head_size)
         assert params.output.data_ptr() == output[token_slice].data_ptr()
+
+
+def test_cache_free_context_plans_contiguous_wrapper_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cache-free context path plans one contiguous wrapper per shape and reuses it."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    attn = _Attention()
+    fmha = PrimsTSFmha(attn)
+    wrapper = Mock()
+    wrapper_factory = Mock(return_value=wrapper)
+    monkeypatch.setattr(prims_context_module, "BatchPrefillTSWrapper", wrapper_factory)
+    batch_size, seq_len = 2, 16
+    q = torch.empty((batch_size * seq_len, attn.num_heads * attn.head_dim), dtype=torch.bfloat16)
+    k = torch.empty((batch_size * seq_len, attn.num_kv_heads * attn.head_dim), dtype=torch.bfloat16)
+    v = torch.empty_like(k)
+    output = torch.empty(
+        (batch_size * seq_len, attn.num_heads * attn.head_dim), dtype=torch.bfloat16
+    )
+    metadata = SimpleNamespace(
+        kv_cache_manager=None,
+        num_contexts=batch_size,
+        num_generations=0,
+        max_seq_len=seq_len,
+        prompt_lens_cpu_runtime=torch.full((batch_size,), seq_len, dtype=torch.int32),
+    )
+    forward_args = AttentionForwardArgs(
+        output=output,
+        attention_input_type=AttentionInputType.context_only,
+        attention_mask=PredefinedAttentionMask.FULL,
+    )
+
+    fmha.forward(q, k, v, metadata, forward_args)
+    fmha.forward(q, k, v, metadata, forward_args)
+
+    wrapper_factory.assert_called_once_with()
+    wrapper.plan.assert_called_once()
+    plan_kwargs = wrapper.plan.call_args.kwargs
+    assert plan_kwargs["batch_size"] == batch_size
+    assert plan_kwargs["max_seq_len_q"] == plan_kwargs["max_kv_len"] == seq_len
+    assert (
+        plan_kwargs["q_dtype"] == plan_kwargs["k_dtype"] == plan_kwargs["v_dtype"] == torch.bfloat16
+    )
+    assert plan_kwargs["mask_type"] == "dense"
+    assert wrapper.run.call_count == 2
+    run_args, run_kwargs = wrapper.run.call_args
+    assert tuple(run_args[0].shape) == (batch_size, seq_len, attn.num_heads, attn.head_dim)
+    assert tuple(run_args[2].shape) == (batch_size, seq_len, attn.num_kv_heads, attn.head_dim)
+    assert run_args[0].data_ptr() == q.data_ptr()
+    assert run_args[2].data_ptr() == v.data_ptr()
+    assert run_kwargs["out"].data_ptr() == output.data_ptr()
+    assert run_kwargs["scale_softmax_log2"] is None
+    assert run_kwargs["output_scale"] is None

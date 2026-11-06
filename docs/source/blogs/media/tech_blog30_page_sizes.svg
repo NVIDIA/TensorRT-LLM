@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 346" width="1000" height="346">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker></defs>
+<rect width="1000" height="346" fill="#f5f5f5"/>
+<text x="70.0" y="34.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="12.5" font-weight="600" fill="#2d3142" text-anchor="start">Size of one attention KV page off the GPU</text>
+<text x="62.0" y="58.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="600" fill="#4f5d75" text-anchor="end">MiB</text>
+<rect x="70" y="48" width="11" height="11" fill="#ffffff" stroke="#2d3142"/>
+<text x="86.0" y="57.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">uncompressed</text>
+<rect x="190" y="48" width="11" height="11" fill="rgba(118,185,0,0.08)" stroke="#76B900"/>
+<text x="206.0" y="57.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4 cold page</text>
+<line x1="70" y1="260.0" x2="950" y2="260.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="62.0" y="263.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">0</text>
+<line x1="70" y1="222.0" x2="950" y2="222.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="225.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">1</text>
+<line x1="70" y1="184.0" x2="950" y2="184.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="187.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">2</text>
+<line x1="70" y1="146.0" x2="950" y2="146.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="149.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">3</text>
+<line x1="70" y1="108.0" x2="950" y2="108.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="111.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">4</text>
+<line x1="70" y1="70.0" x2="950" y2="70.0" stroke="#bfc0c0" stroke-width="0.5" stroke-dasharray="2,3"/>
+<text x="62.0" y="73.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="end">5</text>
+<rect x="118.0" y="222.0" width="56" height="38.0" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="146.0" y="216.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.00</text>
+<rect x="186.0" y="238.6" width="56" height="21.4" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="214.0" y="232.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">0.56</text>
+<text x="214.0" y="218.6" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">-43.8% · 1.78x</text>
+<text x="180.0" y="276.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">Qwen3.5-397B-A17B</text>
+<text x="180.0" y="290.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">FP8 KV</text>
+<text x="180.0" y="303.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">64 tokens per page</text>
+<rect x="338.0" y="174.5" width="56" height="85.5" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="366.0" y="168.5" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.25</text>
+<rect x="406.0" y="211.9" width="56" height="48.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="434.0" y="205.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.27</text>
+<text x="434.0" y="191.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">-43.8% · 1.78x</text>
+<text x="400.0" y="276.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">Qwen3-8B</text>
+<text x="400.0" y="290.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">FP8 KV</text>
+<text x="400.0" y="303.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">32 tokens per page</text>
+<rect x="558.0" y="147.7" width="56" height="112.3" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="586.0" y="141.7" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">2.95</text>
+<rect x="626.0" y="193.9" width="56" height="66.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="654.0" y="187.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.74</text>
+<text x="654.0" y="173.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">-41.1% · 1.70x</text>
+<text x="620.0" y="276.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">GLM-5.2</text>
+<text x="620.0" y="290.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">FP8 MLA latent + lossless index</text>
+<text x="620.0" y="303.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">64 tokens per page</text>
+<rect x="778.0" y="89.0" width="56" height="171.0" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+<text x="806.0" y="83.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">4.50</text>
+<rect x="846.0" y="211.9" width="56" height="48.1" fill="rgba(118,185,0,0.08)" stroke="#76B900" stroke-width="1"/>
+<text x="874.0" y="205.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#2d3142" text-anchor="middle">1.27</text>
+<text x="874.0" y="191.9" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="600" fill="#76B900" text-anchor="middle">-71.9% · 3.56x</text>
+<text x="840.0" y="276.0" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="10" font-weight="600" fill="#2d3142" text-anchor="middle">Qwen3-8B</text>
+<text x="840.0" y="290.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">BF16 KV</text>
+<text x="840.0" y="303.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" fill="#4f5d75" text-anchor="middle">32 tokens per page</text>
+<text x="500.0" y="334.0" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9.5" font-weight="500" fill="#4f5d75" text-anchor="middle">recurrent state of hybrid models is stored as is and does not shrink</text>
+</svg>

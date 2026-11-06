@@ -27,7 +27,7 @@ after model weight loading and BEFORE any inference forward pass.  It:
    local weights into fabric memory and freeing the originals.  Handles
    are exchanged via the DWDP MPI communicator.
 5. Constructs a WeightBuffer with composite VA layout (zero-copy local
-   + page-pool-backed remote double buffer).
+   + page-pool-backed remote prefetch slots).
 6. Fills page-alignment edge bytes at MNNVL region boundaries.
 7. Creates a DWDPWeightManager for runtime P2P prefetch scheduling.
 8. Patches each MoE backend so it sees all ``num_experts`` (ep_size=1) and
@@ -42,7 +42,7 @@ no-op (returns the existing manager stored on the model).
 from __future__ import annotations
 
 import traceback
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -93,7 +93,9 @@ def setup_dwdp(
     layer_indices: List[int],
     num_experts_per_worker: int,
     num_prefetch_experts: int,
+    num_prefetch_slots: int,
     contention_opt: bool = False,
+    repeated_layer_indices: Sequence[int] = (),
 ) -> Optional[DWDPWeightManager]:
     """Set up DWDP for a model after weight loading.
 
@@ -124,6 +126,12 @@ def setup_dwdp(
             redundancy: adjacent ranks' ranges overlap by
             ``num_experts_per_worker - num_prefetch_experts`` experts and
             ``lookup_owner`` resolves the lowest-rank owner.
+        num_prefetch_slots: Number of prefetch buffer slots, each holding the
+            remote experts of one MoE layer (``DwdpConfig.num_prefetch_slots``).
+        contention_opt: Copy-engine prefetch as one interleaved
+            ``cudaMemcpyBatchAsync`` per layer (``DwdpConfig.contention_opt``).
+        repeated_layer_indices: Layers of ``layer_indices`` that run several
+            times in a row within a forward pass (``DwdpManager.add_repeated_layer``).
 
     Returns:
         A ready-to-use DWDPWeightManager if DWDP is enabled, ``None`` otherwise.
@@ -235,11 +243,14 @@ def setup_dwdp(
             local_end=local_end,
             dwdp_size=mapping.dwdp_size,
             device_id=device_id,
+            num_slots=num_prefetch_slots,
         )
     except BaseException:
         _release_during_rollback(transport, "transport")
         raise
-    logger.info("[DWDP Setup] Weight buffer created successfully.")
+    logger.info(
+        f"[DWDP Setup] Weight buffer created successfully ({num_prefetch_slots} prefetch slots)."
+    )
 
     # 6. Fill edge bytes
     logger.info("[DWDP Setup] Filling page-alignment edge bytes...")
@@ -270,6 +281,7 @@ def setup_dwdp(
             dwdp_rank=mapping.dwdp_rank,
             dwdp_size=mapping.dwdp_size,
             contention_opt=contention_opt,
+            repeated_layer_indices=repeated_layer_indices,
         )
     except BaseException:
         _release_during_rollback(weight_buffer, "weight buffer")
@@ -689,7 +701,11 @@ def fixup_moe_backends(
         # ConfigurableMoE has its own ep_size, slot_start, etc. that are used
         # in its forward path.  The backend is the inner module that holds
         # weight parameters.
-        configurable_moe = getattr(layer.mlp, "experts", None)
+        # ``moe_module`` is what _get_moe_and_experts() just resolved, so this
+        # is model-agnostic: on DeepSeek it is layer.mlp and this stays exactly
+        # equivalent to the old getattr(layer.mlp, "experts", None); on K3 it
+        # is layer.block_sparse_moe, which has no ``.mlp`` at all.
+        configurable_moe = _get_configurable_moe(moe_module)
         targets = [experts_module]
         if configurable_moe is not None and configurable_moe is not experts_module:
             targets.insert(0, configurable_moe)
@@ -1110,6 +1126,20 @@ def _get_decoder_model(model: nn.Module) -> nn.Module:
     )
 
 
+def _get_configurable_moe(moe_module: Optional[nn.Module]) -> Optional[nn.Module]:
+    """The ConfigurableMoE wrapper of an MoE module, if the model uses one.
+
+    DeepSeek calls it ``experts``; Kimi K3's ``KimiK3MoERuntime`` calls the
+    same thing ``routed_experts``.  Returns None when the module has neither.
+    """
+    if moe_module is None:
+        return None
+    experts = getattr(moe_module, "experts", None)
+    if experts is None:
+        experts = getattr(moe_module, "routed_experts", None)
+    return experts
+
+
 def _get_moe_and_experts(
     layer: nn.Module,
 ) -> Tuple[Optional[nn.Module], Optional[nn.Module]]:
@@ -1118,13 +1148,22 @@ def _get_moe_and_experts(
     The standard path for DeepSeek is:
         layer.mlp (Deepseekv3MoE) -> .experts (MoE backend)
 
+    Kimi K3 spells the same shape differently:
+        layer.block_sparse_moe (KimiK3MoERuntime) -> .routed_experts (MoE backend)
+
     Returns:
         Tuple of (moe_module, experts_module) where moe_module is the wrapper
         (e.g. Deepseekv3MoE) and experts_module is the backend (e.g.
         CutlassFusedMoE, ConfigurableMoE, etc.). Both may be None if the
         layer is not an MoE layer.
     """
+    # K3's *dense* layers do carry an ``mlp``, but this function is only ever
+    # reached for layer indices that registered themselves from
+    # ConfigurableMoE.__init__, so a dense layer never gets here and the
+    # ``mlp``-first order stays safe.
     mlp = getattr(layer, "mlp", None)
+    if mlp is None:
+        mlp = getattr(layer, "block_sparse_moe", None)
     if mlp is None:
         return None, None
 
@@ -1132,8 +1171,8 @@ def _get_moe_and_experts(
     if hasattr(mlp, "w3_w1_weight"):
         return mlp, mlp
 
-    # Standard path: mlp.experts
-    experts = getattr(mlp, "experts", None)
+    # Standard path: mlp.experts (K3: block_sparse_moe.routed_experts)
+    experts = _get_configurable_moe(mlp)
     if experts is not None:
         # Prefer the inner backend (ConfigurableMoE wraps it)
         backend = getattr(experts, "backend", None)

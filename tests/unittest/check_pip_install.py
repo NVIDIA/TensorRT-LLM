@@ -76,7 +76,7 @@ def verify_license_files():
         timeout=60)
 
     if result.returncode != 0:
-        print(f"ERROR: License files check failed!")
+        print("ERROR: License files check failed!")
         print(result.stdout)
         print(result.stderr)
         exit(1)
@@ -87,7 +87,7 @@ def verify_license_files():
         import json
         found_files = json.loads(output_lines[-1])
     except (json.JSONDecodeError, IndexError):
-        print(f"ERROR: Could not parse license files from output!")
+        print("ERROR: Could not parse license files from output!")
         print(result.stdout)
         exit(1)
 
@@ -101,7 +101,7 @@ def verify_license_files():
     # Check that at least one valid attribution file is present
     found_attributions = [f for f in found_files if f in valid_attributions]
     if not found_attributions:
-        print(f"ERROR: No valid attribution file found!")
+        print("ERROR: No valid attribution file found!")
         print(f"Expected one of: {valid_attributions}")
         print(f"Found: {found_files}")
         exit(1)
@@ -114,6 +114,75 @@ def verify_license_files():
 
     verified_files = required_files + found_attributions
     print(f"✓ License files verified: {', '.join(verified_files)}")
+
+
+def verify_openengine_distribution() -> None:
+    """Verify the installed wheel's OpenEngine metadata and static payload."""
+    from importlib.metadata import distribution
+
+    from packaging.requirements import Requirement
+    from packaging.utils import canonicalize_name
+
+    dist = distribution("tensorrt_llm")
+    provided_extras = set(dist.metadata.get_all("Provides-Extra") or ())
+    expected_requirements = {"grpc-smg": Requirement("smg-grpc-proto>=0.4.2")}
+    missing_extras = {"grpc-smg", "openengine"} - provided_extras
+    if missing_extras:
+        raise RuntimeError("Missing TensorRT-LLM wheel extras: " +
+                           ", ".join(sorted(missing_extras)))
+
+    requirements = [Requirement(raw) for raw in (dist.requires or ())]
+    for extra, expected in expected_requirements.items():
+        declared = any(
+            canonicalize_name(requirement.name) == canonicalize_name(
+                expected.name) and requirement.specifier == expected.specifier
+            and requirement.marker is not None
+            and requirement.marker.evaluate({"extra": extra})
+            for requirement in requirements)
+        if not declared:
+            raise RuntimeError(
+                f"Wheel extra {extra!r} does not declare {expected}")
+
+    for expected_grpc in (Requirement("grpcio>=1.73.1,<2"),
+                          Requirement("grpcio-health-checking>=1.73.1,<1.82")):
+        grpc_declared = any(
+            canonicalize_name(requirement.name) == canonicalize_name(
+                expected_grpc.name) and requirement.specifier ==
+            expected_grpc.specifier and requirement.marker is None
+            for requirement in requirements)
+        if not grpc_declared:
+            raise RuntimeError(
+                f"TensorRT-LLM does not declare base requirement {expected_grpc}"
+            )
+
+    proto_names = (
+        "error",
+        "generation",
+        "kv",
+        "lifecycle",
+        "lora",
+        "model",
+        "openengine",
+        "server",
+    )
+    expected_files = {
+        "tensorrt_llm/grpc/openengine/_generated/__init__.py",
+        *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.py"
+          for name in proto_names),
+        *(f"tensorrt_llm/grpc/openengine/_generated/{name}_pb2.pyi"
+          for name in proto_names),
+        "tensorrt_llm/grpc/openengine/_generated/openengine_pb2_grpc.py",
+        "tensorrt_llm/grpc/openengine/proto/manifest.json",
+        *(f"tensorrt_llm/grpc/openengine/proto/openengine/v1/{name}.proto"
+          for name in proto_names),
+    }
+    installed_files = {str(path) for path in (dist.files or ())}
+    missing_files = expected_files - installed_files
+    if missing_files:
+        raise RuntimeError("Missing OpenEngine wheel files: " +
+                           ", ".join(sorted(missing_files)))
+
+    print("✓ OpenEngine wheel metadata and static payload verified")
 
 
 def get_cpython_version():
@@ -238,9 +307,8 @@ def create_link_for_models():
         print(f"ERROR: Models root {models_root} does not exist")
         exit(1)
     src_dst_dict = {
-        # TinyLlama-1.1B-Chat-v1.0
-        f"{models_root}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0":
-        f"{os.getcwd()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # Qwen3-0.6B
+        f"{models_root}/Qwen3/Qwen3-0.6B": f"{os.getcwd()}/Qwen3/Qwen3-0.6B",
     }
 
     for src, dst in src_dst_dict.items():
@@ -288,6 +356,7 @@ def test_pip_install(args):
     download_wheel(args)
     install_tensorrt_llm()
 
+    verify_openengine_distribution()
     run_sanity_check()
 
 

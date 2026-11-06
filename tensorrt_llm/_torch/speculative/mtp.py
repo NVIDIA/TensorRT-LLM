@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, ClassVar, List, Optional
 
 import torch
 
@@ -80,7 +80,13 @@ class MTPHiddenStatesManager(BaseResourceManager):
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
-                slot_id = self.slot_manager.add_slot(req.request_id)
+                # A padding dummy (e.g. the attention-DP idle-rank dummy) may
+                # already hold a slot from add_dummy_requests -- reuse it
+                # instead of re-adding, which SlotManager.add_slot only
+                # tolerates for the CUDA-graph dummy id.
+                slot_id = self.slot_manager.get_slot(req.request_id)
+                if slot_id is None:
+                    slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
                     self.mtp_relaxed_delta_pool[slot_id].copy_(
                         0, non_blocking=True)
@@ -126,6 +132,7 @@ class MTPSpecMetadata(SpecMetadata):
     """
     Metadata for MTP.
     """
+    supports_steady_prepare: ClassVar[bool] = True
     # The number of MTP modules in the model
     mtp_num_modules: int = 1
     # The hidden states manager for MTP

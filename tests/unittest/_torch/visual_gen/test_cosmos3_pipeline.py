@@ -1721,3 +1721,27 @@ class TestErrorClassificationIsOptIn:
         # Unclassified stays unclassified: an internal fault is not the
         # caller's fault.
         assert pipeline.classify_request_failure(RuntimeError("internal")) is None
+
+
+class TestStepPrecisionSelection:
+    """The pipeline hands every step to the transformer's step selection."""
+
+    @staticmethod
+    def _pipeline(transformer):
+        pipeline = object.__new__(Cosmos3OmniMoTPipeline)
+        pipeline.transformer = transformer
+        pipeline.scheduler = SimpleNamespace(timesteps=torch.arange(5))
+        return pipeline
+
+    def test_request_selects_every_step_against_the_full_schedule(self):
+        calls = []
+        transformer = SimpleNamespace(
+            set_denoising_step=lambda step_index, num_steps: calls.append((step_index, num_steps))
+        )
+        pipeline = self._pipeline(transformer)
+        for step in range(5):
+            pipeline._select_step_precision(step)
+        assert calls == [(step, 5) for step in range(5)]
+
+    def test_transformer_without_a_policy_is_left_alone(self):
+        self._pipeline(SimpleNamespace())._select_step_precision(0)

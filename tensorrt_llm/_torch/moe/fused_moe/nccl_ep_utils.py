@@ -21,13 +21,21 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
 
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from .moe_comm_timeout_guard import (
+    register_moe_comm_timeout_proxy,
+    unregister_moe_comm_timeout_proxy,
+)
+
+if TYPE_CHECKING:
+    from nccl.ep import Group
 
 _MIN_NCCL_EP_INT32_TOPK_VERSION = "0.2"
 _NCCL_RUNTIME_ERRORS = (RuntimeError, OSError)
@@ -85,6 +93,28 @@ def _nccl_ep_supports_int32_topk_idx() -> bool:
     return nccl_ep_supports_version(_MIN_NCCL_EP_INT32_TOPK_VERSION)
 
 
+def nccl_ep_supports_group_timeout() -> bool:
+    """Return True when ``nccl.ep.Group`` can change its wait-loop timeout after creation."""
+    try:
+        from nccl.ep import Group
+    except _NCCL_AVAILABILITY_ERRORS:
+        return False
+    return hasattr(Group, "set_timeout_ns")
+
+
+class _NcclEpGroupTimeoutProxy:
+    """Applies MoE communication timeouts to one NCCL EP group."""
+
+    name = "NcclEP"
+
+    def __init__(self, group: "Group") -> None:
+        self._group = group
+
+    def set_timeout_seconds(self, seconds: int | None) -> None:
+        # The group restores the timeout it resolved at creation for 0.
+        self._group.set_timeout_ns(0 if seconds is None else seconds * 1_000_000_000)
+
+
 # Singleton EP context keyed by (ep_size, ep_rank, max_tokens, num_experts,
 # hidden, max_top_k, use_internal_fp8_dispatch, layout).
 _ep_group_cache: dict = {}
@@ -126,7 +156,7 @@ class NcclEpContext:
             Tensor,
         )
 
-        from tensorrt_llm._utils import mpi_comm
+        from tensorrt_llm._utils import mpi_comm, mpi_disabled
 
         self.mapping = mapping
         self.ep_size = mapping.moe_ep_size
@@ -186,23 +216,24 @@ class NcclEpContext:
             use_internal_fp8_dispatch or external_fp8 or external_nvfp4
         ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
 
-        # MPI sub-communicator scoped to the EP group. Mirrors the
-        # DeepEPLowLatency pattern (see deep_ep_utils.py:104): split
-        # MPI_COMM_WORLD by pp_rank so each pipeline stage gets its own EP
-        # comm, keyed by moe_ep_rank. Avoids the wheel's
-        # nccl.ep.get_nccl_comm_from_group() helper which requires
-        # torch.distributed.init_process_group() -- the test infrastructure
-        # (mpi_pool_executor) and microbenchmarks use MPI4PY only.
-        self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
-        ep_world_rank = self._ep_mpi_comm.Get_rank()
-        ep_world_size = self._ep_mpi_comm.Get_size()
-        unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
-        unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
-        self.comm = nccl_core.Communicator.init(
-            nranks=ep_world_size,
-            rank=ep_world_rank,
-            unique_id=unique_id,
-        )
+        # Ray actors have singleton MPI worlds; bootstrap from their torch EP
+        # group. MPI workers and microbenchmarks need no torch process group.
+        self._ep_mpi_comm = None
+        if mpi_disabled():
+            from nccl.ep.interop.torch import get_nccl_comm_from_group
+
+            self.comm = get_nccl_comm_from_group(mapping.moe_ep_group_pg)
+        else:
+            self._ep_mpi_comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
+            ep_world_rank = self._ep_mpi_comm.Get_rank()
+            ep_world_size = self._ep_mpi_comm.Get_size()
+            unique_id = nccl_core.get_unique_id() if ep_world_rank == 0 else None
+            unique_id = self._ep_mpi_comm.bcast(unique_id, root=0)
+            self.comm = nccl_core.Communicator.init(
+                nranks=ep_world_size,
+                rank=ep_world_rank,
+                unique_id=unique_id,
+            )
 
         dispatch_token_bytes = (
             hidden_size * 2
@@ -226,6 +257,10 @@ class NcclEpContext:
             max_token_bytes=max_token_bytes,
         )
         self.ep_group = Group.create(self.comm, cfg)
+        # Held here because the timeout guard holds its proxies weakly; ``destroy`` unregisters
+        # the proxy before the group goes away.
+        self._timeout_proxy = _NcclEpGroupTimeoutProxy(self.ep_group)
+        register_moe_comm_timeout_proxy(self._timeout_proxy)
 
         logger.info(
             f"NCCL EP group created: ep_size={self.ep_size}, "
@@ -361,6 +396,7 @@ class NcclEpContext:
         (the recommended nccl4py pattern), then ``Free`` on the MPI comm.
         """
         if self.ep_group is not None:
+            unregister_moe_comm_timeout_proxy(self._timeout_proxy)
             try:
                 self.ep_group.destroy()
             except _NCCL_RUNTIME_ERRORS as e:

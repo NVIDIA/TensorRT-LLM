@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ import torch
 
 import tensorrt_llm as tllm
 from tensorrt_llm import Mapping
+from tensorrt_llm._torch.distributed.mnnvl_memory import MnnvlMemory
 
 
 class TestMnnvlMemory(unittest.TestCase):
@@ -42,7 +43,7 @@ class TestMnnvlMemory(unittest.TestCase):
         local_dev_count = torch.cuda.device_count()
         assert self.local_world_size <= local_dev_count, "ntasks_per_node should be less than local device count"
         torch.cuda.set_device(self.local_rank)
-        tllm.MnnvlMemory.initialize()
+        MnnvlMemory.initialize()
         # MnnvlMemory splits its communicator per MoE expert-parallel group, so
         # an allocation is shared across ranks only when moe_ep_size spans them.
         self.mapping = Mapping(self.world_size,
@@ -56,15 +57,15 @@ class TestMnnvlMemory(unittest.TestCase):
         align_size = 2 * 1024 * 1024
         return (size + align_size - 1) // align_size * align_size
 
-    @pytest.mark.skipif(not tllm.MnnvlMemory.supports_mnnvl(),
+    @pytest.mark.skipif(not MnnvlMemory.supports_mnnvl(),
                         reason="Mnnvl memory is not supported on this platform"
                         )  # Skip tests on unsupported platform
     def test_mnnvl_memory(self):
         # allocate un-aligned memory
         allocate0_size = 4 * 1024 * 1024 - 3 * 1024
-        mnnvl_memory0 = tllm.MnnvlMemory(self.mapping, allocate0_size)
+        mnnvl_memory0 = MnnvlMemory(self.mapping, allocate0_size)
         allocate0_size_aligned = TestMnnvlMemory.align_memory(allocate0_size)
-        assert tllm.MnnvlMemory.current_mem_offset == allocate0_size_aligned
+        assert MnnvlMemory.current_mem_offset == allocate0_size_aligned
 
         tensor0 = mnnvl_memory0.as_torch_strided_tensor(torch.int32)
         numel_per_rank = allocate0_size // 4
@@ -79,9 +80,9 @@ class TestMnnvlMemory(unittest.TestCase):
                     device='cuda')), f"segment written by rank {r} mismatched"
 
         allocate1_size = 30 * 1024 * 1024 - 2 * 1024
-        mnnvl_memory1 = tllm.MnnvlMemory(self.mapping, allocate1_size)
+        mnnvl_memory1 = MnnvlMemory(self.mapping, allocate1_size)
         allocate1_size_aligned = TestMnnvlMemory.align_memory(allocate1_size)
-        assert tllm.MnnvlMemory.current_mem_offset == allocate0_size_aligned + allocate1_size_aligned
+        assert MnnvlMemory.current_mem_offset == allocate0_size_aligned + allocate1_size_aligned
         tensor1 = mnnvl_memory1.as_torch_strided_tensor(torch.float32)
         numel_per_rank = allocate1_size // 4
         tensor1[(self.rank + 5) % self.world_size] = torch.arange(
@@ -103,11 +104,10 @@ class TestMnnvlMemory(unittest.TestCase):
         tllm.mpi_barrier()
 
         large_allocation2_size = 768 * 1024 * 1024
-        large_mnnvl_memory2 = tllm.MnnvlMemory(self.mapping,
-                                               large_allocation2_size)
+        large_mnnvl_memory2 = MnnvlMemory(self.mapping, large_allocation2_size)
         allocate2_size_aligned = TestMnnvlMemory.align_memory(
             large_allocation2_size)
-        assert tllm.MnnvlMemory.current_mem_offset == allocate2_size_aligned
+        assert MnnvlMemory.current_mem_offset == allocate2_size_aligned
         assert large_mnnvl_memory2.rank_stride == (1 << 30)
 
         del tensor1

@@ -36,16 +36,19 @@ from typing import Callable, Optional, Tuple
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
-from tensorrt_llm._torch.visual_gen.attention_backend import RingAttention, UlyssesAttention
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import FlashAttn4Attention
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
+from tensorrt_llm._torch.visual_gen.attention.backends import RingAttention, UlyssesAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
+from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
+    _flash_attn_fwd as _fa4_fwd,
+)
+from tensorrt_llm._torch.visual_gen.attention.backends.interface import AttentionTensorLayout
+
+from ._worker_pool import run_distributed
 
 _flash_attn4_available = _fa4_fwd is not None
 
@@ -106,48 +109,11 @@ class _LSEVanillaAttention(nn.Module):
 # =============================================================================
 
 
-def _init_worker(rank: int, world_size: int, backend: str, port: int):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    if backend == "nccl" and torch.cuda.is_available():
-        torch.cuda.set_device(rank % torch.cuda.device_count())
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-    else:
-        dist.init_process_group(backend="gloo", rank=rank, world_size=world_size)
-
-
-def _cleanup():
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _distributed_worker(rank, world_size, backend, test_fn, port):
-    try:
-        _init_worker(rank, world_size, backend, port)
-        test_fn(rank, world_size)
-    except Exception as e:
-        print(f"Rank {rank} failed: {e}")
-        raise
-    finally:
-        _cleanup()
-
-
 def run_test_in_distributed(world_size: int, test_fn: Callable, use_cuda: bool = True):
     if use_cuda and torch.cuda.device_count() < world_size:
         pytest.skip(f"Test requires {world_size} GPUs, only {torch.cuda.device_count()} available")
-
-    backend = "nccl" if use_cuda else "gloo"
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    from ._visual_gen_dist_utils import spawn_with_retry
-
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _distributed_worker,
-            args=(world_size, backend, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
+    run_distributed(
+        world_size, test_fn, dist_backend="nccl" if use_cuda else "gloo", preload=("tensorrt_llm",)
     )
 
 

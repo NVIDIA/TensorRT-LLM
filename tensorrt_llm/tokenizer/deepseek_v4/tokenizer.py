@@ -159,7 +159,9 @@ def _find_last_user_index(messages: list[dict[str, Any]]) -> int:
 def _merge_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     for message in messages:
-        message = copy.deepcopy(message)
+        # A message parsed by the OpenAI server carries its pending media loads (coroutines,
+        # which cannot be deep-copied) under "media"; the renderer never reads them.
+        message = copy.deepcopy({key: value for key, value in message.items() if key != "media"})
         role = message.get("role")
 
         if role == "tool":
@@ -445,7 +447,13 @@ class DeepseekV4Tokenizer(TransformersTokenizer):
         conversation = kwargs.get("conversation", messages)
         messages = list(conversation)
         if tools:
-            messages.insert(0, {"role": "system", "tools": tools})
+            # The checkpoint's encoder renders tools from the system or developer
+            # message that leads the conversation, after its content.
+            first_role = messages[0].get("role") if messages else None
+            if first_role in ("system", "developer") and not messages[0].get("tools"):
+                messages[0] = {**messages[0], "tools": tools}
+            else:
+                messages.insert(0, {"role": "system", "tools": tools})
 
         rendered = _encode_messages(
             messages=messages,

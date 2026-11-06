@@ -428,22 +428,6 @@ class TestHelixPostProcess(unittest.TestCase):
                 partial_o, softmax_stats, workspace, 0, cp_size, mask
             )
 
-    @unittest.skipIf(torch.cuda.device_count() < 2, "needs 2 GPUs")
-    def test_alltoall_helix_native_rejects_cross_device_zero_kv_mask(self):
-        """Reject a mask whose pointer cannot be dereferenced on the input device."""
-        num_tokens, cp_size, value_dim = 8, 2, 64
-        partial_o = torch.randn(
-            num_tokens, cp_size, value_dim, dtype=torch.float16, device="cuda:0"
-        )
-        softmax_stats = torch.randn(num_tokens, cp_size, 2, dtype=torch.float32, device="cuda:0")
-        workspace = torch.zeros(cp_size, 8, dtype=torch.uint64, device="cuda:0")
-        mask = torch.zeros(num_tokens, dtype=torch.bool, device="cuda:1")
-
-        with pytest.raises(RuntimeError, match="same device as partial_o"):
-            torch.ops.trtllm.alltoall_helix_native(
-                partial_o, softmax_stats, workspace, 0, cp_size, mask
-            )
-
     @parameterized.expand(
         [
             # (layout,) — "nccl", "fifo_v1", "fifo_v2".

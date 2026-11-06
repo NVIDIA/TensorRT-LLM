@@ -73,7 +73,7 @@ class Fp4MlaFmha(PhasedFmha):
     ) -> bool:
         # Mask/output formats and the attention phase are represented in the cache key.
         # K/V presence is fixed per phase; optional features and pools are instance invariants.
-        del q, phase
+        del phase
         if forward_args.output_sf is not None:
             raise NotImplementedError("FP4 MLA does not support quantized attention output.")
         if forward_args.attention_mask != PredefinedAttentionMask.CAUSAL:
@@ -112,16 +112,38 @@ class Fp4MlaFmha(PhasedFmha):
         state = metadata.fp4_mla_state
         if state is None or state.hp_pool is None:
             raise RuntimeError("FP4 MLA requires prepared high-precision KV state.")
-        if state.v_scale_pool is None:
-            raise RuntimeError("FP4 MLA requires the V-scale pool.")
-
         attention_input_type = forward_args.attention_input_type
+        context_only_cache = (
+            getattr(metadata.kv_cache_manager, "fp4_mla_context_only_cache", False) is True
+        )
+        if state.v_scale_pool is None and not (
+            context_only_cache and attention_input_type == AttentionInputType.context_only
+        ):
+            # Only a disaggregated context worker omits the V scales, and it
+            # runs context attention only.
+            raise RuntimeError("FP4 MLA requires the V-scale pool.")
         if attention_input_type == AttentionInputType.context_only:
             if k is None or v is None:
                 raise RuntimeError("FP4 MLA context requires expanded K and V tensors.")
         elif attention_input_type == AttentionInputType.generation_only:
             if k is not None or v is not None:
                 raise RuntimeError("FP4 MLA generation expects a fused query input.")
+            # Helix combines the per-rank partial outputs with these stats, so a
+            # Helix generation without them would combine uninitialized memory.
+            if getattr(metadata, "helix_position_offsets", None) is not None:
+                softmax_stats = forward_args.softmax_stats_tensor
+                expected_shape = (q.shape[0], self.attn.num_heads, 2)
+                if softmax_stats is None:
+                    raise RuntimeError("FP4 MLA Helix requires softmax_stats_tensor.")
+                if (
+                    softmax_stats.shape != expected_shape
+                    or softmax_stats.dtype != torch.float32
+                    or not softmax_stats.is_contiguous()
+                ):
+                    raise ValueError(
+                        "FP4 MLA Helix requires contiguous float32 softmax stats "
+                        f"with shape {expected_shape}."
+                    )
         else:
             raise NotImplementedError("FP4 MLA requires a context-only or generation-only call.")
         return True
@@ -368,6 +390,7 @@ class Fp4MlaFmha(PhasedFmha):
             metadata.fp4_mla_state.prequantized_q = None
             metadata.fp4_mla_state.prequantized_q_sf = None
             metadata.fp4_mla_state.q_batch_capacity = None
+            metadata.fp4_mla_state.prequantized_q_rows_per_seq = None
 
 
 __all__ = ["Fp4MlaFmha"]

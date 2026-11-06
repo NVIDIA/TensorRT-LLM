@@ -7,12 +7,12 @@ set -ex
 source "$(dirname "${BASH_SOURCE[0]}")/github_auth.sh"
 
 if [ -n "${GITHUB_MIRROR}" ]; then
-  export PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+  export PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
 fi
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-08.html#rel-26-08
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
 TORCH_VERSION="2.14.0"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 

@@ -33,6 +33,8 @@ from typing import Any
 
 import pytest
 
+from tensorrt_llm.executor.utils import LlmLauncherEnvs
+
 from .harness import DisaggCancellationStressHarness, StressConfig
 
 _CONFIG_DIR = Path(__file__).parent / "configs"
@@ -40,8 +42,20 @@ _CONFIG_DIR = Path(__file__).parent / "configs"
 # Marathon configurations exercised by the parametrized test below.
 # Add a new entry here to wire an additional YAML into the suite.
 _MARATHON_CONFIGS: list[str] = [
-    "marathon_cpp_v1_deepseek.yaml",
+    "marathon_python_v2_deepseek.yaml",
 ]
+
+# ``trtllm-llmapi-launch`` exports these so an LLM created in the pytest process
+# binds to the launcher's single pre-spawned MPI leader. The marathon creates
+# no LLM in-process: every ``trtllm-serve`` it launches inherits this process's
+# environment and must start its own MPI session. That leader serves only one
+# client, so with these set all but one worker block waiting for executor
+# workers that never come up.
+_LAUNCHER_SPAWN_PROXY_ENV_NAMES = (
+    LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS,
+    LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_ADDR,
+    LlmLauncherEnvs.TLLM_SPAWN_PROXY_PROCESS_IPC_HMAC_KEY,
+)
 
 
 def test_all_marathon_yamls_parse_and_validate() -> None:
@@ -60,13 +74,17 @@ def test_all_marathon_yamls_parse_and_validate() -> None:
 
 
 @pytest.mark.parametrize("config_filename", _MARATHON_CONFIGS)
-def test_disagg_cancellation_marathon(config_filename: str) -> None:
+def test_disagg_cancellation_marathon(
+    config_filename: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Drive the configured disagg stress mode and assert current pass criteria."""
     config_path = _CONFIG_DIR / config_filename
     assert config_path.exists(), (
         f"Marathon config not found: {config_path}. "
         "Did you regenerate the symlinks or rename the YAML?"
     )
+    for name in _LAUNCHER_SPAWN_PROXY_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
 
     harness = DisaggCancellationStressHarness(config_path)
     try:
@@ -125,8 +143,8 @@ def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> Non
             f"""\
             mode: {mode}
             duration_min: 1
-            kv_cache_manager: v1
-            transceiver: cpp
+            kv_cache_manager: v2
+            transceiver: python
             """,
         )
     )
@@ -134,6 +152,23 @@ def test_stress_config_accepts_supported_modes(tmp_path: Path, mode: str) -> Non
     assert cfg.mode == mode
     assert cfg.is_log_only is (mode == "log_only")
     assert cfg.is_full_cancel_poison is (mode == "full_cancel_poison")
+
+
+def test_stress_config_defaults_to_python(tmp_path: Path) -> None:
+    cfg = StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, "mode: log_only"))
+    assert cfg.transceiver == "python"
+    assert cfg.kv_cache_manager == "v2"
+
+
+def test_stress_config_rejects_v1_with_python(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="kv_cache_manager must be 'v2'"):
+        StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, "kv_cache_manager: v1"))
+
+
+@pytest.mark.parametrize("runtime", ["cpp", "auto", "unknown"])
+def test_stress_config_rejects_non_python_transceiver(tmp_path: Path, runtime: str) -> None:
+    with pytest.raises(ValueError, match="transceiver must be 'python'"):
+        StressConfig.from_yaml_path(_write_mode_yaml(tmp_path, f"transceiver: {runtime}"))
 
 
 def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
@@ -145,8 +180,8 @@ def test_stress_config_rejects_unknown_mode(tmp_path: Path) -> None:
                 """\
                 mode: accidental
                 duration_min: 1
-                kv_cache_manager: v1
-                transceiver: cpp
+                kv_cache_manager: v2
+                transceiver: python
                 """,
             )
         )
@@ -162,8 +197,8 @@ def test_log_only_thread_sends_probe_and_stops(
             """\
             mode: log_only
             duration_min: 1
-            kv_cache_manager: v1
-            transceiver: cpp
+            kv_cache_manager: v2
+            transceiver: python
             log_only_probe:
               interval_s: 0.01
               max_tokens: 8

@@ -78,7 +78,7 @@ measured: []
   in-place output arg must be marked in `inplace_info()`).
 - **Verify:** correctness — DSA e2e accuracy unchanged with piecewise CUDA graph +
   torch.compile on (`test_nvfp4_multi_gpus_piecewise_cuda_graph`, GSM8K); outputs match
-  the eager path. Perf — confirm Op 1 is captured and Op 2 is the boundary (ad-conf-check
+  the eager path. Perf — confirm Op 1 is captured and Op 2 is the boundary (config/log inspection
   / nsys graph coverage); per-step launch count and latency before vs after.
 - **Rollback:** disable piecewise capture (`torch_compile_piecewise_cuda_graph=false`)
   or fall back to the single-op eager path. Trigger: capture errors, an accuracy

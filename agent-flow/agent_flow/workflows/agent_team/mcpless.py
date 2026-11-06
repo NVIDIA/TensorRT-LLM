@@ -160,19 +160,28 @@ def gather_context(
     status_path: Path,
     replan: bool = False,
     feedback_triggered: bool = False,
+    feedback_path: Path | None = None,
 ) -> str:
     """Assemble the inline context that replaces a role's ``read_*`` tools.
 
     Mirrors, per role, the slices the old read tools returned:
     recent progress entries for the role's phase, the ``human_feedback``
     list, and (for coder/reviewer) the current ``status.md``.
+
+    ``feedback_path`` mirrors
+    :attr:`~agent_flow.workflows.agent_team.progress.ProgressContext.feedback_path`:
+    human feedback is read from it instead of ``progress_path`` when given. The
+    linear path leaves it ``None`` (one shared file holds both); the concurrent
+    path points it at the shared ``progress.yaml`` while ``progress_path`` stays
+    the node's private one, so a node sees the user's ``--feedback`` entries.
     """
 
     def _entries(entries: list[dict[str, Any]]) -> str:
         return _yaml_block(entries) if entries else "(no entries yet)"
 
     def _feedback() -> str:
-        fb = read_progress(progress_path)[HUMAN_FEEDBACK]
+        path = feedback_path if feedback_path is not None else progress_path
+        fb = read_progress(path)[HUMAN_FEEDBACK]
         return _yaml_block(fb) if fb else "(no human feedback)"
 
     def _status() -> str:

@@ -1,7 +1,7 @@
 {
   "image": "qwen_image_layered_lpips_golden/ (assembled into a 2x2 layer grid for LPIPS)",
   "model": "Qwen-Image-Layered",
-  "source": "Qwen-Image-Layered official demo",
+  "source": "TensorRT-LLM VisualGen",
   "prompt": "",
   "negative_prompt": " ",
   "input_image": "qwen_image_layered_lpips_input.png",
@@ -20,5 +20,14 @@
   "lpips_net": "alex",
   "lpips_threshold": 0.05,
   "diffusers_version": "0.39.0",
-  "official_repo_commit": "54c4fe4"
+  "torch_version": "2.14.0a0+4fdf77b940.nv26.08",
+  "tensorrt_llm_version": "1.4.0rc0",
+  "tensorrt_llm_commit": "4541ef09a013c160312391f1b6cd9229cfad3be3",
+  "container_image": "artifactory.nvidia.com/sw-tensorrt-llm-docker-local/tensorrt-llm:pytorch-26.08-py3-x86_64-ubuntu24.04-skip-tritondevel-202609210610-19345",
+  "sha256": {
+    "layer_1.png": "5febd50cbebb63b58d7ae35803617923bbe893ce73737d66fcced4c747213161",
+    "layer_2.png": "e6d86dc2e126bf6ecfe10c39f85eaf8b1976b536d3e3075e7cb93986f97a2826",
+    "layer_3.png": "f660821dc65e105a561138af98b51022c256756dbe32f0fa1089a0c777ffbd56",
+    "layer_4.png": "0fd928d431ad1c9c96499e3135349a6e167300d341ba7c8aa0f1e35831c8a9b8"
+  }
 }

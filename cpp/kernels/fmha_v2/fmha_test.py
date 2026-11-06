@@ -155,21 +155,8 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
         check=True)
 
 
-# The test cases for sage attention.
-@pytest.mark.parametrize('d', [80, 128], ids=["head-size-80", "head-size-128"])
-@pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
-def test_trtllm_sage_attention_fmha(d, s):
-    sm_version = getSMVersion()
-    if sm_version != 89 and sm_version != 90:
-        pytest.skip("Sage attention only supports sm89 and sm90 currently.")
-
-    # Ada.
-    if sm_version == 89:
-        subprocess.run(
-            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 16 -h 8 -d {d} -bf16 \
-            -sage-block-q 64 -sage-block-k 32 -sage-block-v 32 -force-non-tiled",
-            shell=True,
-            check=True)
+# SageAttention ships as a pre-built cubin (see SAGE_CUBIN_TRAITS in setup.py), so bin/fmha.exe
+# contains no sage kernel to exercise. It is covered by the runtime integration tests.
 
 
 # The test cases for mla attention.

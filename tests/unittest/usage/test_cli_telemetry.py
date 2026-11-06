@@ -29,6 +29,8 @@ from tensorrt_llm.commands import _telemetry
 from tensorrt_llm.usage import usage_lib
 from tensorrt_llm.usage.config import UsageContext
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _make_cli(callback=None):
     @click.group(
@@ -67,8 +69,7 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
     usage_lib._REPORTER_LOCK = threading.Lock()
-    usage_lib._REPORTER_STOP = threading.Event()
-    usage_lib._PENDING_TERMINAL = None
+    usage_lib._HEARTBEAT_STOP = threading.Event()
     usage_lib._PROCESS_PID = os.getpid()
 
     payloads = []
@@ -76,12 +77,66 @@ def captured_exit_payloads(monkeypatch, enable_telemetry):
     monkeypatch.setattr(usage_lib, "_is_reporting_rank", lambda: True)
     yield payloads
 
-    usage_lib._REPORTER_STOP.set()
+    usage_lib._HEARTBEAT_STOP.set()
     usage_lib._SESSION = None
     usage_lib._SESSION_DISABLED = False
     usage_lib._REPORTER_STARTED = False
     usage_lib._REPORTER_ACTIVE = False
-    usage_lib._PENDING_TERMINAL = None
+
+
+@pytest.mark.parametrize(
+    "command", ["throughput", "latency", "prepare-dataset", "visual-gen", "invalid"]
+)
+def test_bench_startup_context_command_scope(captured_exit_payloads, command):
+    from tensorrt_llm.bench.benchmark.low_latency import latency_command
+    from tensorrt_llm.bench.benchmark.throughput import throughput_command
+
+    cli = _telemetry.TelemetryGroup(
+        name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
+    )
+    cli.add_command(throughput_command)
+    cli.add_command(latency_command)
+    for name in ("prepare-dataset", "visual-gen"):
+        cli.add_command(click.Command(name))
+    with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(args=[command, "--invalid-option"])
+    assert exc.value.code == 2
+    expected = ["trtllm_exit_report"]
+    if command in ("throughput", "latency"):
+        expected.insert(0, "trtllm_initial_report")
+    assert [event["name"] for event in captured_exit_payloads[0]["events"]] == expected
+    assert collect.called is (command in ("throughput", "latency"))
+
+
+@pytest.mark.parametrize("name", ["throughput", "renamed-benchmark"])
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("option", ["--invalid-option", "--help", "--no-telemetry"])
+def test_startup_command_metadata(captured_exit_payloads, name, startup, option):
+    cli = _telemetry.TelemetryGroup(
+        name="bench", telemetry_usage_context=UsageContext.CLI_BENCH, telemetry_component="llm"
+    )
+
+    @cli.command(name=name, cls=_telemetry.TelemetryCommand, telemetry_llm_startup=startup)
+    @click.option("--telemetry/--no-telemetry", default=True)
+    def command(telemetry):
+        pytest.fail("The command callback must not run before argument validation")
+
+    args = [name, option]
+    if option == "--no-telemetry":
+        args.append("--invalid-option")
+    with patch.object(usage_lib, "bounded_gpu_fields", return_value={}) as collect:
+        with pytest.raises(SystemExit) as exc:
+            cli.main(args=args)
+    assert exc.value.code == (0 if option == "--help" else 2)
+    events = [event["name"] for payload in captured_exit_payloads for event in payload["events"]]
+    expected = []
+    if option == "--invalid-option":
+        expected = ["trtllm_exit_report"]
+        if startup:
+            expected.insert(0, "trtllm_initial_report")
+    assert events == expected
+    assert collect.called is (startup and option == "--invalid-option")
 
 
 @pytest.fixture
@@ -399,6 +454,50 @@ class TestSerializedTerminationKinds:
 
         usage_lib._report_process_exit()
         assert captured_exit_payloads == []
+
+    @pytest.mark.parametrize(
+        "assignment",
+        [
+            "telemetry_config.disabled=false",
+            "unknown_config.enabled=true",
+            "max_batch_size=[",
+        ],
+    )
+    @pytest.mark.parametrize("opt_out_source", [None, "cli", "yaml"])
+    def test_serve_opt_out_precedes_invalid_set(
+        self,
+        tmp_path,
+        captured_exit_payloads,
+        assignment,
+        opt_out_source,
+    ):
+        """Invalid overrides emit an error report unless CLI or YAML opts out."""
+        from tensorrt_llm.commands.serve import main as serve_main
+
+        opt_out_args = ["--no-telemetry"] if opt_out_source == "cli" else []
+        if opt_out_source == "yaml":
+            config_path = tmp_path / "config.yaml"
+            config_path.write_text("telemetry_config:\n  disabled: true\n", encoding="utf-8")
+            opt_out_args = ["--config", str(config_path)]
+        with (
+            patch(
+                "tensorrt_llm.commands.serve.get_is_diffusion_only_model",
+                return_value=False,
+            ),
+            pytest.raises(SystemExit) as raised,
+        ):
+            serve_main(
+                args=["dummy/model", *opt_out_args, "--set", assignment],
+                prog_name="trtllm-serve",
+            )
+
+        assert raised.value.code == 2
+        if opt_out_source is None:
+            params = _captured_terminal_parameters(captured_exit_payloads)
+            assert params["terminationKind"] == "exception"
+            assert params["exitCode"] == 2
+        else:
+            assert captured_exit_payloads == []
 
     @pytest.mark.parametrize(
         ("args", "expected"),

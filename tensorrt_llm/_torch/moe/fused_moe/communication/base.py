@@ -53,6 +53,22 @@ class CheckpointableCommunication(Protocol):
         ...
 
 
+@runtime_checkable
+class CheckpointBlockable(Protocol):
+    """Optional veto on sleep/wakeup, asked once before the engine serves.
+
+    Implementing CheckpointableCommunication is a property of the class;
+    whether a given instance may actually use it can depend on how that
+    instance was configured. Not implementing this protocol means nothing
+    blocks checkpointing.
+    """
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed."""
+        ...
+
+
 class Communication(ABC):
     """
     Abstract base class for MoE communication methods
@@ -79,6 +95,15 @@ class Communication(ABC):
                 f"is not supported on this platform."
             )
         self._is_platform_supported = True
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed.
+
+        Defined here so every strategy answers the question, and only those
+        whose configuration can block checkpointing need to override it.
+        """
+        return None
 
     @staticmethod
     @abstractmethod
@@ -120,6 +145,18 @@ class Communication(ABC):
             False: Dispatch should happen BEFORE quantization
 
         Default: True for most strategies (post-quant is more common)
+        """
+        return True
+
+    def supports_finalize_before_combine(self) -> bool:
+        """Whether ``combine`` is an unweighted row sum over a dense per-token tensor.
+
+        A model-owned finalize that runs before the combine
+        (``ConfigurableMoE.unfinalized_combine_fn``) is only correct when the
+        combine itself reduces the already-finalized partials without applying
+        the routing weights again. A strategy whose combine consumes a
+        different row layout or applies the weights itself answers ``False``,
+        and the incompatibility is rejected at construction.
         """
         return True
 

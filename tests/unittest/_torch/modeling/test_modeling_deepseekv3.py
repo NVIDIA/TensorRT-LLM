@@ -21,18 +21,231 @@ the global one. These tests exercise that resolution on CPU without weights.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
+from tensorrt_llm._torch.locality_domain import policy
+from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models import modeling_deepseekv3, modeling_utils
 from tensorrt_llm._torch.models.modeling_deepseekv3 import Deepseekv3MoE
+from tensorrt_llm._torch.modules import linear
 from tensorrt_llm._torch.moe.fused_moe import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.peft.lora.layer import LoraLayer, LoraModuleType
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-pytestmark = pytest.mark.cpu_only
-
 EXPERTS_KEY = "model.layers.{}.mlp.experts"
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enable_locality_domains", [False, True])
+def test_linear_reassigned_quant_config_guard(enable_locality_domains: bool) -> None:
+    module = linear.Linear(
+        16,
+        16,
+        bias=False,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(),
+        locality_domain_policy=policy.LocalityDomainPolicy(enabled=enable_locality_domains),
+    )
+    weight = module.weight
+    module.quant_config = QuantConfig()
+    if enable_locality_domains:
+        with pytest.raises(RuntimeError, match="quant_config changed"):
+            module.create_weights()
+    else:
+        module.create_weights()
+        assert module.weight is weight
+
+
+@pytest.mark.cpu_only
+def test_layerwise_quant_config_preserves_unquantized_router() -> None:
+    gate = modeling_deepseekv3.DeepseekV3Gate(
+        hidden_size=16,
+        num_experts=4,
+        top_k=2,
+        n_group=2,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+        dtype=torch.bfloat16,
+    )
+    projection = linear.Linear(16, 16, bias=False, skip_create_weights_in_init=True)
+    quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
+    model = torch.nn.Module()
+    model.add_module("gate", gate)
+    model.add_module("projection", projection)
+    model.model_config = SimpleNamespace(
+        quant_config_dict={"gate": quant_config, "projection": quant_config}
+    )
+
+    modeling_utils.apply_layerwise_quant_config(model.model_config, model.named_modules())
+    gate.create_weights()
+
+    assert gate.quant_config is None
+    assert gate.weight.dtype == torch.bfloat16
+    assert projection.quant_config is quant_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("use_cute_dsl_bf16_gemm", [False, True])
+@pytest.mark.parametrize("attach_lora", [False, True])
+@pytest.mark.parametrize("localized_weights", [False, True])
+def test_deepseek_small_m_selects_kernel_for_localized_weights(
+    use_cute_dsl_bf16_gemm: bool,
+    attach_lora: bool,
+    localized_weights: bool,
+) -> None:
+    module = modeling_deepseekv3.DeepseekV3Linear(
+        16,
+        16,
+        bias=False,
+        dtype=torch.bfloat16,
+        use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+        lora=LoraLayer([LoraModuleType.ATTENTION_Q], [16]) if attach_lora else None,
+    )
+    if localized_weights:
+        module._locality_domain_weight_shards = tuple(module.weight.detach().chunk(2))
+        module.weight = torch.nn.Parameter(
+            torch.empty(0, dtype=torch.bfloat16), requires_grad=False
+        )
+    inputs = torch.ones(1, 16, dtype=torch.bfloat16)
+    expected = torch.ones_like(inputs)
+    with (
+        patch.object(modeling_deepseekv3, "get_sm_version", return_value=107),
+        patch.object(modeling_deepseekv3, "is_sm_100f", return_value=True),
+        patch.object(torch.ops.trtllm, "dsv3_fused_a_gemm_op", return_value=expected) as fused,
+        patch.object(linear.Linear, "apply_linear", return_value=expected) as fallback,
+    ):
+        assert module.apply_linear(inputs, None, layer_idx=3) is expected
+    if localized_weights:
+        fallback.assert_called_once_with(inputs, None, None, 3)
+        fused.assert_not_called()
+    else:
+        fused.assert_called_once()
+        fallback.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_tokens", [1, 16])
+@pytest.mark.parametrize("use_cute_dsl_bf16_gemm", [False, True])
+def test_deepseek_small_m_preserves_lora(num_tokens: int, use_cute_dsl_bf16_gemm: bool) -> None:
+    lora_layer = LoraLayer([LoraModuleType.ATTENTION_Q], [16])
+    module = modeling_deepseekv3.DeepseekV3Linear(
+        16,
+        16,
+        dtype=torch.bfloat16,
+        lora=lora_layer,
+        use_cute_dsl_bf16_gemm=use_cute_dsl_bf16_gemm,
+    )
+    module.weight.data.copy_(2 * torch.eye(16, dtype=torch.bfloat16))
+    module.bias.data.fill_(1)
+    inputs = torch.ones(num_tokens, 16, dtype=torch.bfloat16)
+    adapter_output = torch.full_like(inputs, 3)
+    ranks = torch.tensor([1], dtype=torch.int32)
+    weight_pointers = torch.zeros((1, 2), dtype=torch.int64)
+    lora_params = {
+        "num_seqs": 1,
+        "host_request_types": torch.zeros(1, dtype=torch.int32),
+        "prompt_lens_cpu": torch.tensor([num_tokens], dtype=torch.int32),
+        3: {
+            int(LoraModuleType.ATTENTION_Q): {
+                "adapter_size": ranks,
+                "weight_pointers": weight_pointers,
+            }
+        },
+    }
+
+    # Keep Linear.apply_linear and the LoRA merge real. Use CPU implementations
+    # for the fused base GEMM and the native adapter GEMM.
+    with (
+        patch.object(modeling_deepseekv3, "get_sm_version", return_value=107),
+        patch.object(linear, "is_sm_100f", return_value=False),
+        patch.object(
+            torch.ops.trtllm,
+            "dsv3_fused_a_gemm_op",
+            side_effect=lambda x, weight, bias, _: x @ weight + bias,
+        ) as fused,
+        patch.object(
+            torch.ops.trtllm, "lora_grouped_gemm", return_value=adapter_output
+        ) as adapter_gemm,
+    ):
+        output = module.apply_linear(inputs, module.bias, lora_params, layer_idx=3)
+
+    torch.testing.assert_close(output, torch.full_like(inputs, 6))
+    fused.assert_not_called()
+    adapter_gemm.assert_called_once()
+    assert adapter_gemm.call_args.args[2][0] is ranks
+    assert adapter_gemm.call_args.args[3][0] is weight_pointers
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("quant_algo", [None, QuantAlgo.NVFP4], ids=["bf16", "nvfp4"])
+@pytest.mark.parametrize("per_module_quant", [False, True])
+@pytest.mark.parametrize("frozen_config", [False, True])
+def test_shared_experts_do_not_partition_locality_domains(
+    quant_algo, per_module_quant: bool, frozen_config: bool
+) -> None:
+    shared_quant_config = QuantConfig(quant_algo=quant_algo, group_size=16)
+    global_quant_config = (
+        QuantConfig(quant_algo=QuantAlgo.MIXED_PRECISION)
+        if per_module_quant
+        else shared_quant_config
+    )
+    model_policy = policy.LocalityDomainPolicy(enabled=True)
+    model_config = ModelConfig(
+        pretrained_config=SimpleNamespace(n_group=1, topk_group=1, routed_scaling_factor=1.0),
+        quant_config=global_quant_config,
+        quant_config_dict=(
+            {"model.layers.0.mlp.shared_experts": shared_quant_config} if per_module_quant else None
+        ),
+        skip_create_weights_in_init=True,
+        use_cute_dsl_bf16_gemm=True,
+        locality_domain_policy=model_policy,
+    )
+    model_config._frozen = frozen_config
+
+    # Exercise the real GatedMLP/Linear construction and planner on CPU, while
+    # presenting hardware on which both BF16 and NVFP4 can be partitioned.
+    with (
+        patch(
+            "tensorrt_llm._torch.locality_domain_utils.is_locality_domain_enabled",
+            return_value=True,
+        ),
+        patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_AVAILABLE", True),
+        patch("tensorrt_llm._torch.cute_dsl_utils.IS_CUTLASS_DSL_RUBIN_AVAILABLE", True),
+        patch.object(
+            modeling_deepseekv3, "create_moe", return_value=torch.nn.Module()
+        ) as create_moe,
+        patch.object(torch.cuda, "is_available", return_value=False),
+        patch.object(torch.cuda, "Event"),
+    ):
+        module = Deepseekv3MoE(
+            num_experts=4,
+            top_k=2,
+            hidden_size=256,
+            intermediate_size=256,
+            shared_expert_intermediate_size=256,
+            aux_stream_dict={modeling_deepseekv3.AuxStreamType.MoeShared: None},
+            dtype=torch.bfloat16,
+            model_config=model_config,
+            layer_idx=0,
+        )
+        for projection in (module.shared_experts.gate_up_proj, module.shared_experts.down_proj):
+            projection.create_weights()
+            assert projection.quant_config is shared_quant_config
+            assert not projection.partition_plan.enabled
+            assert projection._locality_domain_runtime is None
+
+    assert module.shared_experts_use_fp4 == (quant_algo == QuantAlgo.NVFP4)
+    assert create_moe.call_args.kwargs["model_config"] is model_config
+    assert model_config.quant_config is global_quant_config
+    assert model_config.locality_domain_policy is model_policy
+    assert model_config.extra_attrs["locality_domain_policy"] is model_policy
+    assert model_config.locality_domain_policy.enabled
+    assert model_config._frozen == frozen_config
 
 
 @pytest.fixture
@@ -45,12 +258,14 @@ def w4a8_awq_config():
     return QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ, group_size=128)
 
 
+@pytest.mark.cpu_only
 def test_w4a8_awq_config_is_int4_weight_only_per_group(w4a8_awq_config):
     # This predicate is what selects MoEWeightLoadingMode.W4A8_CUSTOM for the
     # experts in Deepseekv3MoE, so pin it down explicitly.
     assert w4a8_awq_config.layer_quant_mode.is_int4_weight_only_per_group()
 
 
+@pytest.mark.cpu_only
 def test_experts_quant_config_resolved_from_per_module_dict(
     mixed_precision_config, w4a8_awq_config
 ):
@@ -67,6 +282,7 @@ def test_experts_quant_config_resolved_from_per_module_dict(
     assert not mixed_precision_config.layer_quant_mode.is_int4_weight_only_per_group()
 
 
+@pytest.mark.cpu_only
 def test_experts_quant_config_falls_back_to_global_for_unlisted_layer(
     mixed_precision_config, w4a8_awq_config
 ):
@@ -78,12 +294,14 @@ def test_experts_quant_config_falls_back_to_global_for_unlisted_layer(
     assert Deepseekv3MoE._get_experts_quant_config(model_config, 1) is mixed_precision_config
 
 
+@pytest.mark.cpu_only
 def test_experts_quant_config_falls_back_to_global_without_dict(mixed_precision_config):
     model_config = SimpleNamespace(quant_config=mixed_precision_config, quant_config_dict=None)
 
     assert Deepseekv3MoE._get_experts_quant_config(model_config, 0) is mixed_precision_config
 
 
+@pytest.mark.cpu_only
 def test_expert_weight_loading_mode_w4a8_custom_for_w4a8_awq(w4a8_awq_config):
     # The resolved W4A8_AWQ expert config selects the custom loading mode; this
     # is the assignment the MoE construction makes from the resolved config.
@@ -93,6 +311,7 @@ def test_expert_weight_loading_mode_w4a8_custom_for_w4a8_awq(w4a8_awq_config):
     )
 
 
+@pytest.mark.cpu_only
 def test_expert_weight_loading_mode_vanilla_for_non_int4(mixed_precision_config):
     # Neither the ambiguous MIXED_PRECISION global nor a plain FP8 config is
     # int4-weight-per-group, so both fall to VANILLA.
@@ -106,6 +325,7 @@ def test_expert_weight_loading_mode_vanilla_for_non_int4(mixed_precision_config)
     )
 
 
+@pytest.mark.cpu_only
 def test_expert_weight_loading_mode_none_is_vanilla():
     # override_quant_config is Optional, so the resolved expert config is None on
     # an unquantized layer; the mode selection must not dereference it.
@@ -118,6 +338,7 @@ def _bare_configurable_moe(override_quant_config):
     return moe
 
 
+@pytest.mark.cpu_only
 def test_quant_config_dict_prefers_override_over_mixed_precision_global(
     mixed_precision_config, w4a8_awq_config
 ):
@@ -136,6 +357,7 @@ def test_quant_config_dict_prefers_override_over_mixed_precision_global(
     assert not mixed_precision_config.layer_quant_mode.is_int4_weight_only_per_group()
 
 
+@pytest.mark.cpu_only
 def test_quant_config_dict_falls_back_to_global_without_override():
     fp8_config = QuantConfig(quant_algo=QuantAlgo.FP8)
     moe = _bare_configurable_moe(None)
@@ -151,8 +373,170 @@ def test_quant_config_dict_falls_back_to_global_without_override():
     }
 
 
+@pytest.mark.cpu_only
 def test_quant_config_dict_is_none_when_unquantized():
     moe = _bare_configurable_moe(None)
     model_config = SimpleNamespace(quant_config=None)
 
     assert ConfigurableMoE._get_quant_config_dict(moe, model_config) is None
+
+
+@torch.inference_mode()
+def test_glm_moe_dsa_context_forward():
+    from contextlib import contextmanager
+
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.models.modeling_deepseekv3 import (
+        DeepseekV32Attention,
+        GlmMoeDsaForCausalLM,
+    )
+    from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm._utils import torch_dtype_to_binding
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+
+    # Keep the reference MLA geometry: context and latent head sizes must differ.
+    config = PretrainedConfig(
+        architectures=["GlmMoeDsaForCausalLM"],
+        model_type="glm_moe_dsa",
+        vocab_size=64,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        max_position_embeddings=64,
+        rope_theta=10000.0,
+        rope_scaling=None,
+        rms_norm_eps=1e-6,
+        hidden_act="silu",
+        moe_intermediate_size=128,
+        n_routed_experts=None,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        first_k_dense_replace=1,
+        moe_layer_freq=1,
+        tie_word_embeddings=False,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=None,
+        torch_dtype=torch.bfloat16,
+    )
+    model_config = ModelConfig(
+        pretrained_config=config, attn_backend="TRTLLM", max_num_tokens=32, max_seq_len=64
+    )
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.manual_seed(17)
+        model_class = get_registered_model_class("GlmMoeDsaForCausalLM")
+        assert model_class is GlmMoeDsaForCausalLM
+        model = model_class(model_config).cuda().eval()
+        assert type(model) is GlmMoeDsaForCausalLM
+        assert config.model_type == "deepseek_v32"
+        assert len(model.model.layers) == 1
+        layer = model.model.layers[0]
+        assert type(layer.self_attn) is DeepseekV32Attention
+        for parameter in model.parameters():
+            if parameter.ndim == 1:
+                parameter.fill_(1)
+            else:
+                parameter.normal_(mean=0.0, std=0.05)
+        model.setup_aliases()
+        assert layer.next_layer_layernorm is model.model.norm
+        # Use real eager MLA without executor-owned custom-op lookup state.
+        layer.self_attn.register_to_config = False
+
+        @contextmanager
+        def fresh_metadata(length):
+            # Native MLA requires cache pool mappings even for uncached prompts.
+            cache_manager = KVCacheManager(
+                KvCacheConfig(max_tokens=64, enable_block_reuse=False),
+                CacheType.SELFKONLY,
+                num_layers=config.num_hidden_layers,
+                num_kv_heads=1,
+                head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
+                tokens_per_block=64,
+                max_seq_len=64,
+                max_batch_size=1,
+                mapping=model_config.mapping,
+                dtype=torch_dtype_to_binding(config.torch_dtype),
+            )
+            requests = None
+            try:
+                requests = cache_manager.add_dummy_requests([0], [length])
+                assert requests is not None and len(requests) == 1
+                metadata = get_attention_backend("TRTLLM").Metadata(
+                    max_num_requests=1,
+                    max_num_tokens=32,
+                    mapping=model_config.mapping,
+                    kv_cache_manager=cache_manager,
+                    kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0]),
+                    request_ids=[0],
+                    prompt_lens=[length],
+                    seq_lens=torch.tensor([length], dtype=torch.int32),
+                    num_contexts=1,
+                    kv_layout="HND",
+                )
+                metadata.prepare()
+                yield metadata
+            finally:
+                torch.cuda.synchronize()
+                for request in requests or []:
+                    cache_manager.free_resources(request)
+                cache_manager.shutdown()
+
+        input_ids = torch.arange(32, device="cuda", dtype=torch.long)
+        position_ids = torch.arange(32, device="cuda").unsqueeze(0)
+        embeddings = model.model.embed_tokens(input_ids).clone()
+        with fresh_metadata(32) as metadata:
+            logits = model(
+                attn_metadata=metadata,
+                input_ids=input_ids.clone(),
+                position_ids=position_ids.clone(),
+                return_context_logits=True,
+            ).clone()
+        assert logits.shape == (32, config.vocab_size)
+        assert logits.is_cuda and logits.dtype == torch.float32
+        assert torch.isfinite(logits).all()
+
+        with fresh_metadata(24) as metadata:
+            prefix_logits = model(
+                attn_metadata=metadata,
+                input_ids=input_ids[:24].clone(),
+                position_ids=position_ids[:, :24].clone(),
+                return_context_logits=True,
+            ).clone()
+        torch.testing.assert_close(
+            logits[:24],
+            prefix_logits,
+            rtol=2e-2,
+            atol=2e-3,
+        )
+
+        changed_ids = input_ids.clone()
+        changed_ids[0] = 33
+        with fresh_metadata(32) as metadata:
+            changed_logits = model(
+                attn_metadata=metadata,
+                input_ids=changed_ids,
+                position_ids=position_ids.clone(),
+                return_context_logits=True,
+            ).clone()
+        assert torch.isfinite(changed_logits).all()
+        assert (logits[-1] - changed_logits[-1]).abs().max() > 1e-4
+
+        normalized = embeddings.float()
+        normalized = normalized * torch.rsqrt(
+            normalized.square().mean(dim=-1, keepdim=True) + config.rms_norm_eps
+        )
+        normalized = normalized.to(embeddings.dtype) * model.model.norm.weight
+        bypass_logits = torch.nn.functional.linear(normalized, model.lm_head.weight)
+        assert not torch.allclose(logits, bypass_logits.float(), rtol=2e-2, atol=2e-3)

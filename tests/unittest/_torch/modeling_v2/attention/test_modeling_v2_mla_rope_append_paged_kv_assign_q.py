@@ -3,7 +3,7 @@
 """GPU test for the mla_rope_append_paged_kv_assign_q catalog entry.
 
 The op reads paged-KV-cache addressing tensors and cumulative-length
-tensors that the runtime normally derives from a KVCacheManager and a
+tensors that the runtime normally derives from a KVCacheManagerV2 and a
 TrtllmAttentionMetadata prepared with enable_context_mla_with_cached_kv=True.
 The test builds that state for real, pre-writes known cached-prefix rows
 into the paged pool, then checks the three kernel effects against a torch
@@ -32,21 +32,31 @@ Two surfaces:
    generation sequences must be ignored.
 """
 
+import zlib
 from typing import List, NamedTuple, Optional, Sequence, Union
 
+import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (
-    mla_rope_append_paged_kv_assign_q,
+    MlaRopeAppendPagedKvAssignQ,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.mla_rope_append_paged_kv_assign_q import (  # noqa: E501
+    mla_rope_append_paged_kv_assign_q as op,
 )
 from tensorrt_llm._torch.attention.backends.interface import RopeParams
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
+
+__extra_import_path__ = [".."]
+from _cells import certified_cells  # noqa: E402 — needs the path declared above
+from _validating import validating  # noqa: E402 — needs the path declared above
 
 assert torch.cuda.is_available(), "mla_rope_append_paged_kv_assign_q requires a CUDA device"
 
@@ -79,7 +89,12 @@ QUANT_MODE_INT8_KV_CACHE = 64  # QuantMode.INT8_KV_CACHE — rejected, see below
 # ever been approached. That both halves still discriminate is measured, not
 # assumed — test_fp8_kv_explicit_unit_scale runs four wrong mirrors of the same
 # bytes and asserts each blows the gate it is able to blow.
+# Half an e4m3 ulp: e4m3 carries 3 explicit mantissa bits, so a round-to-nearest
+# lands within 2**-3 relative.
 E4M3_ULP_RTOL = 2**-3
+# How much of the appended output may miss bit-exactness before the gate calls it
+# drift rather than rounding. See `_compare` for why this is not zero and why it
+# has never been approached.
 E4M3_MAX_INEXACT_FRACTION = 1e-3
 
 # The roped q must come back as an ordinary bf16 rotation, NOT quantized: this
@@ -95,6 +110,30 @@ _TRTLLM_TO_TORCH_DTYPE = {
     DataType.BF16: torch.bfloat16,
     DataType.HALF: torch.float16,
 }
+
+
+def _compare(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """Half an e4m3 ulp, *and* a floor on how much may miss bit-exactness.
+
+    The rotation is where kernel and reference can disagree: both evaluate
+    `x*cos -+ y*sin`, and they may do it in different orders. e4m3's coarse
+    rounding absorbs that completely in practice -- every appended byte
+    measured on this architecture, across every scale and every cell, came
+    back bit-exact, so neither half of this gate has ever been approached.
+
+    Both halves are kept anyway, and both are measured rather than assumed:
+    the test runs four deliberately wrong mirrors of the same bytes and
+    asserts each blows the half it is able to blow. A tolerance alone would
+    pass a mirror that is uniformly a little wrong; a bit-exact demand alone
+    would fail the first time a reordering did survive the rounding.
+    """
+    assert out.shape == ref.shape, (out.shape, ref.shape)
+    torch.testing.assert_close(out.float(), ref.float(), rtol=E4M3_ULP_RTOL, atol=0.0)
+    inexact = int((out.reshape(-1).view(torch.uint8) != ref.reshape(-1).view(torch.uint8)).sum())
+    allowed = max(1, int(E4M3_MAX_INEXACT_FRACTION * out.numel()))
+    assert inexact <= allowed, (
+        f"not bit-exact enough: {inexact}/{out.numel()} bytes differ (allowed {allowed})"
+    )
 
 
 class _MlaCtxEnv:
@@ -123,7 +162,7 @@ class _MlaCtxEnv:
         self.fp8_pool = fp8_pool
         self.pool_dtype = torch.float8_e4m3fn if fp8_pool else self.torch_dtype
         self.quant_mode = QUANT_MODE_FP8_KV_CACHE if fp8_pool else 0
-        self.kv_cache_manager = KVCacheManager(
+        self.kv_cache_manager = KVCacheManagerV2(
             KvCacheConfig(max_tokens=131072, enable_block_reuse=False),
             CacheType.SELFKONLY,  # MLA latent cache: kv_factor=1, one kv head
             num_layers=num_layers,
@@ -277,14 +316,12 @@ def _inexact_bytes(got: torch.Tensor, want: torch.Tensor) -> int:
 
 
 def _assert_e4m3_roped(got: torch.Tensor, want: torch.Tensor, what: str) -> None:
-    """One-e4m3-ulp gate plus a bit-exact-fraction floor, for the part of the
-    fp8 output that passes through the in-kernel RoPE."""
-    torch.testing.assert_close(got.float(), want.float(), rtol=E4M3_ULP_RTOL, atol=0.0)
-    inexact = _inexact_bytes(got, want)
-    allowed = max(1, int(E4M3_MAX_INEXACT_FRACTION * got.numel()))
-    assert inexact <= allowed, (
-        f"{what} not bit-exact enough: {inexact}/{got.numel()} bytes differ (allowed {allowed})"
-    )
+    """Delegates to the entry: the gate and its derivation are the entry's
+    claim. `what` only labels the failure."""
+    try:
+        _compare(got, want)
+    except AssertionError as exc:
+        raise AssertionError(f"{what}: {exc}") from exc
 
 
 def _fails_e4m3_tolerance(got: torch.Tensor, mirror: torch.Tensor) -> bool:
@@ -352,7 +389,7 @@ def _run_and_check(
     pool = env.pool_tensor(layer_idx)
     pool_before = pool.clone()
 
-    mla_rope_append_paged_kv_assign_q(
+    op(
         q,
         latent_cache,
         num_contexts,
@@ -501,6 +538,42 @@ def _run_and_check(
     )
 
 
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_kimi_k3_bf16_page64_identity_rope() -> None:
+    """Kimi K3's context call: bf16 latent pool (quant_mode=0, no scale), page
+    64, the per-rank head counts 6 / 12 / 24 / 96 (TP16 / TP8 / TP4 / one
+    rank), and its NoPE rope table -- every (cos, sin) pair (1, 0), which Kimi
+    K3's MLA writes over the backend's table, so the in-kernel "rotation" is a
+    copy. q's rope slices, latent_cache and the appended rows come back bit
+    for bit. Cached prefixes put the first new token on a fresh page, on a
+    page boundary, mid-page and at position 1000; a trailing generation
+    sequence must be ignored."""
+    torch.manual_seed(26)
+    for heads in (6, 12, 24, 96):
+        env = _MlaCtxEnv(
+            cache_dtype=DataType.BF16, tokens_per_block=TOKENS_PER_BLOCK, num_heads=heads
+        )
+        try:
+            table = env.rotary_cos_sin.reshape(-1)
+            table[0::2] = 1.0
+            table[1::2] = 0.0
+            cached = [0, 64, 100, 1000, 33]
+            new = [37, 64, 300, 1, 1]
+            rids = [0, 1, 2, 3, 4]
+            env.kv_cache_manager.add_dummy_requests(
+                rids, token_nums=[c + n for c, n in zip(cached, new)]
+            )
+            run = _run_and_check(
+                env, request_ids=rids, seq_lens=new, num_contexts=4, cached_lens=cached
+            )
+            _assert_bytes_equal(run.latent_cache, run.latent_orig, f"latent_cache (H={heads})")
+            _assert_bytes_equal(run.rows, run.latent_orig, f"appended rows (H={heads})")
+        finally:
+            env.shutdown()
+
+
 def _fp8_env(max_batch_size: int = 8, orig_quant: Optional[float] = None) -> _MlaCtxEnv:
     """DeepSeek-R1-0528 cell over an fp8-e4m3 latent pool: H = 128, page 32,
     bf16 activations, single-layer pool."""
@@ -511,6 +584,59 @@ def _fp8_env(max_batch_size: int = 8, orig_quant: Optional[float] = None) -> _Ml
         fp8_pool=True,
         orig_quant=orig_quant,
     )
+
+
+# The shapes each shipped target calls this entry with, by target directory
+# under `models/`. The entry's own `CELLS` are the op's whoever calls it.
+TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
+    "deepseek_v3/r1_0528_nvfp4__sm_10x__default": (
+        Cell(
+            why="deepseek default at attention TP8: 16 heads per rank, production context",
+            spec=dict(
+                cached=[0, 32, 100],
+                new=[37, 64, 300],
+                tokens_per_block=32,
+                **dict(MlaRopeAppendPagedKvAssignQ.R1, head_num=16),
+            ),
+        ),
+    ),
+}
+
+CELLS = certified_cells(op, TARGET_CELLS)
+
+
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
+def test_certified_cells(cell) -> None:
+    """Every configuration the entry claims, through the same driver the
+    hand-written cases use.
+
+    Parametrized off the entry, so a cell added there is a case here. Without
+    this the cell list would be a claim nothing executes, which is worse than
+    no claim at all -- it reads as coverage.
+    """
+    spec = cell.spec
+    torch.manual_seed(zlib.crc32(cell.why.encode()) % 2**31)
+    env = _MlaCtxEnv(
+        max_batch_size=8,
+        tokens_per_block=spec["tokens_per_block"],
+        num_heads=spec["head_num"],
+        fp8_pool=True,
+    )
+    try:
+        rids = list(range(len(spec["new"])))
+        env.kv_cache_manager.add_dummy_requests(
+            rids, token_nums=[c + n for c, n in zip(spec["cached"], spec["new"])]
+        )
+        with validating(op):
+            _run_and_check(
+                env,
+                request_ids=rids,
+                seq_lens=spec["new"],
+                num_contexts=len(rids),
+                cached_lens=spec["cached"],
+            )
+    finally:
+        env.shutdown()
 
 
 def test_fp8_kv_production_config() -> None:
@@ -751,7 +877,7 @@ def test_fp8_kv_rejects_int8_kv_cache_quant_mode() -> None:
         assert pool_pointers is not None and pool_mapping is not None
         raised = ""
         try:
-            mla_rope_append_paged_kv_assign_q(
+            op(
                 q,
                 latent_cache,
                 1,

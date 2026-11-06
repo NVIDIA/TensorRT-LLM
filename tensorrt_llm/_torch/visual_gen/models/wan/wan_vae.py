@@ -475,7 +475,7 @@ def _fp4_imports() -> tuple[Any, ...]:
     import cutlass.torch as cutlass_torch
     from cutlass.cute.runtime import from_dlpack
 
-    from tensorrt_llm._torch.cute_dsl_kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop import (
+    from tensorrt_llm._torch.visual_gen.kernels.blackwell.conv.dense_blockscaled_implicit_gemm_fprop import (
         compile_conv,
         compute_zpq,
         cvt_sf_MKL_to_M32x4xrm_K4xrk_L,

@@ -1,4 +1,20 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
+import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import List, Optional, Union
@@ -7,6 +23,8 @@ import numpy as np
 import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.kv_hints import KvHintsInput
+from tensorrt_llm.kv_hints.protocol import snapshot_kv_hints
 
 from ..conversation_params import ConversationParams
 from ..disaggregated_params import DisaggregatedParams
@@ -64,7 +82,7 @@ class LoRARequest:
 @dataclass(slots=True)
 class PromptAdapterRequest:
     """
-    Request for a Prompt adapter.
+    Deprecated compatibility container for unsupported prompt adapters.
     """
     prompt_adapter_name: str
     prompt_adapter_id: int
@@ -113,11 +131,32 @@ class GenerationRequest:
         encoder_input_token_ids: Optional[Union[torch.Tensor, np.ndarray,
                                                 list]] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ):
+        if prompt_adapter_request is not None:
+            warnings.warn(
+                "prompt_adapter_request is deprecated and will be removed in a future release. "
+                "Prompt adapters are unsupported; omit this argument or pass None.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
         elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
-            self.prompt_token_ids = prompt_token_ids.tolist()
+            if prompt_token_ids.ndim == 1:
+                # A flat array goes straight into the int32 wire buffer that
+                # __setstate__ also produces, so neither this process nor the
+                # pickle path builds one Python int per token; the list is
+                # materialized lazily by the `prompt_token_ids` property.
+                if isinstance(prompt_token_ids, torch.Tensor):
+                    prompt_token_ids = prompt_token_ids.cpu().numpy()
+                self._prompt_token_ids = None
+                # Always a copy: the caller may reuse or mutate its array.
+                self._prompt_token_ids_i32 = np.array(prompt_token_ids,
+                                                      dtype=np.int32,
+                                                      order="C")
+            else:
+                self.prompt_token_ids = prompt_token_ids.tolist()
         else:
             raise TypeError(
                 f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
@@ -137,6 +176,7 @@ class GenerationRequest:
         self.trace_headers = trace_headers
         self.scheduling_params = scheduling_params
         self.conversation_params = conversation_params
+        self.kv_hints = snapshot_kv_hints(kv_hints)
         if cache_salt is not None:
             if not isinstance(cache_salt, str):
                 raise TypeError(
@@ -213,6 +253,9 @@ class GenerationRequest:
     @prompt_token_ids.setter
     def prompt_token_ids(self, value):
         self._prompt_token_ids = value
+        # base_worker hands the int32 buffer to the engine when it exists, so a
+        # replaced prompt must not leave the old tokens behind in it.
+        self._prompt_token_ids_i32 = None
 
     @staticmethod
     def _enc_tokens(v):
@@ -235,6 +278,7 @@ class GenerationRequest:
         return state
 
     def __setstate__(self, state):
+        state.setdefault("kv_hints", None)
         buf = None
         pt = state.get("_prompt_token_ids")
         if type(pt) is tuple and len(

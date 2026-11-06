@@ -70,13 +70,16 @@ What differs from the stock HF loader (why a bespoke mapper is required):
 """
 
 import re
-from typing import Optional
+from typing import Iterator, Optional
 
 import torch
 from torch import nn
 
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import Qwen2MoeHfWeightMapper
-from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm._torch.models.modeling_utils import (
+    concatenate_weights_by_tp_rank,
+    register_mapper,
+)
 from tensorrt_llm._torch.modules.qwen4_exp.ple import Qwen4ExpPinnedHostEmbedding
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
@@ -87,36 +90,6 @@ _LM_PREFIX = "model.language_model."
 # The vision tower is loaded by the composite wrapper.
 _SKIP_PREFIXES = ("model.visual.",)
 _PER_EXPERT_PROJECTION_PATTERN = re.compile(r"^\d+\.(?:gate_proj|up_proj|down_proj)\.")
-
-
-def _rank_block(components: list[torch.Tensor], tp_size: int) -> torch.Tensor:
-    """Concat `components` (each `[out_i, ...]`) into the per-rank column-
-    parallel row order a contiguous `TensorParallelMode.COLUMN` split recovers.
-
-    At `tp_size == 1` this is a plain `[c0 | c1 | ...]` concat. At
-    `tp_size > 1` each component is split across ranks and the rank-`r` slices
-    are grouped together (`[c0_r0 c1_r0 ... | c0_r1 c1_r1 ... | ...]`), so a
-    later contiguous per-rank row split hands each rank its own head slice of
-    every component.
-    """
-    if not components:
-        raise ValueError("rank blocking requires at least one projection")
-    if tp_size <= 0:
-        raise ValueError(f"tp_size must be positive, got {tp_size}")
-    trailing_shape = components[0].shape[1:]
-    for component in components:
-        if component.ndim == 0 or component.shape[1:] != trailing_shape:
-            raise ValueError("rank-blocked projections must have matching trailing dimensions")
-        if component.shape[0] % tp_size:
-            raise ValueError(
-                f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
-            )
-    if tp_size == 1:
-        return torch.cat(components, dim=0)
-    rows: list[torch.Tensor] = []
-    for rank in range(tp_size):
-        rows.extend(split(c, tp_size, rank) for c in components)
-    return torch.cat(rows, dim=0)
 
 
 def _normalize_moe_module_weights(
@@ -232,6 +205,17 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
             module, module_name, module_weights, allow_partial_loading=allow_partial_loading
         )
 
+    def _runtime_named_modules(self) -> Iterator[tuple[str, nn.Module]]:
+        """Expose draft modules using the checkpoint's appended layer indices."""
+        for name, module in self.model.named_modules():
+            if name.startswith("mtp_layers."):
+                _, layer_idx, *suffix = name.split(".")
+                checkpoint_layer_idx = self.config.pretrained_config.num_hidden_layers + int(
+                    layer_idx
+                )
+                name = ".".join([f"model.layers.{checkpoint_layer_idx}", *suffix])
+            yield name, module
+
     def preprocess_weights(self, weights: dict, allow_partial_loading: bool = False) -> dict:
         config = self.config.pretrained_config
         tp_size = 1 if self.config.mapping.enable_attention_dp else self.config.mapping.tp_size
@@ -250,7 +234,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         if self.config.mapping.has_pp():
             owned_layer_ids = set()
             layer_prefix = "model.layers."
-            for module_name, module in self.model.named_modules():
+            for module_name, module in self._runtime_named_modules():
                 if not module_name.startswith(layer_prefix):
                     continue
                 suffix = module_name[len(layer_prefix) :]
@@ -363,7 +347,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                         f"{key} convolution width is {w.shape[1]}, expected {conv_kernel}"
                     )
                 conv_q, conv_k, conv_v = torch.split(w, [key_dim, key_dim, value_dim], dim=0)
-                new_weights[key] = _rank_block([conv_q, conv_k, conv_v], tp_size)
+                new_weights[key] = concatenate_weights_by_tp_rank([conv_q, conv_k, conv_v], tp_size)
             else:
                 new_weights[key] = tensor
 
@@ -376,7 +360,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                 )
             # Split the pre-fused in_proj_qkv [Q|K|V] into its Q/K/V sub-tensors
             # BEFORE rank-blocking. Passing the concatenated [Q|K|V] as one
-            # component makes _rank_block cut it at contiguous (key+key+value)/tp
+            # component cuts it at contiguous (key+key+value)/tp
             # boundaries, which scrambles Q/K/V across ranks at tp>1 (rank r would
             # get [Q[..], K[..]] instead of [Q_r|K_r|V_r]) -> garbage GDN output.
             # Each of Q, K, V, and Z is sharded independently. Mirror the
@@ -402,8 +386,8 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
                         f"{tuple(parts[projection].shape)}, expected {expected_ba_shape}"
                     )
             q_t, k_t, v_t = torch.split(qkv_t, [key_dim, key_dim, value_dim], dim=0)
-            qkvz = _rank_block([q_t, k_t, v_t, parts["z"][:]], tp_size)
-            ba = _rank_block([parts["b"][:], parts["a"][:]], tp_size)
+            qkvz = concatenate_weights_by_tp_rank([q_t, k_t, v_t, parts["z"][:]], tp_size)
+            ba = concatenate_weights_by_tp_rank([parts["b"][:], parts["a"][:]], tp_size)
             expected_qkvz_rows = 2 * key_dim + 2 * value_dim
             if qkvz.shape[0] != expected_qkvz_rows:
                 raise ValueError(
@@ -422,15 +406,15 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         # Pack each layer's HC down and injection projections into a single
         # aligned GEMM. Final mix-only heads have no injection projection and
         # keep the original `input_mix_weight_down` parameter.
+        runtime_modules = dict(self._runtime_named_modules()) if hc_down_inject else {}
         for prefix, parts in hc_down_inject.items():
             down = parts.get("down")
             inject = parts.get("inject")
-            try:
-                target = self.model.get_submodule(prefix)
-            except (AttributeError, KeyError) as error:
+            target = runtime_modules.get(prefix)
+            if target is None:
                 raise ValueError(
                     f"No runtime Hyper-Connection module for checkpoint prefix {prefix!r}"
-                ) from error
+                )
             packed_projection = getattr(target, "input_mix_weight_down_block_inject", None)
             direct_projection = getattr(target, "input_mix_weight_down", None)
             if packed_projection is None:
@@ -508,7 +492,7 @@ class Qwen4ExpHfWeightMapper(Qwen2MoeHfWeightMapper):
         is `model.layers.<L>.ple.ple_embedding`.
         """
         target_name = ple_prefix + ".ple_embedding"
-        for name, module in self.model.named_modules():
+        for name, module in self._runtime_named_modules():
             if name == target_name:
                 return module
         return None

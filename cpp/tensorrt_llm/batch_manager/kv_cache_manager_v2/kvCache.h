@@ -23,10 +23,14 @@
 #include "kv_cache_manager_v2/movingAverage.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/pendingStats.h"
+#include "kv_cache_manager_v2/sparseCache.h"
+#include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/utils/cudaEvent.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/executor/executor.h"
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -37,10 +41,11 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 // Forward declarations.
+class Batch;
+
 class KvCacheIntrospection;
 class KvCacheManager;
 class StorageManager;
-struct ScratchDesc;
 
 // ---------------------------------------------------------------------------
 // BlockPage — what a SeqBlock holds per (beamIndex, lifeCycleId):
@@ -69,6 +74,84 @@ inline SharedPtr<Page> const& blockPageGetPage(BlockPage const& bp) noexcept
 }
 
 // ---------------------------------------------------------------------------
+// ScratchSlots — one life cycle's scratch slot locks, and their page-index mirror.
+//
+// The mirror is positional: entry `i` holds the page index of the `i`th lock, which is
+// what the conversion kernel reads when a block falls inside the scratch range. Every
+// length change goes through this class, so the two stay in step.
+//
+// Entries past the live count read kBadPageIndex; zero would name slot zero.
+// ---------------------------------------------------------------------------
+class ScratchSlots
+{
+public:
+    template <typename... Args>
+    void emplaceBack(Args&&... args)
+    {
+        mSlots.emplace_back(std::forward<Args>(args)...);
+        _mirrorBack();
+    }
+
+    [[nodiscard]] ScratchSlotLock popBack();
+
+    //! Unlock every slot, drop them, and return the mirror to the sentinel, so it names no
+    //! page that has gone back to the pool.
+    void unlockAndClear();
+
+    void reserve(size_t n)
+    {
+        mSlots.reserve(n);
+    }
+
+    //! Mirror into `buf` instead of the internal vector, seeding it from the live slots.
+    //! A null `buf` reverts to the internal vector, carrying the current contents back.
+    void setBuf(int32_t* buf, int len);
+
+    //! Page indices of the live slots, in order.
+    [[nodiscard]] Span<int const> indices() const;
+
+    [[nodiscard]] size_t size() const noexcept
+    {
+        return mSlots.size();
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return mSlots.empty();
+    }
+
+    [[nodiscard]] ScratchSlotLock const& back() const
+    {
+        return mSlots.back();
+    }
+
+    [[nodiscard]] ScratchSlotLock const& operator[](size_t i) const
+    {
+        return mSlots[i];
+    }
+
+    [[nodiscard]] auto begin() const noexcept
+    {
+        return mSlots.begin();
+    }
+
+    [[nodiscard]] auto end() const noexcept
+    {
+        return mSlots.end();
+    }
+
+private:
+    void _mirrorBack();
+    //! Fill [from, to) of the mirror with the sentinel; unset `to` means its end.
+    void _mirrorSentinel(size_t from, std::optional<size_t> to = std::nullopt);
+
+    std::vector<ScratchSlotLock> mSlots;
+    //! Owned when the vector, borrowed when the span; the span's length is the Batch's
+    //! per-row stride, so it holds sentinel past `mSlots.size()`.
+    std::variant<std::vector<int32_t>, Span<int32_t>> mIndices;
+};
+
+// ---------------------------------------------------------------------------
 // SeqBlock — one block-slot in a KvCache sequence.
 // pages[beamIdx][lcId] tracks who holds/locks each page.
 // treeBlock: non-null only for committed blocks (strong ref in rare cases).
@@ -86,7 +169,8 @@ struct SeqBlock
         bool ret = treeBlock != nullptr;
         if (TLLM_UNLIKELY(gDebug))
         {
-            // When committed: must have 1 beam, all non-null pages must be CommittedPage.
+            // Committed blocks have one canonical beam; publication concerns reusable pages.
+            // Request-private state stays uncommitted.
             if (ret)
             {
                 TLLM_CHECK(pages.size() == BeamIndex{1});
@@ -95,7 +179,7 @@ struct SeqBlock
                         if (!blockPageIsNull(bp))
                         {
                             auto pg = blockPageGetPage(bp);
-                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg));
+                            TLLM_CHECK(!pg || dynamicPointerCast<CommittedPage>(pg) || pg->isPrivate());
                         }
             }
             else
@@ -151,6 +235,25 @@ private:
     std::optional<std::vector<WeakPtr<CommittedPage>>> mPageRefs;
 };
 
+// Availability at the claimed prefix, indexed by LayerGroupId. OPTIONAL
+// candidates are held until the first successful resume or close.
+// Describes the initial prefix claim, not subsequent request progress.
+struct ReuseGroupStatus
+{
+    // Lifecycle group returned by getLayerGroupId(layerId), not a physical pool index.
+    LayerGroupId groupId;
+    // REQUIRED constrains the prefix match; OPTIONAL is selected at resume; PRIVATE is never reused.
+    ReusePolicy policy;
+    // Exclusive token endpoint of the prefix claimed by REQUIRED groups, shared by all groups.
+    int endpoint;
+    // All state needed by this group at endpoint is available; does not imply GPU residency or selection.
+    // False for an empty prefix, PRIVATE groups, or missing/discarded OPTIONAL candidates.
+    bool complete;
+    // Retained token ranges [begin, end), including block-rounded SWA windows and sinks.
+    // SSM uses (endpoint, endpoint) for its exact state; empty when complete is false.
+    std::vector<std::pair<int, int>> coverage;
+};
+
 // ---------------------------------------------------------------------------
 // KvCache — manages the per-sequence KV cache state.
 // Mirrors Python's _KVCache.
@@ -176,7 +279,8 @@ public:
 
     KvCache(KvCacheManager& manager, ReuseScope reuseScope, std::optional<BlockRadixTree::ReuseMatch> reuseMatch,
         std::optional<RequestIdType> id, PriorityCb priorityCb, std::optional<int> expectedPromptLength = std::nullopt,
-        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false);
+        std::optional<bool> textOnly = std::nullopt, bool enableRequestStats = false,
+        std::optional<executor::KvCacheRetentionConfig> retentionConfig = std::nullopt, bool isPrefetch = false);
 
     ~KvCache();
 
@@ -185,12 +289,23 @@ public:
 
     // ---- State machine -----------------------------------------------------
 
-    // Resume: check utilization and lock all pages to GPU.
+    // Resume: check utilization and lock active pages at their required storage levels.
     // Optionally sets a new CUDA stream; if nullopt, uses the existing one.
     // Returns false if utilization too high or out of memory.
-    bool resume(std::optional<CUstream> stream = std::nullopt);
+    //
+    // Refused while the cache belongs to a Batch: locking pages writes through the bound
+    // Span, which is the Batch's staged row, so a member is resumed before it joins.
+    bool resume(std::optional<CUstream> stream = std::nullopt,
+        std::optional<std::vector<LifeCycleId>> optionalReuseGroups = std::nullopt);
 
     // Suspend: detach from CUDA stream, unlock pages → PageHolder.
+    //
+    // Refused while the cache belongs to a Batch, for the reason resume() is.
+    //
+    // Returns the sparse cache arena lease, which **discards whatever the GPU cache held**.
+    // A lease comes back with every entry free, so a unit whose only copy was in a cell can
+    // no longer be addressed: call Batch::flushSparseUnits() first for anything worth
+    // keeping.
     void suspend();
 
     // Close: release all blocks back to KvCacheManager.
@@ -199,6 +314,14 @@ public:
     // Commit or discard request-local statistics accumulated since the previous scheduler commit.
     KVCacheStatsDelta commitPendingStats();
     void discardPendingStats();
+
+    //! Record the prompt tokens [tokenBegin, tokenEnd) as loaded by a KV connector from an external
+    //! store rather than computed by the forward pass. They count as connector cached tokens, and
+    //! the uncommitted allocations of the blocks they fill completely count as reused. A block the
+    //! forward pass still writes part of stays a miss. Must be called before the pending stats
+    //! covering those allocations are committed, so the reuse is booked when the load is accepted,
+    //! before an asynchronous transfer completes.
+    void recordConnectorReuse(int tokenBegin, int tokenEnd);
 
     // Best-effort prefetch active pages to the target cache level.
     bool prefetch(CacheLevel target);
@@ -209,6 +332,19 @@ public:
     // Returns true on success, false when the resize ran out of pages and was rolled back.
     bool resize(std::optional<int> capacity, std::optional<int> historyLength = std::nullopt);
 
+    // ---- Sparse history cache ----------------------------------------------
+
+    //! Bound on capacity - history_length: how far capacity may outrun the watermark.
+    //!
+    //! Derived, not declared. The cache holds a whole selection plus every unit still in
+    //! flight, so whatever the reservation has above the selection width is the in-flight
+    //! headroom, and that headroom in tokens is this bound. Size it through
+    //! BufferConfig::maxCachedUnits.
+    //!
+    //! nullopt when no sparse buffer has a cache, where a bound on in-flight blocks
+    //! describes nothing. The smallest bound across sparse life cycles when several differ.
+    [[nodiscard]] std::optional<int> maxInputLength() const;
+
     // Convenience: set only capacity or history length.
     void setCapacity(int capacity);
     void setHistoryLength(int historyLength);
@@ -217,6 +353,8 @@ public:
 
     // Commit tokens: finalises the oldest uncommitted block and makes it
     // available for reuse by other KvCaches.
+    // For beam search, tokens must already be finalized and their KV data must
+    // be in beam 0. Committing a full block releases the other beam pages.
     // is_end: if true, records a final reusable snapshot and stops committing.
     // This is a terminal-memory contract: callers must not perform later writes
     // to this KvCache's memory. The final live pages may be moved into the radix
@@ -243,6 +381,11 @@ public:
     // Zero-copy page index buffer: copy current base indices into [buf, buf+len)
     // and arrange that future updateBasePageIndex calls write there too.
     // Pass buf=nullptr / len=0 to revert to the internal vector.
+    //
+    // Refused while this cache belongs to a Batch: membership binds every layer group to a
+    // row of the Batch's table, and a second buffer would take the writes with it, leaving
+    // that row holding whatever it held when the cache joined. Remove it from the Batch
+    // first, or let the Batch be the one holding the buffer worth writing to.
     void setBasePageIndexBuf(BeamIndex beamIdx, LayerGroupId lgId, int32_t* buf, int len);
 
     // ---- Introspection -----------------------------------------------------
@@ -250,6 +393,12 @@ public:
     Status status() const noexcept
     {
         return mStatus;
+    }
+
+    // Row this cache occupies in its Batch; nullopt when it belongs to none.
+    std::optional<BatchRow> batchRow() const noexcept
+    {
+        return mBatchRow;
     }
 
     CommitState commitState() const noexcept
@@ -311,6 +460,11 @@ public:
     //! survive, so only the tail stops counting as a local hit.
     void dropPartialBlockCachedTokenAttribution();
 
+    std::vector<ReuseGroupStatus> const& reuseStatus() const noexcept
+    {
+        return mReuseStatus;
+    }
+
     // Internal diagnostic: prefix supported by the attention pages alone,
     // before recurrent-state (SSM) snapshot pruning shortened the reuse.
     int numReusableTokensBeforeHybridPruning() const noexcept
@@ -366,11 +520,32 @@ public:
         return mBeamWidth;
     }
 
+    // Beam widths greater than one are generation-only. Before increasing the
+    // width, the caller must resume the cache and materialize prompt storage
+    // (or prepare synthetic warmup state). Expansion must happen before the first
+    // generation step, never during generation. Full prompt blocks remain unmapped
+    // for new beams and are shared through cache indirection; the writable tail,
+    // including preallocated blocks, is copied from beam 0. The boundary is
+    // expectedPromptLength from createKvCache(). Decreasing the width discards
+    // the removed alternatives.
+    void setBeamWidth(BeamIndex beamWidth);
+
     CUstream cudaStream() const;
+
+    // A member runs on its Batch's stream; moving it would order the Batch's transfers and
+    // the member's own work against different streams.
+    void setCudaStream(CUstream stream)
+    {
+        if (mBatch != nullptr)
+        {
+            throw LogicError("A KvCache in a Batch runs on the Batch's stream; remove it first to move it");
+        }
+        _setCudaStream(stream);
+    }
 
     // Mirrors Python's cuda_stream setter: if already on a stream AND active,
     // make the new stream wait for the old one before switching (cross-stream sync).
-    void setCudaStream(CUstream stream)
+    void _setCudaStream(CUstream stream)
     {
         if (mCudaStream.has_value())
         {
@@ -408,6 +583,12 @@ public:
     // Priority for (blockOrdinal, lifeCycleId) based on the callback.
     Priority getPriority(BlockOrdinal ordinal, LifeCycleId lc) const;
 
+    //! Retention is resolved by block start, with decode beginning after the final prompt block.
+    executor::RetentionPriorityAndDuration getRetention(BlockOrdinal ordinal) const;
+
+    //! Current priorities for the request's allocated pages in one layer group.
+    std::vector<Priority> getPagePriorities(LayerGroupId layerGroupId, BeamIndex beamIndex = kDefaultBeamIndex) const;
+
     // Reference to StorageManager (for page acquisition/release).
     StorageManager* storageManager() const;
 
@@ -424,8 +605,21 @@ public:
 
     // ---- SWA scratch slot management ------------------------------------------
 
-    // Return scratch metadata for a layer group, or nullopt if no scratch blocks.
-    std::optional<ScratchDesc> getScratchDesc(LayerGroupId lgId) const;
+    // Block ordinal range this life cycle serves from scratch slots; empty when none of it
+    // does. Read it alongside getScratchSlots(), which names the slots it covers.
+    HalfOpenRange<BlockOrdinal> getSwaScratchRange(LayerGroupId lgId) const;
+
+    // Page indices of this life cycle's scratch slots, in slot order.
+    // Valid until the next scratch slot change or setScratchSlotBuf() for this life cycle.
+    Span<int const> getScratchSlots(LayerGroupId lgId) const;
+
+    // Zero-copy scratch slot buffer: copy the current indices into [buf, buf+len) and
+    // arrange that future scratch slot changes write there too. Pass buf=nullptr / len=0
+    // to revert to internal storage.
+    //
+    // Refused while this cache belongs to a Batch, which binds the buffer itself; see
+    // setBasePageIndexBuf.
+    void setScratchSlotBuf(LayerGroupId lgId, int32_t* buf, int len);
 
     // True if any lifecycle has scratch slots allocated.
     bool hasScratchSlots() const;
@@ -446,8 +640,9 @@ public:
     // requires the already-committed tokens to be digest-free (verified by a scan).
     void setTextOnly(bool textOnly);
 
-    // Whether the given page index mode is supported (SHARED requires no scratch slots).
-    bool supportsIndexMode(PageIndexMode mode) const;
+    // Whether the mode is supported for one life cycle: SHARED requires that it hold no
+    // scratch slots.
+    bool supportsIndexMode(PageIndexMode mode, LifeCycleId lcId) const;
 
     // ---- Internal callbacks (called by SharedPageLock) ----------------------
 
@@ -457,10 +652,11 @@ public:
 
 private:
     friend class KvCacheIntrospection;
-    friend std::vector<SharedPageLock> batchedLockToGpu(
+    friend class Batch;
+    friend std::vector<SharedPageLock> batchedLockPages(
         KvCache& kvCache, std::vector<BatchedLockTarget> const& targets);
 
-    // Activate: lock all pages to GPU. mCudaStream must already be set.
+    // Activate: lock active pages at their required levels. mCudaStream must already be set.
     // Internal — called by resume(). Not public (mirrors Python where activate() doesn't exist).
     void activate();
 
@@ -469,7 +665,7 @@ private:
     // counts. Called at the end of _setupForReuse, which collects them in the same walk.
     void _finalizeCachedTokensByLevel(
         int numTokens, TypedVec<BlockOrdinal, CacheLevel> const& attentionLevels, std::optional<CacheLevel> ssmLevel);
-    void _setupForReuse(BlockRadixTree::ReuseMatch const& match);
+    void _setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claimRetention);
     // Reconstruct the committed token sequence from a match's blocks (mirrors
     // Python's _get_matched_tokens); used when reuse-matching no longer has the
     // raw input tokens in scope.
@@ -521,8 +717,11 @@ private:
     std::vector<ActivePage> _activePages() const;
     SharedPtr<Page> _page(BlockOrdinal ordinal, BeamIndex beamIdx, LifeCycleId lcId) const;
 
-    bool _shortcutSetCapacity(int capacity);
-    bool _shortcutSetHistoryLength(int historyLength);
+    //! Whether the new value can be taken without touching blocks. Both are asked before
+    //! either is applied, so a resize that only one of them can shortcut leaves neither
+    //! changed and the slow path still sees the original state.
+    [[nodiscard]] bool _canShortcutCapacity(int capacity) const;
+    [[nodiscard]] bool _canShortcutHistoryLength(int historyLength) const;
     bool _shouldRecordManagerStats() const;
     bool _shouldRecordRequestStats() const;
     bool _shouldRecordStats() const;
@@ -537,6 +736,8 @@ private:
     void _subtractPendingAllocationRange(BlockOrdinal blockBegin, BlockOrdinal blockEnd);
     static bool _hasReuseSource(BlockPage const& page);
     void _decreaseCapacity(BlockOrdinal newNumBlocks);
+    void _truncateBlockBeams(SeqBlock& block, BeamIndex beamWidth);
+    void _appendBeams(BeamIndex oldBeamWidth, BeamIndex newBeamWidth);
 
     // Release stale held uncommitted pages for SWA layers after committing stops.
     // Mirrors Python's _on_stop_committing().
@@ -566,8 +767,7 @@ private:
 
     // Extract uncommitted pages from a SeqBlock, resetting block page entries.
     // Returns one TakenPage per lifecycle. Mirrors Python's _take_uncommitted_page().
-    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(
-        SeqBlock& sb, BeamIndex beamIdx, std::optional<LifeCycleId> skipLc = std::nullopt);
+    TypedVec<LifeCycleId, TakenPage> _takeUncommittedPage(SeqBlock& sb, BeamIndex beamIdx);
 
     // Get and validate the tree block at a committed ordinal.
     // Mirrors Python's _get_tree_block(). Asserts committed pages reference the correct block.
@@ -597,8 +797,8 @@ private:
     // Recover previously taken excess scratch slots back into mScratchSlots.
     void _recoverExcessScratchSlots(TypedVec<LifeCycleId, std::vector<ScratchSlotLock>>& excess);
 
-    // Release all scratch slots back to storage.
-    void _freeScratchSlots();
+    // Release every GPU slot this request reserves: SWA scratch and sparse history cache.
+    void _freeReservedGpuSlots();
 
     // Whether any lifecycle would require scratch blocks at the current state.
     bool _wouldUseSwaScratchBlocks() const;
@@ -612,6 +812,8 @@ private:
     std::shared_ptr<KvCacheManager> mManager;
     ReuseScope mReuseScope;
     PriorityCb mPriorityCb;
+    std::optional<executor::KvCacheRetentionConfig> mRetentionConfig;
+    std::vector<executor::RetentionPriorityAndDuration> mPromptRetentions;
     std::optional<CUstream> mCudaStream;
     Status mStatus;
     CommitState mCommitState;
@@ -619,6 +821,7 @@ private:
     int mCapacity;
     int mHistoryLength;
     std::optional<int> mExpectedPromptLength;
+    int mNumLookupTokens = 0;
     bool mGenerationAllocReady = false;
 
     // Page index tables: [beamIdx][lcId] → either an internal vector or an external span.
@@ -628,7 +831,13 @@ private:
     using BeamPageIndexBuffers = TypedVec<BeamIndex, LifeCyclePageIndexBuffers>;
     BeamPageIndexBuffers mBasePageIndices;
 
+    // Set while this cache is a Batch member; the Batch clears both on removal and the
+    // destructor detaches, so a dropped request cannot leave a row pointing at it.
+    Batch* mBatch = nullptr;
+    std::optional<BatchRow> mBatchRow;
+
     TypedVec<BlockOrdinal, SeqBlock> mBlocks;
+    std::vector<FuncGuard<std::function<void()>>> mPartialCopyRetentionHolds;
 
     std::vector<TokenIdExt> mCommittedTokens;
     // Initial current-residency provenance, observed before reused pages are held or promoted.
@@ -651,9 +860,22 @@ private:
 
     PendingStats mPendingStats;
 
+    std::vector<ReuseGroupStatus> mReuseStatus;
+    TypedVec<LifeCycleId, std::vector<std::pair<BlockOrdinal, SharedPtr<PageHolder>>>> mOptionalCandidates;
+    std::vector<LifeCycleId> mSelectedOptionalGroups;
+    void _collectReuseCandidates();
+    void _selectOptionalGroups(std::vector<LifeCycleId> const& groups);
+    // PRIVATE and unselected OPTIONAL attention groups need fresh pages for the claimed prefix.
+    bool _needsFreshPrefixPages(LifeCycleId lc) const;
+
     // SWA scratch slot support.
     bool mEnableSwaScratchReuse = false;
-    TypedVec<LifeCycleId, std::vector<ScratchSlotLock>> mScratchSlots;
+    TypedVec<LifeCycleId, ScratchSlots> mScratchSlots;
+
+    // This request's slot in the sparse cache arenas, which addresses its cells and the
+    // device-resident residency, recency and write-back scratch describing them in every
+    // life cycle at once. Taken when the cache joins a Batch, returned on removal,
+    // suspend() and close(). Empty unless some life cycle has its fetch path configured.
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

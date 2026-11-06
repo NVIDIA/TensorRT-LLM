@@ -24,15 +24,18 @@ def timing(monkeypatch):
 
 
 def test_nested_phases_and_unattributed_time(timing):
-    """Count nested time once and retain time outside measured phases."""
+    """Export nested phases without double counting them in the summary."""
     clock, log = timing
     clock.side_effect = [0, 2, 3, 4, 6, 9, 12]
+    metrics = {}
     with _startup._StartupTimer("executor") as timer:
         timer.mark_initialization("configuration")
-        with timer.phase("model"):
-            with timer.phase("weights"):
+        with timer.phase("model", metrics=metrics):
+            with timer.phase("weights", metrics=metrics):
                 pass
     assert timer.timings == {"configuration": 2, "model": 6}
+    assert metrics == {"model": 6, "weights": 2}
+    assert clock.call_count == 7
     assert timer.depth == 0
     log.info.assert_any_call("[startup][pid=42] executor/weights: done in 2.000s")
     log.info.assert_any_call(
@@ -42,15 +45,18 @@ def test_nested_phases_and_unattributed_time(timing):
 
 
 def test_repeated_phases_accumulate(timing):
-    """Keep both occurrences of a repeated phase in the summary."""
+    """Accumulate repeated phases in both the summary and exported metrics."""
     clock, _ = timing
     clock.side_effect = [0, 1, 3, 4, 7, 8]
+    metrics = {}
     with _startup._StartupTimer("executor") as timer:
-        with timer.phase("allocation"):
+        with timer.phase("allocation", metrics=metrics, metric_name="allocation_seconds"):
             pass
-        with timer.phase("allocation"):
+        with timer.phase("allocation", metrics=metrics, metric_name="allocation_seconds"):
             pass
     assert timer.timings == {"allocation": 5}
+    assert metrics == {"allocation_seconds": 5}
+    assert clock.call_count == 6
 
 
 @pytest.mark.parametrize("error_type", [ValueError, KeyboardInterrupt])
@@ -60,14 +66,16 @@ def test_failed_nested_phase_preserves_time_and_exception(timing, error_type):
     clock.side_effect = [0, 1, 2, 4, 6, 8]
     error = error_type("initialization failed")
     timer = _startup._StartupTimer("executor")
+    metrics = {}
     with pytest.raises(error_type) as caught:
         with timer:
-            with timer.phase("model"):
-                with timer.phase("weights"):
+            with timer.phase("model", metrics=metrics):
+                with timer.phase("weights", metrics=metrics):
                     raise error
     assert caught.value is error
     assert timer.depth == 0
     assert timer.timings == {"model": 5}
+    assert metrics == {"model": 5, "weights": 2}
     messages = [c.args[0] for c in log.info.call_args_list]
     assert "[startup][pid=42] executor/weights: failed in 2.000s" in messages
     assert "[startup][pid=42] executor/model: failed in 5.000s" in messages

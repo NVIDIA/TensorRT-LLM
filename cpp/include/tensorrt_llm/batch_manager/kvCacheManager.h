@@ -620,7 +620,7 @@ public:
                 = runtime::BufferManager::cpu(runtime::ITensor::makeShape({numPools, beamWidth, 2, maxBlocks}),
                     runtime::TRTDataType<tensorrt_llm::kernels::KVCacheIndex>::value);
             auto cacheBlockIdsRange
-                = runtime::BufferRange<tensorrt_llm::kernels::KVCacheIndex>(*mCacheBlockIndices.at(windowSize));
+                = mCacheBlockIndices.at(windowSize)->getBufferRange<tensorrt_llm::kernels::KVCacheIndex>();
             std::fill(cacheBlockIdsRange.begin(), cacheBlockIdsRange.end(),
                 tensorrt_llm::kernels::KVCacheIndex{
                     std::numeric_limits<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>::max()});

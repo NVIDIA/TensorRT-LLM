@@ -18,8 +18,8 @@
 
 #include "fusedSamplingKernels.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace fusedSampling
@@ -54,4 +54,5 @@ void launchFusedSamplingMultiCta(FusedSamplingParams const& params, cudaStream_t
 
 } // namespace fusedSampling
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

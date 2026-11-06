@@ -85,6 +85,10 @@ class FlashinferTrtllmGenBf16Impl(TrtllmGenFusedMoEBase):
         """
         return not isinstance(self.routing_method, DeepSeekV3MoeRoutingMethod)
 
+    def supports_unfinalized_output(self) -> bool:
+        """``trtllm_bf16_moe`` honors ``do_finalize=False`` and returns the triple."""
+        return True
+
     def _check_configs(self) -> None:
         """The unquantized kernels take no activation constants at all.
 

@@ -318,11 +318,25 @@ class ProgressContext:
     The workflow updates ``current_iteration`` before each agent run so the
     tool stamps the right iteration number on every entry without the agent
     having to pass (or guess) it.
+
+    ``feedback_path`` splits *where human feedback is read from* off ``path``.
+    It is ``None`` on the linear path, where both live in the one shared
+    ``progress.yaml``. The concurrent path sets it: a node's own ``path`` is
+    its private ``progress.yaml``, but ``--feedback`` is only ever appended to
+    the *shared* workspace file, so without this split ``read_human_feedback``
+    would read the node's private (always empty) list and silently starve the
+    node agents of the user's guidance.
     """
 
     path: Path
     current_iteration: int = 0
+    feedback_path: Path | None = None
     _tool_cache: list[Any] | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def human_feedback_path(self) -> Path:
+        """Where ``read_human_feedback`` reads from — ``path`` unless split off."""
+        return self.feedback_path if self.feedback_path is not None else self.path
 
 
 def build_progress_tools(
@@ -682,7 +696,7 @@ def build_progress_tools(
             },
         )
         async def read_human_feedback(_args: dict[str, Any]) -> dict[str, Any]:
-            entries = read_progress(ctx.path)[HUMAN_FEEDBACK]
+            entries = read_progress(ctx.human_feedback_path)[HUMAN_FEEDBACK]
             if not entries:
                 text = "# No human_feedback entries yet.\n"
             else:

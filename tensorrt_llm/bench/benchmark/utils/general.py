@@ -163,7 +163,6 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
         "backend": backend,
         "decoding_config": {},
         "performance_options": {
-            "cuda_graphs": True,
             "pytorch_config": pyt_options,
         }
     }

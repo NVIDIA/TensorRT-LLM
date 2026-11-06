@@ -93,6 +93,10 @@ class TrtllmTrtllmGenW4a8Nvfp4Fp8Impl(TrtllmGenFusedMoEBase):
     def _get_quant_method(self) -> object:
         return W4A8NVFP4FP8TRTLLMGenFusedMoEMethod()
 
+    def supports_unfinalized_output(self) -> bool:
+        """The W4A8 NVFP4xFP8 runner honors ``do_finalize=False`` and returns the triple."""
+        return True
+
     def quantize_input(
         self, x: torch.Tensor, post_quant_comm: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor | None]:

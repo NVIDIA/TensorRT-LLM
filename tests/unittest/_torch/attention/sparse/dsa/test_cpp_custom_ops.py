@@ -32,13 +32,6 @@ from utils.util import skip_pre_blackwell
 # Import tensorrt_llm to load C++ custom operators
 import tensorrt_llm  # noqa: F401
 
-try:
-    from tensorrt_llm.deep_gemm.utils.math import per_token_cast_to_fp4
-
-    HAS_DEEPGEMM_REF = True
-except ImportError:
-    HAS_DEEPGEMM_REF = False
-
 # ---------------------------------------------------------------------------
 # Constants matching the C++ kernel (DeepSeek-V3.2 indexer config)
 # ---------------------------------------------------------------------------
@@ -1067,14 +1060,36 @@ def test_cute_dsl_fp8_indexer_q_gemm_rope_fp4_matches_unfused(num_tokens):
 
 
 # ===================================================================
-# Test 4: fused_cat_fp4 — bit-exact vs DeepGEMM per_token_cast_to_fp4
+# Test 4: fused_cat_fp4 — bit-exact indexer quantization
 # ===================================================================
 
 
-@pytest.mark.skipif(
-    not HAS_DEEPGEMM_REF,
-    reason="tensorrt_llm.deep_gemm.utils.math.per_token_cast_to_fp4 unavailable",
-)
+def _fp4_indexer_quantize_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize 128-wide rows with block-32 UE8M0 scales and ties toward zero."""
+    rows = x.float().reshape(-1, HEAD_DIM)
+    blocks = rows.reshape(-1, HEAD_DIM // 32, 32)
+    amax = blocks.abs().amax(dim=-1).clamp_min(1.0e-12)
+    scale_exponents = torch.ceil(torch.log2(amax / 6.0))
+    scales = torch.exp2(scale_exponents)
+    normalized = blocks / scales.unsqueeze(-1)
+
+    # Ordered representable magnitudes make argmin choose the lower magnitude
+    # when two values are equally close. Quantized zero has no sign bit.
+    levels = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32, device=x.device
+    )
+    distances = (normalized.abs().unsqueeze(-1) - levels).abs()
+    magnitude_codes = distances.argmin(dim=-1)
+    sign_bits = ((normalized < 0) & (magnitude_codes != 0)).to(torch.int64) << 3
+    codes = (magnitude_codes | sign_bits).reshape(-1, HEAD_DIM)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.int8)
+
+    scale_bytes = scale_exponents.to(torch.int64) + 127
+    byte_shifts = torch.tensor([0, 8, 16, 24], device=x.device)
+    packed_scales = (scale_bytes << byte_shifts).sum(dim=-1, keepdim=True).to(torch.int32)
+    return packed, packed_scales
+
+
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "shape",
@@ -1086,8 +1101,8 @@ def test_cute_dsl_fp8_indexer_q_gemm_rope_fp4_matches_unfused(num_tokens):
     ],
 )
 @pytest.mark.parametrize("seed", [0, 42, 2026])
-def test_fused_cat_fp4_matches_deepgemm(shape, seed):
-    """Packed bytes and UE8M0 scale int32 must match DeepGEMM byte-for-byte."""
+def test_fused_cat_fp4_matches_reference(shape: tuple[int, ...], seed: int) -> None:
+    """Packed bytes and UE8M0 scales must match the indexer quantization contract."""
     torch.manual_seed(seed)
     head_dim = shape[-1]
     leading = shape[:-1]
@@ -1099,9 +1114,7 @@ def test_fused_cat_fp4_matches_deepgemm(shape, seed):
 
     # Reference expects 2D (M, head_dim); flatten leading dims.
     cat_2d = torch.cat([pe, nope], dim=-1).reshape(-1, head_dim).contiguous()
-    ref_packed, ref_scale = per_token_cast_to_fp4(
-        cat_2d, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
-    )
+    ref_packed, ref_scale = _fp4_indexer_quantize_reference(cat_2d)
 
     M = packed.size(0)
     assert packed.shape == (M, head_dim // 2)
@@ -1109,11 +1122,57 @@ def test_fused_cat_fp4_matches_deepgemm(shape, seed):
     assert torch.equal(
         packed.view(-1).contiguous(),
         ref_packed.reshape(-1).to(torch.int8).contiguous(),
-    ), "FP4 packed bytes mismatch vs DeepGEMM reference"
+    ), "FP4 packed bytes mismatch vs indexer reference"
     assert torch.equal(
         scale.view(-1).contiguous(),
         ref_scale.reshape(-1).to(torch.int32).contiguous(),
-    ), "UE8M0 scale int32 mismatch vs DeepGEMM reference"
+    ), "UE8M0 scale int32 mismatch vs indexer reference"
+
+
+@skip_pre_blackwell
+def test_fused_cat_fp4_midpoint_rounding() -> None:
+    """All signed midpoints round toward zero; scales occupy four ordered bytes."""
+    boundaries = torch.tensor(
+        [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0], dtype=torch.bfloat16, device="cuda"
+    )
+    block = torch.zeros((7, 32), dtype=torch.bfloat16, device="cuda")
+    block[:, 0] = boundaries - 0.0625
+    block[:, 1] = boundaries
+    block[:, 2] = boundaries + 0.0625
+    block[:, 3:6] = -block[:, :3]
+    # The endpoint anchors make every block's normalized maximum exactly six.
+    block[:, 30] = 6.0
+    block[:, 31] = -6.0
+    scales = torch.tensor([0.25, 0.5, 1.0, 2.0], dtype=torch.bfloat16, device="cuda")
+    rows = (block[:, None, :] * scales[None, :, None]).reshape(7, HEAD_DIM)
+
+    expected_prefix = torch.tensor(
+        [
+            [0x00, 0x01, 0x90],
+            [0x11, 0x92, 0xA9],
+            [0x22, 0xA3, 0xBA],
+            [0x33, 0xB4, 0xCB],
+            [0x44, 0xC5, 0xDC],
+            [0x55, 0xD6, 0xED],
+            [0x66, 0xE7, 0xFE],
+        ],
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    expected_block = torch.zeros((7, 16), dtype=torch.uint8, device="cuda")
+    expected_block[:, :3] = expected_prefix
+    expected_block[:, 15] = 0xF7
+    expected_packed = expected_block.repeat(1, 4).view(torch.int8)
+    # Exponents -2, -1, 0, 1 become UE8M0 bytes 125, 126, 127, 128.
+    expected_scales = torch.full((7, 1), 0x807F7E7D - (1 << 32), dtype=torch.int32, device="cuda")
+
+    ref_packed, ref_scales = _fp4_indexer_quantize_reference(rows)
+    assert torch.equal(ref_packed, expected_packed)
+    assert torch.equal(ref_scales, expected_scales)
+
+    packed, packed_scales = torch.ops.trtllm.fused_cat_fp4(rows[:, :64], rows[:, 64:])
+    assert torch.equal(packed, expected_packed)
+    assert torch.equal(packed_scales, expected_scales)
 
 
 @skip_pre_blackwell
