@@ -235,3 +235,45 @@ def test_queued_heartbeats_prevent_false_death_after_receiver_pause(monkeypatch)
     monitor._run()
     assert monitor.failure is None
     assert all(report["sequence"] == 1 for report, _seen in monitor._seen.values())
+
+
+@pytest.mark.parametrize("invalid_signature", [False, True])
+def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_signature):
+    # Regression: a continuously readable listener must still expire a silent
+    # rank, even if the incoming frames fail authentication.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(remote.time, "monotonic", lambda: 100.0)
+    monitor = remote.RemoteWorkerProcessMonitor.__new__(remote.RemoteWorkerProcessMonitor)
+    monitor._world_size = 2
+    monitor._wake = threading.Event()
+    monitor._lock = threading.Lock()
+    monitor._stopped = threading.Event()
+    monitor._failure = None
+    reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
+    monitor._seen = {0: (reports[0], 100.0), 1: (reports[1], 0.0)}
+    received = 0
+
+    def poll(_timeout):
+        # Bound the pre-fix failure without waiting for a wall-clock timeout.
+        if monitor.failure is not None or received >= 1024:
+            monitor._stopped.set()
+        return True
+
+    def get():
+        nonlocal received
+        received += 1
+        if invalid_signature:
+            raise RuntimeError("HMAC verification failed")
+        return dict(reports[0], sequence=received)
+
+    monitor._queue = SimpleNamespace(
+        poll=poll,
+        get=get,
+        close=lambda: None,
+        socket=SimpleNamespace(setsockopt=lambda *_args: None),
+    )
+    monitor._run()
+    assert monitor._wake.is_set(), "Continuous traffic suppressed heartbeat expiry"
+    assert monitor.failure["rank"] == 1
+    assert monitor.failure["reason"] == "heartbeat timed out"
