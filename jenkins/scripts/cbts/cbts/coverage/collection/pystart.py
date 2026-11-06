@@ -99,8 +99,8 @@ class PyStartTracker:
         relative = canonicalize_path(absolute, self.repository_root)
         return not self.include or any(fnmatchcase(relative, pattern) for pattern in self.include)
 
-    # Skip synthetic comprehension / genexpr / lambda frames; keep real functions, methods, module bodies.
-    _SKIP_QUALNAMES = frozenset(("<genexpr>", "<listcomp>", "<setcomp>", "<dictcomp>", "<lambda>"))
+    # Skip synthetic genexpr / lambda frames. See COLLECTION.md §5.1 for detail.
+    _SKIP_QUALNAMES = frozenset(("<genexpr>", "<lambda>"))
 
     def _on_py_start(self, code: CodeType, offset: int):
         # A tracker fault must never propagate into monitored host code.
@@ -113,7 +113,7 @@ class PyStartTracker:
                 )
             if fn:
                 qual = code.co_qualname
-                if "<locals>" not in qual and qual not in self._SKIP_QUALNAMES:
+                if qual.rpartition(".")[2] not in self._SKIP_QUALNAMES:
                     self._data.setdefault(self._ctx, set()).add((fn, qual))
         # Disable this code object's PY_START (for this tool) until the next test's restart_events().
         return _MON.DISABLE

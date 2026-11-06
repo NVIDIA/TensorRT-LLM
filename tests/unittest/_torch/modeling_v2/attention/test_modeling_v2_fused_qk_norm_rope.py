@@ -417,3 +417,39 @@ def test_guard_refuses_a_position_id_count_that_is_not_the_token_count() -> None
     with pytest.raises(AssertionError, match="one position per token"):
         with validating(op):
             op(qkv, **kwargs)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0), reason="the Kimi K3 cell is certified on sm_100"
+)
+def test_bf16_neox_kimi_k3_drafter() -> None:
+    torch.manual_seed(9)
+    for num_heads_q, num_heads_kv in ((6, 1), (24, 4)):
+        for num_tokens in (1, 8, 64):
+            qkv = torch.randn(
+                num_tokens,
+                (num_heads_q + 2 * num_heads_kv) * 64,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            kwargs: dict = dict(
+                num_heads_q=num_heads_q,
+                num_heads_k=num_heads_kv,
+                num_heads_v=num_heads_kv,
+                head_dim=64,
+                rotary_dim=64,
+                eps=1e-5,
+                q_weight=torch.randn(64, dtype=torch.bfloat16, device="cuda") * 0.1 + 1.0,
+                k_weight=torch.randn(64, dtype=torch.bfloat16, device="cuda") * 0.1 + 1.0,
+                base=10000.0,
+                is_neox=True,
+                position_ids=torch.randint(
+                    0, 32768, (num_tokens,), dtype=torch.int32, device="cuda"
+                ),
+            )
+            ref = op.reference(qkv, **kwargs)
+            v_start = (num_heads_q + num_heads_kv) * 64
+            v_before = qkv[:, v_start:].clone()
+            op(qkv, **kwargs)
+            torch.testing.assert_close(qkv, ref, rtol=1.6e-2, atol=0.02)
+            assert torch.equal(qkv[:, v_start:], v_before)

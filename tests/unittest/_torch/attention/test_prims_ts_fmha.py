@@ -39,6 +39,7 @@ from tensorrt_llm._torch.attention.backends.interface import (
     PredefinedAttentionMask,
 )
 from tensorrt_llm._torch.attention.backends.sparse.params import SparseRuntimeParams
+from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -70,6 +71,8 @@ class _TensorSpec:
 
 
 class _Attention:
+    out_head_size = TrtllmAttention.out_head_size
+
     def __init__(
         self,
         *,
@@ -86,6 +89,7 @@ class _Attention:
         self.qk_rope_head_dim = 64 if is_mla else None
         self.qk_nope_head_dim = 128 if is_mla else None
         self.v_head_dim = 128 if is_mla else None
+        self.rope_append = True
         self.predicted_tokens_per_seq = 1
         self.sparse_params = None
         self.skip_correction_threshold = 0.0
@@ -1156,7 +1160,7 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
             False,
         )
     )
-    wrapper = Mock()
+    wrapper = create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
     wrapper._plan_state = SimpleNamespace(
         policy=(
             ("use_split_kv", use_split_kv),
@@ -1324,7 +1328,10 @@ def test_decode_layer_adapters_bind_the_same_shared_workspace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_decode_module,
@@ -1410,7 +1417,10 @@ def test_decode_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_decode_module.BatchDecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_decode_module,
@@ -1510,7 +1520,7 @@ def test_mla_eager_wrapper_plans_once_and_reads_live_fixed_metadata(
         dtype=torch.int32,
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,
@@ -1704,7 +1714,10 @@ def test_mla_wrapper_cache_plans_each_batch_once_and_reuses_a_b_a(
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     attn = _Attention(head_dim=576, is_mla=True, num_heads=4)
     fmha = PrimsTSFmha(attn)
-    wrappers = [Mock(), Mock()]
+    wrappers = [
+        create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
+        for _ in range(2)
+    ]
     wrapper_factory = Mock(side_effect=wrappers)
     monkeypatch.setattr(
         prims_mla_module,
@@ -1770,7 +1783,7 @@ def test_mla_wrapper_capture_uses_cached_plan_and_rejects_plan_miss(
         "is_current_stream_capturing",
         lambda: capturing,
     )
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_mla_module,
@@ -1816,7 +1829,7 @@ def test_mla_wrapper_receives_v2_bound_and_shared_workspace(
         dtype=torch.int32,
     )
     build_metadata = Mock(return_value=(kv_cache, block_tables, None))
-    wrapper = Mock()
+    wrapper = create_autospec(prims_mla_module.BatchMLADecodePagedTSWrapper, instance=True)
     wrapper_factory = Mock(return_value=wrapper)
     monkeypatch.setattr(
         prims_ts_module.thop,

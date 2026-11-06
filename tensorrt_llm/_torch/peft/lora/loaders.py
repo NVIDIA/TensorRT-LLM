@@ -396,14 +396,17 @@ class HfLoraLoader:
                 lora_target_modules.add(trtllm_module)
         return list(lora_target_modules)
 
-    def get_dense_lora_dtype(self) -> Optional[torch.dtype]:
-        """Return the common input/output dtype for dense LoRA modules."""
+    def get_lora_dtype(self) -> Optional[torch.dtype]:
+        """Return the common input/output dtype across all LoRA modules."""
         lora_dtypes = set()
         for key, weight in self.lora_weight.items():
             match = HF_LORA_PATTERN.match(key)
-            if match is not None and match.group(6) is None and match.group(8) in ("A", "B"):
+            if match is not None and match.group(8) in ("A", "B"):
                 lora_dtypes.add(weight.dtype)
-        return next(iter(lora_dtypes)) if len(lora_dtypes) == 1 else None
+        if len(lora_dtypes) > 1:
+            dtype_names = ", ".join(sorted(str(dtype) for dtype in lora_dtypes))
+            raise ValueError(f"LoRA checkpoint weights must have one dtype; found {dtype_names}.")
+        return next(iter(lora_dtypes)) if lora_dtypes else None
 
 
 @lru_cache(maxsize=128)
