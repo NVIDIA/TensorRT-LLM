@@ -548,7 +548,7 @@
             }
           ],
           "default": "PYTHON",
-          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path.",
+          "description": "The runtime implementation. 'PYTHON' (default) selects the Python transceiver, while 'CPP' selects the C++ transceiver and requires kv_cache_config.use_kv_cache_manager_v2=False with a model that supports V1. 'auto' adopts the model's preferred runtime when it declares one; otherwise it selects the Python transceiver, falling back to the C++ transceiver only when this config itself rules it out (non-NIXL backend or a null kv_transfer_timeout_ms) \u2014 any other incompatibility fails at transceiver creation. The fallback is decided independently on each server and is only logged, not surfaced, so keep context and generation server configurations consistent. None is equivalent to 'CPP'. 'auto' is resolved on the PyTorch backend's standard model-loading path. The C++ transceiver ('CPP' and None) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period.",
           "title": "Transceiver Runtime"
         }
       },
@@ -562,6 +562,16 @@
         "STATIC_BATCH"
       ],
       "title": "CapacitySchedulerPolicy",
+      "type": "string"
+    },
+    "CheckpointIOPolicy": {
+      "description": "Strategy for reading checkpoint weights and transferring them to GPU.",
+      "enum": [
+        "auto",
+        "native",
+        "rank_striped_read_ahead"
+      ],
+      "title": "CheckpointIOPolicy",
       "type": "string"
     },
     "ColdPageQuantizationCompressionConfig": {
@@ -1107,6 +1117,13 @@
           "description": "Enable confidence-guided selection of a measured verifier-token budget for decode-only batches. The full physical draft block is still proposed; target verification and acceptance rules are unchanged. Requires trained confidence-head weights and a cost table (confidence_cost_table_path). Native verification is kept whenever no compact budget is predicted to win by confidence_min_predicted_gain.",
           "status": "prototype",
           "title": "Enable Confidence Scheduling",
+          "type": "boolean"
+        },
+        "enable_fused_confidence_scheduler": {
+          "default": true,
+          "description": "Re-rank which draft positions are verified on the GPU, using the confidence of the block being verified rather than the previous step's host copy. The verifier budget is still chosen on the host. On by default; set False to rank on the host only, which drops a device pass and a full input rebuild on compact steps. Only used when enable_confidence_scheduling=True and the overlap scheduler is on; with disable_overlap_scheduler=True, ranking stays on the host.",
+          "status": "prototype",
+          "title": "Enable Fused Confidence Scheduler",
           "type": "boolean"
         },
         "enable_penalty": {
@@ -3191,7 +3208,7 @@
             }
           ],
           "default": true,
-          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one.",
+          "description": "Whether to use the KV cache manager v2 (experimental). Defaults to True. Set False to select V1 for models that support it. 'auto' uses the model-specific preference and falls back to False when the model does not declare one. V1 is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period.",
           "status": "prototype",
           "title": "Use Kv Cache Manager V2"
         },
@@ -4430,6 +4447,13 @@
           "description": "Pruning rate for video frames in multimodal models for Efficient Video Sampling (EVS). NOTE: this is currently only implemented in nemotron multimodal models. None (default) disables EVS, values in [0, 1) enable pruning.",
           "status": "prototype",
           "title": "Video Pruning Rate"
+        },
+        "vision_gpu_normalize": {
+          "default": false,
+          "description": "Normalize supported uint8 vision inputs on the GPU instead of the CPU. Applies only to models that opt in and whose processors preserve the required normalization settings and pixel layout. Unsupported inputs keep the existing CPU preprocessing path. False (default) disables GPU normalization.",
+          "status": "prototype",
+          "title": "Vision Gpu Normalize",
+          "type": "boolean"
         }
       },
       "title": "MultimodalConfig",
@@ -6515,7 +6539,7 @@
       "type": "string"
     }
   },
-  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc3/_static/schemas/trtllm-serve-config.schema.json",
+  "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "description": "Static YAML checks only; runtime validation remains authoritative.",
@@ -6655,16 +6679,10 @@
       "title": "Checkpoint Format"
     },
     "checkpoint_io_policy": {
+      "$ref": "#/$defs/CheckpointIOPolicy",
       "default": "auto",
       "description": "Controls checkpoint storage I/O independently of checkpoint format. 'auto' selects rank-striped read-ahead for compatible built-in PyTorch/HF loads and selects native I/O otherwise. 'native' preserves the existing loader. 'rank_striped_read_ahead' lets node-local ranks read disjoint SafeTensors extents while native mapping, materialization, and H2D continue. Incompatible configurations select native I/O before optimized reader or collective setup. Runtime-ineligible loads fall back to native before model mutation.",
-      "enum": [
-        "auto",
-        "native",
-        "rank_striped_read_ahead"
-      ],
-      "status": "prototype",
-      "title": "Checkpoint Io Policy",
-      "type": "string"
+      "status": "prototype"
     },
     "checkpoint_loader": {
       "description": "Live objects require the Python LLM API.",
@@ -8027,6 +8045,6 @@
     }
   },
   "required": [],
-  "title": "TensorRT-LLM 1.4.0rc3 trtllm-serve --config",
+  "title": "TensorRT-LLM 1.4.0rc4 trtllm-serve --config",
   "type": "object"
 }

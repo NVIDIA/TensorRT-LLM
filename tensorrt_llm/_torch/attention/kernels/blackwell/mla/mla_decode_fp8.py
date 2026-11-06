@@ -2626,10 +2626,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
                                       cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (common_params.mPT[k_index] if self.mma_qk_tiler[1] //
-                        self.page_size == 1 else common_params.mPT[
-                            (k_index * qk_params.tiled_mma_qk.thr_id.shape +
-                             common_params.blk_coord[0]) * page_per_tile + i])
+            page_idx = (k_index if self.mma_qk_tiler[1] //
+                        self.page_size == 1 else
+                        (k_index * qk_params.tiled_mma_qk.thr_id.shape +
+                         common_params.blk_coord[0]) * page_per_tile + i)
+            # A partial K tile can extend beyond the allocated page table.
+            # Its masked lanes still issue TMA loads, so use a valid page.
+            k_idx[i] = 0
+            if page_idx < common_params.mPT.shape[0]:
+                k_idx[i] = common_params.mPT[page_idx]
         # load q once at first iteration
         load_q_pipeline = common_params.load_q_pipeline
         if load_q:
@@ -2705,8 +2710,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         k_idx = cute.make_rmem_tensor(cute.make_layout(page_per_tile),
                                       cutlass.Int32)
         for i in cutlass.range_constexpr(page_per_tile):
-            k_idx[i] = (common_params.mPT[k_index] if page_per_tile == 1 else
-                        common_params.mPT[k_index * page_per_tile + i])
+            page_idx = k_index * page_per_tile + i
+            k_idx[i] = 0
+            if page_idx < common_params.mPT.shape[0]:
+                k_idx[i] = common_params.mPT[page_idx]
         # get the mbar ptr from pipeline.
         tma_bar_ptr = common_params.load_v_pipeline.producer_get_barrier(
             load_v_producer_state)
