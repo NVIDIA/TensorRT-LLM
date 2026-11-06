@@ -37,12 +37,15 @@ from __future__ import annotations
 import os
 import unittest
 from copy import deepcopy
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Type
 from unittest import mock
 
+import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 # Gemma4 requires transformers>=5.5.0 (native Gemma4 config/model classes).
 pytest.importorskip(
@@ -63,7 +66,9 @@ from transformers.models.gemma4.video_processing_gemma4 import Gemma4VideoProces
 from tensorrt_llm._torch.model_config import ModelConfig  # noqa: E402
 from tensorrt_llm._torch.models.modeling_gemma4_unified import (  # noqa: E402
     Gemma4UnifiedForConditionalGeneration,
+    Gemma4UnifiedImageProcessor,
     Gemma4UnifiedInputProcessor,
+    Gemma4UnifiedProcessorShim,
 )
 from tensorrt_llm._torch.models.modeling_gemma4_vision import Gemma4VisionModel  # noqa: E402
 from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
@@ -74,8 +79,10 @@ from tensorrt_llm._torch.models.modeling_gemma4mm import (  # noqa: E402
 )
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin  # noqa: E402
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (  # noqa: E402
+    VisionNormalization,
     find_input_mm_embeds,
     get_multimodal_embeddings,
+    vision_normalization_from_processor,
 )
 from tensorrt_llm.inputs.multimodal import (  # noqa: E402
     MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
@@ -306,6 +313,285 @@ def _with_item_metadata(multimodal_data: dict, processor: Gemma4InputProcessor) 
     metadata = processor.get_mm_item_metadata([], multimodal_data)
     multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
     return MultimodalParams(multimodal_data=multimodal_data)
+
+
+def _make_normalization_processor(image_processor, dtype=torch.bfloat16, *, manual=False):
+    processor = Gemma4InputProcessor.__new__(Gemma4InputProcessor)
+    processor._image_processor = image_processor
+    processor._processor = None
+    processor._dtype = dtype
+    processor._vision_gpu_normalize = True
+    processor._tokenizer = lambda *args, **kwargs: {"input_ids": torch.tensor([[1]])}
+    if image_processor is not None and not manual:
+
+        def process(*, text, images, return_tensors, **kwargs):
+            output = image_processor(images=images, return_tensors=return_tensors, **kwargs)
+            output["input_ids"] = torch.tensor([[1]])
+            return output
+
+        processor._processor = process
+    return processor
+
+
+def _encode_normalization_buckets(buckets, modality="image"):
+    model = SimpleNamespace(
+        _get_image_features=lambda **kwargs: kwargs["pixel_values"].flatten(0, 1),
+        embed_audio=None,
+    )
+    return Gemma4MultimodalModelBase.encode_multimodal_inputs(
+        model, [MultimodalParams(multimodal_data={modality: bucket}) for bucket in buckets]
+    )
+
+
+def _make_vision_normalization() -> VisionNormalization:
+    normalization = vision_normalization_from_processor(
+        [Image.new("RGB", (1, 1))], Gemma4ImageProcessor(), torch.float32
+    )
+    assert normalization is not None
+    return normalization
+
+
+@pytest.mark.parametrize("device", [pytest.param("cpu", marks=pytest.mark.cpu_only), "cuda"])
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
+def test_gemma4_vision_gpu_normalize_unified_shim(device, producer_dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required for device normalization exactness")
+    image_processor = Gemma4UnifiedImageProcessor(
+        max_soft_tokens=70,
+        do_resize=False,
+        do_normalize=True,
+        image_mean=[0.2, 0.4, 0.6],
+        image_std=[0.1, 0.3, 0.7],
+    )
+    tokenizer = mock.Mock(return_value={"input_ids": torch.tensor([[1]])})
+    tokenizer.convert_tokens_to_ids.return_value = 1
+    processor = _make_normalization_processor(image_processor)
+    processor._processor = Gemma4UnifiedProcessorShim(
+        feature_extractor=None,
+        image_processor=image_processor,
+        tokenizer=tokenizer,
+        video_processor=None,
+    )
+    values = np.arange(48 * 48 * 3, dtype=np.uint16).reshape(48, 48, 3) % 256
+    inputs = {
+        "prompt": "<|image|>",
+        "multi_modal_data": {"image": [Image.fromarray(values.astype(np.uint8))]},
+    }
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(producer_dtype)
+        with mock.patch.object(
+            image_processor, "preprocess", wraps=image_processor.preprocess
+        ) as preprocess:
+            _, output = processor.call_with_text_prompt(inputs, None)
+        assert preprocess.call_count == 1
+        processor._vision_gpu_normalize = False
+        _, baseline = processor.call_with_text_prompt(inputs, None)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    bucket = output["multimodal_data"]["image"]
+    assert bucket["pixel_values"].dtype == torch.uint8
+    assert "vision_normalization" in bucket
+    expected = baseline["multimodal_data"]["image"]["pixel_values"]
+    bucket = {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in bucket.items()
+    }
+    actual = _encode_normalization_buckets([bucket]).reshape(expected.shape).cpu()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("processor_class", [Gemma4ImageProcessor, Gemma4UnifiedImageProcessor])
+@pytest.mark.parametrize("case", ["off", "gray", "rgba", "float", "tensor", "kwargs", "noop"])
+def test_gemma4_vision_gpu_normalize_fallback(processor_class, case):
+    image_processor = processor_class(max_soft_tokens=70, do_resize=False)
+    processor = _make_normalization_processor(image_processor)
+    image = Image.new("RGB", (48, 48))
+    inputs = {"prompt": "image", "multi_modal_data": {"image": [image]}}
+    if case == "off":
+        processor._vision_gpu_normalize = False
+    elif case in ("gray", "rgba"):
+        inputs["multi_modal_data"]["image"] = [image.convert("L" if case == "gray" else "RGBA")]
+    elif case == "float":
+        inputs["multi_modal_data"]["image"] = [np.zeros((48, 48, 3), dtype=np.float32)]
+    elif case == "tensor":
+        inputs["multi_modal_data"]["image"] = [torch.zeros(3, 48, 48, dtype=torch.uint8)]
+    elif case == "kwargs":
+        inputs["mm_processor_kwargs"] = {"image_mean": [0.5] * 3}
+    elif case == "noop":
+        image_processor.do_rescale = image_processor.do_normalize = False
+    _, output = processor.call_with_text_prompt(inputs, None)
+    bucket = output["multimodal_data"]["image"]
+    assert "vision_normalization" not in bucket
+    processor._vision_gpu_normalize = False
+    _, baseline = processor.call_with_text_prompt(inputs, None)
+    assert torch.equal(bucket["pixel_values"], baseline["multimodal_data"]["image"]["pixel_values"])
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("processor_class", [Gemma4ImageProcessor, Gemma4UnifiedImageProcessor])
+def test_gemma4_vision_gpu_normalize_mixed_fallback(processor_class):
+    image_processor = processor_class(max_soft_tokens=70, do_resize=False)
+    processor = _make_normalization_processor(image_processor)
+    # An empty video list exercises the existing mixed preprocessing path without frame decoding.
+    inputs = {
+        "prompt": "image and video",
+        "multi_modal_data": {"image": [Image.new("RGB", (48, 48))], "video": []},
+    }
+    _, output = processor.call_with_text_prompt(inputs, None)
+    assert "vision_normalization" not in output["multimodal_data"]["image"]
+    assert Gemma4ForConditionalGeneration.supports_vision_gpu_normalize
+    assert Gemma4UnifiedForConditionalGeneration.supports_vision_gpu_normalize
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("processor_class", [Gemma4ImageProcessor, Gemma4UnifiedImageProcessor])
+def test_gemma4_vision_gpu_normalize_manual_fallback(processor_class):
+    processor = _make_normalization_processor(
+        processor_class(max_soft_tokens=70, do_resize=False), manual=True
+    )
+    inputs = {"prompt": "image", "multi_modal_data": {"image": [Image.new("RGB", (48, 48))]}}
+    _, output = processor.call_with_text_prompt(inputs, None)
+    bucket = output["multimodal_data"]["image"]
+    assert bucket["pixel_values"].dtype == torch.uint8
+    processor._vision_gpu_normalize = False
+    _, baseline = processor.call_with_text_prompt(inputs, None)
+    expected = baseline["multimodal_data"]["image"]["pixel_values"]
+    assert torch.equal(_encode_normalization_buckets([bucket]).reshape(expected.shape), expected)
+
+
+@pytest.mark.parametrize("device", [pytest.param("cpu", marks=pytest.mark.cpu_only), "cuda"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
+@pytest.mark.parametrize("processor_class", [Gemma4ImageProcessor, Gemma4UnifiedImageProcessor])
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {},
+        {
+            "do_normalize": True,
+            "image_mean": [0.2, 0.4, 0.6],
+            "image_std": [0.1, 0.3, 0.7],
+            "rescale_factor": 1 / 127,
+        },
+        {
+            "do_rescale": False,
+            "do_normalize": True,
+            "image_mean": [1.0, 2.0, 3.0],
+            "image_std": [2.0, 3.0, 4.0],
+        },
+    ],
+)
+def test_gemma4_vision_gpu_normalize_all_uint8(
+    processor_class, settings, dtype, device, producer_dtype
+):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required for device normalization exactness")
+    image_processor = processor_class(max_soft_tokens=70, do_resize=False, **settings)
+    processor = _make_normalization_processor(image_processor, dtype)
+    values = np.arange(48 * 96, dtype=np.uint16).reshape(48, 96) % 256
+    image = Image.fromarray(
+        np.stack([values, (values + 85) % 256, (values + 171) % 256], -1).astype(np.uint8)
+    )
+    inputs = {"prompt": "image", "multi_modal_data": {"image": [image]}}
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(producer_dtype)
+        _, output = processor.call_with_text_prompt(inputs, None)
+        processor._vision_gpu_normalize = False
+        _, baseline = processor.call_with_text_prompt(inputs, None)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    bucket = output["multimodal_data"]["image"]
+    assert bucket["pixel_values"].dtype == torch.uint8
+    assert "vision_normalization" in bucket
+    expected = baseline["multimodal_data"]["image"]["pixel_values"]
+    bucket = {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in bucket.items()
+    }
+    actual = _encode_normalization_buckets([bucket]).reshape(expected.shape).cpu()
+    assert actual.dtype == expected.dtype
+    assert torch.equal(actual, expected)
+    # Raw and already-normalized requests can share an encoder call.
+    cpu_bucket = {"pixel_values": expected.to(device)}
+    mixed = _encode_normalization_buckets([bucket, cpu_bucket]).cpu()
+    assert torch.equal(mixed, torch.cat([expected, expected]).flatten(0, 1))
+
+
+@pytest.mark.parametrize("device", [pytest.param("cpu", marks=pytest.mark.cpu_only), "cuda"])
+@pytest.mark.parametrize("processor_class", [Gemma4ImageProcessor, Gemma4UnifiedImageProcessor])
+def test_gemma4_vision_gpu_normalize_real_image(processor_class, device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required for device normalization exactness")
+    path = Path(
+        os.environ.get(
+            "TRTLLM_TEST_IMAGE",
+            Path(__file__).parents[3] / "integration/test_input_files/merlion.png",
+        )
+    )
+    if not path.is_file() or path.read_bytes().startswith(
+        b"version https://git-lfs.github.com/spec/"
+    ):
+        pytest.skip("Real-image fixture is not materialized")
+    processor = _make_normalization_processor(processor_class(max_soft_tokens=70))
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    inputs = {"prompt": "image", "multi_modal_data": {"image": [image]}}
+    _, output = processor.call_with_text_prompt(inputs, None)
+    bucket = output["multimodal_data"]["image"]
+    processor._vision_gpu_normalize = False
+    _, baseline = processor.call_with_text_prompt(inputs, None)
+    expected = baseline["multimodal_data"]["image"]["pixel_values"]
+    bucket = {
+        key: value.to(device) if isinstance(value, torch.Tensor) else value
+        for key, value in bucket.items()
+    }
+    actual = _encode_normalization_buckets([bucket]).reshape(expected.shape).cpu()
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("device", [pytest.param("cpu", marks=pytest.mark.cpu_only), "cuda"])
+@pytest.mark.parametrize("producer_dtype", [torch.float32, torch.float64])
+def test_gemma4_vision_gpu_normalize_video_uint8(device, producer_dtype):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required for device normalization exactness")
+    from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedVideoProcessor
+
+    values = torch.arange(3 * 48 * 96, dtype=torch.int64).reshape(3, 48, 96).remainder(256).byte()
+    for video_class in (Gemma4VideoProcessor, Gemma4UnifiedVideoProcessor):
+        video_processor = video_class(
+            max_soft_tokens=70,
+            do_resize=False,
+            do_normalize=True,
+            image_mean=[0.2, 0.4, 0.6],
+            image_std=[0.1, 0.3, 0.7],
+        )
+        frames = [Image.fromarray(values.permute(1, 2, 0).numpy())] * 2
+        processor = _make_normalization_processor(None)
+        processor._processor = SimpleNamespace(video_processor=video_processor)
+        inputs = {"prompt": "<|video|>", "multi_modal_data": {"video": [frames]}}
+        previous_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(producer_dtype)
+            _, raw = processor.call_with_text_prompt(inputs, None)
+            processor._vision_gpu_normalize = False
+            _, baseline = processor.call_with_text_prompt(inputs, None)
+        finally:
+            torch.set_default_dtype(previous_dtype)
+        bucket = raw["multimodal_data"]["video"]
+        assert bucket["pixel_values"].dtype == torch.uint8
+        assert "vision_normalization" in bucket
+        expected = baseline["multimodal_data"]["video"]["pixel_values"]
+        bucket = {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in bucket.items()
+        }
+        actual = (
+            _encode_normalization_buckets([bucket], modality="video").reshape(expected.shape).cpu()
+        )
+        assert torch.equal(actual, expected)
 
 
 # Mirror the engine's ``encoder_max_num_tokens`` runtime budget. The encoder
@@ -920,27 +1206,39 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         torch.testing.assert_close(second, first)
         self.assertEqual(len(model._multimodal_encoder_cache), 1)
 
+    @pytest.mark.cpu_only
     def test_encoder_cache_partial_hit_slices_gemma4_image_input(self):
         """A partial hit encodes only the missing Gemma4 image."""
         model = _Gemma4EncoderCacheHarness()
         shared_hash = [1] * 8
-        model._get_or_encode_multimodal_embeddings(
-            [_make_keyed_image_param(item_hashes=[shared_hash])]
-        )
-
-        embeddings = model._get_or_encode_multimodal_embeddings(
-            [_make_keyed_image_param(item_hashes=[shared_hash, [2] * 8])]
-        )
+        normalization = _make_vision_normalization()
+        for hashes in ([shared_hash], [shared_hash, [2] * 8]):
+            param = _make_keyed_image_param(item_hashes=hashes)
+            image = param.multimodal_data["image"]
+            image["vision_normalization"] = normalization
+            image["pixel_values"] = torch.arange(len(hashes) * 3, dtype=torch.uint8).reshape(
+                len(hashes), 1, 3
+            )
+            with mock.patch.object(
+                type(model), "encode_multimodal_inputs", wraps=model.encode_multimodal_inputs
+            ) as encode:
+                embeddings = model._get_or_encode_multimodal_embeddings([param])
+            encoded_image = encode.call_args.args[0][0].multimodal_data["image"]
+            self.assertIs(encoded_image["vision_normalization"], normalization)
+            torch.testing.assert_close(encoded_image["pixel_values"], image["pixel_values"][-1:])
 
         self.assertEqual(model.encoder_calls, 2)
         torch.testing.assert_close(embeddings[:2], torch.ones(2, model.embedding_dim))
         torch.testing.assert_close(embeddings[2:], torch.full((2, model.embedding_dim), 2.0))
         self.assertEqual(len(model._multimodal_encoder_cache), 2)
 
+    @pytest.mark.cpu_only
     def test_build_multimodal_encoder_input_slices_gemma4_image_metadata(self):
         """Gemma4 image position metadata follows the selected images."""
         param = _make_keyed_image_param(item_hashes=[[0] * 8, [1] * 8, [2] * 8])
         source_image = param.multimodal_data["image"]
+        source_image["pixel_values"] = torch.arange(9, dtype=torch.uint8).reshape(3, 1, 3)
+        source_image["vision_normalization"] = _make_vision_normalization()
 
         residual = _Gemma4EncoderCacheHarness().build_multimodal_encoder_input(param, [2, 0])
 
@@ -952,6 +1250,7 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
             residual_image["image_position_ids"], source_image["image_position_ids"][[2, 0]]
         )
         self.assertEqual(residual_image["image_seq_lens"], [1, 1])
+        self.assertIs(residual_image["vision_normalization"], source_image["vision_normalization"])
 
     def test_build_multimodal_encoder_input_slices_gemma4_audio_input(self):
         """Gemma4 audio features and their mask remain item-aligned."""
@@ -978,15 +1277,17 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         torch.testing.assert_close(residual_audio["audio_features_mask"], audio_mask[[2, 0]])
         assert residual_audio["shared_stats"] is shared_stats
 
+    @pytest.mark.cpu_only
     def test_build_multimodal_encoder_input_slices_whole_videos(self):
         """A video item is the run of flattened frames its `num_frames` entry declares."""
         param = MultimodalParams(
             multimodal_data={
                 "video": {
-                    "pixel_values": torch.arange(6.0).reshape(6, 1, 1),
+                    "pixel_values": torch.arange(18, dtype=torch.uint8).reshape(6, 1, 3),
                     "image_position_ids": torch.arange(6).reshape(6, 1, 1).expand(6, 1, 2),
                     "image_seq_lens": [10, 11, 12, 13, 14, 15],
                     "num_frames": [2, 1, 3],
+                    "vision_normalization": _make_vision_normalization(),
                 },
                 MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
                     [("video", 0), ("video", 1), ("video", 2)],
@@ -1000,10 +1301,15 @@ class TestGemma4ForConditionalGeneration(unittest.TestCase):
         )
 
         video = residual.multimodal_data["video"]
-        self.assertEqual(video["pixel_values"].flatten().tolist(), [3.0, 4.0, 5.0, 0.0, 1.0])
+        torch.testing.assert_close(
+            video["pixel_values"], param.multimodal_data["video"]["pixel_values"][[3, 4, 5, 0, 1]]
+        )
         self.assertEqual(video["image_position_ids"][:, 0, 0].tolist(), [3, 4, 5, 0, 1])
         self.assertEqual(video["image_seq_lens"], [13, 14, 15, 10, 11])
         self.assertEqual(video["num_frames"], [3, 2])
+        self.assertIs(
+            video["vision_normalization"], param.multimodal_data["video"]["vision_normalization"]
+        )
 
     def test_item_scheduling_encodes_selected_items_in_scheduler_order(self):
         """Selected items are sliced, encoded once per modality run, and split back per item."""

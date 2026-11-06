@@ -12,6 +12,7 @@ from .sol_consensus import METHODS
 PERF_KEYS = {
     "enabled", "model", "target", "identity_configs", "workload", "spools", "dev_spools",
     "env_script", "campaign", "sister_engines", "wall", "configs", "goal", "sol",
+    "source_workspace",
 }  # fmt: skip
 #: Keys the campaign no longer reads: it starts once the core holds and measures one baseline,
 #: with no stock reference beside it and no repeat of it. A spec that still has one is run
@@ -45,9 +46,17 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
     con = workload.get("concurrency", [1])
     if not (isinstance(con, list) and con and all(isinstance(c, int) and c > 0 for c in con)):
         errors.append("perf.workload.concurrency: a non-empty list of positive integers")
+    if workload.get("client", "random") != "random":
+        errors.append("perf.workload.client: another client runs only in a perf.configs entry")
     for key in ("identity_configs", "spools"):
         if key in perf and not isinstance(perf[key], list):
             errors.append(f"perf.{key}: a list")
+    source = perf.get("source_workspace")
+    if source is not None and not (isinstance(source, str) and source.strip()):
+        errors.append(
+            "perf.source_workspace: the path of the workspace whose core verdicts establish the "
+            "tested source, e.g. the onboarding's"
+        )
     errors += _validate_configs(perf.get("configs"))
     errors += _validate_goal(perf)
     sol = perf.get("sol")
@@ -79,6 +88,17 @@ def validate_perf_block(data: Mapping[str, Any]) -> list[str]:
         errors += validate_campaign_accuracy(campaign.get("accuracy"))
         errors += _validate_max_hours(campaign.get("max_hours"))
         errors += _validate_checkpoints(campaign)
+        if not _fraction(campaign.get("retry_wait_s", 0)):
+            errors.append(
+                "perf.campaign.retry_wait_s: seconds the stage waits out a transient deferral "
+                "before it resumes in process, >= 0"
+            )
+        retries = campaign.get("max_retries", 0)
+        if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+            errors.append(
+                "perf.campaign.max_retries: how many transient deferrals one process waits out, "
+                "an integer >= 0 (0 ends the process at the first)"
+            )
         tolerance = campaign.get("ttft_tolerance", 0.1)
         if tolerance is not None and (
             isinstance(tolerance, bool) or not isinstance(tolerance, (int, float)) or tolerance < 0
@@ -217,7 +237,20 @@ def _validate_goal(perf: Mapping[str, Any]) -> list[str]:
 
 
 CONFIG_KEYS = {"name", "workload", "identity_configs", "llm_api_options", "constraint"}
-CONSTRAINT_KEYS = {"tpot_ms_max", "ttft_ms_max"}
+CONSTRAINT_KEYS = {"tpot_ms_max", "ttft_ms_max", "kv_hit_pct_min"}
+#: Constraints on a metric only one client reports: the KV-cache hit rate of a trace replay.
+CLIENT_CONSTRAINTS = {"kv_hit_pct_min": "agentx"}
+#: ``workload.client``: ``random`` (benchmark_serving, the default) or ``agentx`` (trace replay).
+CLIENTS = ("random", "agentx")
+#: The AgentX keys of a perf config's workload and what each must be.
+AGENTX_WORKLOAD_KEYS = {
+    "dataset": "a corpus aiperf names (--public-dataset)",
+    "duration_s": "a positive integer of seconds",
+    "warmup_per_lane": "a positive integer",
+    "max_context_length": "a positive integer of tokens",
+    "hf_home": "a path",
+    "extra_args": "a list of aiperf arguments, each a string (quote a number: '42')",
+}
 
 
 def _validate_configs(configs: Any) -> list[str]:
@@ -244,18 +277,45 @@ def _validate_configs(configs: Any) -> list[str]:
         con = workload.get("concurrency")
         if not (isinstance(con, list) and con and all(isinstance(c, int) and c > 0 for c in con)):
             errors.append(f"{where}.workload.concurrency: a non-empty list of positive integers")
+        errors += _validate_client(workload, f"{where}.workload")
         constraint = entry.get("constraint") or {}
-        errors += [
-            f"{where}.constraint.{k}: one of {sorted(CONSTRAINT_KEYS)}"
-            for k in constraint
-            if k not in CONSTRAINT_KEYS
-        ]
+        for key in constraint:
+            if key not in CONSTRAINT_KEYS:
+                errors.append(f"{where}.constraint.{key}: one of {sorted(CONSTRAINT_KEYS)}")
+            elif key in CLIENT_CONSTRAINTS and workload.get("client") != CLIENT_CONSTRAINTS[key]:
+                errors.append(
+                    f"{where}.constraint.{key}: only with client: {CLIENT_CONSTRAINTS[key]}, "
+                    "whose points report it"
+                )
     if len(set(names)) != len(names):
         errors.append("perf.configs: names must be unique")
     return errors
 
 
+def _validate_client(workload: Mapping[str, Any], where: str) -> list[str]:
+    """A workload's ``client`` and, under ``agentx``, its AgentX keys."""
+    client = workload.get("client", "random")
+    if client not in CLIENTS:
+        return [f"{where}.client: one of {list(CLIENTS)}"]
+    present = [k for k in AGENTX_WORKLOAD_KEYS if k in workload]
+    if client != "agentx":
+        return [f"{where}.{k}: only with client: agentx" for k in present]
+    errors = []
+    for key in present:
+        value = workload[key]
+        if key in ("duration_s", "warmup_per_lane", "max_context_length"):
+            ok = isinstance(value, int) and not isinstance(value, bool) and value > 0
+        elif key == "extra_args":
+            ok = isinstance(value, list) and all(isinstance(a, str) for a in value)
+        else:
+            ok = isinstance(value, str) and bool(value.strip())
+        if not ok:
+            errors.append(f"{where}.{key}: {AGENTX_WORKLOAD_KEYS[key]}")
+    return errors
+
+
 __all__ = [
+    "AGENTX_WORKLOAD_KEYS",
     "CAMPAIGN_ACCURACY_KEYS",
     "PERF_KEYS",
     "campaign_max_hours",

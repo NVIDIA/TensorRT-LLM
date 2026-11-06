@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager
     from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
     from tensorrt_llm._torch.speculative.spec_tree_manager import SpecTreeManager
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
     from .inputs import DecoderInputBuffers
 
@@ -143,6 +144,7 @@ class DecoderMetadata:
         kv_cache_manager.configure_decode_shortcuts(
             skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
+            block_ids_from_views=msa.block_ids_from_views,
         )
 
     def setup_speculative(
@@ -154,6 +156,13 @@ class DecoderMetadata:
             self._config, self.model.config, spec_resource_manager, self.mapping
         )
         self.spec_metadata.skip_greedy_rng_upload = self.runtime_hooks.skip_greedy_rng_upload
+        self.spec_metadata.pack_rng_uploads = self.runtime_hooks.pack_spec_rng_uploads
+        if self.runtime_hooks.pack_spec_rng_uploads:
+            logger.info("[M3 host] sampled-step Philox uploads staged into the step-input pack")
+        if self.runtime_hooks.spec_small_h2d:
+            logger.info(
+                "[M3 host] spec step small uploads off the boundary (accepted counts packed, static slot ids)"
+            )
         return self.spec_metadata
 
     @property
@@ -165,20 +174,21 @@ class DecoderMetadata:
 
     @torch.inference_mode()
     def _warmup_dspark_ragged_compressor_metadata(self) -> None:
-        """Compile DSv4 ragged metadata for a non-CUDA-graph batch size.
+        """Compile the DSv4 compressor metadata helpers before the hang detector starts.
 
-        Whole-model CUDA-graph warmup exercises only configured graph batch
-        sizes. The first mixed attention-DP iteration can contain an
-        intermediate number of generation requests, which otherwise triggers
-        a long ``torch.compile`` specialization immediately before a TP
-        collective. Ranks without generation work reach the collective first
-        and can trip the executor hang detector while their peers compile.
+        ``_compute_gen_compressed_position_ids`` and ``_compute_compressed_mask``
+        read the batch composition from device tensors, so each compiles once and
+        that graph serves every batch mix. The one compile must not land on the
+        first mixed attention-DP iteration: it runs right before a TP collective,
+        and ranks without generation work reach the collective first and can trip
+        the executor hang detector while their peers compile.
 
-        One non-bucket probe forces the dynamic specialization during engine
-        warmup, before the hang detector starts. It uses the metadata's real
-        persistent buffers so the tensor shape and stride guards match serving.
-        Those buffers are created under inference mode, so all probe and
-        cleanup mutations must run under the same mode.
+        This probe calls both helpers once during engine warmup, with a number of
+        generation requests outside the CUDA-graph batch sizes. It uses the
+        metadata's real persistent buffers so the tensor shape and stride guards
+        match serving, and restores them afterwards. Those buffers are created
+        under inference mode, so all probe and cleanup mutations must run under
+        the same mode.
         """
         if not self._ragged_verification_enabled:
             return
@@ -192,6 +202,7 @@ class DecoderMetadata:
             "compressed_position_ids_cuda",
             "cu_new_comp_kv_cuda",
             "batch_size_cuda",
+            "gen_position_params_cuda",
             "max_draft_tokens",
             "new_comp_kv_lens_cuda",
             "past_kv_lens_cuda",
@@ -220,9 +231,9 @@ class DecoderMetadata:
         compress_ratios = [int(ratio) for ratio in metadata._compress_ratios_sorted]
         tokens_per_generation = 1 + int(metadata.max_draft_tokens)
         total_compressed_tokens = {}
-        gen_output_offsets = {ratio: 0 for ratio in compress_ratios}
         prepared_ratios = []
         original_batch_size = metadata.batch_size_cuda.clone()
+        original_gen_params = metadata.gen_position_params_cuda.clone()
         try:
             for ratio in compress_ratios:
                 compressed_tokens_per_generation = (tokens_per_generation + ratio - 1) // ratio
@@ -258,18 +269,19 @@ class DecoderMetadata:
                 cu_new_comp[: num_generations + 1].mul_(compressed_tokens_per_generation)
 
             logger.info(
-                "DSpark ragged metadata warmup: compiling one non-graph "
-                f"shape with {num_generations} generation requests"
+                "DSpark ragged metadata warmup: compiling the compressor metadata "
+                f"helpers with {num_generations} generation requests"
             )
+            gen_params = metadata.gen_position_params_cuda
+            gen_params[0].fill_(0)
+            gen_params[1].fill_(num_generations)
+            gen_params[2].fill_(tokens_per_generation)
             metadata._compute_gen_compressed_position_ids(
                 metadata.past_kv_lens_cuda,
                 metadata.cu_new_comp_kv_cuda,
                 metadata.compressed_position_ids_cuda,
-                0,
-                num_generations,
-                tokens_per_generation,
+                gen_params,
                 compress_ratios,
-                gen_output_offsets,
             )
             metadata.batch_size_cuda.fill_(num_generations)
             metadata._compute_compressed_mask(
@@ -282,6 +294,7 @@ class DecoderMetadata:
             torch.cuda.synchronize()
         finally:
             metadata.batch_size_cuda.copy_(original_batch_size)
+            metadata.gen_position_params_cuda.copy_(original_gen_params)
             for ratio in prepared_ratios:
                 total_tokens = total_compressed_tokens[ratio]
                 metadata.past_kv_lens_cuda[ratio][:num_generations].zero_()
@@ -372,7 +385,11 @@ def update_spec_metadata(
 
 
 def sync_group_all_greedy_sample(
-    spec_metadata: SpecMetadata, mapping: Mapping, dist: Distributed | None
+    spec_metadata: SpecMetadata,
+    mapping: Mapping,
+    dist: Distributed | None,
+    *,
+    confidence_enabled: bool = False,
 ) -> None:
     """All-gather the per-rank greedy flags and store the group AND.
 
@@ -387,18 +404,45 @@ def sync_group_all_greedy_sample(
     ``all_rank_num_tokens`` exchange, which runs in ``prepare_inputs`` --
     after the graph key, too late for the key to see the synced value.
     """
-    # enable_lm_head_tp_in_adp implies enable_attention_dp (asserted in
-    # Mapping.__init__), so ADP needs no separate check here.
-    if not (mapping.enable_lm_head_tp_in_adp and spec_metadata.use_rejection_sampling):
+    # Confidence needs the same group-uniform rejection decision even without
+    # LM-head TP. Feature-off execution retains the existing gate.
+    if not (
+        spec_metadata.use_rejection_sampling
+        and (mapping.enable_lm_head_tp_in_adp or confidence_enabled)
+    ):
         return
     local_flag = bool(spec_metadata.is_all_greedy_sample)
-    all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
-    spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    if mapping.tp_size > 1:
+        all_flags = dist.tp_allgather_int64([local_flag])[:, 0]
+        spec_metadata.group_all_greedy_sample = bool(all_flags.all())
+    else:
+        spec_metadata.group_all_greedy_sample = local_flag
     # Also overwrite the live flag directly: this iteration's scan already
     # ran (update_is_all_greedy_sample just returned) and the CUDA graph
     # key reads the flag next -- the stored override only takes effect on
     # the NEXT rescan (populate), which is after key selection.
     spec_metadata.is_all_greedy_sample = spec_metadata.group_all_greedy_sample
+
+
+def supports_advanced_draft_sampling(spec_config: DecodingBaseConfig | None) -> bool:
+    """Whether the engine may capture an advanced draft-sampling variant."""
+    return not (
+        getattr(spec_config, "enable_confidence_scheduling", False)
+        and spec_config.use_rejection_sampling
+    )
+
+
+def validate_dspark_draft_sampling(
+    spec_metadata: SpecMetadata,
+    *,
+    confidence_enabled: bool,
+) -> None:
+    """Reject unsupported group-uniform sampling before graph lookup."""
+    if confidence_enabled and spec_metadata.wants_advanced_draft_sampling:
+        raise ValueError(
+            "DSpark confidence scheduling does not support advanced rejection "
+            "draft sampling: confidence is conditioned on the greedy proposal prefix"
+        )
 
 
 def set_spec_metadata_all_rank_num_tokens(

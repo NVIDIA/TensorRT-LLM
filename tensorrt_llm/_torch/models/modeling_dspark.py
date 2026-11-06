@@ -1424,6 +1424,15 @@ class DSv4DSparkDraftModel(nn.Module):
         new_qc = cls._draft_normalized_quant_config(model_config)
         resolved_moe_backend = None
         if draft_moe_backend is not None:
+            draft_qcd = new_qcd if new_qcd is not None else model_config.quant_config_dict or {}
+            if any(
+                getattr(draft_qcd.get(f"model.layers.{base + s}.mlp.experts"), "quant_algo", None)
+                == QuantAlgo.NVFP4_PLUS
+                for s in range(num_stages)
+            ):
+                ModelConfig.require_nvfp4_plus_moe_backend(
+                    draft_moe_backend, "speculative_config.moe_backend"
+                )
             architectures = getattr(model_config.pretrained_config, "architectures", None) or []
             architecture = architectures[0] if architectures else ""
             draft_quant_config = new_qc if new_qc is not None else model_config.quant_config
@@ -2111,13 +2120,28 @@ class DSv4DSparkForCausalLM(nn.Module):
         )
 
     def _prepare_confidence_head_for_load(self, weights: Dict) -> None:
-        """Match the projection's optional bias to the checkpoint before loading."""
-        head = self.dspark_model.mtp_layers[-1].confidence_head
-        bias_key = f"mtp_layers.{self.num_stages - 1}.confidence_head.proj.bias"
-        if head is not None and bias_key in weights and head.proj.bias is None:
+        """Prepare and validate the embedded confidence namespace before loading."""
+        last = self.dspark_model.mtp_layers[-1]
+        head = last.confidence_head
+        prefix = f"mtp_layers.{self.num_stages - 1}.confidence_head."
+        module_weights = {
+            name[len(prefix) :]: value for name, value in weights.items() if name.startswith(prefix)
+        }
+        if head is not None and not module_weights:
+            # A checkpoint without a trained confidence head still serves static
+            # DSpark; drop the untrained head instead of rejecting the load.
+            last.confidence_head = head = None
+        if head is None:
+            if module_weights:
+                raise ValueError("DSpark confidence head checkpoint has no constructed head")
+            return
+        if "proj.bias" in module_weights and head.proj.bias is None:
             # This runs before weight loading and graph capture. Empty storage
             # avoids consuming RNG or reinitializing the existing projection.
             head.proj.bias = nn.Parameter(head.proj.weight.new_empty(head.proj.out_features))
+        # The generic V4 loader skips this parameter-free head container and
+        # visits its Linear child, so strict validation must run at this seam.
+        head._validate_checkpoint_weights(module_weights)
 
     def load_weights(self, weights: Dict, weight_mapper=None, **kwargs):
         """Load the ``mtp.*`` draft weights from the (full) checkpoint dict.

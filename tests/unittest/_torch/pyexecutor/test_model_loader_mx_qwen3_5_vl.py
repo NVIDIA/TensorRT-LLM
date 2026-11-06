@@ -25,7 +25,9 @@ from torch import nn
 from utils.post_transform_qualification import (
     AllReduceStub,
     PostTransformQualificationCase,
+    assert_every_parameter_was_loaded,
     assert_post_transform_lifecycle_equivalent,
+    keep_factory_parameters,
     module_state_snapshot,
     mx_canonical_parameter_catalog,
 )
@@ -229,6 +231,7 @@ def _qwen3_5_vl_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
@@ -308,31 +311,18 @@ def _embedding_logits(model: nn.Module) -> torch.Tensor:
     return llm.lm_head(llm.model.embed_tokens(token_ids))
 
 
-def _assert_every_parameter_was_loaded(producer: nn.Module, factory_model: nn.Module) -> None:
-    """Assert that `prepare_producer` overwrote every parameter of the factory fill.
-
-    The lifecycle probes then compare bytes that came from the checkpoint
-    through the weight mapper rather than the factory's placeholder values.
-    """
-    # Look parameters up by the factory's canonical names: after
-    # `setup_aliases()` the producer also reaches some of them through
-    # `next_layer_layernorm` alias names.
-    unchanged = [
-        name
-        for name, factory_parameter in factory_model.named_parameters()
-        if torch.equal(producer.get_parameter(name), factory_parameter)
-    ]
-    assert unchanged == [], f"Parameters not written by the producer load: {unchanged}"
-
-
 def _lifecycle_case(
     checkpoint_dir: Path,
     state_dict: dict[str, torch.Tensor],
     *,
     tp_size: int = 1,
     rank: int = 0,
-) -> PostTransformQualificationCase:
-    """Build the lifecycle case whose producer runs the real HF load of `state_dict`."""
+) -> tuple[PostTransformQualificationCase, dict[str, torch.Tensor]]:
+    """Build the lifecycle case whose producer runs the real HF load of `state_dict`.
+
+    Also returns the factory parameters that the load overwrites, for
+    `assert_every_parameter_was_loaded`.
+    """
     output_probes = [
         ("linear-outputs", _linear_outputs),
         ("vision-patch-embed", _vision_patch_embed_output),
@@ -340,7 +330,10 @@ def _lifecycle_case(
     ]
     if tp_size == 1:
         output_probes.append(("embedding-logits", _embedding_logits))
-    return PostTransformQualificationCase(
+    prepare_producer, factory_parameters = keep_factory_parameters(
+        _hf_checkpoint_loader(state_dict)
+    )
+    case = PostTransformQualificationCase(
         profile_id=_PROFILE_ID,
         model_factory=lambda: _tiny_qwen3_5_vl_model(checkpoint_dir, tp_size=tp_size, rank=rank),
         unqualified_model_factory=lambda: _tiny_qwen3_5_vl_model(
@@ -355,8 +348,9 @@ def _lifecycle_case(
             ("module-state", module_state_snapshot),
         ),
         output_probes=tuple(output_probes),
-        prepare_producer=_hf_checkpoint_loader(state_dict),
+        prepare_producer=prepare_producer,
     )
+    return case, factory_parameters
 
 
 def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> None:
@@ -369,11 +363,10 @@ def test_qwen3_5_vl_profile_qualifies_full_staged_lifecycle(tmp_path: Path) -> N
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
     state_dict = _tiny_hf_state_dict()
 
-    producer, receiver = assert_post_transform_lifecycle_equivalent(
-        _lifecycle_case(checkpoint_dir, state_dict)
-    )
+    case, factory_parameters = _lifecycle_case(checkpoint_dir, state_dict)
+    producer, receiver = assert_post_transform_lifecycle_equivalent(case)
 
-    _assert_every_parameter_was_loaded(producer, _tiny_qwen3_5_vl_model(checkpoint_dir))
+    assert_every_parameter_was_loaded(producer, factory_parameters)
 
     # The producer's bytes come from the checkpoint through the weight mapper.
     for trtllm_name, hf_name in (
@@ -503,13 +496,12 @@ def test_qwen3_5_vl_profile_qualifies_tp2_rank_lifecycle(
     monkeypatch.setattr(modeling_qwen3_next_mod, "AllReduce", AllReduceStub)
     checkpoint_dir = _write_tiny_checkpoint_config(tmp_path / "ckpt")
 
-    producer, _receiver = assert_post_transform_lifecycle_equivalent(
-        _lifecycle_case(checkpoint_dir, _tiny_hf_state_dict(), tp_size=2, rank=rank)
+    case, factory_parameters = _lifecycle_case(
+        checkpoint_dir, _tiny_hf_state_dict(), tp_size=2, rank=rank
     )
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
 
-    _assert_every_parameter_was_loaded(
-        producer, _tiny_qwen3_5_vl_model(checkpoint_dir, tp_size=2, rank=rank)
-    )
+    assert_every_parameter_was_loaded(producer, factory_parameters)
 
     assert _runtime_config(producer) == _qwen3_5_vl_runtime_config(
         tp_size=2,

@@ -514,7 +514,9 @@ struct FmhaParams
         }
         else
         {
-            sparse.sparse_kv_cache_pool = kvCachePool;
+            sparse.sparse_kv_cache_pool = fwd.sparse_runtime_params.aux_kv_cache_pool_ptr.has_value()
+                ? reinterpret_cast<void*>(fwd.sparse_runtime_params.aux_kv_cache_pool_ptr.value())
+                : kvCachePool;
         }
         return sparse;
     }

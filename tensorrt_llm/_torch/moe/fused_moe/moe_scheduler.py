@@ -57,7 +57,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from .communication import DeepEP, DeepEPLowLatency, NcclEP, NVLinkOneSided, NVLinkTwoSided
 from .communication.nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 from .fused_moe_cutlass import raise_moe_lora_multichunk_unsupported
-from .impl_contract import MoECommPlan, MoERunContext, PreroutedRouting
+from .impl_contract import MoECommPlan, MoERunContext, MoESortTables, PreroutedRouting
 from .interface import FORCE_SEPARATED_ROUTING, MoESchedulerKind
 
 __all__ = [
@@ -496,24 +496,40 @@ class ExternalCommMoEScheduler(MoEScheduler):
         )
         supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
+        sort_tables = None
+        sorted_ids = None
         if requires_separated_routing:
             # ``MoEImplBase`` declines a fused route+quant path by default. The
             # conditions are the scheduler's: a fused result skips the separate
             # dispatch and carries no per-token scale to fold a router weight or
             # an EPLB layout into.
-            if (
-                supports_post_quant
-                and not moe._using_load_balancer()
+            # The fixed part of this is ConfigurableMoE.routed_ids_unchanged; it is
+            # spelled out here because ``routing_aux`` is per forward and tests may
+            # hand a namespace in for ``moe``.
+            routes_unchanged = (
+                not moe._using_load_balancer()
                 and not moe.apply_router_weight_on_input
                 and routing_aux is None
-            ):
-                # A fused route+quant reads x.
+            )
+            if supports_post_quant and routes_unchanged and isinstance(x, torch.Tensor):
+                # A fused route+quant quantizes x, so it needs an unquantized x
+                # and reads it.
                 input_ready_event = _wait_input_ready(input_ready_event)
                 fused_result = moe.backend.try_fused_route_quant(x, router_logits)
             else:
                 fused_result = None
+            # A routing kernel that also sorts writes tables for the ids it
+            # produced, so they hold only if those ids reach this rank as is.
+            sorted_result = None
+            if fused_result is None and routing_aux is None and moe.sort_routing_applies:
+                sorted_result = moe.backend.try_route_with_sort(router_logits)
 
-            if fused_result is None:
+            if sorted_result is not None:
+                token_selected_experts, token_final_scales, sort_tables = sorted_result
+                # The tables describe exactly these ids; hold on to them past the
+                # perfect-router hook below, which may rebind token_selected_experts.
+                sorted_ids = token_selected_experts
+            elif fused_result is None:
                 # Separated routing: ConfigurableMoE calls routing_method.
                 if routing_aux is None:
                     token_selected_experts, token_final_scales = moe.routing_method.apply(
@@ -618,6 +634,10 @@ class ExternalCommMoEScheduler(MoEScheduler):
         token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
             moe.num_slots, token_selected_slots
         )
+        if sort_tables is not None and token_selected_slots is not sorted_ids:
+            # Replaced (perfect-router) or replayed (calibrator) ids: the routing
+            # kernel's tables describe other ids.
+            sort_tables = None
 
         # ========== Step 4: Communication prepare phase (NVLINK two-sided only) ==========
         local_statistic_tensor_for_dispatch = None
@@ -724,6 +744,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
             use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             x_ready_event=x_ready_event,
             prerouted=prerouted,
+            sort_tables=sort_tables,
         )
         final_hidden_states = moe.backend.run_moe(
             ctx,
@@ -1106,6 +1127,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
         use_deep_ep_direct_metadata: bool = False,
         x_ready_event: Optional[torch.cuda.Event] = None,
         prerouted: Optional[PreroutedRouting] = None,
+        sort_tables: Optional[MoESortTables] = None,
     ) -> MoERunContext:
         """The single ``run_moe`` argument set, identical for every backend.
 
@@ -1132,6 +1154,7 @@ class ExternalCommMoEScheduler(MoEScheduler):
                 use_deep_ep_direct_metadata=use_deep_ep_direct_metadata,
             ),
             prerouted=prerouted,
+            sort_tables=sort_tables,
         )
 
     def _build_comm_plan(

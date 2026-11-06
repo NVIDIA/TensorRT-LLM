@@ -41,6 +41,7 @@ from ..cublaslt_utils import IS_CUBLASLT_AVAILABLE
 from ..cute_dsl_utils import (IS_CUTLASS_DSL_AVAILABLE,
                               IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE, get_env_enable_pdl
+from . import mxfp8_cute_pinned_tactics as _mxfp8_cute_pinned
 from .fast_custom_op import fast_custom_op
 
 if IS_FLASHINFER_AVAILABLE:
@@ -811,6 +812,13 @@ class FlashInferMXFP8GemmRunner(TunableRunner):
             backend = "cutlass"
             context = nullcontext()
         else:
+            # Above 32 rows on SM107, for a model that opts in: the pinned tuned tactic (bitwise the
+            # heuristic's output, faster); see mxfp8_cute_pinned_tactics. Otherwise, or with no entry:
+            # FlashInfer's heuristic config.
+            pinned = _mxfp8_cute_pinned.run(act, act_scale, weight,
+                                            weight_scale, self.output_dtype)
+            if pinned is not None:
+                return pinned
             # Skip FlashInfer's CuTeDSL config sweep; use its heuristic config.
             backend = "cute-dsl"
             context = _flashinfer_autotune(tune_mode=False,
@@ -2697,6 +2705,16 @@ def _(
     return gate.new_empty(gate.shape, dtype=o_dtype)
 
 
+# The AllReduce tuner profiles NCCL_SYMMETRIC by pre-allocating two NCCL window buffers of [2 x max_num_tokens, hidden]
+# (plus registration) inside the memory-profiling warm-up, so they shrink the KV pool even where NCCL_SYMMETRIC never
+# wins (agg TP2: only NCCL / ONESHOT are picked; ~1.24 GiB per rank of KV, GEMM-AR 803388).
+# TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0 leaves it out of the candidates (no windows) and makes plain NCCL the cache-miss
+# fallback; the default keeps stock behavior.
+_AR_TUNE_NCCL_SYMMETRIC = os.environ.get("TRTLLM_AR_TUNE_NCCL_SYMMETRIC",
+                                         "1") == "1"
+_AR_TUNE_NCCL_SYMMETRIC_LOGGED = False
+
+
 class AllReduceRunner(TunableRunner):
     _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
     _prealloc_done: ClassVar[set] = set()
@@ -2745,7 +2763,7 @@ class AllReduceRunner(TunableRunner):
             self.input_dtype,
             self.op,
             self.input_uses_nccl_window,
-            self.exclude_nccl_symmetric,
+            self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC,
         )
 
     @classmethod
@@ -2807,10 +2825,16 @@ class AllReduceRunner(TunableRunner):
         profile: OptimizationProfile,
         **kwargs,
     ) -> List[int]:
-        valid_strategies = [
-            AllReduceStrategy.NCCL_SYMMETRIC.value,
-            AllReduceStrategy.NCCL.value,
-        ]
+        global _AR_TUNE_NCCL_SYMMETRIC_LOGGED
+        valid_strategies = [AllReduceStrategy.NCCL.value]
+        if _AR_TUNE_NCCL_SYMMETRIC:
+            valid_strategies.insert(0, AllReduceStrategy.NCCL_SYMMETRIC.value)
+        elif not _AR_TUNE_NCCL_SYMMETRIC_LOGGED:
+            _AR_TUNE_NCCL_SYMMETRIC_LOGGED = True
+            logger.info(
+                "[tunable_allreduce] AR tuner: NCCL_SYMMETRIC left out (no NCCL window buffers "
+                "pre-allocated); cache-miss fallback is NCCL (TRTLLM_AR_TUNE_NCCL_SYMMETRIC=0)"
+            )
         if self.exclude_nccl_symmetric:
             valid_strategies = [AllReduceStrategy.NCCL.value]
         # Fallback in allreduceOp is set to NCCL_SYMMETRIC as default
@@ -2870,6 +2894,9 @@ class AllReduceRunner(TunableRunner):
             if cache_entry is None:
                 continue
             _, tactic, _ = cache_entry
+            if ((self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC)
+                    and tactic == AllReduceStrategy.NCCL_SYMMETRIC.value):
+                tactic = AllReduceStrategy.NCCL.value
             torch.ops.trtllm.register_allreduce_tactic(input, residual,
                                                        norm_weight, scale, bias,
                                                        workspace, self.group,
@@ -2900,11 +2927,12 @@ class AllReduceRunner(TunableRunner):
             return input
         if tactic == -1:
             # tactic == -1 means the autotuner cache missed for this shape.
-            # Fall back to NCCL_SYMMETRIC; asymmetric ncclMemAlloc failures are handled
+            # Honor the environment policy; asymmetric ncclMemAlloc failures are handled
             # by a cross-rank barrier in NCCLWindowAllocator which falls back
             # to plain NCCL.
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
-        if (self.exclude_nccl_symmetric
+            tactic = (AllReduceStrategy.NCCL_SYMMETRIC.value if
+                      _AR_TUNE_NCCL_SYMMETRIC else AllReduceStrategy.NCCL.value)
+        if ((self.exclude_nccl_symmetric or not _AR_TUNE_NCCL_SYMMETRIC)
                 and tactic == AllReduceStrategy.NCCL_SYMMETRIC.value):
             tactic = AllReduceStrategy.NCCL.value
 
