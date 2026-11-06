@@ -21,7 +21,7 @@ target_include_directories(
   tllm_kernel_cutlass_headers
   INTERFACE ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
             ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
-            ${CMAKE_CURRENT_LIST_DIR}/../cutlass_extensions/include)
+            ${PROJECT_SOURCE_DIR}/tensorrt_llm/cutlass_extensions/include)
 target_link_libraries(tllm_kernel_cutlass_headers INTERFACE tllm::common_cuda)
 
 function(add_tllm_kernel_library target)
@@ -96,8 +96,8 @@ add_tllm_kernel_library(tllm_kernel_mla SOURCES mlaKernels.cu LINK_LIBRARIES
                         tllm::common_environment)
 
 add_tllm_kernel_library(
-  tllm_kernel_mla_chunked_prefill SOURCES mlaChunkedPrefill.cu
-  INCLUDE_DIRECTORIES ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+  tllm_kernel_mla_chunked_prefill SOURCES mlaChunkedPrefill.cu LINK_LIBRARIES
+  tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
   tllm_kernel_moe_communication SOURCES
@@ -110,17 +110,18 @@ add_tllm_kernel_library(
 
 if(USING_OSS_CUTLASS_MOE_GEMM)
   add_tllm_kernel_library(
-    tllm_kernel_moe_lora SOURCES moe/cutlass/moe_lora_pointer_expand.cu
-    moe/cutlass/moe_lora_problem_builder.cu moe/cutlass/moe_lora_slot_expand.cu)
-  target_include_directories(
-    tllm_kernel_moe_lora PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+    tllm_kernel_moe_lora
+    SOURCES
+    moe/cutlass/moe_lora_pointer_expand.cu
+    moe/cutlass/moe_lora_problem_builder.cu
+    moe/cutlass/moe_lora_slot_expand.cu
+    LINK_LIBRARIES
+    tllm::kernel_cutlass_headers)
 endif()
 
 add_tllm_kernel_library(
   tllm_kernel_attention_mask SOURCES trtllmGenKernels/fmha/prepareCustomMask.cu
-  LINK_LIBRARIES trtllm_gen_fmha_interface)
-target_include_directories(tllm_kernel_attention_mask
-                           PUBLIC ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include)
+  LINK_LIBRARIES trtllm_gen_fmha_interface tllm::kernel_cutlass_headers)
 
 add_tllm_kernel_library(
   tllm_kernel_cuda_core_gemm SOURCES weightOnlyBatchedGemv/cudaCoreGemm.cu
