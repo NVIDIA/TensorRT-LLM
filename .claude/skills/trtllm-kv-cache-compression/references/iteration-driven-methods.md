@@ -113,13 +113,14 @@ prepared batch, a request whose protected tail spans a page boundary.
   scheduler on and off, locally on real runs, and write the commands and
   results in the PR description. In pytest, the section 2 boundary test for
   a request in the prepared batch covers the overlap-scheduler ordering.
-  When output diverges only with the overlap scheduler on, check both
-  kinds of ordering. A missing dependency between GPU streams disappears
-  under a full device synchronization; fix it with an event that the
-  consumer stream waits on, as TriAttention makes the KV cache manager V2
-  stream wait for its compaction event. A divergence that survives a full
-  synchronization is host-side ordering: the overlap scheduler prepares the
-  next step while the current one runs.
+  When output diverges only with the overlap scheduler on, consider three
+  causes: a missing dependency between GPU streams, fixed with an event that
+  the consumer stream waits on, as TriAttention makes the KV cache manager
+  V2 stream wait for its compaction event; a host buffer that the next step
+  overwrites while an asynchronous copy still reads it; and kernel inputs,
+  such as batch shapes, that occur only with the overlap scheduler. A full
+  device synchronization narrows the search but does not identify the
+  cause; check the kernel inputs and which buffers are still in use.
 - **Fast paths.** `changes_physical_kv_length = True` disables the steady
   generation-input fast paths. Measure that cost on the target workload.
 

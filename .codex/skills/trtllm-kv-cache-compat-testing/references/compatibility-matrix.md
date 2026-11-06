@@ -100,13 +100,20 @@ in pytest" in `../SKILL.md`.
   NaN in a test run to prove they are never read: kernels must stop at the
   real length. The KV cache manager V2 debug fills do this without custom
   code: `TRTLLM_KV_FRESH_PAGE_FILL=nan` poisons newly handed-out pages, and
-  `TRTLLM_KV_GUARD_PAGE` adds a guard page. The fill depends on the KV cache
-  dtype. An unpacked FP8 KV cache has no fill kernel, so the fill is skipped
-  with a warning; run the check with a BF16 or FP16 KV cache instead. A
-  packed NVFP4 pool cannot hold NaN, so a non-zero fill lands as +6.0;
-  compare outputs with the fill on and off, which must be identical. In
-  every case, confirm from the log that the fill reached each pool under
-  test.
+  `TRTLLM_KV_GUARD_PAGE` adds a guard page. Know their limits:
+  - The fill depends on the KV cache dtype. An unpacked FP8 KV cache has no
+    fill kernel, so the fill is skipped with a warning; run the check with a
+    BF16 or FP16 KV cache instead. A packed NVFP4 pool cannot hold NaN, so a
+    non-zero fill lands as +6.0; compare outputs with the fill on and off,
+    which must be identical.
+  - The fill covers the model's own layers, not the layers the manager
+    appends: the mixed-precision high pool is not filled. The log reports
+    one total for the first fill, not each pool. To check a pool the fill
+    does not reach, fill and check it with test instrumentation.
+  - Only some paths point masked entries at a guard page: the FlashInfer
+    sliding-window path, and the DeepSeek-V4 sparse cache manager with its
+    own guard pages. On other paths, the reservation log does not show that
+    masked entries use it; check those paths with their own instrumentation.
 - **Evidence**: the CUDA graph is still replayed for the feature's steps
   (CUDA graph launch counts or a profile). The feature does not force eager
   mode.
@@ -129,11 +136,15 @@ in pytest" in `../SKILL.md`.
   - compare outputs with the overlap scheduler on and off on the same
     requests, including requests that finish at different steps;
   - repeat several times. If run-to-run divergence appears only with the
-    overlap scheduler, check both kinds of ordering. A missing dependency
-    between GPU streams disappears under a full device synchronization and
-    is fixed with an event that the consumer stream waits on. A divergence
-    that survives a full synchronization is host-side ordering: the overlap
-    scheduler prepares the next step while the current one runs.
+    overlap scheduler, consider three causes: a missing dependency between
+    GPU streams, fixed with an event that the consumer stream waits on; a
+    host buffer that the next step overwrites while an asynchronous copy
+    still reads it (KV cache manager V2 guards its host page-table rows
+    against this in `_prepare_host_rows`); and kernel inputs, such as batch
+    shapes, that occur only with the overlap scheduler. A full device
+    synchronization changes the timing of all three, so it narrows the
+    search but does not identify the cause. Confirm the cause from the
+    kernel inputs and from which buffers are still in use.
 - **Evidence**: where the feature's mutation is ordered relative to the
   in-flight step, and what makes it safe.
 - **Never** conclude that a feature "cannot use the overlap scheduler", and
@@ -341,9 +352,12 @@ in pytest" in `../SKILL.md`.
   - shared-memory limits and supported data types differ between families;
   - a feature validated on only one GPU family is untested on the others.
 - **Smallest test**: run the end-to-end path on each architecture the
-  feature claims: Hopper (SM90: H100, H200), datacenter Blackwell (SM100:
-  B200, GB200; SM103: B300, GB300), and workstation Blackwell (SM120) where
-  supported. Reject the others at configuration time.
+  feature claims. KV cache manager V2 itself runs on more families than most
+  kernels, for example Ampere (SM80, SM86: A100, A10), Hopper (SM90: H100,
+  H200), datacenter Blackwell (SM100: B200, GB200; SM103: B300, GB300), and
+  consumer Blackwell (SM120, SM121: RTX PRO 6000, GB10). Check what the
+  code you build on supports, and reject at configuration time only the
+  architectures the feature cannot support.
 - **Evidence**: a local end-to-end run on each claimed architecture, with the
   commands and results in the PR description. CI does not need a copy per
   architecture: register the feature's few GPU tests on a stage that has the

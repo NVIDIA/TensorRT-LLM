@@ -23,11 +23,12 @@ read the category you are working in before starting.
 1. Deliver the feature: wire the whole path, run it end to end, and make it
    work on every model family and GPU architecture it claims. A
    demonstration on one model is not done.
-2. Write direct code. No defensive try/except, fallbacks, checks for
-   impossible states, or flags and parallel paths added to avoid changing
-   the code that owns the behavior.
-3. Keep tests few and strong, and never edit, skip, or loosen a test to make
-   it pass.
+2. Write direct code. No defensive try/except, fallbacks that hide errors
+   or change results, checks for impossible states, or flags and parallel
+   paths added to avoid changing the code that owns the behavior.
+3. Keep tests few and strong. Never edit, skip, or loosen a test to make it
+   pass; update it only when an approved behavior change makes its
+   expectation obsolete, and say why in the PR.
 4. Use the mechanism the codebase already has when it fits; do not build a
    duplicate.
 5. Read the code, logs, or results before claiming anything. Never invent
@@ -295,7 +296,8 @@ read the category you are working in before starting.
   Kernel-numeric references with tolerances, accuracy thresholds, and
   model-quality checks stay out of unit tests, and GPU tests stay few. Check
   lossy numerics and end-to-end behavior locally on real runs, and write the
-  commands and results in the PR description. Small end-to-end smoke tests
+  commands and results in the PR description; re-run them in every PR that
+  changes the feature's kernels or data path. Small end-to-end smoke tests
   that only prove activation belong in the integration tests; see
   `trtllm-kv-cache-compat-testing`
   (`../../trtllm-kv-cache-compat-testing/SKILL.md`).

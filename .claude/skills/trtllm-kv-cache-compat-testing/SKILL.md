@@ -49,7 +49,7 @@ tests are in `references/compatibility-matrix.md`.
 | Beam search | | |
 | Sliding-window attention, variable sliding-window attention (VSWA), hybrid recurrent models | | |
 | Multi-head latent attention (MLA) and sparse attention backends | | |
-| GPU architecture: Hopper (SM90: H100, H200), datacenter Blackwell (SM100: B200, GB200; SM103: B300, GB300), workstation Blackwell (SM120) | | |
+| GPU architecture: every family the feature claims, for example Ampere (SM80, SM86), Hopper (SM90), datacenter Blackwell (SM100, SM103), consumer Blackwell (SM120, SM121) | | |
 | KV cache offload tiers and connectors | | |
 | Reuse identity: low-rank adaptation (LoRA), cache salt, multimodal inputs | | |
 | KV cache events and KV-cache-aware routing | | |

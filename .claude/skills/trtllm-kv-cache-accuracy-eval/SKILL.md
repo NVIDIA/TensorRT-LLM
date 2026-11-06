@@ -65,7 +65,8 @@ keys. The accuracy test infrastructure and reference scores live under
 `tests/integration/defs/accuracy/`. Do not add an accuracy test or a
 reference score for the feature there or anywhere else in pytest: run the
 arms locally on real runs, and write the commands and results in the PR
-description. When a benchmark's official protocol needs its own harness, run
+description. Re-run them in every later PR that changes the feature's
+kernels or data path. When a benchmark's official protocol needs its own harness, run
 that harness against a TensorRT-LLM server, and keep the harness identical
 across arms.
 

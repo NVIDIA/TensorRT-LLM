@@ -142,9 +142,10 @@ behind them are in `lessons-learned.md`.
   recurrent models, multimodal models, and speculative-decoding draft
   layers. A family that cannot be supported yet is rejected at configuration
   time and listed as a gap with its reason, never silently skipped. Cover
-  every GPU architecture the feature claims the same way: Hopper (SM90:
-  H100, H200) and Blackwell (SM100: B200, GB200; SM103: B300, GB300), since
-  kernels, shared-memory limits, and numerics can differ between them.
+  every GPU architecture the feature claims the same way, for example Ampere
+  (SM80, SM86), Hopper (SM90: H100, H200), and Blackwell (SM100: B200,
+  GB200; SM103: B300, GB300; SM120, SM121), since kernels, shared-memory
+  limits, and numerics can differ between them.
 - **Fit, do not force.** Use configuration and existing extension points when
   they fit the feature. When they do not, change the code that owns the
   behavior or add what is missing. Do not bend the feature to fit an
@@ -165,18 +166,23 @@ behind them are in `lessons-learned.md`.
   initialization, never calibrate during inference.
 - **Direct code, not defensive code.** Write the code the feature needs and
   nothing "just in case": no try/except around code that should not fail,
-  no fallback paths, no `getattr` or `hasattr` defaults for attributes that
-  always exist, no checks for states that validation already rules out, and
-  no options nobody asked for. Every guard names the real failure it
-  handles.
+  no fallback that hides an error or changes results, no `getattr` or
+  `hasattr` defaults for attributes that always exist, no checks for states
+  that validation already rules out, and no options nobody asked for. Every
+  guard names the real failure it handles. A fallback that gives the same
+  results under a resource limit, is counted or logged, and is tested is
+  fine: for example, TriAttention scores requests one at a time when its
+  optional batch workspace does not fit in memory.
 - **Few, strong tests.** Each test exercises the real path and fails if the
   feature breaks. Do not write tests that mock the feature away, compute
   their expected values with the code under test, check trivial getters, or
   repeat another test with different numbers. Never edit, skip, delete, or
   loosen a test, or special-case test inputs, to make it pass: fix the code,
-  or stop and report the conflict. Keep pytest small, with few GPU tests;
-  check lossy numerics and end-to-end behavior locally on real runs, and
-  write the commands and results in the PR description.
+  or stop and report the conflict. When an approved behavior change makes an
+  expectation obsolete, update the test and say why in the PR. Keep pytest
+  small, with few GPU tests; check lossy numerics and end-to-end behavior
+  locally on real runs, and write the commands and results in the PR
+  description.
 - **Preserve algorithm semantics.** Do not change selection rules or
   granularity, and do not remove modes for convenience. Parallel runs must
   match single-GPU semantics.
@@ -264,7 +270,9 @@ behind them are in `lessons-learned.md`.
   is not a fix.
 - **Do not game tests.** When a test fails, fix the code. When a test
   contradicts the requirement, stop and report it. Never edit, skip, delete,
-  or loosen the test, and never special-case its inputs.
+  or loosen the test, and never special-case its inputs. Updating a test
+  because an approved behavior change made its expectation obsolete is not
+  gaming it; say why in the PR.
 - **Decide open design choices before building.** For each:
   - inventory the existing code;
   - present the options with scope, benefit, and impact on other owners,

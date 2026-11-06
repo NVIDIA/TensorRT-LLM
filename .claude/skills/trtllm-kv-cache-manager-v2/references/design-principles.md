@@ -301,3 +301,5 @@ Tests protect a working feature; they do not replace running it.
   go in the PR description.
 - Never edit, skip, delete, or loosen a test, or special-case its inputs, to
   make it pass. If the test contradicts the requirement, stop and report it.
+  When an approved behavior change makes an expectation obsolete, update the
+  test and say why in the PR.

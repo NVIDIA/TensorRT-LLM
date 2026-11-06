@@ -72,16 +72,21 @@ one.
    when it fits; when it does not, extend it or write the new code. Do not
    add a flag, a wrapper, or a parallel path to avoid touching the right
    file.
-5. Write direct code: no defensive try/except, no fallback paths, no checks
-   for states that cannot happen, no options nobody asked for. Reject
-   unsupported combinations at configuration time.
+5. Write direct code: no defensive try/except, no fallback that hides an
+   error or changes results, no checks for states that cannot happen, no
+   options nobody asked for. A counted fallback that gives the same results
+   under a resource limit, such as per-request work when an optional batch
+   workspace does not fit in memory, is fine. Reject unsupported
+   combinations at configuration time.
 6. With the method off, outputs, memory, speed, errors, and API stay
    identical to main.
 7. Write few, strong tests: each one runs the real path and fails if the
    method breaks. Never edit, skip, or loosen a test to make it pass; fix
-   the code, or stop and report the conflict. Keep pytest small, with few
-   GPU tests; check lossy numerics and end-to-end behavior locally on real
-   runs, and write the commands and results in the PR description.
+   the code, or stop and report the conflict. When an approved behavior
+   change makes an expectation obsolete, update the test and say why in the
+   PR. Keep pytest small, with few GPU tests; check lossy numerics and
+   end-to-end behavior locally on real runs, and write the commands and
+   results in the PR description.
 8. Decide and test every compatibility axis, including block reuse, CUDA
    graphs, the overlap scheduler, disaggregated serving, speculative
    decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`),
@@ -141,6 +146,8 @@ regression gates" lists "encode/decode round-trip accuracy for every
 supported runtime dtype" and "aligned end-to-end accuracy and performance
 checks" as automated tests. Under hard rule 7, check both locally on real
 runs instead, and write the commands and results in the PR description.
+Re-run these local checks in every later PR that changes the method's
+kernels or data path, and report them there.
 
 ## How to Use It
 
