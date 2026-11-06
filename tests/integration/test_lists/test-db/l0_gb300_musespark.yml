@@ -41,6 +41,8 @@ l0_gb300_musespark:
   - unittest/_torch/modeling/test_musespark_open_moe_prepare_overlap.py
   - unittest/_torch/modeling/test_musespark_open_fusion_switches.py
   - unittest/_torch/modeling/test_musespark_open_finalize_local.py
+  - unittest/_torch/modeling/test_musespark_open_soft_cap.py
+  - unittest/_torch/modules/test_logit_soft_cap.py
   # DFlash on the TRTLLM attention backend, the shared target/draft KV cache, and the
   # disaggregated KV transfer that carries it. Pre-merge CI on this branch runs only the
   # MuseSpark stages, and these files are listed on no other MuseSpark stage. This stage
