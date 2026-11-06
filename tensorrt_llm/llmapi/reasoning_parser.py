@@ -596,10 +596,12 @@ class Xing4_0ReasoningParser(BaseReasoningParser):
         # the leading-tag strip in :meth:`parse`.
         self._thinking_enabled = thinking_enabled
         self._lead_buffer = ""
-        self._lead_pending = True
+        # Only hold back a possible leading `` marker when thinking is on;
+        # in non-thinking mode the delegate treats every byte as content.
+        self._lead_pending = thinking_enabled
 
     def parse(self, text: str) -> ReasoningParserResult:
-        if text.startswith(self.reasoning_start):
+        if self._thinking_enabled and text.startswith(self.reasoning_start):
             text = text[len(self.reasoning_start):]
         return self._parser.parse(text)
 

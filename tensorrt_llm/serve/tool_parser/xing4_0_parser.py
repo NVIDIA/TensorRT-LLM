@@ -229,8 +229,8 @@ class Xing4_0ToolParser(BaseToolParser):
                         parameters=json.dumps(arguments, ensure_ascii=False),
                     )
                 )
-        except Exception:
-            logger.exception("Failed to extract Xing4.0 tool call spec")
+        except Exception as exc:
+            logger.error("Failed to extract Xing4.0 tool call spec: %s", exc)
             return StreamingParseResult(normal_text=text, calls=[])
 
         normal_text_parts.append(text[consumed:])
@@ -278,10 +278,11 @@ class Xing4_0ToolParser(BaseToolParser):
 
             try:
                 tool_name, arguments = _parse_payload(inner_match.group(1), tools)
-            except Exception:
-                logger.exception(
-                    "Failed to parse Xing4.0 tool call payload: %r",
+            except Exception as exc:
+                logger.error(
+                    "Failed to parse Xing4.0 tool call payload %r: %s",
                     inner_match.group(1),
+                    exc,
                 )
                 tool_name, arguments = "", {}
 
