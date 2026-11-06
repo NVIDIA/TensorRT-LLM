@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from tensorrt_llm._utils import mpi_rank
+from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha, _get_bmm1_scale_log2
@@ -112,7 +113,11 @@ class DrafterLastRowContextFmha(FlashInferTrtllmGenFmha):
         *,
         phase: Optional[FmhaPhase] = None,
     ) -> bool:
-        if phase is not FmhaPhase.CONTEXT:
+        if (
+            phase is not FmhaPhase.CONTEXT
+            or metadata.is_cross
+            or forward_args.mask_type != AttentionMaskType.causal
+        ):
             return False
         supported, reason = self._is_supported_with_reason(
             q, k, v, self.attn, metadata, forward_args, phase=phase
@@ -141,24 +146,6 @@ class DrafterLastRowContextFmha(FlashInferTrtllmGenFmha):
         bmm2_scale,
         causal: bool,
     ) -> None:
-        if params.is_cross or not causal:
-            super()._run_context_attention(
-                params,
-                q_processed,
-                kv_pool,
-                block_tables,
-                kv_scale_pool,
-                fmha_workspace,
-                cu_q_seqlens,
-                cu_kv_seqlens,
-                max_q_len,
-                max_kv_len,
-                window_left,
-                bmm1_scale,
-                bmm2_scale,
-                causal,
-            )
-            return
         batch = params.batch_size
         if self._kv_tail_zero(params.meta):
             _zero_kv_tails(kv_pool, block_tables, params.sequence_lengths, batch)

@@ -9,19 +9,6 @@
 export TLLM_PREFIX_TOKEN_CACHE_ENTRIES=2048
 export TLLM_PREFIX_TOKEN_CACHE_MAX_CHARS=1073741824
 
-# Context-path items that the aggregated deployment keeps off: the dense-MLP SwiGLU + MXFP8 producer, the CLC GEMM,
-# the shared-expert fold into the MoE finalize, the drafter's last-row context attention and the fused embedding
-# gather.
-export TRTLLM_CTX_SWIGLU_MXFP8=0
-export TRTLLM_CTX_CLC_GEMM=0
-export TLLM_M3_MOE_FOLD_SHARED=0
-export TRTLLM_CTX_DRAFTER_LAST_ROW=0
-export TRTLLM_CTX_DRAFTER_LAST_ROW_DECODE=0
-export TRTLLM_CTX_EMBEDDING_GATHER=0
-# Legacy-model items the aggregated deployment keeps off: the drafter's dead-row skip and the generation router_tc.
-export TRTLLM_CTX_DRAFTER_DEAD_ROWS=0
-export TRTLLM_M3_ROUTER_TC_GEN=0
-
 # NCCL all-reduce with 64 CTAs.
 export NCCL_MIN_CTAS=64
 export NCCL_MAX_CTAS=64

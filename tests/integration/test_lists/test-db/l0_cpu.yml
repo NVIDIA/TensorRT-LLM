@@ -160,6 +160,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_takes_eager_qkv
   - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_keeps_captured_qkv_off_rubin
   - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_engages_on_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_avoids_non_consuming_decode_graph
   - unittest/_torch/models/test_minimax_m3.py::test_shared_fold_into_trtllm_gen_finalize_is_sm107_only
   - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_rows_agree_between_eager_and_breakable
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_boundary_norm_declines_off_rubin_and_off_geometry

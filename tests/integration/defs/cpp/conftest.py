@@ -18,6 +18,7 @@ import os as _os
 import pathlib as _pl
 import shutil
 import sys as _sys
+import time as _time
 
 # Declared above the cpp_common import: this covers every file in this
 # directory, but only for imports that run after it, and cpp_common reaches
@@ -187,6 +188,7 @@ def build_fmha_head104_tests(request: pytest.FixtureRequest,
     """Build the packed-QKV numerical regression and its native library."""
     cuda_arch = f"{request.param}"
     _logger.info(f"Using CUDA arch: {cuda_arch}")
+    configure_started = _time.monotonic()
     build_trt_llm(
         build_type=build_type,
         cuda_architectures=cuda_arch,
@@ -204,23 +206,30 @@ def build_fmha_head104_tests(request: pytest.FixtureRequest,
         # rewritten, so nothing rebuilds needlessly).
         generate_fmha=True,
     )
+    _logger.info("FMHA head104 configure/generate completed in %.1fs",
+                 _time.monotonic() - configure_started)
     build_dir = _cpp.find_build_dir(build_type)
-    _cpp.run_command(
-        [
-            "cmake",
-            "--build",
-            str(build_dir),
-            "--config",
-            build_type,
-            "--parallel",
-            "12",
-            "--target",
-            "fmhaHead104Test",
-        ],
-        cwd=build_dir,
-        env=_os.environ,
-        timeout=2700,
-    )
+    build_started = _time.monotonic()
+    try:
+        _cpp.run_command(
+            [
+                "cmake",
+                "--build",
+                str(build_dir),
+                "--config",
+                build_type,
+                "--parallel",
+                "12",
+                "--target",
+                "fmhaHead104Test",
+            ],
+            cwd=build_dir,
+            env=_os.environ,
+            timeout=2700,
+        )
+    finally:
+        _logger.info("FMHA head104 native build elapsed %.1fs",
+                     _time.monotonic() - build_started)
 
 
 @pytest.fixture(scope="function", autouse=True)

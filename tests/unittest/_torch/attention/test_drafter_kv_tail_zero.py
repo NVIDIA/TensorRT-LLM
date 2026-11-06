@@ -3,12 +3,18 @@
 """Gate of the drafter last-row context FMHA's K/V tail zeroing (drafter_last_row._zero_kv_tails)."""
 
 import types
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha import drafter_last_row
+from tensorrt_llm._torch.attention.backends.fmha.interface import FmhaPhase
 from tensorrt_llm._torch.attention.backends.fmha.manager import FmhaManager
+from tensorrt_llm._torch.attention.backends.interface import (
+    AttentionForwardArgs,
+    PredefinedAttentionMask,
+)
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType
@@ -17,6 +23,43 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 
 PAGE, HEADS, D = 128, 4, 128
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("phase", [None, FmhaPhase.CONTEXT, FmhaPhase.GENERATION])
+@pytest.mark.parametrize("is_cross", [False, True])
+@pytest.mark.parametrize("mask", [PredefinedAttentionMask.CAUSAL, PredefinedAttentionMask.FULL])
+@pytest.mark.parametrize("parent_supported", [False, True])
+def test_drafter_last_row_rejects_unsupported_requests_before_preprocessing(
+    phase: FmhaPhase | None,
+    is_cross: bool,
+    mask: PredefinedAttentionMask,
+    parent_supported: bool,
+) -> None:
+    """Only causal self-attention context reaches the inherited shape and backend checks."""
+    backend = Mock(spec_set=["attn", "_is_supported_with_reason", "_logged_not_taken"])
+    backend.attn = Mock(spec_set=TrtllmAttention)
+    backend._logged_not_taken = False
+    backend._is_supported_with_reason.return_value = (parent_supported, "test backend")
+    metadata = Mock(spec_set=["is_cross"])
+    metadata.is_cross = is_cross
+    forward_args = AttentionForwardArgs(attention_mask=mask)
+    q = torch.empty((1, HEADS * D))
+
+    supported = drafter_last_row.DrafterLastRowContextFmha._is_supported(
+        backend, q, None, None, metadata, forward_args, phase=phase
+    )
+
+    admitted = (
+        phase is FmhaPhase.CONTEXT and not is_cross and mask is PredefinedAttentionMask.CAUSAL
+    )
+    assert supported is (admitted and parent_supported)
+    if admitted:
+        backend._is_supported_with_reason.assert_called_once_with(
+            q, None, None, backend.attn, metadata, forward_args, phase=phase
+        )
+    else:
+        backend._is_supported_with_reason.assert_not_called()
 
 
 @pytest.mark.cpu_only
