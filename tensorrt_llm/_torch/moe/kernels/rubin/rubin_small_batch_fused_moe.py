@@ -1056,12 +1056,18 @@ class RubinSmallBatchFusedMoeKernel:
             griddepcontrol_launch_dependents()
         # The CTA's first claim after the grid dependency: the previous launch on this counter
         # buffer may still run until then (die-major: claimed by the weight producer). With
-        # published routing the routing kernel's producer waited for every earlier grid.
+        # published routing the routing kernel's producer waited for every earlier grid, so the
+        # claim (die-major: on the own domain's FC1 counter, resolved by the weight producer once
+        # the tile count is known) runs before the tables.
         first = Int32(0)
-        if cutlass.const_expr(not self.die_major):
+        if cutlass.const_expr(not self.die_major or self.published_routing):
             if warp_idx == self.tma_warp:
                 if cute.arch.lane_idx() == 0:
-                    first = _atom_add_relaxed(ctr_ptr.toint(), 1)
+                    word = Int64(0)
+                    if cutlass.const_expr(self.die_major):
+                        if self._sm_domain(_smid()) == 1:
+                            word = Int64(CTR_DIE1)
+                    first = _atom_add_relaxed(ctr_ptr.toint() + word * 4, 1)
 
         t2e_pre = Int32(0)
         nt = Int32(0)
@@ -1376,7 +1382,16 @@ class RubinSmallBatchFusedMoeKernel:
         if cutlass.const_expr(self.die_major):
             nloc = Int32(cute.size(mA1, mode=[2])) // 2
             own_die = self._sm_domain(_smid())
-            cur, queue = self._dm_claim(ctr, own_die, queue, w1, nt, ns)
+            if cutlass.const_expr(self.published_routing):
+                # the claim before the tables: an own-domain FC1 unit, else on to the other's
+                h1 = self.nblk1 // 2
+                if cur < nt * h1:
+                    tile0 = cur // h1
+                    cur = tile0 * self.nblk1 + own_die * h1 + (cur - tile0 * h1)
+                else:
+                    cur, queue = self._dm_claim(ctr, own_die, Int32(1), w1, nt, ns)
+            else:
+                cur, queue = self._dm_claim(ctr, own_die, queue, w1, nt, ns)
         g = Int32(0)
         j = Int32(0)
         while cur < total:

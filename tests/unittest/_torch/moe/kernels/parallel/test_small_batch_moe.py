@@ -302,11 +302,12 @@ def test_small_batch_moe_no_local_expert(token_indexed, deterministic):
 
 @pytest.mark.parametrize("shape", list(SHAPES))
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 32])
-@pytest.mark.parametrize("token_indexed", [False, True])
-def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_indexed, monkeypatch):
+@pytest.mark.parametrize("layout", ["permuted", "token_indexed", "published"])
+def test_small_batch_moe_die_major_matches_default(shape, num_tokens, layout, monkeypatch):
     """Die-major weights with per-domain claiming: the same units and arithmetic as the default
     layout, so with the slice combine the output is bitwise the default's, for any CTA count and
-    over graph replays; counters reset. On a device without two locality domains the weights
+    over graph replays; counters reset. ``published``: the tables come from the published top-k
+    and the first claim precedes them. On a device without two locality domains the weights
     stay in default memory and a synthetic SM -> domain table drives the claiming."""
     from tensorrt_llm._torch.locality_domain import placement
     from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
@@ -314,6 +315,7 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
         die_major_layout,
     )
 
+    token_indexed, published = layout != "permuted", layout == "published"
     d = _setup(shape, num_tokens, 8642 + num_tokens)
     counters = _counters()
     ref = torch.full((num_tokens, d["hidden"]), float("nan"), dtype=torch.bfloat16, device="cuda")
@@ -341,6 +343,7 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
             deterministic=True,
             num_ctas=ctas,
             die_major=True,
+            published=published,
         )
         torch.cuda.synchronize()
         assert int(counters.abs().sum().item()) == 0, f"counters not reset (ctas={ctas})"
@@ -351,7 +354,13 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         run_small_batch_moe(
-            dm, out_g, counters, token_indexed=token_indexed, deterministic=True, die_major=True
+            dm,
+            out_g,
+            counters,
+            token_indexed=token_indexed,
+            deterministic=True,
+            die_major=True,
+            published=published,
         )
     for _ in range(2):
         out_g.fill_(float("nan"))
@@ -361,7 +370,13 @@ def test_small_batch_moe_die_major_matches_default(shape, num_tokens, token_inde
         assert int(counters.abs().sum().item()) == 0
     out_r = torch.full_like(ref, float("nan"))
     run_small_batch_moe(
-        dm, out_r, counters, token_indexed=token_indexed, deterministic=False, die_major=True
+        dm,
+        out_r,
+        counters,
+        token_indexed=token_indexed,
+        deterministic=False,
+        die_major=True,
+        published=published,
     )
     torch.cuda.synchronize()
     assert int(counters.abs().sum().item()) == 0
