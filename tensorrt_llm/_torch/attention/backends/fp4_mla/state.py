@@ -48,8 +48,10 @@ class Fp4MlaState:
     # re-plans when it changes. Monotonic across steps, never reset.
     generation_lengths_serial: int = 0
     plan_4x_key: tuple | None = None
-    # Longest live KV (tokens) of the regime this metadata serves, set by a graph runner that keys its decode graphs
-    # by KV regime (fp4_mla_dispatch.kv_regimes_for_batch); None = decide on the page-table capacity.
+    # Ceiling (tokens) of the KV regime this CUDA graph metadata serves, an upper bound of its steps' longest live KV,
+    # set through set_decode_kv_regime by a graph runner that keys its decode graphs by KV regime
+    # (fp4_mla_dispatch.kv_regimes_for_batch). None (eager metadata, graphs without regimes): decide on the
+    # page-table capacity.
     kv_regime_max_kv: int | None = None
     generation_cache_scattered: bool = False
     device_page_table: bool = False

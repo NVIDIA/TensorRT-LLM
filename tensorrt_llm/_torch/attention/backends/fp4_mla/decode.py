@@ -1278,8 +1278,9 @@ def run_fp4_mla_attention_decode(
         if packed_rows_per_seq and _decode_4x._fp4_mla_cutedsl_4x_enabled():
             # Path selection (fp4_mla_dispatch): 2x packed by default; the four-CTA-cluster kernel, or the
             # two-stream split (4x arm + 2x arm), only inside the static envelope and where the measured gain is
-            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself may use
-            # the step's longest live KV when a graph runner provides it (Fp4MlaState.kv_regime_max_kv).
+            # certain. The kernels are compiled and planned for the page-table capacity; the choice itself uses the
+            # KV regime ceiling of a regime-keyed CUDA graph (Fp4MlaState.kv_regime_max_kv), an upper bound of the
+            # step's longest live KV; eager steps decide on the capacity.
             from . import fp4_mla_cutedsl_4x_host as _host_4x
 
             max_kv_len_4x = max_pages * metadata.page_size
