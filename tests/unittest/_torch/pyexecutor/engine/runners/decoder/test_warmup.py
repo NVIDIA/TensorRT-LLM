@@ -1033,7 +1033,7 @@ class TestWarmupCleanup(unittest.TestCase):
         ).is_disagg = False
         tracker = _Tracker()
         with patch.object(
-            model_engine._runner._warmup,
+            model_engine,
             "_run_mamba_hybrid_warmup",
             side_effect=tracker("mamba_hybrid"),
         ):
