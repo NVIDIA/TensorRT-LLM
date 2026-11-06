@@ -528,8 +528,8 @@ def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bo
             (20, AttentionKind.PRIMARY): 0,
             (22, AttentionKind.PRIMARY): 1,
         }
-    manager._mixed_precision_layer_names = (
-        KVCacheManagerV2._mixed_precision_layer_names.__get__(manager)
+    manager._mixed_precision_layer_names = KVCacheManagerV2._mixed_precision_layer_names.__get__(
+        manager
     )
     manager.get_disagg_global_layer_ids = (
         KVCacheManagerV2._mixed_precision_global_layer_ids.__get__(manager)
