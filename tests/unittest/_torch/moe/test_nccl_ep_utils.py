@@ -38,6 +38,7 @@ from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
 # The CPU stage runs -m cpu_only and collects only files that carry this marker.
 pytestmark = pytest.mark.cpu_only
 
+_EP_SIZE = 2
 _NUM_EXPERTS = 8
 _MAX_TOKENS_PER_RANK = 4
 _HIDDEN_SIZE = 512
@@ -100,7 +101,7 @@ class _CpuTorch:
 
 def _make_mapping() -> SimpleNamespace:
     return SimpleNamespace(
-        moe_ep_size=2,
+        moe_ep_size=_EP_SIZE,
         moe_ep_rank=1,
         pp_rank=3,
         moe_ep_group_pg=object(),
@@ -164,7 +165,7 @@ def nccl_ep_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ep_group=ep_group,
     )
     sub_comm = Mock(name="ep_mpi_sub_comm")
-    sub_comm.Get_size.return_value = 2
+    sub_comm.Get_size.return_value = _EP_SIZE
     sub_comm.bcast.return_value = _UNIQUE_ID
     mpi_comm = Mock(name="mpi_comm")
     mpi_comm.return_value.Split.return_value = sub_comm
@@ -237,6 +238,7 @@ def test_mpi_orchestrator_splits_session_comm_by_pipeline_stage(
     nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
     nccl_ep_fakes.sub_comm.Get_rank.return_value = ep_world_rank
     mapping = _make_mapping()
+    mapping.moe_ep_rank = ep_world_rank
 
     ctx = _create_context(mapping)
 
@@ -251,7 +253,7 @@ def test_mpi_orchestrator_splits_session_comm_by_pipeline_stage(
         nccl_ep_fakes.fake.core.get_unique_id.assert_not_called()
         nccl_ep_fakes.sub_comm.bcast.assert_called_once_with(None, root=0)
     nccl_ep_fakes.fake.core.Communicator.init.assert_called_once_with(
-        nranks=2, rank=ep_world_rank, unique_id=_UNIQUE_ID
+        nranks=_EP_SIZE, rank=ep_world_rank, unique_id=_UNIQUE_ID
     )
     assert ctx._ep_mpi_comm is nccl_ep_fakes.sub_comm
     assert ctx.comm is nccl_ep_fakes.mpi_comm_result
