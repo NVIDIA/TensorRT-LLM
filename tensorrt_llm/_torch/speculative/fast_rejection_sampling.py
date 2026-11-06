@@ -12,56 +12,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused, vocab-split rejection sampling for one-model block drafters (DSpark / DFlash).
+"""Fused rejection sampling for one-model block drafters (DSpark and DFlash), as Triton kernels.
 
-The reference path (``SpecWorkerBase._sample_and_accept_draft_tokens_rejection`` and the
-rejection branch of ``advanced_sample_draft_block``) chains about ten flashinfer / PyTorch
-launches per step, most of them one CTA per row over the full vocabulary: at a few rows per
-step that leaves the GPU nearly idle for hundreds of microseconds. This module computes the
-same quantities with every row split into ``_CHUNK``-wide pieces, so a handful of rows fills
-the machine:
+With ``TLLM_SPEC_FAST_RS=1``, `SpecWorkerBase` calls these kernels instead of its reference path
+(`SpecWorkerBase._sample_and_accept_draft_tokens_rejection` and the rejection branch of
+`SpecWorkerBase.advanced_sample_draft_block`). The reference path runs about ten flashinfer and
+PyTorch launches per step, most of them one CTA per row over the full vocabulary, which leaves the
+GPU nearly idle for hundreds of microseconds at a few rows per step. Here every row is split into
+``_CHUNK``-wide pieces, so a few rows fill the GPU.
 
-Draft (one block of ``K`` proposals per request, ``advanced_sample_draft_block``):
-  1. ``_rs_row_stats_kernel``   per (row, chunk): online max / sum of ``exp(x / T - max)``.
-  2. ``_rs_draft_write_kernel`` per (row, chunk): ``q = exp(x / T - M) * (1 / S)`` written
-     straight into the slot-indexed ``draft_probs[slot, i, :]`` row (the reference scatters a
-     temporary), plus per-chunk mass and last nonzero index.
-  3. ``_rs_draft_pick_kernel``  per row: inverse-CDF draw ``first x: q(x) > 0 and
-     cumsum(q)(x) > u`` (the flashinfer ``sampling_from_probs`` rule).
-
-Verify (``K`` stored proposals + ``K + 1`` target rows per request):
-  1. ``_rs_row_stats_kernel`` on the ``K + 1`` target rows.
-  2. ``_rs_verify_resid_kernel`` per (request, chunk): the accept loop (``u_i * q(d_i) <
-     p(d_i)``, a few scalar loads), then the chunk mass of ``max(p - q, 0)`` at the first
-     rejected position (``p`` alone for the bonus position).
-  3. ``_rs_verify_pick_kernel`` per request: inverse-CDF draw from the residual and the
-     ``[K + 1]`` output row (accepted drafts, the drawn token, ``-1`` padding).
-
-Semantics are flashinfer's ``AdvancedSamplingMode.NO_TOPK_NO_TOPP`` path (temperature-only
-softmax, ``chain_speculative_sampling``, ``sampling_from_probs``) with cuRAND's Philox4x32-10
-draws (``curand_init(seed, subsequence, offset)`` + ``curand_uniform``), assigned so that no
-uniform is ever used twice for one request:
-
-* each request uses its own seed and offset (``seed[b]``, ``offset[b]``; flashinfer reads
-  element 0 for every row, so a request's stream follows whichever request is in row 0 and can
-  revisit words it already used when that request changes);
-* the verify of request ``b`` (subsequence ``b``) uses draw ``i`` for accept test ``i`` and
-  draw ``K`` for the residual or bonus token: ``K + 1`` words, exactly the
-  ``max_draft_len + 1`` window ``_populate_request_rng_state`` advances the offset by per step
-  (flashinfer's residual after a rejection is draw ``K + 1``, the next step's draw 0);
-* the draft draws (draw 0 of subsequence ``b * K + i`` at offset + 1) use the key
-  ``seed ^ DRAFT_KEY_XOR``, so they never coincide with a verify draw (same key, subsequence
-  ``b * K + i == b'``, word offset + 1 = accept test 1 of request ``b'``).
-
-The accept decisions therefore equal ``chain_speculative_sampling``'s given the same seed and
-offset, and every drawn token equals flashinfer's inverse-CDF rule applied to that draw, except
-where a float sum computed in a different order straddles a threshold (the mass sums and the
-softmax denominator are reduced per chunk here and per block there). Logits of ``-inf``
-(masked tokens) get probability 0, including chunks with no finite logit.
-
-Everything is static-shaped and host-sync free, so it captures into CUDA graphs. All
-reductions run in a fixed order (no atomics), so every tensor-parallel rank holding the same
-logits draws the same tokens.
+The kernels follow flashinfer's temperature-only path (``AdvancedSamplingMode.NO_TOPK_NO_TOPP``:
+softmax, ``chain_speculative_sampling`` and ``sampling_from_probs``). They have static shapes and
+never sync with the host, so they capture into CUDA graphs. All reductions run in a fixed order (no
+atomics), so every tensor-parallel rank holding the same logits draws the same tokens. Logits of
+``-inf`` (masked tokens) get probability 0, including chunks with no finite logit.
 """
 
 import os
@@ -483,7 +447,7 @@ def _rs_verify_pick_kernel(
     pos = tl.load(pos_ptr + req)
     has_draft = pos < num_draft
     # Draw K, after the accept draws 0..K-1, for the residual and the bonus token alike: the
-    # step then uses K + 1 words, the per-step offset window (see the module docstring).
+    # step then uses K + 1 words of its offset window (see the Philox layout above DRAFT_KEY_XOR).
     u = _curand_uniform(seed, offset, req, num_draft)
     total = 0.0
     for k in range(num_chunks):

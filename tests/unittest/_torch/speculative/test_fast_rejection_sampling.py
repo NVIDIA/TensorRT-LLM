@@ -17,7 +17,6 @@
 
 The kernels are checked for exactness against flashinfer and float64 models on the same Philox draws,
 for losslessness with chi-square tests, and through the `SpecWorkerBase` entry points and CUDA graphs.
-The top-p kernels are tested in ``test_fast_topp_*.py``.
 """
 
 import math
@@ -449,9 +448,9 @@ def test_short_draft_and_ragged_vocab():
 
 
 def test_philox_layout_never_reuses_a_draw():
-    """Over consecutive steps (offset window max_draft_len + 1, as
-    _populate_request_rng_state advances it), no (key, subsequence, word) is drawn twice, even
-    with every request on one seed."""
+    """Over consecutive steps whose offsets are only ``K + 1`` words apart (the narrowest spacing;
+    `SpecMetadata._take_rng_window_offsets` spaces them further), no ``(key, subsequence, word)`` is
+    drawn twice, even with every request on one seed."""
     window = K + 1
     seed = 7
     for k in range(1, K + 1):
@@ -495,9 +494,11 @@ def _worker_metadata(mbs, slots, seed, offset):
     rows = mbs * (K + 1)
     md.temperatures = torch.ones(rows, device=DEV)
     md.top_ks = torch.full((rows,), 2**31 - 1, dtype=torch.int32, device=DEV)
+    md.min_ps = torch.zeros(rows, device=DEV)
     md.top_ps = torch.ones(rows, device=DEV)
     md.request_temperatures = torch.ones(mbs, device=DEV)
     md.request_top_ks = torch.full((mbs,), 2**31 - 1, dtype=torch.int32, device=DEV)
+    md.request_min_ps = torch.zeros(mbs, device=DEV)
     md.request_top_ps = torch.ones(mbs, device=DEV)
     md.request_seeds = torch.full((mbs,), seed, dtype=torch.int64, device=DEV)
     md.request_offsets = torch.full((mbs,), offset, dtype=torch.int64, device=DEV)
