@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -28,20 +29,37 @@ from pathlib import Path
 _HEARTBEAT_INTERVAL = 0.5
 _HEARTBEAT_TIMEOUT = 5.0
 _START_TIMEOUT = 10.0
+_NETWORK_HINT = (
+    "Set TRTLLM_WORKER_WATCH_HOST to this proxy's address reachable from every MPI worker "
+    "and allow worker-to-proxy TCP traffic through the firewall. "
+    "TRTLLM_WORKER_WATCH_PORT selects a fixed listener port. "
+    "TRTLLM_WORKER_WATCH=0 disables independent remote process supervision."
+)
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class ProcessWatchEndpoint:
+    """Authenticated listener address and address family sent to each worker."""
+
     address: str
     key: bytes = field(repr=False)
+    ipv6: bool = False
 
 
 class RemoteWorkerProcessMonitor:
     """Receive authenticated process-watch reports on a dedicated socket owner."""
 
     def __init__(self, world_size: int, wake: threading.Event | None = None) -> None:
+        """Start the proxy listener selected by the worker-watch environment.
+
+        Args:
+            world_size: Number of MPI worker ranks required for readiness.
+            wake: Event to set when a worker or its supervision is lost.
+        """
         import zmq
+
+        from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
         from .ipc import IpcQueue
 
@@ -51,27 +69,49 @@ class RemoteWorkerProcessMonitor:
         self._stopped = threading.Event()
         self._seen: dict[int, tuple[dict, float]] = {}
         self._failure: dict | None = None
-        host_override = os.environ.get("TRTLLM_WORKER_WATCH_HOST")
-        host_error = (
-            "Set TRTLLM_WORKER_WATCH_HOST to a leader address reachable from all MPI workers"
-        )
+        host = os.environ.get("TRTLLM_WORKER_WATCH_HOST") or get_local_ip()
         try:
-            host = socket.gethostbyname(host_override or socket.gethostname())
+            family, _, _, _, address = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0]
         except socket.gaierror as error:
-            raise RuntimeError(host_error) from error
+            raise RuntimeError(
+                f"Cannot resolve process-watch host {host!r}. {_NETWORK_HINT}"
+            ) from error
+        host = address[0]
         # Reject wildcard advertised addresses; this comparison does not bind.
         # Loopback is valid when every rank can report to this endpoint.
-        if host == "0.0.0.0":  # nosec B104
-            raise RuntimeError(host_error)
-        self._queue = IpcQueue(
-            ("tcp://0.0.0.0:*", None),
-            is_server=True,
-            socket_type=zmq.PULL,
-            name="remote_worker_process_watch",
-            receive_hwm=max(64, world_size * 4),
-        )
+        if ipaddress.ip_address(host).is_unspecified:
+            raise RuntimeError(
+                f"Cannot advertise wildcard process-watch host {host!r}. {_NETWORK_HINT}"
+            )
+        port = os.environ.get("TRTLLM_WORKER_WATCH_PORT", "*")
+        if port != "*":
+            try:
+                port_number = int(port)
+            except ValueError as error:
+                raise ValueError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535") from error
+            if not 1 <= port_number <= 65535:
+                raise ValueError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535")
+            port = str(port_number)
+        ipv6 = family == socket.AF_INET6
+        bind_address = f"tcp://{'[::]' if ipv6 else '0.0.0.0'}:{port}"
+        try:
+            self._queue = IpcQueue(
+                (bind_address, None),
+                is_server=True,
+                socket_type=zmq.PULL,
+                name="remote_worker_process_watch",
+                receive_hwm=max(64, world_size * 4),
+                ipv6=ipv6,
+            )
+        except zmq.ZMQError as error:
+            raise RuntimeError(
+                f"Cannot bind process-watch listener {bind_address}. {_NETWORK_HINT}"
+            ) from error
         port = self._queue.address[0].rsplit(":", 1)[1]
-        self.endpoint = ProcessWatchEndpoint(f"tcp://{host}:{port}", self._queue.address[1])
+        advertised_host = f"[{host}]" if ipv6 else host
+        self.endpoint = ProcessWatchEndpoint(
+            f"tcp://{advertised_host}:{port}", self._queue.address[1], ipv6
+        )
         self._thread = threading.Thread(
             target=self._run, name="remote_worker_process_watch", daemon=True
         )
@@ -79,6 +119,7 @@ class RemoteWorkerProcessMonitor:
 
     @property
     def failure(self) -> dict | None:
+        """Return the first worker/helper loss report, or None while healthy."""
         with self._lock:
             return self._failure
 
@@ -92,6 +133,7 @@ class RemoteWorkerProcessMonitor:
             self._wake.set()
 
     def wait_ready(self, timeout: float = _START_TIMEOUT) -> bool:
+        """Wait at most timeout seconds for authenticated reports from all ranks."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self._lock:
@@ -101,6 +143,14 @@ class RemoteWorkerProcessMonitor:
                     return True
             if self._stopped.wait(0.01):
                 return False
+        with self._lock:
+            missing = sorted(set(range(self._world_size)) - self._seen.keys())
+        logger.error(
+            "MPI ranks %s did not report to process-watch endpoint %s. %s",
+            missing,
+            self.endpoint.address,
+            _NETWORK_HINT,
+        )
         return False
 
     def _accept_report(self, report: dict) -> None:
@@ -159,6 +209,7 @@ class RemoteWorkerProcessMonitor:
             self._queue.close()
 
     def close(self) -> None:
+        """Stop the receiver and close its listener without waiting for workers."""
         self._stopped.set()
         if self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
@@ -168,6 +219,12 @@ class WorkerProcessWatch:
     """Keep process liveness observable while the worker is in Python or CUDA."""
 
     def __init__(self, endpoint: ProcessWatchEndpoint, rank: int) -> None:
+        """Start an independent helper and require its first report to connect.
+
+        Args:
+            endpoint: Proxy-owned authenticated process-watch listener.
+            rank: MPI rank of the calling worker process.
+        """
         self._process = subprocess.Popen(
             [sys.executable, str(Path(__file__).resolve()), "--watch"],
             stdin=subprocess.PIPE,
@@ -179,18 +236,23 @@ class WorkerProcessWatch:
             "key": endpoint.key.hex(),
             "rank": rank,
             "pid": os.getpid(),
+            "ipv6": endpoint.ipv6,
         }
         try:
             self._process.stdin.write(json.dumps(config) + "\n")
             self._process.stdin.flush()
             readable, _, _ = select.select([self._process.stdout], [], [], _START_TIMEOUT)
             if not readable or self._process.stdout.readline().strip() != "ready":
-                raise RuntimeError(f"MPI rank {rank} process watch failed to start")
+                raise RuntimeError(
+                    f"MPI rank {rank} process watch failed to connect to {endpoint.address}. "
+                    f"{_NETWORK_HINT}"
+                )
         except BaseException:
             self.close()
             raise
 
     def close(self) -> None:
+        """Stop and reap this worker's helper, escalating after a bounded wait."""
         process = self._process
         try:
             if process.poll() is None:
@@ -241,6 +303,7 @@ def _watch_process() -> int:
         "kind": "alive",
     }
     with zmq.Context() as context, context.socket(zmq.PUSH) as channel:
+        channel.setsockopt(zmq.IPV6, int(config.get("ipv6", False)))
         channel.setsockopt(zmq.IMMEDIATE, 1)
         channel.setsockopt(zmq.LINGER, 250)
         channel.setsockopt(zmq.SNDHWM, 4)
