@@ -139,6 +139,122 @@ def test_grouping_pads_groups_and_demotes_surplus_sharing_groups():
     assert grouping.prefix_empty.all()
 
 
+def _stats_meta(manager, request_ids, *, cuda_graph=True, num_contexts=0, rows=None):
+    return SimpleNamespace(
+        num_generations=len(request_ids) - num_contexts if rows is None else rows,
+        num_contexts=num_contexts,
+        is_cuda_graph=cuda_graph,
+        request_ids=request_ids,
+        kv_cache_manager=manager,
+    )
+
+
+def _stats_state(grouping, *, planned=True, captured=False):
+    return SimpleNamespace(
+        step_grouping=grouping,
+        plan=SimpleNamespace(grouping=grouping) if planned else None,
+        captured=captured,
+        stats_grouping=None,
+        stats_counts=(),
+        pending_shared=None,
+        table_rows_key=None,
+        real_rows_key=None,
+        real_rows=0,
+    )
+
+
+def test_grouping_keeps_padding_and_dummy_rows_out_of_groups():
+    """Rows marked not groupable go to the placeholder group even when they share pages."""
+    tables = [[1, 2, 9], [1, 2, 10], [7, 8, 0], [7, 8, 0]]
+    groupable = np.array([True, True, False, False])
+    grouping = _build(tables, [10, 11, 9, 9], 4, padded_groups=3, groupable=groupable)
+    assert grouping.num_sharing == 1
+    assert grouping.shareable_rows.tolist() == [True, True, False, False]
+    assert grouping.prefix_empty.tolist() == [False, False, True, True]
+    # The placeholder page stays a real page.
+    assert grouping.prefix_indices.tolist()[2] == 7
+
+
+def test_step_stats_count_request_steps_per_kv_manager():
+    """Every real generation request of a step counts once; padding and attention-DP dummies do
+    not; shared rows count when the library attends the step."""
+    tpb = 4
+    pad = (1 << 64) - 1
+    # Rows 0, 1 share two pages and pass the gate; rows 2, 3 share one page and do not; row 4
+    # shares nothing; rows 5, 6 are padding.
+    tables = [[1, 2, 9], [1, 2, 10], [3, 11, 0], [3, 12, 0], [5, 14, 0], [7, 8, 0], [7, 8, 0]]
+    groupable = np.array([True] * 5 + [False] * 2)
+    grouping = _build(
+        tables,
+        [10, 11, 6, 7, 6, 9, 9],
+        tpb,
+        padded_groups=4,
+        group_pays=lambda rows, tokens: tokens >= 2 * tpb,
+        groupable=groupable,
+    )
+    assert grouping.num_sharing == 1
+    manager, other = _Manager(), _Manager()
+    ids = [11, 12, 13, 14, 15, pad, pad]
+    lib.reset_step_stats()
+
+    # Eager step: shared rows wait for the library to run the step.
+    state = _stats_state(grouping)
+    lib._record_step(_stats_meta(manager, ids, cuda_graph=False), state)
+    assert lib.step_stats(manager).shared_request_steps == 0
+    lib._commit_shared(state)
+    lib._commit_shared(state)  # once per step
+    # A planned step the library then declines on every layer: never committed.
+    state = _stats_state(grouping)
+    lib._record_step(_stats_meta(manager, ids, cuda_graph=False), state)
+    state.pending_shared = None  # what plan_step does at the next step
+    # Replay of a graph captured with the library: counted at plan time.
+    state = _stats_state(grouping, captured=True)
+    lib._record_step(_stats_meta(manager, ids), state)
+    # A step declined before grouping, with a context row first and an attention-DP dummy.
+    lib._record_step(_stats_meta(manager, [99, 21, 0, 22], num_contexts=1, cuda_graph=False), None)
+    lib._record_step(_stats_meta(other, ids), None)
+
+    assert lib.step_stats(manager).as_dict() == {
+        "requestSteps": 5 + 5 + 5 + 2,
+        "shareableRequestSteps": 4 + 4 + 4,
+        "sharedRequestSteps": 2 + 2,
+    }
+    assert lib.step_stats(other).as_dict() == {
+        "requestSteps": 5,
+        "shareableRequestSteps": 0,
+        "sharedRequestSteps": 0,
+    }
+    assert lib.step_stats().request_steps == 17 + 5
+    lib.reset_step_stats(manager)
+    assert lib.step_stats(manager).request_steps == 0
+    assert lib.step_stats(other).request_steps == 5
+    # A manager without weak-reference support is not counted (nor kept alive).
+    lib._record_step(_stats_meta(SimpleNamespace(), ids), None)
+    assert lib.step_stats().request_steps == 5
+    lib.reset_step_stats()
+
+
+def test_executor_reports_only_its_own_rank_counters(monkeypatch):
+    """Records appended on behalf of another attention-DP rank carry no counters (they are local)."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+    executor = object.__new__(PyExecutor)
+    executor.dist = SimpleNamespace(rank=0, tp_rank=0)
+    executor.kv_cache_manager = _Manager()
+    monkeypatch.setattr(PyExecutor, "_shared_prefix_attn_library", staticmethod(lambda: lib))
+    lib.reset_step_stats()
+    lib._record_step(_stats_meta(executor.kv_cache_manager, [5, 6]), None)
+    expected = {"requestSteps": 2, "shareableRequestSteps": 0, "sharedRequestSteps": 0}
+    assert executor._shared_prefix_attn_stats() == expected
+    assert executor._shared_prefix_attn_stats(attention_dp_rank=0) == expected
+    assert executor._shared_prefix_attn_stats(attention_dp_rank=1) is None
+    executor.kv_cache_manager = None
+    assert executor._shared_prefix_attn_stats() is None
+    monkeypatch.setattr(PyExecutor, "_shared_prefix_attn_library", staticmethod(lambda: None))
+    assert PyExecutor._shared_prefix_attn_stats(executor) is None
+    lib.reset_step_stats()
+
+
 def test_grouping_drops_groups_that_do_not_pay():
     """``group_pays`` sees each candidate group's rows and shared tokens; the rows of the
     groups it rejects take the tail alone."""
@@ -317,6 +433,7 @@ def _planner_meta(host, request_ids, slot_of, kv_lens, tpb, *, q_len, caches, in
         kv_lens_runtime=torch.tensor(kv_lens),
         tokens_per_block=tpb,
         num_generations=rows,
+        num_contexts=0,
         num_tokens=rows * q_len,
         seq_lens=torch.full((rows,), q_len, dtype=torch.int32),
         is_cuda_graph=is_cuda_graph,
@@ -411,7 +528,7 @@ def test_planner_declines_short_drafts_and_eager_batches_without_sharing(monkeyp
     host[0, 0, 0, :] = torch.tensor([1, 2, 3, 4])
     host[0, 1, 0, :] = torch.tensor([5, 6, 7, 8])
     host[0, 2, 0, :] = torch.tensor([9, 10, 11, 12])
-    ids, slots = [0, 1, 2], {0: 0, 1: 1, 2: 2}
+    ids, slots = [1, 2, 3], {1: 0, 2: 1, 3: 2}
     # Fewer query tokens per row than the FA4 prefix tile is measured with.
     caches = {}
     lib._plan_sampling_step(_planner_meta(host, ids, slots, [12] * 3, tpb, q_len=lib.MIN_Q_LEN - 1,
@@ -528,7 +645,7 @@ def test_library_cuda_graph_replay_matches_eager_across_steps(monkeypatch):
         layer_offsets={0: 0},
         kv_factor=2,
         max_beam_width=1,
-        index_mapper=SimpleNamespace(get_index=lambda rid: rid),
+        index_mapper=SimpleNamespace(get_index=lambda rid: rid - 1),  # ids start at 1
         layer_to_pool_mapping_dict={0: 0},
         get_layer_page_index_scale=lambda layer_idx: 2,
         get_buffers=lambda layer, kv_layout: pool_of["pool"],
@@ -546,13 +663,14 @@ def test_library_cuda_graph_replay_matches_eager_across_steps(monkeypatch):
         meta = SimpleNamespace(
             fmha_plan_caches=caches,
             kv_cache_manager=manager,
-            request_ids=list(range(rows)),
+            request_ids=list(range(1, rows + 1)),  # 0 is the attention-DP dummy id
             host_kv_cache_block_offsets=host,
             kv_cache_block_offsets=offsets,
             kv_lens_runtime=torch.tensor(kv_lens),
             kv_lens_cuda_runtime=kv_lens_device,
             tokens_per_block=tpb,
             num_generations=rows,
+            num_contexts=0,
             num_tokens=rows * q_len,
             seq_lens=torch.full((rows,), q_len, dtype=torch.int32),
             is_cuda_graph=True,

@@ -1376,6 +1376,11 @@ class PyExecutor:
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
             self.kv_cache_manager.snapshot_warmup_baseline()
+        # Likewise drop the warmup steps from the shared-prefix attention counters.
+        sampling_shared_prefix = self._shared_prefix_attn_library()
+        if (sampling_shared_prefix is not None
+                and self.kv_cache_manager is not None):
+            sampling_shared_prefix.reset_step_stats(self.kv_cache_manager)
 
         self.is_shutdown = False
         # Set at the executor loops' normal-exit `break` sites, and ONLY
@@ -3613,6 +3618,9 @@ class PyExecutor:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
+            shared_prefix_attn_stats = self._shared_prefix_attn_stats()
+            if shared_prefix_attn_stats is not None:
+                local_dict["sharedPrefixAttnStats"] = shared_prefix_attn_stats
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
             # desync (reached from per-rank-divergent gates).
             self._pending_iter_stats_dict = local_dict
@@ -3629,6 +3637,9 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] shared_prefix_attn_stats: Optional[Dict[str, int]]
+        shared_prefix_attn_stats = self._shared_prefix_attn_stats(
+            attention_dp_rank)
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -3636,7 +3647,36 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, shared_prefix_attn_stats))
+
+    @staticmethod
+    def _shared_prefix_attn_library():
+        """The shared-prefix attention module when that FMHA library is enabled, else None."""
+        from tensorrt_llm._torch.attention.backends.fmha.registry import \
+            is_fmha_lib_enabled
+        if not is_fmha_lib_enabled("sampling_shared_prefix"):
+            return None
+        from tensorrt_llm._torch.attention.backends.fmha import \
+            sampling_shared_prefix
+        return sampling_shared_prefix
+
+    def _shared_prefix_attn_stats(
+            self,
+            attention_dp_rank: Optional[int] = None) -> Optional[Dict[str, int]]:
+        """Cumulative shared-prefix attention counters of this executor's KV cache.
+
+        Cumulative, so a consumer that misses records (a bounded stats buffer)
+        still reads exact totals. None unless that FMHA library is enabled, and
+        for records this rank appends on behalf of another attention-DP rank
+        (the counters are local to each rank; TLLM_METRICS_ALL_RANKS=1 reports
+        every rank's own).
+        """
+        if attention_dp_rank not in (None, self.dist.tp_rank):
+            return None
+        sampling_shared_prefix = self._shared_prefix_attn_library()
+        if sampling_shared_prefix is None or self.kv_cache_manager is None:
+            return None
+        return sampling_shared_prefix.step_stats(self.kv_cache_manager).as_dict()
 
     def _process_iter_stats(
         self,

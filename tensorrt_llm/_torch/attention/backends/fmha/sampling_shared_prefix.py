@@ -197,6 +197,153 @@ def has_active_plan(metadata: "TrtllmAttentionMetadata") -> bool:
     return state is not None and state.plan is not None
 
 
+@dataclass
+class StepStats:
+    """Cumulative counts of generation requests per decode step ("request-steps").
+
+    A generation request decoded in a step adds 1 to ``request_steps``; one that decodes for 100
+    steps adds 100. Updated on the host, once per step. CUDA graph padding rows and attention-DP
+    dummy requests are not counted, and the executor calls ``reset_step_stats`` at the end of its
+    warm-up.
+    """
+
+    request_steps: int = 0
+    """Generation requests decoded, summed over steps."""
+    shareable_request_steps: int = 0
+    """Of those, requests that share at least one full prompt page with another request of the
+    step (before the size gate and the group limit). Counted only on steps the library groups;
+    steps it declines before grouping (a prefill in the batch, mixed or short query lengths) add to
+    ``request_steps`` only."""
+    shared_request_steps: int = 0
+    """Of those, requests attended through a shared-prefix group: counted when the library runs the
+    step (eagerly, or by replaying a CUDA graph captured with it), not when it plans it."""
+
+    def as_dict(self) -> dict:
+        return {
+            "requestSteps": self.request_steps,
+            "shareableRequestSteps": self.shareable_request_steps,
+            "sharedRequestSteps": self.shared_request_steps,
+        }
+
+
+_step_stats: dict = {}
+"""id(KV cache manager) -> (weak reference to the manager, its ``StepStats``)."""
+
+
+def _stats_for(kv_cache_manager) -> Optional[StepStats]:
+    """The counters of ``kv_cache_manager``, or None for a manager without weak-reference support
+    (holding it strongly would keep its pools alive)."""
+    entry = _step_stats.get(id(kv_cache_manager))
+    if entry is None or entry[0]() is not kv_cache_manager:
+        try:
+            ref = weakref.ref(kv_cache_manager)
+        except TypeError:
+            return None
+        entry = _step_stats[id(kv_cache_manager)] = (ref, StepStats())
+    return entry[1]
+
+
+def step_stats(kv_cache_manager=None) -> StepStats:
+    """Cumulative counters (a copy) of the steps attended on ``kv_cache_manager``'s cache; without
+    a manager, summed over every live manager of the process."""
+    total = StepStats()
+    for ref, stats in list(_step_stats.values()):
+        manager = ref()
+        if manager is None or (kv_cache_manager is not None and manager is not kv_cache_manager):
+            continue
+        total.request_steps += stats.request_steps
+        total.shareable_request_steps += stats.shareable_request_steps
+        total.shared_request_steps += stats.shared_request_steps
+    return total
+
+
+def reset_step_stats(kv_cache_manager=None) -> None:
+    """Zero the counters of ``kv_cache_manager``; without a manager, of every manager."""
+    if kv_cache_manager is None:
+        _step_stats.clear()
+    else:
+        _step_stats.pop(id(kv_cache_manager), None)
+
+
+_PADDING_REQUEST_ID_FLOOR = 1 << 63
+"""CUDA graph padding rows carry request ids at the top of the uint64 range, after the real rows."""
+_ADP_DUMMY_REQUEST_ID = 0
+"""``ATTENTION_DP_DUMMY_REQUEST_ID``: the placeholder request of an idle attention-DP rank."""
+
+
+def _generation_request_ids(metadata: "TrtllmAttentionMetadata", rows: int) -> Optional[list]:
+    request_ids = metadata.request_ids
+    if request_ids is None:
+        return None
+    start = int(metadata.num_contexts)
+    return list(request_ids[start : start + rows])
+
+
+def _num_real_rows(metadata: "TrtllmAttentionMetadata", rows: int) -> int:
+    """Generation rows that are neither CUDA graph padding nor attention-DP dummies."""
+    request_ids = _generation_request_ids(metadata, rows)
+    if request_ids is None:
+        return rows
+    n = len(request_ids)
+    while n and request_ids[n - 1] >= _PADDING_REQUEST_ID_FLOOR:  # padding is appended last
+        n -= 1
+    return n - request_ids[:n].count(_ADP_DUMMY_REQUEST_ID)
+
+
+def _real_row_mask(metadata: "TrtllmAttentionMetadata", rows: int) -> Optional[np.ndarray]:
+    """[rows] bool: the rows ``_num_real_rows`` counts; None when every row is real."""
+    request_ids = _generation_request_ids(metadata, rows)
+    if request_ids is None:
+        return None
+    ids = np.array(request_ids, dtype=np.uint64)
+    mask = (ids < _PADDING_REQUEST_ID_FLOOR) & (ids != _ADP_DUMMY_REQUEST_ID)
+    return None if mask.all() else mask
+
+
+def _record_step(metadata: "TrtllmAttentionMetadata", state: Optional["_SamplingState"]) -> None:
+    rows = int(metadata.num_generations)
+    if rows <= 0 or metadata.kv_cache_manager is None:
+        return
+    stats = _stats_for(metadata.kv_cache_manager)
+    if stats is None:
+        return
+    grouping = state.step_grouping if state is not None else None
+    if grouping is None:
+        stats.request_steps += _num_real_rows(metadata, rows)
+        return
+    if state.stats_grouping is not grouping:
+        # Padding and dummy rows never join a group (``_build_grouping``'s ``groupable``).
+        # The real-row count changes only with the step's requests; ``_advance`` makes a new
+        # grouping whenever a row crosses a page boundary, so key it on the request ids.
+        if state.real_rows_key is not state.table_rows_key or state.table_rows_key is None:
+            state.real_rows_key = state.table_rows_key
+            state.real_rows = _num_real_rows(metadata, rows)
+        state.stats_grouping = grouping
+        state.stats_counts = (
+            state.real_rows,
+            int(grouping.shareable_rows.sum()),
+            int((~grouping.prefix_empty).sum()),
+        )
+    real, shareable, shared = state.stats_counts
+    stats.request_steps += real
+    stats.shareable_request_steps += shareable
+    if state.plan is None or not shared:
+        return
+    if metadata.is_cuda_graph and state.captured:
+        # The step replays a graph captured with this library; no Python runs for it.
+        stats.shared_request_steps += shared
+    else:
+        state.pending_shared = (stats, shared)  # counted by ``_commit_shared`` if the step runs
+
+
+def _commit_shared(state: "_SamplingState") -> None:
+    """Count the step's shared rows once the library attends it (first layer of the step)."""
+    if state.pending_shared is not None:
+        stats, shared = state.pending_shared
+        stats.shared_request_steps += shared
+        state.pending_shared = None
+
+
 def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     """Per-step host planning, called from ``TrtllmAttentionMetadata.prepare``.
 
@@ -207,9 +354,12 @@ def plan_step(metadata: "TrtllmAttentionMetadata") -> None:
     state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
     if state is not None:
         state.plan = None
+        state.step_grouping = None
+        state.pending_shared = None
     if sampling_metadata_eligible(metadata):
         _plan_sampling_step(metadata)
         state = metadata.fmha_plan_caches.get(SAMPLING_KEY)
+    _record_step(metadata, state)
     if state is not None and state.captured and state.plan is None:
         # A graph captured with this library would replay stale tables.
         raise RuntimeError(
@@ -269,6 +419,9 @@ class _Grouping:
     capped_keys: np.ndarray
     """Keys of multi-row first pages whose members also agree on the page after
     their shared run, so the run may grow with their smallest full-page count."""
+    shareable_rows: np.ndarray
+    """[rows] bool, batch order: the row shares at least one full page before its first token of
+    the step with another row (a candidate group, before the size gate and the group limit)."""
     key_caps: np.ndarray
     """[keys] int64: smallest full-page count of each key's rows."""
     shared_g: np.ndarray
@@ -302,6 +455,7 @@ def _build_grouping(
     padded_groups: Optional[int],
     q_len: int,
     group_pays: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+    groupable: Optional[np.ndarray] = None,
 ) -> _Grouping:
     """Group rows by common leading pages and build the prefix tables.
 
@@ -325,6 +479,8 @@ def _build_grouping(
             placeholder group exists only when it has rows.
         group_pays: ``(rows, shared tokens)`` of the candidate groups -> which of
             them share; the rows of the others join the placeholder group.
+        groupable: [rows] bool; rows marked False (CUDA graph padding, attention-DP
+            dummies) never join a group. None: every row may.
     """
     i64 = np.int64
     pages_all = np.asarray(pages_all, dtype=i64)
@@ -336,8 +492,14 @@ def _build_grouping(
     private_from = np.maximum(kv_lens - q_len, 0) // tokens_per_block
 
     first_pages = pages_all[:, 0].copy()
+    group_keys = first_pages
+    if groupable is not None and not groupable.all():
+        # A key no page can take, distinct per row, keeps those rows out of every group.
+        group_keys = first_pages.copy()
+        excluded = np.flatnonzero(~groupable)
+        group_keys[excluded] = -1 - np.arange(excluded.size, dtype=i64)
     _, leader, key_of_row, members = np.unique(
-        first_pages, return_index=True, return_inverse=True, return_counts=True
+        group_keys, return_index=True, return_inverse=True, return_counts=True
     )
     key_of_row = key_of_row.reshape(-1)
     num_keys = leader.size
@@ -361,6 +523,7 @@ def _build_grouping(
         capped_keys = np.flatnonzero(multi & (common > cap))
 
     sharing = np.flatnonzero(shared > 0)
+    shareable_rows = shared[key_of_row] > 0
     if group_pays is not None and sharing.size:
         sharing = sharing[group_pays(members[sharing], shared[sharing] * tokens_per_block)]
     if max_sharing_groups is not None and sharing.size > max_sharing_groups:
@@ -418,6 +581,7 @@ def _build_grouping(
         is_identity=bool((perm == row_ids).all()),
         key_of_row=key_of_row,
         capped_keys=capped_keys,
+        shareable_rows=shareable_rows,
         key_caps=cap,
         shared_g=row_shared[perm],
         qo_indptr=_indptr(sizes * q_len),
@@ -663,6 +827,16 @@ class _SamplingState:
     tables_captured: bool = False
     logged: bool = False
     ran: bool = False
+    step_grouping: Optional[_Grouping] = None
+    """Grouping of the current step; None when the step was declined before grouping."""
+    stats_grouping: Optional[_Grouping] = None
+    """Grouping that ``stats_counts`` describes (``_record_step``)."""
+    stats_counts: tuple = ()
+    pending_shared: Optional[tuple] = None
+    real_rows_key: Optional[tuple] = None
+    """``table_rows_key`` (the step's request ids) that ``real_rows`` was counted for."""
+    real_rows: int = 0
+    """(counters, shared rows) of the planned step, counted when the library attends it."""
 
 
 def _int_env(name: str, default: int) -> int:
@@ -884,9 +1058,11 @@ def _plan_sampling_step(metadata: "TrtllmAttentionMetadata") -> None:
                 padded_groups=buffers.num_groups,
                 q_len=q_len,
                 group_pays=_group_filter(q_len),
+                groupable=_real_row_mask(metadata, rows),
             )
         grouping = state.grouping = advanced
         state.grouping_pages = host_pages
+    state.step_grouping = grouping
     if eager and grouping.num_sharing == 0:
         # No group passes the size gate: the library would only add its fixed cost.
         return
@@ -1097,6 +1273,8 @@ class SamplingSharedPrefixFmha(PhasedFmha):
         capturing = torch.cuda.is_current_stream_capturing()
         # Once per step, and recorded by the capture itself: an eager warmup forward of
         # the same step does not put it in the graph.
+        if state.tables_step != plan.step:
+            _commit_shared(state)
         if state.tables_step != plan.step or (capturing and not state.tables_captured):
             tail.build_tables(
                 metadata.kv_cache_block_offsets[state.pool_index, :rows, 0],
@@ -1152,8 +1330,11 @@ class SamplingSharedPrefixFmha(PhasedFmha):
 __all__ = [
     "LIB_NAME",
     "SamplingSharedPrefixFmha",
+    "StepStats",
     "group_saved_bytes",
     "has_active_plan",
     "plan_step",
+    "reset_step_stats",
     "sampling_metadata_eligible",
+    "step_stats",
 ]

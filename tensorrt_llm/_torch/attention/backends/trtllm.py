@@ -1499,7 +1499,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def supports_steady_decode_step(self) -> bool:
         """Whether prepare_steady_decode_step may stand in for this metadata's prepare(): no host state of
         prepare() beyond the KV lengths and block offsets (no FlashMLA, helix, cached-KV context MLA, FP4 MLA,
-        mixed-precision KV or full generation page table) and prepare() is this class's."""
+        mixed-precision KV, full generation page table or shared-prefix step plan) and prepare() is this
+        class's."""
         return (type(self).prepare is TrtllmAttentionMetadata.prepare
                 and self.kv_cache_manager is not None
                 and not self.enable_flash_mla and not self.enable_helix
@@ -1507,7 +1508,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
                 and self.mixed_precision_high_block_table is None
-                and not self.kv_cache_params.use_full_generation_page_table)
+                and not self.kv_cache_params.use_full_generation_page_table
+                # The shared-prefix library plans every step in prepare().
+                and not is_fmha_lib_enabled(SAMPLING_SHARED_PREFIX_LIB))
 
     def key_prepared_block_offsets(self) -> None:
         """Key the block offsets the last prepare() copied, so that the next prepare_steady_decode_step skips
