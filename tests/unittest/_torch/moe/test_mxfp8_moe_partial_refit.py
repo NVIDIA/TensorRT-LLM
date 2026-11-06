@@ -43,8 +43,8 @@ from transformers.configuration_utils import PretrainedConfig
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.cute_dsl_utils import (
-    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
@@ -503,3 +503,35 @@ def test_mxfp8_fused_gate_up_proj_refit_matches_vanilla_load(backend):
     _refit(module, [_fused(weights_a)])
     _refit(module, [_fused(weights_b, {"w1", "w3"}), _fused(weights_b, {"w2"})])
     _assert_matches(module, expected_b, "FUSED_GATE_UP_PROJ refit")
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rebuilt, cleared",
+    [
+        ({"w3_w1_weight"}, False),
+        ({"w3_w1_weight_scale"}, True),
+        ({"w3_w1_weight", "w3_w1_weight_scale"}, True),
+        ({"w2_weight"}, False),
+    ],
+    ids=["fc1_weight", "fc1_scale", "both", "fc2_only"],
+)
+def test_mxfp8_cutedsl_pre_reload_resets_interleave_state_of_rebuilt_fc1(
+    rebuilt: set, cleared: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recreated FC1 scale parameter holds no slot in the CuTe DSL
+    interleaved layout, so ``pre_reload_weights`` must forget its interleave
+    state, and only then: a scale parameter left in place keeps its slots'
+    layout for a partial refit to build on. The FC1 weight has no such state;
+    it is written in the kernel layout at load time."""
+    monkeypatch.setattr(
+        MXFP8CuteDslFusedMoEMethod.__mro__[1], "pre_reload_weights", lambda self, module: None
+    )
+    module = torch.nn.Module()
+    module.rebuild_tensor_metadata = {name: None for name in rebuilt}
+    module._cute_dsl_mxfp8_w3_w1_scale_interleaved = {0, 1, 2}
+
+    MXFP8CuteDslFusedMoEMethod.__new__(MXFP8CuteDslFusedMoEMethod).pre_reload_weights(module)
+
+    slots = module._cute_dsl_mxfp8_w3_w1_scale_interleaved
+    assert (not slots) is cleared, slots

@@ -53,8 +53,8 @@ from utils.util import check_accuracy, getSMVersion, skip_pre_blackwell
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
 from tensorrt_llm._torch.cute_dsl_utils import (
-    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
@@ -8418,6 +8418,8 @@ def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
     elif sm in (100, 103):
         if not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE:
             pytest.skip("MXFP8 on SM100/SM103 requires a CuTe DSL build with the Blackwell helpers")
+        if fused_input_quant:
+            pytest.skip("Only SM107 fuses the input quantization into the op")
     else:
         pytest.skip(f"CuteDSL MXFP8 fused FC12 requires SM107 or SM100/SM103, got SM{sm}")
     dtype = torch.bfloat16

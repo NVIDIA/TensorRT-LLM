@@ -36,8 +36,8 @@ from ....autotuner import (
 from ....custom_ops.cute_dsl_custom_ops import GroupedGemmInputsHelper
 from ....cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
-    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from ....locality_domain.autotune import (
