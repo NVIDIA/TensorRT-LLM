@@ -344,7 +344,7 @@ class TestMambaHelixCP:
         assert MambaPolicy.is_paired(paired_ri, peer_ri)
 
 
-def test_from_bytes_defaults_missing_protocol_version_to_legacy():
+def test_from_bytes_rejects_another_protocol_version_before_decoding_fields():
     import msgpack
 
     ri = RankInfo(
@@ -363,17 +363,18 @@ def test_from_bytes_defaults_missing_protocol_version_to_legacy():
     assert ri.protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
     assert RankInfo.from_bytes(ri.to_bytes()).protocol_version == NATIVE_TRANSFER_PROTOCOL_VERSION
 
-    # A peer that predates the versioned frames sends no version field; it must
-    # decode as the legacy version (so validate_protocol_version rejects it)
-    # rather than silently adopting the current version.
-    without_version = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
-    without_version.pop("protocol_version", None)
-    legacy = RankInfo.from_bytes(msgpack.packb(without_version))
-    assert legacy.protocol_version == _LEGACY_PROTOCOL_VERSION
+    # A peer that predates the versioned frames sends no version field; it is
+    # read as the legacy version and rejected rather than adopting ours.
     assert _LEGACY_PROTOCOL_VERSION != NATIVE_TRANSFER_PROTOCOL_VERSION
-    # A peer that predates the versioned frames sends no version field.
     older = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
     older.pop("protocol_version")
-    restored = RankInfo.from_bytes(msgpack.packb(older))
-    assert restored.protocol_version == _LEGACY_PROTOCOL_VERSION
-    assert restored.protocol_version != NATIVE_TRANSFER_PROTOCOL_VERSION
+    with pytest.raises(ValueError, match=f"peer={_LEGACY_PROTOCOL_VERSION}"):
+        RankInfo.from_bytes(msgpack.packb(older))
+
+    # A newer peer may add fields this release does not define; the version
+    # mismatch is reported instead of a TypeError from the dataclass.
+    newer = msgpack.unpackb(ri.to_bytes(), strict_map_key=False)
+    newer["protocol_version"] = NATIVE_TRANSFER_PROTOCOL_VERSION + 1
+    newer["field_from_a_newer_release"] = 1
+    with pytest.raises(ValueError, match="protocol version mismatch"):
+        RankInfo.from_bytes(msgpack.packb(newer))

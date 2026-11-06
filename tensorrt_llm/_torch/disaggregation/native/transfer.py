@@ -3364,7 +3364,6 @@ class Receiver(ReceiverBase):
             try:
                 messenger.send([MessageType.REQUEST_INSTANCE_INFO])
                 message = messenger.receive()
-                sender_info = RankInfo.from_bytes(message[0])
             finally:
                 messenger.stop()
 
@@ -3377,6 +3376,8 @@ class Receiver(ReceiverBase):
             # (handled in dispatch_task) so only requests targeting this peer
             # fail, and cached so later requests fail fast.
             try:
+                # from_bytes rejects a peer on another protocol version.
+                sender_info = RankInfo.from_bytes(message[0])
                 validate_protocol_version(sender_info)
                 self._registrar.validate_bounded_replay_compatible(sender_info)
                 MambaPolicy.validate_peer_compatible(

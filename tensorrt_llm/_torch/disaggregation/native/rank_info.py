@@ -42,10 +42,14 @@ def validate_protocol_version(peer_ri: "RankInfo") -> None:
     same way, so no other RankInfo field can be trusted; raise before any of
     them is used.
     """
-    if peer_ri.protocol_version != NATIVE_TRANSFER_PROTOCOL_VERSION:
+    _check_protocol_version(peer_ri.protocol_version)
+
+
+def _check_protocol_version(peer_version) -> None:
+    if peer_version != NATIVE_TRANSFER_PROTOCOL_VERSION:
         raise ValueError(
             "PeerRegistrar: native transfer protocol version mismatch "
-            f"(local={NATIVE_TRANSFER_PROTOCOL_VERSION}, peer={peer_ri.protocol_version}). "
+            f"(local={NATIVE_TRANSFER_PROTOCOL_VERSION}, peer={peer_version}). "
             "Context and generation servers must run the same TensorRT-LLM release."
         )
 
@@ -154,10 +158,10 @@ class RankInfo:
     @classmethod
     def from_bytes(cls, data: bytes) -> "RankInfo":
         unpacked = msgpack.unpackb(data, strict_map_key=False)
-        # A peer that predates the versioned frames sends no version field;
-        # decode it as the legacy version so validate_protocol_version rejects
-        # it rather than silently treating it as the current version.
-        unpacked.setdefault("protocol_version", _LEGACY_PROTOCOL_VERSION)
+        # A peer that predates the versioned frames sends no version field.
+        # Check the version before building the dataclass: a peer on another
+        # version may send fields this release does not define.
+        _check_protocol_version(unpacked.get("protocol_version", _LEGACY_PROTOCOL_VERSION))
         if unpacked.get("attention") is not None:
             unpacked["attention"] = AttentionInfo.from_dict(unpacked["attention"])
         if unpacked.get("page_table") is not None:
