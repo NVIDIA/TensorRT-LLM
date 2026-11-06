@@ -23,6 +23,7 @@ from unittest.mock import Mock
 from unittest.mock import Mock as _Mock
 
 import pytest
+import zmq
 
 from tensorrt_llm._startup_errors import (
     StartupErrorInfo,
@@ -116,8 +117,7 @@ def test_cancellation_preserves_live_worker_shutdown(state: str) -> None:
     try:
         peer.setup_lazily()
         # Complete the real connection before checking delivery or suppression.
-        peer.put("ready")
-        assert proxy.request_queue.get() == "ready"
+        assert peer.socket.poll(timeout=1000, flags=zmq.POLLOUT)
         proxy.abort_request(42)
         if state in ("healthy", "graceful"):
             assert peer.poll(timeout=1)
@@ -147,7 +147,7 @@ def test_cancellation_without_peer_fails_executor(batching: bool) -> None:
     proxy.mpi_futures = []
     proxy.request_queue = IpcQueue(is_server=True)
     proxy._request_sender = proxy_module._RequestSender(
-        proxy.request_queue, proxy._error_queue, batching=batching, recovery_timeout=0.2
+        proxy.request_queue, proxy._error_queue, batching=batching, connect_timeout=0.2
     )
     result = _FakeResult()
     result.abort = Mock()
@@ -938,6 +938,9 @@ def _proxy_awaiting_worker_init(
     proxy = _bare_proxy()
     proxy._error_queue = _queue.Queue()
     proxy._fatal_error = None
+    proxy._command_failure_lock = threading.Lock()
+    proxy._workers_ready = False
+    proxy._command_failure = None
     proxy._owns_mpi_session = owns_session
     proxy.worker_cls = object
     # This partial fixture owns no worker or socket resources. Its finalizer
@@ -967,6 +970,75 @@ def _proxy_awaiting_worker_init(
         status_queue.get.return_value = ready_status
     proxy.worker_init_status_queue = status_queue
     return proxy
+
+
+@pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("loss_at", ["waiting-for-ready", "readiness-transition"])
+def test_early_command_disconnect_aborts_before_marking_dead(tmp_path, loss_at):
+    """An eager command monitor must preserve ordered initialization teardown."""
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=True, ready_status=(GenerationExecutorProxy.READY_SIGNAL, None)
+    )
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+    proxy._num_frontends = 2
+    proxy._multi_frontend_ipc_dir = str(tmp_path)
+    proxy._multi_frontend_hmac = b"k" * 32
+    proxy._enable_resource_governor = False
+    proxy.mpi_session.check_worker_error.return_value = None
+    status_queue = proxy.worker_init_status_queue
+    address = (
+        proxy_module.multi_frontend_request_addr(str(tmp_path)),
+        proxy._multi_frontend_hmac,
+    )
+    peer = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
+    peer_monitor = peer.socket.get_monitor_socket(events=zmq.EVENT_HANDSHAKE_SUCCEEDED)
+    try:
+        # Exercise the real startup callback selected by queue construction,
+        # before any generation command or worker READY message exists.
+        proxy._setup_queues()
+        proxy.worker_init_status_queue.close()
+        proxy.worker_init_status_queue = status_queue
+        assert peer_monitor.poll(2000), "command transport did not establish a connection"
+        peer.socket.disable_monitor()
+        peer_monitor.close(linger=0)
+        proxy._handle_background_error = _Mock(wraps=proxy._handle_background_error)
+
+        def disconnect():
+            peer.close()
+            proxy._request_sender._thread.join(timeout=2)
+            assert not proxy._request_sender._thread.is_alive()
+            return True
+
+        if loss_at == "waiting-for-ready":
+            status_queue.poll.return_value = False
+            disconnect()
+        else:
+            # READY has arrived, but initialization has not yet committed to
+            # runtime failure handling. A loss here must not fall between them.
+            proxy._worker_process_monitor.wait_remote_ready.side_effect = disconnect
+
+        with pytest.raises(RuntimeError, match="initialization") as error:
+            proxy._start_executor_workers({})
+
+        cause = error.value.__cause__
+        assert isinstance(cause, ConnectionError)
+        assert proxy._fatal_error is cause
+        assert pending.queue.get_nowait().root_cause is cause
+        proxy.mpi_session.shutdown_abort.assert_called_once_with(reason=cause)
+        called = [call[0] for call in proxy.mpi_session.mock_calls]
+        assert called.index("shutdown_abort") < called.index("release_exit_joins")
+        proxy._handle_background_error.assert_not_called()
+        assert proxy._error_queue.empty()
+    finally:
+        peer_monitor.close(linger=0)
+        peer.close()
+        if proxy._request_sender is not None:
+            proxy._request_sender.close(timeout=2)
+        if hasattr(proxy, "result_queue"):
+            proxy.result_queue.close()
+        if proxy.worker_init_status_queue is not status_queue:
+            proxy.worker_init_status_queue.close()
 
 
 def test_remote_supervision_failure_after_ready_preserves_startup_error():

@@ -96,6 +96,7 @@ class WorkerProcessMonitor:
     """
 
     def __init__(self) -> None:
+        """Initialize local handles and optional remote supervision ownership."""
         self._pidfd_to_identity: Dict[int, WorkerProcessIdentity] = {}
         self._procfs_identities: List[WorkerProcessIdentity] = []
         self._dead_identity: Optional[WorkerProcessIdentity] = None
@@ -106,7 +107,21 @@ class WorkerProcessMonitor:
         self._remote = None
 
     def start_remote(self, world_size: int, wake: threading.Event):
-        """Watch remote workers independently of MPI futures and collectives."""
+        """Watch remote ranks, unless TRTLLM_WORKER_WATCH=0 explicitly opts out.
+
+        Args:
+            world_size: Number of worker ranks that must report readiness.
+            wake: Event to set when independent supervision detects a failure.
+
+        Returns:
+            The helper endpoint, or None when independent supervision is disabled.
+        """
+        if os.environ.get("TRTLLM_WORKER_WATCH") == "0":
+            logger.warning(
+                "TRTLLM_WORKER_WATCH=0: independent remote worker process supervision is disabled; "
+                "existing MPI future/error checks may not detect an abruptly lost remote rank"
+            )
+            return None
         from .remote_worker_process_monitor import RemoteWorkerProcessMonitor
 
         self._remote = RemoteWorkerProcessMonitor(world_size, wake)

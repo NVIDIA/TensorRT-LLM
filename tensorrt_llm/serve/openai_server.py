@@ -45,6 +45,7 @@ from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
 from tensorrt_llm.executor.request import DEFAULT_REQUEST_PRIORITY
 from tensorrt_llm.executor.rpc import RPCError
 from tensorrt_llm.executor.utils import (CONTEXT_LENGTH_EXCEEDED_CODE,
+                                         EngineDeadError,
                                          EngineUnavailableError,
                                          is_context_length_exceeded_message)
 from tensorrt_llm.inputs import prompt_inputs
@@ -96,7 +97,6 @@ from tensorrt_llm.serve.encode_batcher import (EncodeBatcher, InputTooLongError,
                                                QueueFullError)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.multi_frontend import (FORWARDED_ROUTES,
-                                               LAUNCHER_RECOVERY_HEADER,
                                                AttachedFrontendWatchdog,
                                                LauncherForwarder,
                                                MultiFrontendServing,
@@ -1177,7 +1177,7 @@ class OpenAIServer(_VideoRoutesMixin):
 
     @staticmethod
     def _create_exception_response(error: Exception) -> Response:
-        if isinstance(error, EngineUnavailableError):
+        if isinstance(error, (EngineUnavailableError, EngineDeadError)):
             return OpenAIServer.create_error_response(
                 str(error),
                 err_type="ServiceUnavailableError",
@@ -1745,26 +1745,14 @@ class OpenAIServer(_VideoRoutesMixin):
             # Executor cleanup can precede HTTP shutdown. A fatal engine must
             # also stop serving, without stacking signals during HTTP teardown.
             executor = getattr(self.generator, '_executor', None)
-            headers = {}
             if executor is not None and getattr(executor, '_fatal_error',
                                                 None) is not None:
                 logger.error(
                     "Health check detected fatal engine error, initiating "
                     f"server shutdown: {executor._fatal_error}")
                 self._request_http_shutdown()
-            elif (executor is not None
-                  and not getattr(executor, '_engine_dead', False)
-                  and not getattr(executor, 'doing_shutdown', True)):
-                sender = getattr(executor, '_request_sender', None)
-                batcher = self.embedding_batcher
-                if (sender is not None and sender.recovering
-                        and (batcher is None or batcher.is_alive())):
-                    # Readiness stays unavailable, but attached frontends must
-                    # survive until the sender's recovery deadline expires.
-                    headers[LAUNCHER_RECOVERY_HEADER] = "1"
             return Response(
                 status_code=503,
-                headers=headers,
                 content=
                 "LLM is unavailable. Please check the server logs for more details."
             )
@@ -2561,6 +2549,8 @@ class OpenAIServer(_VideoRoutesMixin):
                                    dtype=np.int32).tobytes()).decode("ascii")
                     response.prompt_token_ids = None
                 return JSONResponse(content=response.model_dump())
+        except EngineUnavailableError as e:
+            return self._create_exception_response(e)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -2982,6 +2972,8 @@ class OpenAIServer(_VideoRoutesMixin):
             response = await create_mm_embedding_response(promise)
             return JSONResponse(content=response.model_dump())
 
+        except EngineUnavailableError as e:
+            return self._create_exception_response(e)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server
@@ -3640,6 +3632,8 @@ class OpenAIServer(_VideoRoutesMixin):
                     response.prompt_token_ids = None
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(content=response.model_dump(by_alias=True))
+        except EngineUnavailableError as e:
+            return self._create_exception_response(e)
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

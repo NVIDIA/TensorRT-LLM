@@ -55,9 +55,10 @@ from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
 from .utils import (EngineDeadError, EngineUnavailableError, ErrorResponse,
                     RequestError, WorkerCommIpcAddrs, create_mpi_comm_session,
-                    get_spawn_proxy_process_env, is_llm_response,
-                    multi_frontend_request_addr, multi_frontend_result_addr,
-                    namespace_client_id, print_alive_threads)
+                    get_spawn_proxy_process_env, has_event_loop,
+                    is_llm_response, multi_frontend_request_addr,
+                    multi_frontend_result_addr, namespace_client_id,
+                    print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 from .worker_process_monitor import WorkerProcessIdentity, WorkerProcessMonitor
 
@@ -128,6 +129,7 @@ class GenerationExecutorProxy(GenerationExecutor):
     # Every command uses this socket owner; TRTLLM_PROXY_BATCH_REQUESTS
     # controls burst coalescing only.
     _request_sender: Optional[_RequestSender] = None
+    _command_failure: Optional[BaseException] = None
     # Total wait for the worker futures in an orderly shutdown. Generous
     # enough for the teardown of a large engine.
     _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
@@ -192,6 +194,9 @@ class GenerationExecutorProxy(GenerationExecutor):
         # new requests fail fast with EngineDeadError instead of blocking on a
         # response queue whose producer is gone.
         self._engine_dead = False
+        self._command_failure_lock = threading.Lock()
+        self._workers_ready = False
+        self._command_failure = None
 
         self.model_world_size = model_world_size
 
@@ -396,6 +401,15 @@ class GenerationExecutorProxy(GenerationExecutor):
                 logger.debug(
                     f"MPI session exit-join release failed (ignored): {e!r}")
 
+    def _handle_command_failure(self, error: BaseException) -> None:
+        """Retain startup losses for abort-before-mark initialization teardown."""
+        with self._command_failure_lock:
+            if not self._workers_ready:
+                if self._command_failure is None:
+                    self._command_failure = error
+                return
+        self._handle_worker_death(error)
+
     def _handle_worker_death(self, error: BaseException) -> None:
         """Fail pending requests and queue terminal worker errors for cleanup.
 
@@ -499,7 +513,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
             self._request_sender = _create_request_sender(
                 self.request_queue, self._error_queue,
-                weakref.WeakMethod(self._handle_worker_death))
+                weakref.WeakMethod(self._handle_command_failure))
             self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
                                               is_server=True,
                                               fuse_message=False,
@@ -513,7 +527,7 @@ class GenerationExecutorProxy(GenerationExecutor):
                 send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
             self._request_sender = _create_request_sender(
                 self.request_queue, self._error_queue,
-                weakref.WeakMethod(self._handle_worker_death))
+                weakref.WeakMethod(self._handle_command_failure))
             # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
             # Use PULL mode when enable_postprocess_parallel as there are
             # multiple senders from multiple processes.
@@ -696,12 +710,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         request.ack_addr = self._ensure_profile_ack_queue()
         deadline = time.monotonic() + timeout
-        self._request_sender.set_control_deadline(deadline)
-        try:
-            self._send_request(request)
-            self._wait_profile_ack(kind, max(0.0, deadline - time.monotonic()))
-        finally:
-            self._request_sender.set_control_deadline(0.0)
+        self._send_request(request)
+        self._wait_profile_ack(kind, max(0.0, deadline - time.monotonic()))
 
     def _submit_profile_control(self, kind: str, request,
                                 timeout: float) -> None:
@@ -897,6 +907,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         before the abort would defang it (see _fail_initialization), so the
         init wait loop needs detection kept separate from handling.
         """
+        if self._command_failure is not None:
+            return self._command_failure
         dead_worker = self._worker_process_monitor.find_dead_worker()
         if dead_worker is not None:
             return RuntimeInitError(
@@ -996,6 +1008,15 @@ class GenerationExecutorProxy(GenerationExecutor):
                 RuntimeError(
                     "Remote worker process supervision is unavailable"),
                 self._detect_worker_death_during_init())
+
+        with self._command_failure_lock:
+            command_failure = self._command_failure
+            self._workers_ready = command_failure is None
+        if command_failure is not None:
+            self._fail_initialization(
+                RuntimeError(
+                    "Executor command connection lost during initialization"),
+                command_failure)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -1118,6 +1139,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise RuntimeError("Executor command sender is not initialized")
         self._request_sender.send(
             pickle.dumps(request),
+            wait_for_capacity=isinstance(request, GenerationRequest)
+            and not has_event_loop(),
             cancellation_id=request.id
             if isinstance(request, CancellingRequest) else None,
             control=isinstance(

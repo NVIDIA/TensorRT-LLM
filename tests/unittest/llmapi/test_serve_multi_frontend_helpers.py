@@ -16,31 +16,25 @@
 
 import asyncio
 import os
-import pickle
 import queue
 import signal
 import subprocess
 import sys
 import threading
 import time
-import weakref
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest import mock
 
 import msgspec
 import pytest
-import zmq
 from aiohttp import web
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from tensorrt_llm._utils import AdjustedSteadyClock
-from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-from tensorrt_llm.executor.request import _CommandBarrier
-from tensorrt_llm.executor.request_sender import _RequestSender
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
@@ -218,8 +212,8 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(
     assert len(deaths) == 1 and "failed 2 consecutive" in str(deaths[0])
 
 
-@pytest.mark.parametrize("outcome", ["recover", "expire", "batcher_failure"])
-def test_watchdog_preserves_bounded_command_recovery(tmp_path, monkeypatch, outcome) -> None:
+@pytest.mark.parametrize("failure", ["engine", "batcher"])
+def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeypatch, failure):
     proxy = object.__new__(GenerationExecutorProxy)
     proxy.workers_started = False
     proxy.doing_shutdown = False
@@ -228,53 +222,17 @@ def test_watchdog_preserves_bounded_command_recovery(tmp_path, monkeypatch, outc
     proxy._results = {}
     proxy._error_queue = queue.Queue()
     proxy._check_mpi_workers = lambda: False
-    address = (f"ipc://{tmp_path}/commands", b"k" * 32)
-    sender = _RequestSender(
-        IpcQueue(address, is_server=False, socket_type=zmq.PUSH),
-        proxy._error_queue,
-        batching=False,
-        on_failure=weakref.WeakMethod(proxy._handle_worker_death),
-        recovery_timeout=0.15,
+    proxy._request_sender = SimpleNamespace(
+        available=True, fail=lambda _: None, close=lambda **_: None
     )
-    proxy._request_sender = sender
     server = object.__new__(OpenAIServer)
     server.embedding_batcher = None
     server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
     monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)
     monkeypatch.setattr(signal, "raise_signal", lambda _: None)
     deaths = []
-    received = []
-    stop = threading.Event()
-    worker = None
 
-    def receive() -> None:
-        commands = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
-        try:
-            while not stop.is_set():
-                if not commands.poll(timeout=0.05):
-                    continue
-                for payload in commands.get():
-                    request = pickle.loads(payload)
-                    if isinstance(request, _CommandBarrier):
-                        ack = IpcQueue(request.ack_addr, is_server=False, socket_type=zmq.PUSH)
-                        try:
-                            ack.socket.setsockopt(zmq.IMMEDIATE, 1)
-                            ack.put(request.token, timeout=0.2)
-                        except zmq.Again:
-                            pass  # The sender retries the idempotent barrier.
-                        finally:
-                            ack.close()
-                    else:
-                        received.append(request)
-        finally:
-            commands.close()
-
-    async def run() -> None:
-        nonlocal worker
-        # Profiling can extend transport recovery beyond the watchdog's budget.
-        sender.set_control_deadline(time.monotonic() + 3)
-        await asyncio.to_thread(sender.send, pickle.dumps("generation"))
-        assert sender.recovering
+    async def run():
         launcher = await asyncio.to_thread(
             _FakeLauncher, str(tmp_path / "launcher.sock"), 200, server.health
         )
@@ -289,40 +247,23 @@ def test_watchdog_preserves_bounded_command_recovery(tmp_path, monkeypatch, outc
         )
         task = asyncio.create_task(watchdog.run())
         try:
-            await _wait_for(lambda: launcher.health_hits >= 6 or task.done())
-            assert sender.recovering and not proxy._engine_dead
-            assert (await server.health()).status_code == 503
-            assert not task.done() and not deaths
-            if outcome == "recover":
-                worker = threading.Thread(target=receive)
-                worker.start()
-                await _wait_for(lambda: sender.available)
-                assert (await server.health()).status_code == 200
-                assert received == ["generation"]
-                # Confirmed worker loss must still end the frontend after recovery.
-                proxy._handle_worker_death(RuntimeError("worker exited"))
-            elif outcome == "batcher_failure":
+            await _wait_for(lambda: launcher.health_hits >= 4)
+            assert (await server.health()).status_code == 200
+            assert not deaths
+            if failure == "engine":
+                proxy._handle_worker_death(RuntimeError("command connection lost"))
+            else:
                 server.embedding_batcher = SimpleNamespace(is_alive=lambda: False)
+            assert (await server.health()).status_code == 503
             await asyncio.wait_for(task, timeout=10)
             assert len(deaths) == 1
-            if outcome == "expire":
-                assert proxy._fatal_error is not None
-            elif outcome == "batcher_failure":
-                assert sender.recovering and not proxy._engine_dead
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
             await forwarder.close()
             await asyncio.to_thread(launcher.close)
 
-    try:
-        asyncio.run(run())
-    finally:
-        sender.close(timeout=5)
-        stop.set()
-        if worker is not None:
-            worker.join(timeout=5)
-            assert not worker.is_alive()
+    asyncio.run(run())
 
 
 def test_watchdog_notices_a_gone_launcher_process(tmp_path) -> None:
