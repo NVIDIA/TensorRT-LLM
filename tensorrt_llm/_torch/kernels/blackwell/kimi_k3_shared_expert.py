@@ -18,8 +18,9 @@
 The shared expert of a decode step is a TP-sharded gated MLP: this rank computes
 ``act = situ(x @ Wg^T, x @ Wu^T)`` for its ``I = 6144 / W`` intermediate columns and the
 row-parallel partial ``act @ Wd^T`` (``[M, 7168]``), which the column-parallel MoE tail pushes into
-its all-gather call. :class:`KimiK3SharedExpertKernel` does all of it with ``N`` persistent CTAs on
-the shared stream, beside the routed experts' grid:
+its all-gather call (or the kernel stores straight into that call's slots: the output push).
+:class:`KimiK3SharedExpertKernel` does all of it with ``N`` persistent CTAs on the shared stream,
+beside the routed experts' grid:
 
 * Weights. Each CTA streams its weights once, in consumption order, through a ring of shared
   memory stages (``cp.async.bulk``, one producer warp, full / empty mbarriers, a proxy fence
@@ -34,12 +35,16 @@ the shared stream, beside the routed experts' grid:
   (release); every CTA then waits for all ``N`` (acquire) and copies the whole activation into
   shared memory; the last CTA to have copied it re-arms the two counters.
 * Down. Warp ``w`` multiplies m-tile ``8 g + w`` of the CTA's list (``K = I``) and stores the
-  16 x M outputs as BF16 into the partial ``[M, 7168]``.
+  16 x M outputs as BF16 into the partial ``[M, 7168]``, or with the output push rounds them to
+  BF16 (``-0`` as ``+0``) and multicasts them into slot ``(token, rank)`` of the all-gather call's
+  current buffer (``mnnvl_pushed_allreduce.push_slot``, one-shot), the bits
+  ``PushedAllReduceCopyKernel`` would push.
 
 Numerics: the products are those of the BF16 GEMMs (FP32 accumulation, BF16 outputs) in a
 different summation order, and the activation evaluates tanh / sigmoid with ``ex2.approx``: not
 bitwise. Launched without PDL; consecutive launches on a stream reuse the exchange buffer and
-counters (the stream serializes them).
+counters (the stream serializes them). The output push reads the call's rotation state before the
+down projection: the call must be the current one on its workspace when the kernel starts.
 """
 
 from __future__ import annotations
@@ -54,12 +59,15 @@ import torch
 from cutlass import Float32, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from . import mnnvl_pushed_allreduce as pushed_ar
 from .raw_ptx import asm as _asm
 from .raw_ptx import (
     atom_add_acq_rel_u32,
     ld_acquire_u32,
     ld_volatile_v4,
+    multimem_st_v4,
     pack_bf16x2,
+    sanitize_bf16x2,
     st_u32,
     st_v4,
 )
@@ -269,9 +277,19 @@ class _Plan:
 
 class KimiK3SharedExpertKernel:
     """The shared expert of ``m <= 8`` rows of one rank of ``world`` on ``sms`` CTAs (see the
-    module docstring)."""
+    module docstring). ``push``: the output push into a ``world``-rank all-gather call (multicast,
+    or with ``mc_out=False`` plain stores through a local base)."""
 
-    def __init__(self, world: int, m: int, sms: int, beta: float, lbeta: Optional[float]):
+    def __init__(
+        self,
+        world: int,
+        m: int,
+        sms: int,
+        beta: float,
+        lbeta: Optional[float],
+        push: bool = False,
+        mc_out: bool = True,
+    ):
         if not 1 <= m <= MAX_M:
             raise ValueError(f"m={m}: 1..{MAX_M}")
         self.p = _Plan(world, sms)
@@ -280,6 +298,8 @@ class KimiK3SharedExpertKernel:
         self.sms = sms
         self.beta = float(beta)
         self.lbeta = None if lbeta is None else float(lbeta)
+        self.push = push
+        self.mc_out = mc_out
 
     @cute.jit
     def __call__(
@@ -289,6 +309,8 @@ class KimiK3SharedExpertKernel:
         xch_addr: Int64,
         ctr_addr: Int64,
         out_addr: Int64,
+        out_flags: Int64,
+        rank: Int32,
         stream: cuda.CUstream,
     ):
         p = self.p
@@ -305,7 +327,7 @@ class KimiK3SharedExpertKernel:
             out: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, p.out_bytes], 16]
 
         self.shared_storage = SharedStorage
-        self.kernel(x_addr, w_addr, xch_addr, ctr_addr, out_addr).launch(
+        self.kernel(x_addr, w_addr, xch_addr, ctr_addr, out_addr, out_flags, rank).launch(
             grid=(self.sms, 1, 1),
             block=(THREADS, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
@@ -323,6 +345,8 @@ class KimiK3SharedExpertKernel:
         xch_addr: Int64,
         ctr_addr: Int64,
         out_addr: Int64,
+        out_flags: Int64,
+        rank: Int32,
     ):
         p = self.p
         m = self.m
@@ -459,6 +483,12 @@ class KimiK3SharedExpertKernel:
                     st_u32(ctr_addr + Int64(4), Int32(0))
 
             # ---- down: m-tile 8 g + warp of this CTA's list, K = I ----
+            cur = Int32(0)
+            nbytes = Int32(0)
+            if cutlass.const_expr(self.push):
+                # The all-gather call's buffer and its bytes (``lamport_state``).
+                f = ld_volatile_v4(out_flags)
+                cur, nbytes = f[0], f[2]
             arow = act_s + gq * p.act_pitch
             stg = out_s + warp * MAX_M * STAGE_PITCH * 4
             for g in cutlass.range_constexpr(p.groups):
@@ -499,8 +529,19 @@ class KimiK3SharedExpertKernel:
                         pack_bf16x2(e4, e5),
                         pack_bf16x2(e6, e7),
                     ]
-                    dst = out_addr + (Int64(tk) * HIDDEN + Int64(tile * 16 + h8)) * 2
-                    st_v4(dst, o[0], o[1], o[2], o[3])
+                    if cutlass.const_expr(self.push):
+                        o = [sanitize_bf16x2(word) for word in o]
+                        dst = pushed_ar.push_slot(
+                            Int64(0), out_addr, cur, nbytes, tk, rank, tile * 16 + h8,
+                            self.world, HIDDEN, True,
+                        )  # fmt: skip
+                        if cutlass.const_expr(self.mc_out):
+                            multimem_st_v4(dst, o[0], o[1], o[2], o[3])
+                        else:
+                            st_v4(dst, o[0], o[1], o[2], o[3])
+                    else:
+                        dst = out_addr + (Int64(tk) * HIDDEN + Int64(tile * 16 + h8)) * 2
+                        st_v4(dst, o[0], o[1], o[2], o[3])
                 cute.arch.sync_warp()
 
 
@@ -578,13 +619,23 @@ class PersistWorkspace:
 
 
 @functools.cache
-def _compiled(world: int, m: int, sms: int, beta: float, lbeta: Optional[float], dev: int):
-    kernel = KimiK3SharedExpertKernel(world, m, sms, beta, lbeta)
+def _compiled(
+    world: int,
+    m: int,
+    sms: int,
+    beta: float,
+    lbeta: Optional[float],
+    push: bool,
+    mc_out: bool,
+    dev: int,
+):
+    kernel = KimiK3SharedExpertKernel(world, m, sms, beta, lbeta, push, mc_out)
     z = Int64(0)
     with torch.cuda.device(dev):
         compiled = cute.compile(
-            kernel, z, z, z, z, z, cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        )
+            kernel, z, z, z, z, z, z, Int32(0),
+            cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+        )  # fmt: skip
     return compiled
 
 
@@ -595,10 +646,14 @@ def run_shared_expert(
     world: int,
     sms: int,
     ws: PersistWorkspace,
-    out: torch.Tensor,
+    out: Optional[torch.Tensor],
     beta: float,
     linear_beta: Optional[float],
-) -> torch.Tensor:
+    push_base: Optional[int] = None,
+    push_flags: Optional[torch.Tensor] = None,
+    rank: int = 0,
+    mc_out: bool = True,
+) -> Optional[torch.Tensor]:
     """Launch :class:`KimiK3SharedExpertKernel` on the current stream; returns ``out``.
 
     Args:
@@ -606,8 +661,13 @@ def run_shared_expert(
         frags: :func:`persist_fragments` of this rank's weights for ``sms`` CTAs.
         world: The shared expert's TP size (``I = 6144 / world``).
         ws: The exchange buffer and counters (:class:`PersistWorkspace`).
-        out: The partial ``[m, 7168]`` BF16 (contiguous; every element written).
+        out: The partial ``[m, 7168]`` BF16 (contiguous; every element written); None with the
+            output push.
         beta / linear_beta: SiTU's ``beta`` and ``linear_beta`` (``None``: no up clamp).
+        push_base / push_flags / rank: The output push: a ``world``-rank all-gather call of
+            ``m`` rows (``MnnvlPushTarget``; multicast base, or with ``mc_out=False`` a local
+            base, and its rotation state), current on its workspace when the kernel starts; the
+            kernel writes slot ``(token, rank)`` of every token.
     """
     m = x.shape[0]
     if x.dtype != torch.bfloat16 or tuple(x.shape[1:]) != (HIDDEN,) or not x.is_contiguous():
@@ -615,14 +675,22 @@ def run_shared_expert(
     if not can_run(m, world, sms):
         raise ValueError(f"m={m} world={world} sms={sms} not supported")
     lbeta = None if linear_beta is None else float(linear_beta)
-    if out.dtype != torch.bfloat16 or tuple(out.shape) != (m, HIDDEN) or not out.is_contiguous():
+    push = push_flags is not None
+    if push:
+        if out is not None or push_base is None:
+            raise ValueError("the output push takes push_base and push_flags instead of out")
+    elif out is None or (
+        out.dtype != torch.bfloat16 or tuple(out.shape) != (m, HIDDEN) or not out.is_contiguous()
+    ):
         raise ValueError("out must be contiguous BF16 [m, 7168]")
-    _compiled(world, m, sms, float(beta), lbeta, x.device.index)(
+    _compiled(world, m, sms, float(beta), lbeta, push, push and mc_out, x.device.index)(
         Int64(x.data_ptr()),
         Int64(frags.data_ptr()),
         Int64(ws.xch.data_ptr()),
         Int64(ws.ctr.data_ptr()),
-        Int64(out.data_ptr()),
+        Int64(push_base if push else out.data_ptr()),
+        Int64(push_flags.data_ptr() if push else 0),
+        Int32(rank),
         cuda.CUstream(torch.cuda.current_stream().cuda_stream),
     )
     return out

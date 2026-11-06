@@ -127,7 +127,7 @@ from ..distributed import (
     MnnvlWorkspaceResult,
     allgather,
 )
-from ..distributed.ops import MnnvlOwnWorkspace
+from ..distributed.ops import MnnvlOwnWorkspace, MnnvlPushTarget
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
@@ -2375,7 +2375,7 @@ class KimiK3MoERuntime(nn.Module):
     def _column_parallel_tail(
         self,
         routed_latent: torch.Tensor,
-        shared_partial: torch.Tensor,
+        shared_partial: Optional[torch.Tensor],
         tail_targets=None,
         shared_pushed: bool = False,
     ) -> Tuple[Union[torch.Tensor, MnnvlPendingResult], Optional[torch.Tensor]]:
@@ -2389,8 +2389,8 @@ class KimiK3MoERuntime(nn.Module):
         ``bf16(latent_up + shared all-reduce)``, which the next decode mix finishes, while each
         rank reads 1 / W of latent_up. Every rank runs the same calls in this order on the main
         stream: the pushes read the rotation state the latent all-reduce left. ``shared_pushed``
-        (with ``tail_targets``): the shared partial is already in the all-gather call's slots
-        (``_shared_push_target``).
+        (with ``tail_targets``): the persistent shared expert stored its partial in the all-gather
+        call's slots (``_shared_push_target``); ``shared_partial`` is then None.
         """
         up = self.routed_expert_up_proj
         shared_ar = self.shared_experts.down_proj.all_reduce
@@ -2422,14 +2422,14 @@ class KimiK3MoERuntime(nn.Module):
     def _moe_tail(
         self,
         routed_latent: torch.Tensor,
-        shared_partial: torch.Tensor,
+        shared_partial: Optional[torch.Tensor],
         ag,
         latent,
         shared_pushed: bool = False,
     ):
         """The one-kernel MoE tail (``kimi_k3_moe_tail``) on the latent all-reduce the routed
-        experts pushed into, then the shared partial's push unless ``shared_pushed`` (pushed on
-        the shared expert's stream); returns the pending all-gather call."""
+        experts pushed into, then the shared partial's push unless ``shared_pushed`` (stored by
+        the persistent shared expert on its stream); returns the pending all-gather call."""
         from ..kernels.blackwell import kimi_k3_moe_tail
 
         num_tokens = routed_latent.shape[0]
@@ -2563,21 +2563,28 @@ class KimiK3MoERuntime(nn.Module):
         return self._shared_frags is not None and 1 <= num_tokens <= kimi_k3_shared_expert.MAX_M
 
     def _shared_push_target(self, num_tokens: int, ag, latent):
-        """``ag`` where the persistent shared expert's partial can be pushed into this all-gather
-        call on the shared expert's stream, beside the routed experts and the MoE tail; else None.
+        """``ag`` where the persistent shared expert stores its partial into this all-gather
+        call's slots itself (output push) on the shared expert's stream, beside the routed
+        experts and the MoE tail; else None.
 
-        The copy push reads the call's rotation state when it starts, so the call must already be
-        the current one on its workspace: not where it follows the latent all-reduce on one
+        The kernel reads the call's rotation state, so the call must already be the current one
+        on its workspace when it starts: not where it follows the latent all-reduce on one
         workspace (``ag_follows``), which makes it current only once the tail finishes that
         all-reduce. The next decode mix polls the slots, so the tail does not wait for them."""
         if not self._min_latency_shared_applies(num_tokens):
             return None
         if ag.view.flags.data_ptr() == latent.view.flags.data_ptr():
             return None
+        if ag.view.world != self._shared_world:
+            return None
         return ag
 
-    def _min_latency_shared(self, identity: torch.Tensor) -> Optional[torch.Tensor]:
-        """The shared expert's partial from the persistent kernel where it applies, else None."""
+    def _min_latency_shared(
+        self, identity: torch.Tensor, push: Optional[MnnvlPushTarget] = None
+    ) -> Optional[torch.Tensor]:
+        """The shared expert's partial from the persistent kernel where it applies, else None.
+        With ``push`` (``_shared_push_target``) the kernel stores the partial into the call's
+        slots instead and returns None."""
         from ..kernels.blackwell import kimi_k3_shared_expert
 
         num_tokens = identity.shape[0]
@@ -2586,15 +2593,22 @@ class KimiK3MoERuntime(nn.Module):
             return None
         x = identity.reshape(num_tokens, self.hidden_size).contiguous()
         act = self.shared_experts.activation
+        out, push_args = None, {}
+        if push is not None:
+            view = push.view
+            push_args = dict(push_base=view.mc_base, push_flags=view.flags, rank=view.rank)
+        else:
+            out = torch.empty((num_tokens, self.hidden_size), dtype=x.dtype, device=x.device)
         return kimi_k3_shared_expert.run_shared_expert(
             x=x,
             frags=self._shared_frags,
             world=self._shared_world,
             sms=sms,
             ws=self._shared_ws,
-            out=torch.empty((num_tokens, self.hidden_size), dtype=x.dtype, device=x.device),
+            out=out,
             beta=float(act.beta),
             linear_beta=act.linear_beta,
+            **push_args,
         )
 
     def _moe_front_unsupported(self) -> Optional[str]:
@@ -3232,10 +3246,12 @@ class KimiK3MoERuntime(nn.Module):
         def _shared_output():
             if cp_tail and self._min_latency:
                 # The persistent shared expert (lossy), beside the routed grid.
+                if shared_push is not None:
+                    # Its partial goes straight into the all-gather call's slots: no output.
+                    self._min_latency_shared(identity, push=shared_push)
+                    return None
                 partial = self._min_latency_shared(identity)
                 if partial is not None:
-                    if shared_push is not None:
-                        self.shared_experts.down_proj.all_reduce.push_input(shared_push, partial)
                     return partial
             # Beside the routed grid (multi-stream) the shared GEMMs keep to the SMs it leaves.
             with _cublas_sm_limit(self._shared_sms if do_multi_stream() else 0):

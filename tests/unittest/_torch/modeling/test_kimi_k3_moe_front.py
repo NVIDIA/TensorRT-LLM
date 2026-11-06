@@ -221,9 +221,12 @@ def _min_latency_runtime(log, num_tokens, ag_follows):
     flags = torch.zeros(9, dtype=torch.int32, device="cuda")
     latent = SimpleNamespace(view=SimpleNamespace(world=4, uc_local=0, flags=flags))
     ag = SimpleNamespace(
-        view=SimpleNamespace(mc_base=0, flags=flags if ag_follows else torch.zeros_like(flags)),
+        view=SimpleNamespace(
+            world=4, mc_base=0, flags=flags if ag_follows else torch.zeros_like(flags)
+        ),
         buffer=torch.zeros(num_tokens, HIDDEN, device="cuda"),
     )
+    runtime._shared_world = 4
     runtime._moe_front_applies = lambda value: True
     runtime.runs_column_parallel_tail = lambda n: True
     runtime._min_latency_tail_targets = lambda n: (ag, latent)
@@ -236,9 +239,14 @@ def _min_latency_runtime(log, num_tokens, ag_follows):
         log.append(("front_route", torch.cuda.current_stream() == main["stream"]))
         return value * 1.0, None
 
-    def min_latency_shared(identity):
+    def min_latency_shared(identity, push=None):
         log.append(("shared_expert", torch.cuda.current_stream() == main["stream"]))
-        return identity * 2.0
+        if push is None:
+            return identity * 2.0
+        # The kernel's output push: the partial straight into the call's slots.
+        log.append(("shared_push", torch.cuda.current_stream() == main["stream"]))
+        push.buffer.copy_(identity * 2.0)
+        return None
 
     runtime._moe_front = moe_front
     runtime._min_latency_shared = min_latency_shared
@@ -255,11 +263,12 @@ def _min_latency_runtime(log, num_tokens, ag_follows):
 @pytest.mark.parametrize("ag_follows", [False, True])
 @pytest.mark.parametrize("capture", [False, True])
 def test_min_latency_shared_push_beside_tail(monkeypatch, ag_follows, capture):
-    """enable_min_latency: the persistent shared expert's partial is pushed into the tail's
-    all-gather call on the shared expert's stream and the main stream joins that stream only
-    after the one-kernel tail; where the call follows the latent all-reduce on its workspace
-    (its rotation state is the tail's to advance) the push stays on the main stream after the
-    tail. Eager and under CUDA graph capture (which rejects an unjoined stream)."""
+    """enable_min_latency: the persistent shared expert stores its partial into the tail's
+    all-gather call itself (output push) on the shared expert's stream, no copy push, and the
+    main stream joins that stream only after the one-kernel tail; where the call follows the
+    latent all-reduce on its workspace (its rotation state is the tail's to advance) the kernel
+    returns the partial and its copy push stays on the main stream after the tail. Eager and
+    under CUDA graph capture (which rejects an unjoined stream)."""
     from tensorrt_llm._torch.kernels.blackwell import kimi_k3_moe_tail
 
     log = []

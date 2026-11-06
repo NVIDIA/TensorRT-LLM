@@ -21,7 +21,10 @@ re-arm) and a CUDA graph replay:
 * the slot rows against an FP64 reference of the math, and against the GatedMLP path (BF16
   GEMM, ``situ_and_mul``, BF16 GEMM): no further from FP64 than that path (plus a margin for the
   BF16 rounding of the activation), and close to it;
-* every element written, the exchange counters back at zero.
+* every element written, the exchange counters back at zero;
+* the output push (local all-gather call, ``mc_out=False``): slot ``(token, rank)`` of the call's
+  current buffer holds the plain partial's bits with ``-0`` as ``+0`` (what the copy push stores),
+  and nothing else of the workspace or its rotation state changes.
 """
 
 import pytest
@@ -156,6 +159,55 @@ def test_shared_persist(world, m, sms, lbeta):
         err_mlp = _rel(mlp, _ideal(x, gu, dn, lbeta))
         assert err <= err_mlp * 1.05 + 1e-4, (step, err, err_mlp)
         assert ws.ctr.tolist() == [0, 0]
+
+
+SENT = -(2**31)  # 0x80000000 as int32, the Lamport sentinel
+
+
+@pytest.mark.parametrize("world,m,sms,rank", [(16, 8, 8, 5), (16, 3, 16, 15), (8, 1, 8, 0)])
+def test_shared_persist_output_push(world, m, sms, rank):
+    sp = _sp()
+    inter = INTER // world
+    g = torch.Generator(device="cuda").manual_seed(world * 7 + m + rank)
+    x = (torch.randn(m, HIDDEN, device="cuda", generator=g) * 0.5).bfloat16()
+    gu = (torch.randn(2 * inter, HIDDEN, device="cuda", generator=g) * 0.02).bfloat16()
+    dn = (torch.randn(HIDDEN, inter, device="cuda", generator=g) * 0.02).bfloat16()
+    frags = sp.persist_fragments(gu, dn, sms)
+    ws = sp.PersistWorkspace(world, x.device)
+    plain = torch.empty((m, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    sp.run_shared_expert(
+        x=x, frags=frags, world=world, sms=sms, ws=ws, out=plain, beta=BETA, linear_beta=LBETA
+    )
+    bits = plain.view(torch.int16)
+    expect = torch.where(bits == -32768, torch.zeros_like(bits), bits)
+
+    # The all-gather call's three Lamport buffers: W slots + the all-gather row per token.
+    nbytes = 8 * (world + 1) * HIDDEN * 2
+    buf = torch.full((3 * nbytes // 4,), SENT, dtype=torch.int32, device="cuda")
+    for cur in (2, 0):
+        buf.fill_(SENT)
+        flags = torch.tensor(
+            [cur, (cur + 2) % 3, nbytes, 1, 0, 0, 0, 0, 0], dtype=torch.int32, device="cuda"
+        )
+        flags_before = flags.clone()
+        ret = sp.run_shared_expert(
+            x=x, frags=frags, world=world, sms=sms, ws=ws, out=None, beta=BETA,
+            linear_beta=LBETA, push_base=buf.data_ptr(), push_flags=flags, rank=rank,
+            mc_out=False,
+        )  # fmt: skip
+        torch.cuda.synchronize()
+        assert ret is None
+        assert torch.equal(flags, flags_before), "rotation state written"
+        assert ws.ctr.tolist() == [0, 0]
+        n = nbytes // 4
+        slots = buf[cur * n : (cur + 1) * n].view(torch.int16)
+        slots = slots[: m * world * HIDDEN].view(m, world, HIDDEN)
+        assert torch.equal(slots[:, rank], expect), "slot (token, rank) is not the copy push's"
+        others = torch.ones(world, dtype=torch.bool, device="cuda")
+        others[rank] = False
+        assert bool((slots[:, others].reshape(-1).view(torch.int32) == SENT).all())
+        rest = torch.cat((buf[: cur * n], buf[cur * n + m * world * HIDDEN // 2 :]))
+        assert bool((rest == SENT).all()), "written outside the call's slots of this rank"
 
 
 def test_shared_persist_plans():
