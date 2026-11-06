@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import time
@@ -17,13 +18,21 @@ from agent_flow import AgentLayer, AgentLayerConfig, BackendConfig, SessionConfi
 from agent_flow.agent_runtime import AgentConfig, resolve_agent_config
 from agent_flow.console import print_message, print_rule
 from agent_flow.logger import get_logger
-from agent_flow.workflows.perf_analyze.prompts._common import profile_ranks_note
+from agent_flow.workflows.perf_analyze.prompts._common import (
+    external_benchmark_run_instruction,
+    profile_ranks_note,
+)
 from agent_flow.workflows.perf_analyze.sol_methodology import (
     SolMethodology,
     output_instruction,
     projector_instruction,
 )
-from agent_flow.workflows.perf_analyze.task_schema import CASEBOOK_SKILL_NAMES, casebook_enabled
+from agent_flow.workflows.perf_analyze.task_schema import (
+    CASEBOOK_SKILL_NAMES,
+    EXTERNAL_BENCHMARK,
+    benchmark_type,
+    casebook_enabled,
+)
 from agent_flow.workflows.perf_analyze.workflow import clear_stale_benchmark_results
 
 from . import gitops, kernel_ledger, nsys_items, reuse, roadmap_schema
@@ -403,6 +412,7 @@ class PerfOptimizeWorkflow:
                 clear_stale_benchmark_results(self.baseline_dir)
                 self._run_benchmarker(state)
                 self._require_stage_outputs(STAGE_BENCHMARKER, [self.baseline_results_path])
+                self._require_benchmarker_metric_handoff()
                 self._require_baseline_measurement()
                 state.benchmarker_done = True
                 state.stage = STAGE_PROJECTOR
@@ -1576,7 +1586,7 @@ class PerfOptimizeWorkflow:
         )
 
     def _require_baseline_measurement(self) -> None:
-        """Fail loudly when the baseline stage produced no measurement.
+        """Require the builtin benchmark's result JSON to carry the metric.
 
         ``_require_stage_outputs`` only proves the report exists. A report
         can exist and still carry no numbers: the benchmarker is required
@@ -1591,6 +1601,9 @@ class PerfOptimizeWorkflow:
         the prose: at least one result JSON under ``baseline/`` must carry
         the target metric.
         """
+        if benchmark_type(self._task_data()) == EXTERNAL_BENCHMARK:
+            return
+
         metric = str(self._optimize_block()["target_metric"])
         for path in sorted(self.baseline_dir.rglob("*.json")):
             try:
@@ -1608,6 +1621,45 @@ class PerfOptimizeWorkflow:
             f"a configuration that cannot serve a request. Fix the blocker and "
             f"re-run to retry the baseline, or pass --clean to start over."
         )
+
+    def _require_benchmarker_metric_handoff(self) -> None:
+        """Stop the campaign when the benchmarker could not resolve its target metric."""
+        expected = str(self._optimize_block()["target_metric"])
+        entry = latest_entry(self.progress_path, "benchmarker")
+        if entry is None:
+            raise RuntimeError(
+                "the benchmarker did not submit its target-metric handoff; "
+                "re-run the workflow to retry the baseline"
+            )
+
+        reported = entry.get("target_metric")
+        if reported != expected:
+            raise RuntimeError(
+                f"the benchmarker reported target metric {reported!r}, but "
+                f"optimize.target_metric is {expected!r}; the flow is stopped"
+            )
+
+        source = str(entry.get("metric_source") or "benchmark output")
+        if entry.get("measurement_status") == "TARGET_METRIC_MISSING":
+            raise RuntimeError(
+                f"the benchmarker could not find optimize.target_metric "
+                f"{expected!r} in {source}; the flow is stopped"
+            )
+        if entry.get("measurement_status") != "MEASURED":
+            raise RuntimeError(
+                "the benchmarker submitted an invalid measurement_status; the flow is stopped"
+            )
+
+        value = entry.get("target_metric_value")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+        ):
+            raise RuntimeError(
+                f"the benchmarker did not provide a finite numeric value for "
+                f"optimize.target_metric {expected!r}; the flow is stopped"
+            )
 
     def _require_stage_outputs(self, stage: str, paths: list[Path]) -> None:
         """Fail loudly if a stage finished without its required deliverable.
@@ -2113,7 +2165,14 @@ class PerfOptimizeWorkflow:
 
     def _run_benchmarker(self, state: WorkflowState) -> None:
         self._stamp_progress(state, round_no=0)
-        if self._curve_mode():
+        task_data = self._task_data()
+        if benchmark_type(task_data) == EXTERNAL_BENCHMARK:
+            load_instruction = external_benchmark_run_instruction(task_data, self.baseline_dir)
+            baseline_note = (
+                "naming the exact target metric field, numeric value, and source explicitly — "
+                "it becomes the roadmap's `baseline.value`. "
+            )
+        elif self._curve_mode():
             points = self._curve_points()
             load_instruction = (
                 f"then run `benchmark_serving.py` **once per concurrency "
@@ -2170,8 +2229,10 @@ class PerfOptimizeWorkflow:
             f"Record the **exact** serve and benchmark commands so every "
             f"later stage can replay the same load.\n\n"
             f"Before completing your turn, call `append_benchmarker_progress` "
-            f"with a `summary` of the commands you ran, the operating point, "
-            f"the headline metrics, and the files you wrote."
+            f"with `summary`, `measurement_status`, the exact `target_metric`, "
+            f"its numeric `target_metric_value` when found, and `metric_source`. "
+            f"Use `TARGET_METRIC_MISSING` when the requested field is absent; "
+            f"the harness will stop the flow."
         )
 
     def _run_projector(self, state: WorkflowState) -> None:
@@ -2805,7 +2866,26 @@ class PerfOptimizeWorkflow:
         tuning_config, tuning_accepted = self._state_tuning_paths(state)
         optimize = self._optimize_block()
         reference_dir = self._reference_result_dir()
-        if self._curve_mode():
+        task_data = self._task_data()
+        if benchmark_type(task_data) == EXTERNAL_BENCHMARK:
+            measure_instruction = (
+                "then " + external_benchmark_run_instruction(task_data, attempt_dir) + ". Compute "
+                "`measured_gain_pct` against `current_best.value` using the exact "
+                "`optimize.target_metric`, and apply the acceptance gate"
+            )
+            full_diff_note = (
+                f"compare every metric available in the external benchmark output against the "
+                f"reference artifacts under `{reference_dir}`"
+            )
+            progress_fields = (
+                "with all six fields — `summary`, `decision` "
+                "(APPROVE|REJECT|PUSH_BACK), `reason_category` "
+                "(none|code_quality|functionality|perf_shortfall), "
+                "`measured_gain_pct`, `measured_value`, and "
+                "`has_native_changes` — exactly as measured/reviewed; the "
+                "orchestrator acts on them"
+            )
+        elif self._curve_mode():
             points = self._curve_points()
             focus = self._focus_points()
             budget = self._regression_budget()
@@ -2957,7 +3037,20 @@ class PerfOptimizeWorkflow:
                 'step entirely and note "accuracy: not configured" in your '
                 "report."
             )
-        if self._curve_mode():
+        task_data = self._task_data()
+        if benchmark_type(task_data) == EXTERNAL_BENCHMARK:
+            benchmark_instruction = external_benchmark_run_instruction(
+                task_data, self.final_verification_dir
+            )
+            cumulative_instruction = (
+                "Compute `cumulative_improvement_pct` from your own exact "
+                "target-metric measurement vs the roadmap's `baseline.value`"
+            )
+            progress_fields = (
+                "with both fields — `summary` and "
+                "`cumulative_improvement_pct` — from your own measurement"
+            )
+        elif self._curve_mode():
             points = self._curve_points()
             focus = self._focus_points()
             if focus:

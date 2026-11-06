@@ -119,6 +119,12 @@ _RENAMED_SOL_FIELD = "dlsim"
 
 VALID_PROFILE_METHODS: tuple[str, ...] = ("nsys", "ncu")
 
+BENCHMARK_TYPE_FIELD = "type"
+BUILTIN_BENCHMARK = "builtin"
+EXTERNAL_BENCHMARK = "external"
+VALID_BENCHMARK_TYPES: tuple[str, ...] = (BUILTIN_BENCHMARK, EXTERNAL_BENCHMARK)
+EXTERNAL_BENCHMARK_FIELDS: tuple[str, ...] = ("path", "command", "notes")
+
 # ``profile.profile_ranks`` — the rank ids nsys captures a trace for.
 PROFILE_RANKS_FIELD = "profile_ranks"
 
@@ -185,7 +191,15 @@ _BENCHMARK_STR_FIELDS = ("dataset_name", "dataset_path")
 # question — a second copy anywhere else is how it goes stale, and this schema
 # has already been renamed twice (`max_concurrency`, `dlsim`).
 KNOWN_BENCHMARK_KEYS: frozenset[str] = frozenset(
-    _BENCHMARK_INT_FIELDS + _BENCHMARK_STR_FIELDS + ("concurrency", "num_prompts", "request_rate")
+    _BENCHMARK_INT_FIELDS
+    + _BENCHMARK_STR_FIELDS
+    + (
+        BENCHMARK_TYPE_FIELD,
+        *EXTERNAL_BENCHMARK_FIELDS,
+        "concurrency",
+        "num_prompts",
+        "request_rate",
+    )
 )
 KNOWN_PROFILE_KEYS: frozenset[str] = frozenset({"methods", "nsys_iter_range", PROFILE_RANKS_FIELD})
 KNOWN_SLURM_KEYS: frozenset[str] = frozenset(
@@ -532,20 +546,32 @@ def load_and_validate_task_yaml(
                 )
 
     benchmark = _validate_mapping_block(data, "benchmark", errors)
-    _validate_int_fields(benchmark, "benchmark", _BENCHMARK_INT_FIELDS, errors)
-    _validate_str_fields(benchmark, "benchmark", _BENCHMARK_STR_FIELDS, errors)
-    _validate_concurrency(benchmark, errors)
-    _validate_num_prompts(benchmark, errors)
-    # ``request_rate`` is either a positive number or the string "inf".
-    rr = benchmark.get("request_rate")
-    if rr is not None:
-        rr_ok = (isinstance(rr, (int, float)) and not isinstance(rr, bool)) or (
-            isinstance(rr, str) and rr.strip().lower() in ("inf", "infinity")
+    benchmark_kind = benchmark.get(BENCHMARK_TYPE_FIELD, BUILTIN_BENCHMARK)
+    if benchmark_kind not in VALID_BENCHMARK_TYPES:
+        errors.append(
+            f"'benchmark.{BENCHMARK_TYPE_FIELD}' must be one of "
+            f"{list(VALID_BENCHMARK_TYPES)}, got {benchmark_kind!r}"
         )
-        if not rr_ok:
-            errors.append(
-                f"'benchmark.request_rate' must be a number or \"inf\", got {type(rr).__name__}"
+    elif benchmark_kind == EXTERNAL_BENCHMARK:
+        for field in EXTERNAL_BENCHMARK_FIELDS:
+            if field not in benchmark:
+                errors.append(f"'benchmark.{field}' is required for external benchmarks")
+        _validate_str_fields(benchmark, "benchmark", EXTERNAL_BENCHMARK_FIELDS, errors)
+    else:
+        _validate_int_fields(benchmark, "benchmark", _BENCHMARK_INT_FIELDS, errors)
+        _validate_str_fields(benchmark, "benchmark", _BENCHMARK_STR_FIELDS, errors)
+        _validate_concurrency(benchmark, errors)
+        _validate_num_prompts(benchmark, errors)
+        # ``request_rate`` is either a positive number or the string "inf".
+        rr = benchmark.get("request_rate")
+        if rr is not None:
+            rr_ok = (isinstance(rr, (int, float)) and not isinstance(rr, bool)) or (
+                isinstance(rr, str) and rr.strip().lower() in ("inf", "infinity")
             )
+            if not rr_ok:
+                errors.append(
+                    f"'benchmark.request_rate' must be a number or \"inf\", got {type(rr).__name__}"
+                )
 
     profile = _validate_mapping_block(data, "profile", errors)
     methods = profile.get("methods")
@@ -687,14 +713,18 @@ def load_and_validate_task_yaml(
     # profiling) shares one deterministic order. A num_prompts list stays
     # paired with its concurrency point through the sort (validation
     # already rejected duplicate points in that case).
-    if isinstance(benchmark.get("concurrency"), list):
+    benchmark[BENCHMARK_TYPE_FIELD] = benchmark_kind
+    if benchmark_kind == BUILTIN_BENCHMARK and isinstance(benchmark.get("concurrency"), list):
         if isinstance(benchmark.get("num_prompts"), list):
             pairs = sorted(zip(benchmark["concurrency"], benchmark["num_prompts"]))
             benchmark["concurrency"] = [c for c, _ in pairs]
             benchmark["num_prompts"] = [n for _, n in pairs]
         else:
             benchmark["concurrency"] = sorted(set(benchmark["concurrency"]))
-    data["benchmark"] = {**BENCHMARK_DEFAULTS, **benchmark}
+    if benchmark_kind == BUILTIN_BENCHMARK:
+        data["benchmark"] = {**BENCHMARK_DEFAULTS, **benchmark}
+    else:
+        data["benchmark"] = benchmark
     data["profile"] = {**PROFILE_DEFAULTS, **profile}
     data[CASEBOOK_FIELD] = {**CASEBOOK_DEFAULTS, **casebook}
     # ``sol`` is materialized even when the user never wrote the block —
@@ -797,6 +827,14 @@ def is_curve_mode(data: Mapping[str, Any]) -> bool:
     return isinstance(benchmark.get("concurrency"), list)
 
 
+def benchmark_type(data: Mapping[str, Any]) -> str:
+    """Return the benchmark driver type, defaulting to ``builtin``."""
+    benchmark = data.get("benchmark")
+    if not isinstance(benchmark, Mapping):
+        return BUILTIN_BENCHMARK
+    return str(benchmark.get(BENCHMARK_TYPE_FIELD, BUILTIN_BENCHMARK))
+
+
 def concurrency_points(data: Mapping[str, Any]) -> list[int]:
     """Concurrency points of a validated spec, always as a list.
 
@@ -858,10 +896,14 @@ def dump_task_yaml(data: Mapping[str, Any]) -> str:
 
 __all__ = [
     "BENCHMARK_DEFAULTS",
+    "BENCHMARK_TYPE_FIELD",
+    "BUILTIN_BENCHMARK",
     "CASEBOOK_DEFAULTS",
     "CASEBOOK_ENABLED_FIELD",
     "CASEBOOK_FIELD",
     "CASEBOOK_SKILL_NAMES",
+    "EXTERNAL_BENCHMARK",
+    "EXTERNAL_BENCHMARK_FIELDS",
     "EXTRA_LLM_API_OPTIONS_FIELD",
     "PROFILE_DEFAULTS",
     "PROFILE_RANKS_FIELD",
@@ -878,8 +920,10 @@ __all__ = [
     "SOL_FIELD",
     "SOL_FIELDS",
     "SOL_OPTIONAL_STR_FIELDS",
+    "VALID_BENCHMARK_TYPES",
     "VALID_PROFILE_METHODS",
     "TaskSchemaError",
+    "benchmark_type",
     "casebook_enabled",
     "concurrency_points",
     "dump_task_yaml",

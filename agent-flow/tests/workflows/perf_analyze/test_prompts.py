@@ -13,6 +13,7 @@ import re
 from agent_flow.workflows.perf_analyze.prompts import (
     ANALYZER_SYSTEM_PROMPT,
     BENCHMARKER_SYSTEM_PROMPT,
+    DEFAULT_PROMPTS,
     PROJECTOR_SYSTEM_PROMPT,
     REPORTER_SYSTEM_PROMPT,
     build_perf_analyze_prompts,
@@ -98,12 +99,33 @@ _NCU_CANONICAL_FLAGS = (
 
 def test_benchmarker_prompt_has_canonical_benchmark_flags():
     for flag in _BENCHMARK_CANONICAL_FLAGS:
-        assert flag in BENCHMARKER_SYSTEM_PROMPT, flag
+        assert flag in DEFAULT_PROMPTS.benchmarker, flag
 
 
 def test_analyzer_prompt_has_canonical_benchmark_flags():
     for flag in _BENCHMARK_CANONICAL_FLAGS:
-        assert flag in ANALYZER_SYSTEM_PROMPT, flag
+        assert flag in DEFAULT_PROMPTS.analyzer, flag
+
+
+def test_external_benchmark_prompt_is_injected_without_builtin_assumptions():
+    task = {
+        "benchmark": {
+            "type": "external",
+            "path": "/opt/aiperf",
+            "command": "aiperf benchmark --dataset semianalysisai/cc-traces-weka-062126",
+            "notes": "Read tps_user_p10 from stdout.",
+        }
+    }
+
+    bundle = build_perf_analyze_prompts(remote_execution=task)
+
+    for prompt in (bundle.benchmarker, bundle.analyzer):
+        assert "/opt/aiperf" in prompt
+        assert "semianalysisai/cc-traces-weka-062126" in prompt
+        assert "Read tps_user_p10 from stdout." in prompt
+        assert "benchmark_serving.py" not in prompt
+        assert "--random-input-len" not in prompt
+        assert "--no-test-input" not in prompt
 
 
 def test_analyzer_prompt_has_canonical_nsys_flags():
@@ -283,8 +305,8 @@ def test_reporter_grounds_recommendations_in_all_three_analyses():
 def test_prompts_tell_agents_not_to_improvise_flags():
     # Both serving roles are steered to the canonical template rather than
     # figuring the command out on their own.
-    assert "do not improvise" in BENCHMARKER_SYSTEM_PROMPT
-    assert "do not improvise" in ANALYZER_SYSTEM_PROMPT
+    assert "do not improvise" in DEFAULT_PROMPTS.benchmarker
+    assert "do not improvise" in DEFAULT_PROMPTS.analyzer
 
 
 def test_no_prompt_references_removed_builtin_tools():
@@ -718,8 +740,8 @@ def test_serving_prompts_load_optimization_casebook():
     # Both roles that analyze the TRT-LLM run must be told to load the
     # casebook skill — and via the ``Skill`` tool, not merely mention it.
     for name, prompt in (
-        ("benchmarker", BENCHMARKER_SYSTEM_PROMPT),
-        ("analyzer", ANALYZER_SYSTEM_PROMPT),
+        ("benchmarker", DEFAULT_PROMPTS.benchmarker),
+        ("analyzer", DEFAULT_PROMPTS.analyzer),
     ):
         assert "perf-optimization-casebook" in prompt, name
         assert "`Skill` tool" in prompt, name
@@ -790,8 +812,8 @@ def test_reporter_prompt_carries_the_chart_contract():
 
 def test_serving_roles_carry_the_one_run_per_point_rule():
     for role, prompt in (
-        ("benchmarker", BENCHMARKER_SYSTEM_PROMPT),
-        ("analyzer", ANALYZER_SYSTEM_PROMPT),
+        ("benchmarker", DEFAULT_PROMPTS.benchmarker),
+        ("analyzer", DEFAULT_PROMPTS.analyzer),
     ):
         normed = _norm(prompt)
         assert "One run per concurrency point" in normed, role
@@ -801,7 +823,7 @@ def test_serving_roles_carry_the_one_run_per_point_rule():
 
 
 def test_benchmarker_carries_the_derived_metrics_reference():
-    prompt = _norm(BENCHMARKER_SYSTEM_PROMPT)
+    prompt = _norm(DEFAULT_PROMPTS.benchmarker)
     assert "1000 / mean_tpot_ms" in prompt
     assert "output_throughput / num_gpus" in prompt
     assert "curve summary table" in prompt
@@ -811,8 +833,8 @@ def test_benchmarker_carries_the_derived_metrics_reference():
 
 def test_analyzer_profiles_the_largest_concurrency_point():
     prompt = _norm(ANALYZER_SYSTEM_PROMPT)
-    assert "the largest concurrency" in prompt
-    assert "Do not profile the other points" in prompt
+    assert "the largest configured concurrency" in prompt
+    assert "Do not profile the other curve points" in prompt
     assert "Profiled concurrency point" in prompt
 
 

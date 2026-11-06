@@ -282,7 +282,7 @@ durable knowledge.>
   `evaluation.md`, a `profile_findings.md` section, a source file the
   campaign read); a lesson without a citation is a hunch and does not
   belong in the section.
-- **Every claim traces to an artifact** (a report file, a result JSON,
+- **Every claim traces to an artifact** (a report file, benchmark output,
   the verification report, the roadmap). Do not introduce numbers that
   appear in none.
 - **Markdown and HTML in lock-step** — same sections, same tables, same

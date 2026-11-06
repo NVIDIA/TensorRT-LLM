@@ -1,6 +1,4 @@
 from ._common import (
-    BENCHMARK_FLAGS_REFERENCE,
-    DERIVED_METRICS_REFERENCE,
     EVIDENCE_DISCIPLINE,
     EXPECTATION_GATE,
     GIT_DISCIPLINE,
@@ -48,14 +46,12 @@ continuity.
    the outputs are coherent. For `approach: code` items, additionally run
    the narrowest relevant tests in the checkout when a targeted test
    exists (locate them with shell `grep -rn`/`rg` via `Bash`).
-4. **Measure**: run the canonical benchmark at the configured operating
-   point(s) — one run per `benchmark.concurrency` entry over one server
-   launch when it is a list — with `--result-dir` pointing at the attempt
-   directory (curve mode: `<attempt dir>/concurrency_<c>` per point),
-   then compute the gain per the measurement protocol below against
+4. **Measure**: run the configured benchmark exactly as specified by the
+   injected benchmark-driver section, retaining its outputs in the attempt
+   directory when possible, then compute the gain against
    `current_best` (scalar: its `value`; curve mode: per point against
    `current_best.curve`, aggregated per the acceptance gate). Also
-   assemble the **full-metric diff** vs the reference result JSON(s)
+   assemble the **full-metric diff** vs the reference benchmark output
    named in your instructions (see the required output below).
 5. Decide APPROVE / PUSH_BACK / REJECT per the acceptance gate.
 6. **Only on APPROVE**: capture the accept-evidence nsys profile when
@@ -73,8 +69,8 @@ continuity.
   the Optimizer's account of the change. Read-only.
 - `rounds/round_<n>/item_<j>_<id>/attempt_<k>/evaluation.md` — **your
   primary output file** (exact path in your instructions).
-- `rounds/round_<n>/item_<j>_<id>/attempt_<k>/` — your benchmark result
-  JSON, `serve.log`, `serve.pid` land here.
+- `rounds/round_<n>/item_<j>_<id>/attempt_<k>/` — your benchmark outputs,
+  `serve.log`, and `serve.pid` land here.
 - `rounds/round_<n>/item_<j>_<id>/attempt_<k>/profile/` — the
   accept-evidence capture (APPROVE only): `.nsys-rep`, `nsys_stats.txt`,
   `nsys_analysis/`, the replay log.
@@ -176,7 +172,7 @@ outputs were coherent, targeted test results for code items.>
 | --- | --- |
 | Target metric | <optimize.target_metric> |
 | Reference (current_best) | <value> (<source>) |
-| Measured (this attempt) | <value> (<result JSON filename>) |
+| Measured (this attempt) | <value> (<benchmark artifact>) |
 | measured_gain_pct | <signed %> |
 | Gate: accept_fraction × expected_gain_pct | <threshold %> |
 | Gate: noise_floor_pct | <threshold %> |
@@ -184,7 +180,7 @@ outputs were coherent, targeted test results for code items.>
 <Show the gain arithmetic explicitly, per the measurement protocol.>
 
 Follow the gate table with the **full-metric diff** — the headline
-metrics vs the reference result JSON named in your instructions, so an
+metrics vs the reference benchmark output named in your instructions, so an
 accepted target-metric win that trades latency away is visible:
 
 | metric | reference | measured | gain % |
@@ -248,10 +244,6 @@ paid for.>
     + SERVE_FLAGS_REFERENCE
     + "\n"
     + TUNING_CONFIG_NOTE
-    + "\n"
-    + BENCHMARK_FLAGS_REFERENCE
-    + "\n"
-    + DERIVED_METRICS_REFERENCE
     + "\n"
     + PROFILING_RUNS_REFERENCE
     + """
