@@ -445,6 +445,22 @@ def test_a_long_wait_on_a_gate_job_is_said_once_per_period(tmp_path):
 
 
 @pytest.mark.usefixtures("_no_ambient_spool")
+def test_a_queued_job_names_what_runs_ahead_of_it_on_its_spool(tmp_path):
+    """A tune step sat 20 min behind a profiling job an agent had launched, and nothing said so."""
+    work = session(tmp_path, "work-1")
+    hold = "waiting for the whole node to drain"
+    _hold(work, "tune-t-sol", hold)
+    running = SpoolPaths(work).running
+    (running / "sol-profile.sh").write_text("true\n")
+    line = spoolctl.waiting_line(work, "tune-t-sol", time.time())
+    assert line.endswith(f"; held: {hold}; running there: sol-profile")
+    for name in ("a", "b", "c"):
+        (running / f"{name}.sh").write_text("true\n")
+    line = spoolctl.waiting_line(work, "tune-t-sol", time.time())
+    assert line.endswith("; running there: a, b, c and 1 more")
+
+
+@pytest.mark.usefixtures("_no_ambient_spool")
 def test_the_tune_runner_says_its_long_waits_at_most_once_per_period(tmp_path, monkeypatch):
     monkeypatch.setattr(spoolctl, "WAIT_NOTE_S", 0.2)
     work = session(tmp_path, "work-1")

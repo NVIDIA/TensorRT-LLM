@@ -201,25 +201,38 @@ def wait_for_job(
         time.sleep(poll_s)
 
 
+#: The most running jobs a queued job's :func:`waiting_line` names; the rest are counted.
+MAX_AHEAD = 3
+
+
 def waiting_line(spool: str | Path, name: str, now: float) -> str:
     """Job ``name`` on ``spool``: queued or running and since when, and the scheduler's hold reason.
 
+    A queued job's line also names what runs on its spool meanwhile, which it waits behind.
     ``""`` when the spool does not say (the job between states, an unreadable record).
     """
     paths = _sched.SpoolPaths(spool)
+    ahead: list[str] = []
     try:
         if (paths.running / f"{name}.sh").exists():
             meta = _files.read_json(paths.running / f"{name}.json") or {}
             state, since = "running", float(meta["started_epoch"])
         else:
             state, since = "queued", (paths.pending / f"{name}.sh").stat().st_mtime
+            ahead = sorted(path.stem for path in paths.running.glob("*.sh"))
         pending = (_files.read_json(paths.snapshot) or {}).get("pending") or ()
         hold = next((str(job.get("reason") or "") for job in pending if job["name"] == name), "")
     except (OSError, KeyError, TypeError, ValueError, AttributeError):
         return ""
     minutes = (now - since) / 60
     line = f"{name} on {paths.root} {state} since {_sched.utc_iso(since)} ({minutes:.0f} min)"
-    return line + (f"; held: {hold}" if hold else "")
+    if hold:
+        line += f"; held: {hold}"
+    if ahead:
+        more = len(ahead) - MAX_AHEAD
+        line += "; running there: " + ", ".join(ahead[:MAX_AHEAD])
+        line += f" and {more} more" if more > 0 else ""
+    return line
 
 
 def left_in_spool(spool: str | Path, name: str) -> str:

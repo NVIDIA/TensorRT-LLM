@@ -94,8 +94,9 @@ a container runtime, a shell). The run needs:
 `trtllm-modeling-v2 monitor status` shows each session, and raises `SESSION_ENDING` while one is in
 hand-over with no newer session on its spool. A gate, substrate or regression job the run has
 waited on for 15 minutes writes a `waiting` event: the job, its spool, queued or running and since
-when, and why the session holds it when its `status.json` says; then at most one every 15 minutes
-while the wait lasts. The tune campaign's jobs say the same in its `tune` events.
+when, why the session holds it when its `status.json` says, and for a queued job what runs on its
+spool meanwhile; then at most one every 15 minutes while the wait lasts. The tune campaign's jobs
+say the same in its `tune` events.
 
 **While it runs**, you or the launching agent keep the sessions alive and leave the work to the run. Never cancel
 a job the run submitted (a gate, a worker's test) or run a replacement check beside it: a cancelled
