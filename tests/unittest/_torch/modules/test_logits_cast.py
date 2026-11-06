@@ -80,6 +80,9 @@ def test_unsupported_inputs_take_tensor_float(kernel_launches, monkeypatch):
     assert torch.equal(logits_cast.widen_logits_to_fp32(x), x.float())
     y = torch.randn(4, 8, device="cuda")
     assert torch.equal(logits_cast.widen_logits_to_fp32(y), y)
+    z = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    logits_cast.widen_logits_to_fp32(z).sum().backward()
+    assert torch.equal(z.grad, torch.ones_like(z))
     w = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
     assert torch.equal(logits_cast.widen_logits_to_fp32(w), w.float())
@@ -90,8 +93,10 @@ def test_logits_processor_takes_kernel(kernel_launches):
     torch.manual_seed(1)
     head = torch.nn.Linear(512, 4096, bias=False, device="cuda", dtype=torch.bfloat16)
     hidden = torch.randn(6, 512, device="cuda", dtype=torch.bfloat16)
-    out = logits_processor.LogitsProcessor()(hidden, head, None, True)
-    ref = head(hidden).float()
+    # The executor runs the model under inference mode, so the logits take the kernel.
+    with torch.inference_mode():
+        out = logits_processor.LogitsProcessor()(hidden, head, None, True)
+        ref = head(hidden).float()
     assert len(kernel_launches) == 1
     assert out.dtype == torch.float32
     assert torch.equal(out.view(torch.int32), ref.view(torch.int32))
