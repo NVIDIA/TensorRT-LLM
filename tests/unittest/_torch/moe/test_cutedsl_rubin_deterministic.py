@@ -46,6 +46,8 @@ def _build(backend_type, x):
         dtype=dtype, quant_config=qcfg, mapping=Mapping(), swiglu_alpha=sw["swiglu_alpha"],
         swiglu_beta=sw["swiglu_beta"], swiglu_limit=sw["swiglu_limit"],
     )  # fmt: skip
+    if backend_type == MoeBackendType.CUTEDSL:
+        backend.deterministic_finalize = True
     return qu, qkw, routing, backend
 
 
@@ -66,7 +68,6 @@ def _err(y, ref):
 
 
 def test_deterministic_cutedsl_gate_a() -> None:
-    assert cute_moe._RUBIN_DETERMINISTIC_FC2, "the kill switch is off in this environment"
     with torch.device("cuda"):
         torch.manual_seed(0)
         AutoTuner.get().setup_distributed_state(Mapping())
@@ -74,6 +75,7 @@ def test_deterministic_cutedsl_gate_a() -> None:
         x = torch.randn((big, H), dtype=torch.bfloat16)
         logits = torch.randn((big, E), dtype=torch.bfloat16)
         qu, qkw, routing, cute = _build(MoeBackendType.CUTEDSL, x)
+        assert cute.deterministic_finalize
         ref_cls = qkw.pop("ref_cls", None)
         weights = qu.create_weights(**qkw)
         cute.load_weights([weights])

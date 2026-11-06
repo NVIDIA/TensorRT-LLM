@@ -82,6 +82,7 @@ from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_paral
 from ..modules.rms_norm import RMSNorm
 from ..modules.swiglu import swiglu_mxfp8
 from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, create_moe
+from ..moe.fused_moe.impl_contract import DETERMINISTIC_MOE_FINALIZE
 from ..peft.lora.ownership import DecoderLoraOwner
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
@@ -108,6 +109,7 @@ from .modeling_utils import (
 _DENSE_SDPA_BACKENDS = [SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 
+_CUTEDSL_DETERMINISTIC_FC2 = os.environ.get("TLLM_CUTEDSL_MOE_DETERMINISTIC", "1") == "1"
 _FOLD_LOGGED = False
 _FOLD_CALLS_LOGGED = False
 _FOLD_CALLS_SEEN: set = set()
@@ -121,8 +123,8 @@ def _fold_shared_backend(experts: nn.Module) -> bool:
     backend = getattr(experts, "backend", experts)
     return (
         get_sm_version() == 107
-        and _cute_moe._RUBIN_DETERMINISTIC_FC2
         and isinstance(backend, _cute_moe.TrtllmCutedslGroupedGemmNvfp4Impl)
+        and backend.deterministic_finalize
     )
 
 
@@ -1309,12 +1311,17 @@ class MiniMaxM3MoE(nn.Module):
         # skips its in-op all-reduce, so ``reduce_results=False`` is
         # also the correct flag there.
         experts_quant_config = MiniMaxM3MoE._get_experts_quant_config(model_config, layer_idx)
+        experts_model_config = copy.copy(model_config)
+        experts_model_config.extra_attrs = {
+            **model_config.extra_attrs,
+            DETERMINISTIC_MOE_FINALIZE: _CUTEDSL_DETERMINISTIC_FC2,
+        }
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
             num_experts=self.num_experts,
             aux_stream_dict=aux_stream_dict,
             reduce_results=False,
-            model_config=model_config,
+            model_config=experts_model_config,
             layer_idx=layer_idx,
             override_quant_config=experts_quant_config,
             activation=self.moe_activation,

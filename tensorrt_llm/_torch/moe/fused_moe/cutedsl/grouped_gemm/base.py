@@ -26,6 +26,7 @@ from .....utils import ActivationType, AuxStreamType, EventType
 from ...activation import DEFAULT_MOE_ACTIVATION, MoEActivation
 from ...cutlass.eligibility import BF16_ONLY, SmSupport
 from ...impl_base import MoEImplBase, apply_moe_impl_construction_state
+from ...impl_contract import DETERMINISTIC_MOE_FINALIZE
 from ...quantization import MoEWeightLoadingMode
 from ...routing import BaseMoeRoutingMethod
 
@@ -172,6 +173,10 @@ class CuteDslFusedMoEBase(MoEImplBase):
         # LoRA GEMM.
         self.use_fused_finalize = (
             not model_config.moe_disable_finalize_fusion and model_config.lora_config is None
+        )
+
+        self.deterministic_finalize = bool(
+            model_config.extra_attrs.get(DETERMINISTIC_MOE_FINALIZE, False)
         )
 
         # Output-memset overlap is independent of MoE chunking, so ensure its

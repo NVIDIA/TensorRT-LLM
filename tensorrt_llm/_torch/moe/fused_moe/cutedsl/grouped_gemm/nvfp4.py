@@ -66,9 +66,6 @@ ASYNC_INPUT_QUANT_MAX_TOKENS = 1024
 _DISABLE_DIRECT_DEEP_EP_METADATA_ENV = "TRTLLM_DISABLE_CUTEDSL_DEEP_EP_DIRECT_METADATA"
 
 
-# (rule 1b) Rubin CuteDSL NVFP4 MoE: FC2 as a plain grouped GEMM per permuted row + a fixed-order unpermute instead
-# of the fused scatter-add finalize (bf16 atomics, run-to-run order dependent). Kill: TLLM_CUTEDSL_MOE_DETERMINISTIC=0.
-_RUBIN_DETERMINISTIC_FC2 = os.environ.get("TLLM_CUTEDSL_MOE_DETERMINISTIC", "1") == "1"
 _DETERMINISTIC_FC2_LOGGED = False
 
 
@@ -162,7 +159,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 and not p.bias
                 and d.env.sm == 107
                 and not d.locality_domain_requested
-                and _RUBIN_DETERMINISTIC_FC2
+                and d.deterministic_finalize_requested
             ),
         )
 
@@ -392,7 +389,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             ]
         else:
             forward_impl = self.run_moe_nvfp4_impl
-            workload_identity = None
+            workload_identity = ("deterministic_finalize",) if self.deterministic_finalize else None
             tuner_key = "CuteDslFusedMoE::run_moe_nvfp4"
             inputs = [
                 x,
@@ -522,14 +519,8 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
         has_aux_streams = self._has_moe_output_memset_aux_stream()
         # The deterministic Rubin FC2 overwrites every output row (moe_unpermute_inplace): no zeroed output needed.
         deterministic_fc2 = (
-            use_rubin and _RUBIN_DETERMINISTIC_FC2 and not use_count_native_expert_metadata
+            use_rubin and self.deterministic_finalize and not use_count_native_expert_metadata
         )
-        if use_rubin and not _RUBIN_DETERMINISTIC_FC2:
-            logger.warning_once(
-                "CuteDSL NVFP4 MoE on SM107 with TLLM_CUTEDSL_MOE_DETERMINISTIC=0: the FC2 finalize uses bf16 "
-                "atomics (run-to-run order dependent). Debug only; select moe_config.backend TRTLLM instead.",
-                key="cutedsl_moe_nondeterministic_sm107",
-            )
         if self.use_fused_finalize and has_aux_streams and not deterministic_fc2:
             memset_stream = self._moe_output_memset_run_stream()
             self.event_dict[EventType.Main].record()
@@ -625,7 +616,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 _DETERMINISTIC_FC2_LOGGED = True
                 logger.info(
                     "[CuteDSL MoE] deterministic FC2 engaged (grouped store + fixed-order finalize; "
-                    f"activation={self.activation_type.name}; TLLM_CUTEDSL_MOE_DETERMINISTIC)"
+                    f"activation={self.activation_type.name})"
                 )
             # (rule 1b) Deterministic FC2 on Rubin: the grouped GEMM stores bf16(alpha * acc) per permuted row
             # (no scatter-add atomics), then moe_unpermute_inplace sums each token's top-k rows in fixed index

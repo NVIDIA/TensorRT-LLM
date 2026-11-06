@@ -39,7 +39,6 @@ from transformers import AutoConfig
 from utils.llm_data import llm_models_root
 
 import tensorrt_llm._torch.models.modeling_minimaxm3 as modeling_minimaxm3
-import tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 as cutedsl_nvfp4
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
@@ -95,6 +94,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import (
     TrtllmCutedslGroupedGemmNvfp4Impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import DETERMINISTIC_MOE_FINALIZE
 from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
 from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM2MoeRoutingMethod,
@@ -3491,14 +3491,15 @@ def test_minimax_m3_gate_fixed_router_refit_preserves_allocation(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("sm", [100, 103, 107, 110])
+@pytest.mark.parametrize("opted_in", [False, True])
 def test_cutedsl_shared_fold_backend_is_rubin_only(
-    monkeypatch: pytest.MonkeyPatch, sm: int
+    monkeypatch: pytest.MonkeyPatch, sm: int, opted_in: bool
 ) -> None:
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: sm)
-    monkeypatch.setattr(cutedsl_nvfp4, "_RUBIN_DETERMINISTIC_FC2", True)
     backend = TrtllmCutedslGroupedGemmNvfp4Impl.__new__(TrtllmCutedslGroupedGemmNvfp4Impl)
     nn.Module.__init__(backend)
-    assert modeling_minimaxm3._fold_shared_backend(backend) is (sm == 107)
+    backend.deterministic_finalize = opted_in
+    assert modeling_minimaxm3._fold_shared_backend(backend) is (sm == 107 and opted_in)
 
 
 @pytest.mark.cpu_only
@@ -3578,3 +3579,34 @@ def test_ctx_qkv_invalid_arguments_keep_stock_fallback(monkeypatch, error_type) 
     )
     runner.make_args.assert_called_once()
     runner.run_args.assert_not_called()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("enabled", [False, True])
+def test_minimax_m3_opts_in_only_its_routed_moe_config(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    config = ModelConfig(pretrained_config=_make_text_config())
+    config.pretrained_config.n_shared_experts = 0
+    sentinel = object()
+    config.extra_attrs["scope_sentinel"] = sentinel
+    original_attrs = dict(config.extra_attrs)
+    gate = create_autospec(modeling_minimaxm3.MiniMaxM3Gate, instance=True, spec_set=True)
+    gate_constructor = create_autospec(
+        modeling_minimaxm3.MiniMaxM3Gate, spec_set=True, return_value=gate
+    )
+    experts = nn.Module()
+    factory = create_autospec(modeling_minimaxm3.create_moe, spec_set=True, return_value=experts)
+    monkeypatch.setattr(modeling_minimaxm3, "MiniMaxM3Gate", gate_constructor)
+    monkeypatch.setattr(modeling_minimaxm3, "create_moe", factory)
+    monkeypatch.setattr(modeling_minimaxm3, "_CUTEDSL_DETERMINISTIC_FC2", enabled)
+    monkeypatch.setattr(torch.cuda, "Event", create_autospec(torch.cuda.Event, spec_set=True))
+    moe = MiniMaxM3MoE(config, {AuxStreamType.MoeShared: None}, layer_idx=0)
+    assert moe.experts is experts
+    routed_config = factory.call_args.kwargs["model_config"]
+    assert routed_config is not config
+    assert routed_config.extra_attrs is not config.extra_attrs
+    assert routed_config.extra_attrs[DETERMINISTIC_MOE_FINALIZE] is enabled
+    assert routed_config.extra_attrs["scope_sentinel"] is sentinel
+    assert config.extra_attrs == original_attrs
+    assert routed_config.pretrained_config is config.pretrained_config
