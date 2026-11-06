@@ -21,10 +21,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
 _CUTEDSL_FC2_N_TILE_SIZE_ENV = "TRTLLM_CUTEDSL_FC2_N_TILE_SIZE"
 
-pytestmark = pytest.mark.skipif(
-    not IS_CUTLASS_DSL_AVAILABLE,
-    reason="Requires CUTLASS DSL",
-)
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(
+        not IS_CUTLASS_DSL_AVAILABLE,
+        reason="Requires CUTLASS DSL",
+    ),
+]
 
 
 @pytest.fixture(autouse=True)
