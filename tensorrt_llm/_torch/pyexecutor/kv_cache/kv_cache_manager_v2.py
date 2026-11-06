@@ -2660,6 +2660,9 @@ class KVCacheManagerV2(BaseResourceManager):
             # stay int.
             self.max_seq_len = int(max_num_tokens)
 
+        if kv_cache_config.enable_kv_pool_rebalance:
+            self._raise_rebalance_floors()
+
         # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
         # Include the same maximum generation lead used by allocation and sizing.
         max_seq_capacity = self.max_seq_len + self._generation_kv_capacity_headroom
@@ -4797,6 +4800,30 @@ class KVCacheManagerV2(BaseResourceManager):
         full_slot_shape = [num_slots, scale, *page_shape]
         full_view = convert_to_torch_tensor(TensorWrapper(addr, torch_dtype, full_slot_shape))
         return full_view[:, 0]
+
+    def _raise_rebalance_floors(self) -> None:
+        """Keep one ``max_seq_len`` request schedulable under pool rebalancing.
+
+        Construction clamps ``max_seq_len`` to what the initial split holds, but the
+        only floor rebalancing respects comes from the warmup constraint (one fresh
+        ``max_num_tokens`` chunk). The tuner could then shrink a pool group below one
+        request, and the V2 scheduler deadlocks once a request needs more than the
+        group holds (seen with Gemma-3-12B at TP1 under a KV cap). The floor
+        here is one request at its last prefill chunk: ``max_seq_len`` blocks in
+        full-attention groups, window + one chunk in sliding-window groups. The
+        manager caps it at the current slot counts, so nothing moves now.
+        """
+        # The same extra tokens the max_seq_len clamp counts (get_num_available_tokens).
+        capacity = self.max_seq_len + self._kv_alloc_extra_tokens
+        chunk = self.max_num_tokens if self.max_num_tokens is not None else capacity
+        history = max(0, capacity - chunk)
+        floors = self.impl.raise_hot_min_slots(
+            BatchDesc([KVCacheDesc(capacity=capacity, history_length=history)])
+        )
+        logger.info(
+            f"KV pool rebalancing: per-pool-group slot floors {list(floors)} keep one "
+            f"{self.max_seq_len}-token request schedulable (prefill chunk {chunk})"
+        )
 
     def get_num_available_tokens(
         self, *, token_num_upper_bound: int, batch_size: int = 1, max_num_draft_tokens: int = 0

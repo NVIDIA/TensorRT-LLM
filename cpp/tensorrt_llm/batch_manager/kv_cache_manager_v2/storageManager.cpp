@@ -331,6 +331,7 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     // utilization. Other levels need only the structural one-slot floor.
     mHotMinSlots
         = computePoolGroupMinSlotsFromConstraints(constraints, tokensPerBlock, mSwaScratchReuse, maxUtilForResume);
+    mMaxUtilForResume = maxUtilForResume;
 
     // Derive hot-tier lifecycle byte weights. Cold initialization preserves the slot-count proportions implied by
     // those weights while accounting for the cold representation's page sizes.
@@ -2234,6 +2235,18 @@ HostMemBackingOptions StorageManager::tierBackingOptions(CacheTierConfig const& 
 // ---------------------------------------------------------------------------
 // minQuotaForLevel
 // ---------------------------------------------------------------------------
+
+TypedVec<PoolGroupIndex, SlotCount> StorageManager::raiseHotMinSlots(BatchDesc const& batch, int tokensPerBlock)
+{
+    auto const needed
+        = computePoolGroupMinSlotsFromConstraints({batch}, tokensPerBlock, mSwaScratchReuse, mMaxUtilForResume);
+    for (PoolGroupIndex pgIdx{0}; pgIdx < mHotMinSlots.size() && pgIdx < needed.size(); ++pgIdx)
+    {
+        SlotCount const capped = std::min(needed[pgIdx], numSlots(pgIdx, kHotLevel));
+        mHotMinSlots[pgIdx] = std::max(mHotMinSlots[pgIdx], capped);
+    }
+    return mHotMinSlots;
+}
 
 TypedVec<PoolGroupIndex, SlotCount> StorageManager::_minSlotsFor(CacheLevel level) const
 {
