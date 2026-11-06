@@ -2509,6 +2509,13 @@ class KvCacheCreator:
         if set(draft_windows) & set(target_windows):
             return ("the draft layers would share a KV cache lifecycle with "
                     "target layers")
+        # The configured ratio, not the one estimation may clear meanwhile.
+        pool_ratio = getattr(self, "_pool_ratio_in", None)
+        num_lifecycles = len(set(target_windows)) + len(set(draft_windows))
+        if pool_ratio is not None and len(pool_ratio) != num_lifecycles:
+            return (
+                f"kv_cache_config.pool_ratio has {len(pool_ratio)} entries, "
+                f"not one per lifecycle ({num_lifecycles})")
         head_major = getattr(self._kv_cache_manager_cls,
                              "main_kv_is_head_major", None)
         if (self._is_disagg and head_major is not None and not head_major(

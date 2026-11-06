@@ -572,6 +572,13 @@ def test_gate_keeps_layouts_the_hosting_manager_refuses(
     creator._get_draft_max_attention_window = lambda *_: [creator._unification_max_seq_len]
     assert "share a KV cache lifecycle" in creator._dflash_unify_blocker()
 
+    # An explicit pool ratio sized for the separate pools' single lifecycle each.
+    creator = _dspark_creator(is_disagg=is_disagg)
+    creator._pool_ratio_in = [1.0]
+    assert "pool_ratio has 1 entries" in creator._dflash_unify_blocker()
+    creator._pool_ratio_in = [0.9, 0.1]
+    assert creator._dflash_unify_blocker() is None
+
     # The Triton implementation keeps an NVFP4 cache NHD, which transfer cannot pair with draft layers.
     creator = _dspark_creator(is_disagg=is_disagg)
     creator._sparse_attention_config = SimpleNamespace(implementation="triton")

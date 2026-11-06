@@ -3960,7 +3960,7 @@ class KVCacheManagerV2(BaseResourceManager):
                         BatchDesc(
                             [
                                 KVCacheDesc(
-                                    capacity=self.max_num_tokens + self.num_extra_kv_tokens,
+                                    capacity=self.max_num_tokens + self._kv_alloc_extra_tokens,
                                     history_length=0,
                                 )
                             ]
@@ -4169,7 +4169,7 @@ class KVCacheManagerV2(BaseResourceManager):
         # The context-chunk floor declared with this ratio: every lifecycle holds one fresh chunk
         # below the resume watermark, each pool rounded to the allocation granularity (bounded
         # here per buffer). Without room for it the backend keeps its own split.
-        chunk_blocks = -(-(self.max_num_tokens + self.num_extra_kv_tokens) // tokens_per_block)
+        chunk_blocks = -(-(self.max_num_tokens + self._kv_alloc_extra_tokens) // tokens_per_block)
         floor_slots = math.ceil(chunk_blocks / float(np.float32(max_util_for_resume)))
         granularity = _gpu_alloc_granularity(gpu_quota)
         floor_bytes = sum(
