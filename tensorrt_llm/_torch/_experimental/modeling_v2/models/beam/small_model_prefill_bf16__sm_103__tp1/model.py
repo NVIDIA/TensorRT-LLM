@@ -64,12 +64,12 @@ import numpy as np
 import torch
 from torch import nn
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.activation.beam_logit_softcap import (
-    beam_logit_softcap,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.activation.beam_logit_softcap import (
+    beam_logit_softcap,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams

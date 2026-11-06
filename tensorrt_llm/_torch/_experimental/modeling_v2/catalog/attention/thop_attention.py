@@ -85,35 +85,6 @@ _FP8_24_4_256 = dict(
 )
 
 
-_BEAM_DENSE = dict(
-    input_type=STANDARD,
-    num_heads=48,
-    num_kv_heads=8,
-    head_size=128,
-    v_head_dim=128,
-    sinks=False,
-    window=512,
-    quant_mode=0,
-    mask_type=1,
-    tokens_per_block=32,
-    num_blocks=16,
-    max_num_requests=1,
-    use_paged_context_fmha=False,
-    num_contexts=1,
-    predicted_tokens_per_seq=1,
-)
-
-_BEAM_SLIDING = dict(
-    _BEAM_DENSE,
-    num_blocks=64,
-    max_num_requests=3,
-    max_blocks_per_seq=20,
-    use_paged_context_fmha=True,
-)
-
-_BEAM_FULL = dict(_BEAM_SLIDING, window=None)
-
-
 class ThopAttention(OpWrapper):
     """Append this step's K/V to the paged cache, then attend over it.
 
@@ -291,59 +262,6 @@ class ThopAttention(OpWrapper):
                 new=(20, 3, 3),
                 num_contexts=1,
                 predicted_tokens_per_seq=3,
-            ),
-        ),
-        *(
-            Cell(
-                why=f"beam dense block: GQA 48q/8kv d128, fresh {tokens}-row context",
-                spec=dict(_BEAM_DENSE, cached=(0,), new=(tokens,)),
-            )
-            for tokens in (1, 17, 129)
-        ),
-        Cell(
-            why="beam sliding, paged context: 17 rows over a 64-token reused prefix",
-            spec=dict(
-                _BEAM_SLIDING, cached=(64,), new=(17,), num_contexts=1, predicted_tokens_per_seq=1
-            ),
-        ),
-        Cell(
-            why="beam sliding, paged context: a fresh 513-row context, key 0 leaves the "
-            "window at row 512",
-            spec=dict(
-                _BEAM_SLIDING, cached=(0,), new=(513,), num_contexts=1, predicted_tokens_per_seq=1
-            ),
-        ),
-        Cell(
-            why="beam sliding, paged context: one row at position 512 after a 512-token "
-            "reused prefix",
-            spec=dict(
-                _BEAM_SLIDING, cached=(512,), new=(1,), num_contexts=1, predicted_tokens_per_seq=1
-            ),
-        ),
-        Cell(
-            why="beam sliding decode across the window: histories 511, 512 and 513",
-            spec=dict(
-                _BEAM_SLIDING,
-                cached=(511, 512, 513),
-                new=(1, 1, 1),
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="beam full layer decode past the sliding window: histories 511, 512 and 513",
-            spec=dict(
-                _BEAM_FULL,
-                cached=(511, 512, 513),
-                new=(1, 1, 1),
-                num_contexts=0,
-                predicted_tokens_per_seq=1,
-            ),
-        ),
-        Cell(
-            why="beam full layer, paged context: 17 rows over a 64-token reused prefix",
-            spec=dict(
-                _BEAM_FULL, cached=(64,), new=(17,), num_contexts=1, predicted_tokens_per_seq=1
             ),
         ),
     )

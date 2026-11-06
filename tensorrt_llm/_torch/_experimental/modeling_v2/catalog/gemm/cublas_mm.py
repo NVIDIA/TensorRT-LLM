@@ -10,29 +10,6 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper, true_fp32_matmul
 
-_BEAM_DENSE_BLOCK = tuple(
-    Cell(
-        why=f"beam dense {name} {k}->{n}, {m} tokens",
-        spec=dict(m=m, k=k, n=n, dtype=torch.bfloat16, bias=False, out_dtype=None),
-    )
-    for name, k, n in (
-        ("q/gate", 5120, 6144),
-        ("k/v", 5120, 1024),
-        ("o", 6144, 5120),
-        ("gate/up", 5120, 20480),
-        ("down", 20480, 5120),
-    )
-    for m in (1, 17, 129)
-)
-
-_BEAM_HEAD = tuple(
-    Cell(
-        why=f"beam head 5120->151936, {m} tokens",
-        spec=dict(m=m, k=5120, n=151936, dtype=torch.bfloat16, bias=False, out_dtype=None),
-    )
-    for m in (1, 17, 129)
-)
-
 
 class CublasMm(OpWrapper):
     """`mat_a @ mat_b (+ bias)`, fp32-accumulated, one cublas_mm call.
@@ -43,8 +20,8 @@ class CublasMm(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
 
-    # Both targets use this for every dense projection. This entry's test
-    # carries their three argument shapes that differ in kind rather than in size: fused
+    # Targets use this for dense projections. This entry's test
+    # carries argument shapes that differ in kind rather than in size: fused
     # bias (gpt-oss carries one on qkv, o and the router), no bias (deepseek's
     # projections), and an out_dtype that is not the input's (deepseek's router
     # asks for fp32 logits).
@@ -53,13 +30,11 @@ class CublasMm(OpWrapper):
             why="decode-shaped: one token, the shape every projection sees per step",
             spec=dict(m=1, k=7168, n=1536, dtype=torch.bfloat16, bias=False, out_dtype=None),
         ),
-        *_BEAM_DENSE_BLOCK,
-        *_BEAM_HEAD,
     )
 
     note = """
     `output_buffer_kind` and `group` are the op's multi-stream and collective
-    arguments. Both shipped targets leave them at their defaults, so neither is
+    arguments. The covered targets leave them at their defaults, so neither is
     a cell axis and neither is certified here.
     """
 

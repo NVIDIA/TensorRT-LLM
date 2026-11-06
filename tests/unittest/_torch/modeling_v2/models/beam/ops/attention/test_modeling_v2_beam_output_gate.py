@@ -7,14 +7,24 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Cell
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
     beam_output_gate as op,
 )
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../.."]
+from _cells import certified_cells  # noqa: E402
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "beam_output_gate requires a CUDA device"
+
+
+TARGET_CELLS = {
+    "beam/full_model_nvfp4__sm_103__tp4": tuple(
+        Cell(why=f"beam TP4: {cell.why}", spec=dict(cell.spec, num_heads=12)) for cell in op.CELLS
+    ),
+}
+CELLS = certified_cells(op, TARGET_CELLS)
 
 
 def _build(spec, seed):
@@ -26,7 +36,7 @@ def _build(spec, seed):
     return attention_output, gate, gate_bias
 
 
-@pytest.mark.parametrize("cell", op.CELLS, ids=[c.why[:44] for c in op.CELLS])
+@pytest.mark.parametrize("cell", CELLS, ids=[c.why[:44] for c in CELLS])
 def test_certified_cells(cell, certifying) -> None:  # noqa: F811 — pytest resolves the fixture by this name
     """Bitwise: each activation-dtype step of the op is an fp32 computation rounded once,
     which is what the reference spells out."""

@@ -56,15 +56,6 @@ from typing import Mapping
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_neox_rope import (
-    beam_neox_rope,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_nope_query_scale import (  # noqa: E501
-    beam_nope_query_scale,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.beam_output_gate import (
-    beam_output_gate,
-)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attention import (
     STANDARD,
     thop_attention,
@@ -72,6 +63,15 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.thop_attent
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.norm.flashinfer_rmsnorm import (
     flashinfer_rmsnorm,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_neox_rope import (
+    beam_neox_rope,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_nope_query_scale import (  # noqa: E501
+    beam_nope_query_scale,
+)
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.attention.beam_output_gate import (
+    beam_output_gate,
 )
 from tensorrt_llm._torch.attention.backends.fmha.phased import get_spec_decoding_position_offsets
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata

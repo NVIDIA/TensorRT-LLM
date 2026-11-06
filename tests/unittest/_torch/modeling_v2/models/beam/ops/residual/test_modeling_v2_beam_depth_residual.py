@@ -8,11 +8,11 @@ import zlib
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.residual.beam_depth_residual import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.residual.beam_depth_residual import (
     beam_depth_residual as op,
 )
 
-__extra_import_path__ = [".."]
+__extra_import_path__ = ["../../../.."]
 from _validating import certifying, validating  # noqa: E402,F401 — path above; fixture by name
 
 assert torch.cuda.is_available(), "beam_depth_residual requires a CUDA device"

@@ -38,7 +38,7 @@ from typing import Callable
 
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (
     beam_dispatch_combine_op,
 )
 

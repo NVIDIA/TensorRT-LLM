@@ -80,7 +80,15 @@ def test_certified_cells(cell) -> None:
     alpha = (1.0 / (act_gs * weight_gs)).float().reshape(1)
 
     with validating(op):
-        out = op(act, weight, act_sf, weight_sf, alpha, torch.bfloat16)
+        out = op(
+            act,
+            weight,
+            act_sf,
+            weight_sf,
+            alpha,
+            torch.bfloat16,
+            allowed_backends=spec.get("backend", "cutlass,cublaslt,cuda_core"),
+        )
     assert out.shape == (spec["m"], spec["n"])
     _compare(out, op.reference(act, weight, act_sf, weight_sf, alpha, torch.bfloat16))
 

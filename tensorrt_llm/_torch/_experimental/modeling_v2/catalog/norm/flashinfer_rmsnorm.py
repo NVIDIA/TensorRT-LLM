@@ -16,19 +16,6 @@ import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtl
 
 from .._op import Arch, Cell, OpWrapper
 
-_BEAM_DENSE_BLOCK = tuple(
-    Cell(
-        why=f"beam dense {name}, {tokens} tokens: {rows} rows of {width}",
-        spec=dict(shape=(rows, width), dtype=torch.bfloat16, eps=1e-6),
-    )
-    for tokens in (1, 17, 129)
-    for name, rows, width in (
-        ("sandwich norm", tokens, 5120),
-        ("q_norm", tokens * 48, 128),
-        ("k_norm", tokens * 8, 128),
-    )
-)
-
 
 class FlashinferRmsnorm(OpWrapper):
     """`x / sqrt(mean(x^2, -1) + eps) * weight`, one op call, new tensor out.
@@ -51,7 +38,6 @@ class FlashinferRmsnorm(OpWrapper):
             why="prefill-shaped: enough rows to cross the kernel's grid tiling",
             spec=dict(shape=(2048, 7168), dtype=torch.bfloat16, eps=1e-6),
         ),
-        *_BEAM_DENSE_BLOCK,
     )
 
     note = """

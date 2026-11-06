@@ -5,11 +5,11 @@
 import pytest
 import torch
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog.moe.beam_dispatch_combine import (  # noqa: E501
+from tensorrt_llm._torch._experimental.modeling_v2.models.beam.ops.moe.beam_dispatch_combine import (  # noqa: E501
     beam_dispatch_combine_op as op,
 )
 
-__extra_import_path__ = ["..", "../../../.."]
+__extra_import_path__ = ["../../moe_dispatch_combine_bf16__sm_103__tp1", "../../../.."]
 import _dispatch_combine_cases as cases  # noqa: E402
 from _validating import certifying  # noqa: E402,F401 — path above; fixture by name
 
