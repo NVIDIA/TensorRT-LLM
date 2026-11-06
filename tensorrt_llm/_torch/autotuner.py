@@ -16,6 +16,7 @@ import ast
 import contextlib
 import copy
 import enum
+import errno
 import fcntl
 import inspect
 import itertools
@@ -24,6 +25,7 @@ import os
 import time
 import zlib
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -34,6 +36,7 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.modules.multi_stream_utils import no_eager_forks
 from tensorrt_llm._torch.nccl_window_graph import (
     abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
     nccl_window_graph_capture, release_nccl_window_graph_owner)
@@ -147,6 +150,10 @@ class TuningConfig:
         exclude_from_cache (bool): Skip disk persistence of tuning results for this op.
             Use for JIT-driven ops where caching the tactic across processes would skip
             the JIT warmup. In-process cache still works.
+        cold_l2_flush_bytes (int): When > 0, every timed repeat first reads a buffer of this many
+            bytes (evicting the operands, weights included, from L2) and each repeat is timed alone
+            with %globaltimer stamps inside one CUDA graph; the median repeat is the tactic's time.
+            For decode-sized GEMMs whose weights never stay in L2 between uses.
     """
     dynamic_tensor_specs: Tuple[DynamicTensorSpec, ...] = ()
     constraint_specs: Tuple[ConstraintSpec, ...] = ()
@@ -156,6 +163,7 @@ class TuningConfig:
     use_cuda_graph: bool = True
     distributed_tuning_strategy: DistributedTuningStrategy = DistributedTuningStrategy.INDEPENDENT
     exclude_from_cache: bool = False
+    cold_l2_flush_bytes: int = 0
 
 
 @dataclass(unsafe_hash=True)
@@ -338,13 +346,18 @@ def autotune(tune_mode: bool = True,
     if autotune_enabled:
         torch.ops.trtllm.set_fine_grained_sync_disabled_override(True)
 
+    eager_forks_context = (no_eager_forks()
+                           if tune_required else contextlib.nullcontext())
+
     try:
-        yield
+        with eager_forks_context:
+            yield
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
         set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
+            AutoTuner.L2_FLUSH_BUFFERS.clear()
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
             logger.info("[Autotuner] Autotuning process ends")
 
@@ -420,6 +433,47 @@ class AutoTunerStatistics:
                 stats_str += f"  {op}: {self.tuned_op_time_cost[op] * 1000:.4f} milliseconds\n"
 
         return stats_str
+
+
+# POSIX ESTALE and the Linux NFS client's EBADHANDLE (521).
+_STALE_HANDLE_ERRNOS = (errno.ESTALE, 521)
+
+
+def _read_cache_text(file_path: Path, attempts: int = 5) -> str:
+    """Read the cache file, retrying reads that hit a stale NFS handle."""
+    for attempt in range(attempts):
+        try:
+            with open(file_path, "r") as f:
+                return f.read()
+        except OSError as e:
+            if e.errno not in _STALE_HANDLE_ERRNOS or attempt == attempts - 1:
+                raise
+            logger.warning(
+                f"[AutoTuner] Retrying cache read of {file_path} after {e!r}")
+            time.sleep(0.2 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def _fastest_entries(per_rank: List[Dict[Tuple, Tuple]]) -> Dict[Tuple, Tuple]:
+    """Per cache key, the fastest of the ranks' entries (ties: the lowest rank's)."""
+    merged = {}
+    for entries in per_rank:
+        for key, value in entries.items():
+            if value[-1] < merged.get(key, (float('inf'), ))[-1]:
+                merged[key] = value
+    return merged
+
+
+def _majority_entries(per_rank: List[Dict[Tuple, Tuple]]) -> Dict[Tuple, Tuple]:
+    """Per cache key, the entry whose tactic most ranks hold (ties: the lowest rank's)."""
+    merged = {}
+    for key in {key for entries in per_rank for key in entries}:
+        held = [entries[key] for entries in per_rank if key in entries]
+        votes = Counter(repr(value[1]) for value in held)
+        top = max(votes.values())
+        merged[key] = next(value for value in held
+                           if votes[repr(value[1])] == top)
+    return merged
 
 
 @contextlib.contextmanager
@@ -702,8 +756,7 @@ class AutoTunerProfilingCache:
         if not file_path.exists():
             return {"metadata": self._serialize_metadata()}
         try:
-            with open(file_path, "r") as f:
-                content = f.read()
+            content = _read_cache_text(file_path)
             if not content.strip():
                 return {"metadata": self._serialize_metadata()}
             return json.loads(content)
@@ -751,8 +804,7 @@ class AutoTunerProfilingCache:
         lock_path = self._lock_path_for(file_path)
         try:
             with _exclusive_cache_lock(lock_path):
-                with open(file_path, "r") as f:
-                    current_cache_contents = json.load(f)
+                current_cache_contents = json.loads(_read_cache_text(file_path))
             self._deserialize_metadata(
                 current_cache_contents.get("metadata", {}))
 
@@ -1204,6 +1256,12 @@ class AutoTuner:
                     key=(custom_op, "inference_dispatch_fine_grained"))
             return (best_runner, best_tactic)
 
+        # Collective strategies tune in lockstep, but ranks can load different
+        # caches from a shared file: tune unless every rank has the entry.
+        if self._needs_rank_agreement(
+                tuning_config.distributed_tuning_strategy):
+            is_cache_hit = self._hit_on_all_ranks(is_cache_hit)
+
         # If it's tuning mode and cache hit, return the best runner and tactic to avoid redundant profiling.
         if self.is_tuning_mode and is_cache_hit:
             self._prime_cached_tactics(custom_op, runners, tuning_config,
@@ -1232,20 +1290,26 @@ class AutoTuner:
             self.stats.failed_profiling_count[custom_op] = set()
         new_tuning_failure_occurred = False
 
-        # Synchronize ranks before profiling
-        if self._should_current_rank_tune(
-                tuning_config.distributed_tuning_strategy):
+        strategy = tuning_config.distributed_tuning_strategy
+        if self._should_current_rank_tune(strategy):
+            profile_hits = [
+                self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )[0] for p in profiles
+            ]
+            # Every rank profiles under MERGE / PARALLEL, so they agree on the profiles to tune.
+            if (self._needs_rank_agreement(strategy)
+                    and strategy != DistributedTuningStrategy.BROADCAST):
+                profile_hits = self._profile_hits_on_all_ranks(
+                    profiles, profile_hits)
             with self._shared_profile_graph_pool():
-                for p in profiles:
-                    tensors = self._prepare_input_tensors(p, inputs)
-                    is_cache_hit, *_ = self.profiling_cache.search_cache(
-                        custom_op,
-                        runners,
-                        p.get_opt_shapes(),
-                        tuning_config,
-                        apply_map_to_tuning_buckets=False,
-                    )
+                for p, is_cache_hit in zip(profiles, profile_hits):
                     if not is_cache_hit:
+                        tensors = self._prepare_input_tensors(p, inputs)
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         with nvtx_range(
                                 f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -1653,6 +1717,14 @@ class AutoTuner:
         input_tensor_batches = self._prepare_input_tensors_with_batches(
             inputs, tuning_config)
 
+        if tuning_config.cold_l2_flush_bytes > 0:
+            avg_time = self._profile_cold_l2(runner, input_tensor_batches,
+                                             tactic, tuning_config, **kwargs)
+            self._debug_logger(
+                f"[Autotuner] Profiled (cold L2) runner={runner}, tactic={tactic}, "
+                f"shapes={self._get_input_sizes(inputs)}: {avg_time:.6f}ms.")
+            return avg_time
+
         stream = torch.cuda.current_stream()
         # If the warm up time is longer than 0.5ms, we will profile the kernel with fewer repeats.
         profile_fewer_repeat = 2
@@ -1779,6 +1851,59 @@ class AutoTuner:
         )
 
         return avg_time
+
+    # Flush buffers of cold-L2 profiling, by (device, bytes); released when the ``autotune()`` that
+    # turned tuning on exits.
+    L2_FLUSH_BUFFERS: Dict[Tuple[int, int], torch.Tensor] = {}
+
+    def _profile_cold_l2(self, runner: TunableRunner,
+                         input_tensor_batches: List[List[torch.Tensor]],
+                         tactic: Any, tuning_config: TuningConfig,
+                         **kwargs) -> float:
+        """Median per-repeat time (ms) of ``runner`` with L2 flushed before every repeat.
+
+        One CUDA graph holds ``repeat`` x (read the flush buffer, stamp, runner, stamp); a repeat's
+        time is its stamp difference, so neither the flush nor host launches are timed.
+        """
+        key = (torch.cuda.current_device(), tuning_config.cold_l2_flush_bytes)
+        flush = self.L2_FLUSH_BUFFERS.get(key)
+        if flush is None:
+            flush = torch.ones(tuning_config.cold_l2_flush_bytes // 2,
+                               dtype=torch.bfloat16,
+                               device="cuda")
+            self.L2_FLUSH_BUFFERS[key] = flush
+        for _ in range(self.warmup):
+            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+        repeat = max(self.repeat, 3)
+        stamps = torch.zeros(2 * repeat, dtype=torch.int64, device="cuda")
+        base = stamps.data_ptr()
+        graph = torch.cuda.CUDAGraph()
+        graph_pool = torch.cuda.graph_pool_handle()
+        torch.cuda.synchronize()
+        completed = False
+        try:
+            # Like every capture here: NCCL-window ownership, and no automatic GC until it ends.
+            with nccl_window_graph_capture(graph, graph_pool):
+                capture_stream = torch.cuda.current_stream()
+                for r in range(repeat):
+                    torch.amax(flush)
+                    record_global_timer(base + 16 * r, capture_stream)
+                    runner(input_tensor_batches[r % len(input_tensor_batches)],
+                           tactic=tactic,
+                           **kwargs)
+                    record_global_timer(base + 16 * r + 8, capture_stream)
+            for _ in range(2):
+                graph.replay()
+            torch.cuda.synchronize()
+            completed = True
+        finally:
+            graph.reset()
+            if completed:
+                release_nccl_window_graph_owner(graph_pool)
+            else:
+                abandon_nccl_window_graph_owner(graph_pool)
+        times = (stamps[1::2] - stamps[0::2]).double() / 1e6
+        return float(times.median().item())
 
     def _optimization_profiles(
             self, tuning_config: TuningConfig,
@@ -2212,6 +2337,30 @@ class AutoTuner:
         """Check if we're in a distributed environment."""
         return self._dist is not None and self._tuning_group()[0] > 1
 
+    def _needs_rank_agreement(self,
+                              strategy: DistributedTuningStrategy) -> bool:
+        """Whether ranks must agree on cache hits under ``strategy``."""
+        return (strategy != DistributedTuningStrategy.INDEPENDENT
+                and self._is_distributed())
+
+    def _hit_on_all_ranks(self, is_cache_hit: bool) -> bool:
+        """Whether ``is_cache_hit`` holds on every rank (host all-gather)."""
+        return all(self._dist.tp_cp_allgather(obj=bool(is_cache_hit)))
+
+    def _profile_hits_on_all_ranks(self, profiles: List[OptimizationProfile],
+                                   hits: List[bool]) -> List[bool]:
+        """Per profile, whether every rank that builds it has it cached (one host all-gather).
+
+        Ranks build their profiles from their own input shapes (attention DP), so the lists may differ.
+        """
+        keys = [p.get_opt_shapes() for p in profiles]
+        missed = set()
+        for rank_keys, rank_hits in self._dist.tp_cp_allgather(
+                obj=(keys, [bool(hit) for hit in hits])):
+            missed.update(key for key, hit in zip(rank_keys, rank_hits)
+                          if not hit)
+        return [key not in missed for key in keys]
+
     def _parallel_deal_start(self, custom_op: str, profile: OptimizationProfile,
                              strategy: DistributedTuningStrategy) -> int:
         """Where a PARALLEL deal of ``profile``'s (runner, tactic) pairs starts.
@@ -2268,31 +2417,29 @@ class AutoTuner:
 
     def _merge_cache_data(self, custom_op: str):
         cache_data = self.profiling_cache.get_specific_custom_op(custom_op)
-        merged_cache_data = dict()
-        all_cache_data = self._dist.tp_cp_allgather(obj=cache_data)
+        self.profiling_cache.merge_cache_data(
+            _fastest_entries(self._dist.tp_cp_allgather(obj=cache_data)))
 
-        for data in all_cache_data:
-            for key, value in data.items():
-                current_time = merged_cache_data.get(key, [
-                    float('inf'),
-                ])[-1]
-                if value[-1] < current_time:
-                    merged_cache_data[key] = value
-
-        self.profiling_cache.merge_cache_data(merged_cache_data)
-
-    def post_tune_merge_tactics(self) -> None:
-        """Merge tactics across ranks after tuning: all-gather every rank's whole
-        profiling cache and keep the fastest tactic per key. One-shot
-        (session-level, not per-op). Collective — all ranks must call it."""
+    def post_tune_merge_tactics(self,
+                                custom_ops: Optional[Set[str]] = None,
+                                majority: bool = False) -> int:
+        """After tuning, keep per cache key (of ``custom_ops`` when given) the ranks' fastest tactic,
+        or with ``majority`` the one most ranks chose. Collective — all ranks must call it.
+        Returns how many of this rank's tactics changed."""
         if not self._is_distributed():
-            return
-        merged = dict()
-        for data in self._dist.tp_cp_allgather(obj=self.profiling_cache.cache):
-            for key, value in data.items():
-                if value[-1] < merged.get(key, [float('inf')])[-1]:
-                    merged[key] = value
+            return 0
+        mine = {
+            key: value
+            for key, value in self.profiling_cache.cache.items()
+            if custom_ops is None or key[0] in custom_ops
+        }
+        per_rank = self._dist.tp_cp_allgather(obj=mine)
+        merged = (_majority_entries(per_rank)
+                  if majority else _fastest_entries(per_rank))
+        changed = sum(1 for key, value in merged.items()
+                      if key not in mine or mine[key][1] != value[1])
         self.profiling_cache.merge_cache_data(merged)
+        return changed
 
     def _broadcast_cache_data(
         self,

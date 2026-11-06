@@ -1867,6 +1867,7 @@ def test_megamoe_quantize_reserves_sms_only_for_a_replica_plan(has_sm_budget):
     _extract_function(source, "_fp4_quantize_has_sm_budget", namespace)
     impl = _extract_class(source, "TrtllmCutedslMegaMoeNvfp4Impl", {"quantize_input"}, namespace)
     owner = impl()
+    owner._shared_activation_target = lambda num_tokens: None
     owner.fc31_input_scale = "scale"
 
     owner.quantize_input(Activation(3, 64))
@@ -2405,11 +2406,16 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         "get_active_route_capture": lambda: None,
         "torch": SimpleNamespace(int32="int32", float32="float32"),
         "Fp4QuantizedTensor": type("Fp4QuantizedTensor", (), {}),
+        "RouterLogitPartials": type("RouterLogitPartials", (), {}),
         "MoERunContext": lambda **kwargs: SimpleNamespace(**kwargs),
     }
     _extract_function(source, "_record_routes", namespace)
     _extract_function(source, "_leading_rows", namespace)
-    scheduler_cls = _extract_class(source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace)
+    _extract_function(source, "_num_rows", namespace)
+    _extract_class(source, "MoEScheduler", {"_try_fused_route_quant"}, namespace)
+    scheduler_cls = _extract_class(
+        source, "FusedCommMoEScheduler", {"_forward_chunk"}, namespace, bases=("MoEScheduler",)
+    )
 
     plan = SimpleNamespace(reserved_sms=4)
     layer = (
@@ -2453,7 +2459,11 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
         _load_balancer_route=route,
         _load_balancer_start_set_cpu_stage=lambda is_last_call: trace.append("start_set_cpu"),
         _load_balancer_done_set_cpu_stage=lambda is_last_call: trace.append("done_set_cpu"),
+        _using_dynamic_load_balancer=lambda: False,
+        _warmup_placement_route_counters=lambda row_offset: None,
+        _load_balancer_count_warmup=lambda *args: None,
         backend=SimpleNamespace(
+            fused_route_quant_enabled=False,
             quantize_input=lambda x, **kwargs: trace.append(("quantize", kwargs)) or ("x", "sf"),
             set_adaptive_launch_tokens=lambda tokens: trace.append(("bucket", tokens)),
             run_moe=run_moe,
@@ -2472,30 +2482,30 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     )
 
     assert out == "out"
-    tail = [("quantize", {}), ("bucket", 6)]
     if mode == "per_layer_dynamic":
         # The planner consumes the logical routes the calibrator records or
         # replays, and quantization leaves the plan's SMs to its copy kernel.
         # The layer has no CPU stage or host statistics, so only the post-MoE
         # hook that releases its plan runs.
         expected = [
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
             ("route", "replayed logical"),
             ("quantize", {"reserved_sms": 4}),
-            ("bucket", 6),
             ("run_moe", "physical", plan),
             "start_set_cpu",
         ]
     elif mode == "standard":
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             "done_wait_gpu",
             ("update_statistic", "logical"),
             ("route", "logical"),
             ("statistic", "slots"),
             ("calibrator", "slots"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed slots", None),
             "start_set_cpu",
             "done_set_cpu",
@@ -2503,9 +2513,10 @@ def test_fused_comm_chunk_routes_once_after_recording_the_planner_input(mode):
     else:
         expected = [
             "start_wait_gpu",
+            ("bucket", 6),
             ("statistic", "logical"),
             ("calibrator", "logical"),
-            *tail,
+            ("quantize", {}),
             ("run_moe", "replayed logical", None),
             "start_set_cpu",
             "done_set_cpu",

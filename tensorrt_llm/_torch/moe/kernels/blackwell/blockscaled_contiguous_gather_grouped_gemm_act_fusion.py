@@ -48,9 +48,13 @@ from tensorrt_llm._torch.kernels.blackwell.utils import (
     is_power_of_2,
     sigmoid_f32,
     silu_f32,
+    st_global_zero_v4,
 )
 
 from ....utils import ActivationType, is_gated_activation
+
+# TMA cache hint (CUTLASS copy_sm90_desc.hpp): L2 evict-first.
+_TMA_L2_EVICT_FIRST = 0x12F0000000000000
 
 SUPPORTED_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
@@ -291,6 +295,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_local_experts: int = 0,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        zero_fill: bool = False,
+        weight_evict_first: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and fused activation.
@@ -344,6 +350,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         """
 
         self.sf_vec_size = sf_vec_size
+        # The scheduler warp also zeroes [zero_addr, zero_addr + zero_bytes) (the FC2 finalize
+        # output), a slice per produced tile, in place of a memset FC2 would wait for.
+        self.zero_fill = zero_fill
+        # Expert weights (B, SFB) are loaded with the L2 evict-first hint.
+        self.weight_evict_first = weight_evict_first
         self.topk = topk
         self.activation_type = validate_activation_type(activation_type)
         self.is_gated = is_gated_activation(self.activation_type)
@@ -719,6 +730,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
+        zero_addr: cutlass.Int64 = cutlass.Int64(0),
+        zero_bytes: cutlass.Int64 = cutlass.Int64(0),
     ):
         """Execute the contiguous grouped GEMM with gather operation and fused activation.
 
@@ -1050,6 +1063,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             self.c_smem_layout_staged,
             self.epi_tile,
             self.tile_sched_params,
+            zero_addr,
+            zero_bytes,
             epilogue_op,
         ).launch(
             grid=grid,
@@ -1135,6 +1150,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
         tile_sched_params: utils.PersistentTileSchedulerParams,
+        zero_addr: cutlass.Int64,
+        zero_bytes: cutlass.Int64,
         epilogue_op: cutlass.Constexpr,
     ):
         """
@@ -1447,6 +1464,19 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             else:
                 num_non_exiting_tiles_value = num_non_exiting_tiles[0]
 
+            if cutlass.const_expr(self.zero_fill):
+                # This CTA's slice of the zero range, in 512 B warp stores (32 lanes x 16 B).
+                zb_x, zb_y, zb_z = cute.arch.block_idx()
+                zg_x, zg_y, zg_z = cute.arch.grid_dim()
+                z_lin = cutlass.Int64(zb_x + zg_x * (zb_y + zg_y * zb_z))
+                z_nblk = cutlass.Int64(zg_x * zg_y * zg_z)
+                z_lane = cutlass.Int64(cute.arch.lane_idx())
+                z_chunk = (zero_bytes + z_nblk * 512 - 1) // (z_nblk * 512) * 512
+                z_cur = z_lin * z_chunk
+                z_end = cutlass.min(z_cur + z_chunk, zero_bytes)
+                # ~64 KB per produced tile; whatever is left is written after the loop.
+                z_step = cutlass.Int64(65536)
+
             if cutlass.const_expr(self.raster_along_m):
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
@@ -1487,6 +1517,14 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         self.sched_sync_barrier.arrive_and_wait()
                         tile_info_pipeline.producer_commit(tile_info_producer_state)
                         tile_info_producer_state.advance()
+                        if cutlass.const_expr(self.zero_fill):
+                            z_stop = cutlass.min(z_cur + z_step, z_end)
+                            z_n = cutlass.Int32((z_stop - z_cur + 511) // 512)
+                            for z_i in cutlass.range(z_n):
+                                z_off = z_cur + cutlass.Int64(z_i) * 512 + z_lane * 16
+                                if z_off < z_end:
+                                    st_global_zero_v4(zero_addr + z_off)
+                            z_cur = z_stop
 
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
@@ -1531,12 +1569,26 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         self.sched_sync_barrier.arrive_and_wait()
                         tile_info_pipeline.producer_commit(tile_info_producer_state)
                         tile_info_producer_state.advance()
+                        if cutlass.const_expr(self.zero_fill):
+                            z_stop = cutlass.min(z_cur + z_step, z_end)
+                            z_n = cutlass.Int32((z_stop - z_cur + 511) // 512)
+                            for z_i in cutlass.range(z_n):
+                                z_off = z_cur + cutlass.Int64(z_i) * 512 + z_lane * 16
+                                if z_off < z_end:
+                                    st_global_zero_v4(zero_addr + z_off)
+                            z_cur = z_stop
                     else:
                         is_continue = cutlass.Boolean(0)
 
                     tile_sched.advance_to_next_work()
                     work_tile = tile_sched.get_current_work()
 
+            if cutlass.const_expr(self.zero_fill):
+                z_n = cutlass.Int32((z_end - z_cur + 511) // 512)
+                for z_i in cutlass.range(z_n):
+                    z_off = z_cur + cutlass.Int64(z_i) * 512 + z_lane * 16
+                    if z_off < z_end:
+                        st_global_zero_v4(zero_addr + z_off)
             tile_info_pipeline.producer_acquire(tile_info_producer_state)
             with cute.arch.elect_one():
                 sInfo[(0, tile_info_producer_state.index)] = work_tile.tile_idx[0]
@@ -1977,6 +2029,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tBsB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
+                        **(
+                            {"cache_policy": cutlass.Int64(_TMA_L2_EVICT_FIRST)}
+                            if cutlass.const_expr(self.weight_evict_first)
+                            else {}
+                        ),
                     )
                     cute.copy(
                         tma_atoms_sfb[0],
@@ -1984,6 +2041,11 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         tBsSFB_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
+                        **(
+                            {"cache_policy": cutlass.Int64(_TMA_L2_EVICT_FIRST)}
+                            if cutlass.const_expr(self.weight_evict_first)
+                            else {}
+                        ),
                     )
 
                     b_producer_state.advance()
@@ -2528,7 +2590,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
-                        if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
+                        # 2-CTA tiles release after the first iterations of either direction (stage 0 runs in
+                        # reverse), which load the columns the two stages share; on 1-CTA tiles that early
+                        # release is slower, so they keep it at the real subtile index.
+                        release_idx = real_subtile_idx
+                        if cutlass.const_expr(self.use_2cta_instrs):
+                            release_idx = subtile_idx // 2 if self.is_gated else subtile_idx
+                        if release_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
                             acc_pipeline.consumer_release(acc_consumer_state)
@@ -3602,6 +3670,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         activation_type: cutlass.Constexpr = ActivationType.Swiglu,
+        zero_addr: cutlass.Int64 = cutlass.Int64(0),
+        zero_bytes: cutlass.Int64 = cutlass.Int64(0),
     ):
         """Single-B wrapper.
 
@@ -3668,6 +3738,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
+            zero_addr=zero_addr,
+            zero_bytes=zero_bytes,
         )
 
 

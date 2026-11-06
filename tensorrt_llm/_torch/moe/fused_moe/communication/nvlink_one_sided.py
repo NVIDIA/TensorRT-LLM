@@ -57,6 +57,7 @@ from tensorrt_llm.math_utils import pad_up
 
 from ..moe_comm_timeout_guard import register_moe_comm_timeout_proxy
 from .base import Communication
+from .pull_combine import PULL_COMBINE_MIN_TOKENS, PullCombineSync, pull_reduce
 
 _CFT_DEFAULT_MAX_BATCH_FOR_DISPATCH = 128
 _CFT_MAX_BATCH_FOR_DISPATCH_ENV = "TRTLLM_NVLINK_ONE_SIDED_A2A_CFT_MAX_BATCH_FOR_DISPATCH"
@@ -236,14 +237,26 @@ def _get_cft_max_batch_for_combine() -> int:
     return _get_cft_max_batch(_CFT_MAX_BATCH_FOR_COMBINE_ENV, _CFT_DEFAULT_MAX_BATCH_FOR_COMBINE)
 
 
+# The moe_a2a kernels' own timeout (kDefaultTimeoutCycles), used while no budget is set.
+_NATIVE_A2A_TIMEOUT_SEC = 300
+
+
 class _NVLinkOneSidedTimeoutProxy:
     """Applies MoE communication timeouts to the process-wide completion-flag budget."""
 
     name = "NVLinkOneSided"
 
+    def __init__(self) -> None:
+        # The current budget, for the pull combine's handshake; None is the native default.
+        self.seconds: int | None = None
+
     def set_timeout_seconds(self, seconds: int | None) -> None:
         # The op restores its native default for 0.
         torch.ops.trtllm.moe_a2a_set_timeout(0 if seconds is None else seconds)
+        self.seconds = seconds
+
+    def handshake_timeout_seconds(self) -> int:
+        return self.seconds or _NATIVE_A2A_TIMEOUT_SEC
 
 
 _TIMEOUT_PROXY = _NVLinkOneSidedTimeoutProxy()
@@ -285,6 +298,8 @@ class NVLinkOneSided(Communication):
     RECV_COUNTERS_OFFSET_INDEX = None
     DISPATCH_COMPLETION_FLAGS_OFFSET_INDEX = None
     COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = None
+    TOPK_TARGET_RANKS_OFFSET_INDEX = None
+    TOPK_TARGET_INDICES_OFFSET_INDEX = None
     EPLB_GATHERED_STATS_OFFSET_INDEX = None
     DISPATCH_PAYLOAD_OFFSET_INDEX = None
     DISPATCH_PAYLOAD_SIZE_INDEX = None
@@ -379,6 +394,10 @@ class NVLinkOneSided(Communication):
             )
             cls.COMBINE_COMPLETION_FLAGS_OFFSET_INDEX = int(
                 thop.MOE_A2A_COMBINE_COMPLETION_FLAGS_OFFSET_INDEX
+            )
+            cls.TOPK_TARGET_RANKS_OFFSET_INDEX = int(thop.MOE_A2A_TOPK_TARGET_RANKS_OFFSET_INDEX)
+            cls.TOPK_TARGET_INDICES_OFFSET_INDEX = int(
+                thop.MOE_A2A_TOPK_TARGET_INDICES_OFFSET_INDEX
             )
             cls.EPLB_GATHERED_STATS_OFFSET_INDEX = int(
                 thop.MOE_A2A_EPLB_GATHERED_STATS_OFFSET_INDEX
@@ -709,6 +728,17 @@ class NVLinkOneSided(Communication):
             workspace_state["cft_initialized"] = True
             NVLinkOneSided._CFT_OWNER_SHAPE = self._cft_shape
 
+        # Two ranks may pull each other's BF16 partials straight from the workspace (pull_combine.py)
+        # once enable_pull_combine attaches the handshake. The watchdog watches only native kernels.
+        self._pull_sync: Optional[PullCombineSync] = None
+        self._pull_combine_supported = (
+            self.ep_size == 2
+            and dtype == torch.bfloat16
+            and not self.use_low_precision_combine
+            and not self._rank_mask_enabled
+            and alltoall_watchdog_timeout_s is None
+        )
+
         # Initialize dispatch state
         self._dispatch_state = {"phase": "idle"}
 
@@ -744,6 +774,11 @@ class NVLinkOneSided(Communication):
         """
         NVLINK one-sided comm supports post-quant dispatch.
         """
+        return True
+
+    def carries_unrouted_rows(self) -> bool:
+        """Dispatch sends a row of ``invalid_token_expert_id`` ids to no rank, and combine returns
+        zeros for it."""
         return True
 
     @classmethod
@@ -1137,6 +1172,22 @@ class NVLinkOneSided(Communication):
             final_hidden_states,
             self.use_low_precision_combine,
         )
+        addend = kwargs.get("addend")
+        if addend is not None or (
+            self.payload_in_workspace and self.pull_combine_applies(runtime_max_tokens_per_rank)
+        ):
+            if not self.combine_fuses_addend(runtime_max_tokens_per_rank, int(local_num_tokens)):
+                raise ValueError("this combine cannot add an addend")
+            output = self._combine_pull(
+                final_hidden_states,
+                int(local_num_tokens),
+                int(runtime_max_tokens_per_rank),
+                int(combine_payload_offset),
+                addend,
+                kwargs.get("addend_ready"),
+            )
+            self.reset_state()
+            return output
         output = torch.ops.trtllm.moe_a2a_combine(
             final_hidden_states,
             int(local_num_tokens),
@@ -1161,6 +1212,86 @@ class NVLinkOneSided(Communication):
         self.reset_state()
 
         return output
+
+    def enable_pull_combine(self) -> None:
+        """Let this communicator's combines pull the partials where ``pull_combine_applies``.
+
+        Collective on the first call for a workspace: every rank calls it at the same construction step.
+        """
+        if self._pull_sync is not None or not self._pull_combine_supported:
+            return
+        pull_sync = self._workspace_state.get("pull_sync")
+        if pull_sync is None:
+            pull_sync = PullCombineSync(self.mapping, self.ep_rank)
+            self._workspace_state["pull_sync"] = pull_sync
+        self._pull_sync = pull_sync
+
+    def pull_combine_applies(self, runtime_max_tokens_per_rank: int) -> bool:
+        """Whether a combine with this busiest-rank token count may pull the partials (it does
+        when the expert output is also in the workspace); never for a batch that combines with CFT.
+        Rank-shared inputs only."""
+        return (
+            self._pull_sync is not None
+            and PULL_COMBINE_MIN_TOKENS
+            <= runtime_max_tokens_per_rank
+            <= self.max_num_tokens_per_rank
+            and not self.use_cft_for_combine(runtime_max_tokens_per_rank)
+        )
+
+    def combine_fuses_addend(self, runtime_max_tokens_per_rank: int, rows: int) -> bool:
+        if not (
+            self.payload_in_workspace and self.pull_combine_applies(runtime_max_tokens_per_rank)
+        ):
+            return False
+        return self._dispatch_state.get("local_num_tokens") == rows
+
+    def _combine_pull(
+        self,
+        payload: torch.Tensor,
+        local_num_tokens: int,
+        runtime_max_tokens_per_rank: int,
+        combine_payload_offset: int,
+        addend: Optional[torch.Tensor],
+        addend_ready: Optional[torch.cuda.Event],
+    ) -> torch.Tensor:
+        """Pull combine: this rank's tokens' own partials in ``payload[ep_rank]`` and the peer's in
+        the peer's payload at the same workspace offset."""
+        hidden = payload.shape[-1]
+        nbytes = self.ep_size * runtime_max_tokens_per_rank * hidden * payload.element_size()
+        own_payload = self.workspace[self.ep_rank, combine_payload_offset:]
+        if own_payload.data_ptr() != payload.data_ptr():
+            raise RuntimeError("pull combine: the payload is not at this rank's combine offset")
+        # The native prepare-combine's round step, which keeps later native rounds in parity.
+        offset = int(self.moe_a2a_metainfo[self.FLAG_VAL_OFFSET_INDEX])
+        self.workspace[self.ep_rank, offset : offset + 4].view(torch.int32).add_(1)
+        # A launch keeps the timeout of its capture, as the native kernels' launch arguments do.
+        self._pull_sync.signal_wait(_TIMEOUT_PROXY.handshake_timeout_seconds())
+        peer_payload = (
+            self.workspace[
+                1 - self.ep_rank, combine_payload_offset : combine_payload_offset + nbytes
+            ]
+            .view(payload.dtype)
+            .view(self.ep_size, runtime_max_tokens_per_rank, hidden)
+        )
+        metadata = []
+        for index in (self.TOPK_TARGET_RANKS_OFFSET_INDEX, self.TOPK_TARGET_INDICES_OFFSET_INDEX):
+            start = int(self.moe_a2a_metainfo[index])
+            metadata.append(
+                self.workspace[self.ep_rank, start : start + local_num_tokens * self.top_k * 4]
+                .view(torch.int32)
+                .view(local_num_tokens, self.top_k)
+            )
+        if addend is not None and addend_ready is not None:
+            torch.cuda.current_stream().wait_event(addend_ready)
+        out = torch.empty((local_num_tokens, hidden), dtype=payload.dtype, device=payload.device)
+        return pull_reduce(
+            payload[self.ep_rank],
+            peer_payload[self.ep_rank],
+            *metadata,
+            self.ep_rank,
+            out,
+            addend,
+        )
 
     def reset_state(self) -> None:
         """Reset the dispatch/combine state machine to ``idle``.

@@ -74,6 +74,9 @@ class _ReferenceRouting(BaseMoeRoutingMethod):
 
 def _init_worker(paths: list[str]) -> None:
     sys.path[:] = paths
+    # Resolve __extra_import_path__ imports, such as test_modeling_deepseekv41's, as pytest does.
+    import test_common.magic_import  # noqa: F401
+
     os.environ["TRTLLM_FORCE_COMM_METHOD"] = "ALLGATHER"
     os.environ["ENABLE_PERFECT_ROUTER"] = "0"
     # Keep torch backend proxies out of the initializer's pickle.
@@ -212,7 +215,11 @@ def _run_native_ep() -> None:
             del weights
             assert isinstance(moe.comm, NVLinkOneSided)
 
-            token_counts = [list(range(1, world_size + 1)), [0, *range(2, world_size + 1)]]
+            token_counts = [
+                list(range(1, world_size + 1)),
+                [0, *range(2, world_size + 1)],
+                [0] * (world_size - 1) + [640],
+            ]
             for counts in token_counts:
                 torch.manual_seed(1702)
                 global_x = torch.randn((sum(counts), _HIDDEN_SIZE), dtype=torch.bfloat16)
@@ -224,6 +231,7 @@ def _run_native_ep() -> None:
                 ) == set(range(world_size))
                 start = sum(counts[:rank])
                 x = global_x[start : start + counts[rank]]
+                ids = torch.arange(start, start + counts[rank], dtype=torch.int32)
                 # Final-window replay can leave a peer empty before the gate.
                 logits = gate(x)
                 reference_logits = F.linear(x.float(), gate.weight.float())
@@ -235,7 +243,7 @@ def _run_native_ep() -> None:
                     torch.testing.assert_close(scales, expected_scales, rtol=1e-4, atol=1e-5)
 
                 expected = reference(x, reference_logits)
-                actual = moe(x, logits, all_rank_num_tokens=counts)
+                actual = moe(x, logits, all_rank_num_tokens=counts, input_ids=ids)
                 torch.cuda.synchronize()
                 assert actual.shape == expected.shape == x.shape
                 assert torch.isfinite(actual).all()

@@ -12,6 +12,7 @@ from pydantic import TypeAdapter
 from torch import nn
 from utils.util import skip_blackwell_geforce
 
+from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import _fused_context_supported
 from tensorrt_llm._torch.attention.backends.sparse.csa2.cache_manager import CSA2CacheManager
 from tensorrt_llm._torch.attention.backends.sparse.csa2.params import (
     CSA2Layout,
@@ -25,11 +26,16 @@ from tensorrt_llm._torch.attention.backends.sparse.csa2.quantization import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.csa2.weights import load_attention_weights
 from tensorrt_llm._torch.attention.backends.sparse.registry import get_sparse_attn_kv_cache_manager
+from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig, SparseAttentionConfig
 
 skip_pre_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (10, 0),
     reason="This test requires Blackwell or newer",
+)
+skip_no_fused_context = pytest.mark.skipif(
+    not torch.cuda.is_available() or not _fused_context_supported(torch.cuda.current_device()),
+    reason="The fused CSA2 context kernel requires an SM100-family GPU",
 )
 
 
@@ -136,12 +142,17 @@ def test_module_sends_whole_context_and_generation_phases(monkeypatch, implement
         sparse_params=CSA2Params(layout=layout, compute_backend=implementation),
         staging_dtype=torch.bfloat16,
         native_fp8=False,
+        fused_decode=False,
+        gen_fmha_serves=lambda *args: False,
         layer_idx=0,
         num_heads=1,
         indexer=indexer,
     )
     backend._native_slot_mapping = lambda logical: CSA2TrtllmAttention._native_slot_mapping(
         backend, logical
+    )
+    backend._resolve_sparse_inputs = lambda count, args: (
+        CSA2TrtllmAttention._resolve_sparse_inputs(backend, count, args)
     )
 
     def compute(query, k, v, metadata, *, forward_args):
@@ -228,6 +239,8 @@ def module_cache(request):
     from tensorrt_llm.mapping import Mapping
 
     compress_ratio = getattr(request, "param", 2)
+    # Ratio 0 makes the single layer SWA-only, without global KV or index sources.
+    sources = () if compress_ratio == 0 else (0,)
     manager = CSA2CacheManager(
         KvCacheConfig(
             enable_block_reuse=False,
@@ -245,7 +258,7 @@ def module_cache(request):
         mapping=Mapping(),
         dtype=DataType.BF16,
         vocab_size=128,
-        layout=CSA2Layout((compress_ratio,), (0,), (0,), index_topk=2, window_size=4),
+        layout=CSA2Layout((compress_ratio,), sources, sources, index_topk=2, window_size=4),
     )
     request = LlmRequest(
         request_id=41,
@@ -331,6 +344,7 @@ def test_ced_owner_is_written_once_before_narrowed_query(monkeypatch, module_cac
     metadata.prompt_lens = [1]
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[3])
     metadata.prepare()
+    metadata._ensure_swa_slots()  # As entering the layer does.
     actual = model(hidden[-1:], metadata.csa2_positions, metadata)
     torch.cuda.synchronize()
     assert actual.shape == (1, 32) and torch.isfinite(actual).all()
@@ -515,7 +529,12 @@ def _native_model(
     sparse_options=None,
     mapping=None,
     num_groups=2,
+    q_lora_rank=128,
     allreduce_strategy=None,
+    kv_cache_dtype="auto",
+    layer_idx=0,
+    max_positions=32,
+    hidden_size=128,
 ):
     from tensorrt_llm._torch.attention.backends.interface import (
         PositionalEmbeddingParams,
@@ -525,29 +544,30 @@ def _native_model(
     from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout, CSA2Params
     from tensorrt_llm.functional import PositionEmbeddingType
 
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("Native MXFP8 projections require SM100/SM103")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Native MXFP8 projections require SM100/SM103/SM107")
     layout = layout or CSA2Layout((1,), (0,), (0,), index_topk=32)
     options = {"fuse_index_q": fused}
     options.update(sparse_options or {})
     with torch.device("cuda"):
         model = DeepseekV41Attention(
             layout,
-            0,
+            layer_idx,
             PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gptj,
-                rope=RopeParams(dim=64, theta=160000, max_positions=32),
+                rope=RopeParams(dim=64, theta=160000, max_positions=max_positions),
                 is_neox=False,
             ),
-            hidden_size=128,
+            hidden_size=hidden_size,
             num_heads=attention_heads,
-            q_lora_rank=128,
+            q_lora_rank=q_lora_rank,
             o_lora_rank=128,
             num_groups=num_groups,
             index_heads=32,
             mapping=mapping,
             sparse_params=CSA2Params(layout=layout, **options),
             projection_quantization=projection_quantization,
+            kv_cache_dtype=kv_cache_dtype,
             aux_stream=aux_stream,
             **(
                 {"allreduce_strategy": allreduce_strategy} if allreduce_strategy is not None else {}
@@ -629,12 +649,15 @@ def test_attention_dp_loads_full_projection_weights(rank, quantization):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("q_lora_rank", [128, 1280])
 @torch.inference_mode()
-def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch):
+def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch, q_lora_rank):
     from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
 
     torch.manual_seed(943)
-    model, weights = _native_model()
+    model, weights = _native_model(q_lora_rank=q_lora_rank)
+    # The MXFP8 fused projection; small steps otherwise take the small-M kernel.
+    model._small_m_projection = False
     calls = []
     native = torch.ops.trtllm.mxfp8_mxfp8_gemm
 
@@ -649,7 +672,7 @@ def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch):
     reference_input = dequant_mxfp8_weight(data, scale)
     reference_weight = weights["wq_a.weight"].float() / 16
     expected = F.linear(reference_input, reference_weight).bfloat16()
-    assert calls == [(128, 128)]
+    assert calls == [(q_lora_rank, 128)]
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
     torch.testing.assert_close(
         model.wq_a.weight.view(torch.uint8),
@@ -671,14 +694,178 @@ def test_native_mxfp8_projection_checkpoint_and_atomic_load(monkeypatch):
         )
         torch.testing.assert_close(actual_bytes, expected_bytes, atol=0, rtol=0)
 
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+
+    for linear in (model.wq_a, model.wq_b, model.wkv):
+        linear.quant_method.tune_mxfp8_backends = True
+    with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_autotune():
+            model._project_query_and_swa(x, decode_only=True)
+            model._fuse_qkv_projection = False
+            model._project_query_and_swa(x, decode_only=True)
+            model.wkv(x)
+            model._fuse_qkv_projection = True
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            outputs = model._project_query_and_swa(x, decode_only=True)
+        for _ in range(2):
+            x.normal_()
+            graph.replay()
+            model._fuse_qkv_projection = False
+            qr, q, _ = model._project_query_and_swa(x, decode_only=True)
+            swa = model.wkv(x)
+            model._fuse_qkv_projection = True
+            torch.testing.assert_close(outputs[0], qr, atol=0, rtol=1 / 128)
+            # The small-M Q-B kernel reads BF16 activations, the plain path MXFP8 ones.
+            torch.testing.assert_close(outputs[1], q, atol=5e-2 * q.abs().max().item(), rtol=0)
+            torch.testing.assert_close(outputs[2], swa, atol=0, rtol=0)
+        # A caller's MXFP8 copy of the input (the mHC boundary's) replaces the quantize launch.
+        assert model.takes_mxfp8_input
+        prequantized = MxFp8QuantizedTensor(
+            *torch.ops.trtllm.mxfp8_quantize(x, True), is_sf_swizzled=True
+        )
+        given = model._project_query_and_swa(x, decode_only=True, prequantized=prequantized)
+        for got, want in zip(given, model._project_query_and_swa(x, decode_only=True)):
+            torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+    # Reloading must refresh the packed projection as well as the original weights.
+    weights["wkv.weight"] = torch.zeros_like(weights["wkv.weight"])
+    model.load_hf_weights(weights)
+    assert not bool(model._fused_qkv_weight[q_lora_rank:].view(torch.uint8).any())
+
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block", [32, 128])
+@pytest.mark.parametrize("lowm_qkv", [False, True])
+@pytest.mark.parametrize("rows", [6])
 @torch.inference_mode()
-def test_native_grouped_output_paths_and_replay(monkeypatch, block):
+def test_decode_graph_query_projections_match_unfused(rows, lowm_qkv):
+    """Decode-graph query/SWA, Q and index-Q projections (index Q with its RoPE) on the small-M
+    kernel, with and without the fused Q-A and KV projection on it, match the plain path at the
+    model's shapes (hidden 5120, 8 heads, 32 index heads)."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+
+    torch.manual_seed(946)
+    model, _ = _native_model(q_lora_rank=1280, hidden_size=5120)
+    model._lowm_qkv_projection = lowm_qkv
+    with flashinfer_mxfp8_decode_graph_capture():
+        if not model._lowm_projects(model.wq_b, rows):
+            pytest.skip("The small-M kernel runs on SM100/SM103")
+        assert model._lowm_projects(model.index_wq_b, rows)
+        assert model._lowm_projects_qkv(rows) == lowm_qkv
+    x = torch.randn(rows, 5120, dtype=torch.bfloat16, device="cuda")
+    positions = torch.randint(0, 32, (rows,), dtype=torch.int32, device="cuda")
+
+    def plain():
+        qr = model.q_norm(model.wq_a(x))
+        index_q = model.index_wq_b(qr).reshape(rows, model.index_heads, -1)
+        return qr, model.wq_b(qr), model._rope(index_q, positions, model.index_heads), model.wkv(x)
+
+    for linear in (model.wq_a, model.wq_b, model.wkv, model.index_wq_b):
+        linear.quant_method.tune_mxfp8_backends = True
+    AutoTuner.get().clear_cache()
+    with flashinfer_mxfp8_decode_graph_capture():
+        # The mHC boundary's MXFP8 copy of the rows is requested only when the GEMM reads it.
+        assert model.takes_mxfp8_input
+        assert model.takes_mxfp8_input_for(rows) != lowm_qkv
+        with flashinfer_mxfp8_autotune():
+            model._project_query_and_swa(x, decode_only=True)
+            plain()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qr, q, swa = model._project_query_and_swa(x, decode_only=True)
+            index_q, _ = model._project_index_q(qr, positions)
+    x.normal_()
+    graph.replay()
+    expected_qr, expected_q, expected_index_q, expected_swa = plain()
+    # BF16 versus MXFP8 activations.
+    for actual, expected in (
+        (qr, expected_qr),
+        (swa, expected_swa),
+        (q, expected_q),
+        (index_q, expected_index_q),
+    ):
+        torch.testing.assert_close(
+            actual.reshape(expected.shape).float(),
+            expected.float(),
+            rtol=0,
+            atol=5e-2 * expected.abs().max().item(),
+        )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [6, 16])
+@torch.inference_mode()
+def test_decode_graph_q_b_normalizes_without_indexer(monkeypatch, rows):
+    """Without an indexer, a decode-graph small step leaves the Q norm to the small-M Q-B kernel:
+    no separate norm runs, no normalized latent is returned, and Q matches the plain path."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Layout
+    from tensorrt_llm._torch.autotuner import AutoTuner
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+
+    torch.manual_seed(951)
+    model, _ = _native_model(
+        layout=CSA2Layout((0,), (), (), index_topk=32), q_lora_rank=1280, hidden_size=5120
+    )
+    assert model.layer.mode == CSA2Mode.SWA
+    with flashinfer_mxfp8_decode_graph_capture():
+        if not model._lowm_projects(model.wq_b, rows):
+            pytest.skip("The small-M kernel runs on SM100/SM103")
+    x = torch.randn(rows, 5120, dtype=torch.bfloat16, device="cuda")
+    for linear in (model.wq_a, model.wq_b, model.wkv):
+        linear.quant_method.tune_mxfp8_backends = True
+    AutoTuner.get().clear_cache()
+    norms = []
+    norm = projection.rms_norm_mxfp8
+    monkeypatch.setattr(
+        projection,
+        "rms_norm_mxfp8",
+        lambda *args, **kwargs: norms.append(1) or norm(*args, **kwargs),
+    )
+    with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_autotune():
+            model._project_query_and_swa(x, decode_only=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qr, q, _ = model._project_query_and_swa(x, decode_only=True)
+    assert qr is None and not norms
+    x.normal_()
+    graph.replay()
+    expected = model.wq_b(model.q_norm(model.wq_a(x)))
+    # BF16 versus MXFP8 activations.
+    torch.testing.assert_close(
+        q.float(), expected.float(), rtol=0, atol=5e-2 * expected.abs().max().item()
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "block,path",
+    [(32, "native"), (128, "fp8_bmm"), (128, "small_m"), (128, "mxfp8"), (128, "mxfp8_latent")],
+)
+@torch.inference_mode()
+def test_native_grouped_output_paths_and_replay(monkeypatch, block, path):
     torch.manual_seed(944)
     model, weights = _native_model(grouped_block=block)
+    assert (model._o_a_mxfp8_scale is not None) == (block == 128)
+    model._small_m_projection = path == "small_m"
+    if path == "fp8_bmm":
+        model._o_a_mxfp8_scale = None
+    # Without a TP reduction O-B takes the latent quantized by the O-A epilogue.
+    model.o_b_proj.reduce_output = path != "mxfp8_latent"
     names = ("mxfp8_mxfp8_gemm", "fused_inv_rope_fp8_quant_vllm_port", "cute_dsl_fp8_bmm_blackwell")
     calls = []
     for name in names:
@@ -693,9 +880,30 @@ def test_native_grouped_output_paths_and_replay(monkeypatch, block):
     positions = torch.tensor([1, 5, 11], dtype=torch.int32, device="cuda")
     for _ in range(3):
         model._project_output(values.clone(), positions)
-    if block == 128:
+    if path in ("small_m", "mxfp8", "mxfp8_latent"):
+        assert "fused_inv_rope_fp8_quant_vllm_port" not in calls
+        assert "cute_dsl_fp8_bmm_blackwell" not in calls
+    elif block == 128:
         assert "fused_inv_rope_fp8_quant_vllm_port" in calls
         assert "cute_dsl_fp8_bmm_blackwell" in calls
+        # The fused context kernel's FP8 projection input replaces the separate quantizer exactly.
+        prequantized = torch.ops.trtllm.fused_inv_rope_fp8_quant_vllm_port(
+            values,
+            positions,
+            model.inverse_rotary_emb.rotary_cos_sin,
+            2,
+            4,
+            448,
+            64,
+            128,
+            model.inverse_rotary_emb.is_neox,
+        )
+        torch.testing.assert_close(
+            model._project_output(values.clone(), positions, prequantized=prequantized),
+            model._project_output(values.clone(), positions),
+            atol=0,
+            rtol=0,
+        )
     else:
         assert "fused_inv_rope_fp8_quant_vllm_port" not in calls
         assert len(calls) == 9  # two grouped GEMMs plus O-B each time
@@ -783,6 +991,7 @@ def test_fused_native_index_q_and_graph(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @torch.inference_mode()
 def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module as csa2_module
     from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
     from tensorrt_llm._torch.metadata import KVCacheParams
 
@@ -790,10 +999,17 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
     manager, request = module_cache
     stream = torch.cuda.Stream()
     model, _ = _native_model(aux_stream=stream, layout=manager.layout)
-    enabled = [False]
+    enabled = [True]
     monkeypatch.setattr(
         "tensorrt_llm._torch.attention.backends.sparse.csa2.module.do_multi_stream",
         lambda: enabled[0],
+    )
+    side_streams = []
+    side_stream = csa2_module.csa2_side_stream
+    monkeypatch.setattr(
+        csa2_module,
+        "csa2_side_stream",
+        lambda device, index=0: side_streams.append(index) or side_stream(device, index),
     )
     metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
     metadata.request_ids = [request.py_request_id]
@@ -806,6 +1022,9 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
     metadata.prepare()
     model(hidden, metadata.csa2_positions, metadata)
+    # A forward with context tokens keeps its index weights on the auxiliary stream.
+    assert not side_streams
+    enabled[0] = False
     metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[1])
     metadata.num_contexts = 0
     metadata.is_cuda_graph = True
@@ -822,6 +1041,8 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
     for _ in range(3):
         parallel = run()
     torch.testing.assert_close(parallel, serial, atol=0, rtol=0)
+    # Index weights and paged descriptors each take a side stream in forwards without context.
+    assert set(side_streams) == {0, 1}
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run()
@@ -833,6 +1054,248 @@ def test_native_module_auxiliary_stream_and_graph(monkeypatch, module_cache):
         expected = run()
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
         enabled[0] = True
+    torch.cuda.synchronize()
+
+    # Advancing decode positions, overlapped first (no forward wrote their rows yet) with the
+    # descriptor stream held back, then serially: a cache write that read a step's SWA slots
+    # before their refresh would land on the previous step's row.
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.indexer import CSA2Indexer
+
+    prepare_descriptors = CSA2Indexer.prepare_paged_descriptors
+
+    def delayed_descriptors(self, *args):
+        torch.cuda._sleep(1 << 26)
+        prepare_descriptors(self, *args)
+
+    monkeypatch.setattr(CSA2Indexer, "prepare_paged_descriptors", delayed_descriptors)
+    steps = [(cached, torch.randn_like(hidden)) for cached in (2, 3)]
+    outputs = {}
+    for overlap in (True, False):
+        enabled[0] = overlap
+        for cached, step_hidden in steps:
+            metadata.kv_cache_params = KVCacheParams(
+                use_cache=True, num_cached_tokens_per_seq=[cached]
+            )
+            metadata.prepare()
+            metadata.reset_routing()
+            output = model(step_hidden, metadata.csa2_positions, metadata).clone()
+            outputs.setdefault(cached, []).append(output)
+    for cached, (parallel, serial) in outputs.items():
+        torch.testing.assert_close(parallel, serial, atol=0, rtol=0, msg=f"{cached} cached tokens")
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("module_cache", [2], indirect=True)
+@pytest.mark.parametrize("overlap", [True])
+@torch.inference_mode()
+def test_small_step_query_amax_word_decode_and_graph(monkeypatch, module_cache, overlap):
+    """A small step's query RoPE raises Q's amax word; staging waits for it only to finalize."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import kernel
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+
+    # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
+    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
+    torch.manual_seed(949)
+    manager, request = module_cache
+    model, _ = _native_model(
+        aux_stream=torch.cuda.Stream() if overlap else None,
+        layout=manager.layout,
+        kv_cache_dtype="fp8",
+    )
+    assert model.backend.native_fp8
+    for linear in (model.wq_a, model.wq_b, model.wkv):
+        linear.quant_method.tune_mxfp8_backends = True
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.attention.backends.sparse.csa2.module.do_multi_stream", lambda: overlap
+    )
+    words = []
+    original = kernel.derive_stage_kv_scales
+
+    def spy(*args, **kwargs):
+        words.append(kwargs.get("q_word") is not None)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "derive_stage_kv_scales", spy)
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id]
+    metadata.num_contexts = 1
+    metadata.prompt_lens = [4]
+    metadata.seq_lens = torch.tensor([1], dtype=torch.int32, device="cpu")
+    hidden = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
+    metadata.prepare()
+    model(hidden, metadata.csa2_positions, metadata)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[1])
+    metadata.num_contexts = 0
+    metadata.is_cuda_graph = True
+    metadata.prepare()
+    positions = metadata.csa2_positions
+
+    def run(word):
+        monkeypatch.setattr(model, "_stages_native_fp8_generation", lambda attn_metadata: word)
+        metadata.reset_routing()
+        return model(hidden, positions, metadata)
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_autotune():
+            run(False)
+        for _ in range(2):
+            hidden.normal_()
+            words.clear()
+            expected = run(False)
+            assert words == [False]
+            words.clear()
+            actual = run(True)
+            assert words == [True]
+            assert model._fp8_q_word.item() == 0
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(True)
+        for sign in (-1.0, 1.0):
+            hidden.mul_(sign)
+            graph.replay()
+            actual = captured.clone()
+            expected = run(False)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.cuda.synchronize()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("overlap,module_cache", [(True, 0), (False, 2)], indirect=["module_cache"])
+@torch.inference_mode()
+def test_fp8_query_projection_decode_and_graph(monkeypatch, module_cache, overlap):
+    """Decode Q projected straight to E4M3 matches staging's own BF16 Q quantization.
+
+    An overlapped SWA step reduces the selected rows before waiting for Q-B and waits only
+    to finalize the staging scale; the native staging launch rescales the E4M3 Q itself.
+    Overlapped steps normalize Q on the QKV-A stream and run only Q-B on the auxiliary one.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import (
+        kernel,
+        projection,
+        query_projection,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.backend import CSA2TrtllmAttention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm._torch.modules.linear import (
+        flashinfer_mxfp8_autotune,
+        flashinfer_mxfp8_decode_graph_capture,
+    )
+    from tensorrt_llm._torch.modules.multi_stream_utils import private_stream
+
+    # FP8 staging path: keep the direct decode, which takes <= 16-row generation tiles, out.
+    monkeypatch.setattr(CSA2TrtllmAttention, "direct_decode_serves", lambda *args: False)
+    torch.manual_seed(948)
+    manager, request = module_cache
+    model, _ = _native_model(
+        aux_stream=torch.cuda.Stream() if overlap else None,
+        layout=manager.layout,
+        kv_cache_dtype="fp8",
+    )
+    assert model.backend.native_fp8
+    model._fp8_q_min_tokens = 1
+    # The BF16 comparison Q comes from the same MXFP8 GEMM, not the small-M kernel.
+    monkeypatch.setattr(model, "_lowm_projects", lambda linear, rows: False)
+    for linear in (model.wq_a, model.wq_b, model.wkv):
+        linear.quant_method.tune_mxfp8_backends = True
+    for owner in ("module", "backend"):
+        monkeypatch.setattr(
+            f"tensorrt_llm._torch.attention.backends.sparse.csa2.{owner}.do_multi_stream",
+            lambda: overlap,
+        )
+    calls = []
+    streams = []
+    query_streams = []
+    for owner, name in (
+        (query_projection, "fp8_query_gemm"),
+        (kernel, "quantize_stage_query"),
+        (query_projection, "rescale_fp8_query"),
+        (projection, "rms_norm_mxfp8"),
+    ):
+
+        def spy(*args, _original=getattr(owner, name), _name=name, **kwargs):
+            stream = torch.cuda.current_stream().cuda_stream
+            if _name in ("fp8_query_gemm", "rms_norm_mxfp8"):
+                query_streams.append((_name, stream))
+            else:
+                streams.append(stream)
+            if _name != "rms_norm_mxfp8":
+                calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, spy)
+    side = private_stream(torch.cuda.current_device(), "csa2_query").cuda_stream
+    late = []
+    derive = kernel.derive_stage_kv_scales
+
+    def derive_spy(*args, **kwargs):
+        late.append(kwargs.get("q_ready") is not None)
+        return derive(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "derive_stage_kv_scales", derive_spy)
+    metadata = CSA2TrtllmMetadata(max_num_requests=1, max_num_tokens=8, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id]
+    metadata.num_contexts = 1
+    metadata.prompt_lens = [4]
+    metadata.seq_lens = torch.tensor([1], dtype=torch.int32, device="cpu")
+    hidden = torch.randn(1, 128, device="cuda", dtype=torch.bfloat16)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
+    metadata.prepare()
+    model(hidden, metadata.csa2_positions, metadata)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[1])
+    metadata.num_contexts = 0
+    metadata.is_cuda_graph = True
+    metadata.prepare()
+    positions = metadata.csa2_positions
+
+    def run(fp8_query):
+        model._fp8_q_projection = fp8_query
+        metadata.reset_routing()
+        return model(hidden, positions, metadata)
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        with flashinfer_mxfp8_autotune():
+            run(False)
+        for _ in range(2):
+            hidden.normal_()
+            calls.clear()
+            streams.clear()
+            expected = run(False)
+            assert calls == ["quantize_stage_query"]
+            calls.clear()
+            late.clear()
+            query_streams.clear()
+            actual = run(True)
+            assert calls == ["fp8_query_gemm"]
+            assert late == [overlap and model.layer.mode == CSA2Mode.SWA]
+            # Under multi-stream graphs Q's quantization runs on the side stream beside the row
+            # staging.
+            current = torch.cuda.current_stream().cuda_stream
+            assert streams == [side if overlap else current]
+            # The Q norm stays on the QKV-A stream and only Q-B runs on the auxiliary one.
+            auxiliary = model.aux_stream.cuda_stream if overlap else current
+            assert query_streams == [("rms_norm_mxfp8", current), ("fp8_query_gemm", auxiliary)]
+            assert model._fp8_q_word.item() == 0
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run(True)
+        for sign in (-1.0, 1.0):
+            hidden.mul_(sign)
+            graph.replay()
+            actual = captured.clone()
+            expected = run(False)
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.cuda.synchronize()
 
 
@@ -914,6 +1377,124 @@ def test_large_index_q_uses_unfused_native_path(monkeypatch, tokens):
 
 @skip_pre_blackwell
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("ratio", [1, 2])
+@torch.inference_mode()
+def test_fused_compression_step_matches_native(monkeypatch, ratio):
+    """Steps of two requests through the one-launch compression leave the paged state the native
+    kernel leaves and match its latents and index K."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import (
+        CSA2CompressionBatch,
+        CSA2Compressor,
+    )
+
+    torch.manual_seed(2604)
+    hidden, width, page_size, pages = 256, 512, 4, 16
+    with torch.device("cuda"):
+        compressor = CSA2Compressor(hidden, width, ratio, 1e-6)
+        index_wk = nn.Linear(width, 128, bias=False, dtype=torch.bfloat16)
+        for parameter in (*compressor.parameters(), *index_wk.parameters()):
+            parameter.normal_(std=0.05)
+        compressor.norm.weight.normal_(1.0, 0.2)
+        native = [torch.randn(pages, page_size, width) for _ in range(2)]
+        fused = [pool.clone() for pool in native]
+        kv_pages, score_pages = (torch.randperm(pages).int().view(2, 8) for _ in range(2))
+
+    def ints(values):
+        return torch.tensor(values, device="cuda", dtype=torch.int32)
+
+    fuses = CSA2Compressor._fuses
+    starts = [0, 0]
+    # Odd and even starts: windows of two new positions and windows completing a cached one.
+    for lengths in ((3, 1), (1, 5), (2, 2), (6, 3), (1, 1)):
+        x = torch.randn(sum(lengths), hidden, device="cuda", dtype=torch.bfloat16)
+        ends = [start + length for start, length in zip(starts, lengths)]
+        windows = [end // 2 - start // 2 for start, end in zip(starts, ends)]
+
+        def batch(pools):
+            if ratio == 1:
+                return None
+            return CSA2CompressionBatch(
+                *pools,
+                kv_pages,
+                score_pages,
+                ints(ends),
+                ints(starts),
+                ints([0, lengths[0], sum(lengths)]),
+                ints([0, windows[0], sum(windows)]),
+                sum(lengths),
+                page_size,
+                max(-(-length // 2) for length in lengths),
+            )
+
+        monkeypatch.setattr(CSA2Compressor, "_fuses", lambda *args: False)
+        latent_ref, index_ref = compressor.project(x, batch(native), index_wk)
+        monkeypatch.setattr(CSA2Compressor, "_fuses", fuses)
+        assert compressor._fuses(x, batch(fused), index_wk.weight)
+        latent, index_k = compressor.project(x, batch(fused), index_wk)
+        for pool, pool_ref in zip(fused, native):
+            torch.testing.assert_close(pool, pool_ref, atol=0, rtol=0)
+        # The norm's parallel FP32 reduction can move a value across one BF16 boundary.
+        torch.testing.assert_close(latent, latent_ref, atol=0, rtol=1 / 128)
+        torch.testing.assert_close(index_k, index_wk(latent), atol=1e-3, rtol=1 / 128)
+        starts = ends
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [6, 64])
+@torch.inference_mode()
+def test_decode_index_source_projections_match_cublas(monkeypatch, rows):
+    """Decode-graph steps of up to 64 rows run the compressor and index head-weight projections on
+    the small-M kernel and match the cuBLAS projections to BF16 rounding; other forwards keep
+    cuBLAS."""
+    from tensorrt_llm._torch.modules import low_m_gemm
+    from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_decode_graph_capture
+
+    if not low_m_gemm.lowm_fp8_supported():
+        pytest.skip("The small-M kernel runs on SM100/SM103")
+    torch.manual_seed(2605)
+    model, _ = _native_model(q_lora_rank=1280, hidden_size=5120)
+    calls = []
+    lowm = low_m_gemm.bf16_lowm_linear
+
+    def spy(x, weight, *args, **kwargs):
+        calls.append(tuple(weight.shape))
+        return lowm(x, weight, *args, **kwargs)
+
+    monkeypatch.setattr(low_m_gemm, "bf16_lowm_linear", spy)
+    x = torch.randn(rows, 5120, device="cuda", dtype=torch.bfloat16)
+
+    def project():
+        latent, index_k = model.compressor.project(x, None, model.index_wk)
+        return latent, index_k, model._project_index_weights(x)
+
+    project()
+    assert not calls
+    with flashinfer_mxfp8_decode_graph_capture():
+        latent, index_k, weights = project()
+    small_m = set(calls)
+    calls.clear()
+    expected_latent = model.compressor.norm(model.compressor.wkv(x))
+    expected_index_k = model.index_wk(expected_latent)
+    expected_weights = model.index_weights_proj(x).float() * model._index_weight_scale
+    assert not calls
+    assert small_m == {
+        tuple(model.compressor.wkv.weight.shape),
+        tuple(model.index_weights_proj.weight.shape),
+    }
+    # FP32 sums in another order than cuBLAS's, each rounded once to BF16.
+    for actual, expected in (
+        (latent, expected_latent),
+        (index_k, expected_index_k),
+        (weights, expected_weights),
+    ):
+        torch.testing.assert_close(
+            actual.float(), expected.float(), rtol=0, atol=1e-2 * expected.abs().max().item()
+        )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("width", [128, 512, 1280])
 @torch.inference_mode()
 def test_rms_norm_native_single_rounding(monkeypatch, width):
@@ -946,6 +1527,20 @@ def test_rms_norm_native_single_rounding(monkeypatch, width):
     ).bfloat16()
     # Parallel FP32 reduction/rsqrt can move a value across one BF16 boundary.
     torch.testing.assert_close(norm(x), reference, atol=0, rtol=1 / 128)
+    if width == 1280 and torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import rms_norm_mxfp8
+
+        for values in (x, torch.zeros_like(x), x.repeat(1, 2)[:, :width]):
+            normalized, quantized, scales = rms_norm_mxfp8(values, weight, 1e-20)
+            torch.testing.assert_close(normalized, norm(values), atol=0, rtol=1 / 128)
+            ref_quantized, ref_scales = torch.ops.trtllm.mxfp8_quantize(normalized, True)
+            torch.testing.assert_close(
+                quantized.view(torch.uint8), ref_quantized.view(torch.uint8), atol=0, rtol=0
+            )
+            rows = torch.arange(3, device="cuda")[:, None]
+            blocks = torch.arange(width // 32, device="cuda")[None, :]
+            offsets = blocks // 4 * 512 + rows * 16 + blocks % 4
+            torch.testing.assert_close(scales[offsets], ref_scales[offsets], atol=0, rtol=0)
 
 
 @skip_pre_blackwell
@@ -1100,6 +1695,7 @@ def test_two_rank_module_projection_parity(monkeypatch, quantization):
             vocab_size=128,
             layout=layout,
         )
+        assert not manager._encoder_replay_enabled
         request = LlmRequest(
             request_id=953,
             max_new_tokens=1,
@@ -1315,13 +1911,13 @@ def test_encoder_bounded_replay_preserves_global_and_truncates_swa(
     replay = hidden[1:8].clone()
     replay[:4].add_(0.125)  # model-layer replay inputs may be approximate
     seen = []
-    compressor = model.compressor.forward
+    project = model.compressor.project
 
-    def observe(x, batch=None):
+    def observe(x, batch, index_wk):
         seen.append(x.clone())
-        return compressor(x, batch)
+        return project(x, batch, index_wk)
 
-    monkeypatch.setattr(model.compressor, "forward", observe)
+    monkeypatch.setattr(model.compressor, "project", observe)
     _prepare_replay_step(metadata, 1, 8, cached=5)
     actual = model(replay, metadata.csa2_positions, metadata)
     assert len(seen) == 1 and seen[0].shape[0] == 4
@@ -1367,7 +1963,8 @@ def test_pure_replay_skips_global_projection_and_restores_odd_state(
     if ratio == 2:
         for role in (CSA2CacheRole.COMPRESSOR_KV, CSA2CacheRole.COMPRESSOR_SCORE):
             manager.get_buffers(0, role).fill_(float("nan"))
-    start = max(cached - 4, 0)
+    # Decoder replay starts at its bounded-replay window, not at the SWA window.
+    start = manager.get_swa_replay_ranges([cached], decoder=decoder)[0][0]
     replay = hidden[start:cached].clone().add_(0.125)
     counts = []
     projection = model.compressor.wkv_gate if ratio == 2 else model.compressor.wkv
@@ -1554,13 +2151,32 @@ def test_checkpoint_owned_config_and_cache_factory():
     )
     config = TypeAdapter(SparseAttentionConfig).validate_python({"algorithm": "csa2"})
     assert isinstance(config, CSA2SparseAttentionConfig)
-    # The config carries no geometry: only the selector plus opt-in knobs, and
+    # The config carries no geometry: only the selector plus runtime knobs, and
     # staging stays unset so the backend decides it from its own support.
-    assert config.model_dump() == {"algorithm": "csa2", "use_fp8_staging": None}
+    expected = {
+        "algorithm": "csa2",
+        "use_fp8_staging": None,
+        "indexer_max_chunk_size": None,
+        "q_split_threshold": 8192,
+        "skip_indexer_for_short_seqs": True,
+        "use_cute_dsl_topk": True,
+        "use_cute_dsl_paged_mqa_logits": False,
+        "enable_heuristic_topk": False,
+        "use_self_sampling_topk": True,
+        "use_gvr_emission": False,
+    }
+    assert {key: config.model_dump()[key] for key in expected} == expected
+    assert not config.needs_separate_short_long_cuda_graphs()
     lowered = config.to_sparse_params(pretrained_config={"text_config": text})
     metadata = config.to_sparse_metadata_params(pretrained_config=SimpleNamespace(**text))
     assert lowered.layout == metadata.layout
     assert lowered.use_fp8_staging is None
+    tuned = CSA2SparseAttentionConfig(
+        indexer_max_chunk_size=4096, q_split_threshold=-1, use_cute_dsl_topk=False
+    )
+    assert not tuned.to_sparse_params(pretrained_config={"text_config": text}).use_cute_dsl_topk
+    tuned_metadata = tuned.to_sparse_metadata_params(pretrained_config=SimpleNamespace(**text))
+    assert (tuned_metadata.indexer_max_chunk_size, tuned_metadata.q_split_threshold) == (4096, -1)
     assert metadata.layout.compress_ratios == (0, 2, 2, 1)
     assert get_sparse_attn_kv_cache_manager(config) is CSA2CacheManager
     assert config.supports_backend("pytorch")
@@ -1980,3 +2596,961 @@ def test_hf_factory_selects_native_fp8_for_both_fp8_cache_spellings():
         assert model.backend.native_fp8 is fp8
         assert model.backend.staging_dtype == (torch.float8_e4m3fn if fp8 else torch.bfloat16)
         assert model.backend.has_fp8_kv_cache == fp8
+
+
+@pytest.fixture
+def fused_context_cache(request):
+    """Manager with SWA-only, Full and Reuse layers (index_topk 512) and four requests to prefill."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings import DataType, SamplingConfig
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    ratio = request.param
+    layout = CSA2Layout((0, ratio, ratio), (1,), (1,), index_topk=512, window_size=128)
+    manager = CSA2CacheManager(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=16384,
+            enable_swa_scratch_reuse=True,
+            dtype="fp8",
+        ),
+        CacheType.SELFKONLY,
+        layout=layout,
+        num_layers=3,
+        tokens_per_block=128,
+        mapping=Mapping(),
+        max_seq_len=4096,
+        max_batch_size=4,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        dtype=DataType.BF16,
+        vocab_size=1024,
+    )
+    requests = []
+    for request_id, length in zip((21, 22, 23, 24), (2300, 1, 640, 129)):
+        llm_request = LlmRequest(
+            request_id=request_id,
+            max_new_tokens=4,
+            input_tokens=list(range(length)),
+            sampling_config=SamplingConfig(),
+            is_streaming=False,
+        )
+        assert manager.prepare_context(llm_request)
+        assert manager.resize_context(llm_request, llm_request.context_chunk_size)
+        requests.append(llm_request)
+    manager._stream.synchronize()
+    yield manager, requests
+    for llm_request in requests:
+        manager.free_resources(llm_request)
+    manager.shutdown()
+
+
+def _fused_context_layers(layout):
+    from tensorrt_llm._torch.attention.backends.interface import (
+        PositionalEmbeddingParams,
+        RopeParams,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.module import DeepseekV41Attention
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.params import CSA2Params
+    from tensorrt_llm.functional import PositionEmbeddingType
+
+    torch.manual_seed(77)
+    layers = []
+    with torch.device("cuda"):
+        for layer_idx in range(len(layout.compress_ratios)):
+            model = DeepseekV41Attention(
+                layout,
+                layer_idx,
+                PositionalEmbeddingParams(
+                    type=PositionEmbeddingType.rope_gptj,
+                    rope=RopeParams(dim=64, theta=160000, max_positions=4096),
+                    is_neox=False,
+                ),
+                hidden_size=128,
+                num_heads=64,
+                q_lora_rank=128,
+                o_lora_rank=128,
+                num_groups=8,
+                index_heads=32,
+                sparse_params=CSA2Params(layout=layout),
+                projection_quantization="bf16",
+                kv_cache_dtype="fp8",
+            )
+            for name, parameter in model.named_parameters():
+                if name.endswith("norm.weight"):
+                    parameter.data.fill_(1.0)
+                elif parameter.dtype.is_floating_point:
+                    parameter.data.copy_(torch.randn_like(parameter, dtype=torch.float32) * 0.05)
+            model.attn_sink.data.normal_()
+            layers.append(model)
+    return layers
+
+
+def _prefill_attention(layers, manager, requests, hidden):
+    """One prefill forward through every layer on fresh metadata; returns each layer's attention output."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    metadata = CSA2TrtllmMetadata(max_num_requests=4, max_num_tokens=8192, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id for request in requests]
+    metadata.num_contexts = len(requests)
+    metadata.prompt_lens = [request.prompt_len for request in requests]
+    metadata.seq_lens = torch.tensor(metadata.prompt_lens, dtype=torch.int32)
+    metadata.kv_cache_params = KVCacheParams(
+        use_cache=True, num_cached_tokens_per_seq=[0] * len(requests)
+    )
+    metadata.prepare()
+    attention = []
+    metadata.reset_routing()
+    for model in layers:
+        project = model._project_output
+
+        def capture(output, positions, **kwargs):
+            attention.append(output.clone())
+            return project(output, positions, **kwargs)
+
+        model._project_output = capture
+        try:
+            model(hidden, metadata.csa2_positions, metadata)
+        finally:
+            del model._project_output
+    return attention
+
+
+@skip_no_fused_context
+@pytest.mark.parametrize("fused_context_cache", [1, 2], indirect=True)
+@torch.inference_mode()
+def test_context_prefill_runs_fused_kernel(monkeypatch, fused_context_cache):
+    """A prefill of SWA-only, Full and Reuse layers runs every layer's context tile on the fused
+    kernel and matches the trtllm-gen context FMHA."""
+    manager, requests = fused_context_cache
+    layers = _fused_context_layers(manager.layout)
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 128, device="cuda", dtype=torch.bfloat16
+    )
+    op = torch.ops.trtllm.csa2_sparse_context
+    calls = []
+
+    def record(*args):
+        calls.append(args[1].shape[0])
+        return op(*args)
+
+    monkeypatch.setattr(torch.ops.trtllm, "csa2_sparse_context", record)
+    fused = _prefill_attention(layers, manager, requests, hidden)
+    assert calls == [hidden.shape[0]] * len(layers)
+    for model in layers:
+        model.backend.fused_context = False
+    reference = _prefill_attention(layers, manager, requests, hidden)
+    assert len(calls) == len(layers)
+    for actual, expected in zip(fused, reference, strict=True):
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error <= 1e-3
+
+
+@pytest.fixture
+def long_chunk_cache():
+    """Manager with SWA-only and ratio-2 layers and one request prefilled as a single 65536-token chunk."""
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+    from tensorrt_llm.bindings import DataType, SamplingConfig
+    from tensorrt_llm.bindings.internal.batch_manager import CacheType
+    from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+    from tensorrt_llm.mapping import Mapping
+
+    length = 65536
+    layout = CSA2Layout((0, 2, 2), (1,), (1,), index_topk=512, window_size=128)
+    manager = CSA2CacheManager(
+        KvCacheConfig(
+            enable_block_reuse=False,
+            max_tokens=length + 1024,
+            enable_swa_scratch_reuse=True,
+            dtype="fp8",
+        ),
+        CacheType.SELFKONLY,
+        layout=layout,
+        num_layers=3,
+        tokens_per_block=128,
+        mapping=Mapping(),
+        max_seq_len=length + 128,
+        max_batch_size=1,
+        max_input_len=length,
+        max_num_tokens=length,
+        dtype=DataType.BF16,
+        vocab_size=1024,
+    )
+    llm_request = LlmRequest(
+        request_id=31,
+        max_new_tokens=4,
+        input_tokens=[token % 1024 for token in range(length)],
+        sampling_config=SamplingConfig(),
+        is_streaming=False,
+    )
+    assert manager.prepare_context(llm_request)
+    assert manager.resize_context(llm_request, llm_request.context_chunk_size)
+    manager._stream.synchronize()
+    yield manager, llm_request
+    manager.free_resources(llm_request)
+    manager.shutdown()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_ratio2_compression_of_a_long_chunk(long_chunk_cache):
+    """A 65536-token chunk, more tokens than CUDA grid rows, compresses through its prefill metadata
+    like the reference pooling."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.compressor import CSA2Compressor
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    manager, request = long_chunk_cache
+    length = request.prompt_len
+    metadata = CSA2TrtllmMetadata(
+        max_num_requests=1, max_num_tokens=length, kv_cache_manager=manager
+    )
+    metadata.request_ids = [request.py_request_id]
+    metadata.num_contexts = 1
+    metadata.prompt_lens = [length]
+    metadata.seq_lens = torch.tensor([length], dtype=torch.int32)
+    metadata.kv_cache_params = KVCacheParams(use_cache=True, num_cached_tokens_per_seq=[0])
+    metadata.prepare()
+    torch.manual_seed(733)
+    with torch.device("cuda"):
+        compressor = CSA2Compressor(128, 512, 2, 1e-6)
+    compressor.wkv_gate.weight.data.copy_(torch.randn_like(compressor.wkv_gate.weight) * 0.05)
+    compressor.norm.weight.data.fill_(1.0)
+    hidden = torch.randn(length, 128, device="cuda", dtype=torch.bfloat16)
+    latent = compressor(hidden, metadata.get_compression_batch(1))
+    expected = compressor.norm(_reference(compressor.wkv_gate(hidden).float(), 2, 512))
+    torch.testing.assert_close(latent[: length // 2], expected, atol=0.016, rtol=0.008)
+    assert not latent[length // 2 :].any()
+
+
+def _native_context_layers(layout, kv_cache_dtype="fp8", weights=None):
+    """Native MXFP8 layers with 64 heads and grouped 128-block O-A, one per layout layer.
+
+    Returns the layers and their checkpoint weights; ``weights`` loads given ones instead.
+    """
+    layers, checkpoints = [], []
+    for layer_idx in range(len(layout.compress_ratios)):
+        model, checkpoint = _native_model(
+            layout=layout,
+            layer_idx=layer_idx,
+            attention_heads=64,
+            num_groups=8,
+            grouped_block=128,
+            kv_cache_dtype=kv_cache_dtype,
+            max_positions=4096,
+            hidden_size=256,
+        )
+        if weights is not None:
+            checkpoint = weights[layer_idx]
+            model.load_hf_weights(checkpoint)
+        layers.append(model)
+        checkpoints.append(checkpoint)
+    return layers, checkpoints
+
+
+def _prefill_outputs(layers, manager, requests, hidden):
+    """One prefill forward through every layer on fresh metadata; returns each layer's output."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.metadata import CSA2TrtllmMetadata
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    metadata = CSA2TrtllmMetadata(max_num_requests=4, max_num_tokens=8192, kv_cache_manager=manager)
+    metadata.request_ids = [request.py_request_id for request in requests]
+    metadata.num_contexts = len(requests)
+    metadata.prompt_lens = [request.prompt_len for request in requests]
+    metadata.seq_lens = torch.tensor(metadata.prompt_lens, dtype=torch.int32)
+    metadata.kv_cache_params = KVCacheParams(
+        use_cache=True, num_cached_tokens_per_seq=[0] * len(requests)
+    )
+    metadata.prepare()
+    metadata.reset_routing()
+    return [model(hidden, metadata.csa2_positions, metadata) for model in layers]
+
+
+@skip_no_fused_context
+@pytest.mark.parametrize("fused_context_cache", [2], indirect=True)
+@pytest.mark.parametrize("kv_magnitude", [1.0, 1024.0])
+@torch.inference_mode()
+def test_context_query_stays_unit_scale_fp8(monkeypatch, fused_context_cache, kv_magnitude):
+    """A context-only prefill on the fused kernel projects Q to unit-scale E4M3 only.
+
+    BMM1 then takes the staged KV scale alone and the KV range is no longer capped by
+    Q. With unit staging scales this is byte-identical to the BF16 Q plus fixup path;
+    with KV beyond the E4M3 range it is closer to BF16 staging than that path.
+    """
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import query_projection
+
+    manager, requests = fused_context_cache
+    torch.manual_seed(79)
+    layers, weights = _native_context_layers(manager.layout)
+    # BF16 staging of the same weights is the higher-precision reference.
+    reference_layers, _ = _native_context_layers(manager.layout, "auto", weights)
+    for model, reference in zip(layers, reference_layers, strict=True):
+        assert model.backend.fused_context and not reference.backend.native_fp8
+        for norm in (model.kv_norm, reference.kv_norm):
+            norm.weight.data.fill_(kv_magnitude)
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    calls = []
+    for name in ("fp8_query_gemm", "query_gemm_rope", "fixup_fp8_query"):
+
+        def spy(*args, _original=getattr(query_projection, name), _name=name, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(query_projection, name, spy)
+    unit = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == ["fp8_query_gemm"] * len(layers)
+    calls.clear()
+    for model in layers:
+        model._unit_scale_context_query = False
+    scaled = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == ["query_gemm_rope", "fixup_fp8_query"] * len(layers)
+    reference = _prefill_outputs(reference_layers, manager, requests, hidden)
+    for actual, previous, expected in zip(unit, scaled, reference, strict=True):
+        assert torch.isfinite(actual).all()
+        if kv_magnitude == 1.0:
+            torch.testing.assert_close(actual, previous, atol=0, rtol=0)
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        previous_error = (previous.float() - expected.float()).norm() / expected.float().norm()
+        assert error <= max(previous_error * 1.01, 0.02), (error, previous_error)
+
+
+@skip_no_fused_context
+@pytest.mark.parametrize("fused_context_cache", [2], indirect=True)
+@torch.inference_mode()
+def test_context_output_projection_quantizes_o_b_input(monkeypatch, fused_context_cache):
+    """The fused context kernel's E4M3 output reaches O-B through one block-128 O-A GEMM whose
+    epilogue writes O-B's MXFP8 input, and O-B runs on the persistent CuTe DSL GEMM; the
+    outputs equal BF16 O-A, quantization and the native O-B GEMM."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+
+    manager, requests = fused_context_cache
+    torch.manual_seed(83)
+    layers, _ = _native_context_layers(manager.layout)
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    calls = []
+    for name in ("grouped_output_block128_mxfp8", "dense_mxfp8_gemm"):
+
+        def spy(*args, _original=getattr(projection, name), _name=name, **kwargs):
+            calls.append((_name, args[0].shape))
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(projection, name, spy)
+    fused = _prefill_outputs(layers, manager, requests, hidden)
+    assert calls == [
+        ("grouped_output_block128_mxfp8", (8, hidden.shape[0], 8 * 512)),
+        ("dense_mxfp8_gemm", (hidden.shape[0], 8 * 128)),
+    ] * len(layers)
+    calls.clear()
+    for model in layers:
+        model._fuse_o_a_mxfp8 = False
+    separate = _prefill_outputs(layers, manager, requests, hidden)
+    assert not calls
+    for actual, expected in zip(fused, separate, strict=True):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@skip_no_fused_context
+@pytest.mark.parametrize("fused_context_cache", [2], indirect=True)
+@torch.inference_mode()
+def test_context_o_a_input_workspace_matches_fresh_buffers(monkeypatch, fused_context_cache):
+    """The fused context kernel's O-A input lives in one workspace per device and stream, holding
+    stale bytes of a larger earlier forward; the layer outputs equal those from fresh buffers."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import module
+
+    manager, requests = fused_context_cache
+    torch.manual_seed(89)
+    layers, _ = _native_context_layers(manager.layout)
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    module._O_A_INPUT_WORKSPACES.clear()
+    data, scale = module._o_a_input_buffers(hidden.device, 8, 2 * hidden.shape[0], 4096)
+    data.view(torch.uint8).fill_(0x7F)
+    scale.fill_(float("nan"))
+    shared = _prefill_outputs(layers, manager, requests, hidden)
+    assert len(module._O_A_INPUT_WORKSPACES) == 1
+
+    def fresh(device, groups, rows, width):
+        return (
+            torch.full((groups, rows, width), 0x7F, dtype=torch.uint8, device=device).view(
+                torch.float8_e4m3fn
+            ),
+            torch.full((groups, width // 128, (rows + 3) // 4 * 4), float("nan"), device=device),
+        )
+
+    monkeypatch.setattr(module, "_o_a_input_buffers", fresh)
+    separate = _prefill_outputs(layers, manager, requests, hidden)
+    for actual, expected in zip(shared, separate, strict=True):
+        assert torch.isfinite(actual).all()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@skip_no_fused_context
+@pytest.mark.parametrize("fused_context_cache", [2], indirect=True)
+@torch.inference_mode()
+def test_context_index_q_reads_mxfp8_latent(monkeypatch, fused_context_cache):
+    """The fused context Q projection hands the index-Q projection its MXFP8 latent instead of
+    the BF16 one; the index queries are unchanged, and so are the outputs up to the order in
+    which the top-k selection breaks ties between equal index scores."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+
+    manager, requests = fused_context_cache
+    torch.manual_seed(85)
+    layers, _ = _native_context_layers(manager.layout)
+    hidden = torch.randn(
+        sum(request.prompt_len for request in requests), 256, device="cuda", dtype=torch.bfloat16
+    )
+    stored = []
+    original = projection.rms_norm_mxfp8
+
+    def spy(*args, **kwargs):
+        result = original(*args, **kwargs)
+        stored.append(result[0] is not None)
+        return result
+
+    monkeypatch.setattr(projection, "rms_norm_mxfp8", spy)
+    index_queries = []
+    for model in layers:
+        project = model._project_index_q
+
+        def capture(qr, positions, _project=project):
+            result = _project(qr, positions)
+            index_queries.append(None if result[0] is None else result[0].clone())
+            return result
+
+        model._project_index_q = capture
+    latent = _prefill_outputs(layers, manager, requests, hidden)
+    assert stored == [False] * len(layers)
+    stored.clear()
+    for model in layers:
+        model._mxfp8_query_latent = False
+    normalized = _prefill_outputs(layers, manager, requests, hidden)
+    assert stored == [True] * len(layers)
+    half = len(index_queries) // 2
+    assert any(query is not None for query in index_queries[:half])
+    for actual, expected in zip(index_queries[:half], index_queries[half:], strict=True):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    # A tie broken the other way changes one query row's output (about 1e-3 relative).
+    for actual, expected in zip(latent, normalized, strict=True):
+        assert torch.isfinite(actual).all()
+        error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert error <= 1e-2, error
+
+
+def _inverse_rope_reference(output, positions, cos_sin):
+    """FP64 GPT-J inverse RoPE of each 512-channel head's last 64 channels."""
+    rows = output.shape[0]
+    x = output.double().view(rows, -1, 512).clone()
+    tail = x[..., 448:].reshape(rows, -1, 32, 2)
+    trig = cos_sin.double().view(-1, 2, 32)[positions.long()]
+    cosine, sine = trig[:, None, 0, :], trig[:, None, 1, :]
+    even, odd = tail[..., 0].clone(), tail[..., 1].clone()
+    tail[..., 0], tail[..., 1] = even * cosine + odd * sine, odd * cosine - even * sine
+    x[..., 448:] = tail.view(rows, -1, 64)
+    return x
+
+
+def _inverse_rope_o_a_reference(output, positions, cos_sin, weight, scale):
+    """FP64 GPT-J inverse RoPE of each head's last 64 channels, then the block-128 O-A."""
+    rows = output.shape[0]
+    groups, rank, depth = weight.shape
+    x = _inverse_rope_reference(output, positions, cos_sin)
+    dequant = weight.double() * scale.double().repeat_interleave(128, 1).repeat_interleave(128, 2)
+    return torch.einsum("mgd,grd->mgr", x.view(rows, groups, depth), dequant).reshape(rows, -1)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows,groups,heads,split_k", [(6, 1, 8, None), (16, 2, 4, None)])
+@torch.inference_mode()
+def test_small_m_inverse_rope_o_a_matches_reference(rows, groups, heads, split_k):
+    """Fused inverse RoPE + block-128 split-K O-A projection against an FP64 reference."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
+        inverse_rope_block128_small_m,
+    )
+
+    gen = torch.Generator(device="cuda").manual_seed(rows * 7 + groups)
+    rank, depth = 1024, heads * 512
+    weight = (torch.randn(groups, rank, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    scale = torch.rand(groups, rank // 128, depth // 128, device="cuda", generator=gen) * 0.02
+    cos_sin = (torch.rand(512, 2, 32, device="cuda", generator=gen) * 2 - 1).contiguous()
+    output = torch.randn(rows, groups * depth, device="cuda", dtype=torch.bfloat16, generator=gen)
+    positions = torch.randint(0, 512, (rows,), device="cuda", dtype=torch.int32, generator=gen)
+    reference = _inverse_rope_o_a_reference(output, positions, cos_sin, weight, scale)
+    kwargs = {} if split_k is None else {"split_k": split_k}
+    actual = inverse_rope_block128_small_m(
+        output, positions, cos_sin, weight, scale, name="test", **kwargs
+    )
+    # One BF16 rounding of the rotated input plus the BF16 output rounding.
+    bound = reference.abs() * 2**-7 + 2e-3 * reference.abs().max()
+    assert ((actual.double() - reference).abs() <= bound).all()
+    again = inverse_rope_block128_small_m(
+        output, positions, cos_sin, weight, scale, name="test", **kwargs
+    )
+    torch.testing.assert_close(again, actual, atol=0, rtol=0)
+    # The quantized output is mxfp8_quantize of that BF16 output, scale rows past M zero.
+    quantized, scales = inverse_rope_block128_small_m(
+        output, positions, cos_sin, weight, scale, name="test_q", quantize_output=True, **kwargs
+    )
+    expected, expected_scales = torch.ops.trtllm.mxfp8_quantize(actual, True)
+    assert torch.equal(quantized.view(torch.uint8), expected.view(torch.uint8))
+    blocks = groups * rank // 32
+    linear = torch.ops.trtllm.block_scale_interleave_reverse(scales.view(128, blocks))
+    reference_scales = torch.ops.trtllm.block_scale_interleave_reverse(
+        expected_scales.view(-1, blocks)
+    )
+    assert torch.equal(linear[:rows], reference_scales[:rows])
+    assert not linear[rows:].any()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "positions_dtype,rows,heads,depth", [(torch.int32, 6, 64, 512), (torch.int64, 1, 8, 512)]
+)
+@torch.inference_mode()
+def test_small_m_rope_matches_cuda_rope(rows, heads, depth, positions_dtype):
+    """The small-step query RoPE is bit-identical to mla_rope_inplace, graph capture included."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import gptj_rope_small_m
+
+    gen = torch.Generator(device="cuda").manual_seed(rows * 31 + heads)
+    q = (torch.randn(rows, heads, depth, device="cuda", generator=gen) * 4).to(torch.bfloat16)
+    positions = torch.randint(0, 512, (rows,), device="cuda", generator=gen).to(positions_dtype)
+    angle = torch.rand(512, 32, device="cuda", generator=gen) * 6.3
+    cos_sin = torch.stack((angle.cos(), angle.sin()), dim=1).contiguous()
+    expected = q.clone()
+    torch.ops.trtllm.mla_rope_inplace(
+        expected, positions.int(), cos_sin, heads, depth - 64, 64, False, False
+    )
+    actual = q.clone()
+    gptj_rope_small_m(actual, positions, cos_sin)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+    graph = torch.cuda.CUDAGraph()
+    static = q.clone()
+    with torch.cuda.graph(graph):
+        gptj_rope_small_m(static, positions, cos_sin)
+    static.copy_(q)
+    graph.replay()
+    assert torch.equal(static.view(torch.int16), expected.view(torch.int16))
+    # The word rises to the rotated Q's amax bits and keeps a larger earlier value.
+    halves = expected.view(torch.int16).to(torch.int32) & 0x7FFF
+    bits = int(halves.max()) << 16
+    for start, result in ((0, bits), (bits + (1 << 16), bits + (1 << 16))):
+        word = torch.full((1,), start, device="cuda", dtype=torch.int32)
+        raised = q.clone()
+        gptj_rope_small_m(raised, positions, cos_sin, word)
+        assert torch.equal(raised.view(torch.int16), expected.view(torch.int16))
+        assert word.item() == result
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("pdl,rows,width", [(True, 6, 5120), (False, 130, 256)])
+@torch.inference_mode()
+def test_mxfp8_quantize_rows_and_prefetch(monkeypatch, rows, width, pdl):
+    """Row quantization is mxfp8_quantize byte for byte; L2 prefetches change no output."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2 import projection
+
+    monkeypatch.setattr(projection, "_pdl", lambda: pdl)
+    gen = torch.Generator(device="cuda").manual_seed(rows * 13 + width)
+    x = torch.randn(rows, width, device="cuda", generator=gen) * 4
+    x[0, :64] = 0.0
+    x[-1, 32:64] *= 2.0**40
+    x = x.to(torch.bfloat16)
+    weight = (torch.randn(3000, 701, device="cuda", generator=gen) * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.randint(0, 255, (5, 99), device="cuda", dtype=torch.uint8, generator=gen)
+    expected, expected_scales = torch.ops.trtllm.mxfp8_quantize(x, True)
+    for prefetch in ((), (weight,), (weight, scale)):
+        quantized, scales = projection.mxfp8_quantize_rows(x, prefetch=prefetch)
+        assert torch.equal(quantized.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(scales.view(torch.uint8), expected_scales.view(torch.uint8))
+    gamma = (torch.rand(width, device="cuda", generator=gen) + 0.5).to(torch.bfloat16)
+    reference = projection.rms_norm_mxfp8(x, gamma, 1e-6)
+    prefetched = projection.rms_norm_mxfp8(x, gamma, 1e-6, prefetch=(scale, weight))
+    for a, b in zip(reference, prefetched):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    # Without its BF16 output the kernel quantizes the same values.
+    unstored = projection.rms_norm_mxfp8(x, gamma, 1e-6, normalized=False)
+    assert unstored[0] is None
+    for a, b in zip(reference[1:], unstored[1:]):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    with pytest.raises(ValueError):
+        projection.mxfp8_quantize_rows(x, prefetch=(weight.t(),))
+    graph = torch.cuda.CUDAGraph()
+    static = x.clone()
+    with torch.cuda.graph(graph):
+        captured = projection.mxfp8_quantize_rows(static, prefetch=(weight, scale))
+    static.copy_(-x)
+    graph.replay()
+    expected, expected_scales = torch.ops.trtllm.mxfp8_quantize(-x, True)
+    assert torch.equal(captured[0].view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(captured[1].view(torch.uint8), expected_scales.view(torch.uint8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_l2_touch_reads_without_writing():
+    """The L2 touch only reads its ranges, under graph capture too, and rejects bad ranges."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import l2_touch
+
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    weight = (torch.randn(1024, 4100, device="cuda", generator=gen) * 0.5).to(torch.float8_e4m3fn)
+    scale = torch.randint(0, 255, (163840,), device="cuda", dtype=torch.uint8, generator=gen)
+    copies = [weight.clone(), scale.clone()]
+    sink = torch.zeros(64, dtype=torch.int32, device="cuda")
+    l2_touch((weight, scale), sink)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        l2_touch((weight, scale, weight[:3]), sink)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(weight.view(torch.uint8), copies[0].view(torch.uint8))
+    assert torch.equal(scale, copies[1])
+    with pytest.raises(ValueError):
+        l2_touch((weight.t(),), sink)
+    with pytest.raises(ValueError):
+        l2_touch((scale[:3],), sink)
+    with pytest.raises(ValueError):
+        l2_touch((weight, weight, weight, weight), sink)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows,groups,heads", [(6, 1, 8), (16, 2, 8)])
+@torch.inference_mode()
+def test_small_m_warp_mma_o_a_matches_reference(rows, groups, heads):
+    """The small-M kernel's grouped O-A (inverse RoPE on load, FP32 power-of-two block
+    multipliers) against an FP64 reference, eager and replayed."""
+    from tensorrt_llm._torch.modules.low_m_gemm import fp8_grouped_lowm, lowm_fp8_supported
+
+    if not lowm_fp8_supported():
+        pytest.skip("The small-M kernel runs on SM100/SM103")
+    gen = torch.Generator(device="cuda").manual_seed(rows * 11 + groups)
+    rank, depth = 1024, heads * 512
+    weight = (torch.randn(groups, rank, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    exponent = torch.randint(
+        -9, -4, (groups, rank // 128, depth // 128), generator=gen, device="cuda"
+    )
+    scale = torch.exp2(exponent.float())
+    cos_sin = (torch.rand(512, 2, 32, device="cuda", generator=gen) * 2 - 1).contiguous()
+    output = torch.randn(rows, groups * depth, device="cuda", dtype=torch.bfloat16, generator=gen)
+    positions = torch.randint(0, 512, (rows,), device="cuda", dtype=torch.int32, generator=gen)
+
+    def project():
+        return fp8_grouped_lowm(
+            output,
+            weight.view(groups * rank, depth),
+            scale.view(groups * rank // 128, depth // 128),
+            rank,
+            inverse_rope=(positions, cos_sin, 512),
+        )
+
+    def check(actual):
+        reference = _inverse_rope_o_a_reference(output, positions, cos_sin, weight, scale)
+        # One BF16 rounding of the rotated input plus the BF16 output rounding.
+        bound = reference.abs() * 2**-7 + 2e-3 * reference.abs().max()
+        assert ((actual.double() - reference).abs() <= bound).all()
+
+    check(project())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = project()
+    output.normal_(generator=gen)
+    graph.replay()
+    check(captured)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [6, 12])
+@torch.inference_mode()
+def test_decode_graph_output_projection_matches_plain(rows):
+    """Decode-graph O-A -> O-B (the small-M kernel's O-A, its BF16 latent into the small-M O-B)
+    matches an FP32 O-A -> O-B, eager and replayed."""
+    from tensorrt_llm._torch.modules.linear import flashinfer_mxfp8_decode_graph_capture
+
+    torch.manual_seed(1019 + rows)
+    model, weights = _native_model(
+        grouped_block=128, hidden_size=5120, num_groups=1, attention_heads=8, q_lora_rank=1280
+    )
+    output = torch.randn(rows, model.num_heads_tp, 512, device="cuda", dtype=torch.bfloat16)
+    positions = torch.randint(0, 32, (rows,), device="cuda", dtype=torch.int32)
+    with flashinfer_mxfp8_decode_graph_capture():
+        if not (model._lowm_o_a(rows) and model._lowm_projects(model.o_b_proj, rows)):
+            pytest.skip("The small-M kernel runs on SM100/SM103")
+
+    def plain():
+        reference = _inverse_rope_o_a_reference(
+            output.view(rows, -1),
+            positions,
+            model.inverse_rotary_emb.rotary_cos_sin,
+            model.o_a_proj,
+            model.o_a_proj_scale,
+        )
+        return F.linear(reference.float(), weights["wo_b.weight"].float() / 16)
+
+    with flashinfer_mxfp8_decode_graph_capture():
+        eager = model._project_output(output.clone(), positions)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = model._project_output(output, positions)
+    expected = plain()
+    torch.testing.assert_close(
+        eager.float(), expected, rtol=0, atol=2e-2 * expected.abs().max().item()
+    )
+    output.normal_()
+    graph.replay()
+    expected = plain()
+    torch.testing.assert_close(
+        captured.float(), expected, rtol=0, atol=2e-2 * expected.abs().max().item()
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows,columns,depth", [(1, 256, 128)])
+@torch.inference_mode()
+def test_dense_mxfp8_gemm_matches_native(rows, columns, depth):
+    """The persistent CuTe DSL MXFP8 GEMM equals the native CUTLASS GEMM byte for byte."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import dense_mxfp8_gemm
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MXFP8 CuTe DSL GEMMs require SM100/SM103")
+    gen = torch.Generator(device="cuda").manual_seed(rows + columns)
+    x = (torch.randn(rows, depth, device="cuda", generator=gen) * 3).to(torch.bfloat16)
+    activation, activation_scale = torch.ops.trtllm.mxfp8_quantize(x, True)
+    weight = (torch.randn(columns, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.ops.trtllm.block_scale_interleave(
+        torch.randint(
+            118, 124, (columns, depth // 32), device="cuda", dtype=torch.uint8, generator=gen
+        )
+    ).reshape(-1)
+    alpha = torch.ones(1, device="cuda")
+    actual = dense_mxfp8_gemm(activation, activation_scale.view(-1), weight, weight_scale, alpha)
+    expected = torch.ops.trtllm.mxfp8_mxfp8_gemm(
+        activation, activation_scale, weight, weight_scale, alpha, torch.bfloat16
+    )
+    torch.testing.assert_close(actual.view(torch.int16), expected.view(torch.int16), atol=0, rtol=0)
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "rows,groups,heads,rank",
+    [(1, 1, 1, 128), (1000, 8, 8, 1024)],
+)
+@torch.inference_mode()
+def test_grouped_output_block128_mxfp8_matches_bmm_and_reference(rows, groups, heads, rank):
+    """Block-128 O-A with an MXFP8 epilogue: bytes of the blockwise BMM's BF16 output quantized
+    by ``mxfp8_quantize``, and within E4M3 rounding of an FP64 reference."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
+        grouped_output_block128_mxfp8,
+    )
+    from tensorrt_llm._torch.attention.mla import _cute_dsl_fp8_bmm_out
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blockwise CuTe DSL GEMMs require SM100/SM103")
+    gen = torch.Generator(device="cuda").manual_seed(rows * 7 + rank)
+    depth = heads * 512
+    padded = (rows + 3) // 4 * 4
+    data = (torch.randn(groups, rows, depth, device="cuda", generator=gen) * 100).to(
+        torch.float8_e4m3fn
+    )
+    scale = torch.rand(groups, depth // 128, padded, device="cuda", generator=gen) * 0.01 + 1e-4
+    weight = (torch.randn(groups, rank, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.exp2(
+        torch.randint(-10, -5, (groups, rank // 128, depth // 128), device="cuda", generator=gen)
+    ).float()
+    quantized, quantized_scale = grouped_output_block128_mxfp8(data, scale, weight, weight_scale)
+    assert quantized.shape == (rows, groups * rank)
+    # A 2x2 cluster also runs tiles past a group's columns when its tile count is odd; the tile
+    # order is a schedule only.
+    for variant in (
+        dict(cluster=(2, 2)),
+        dict(raster_along_m=True),
+        *([dict(n256=True)] if rank % 256 == 0 else []),
+    ):
+        paired = grouped_output_block128_mxfp8(data, scale, weight, weight_scale, **variant)
+        for actual, expected in zip(paired, (quantized, quantized_scale)):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8)), variant
+
+    latent = torch.empty(rows, groups, rank, device="cuda", dtype=torch.bfloat16)
+    _cute_dsl_fp8_bmm_out(data, weight, scale, weight_scale, latent.transpose(0, 1))
+    expected, expected_scale = torch.ops.trtllm.mxfp8_quantize(latent.view(rows, -1), True)
+    torch.testing.assert_close(
+        quantized.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0
+    )
+    sf_rows = (rows + 127) // 128 * 128
+    unswizzle = torch.ops.trtllm.block_scale_interleave_reverse
+    torch.testing.assert_close(
+        unswizzle(quantized_scale.view(sf_rows, -1)),
+        unswizzle(expected_scale.view(sf_rows, -1)),
+        atol=0,
+        rtol=0,
+    )
+
+    activation = data.double() * scale[..., :rows].double().transpose(1, 2).repeat_interleave(
+        128, 2
+    )
+    dequant = weight.double() * weight_scale.double().repeat_interleave(128, 1).repeat_interleave(
+        128, 2
+    )
+    reference = torch.einsum("gmd,grd->mgr", activation, dequant).reshape(rows, -1)
+    exponent = unswizzle(quantized_scale.view(sf_rows, -1))[:rows].double() - 127
+    actual = quantized.double() * torch.exp2(exponent).repeat_interleave(32, 1)
+    # BF16 rounding, then E4M3 rounding under a power-of-two block scale.
+    bound = (
+        reference.abs() * (2**-8 + 2**-4) + torch.exp2(exponent).repeat_interleave(32, 1) * 2**-9
+    )
+    assert ((actual - reference).abs() <= bound + 1e-5 * reference.abs().max()).all()
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("rows", [4100])
+@torch.inference_mode()
+def test_grouped_output_n256_matches_block128_at_prefill_rows(rows):
+    """The 256x256-tile O-A kernel (the default from 4K rows)
+    writes the 256x128 kernel's bytes, over many persistent waves and a partial last M tile."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
+        grouped_output_block128_mxfp8,
+    )
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blockwise CuTe DSL GEMMs require SM100/SM103")
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    groups, rank, depth = 8, 1024, 4096
+    data = (torch.randn(groups, rows, depth, device="cuda", generator=gen) * 4).to(
+        torch.float8_e4m3fn
+    )
+    scale = torch.rand(groups, depth // 128, (rows + 3) // 4 * 4, device="cuda", generator=gen)
+    weight = (torch.randn(groups, rank, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    weight_scale = torch.exp2(
+        torch.randint(-8, -4, (groups, rank // 128, depth // 128), device="cuda", generator=gen)
+    ).float()
+    expected = grouped_output_block128_mxfp8(data, scale * 0.01, weight, weight_scale, n256=False)
+    actual = grouped_output_block128_mxfp8(data, scale * 0.01, weight, weight_scale, n256=True)
+    for got, want in zip(actual, expected):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "rows,groups,heads,rank",
+    [(1, 1, 8, 1024), (130, 8, 8, 1024)],
+)
+@torch.inference_mode()
+def test_grouped_output_mxfp8_matches_reference(rows, groups, heads, rank):
+    """Inverse-RoPE MXFP8 quantization and the grouped MXFP8 O-A GEMM against FP64."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import (
+        grouped_output_mxfp8,
+        inverse_rope_mxfp8,
+        mxfp8_weight_scale,
+    )
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("MXFP8 CuTe DSL GEMMs require SM100/SM103")
+    gen = torch.Generator(device="cuda").manual_seed(rows * 31 + groups)
+    depth = heads * 512
+    weight = (torch.randn(groups, rank, depth, device="cuda", generator=gen) * 0.5).to(
+        torch.float8_e4m3fn
+    )
+    exponents = torch.randint(
+        -9, -4, (groups, rank // 128, depth // 128), device="cuda", generator=gen
+    )
+    scale = torch.exp2(exponents.float())
+    assert mxfp8_weight_scale(scale * 1.5) is None
+    weight_scale = mxfp8_weight_scale(scale)
+    cos_sin = (torch.rand(512, 2, 32, device="cuda", generator=gen) * 2 - 1).contiguous()
+    output = torch.randn(rows, groups * depth, device="cuda", dtype=torch.bfloat16, generator=gen)
+    positions = torch.randint(0, 512, (rows,), device="cuda", dtype=torch.int32, generator=gen)
+    reference = _inverse_rope_o_a_reference(output, positions, cos_sin, weight, scale)
+
+    # Each 1x32 block of the rotated output is E4M3 under its power-of-two scale.
+    quantized, scales = inverse_rope_mxfp8(output, positions, cos_sin, groups)
+    sf_rows = (rows + 127) // 128 * 128
+    exponent = torch.stack(
+        [
+            torch.ops.trtllm.block_scale_interleave_reverse(group.view(sf_rows, depth // 32))[:rows]
+            for group in scales.view(groups, -1)
+        ]
+    )
+    block_scale = torch.exp2(exponent.double() - 127).repeat_interleave(32, 2)
+    dequantized = quantized.double() * block_scale  # [groups, rows, depth]
+    rotated = _inverse_rope_reference(output, positions, cos_sin).view(rows, groups, depth)
+    rotated = rotated.transpose(0, 1)
+    bound = rotated.abs() * (2**-4 + 2**-8) + block_scale * 2**-10
+    assert ((dequantized - rotated).abs() <= bound).all()
+
+    alpha = torch.ones(1, device="cuda")
+    actual = grouped_output_mxfp8(output, positions, cos_sin, weight, weight_scale, alpha)
+    emulated = torch.einsum(
+        "gmd,grd->mgr",
+        dequantized,
+        weight.double() * scale.double().repeat_interleave(128, 1).repeat_interleave(128, 2),
+    ).reshape(rows, -1)
+    # FP32 accumulation of the quantized operands, rounded to BF16.
+    tight = emulated.abs() * 2**-7 + 1e-3 * emulated.abs().max()
+    assert ((actual.double() - emulated).abs() <= tight).all()
+    assert (actual.double() - reference).abs().max() <= 0.06 * reference.abs().max()
+
+    # The MXFP8 epilogue matches quantizing the BF16 projection afterwards.
+    latent, latent_scale = grouped_output_mxfp8(
+        output, positions, cos_sin, weight, weight_scale, alpha, quantize_output=True
+    )
+    expected, expected_scale = torch.ops.trtllm.mxfp8_quantize(actual, True)
+    torch.testing.assert_close(latent.view(torch.uint8), expected.view(torch.uint8), atol=0, rtol=0)
+    unswizzle = torch.ops.trtllm.block_scale_interleave_reverse
+    torch.testing.assert_close(
+        unswizzle(latent_scale.view(sf_rows, -1))[:rows],
+        unswizzle(expected_scale.view(sf_rows, -1))[:rows],
+        atol=0,
+        rtol=0,
+    )
+
+
+@skip_pre_blackwell
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@torch.inference_mode()
+def test_inverse_rope_mxfp8_rows_past_int32_offsets():
+    """Rows whose element offsets pass 2**31 at 64 heads per rank quantize as they do alone."""
+    from tensorrt_llm._torch.attention.backends.sparse.csa2.projection import inverse_rope_mxfp8
+
+    groups, depth, rows = 8, 4096, 65537
+    gen = torch.Generator(device="cuda").manual_seed(rows)
+    output = torch.zeros(rows, groups * depth, device="cuda", dtype=torch.bfloat16)
+    output[-2:] = torch.randn(2, groups * depth, device="cuda", generator=gen).bfloat16()
+    positions = torch.randint(0, 512, (rows,), device="cuda", dtype=torch.int32, generator=gen)
+    cos_sin = (torch.rand(512, 2, 32, device="cuda", generator=gen) * 2 - 1).contiguous()
+    quantized, scales = inverse_rope_mxfp8(output, positions, cos_sin, groups)
+    tail, tail_scales = inverse_rope_mxfp8(output[-2:], positions[-2:], cos_sin, groups)
+    assert torch.equal(quantized[:, -2:].view(torch.uint8), tail.view(torch.uint8))
+    unswizzle = torch.ops.trtllm.block_scale_interleave_reverse
+    sf_rows = (rows + 127) // 128 * 128
+    for group in range(groups):
+        full = unswizzle(scales.view(groups, sf_rows, depth // 32)[group])[rows - 2 : rows]
+        alone = unswizzle(tail_scales.view(groups, 128, depth // 32)[group])[:2]
+        assert torch.equal(full, alone)

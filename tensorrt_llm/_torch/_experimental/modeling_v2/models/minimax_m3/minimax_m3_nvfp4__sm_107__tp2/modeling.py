@@ -1489,7 +1489,7 @@ def _linear(
        (``MX_GEMV_QUANT_ROWS``): the decode-graph MXFP8 quantize, then the MXFP8 GEMV;
     4. otherwise the decode-graph MXFP8 quantize + GEMM.
 
-    MX-TAC: on a decode graph whose MXFP8 projections the engine tunes (``tune_decode_graph_backends``), the GEMM
+    MX-TAC: on a decode graph whose MXFP8 projections the engine tunes (``tune_mxfp8_backends``), the GEMM
     (and, on a bf16 activation, the quantize) the GEMVs do not serve take one fixed decision
     (``MXFP8_DECODE_QUANT_TACTIC`` / ``MXFP8_DECODE_GEMM_TACTIC``: FlashInfer's CuTe DSL quantize and CuTe DSL GEMM)
     instead of the AutoTuner's per-start choice (whose L2-hot profiling left c2 bimodal at +-6%). On SM107 every TP2

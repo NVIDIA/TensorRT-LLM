@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stack>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
@@ -56,6 +57,10 @@ struct HostMemBackingOptions
     //! fails rather than silently running with first-touch placement, which
     //! would take a remote page instead of refusing.
     bool allowRemoteNumaFallback = true;
+
+    //! The NUMA node to place the pages on instead of the one the GPU attaches
+    //! to. allowRemoteNumaFallback still decides the policy.
+    std::optional<int> numaNode;
 };
 
 //! Physical backing for the host tier: an address range reserved on

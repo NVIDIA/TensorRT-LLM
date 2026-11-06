@@ -97,6 +97,7 @@ def engram_gate(
     *,
     add_residual: bool = False,
     norm_weight_product: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute the keys-first Engram gate in one GPU kernel.
 
@@ -109,6 +110,8 @@ def engram_gate(
         add_residual: Add the residual in FP32 before casting; otherwise return the delta.
         norm_weight_product: Optional cached FP32 query/key product, shape ``[HC, D]``.
             Refresh after weight changes. Used only for contiguous BF16 GB300 residuals.
+        out: Optional contiguous ``[T, HC, D]`` CUDA destination in the residual dtype, which
+            may be ``hidden_states``: each program loads its whole row before it stores it.
 
     Returns:
         Contiguous ``[T, HC, D]`` in the residual dtype, with a PyTorch CPU fallback.
@@ -152,7 +155,18 @@ def engram_gate(
             output = hidden + output
         return output.to(hidden_states.dtype)
 
-    output = torch.empty((tokens, hc, dim), dtype=hidden_states.dtype, device=hidden_states.device)
+    if (
+        out is not None
+        and out.shape == (tokens, hc, dim)
+        and out.dtype == hidden_states.dtype
+        and out.device == hidden_states.device
+        and out.is_contiguous()
+    ):
+        output = out
+    else:
+        output = torch.empty(
+            (tokens, hc, dim), dtype=hidden_states.dtype, device=hidden_states.device
+        )
     if tokens == 0:
         return output
     use_precomputed = (

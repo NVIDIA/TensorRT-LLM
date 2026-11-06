@@ -263,6 +263,8 @@ void moeStatisticDevice(MoeLoadBalanceMetaInfo metaInfo, MoeLoadBalanceStatistic
         TLLM_CUDA_CHECK(cudaLaunchCooperativeKernel(kernelFunc, gridDim, blockDim, &args[0], 0, stream));
     }
 
+    // An empty batch adds no counts, and a zero-block launch is invalid.
+    if (numTotalTokens > 0)
     {
         // do the statistic into expertTokenCount and maybe also expertLoadFactor;
         int threadCount = 1024;
@@ -316,6 +318,8 @@ void moeHierarchicalStatisticLocalDevice(MoeLoadBalanceMetaInfo metaInfo, int nu
             "zeroExpertTokenCount", kernelFunc, gridDim, blockDim, 0, stream, metaInfo, enabled, localExpertTokenCount);
     }
 
+    // An empty batch adds no counts, and a zero-block launch is invalid.
+    if (numTotalTokens > 0)
     {
         // do the statistic into expertTokenCount and maybe also expertLoadFactor;
         int threadCount = 1024;
@@ -625,6 +629,11 @@ void moeComputeRouteDevice(MoeLoadBalanceMetaInfo metaInfo, MoePlacementInfo pla
     constexpr int kThreadCount = 256;
     constexpr int kEltPerThread = 4;
     int blockCount = (tokenCount * metaInfo.topK + kThreadCount * kEltPerThread - 1) / (kThreadCount * kEltPerThread);
+    if (blockCount == 0)
+    {
+        // An empty batch has nothing to route, and a zero-block launch is invalid.
+        return;
+    }
     int dynamicShmSize = sizeof(int16_t) * metaInfo.epSize * metaInfo.slotCountPerRank;
     if (metaInfo.expertCount == metaInfo.epSize * metaInfo.slotCountPerRank)
     {

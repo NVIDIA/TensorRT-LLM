@@ -978,7 +978,7 @@ def test_replay_with_a_different_pack_issues_its_copies_eagerly(early):
     runner = object.__new__(CUDAGraphRunner)
     runner.graph_metadata = {key: {"attn_metadata": metadata, "spec_metadata": None}}
     runner.shared_static_tensors = {"input_ids": a, "position_ids": b.view(1, 16)}
-    runner.config = SimpleNamespace(use_mrope=False)
+    runner.config = SimpleNamespace(use_mrope=False, stage_decode_inputs=False)
     runner._check_strict_buffer_stability = lambda meta: None
     runner._get_num_tokens_for_key = lambda key: 16
     runner._step_input_prologue_keys = {key: captured}

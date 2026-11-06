@@ -512,6 +512,7 @@ literal also selects, descend from the CUTLASS family and stay in
 |------|------|
 | `mega_moe_deepgemm.py` | `DeepgemmCudaW4a8Mxfp4Mxfp8Impl` backend (DeepGEMM `fp8_fp4_mega_moe` wrapper), aliased as `MegaMoEDeepGemm` |
 | `mega_moe_cute_dsl.py` | `TrtllmCutedslMegaMoeNvfp4Impl` backend (architecture-specific CuteDSL MegaMoE wrapper, NVFP4), aliased as `MegaMoECuteDsl` |
+| `shared_expert.py` | Weight layout and MXFP8 input buffers of the shared expert fused into `TrtllmCutedslMegaMoeNvfp4Impl` |
 | `CHUNKING_DESIGN.md` | Chunking design for MegaMoE (sequential multi-chunk, in-kernel barrier semantics) |
 | `COMMUNICATION_COMPARISON.md` | Comparison of fused-comm SymmBuffer vs external comm strategies |
 | `KERNEL_INTERNALS.html` | Reference for the underlying DeepGEMM kernel layout |
@@ -525,6 +526,22 @@ points. The runner constructs
 remains `MEGAMOE_CUTEDSL`. Rubin's smaller token buckets use the genphase
 kernel when supported, otherwise the generic kernel. During warmup, the
 default multi-rank path primes its adaptive buckets with zero-token launches.
+
+With `moe_config.megamoe_fuse_shared_expert` on SM100/SM103 under attention DP with MoE TP 1
+for DeepSeek-V4 models (one shared expert, FP8 block-scale weights with power-of-two scales, bf16
+combine, plain SwiGLU), `TrtllmCutedslMegaMoeNvfp4Impl.fuse_shared_expert` takes
+the shared `GatedMLP`'s weights and the persistent kernel runs the shared expert
+as extra MXFP8 work tiles: gate/up tiles before the routed tiles (they need only
+local tokens), down tiles after them; `TopkReduce` adds the shared output in
+FP32. The DeepSeek-V4 route + quantize launch also writes the MXFP8 input.
+`fuse_megamoe_shared_experts` (modeling_deepseekv4.py) calls it once for the
+target's, the one-model MTP and the draft's layers, which fuse all or none,
+before the Linear transforms and drops the `GatedMLP`; `DeepseekV4MoE` then
+skips the shared expert and the add. Fused and
+unfused kernels of one bucket share its symmetric workspace, whose barrier fence
+cannot switch between them inside a CUDA graph, so every MEGAMOE_CUTEDSL MoE of a
+process takes the same path (drafters inherit the field). Anything else keeps the
+separate shared expert.
 
 ### Design Documents
 
@@ -965,6 +982,7 @@ set wrong has a test that catches it:
 - `FusedCommMoEScheduler` calls `backend.quantize_input(...)` for every chunk including zero-token chunks (so peer ranks can cross the in-kernel NVLink barrier). Each fused-comm backend therefore MUST make `quantize_input` tolerate `x.shape[0] == 0` and return its own empty tensor layout; the scheduler does NOT synthesize backend-specific empty tensors.
 - Dynamic EPLB requires backend and quantization-method support; backends gate wrapper-level constraints in `validate_configurable_moe`. `MegaMoEDeepGemm` routes to slot IDs and migrates the transformed DG weights its quantization method registers (`num_slots % ep_size == 0`). `TrtllmCutedslMegaMoeNvfp4Impl` declares `supports_eplb=True`; its quantization method registers the MegaMoE-format derived params and `fc1_norm_const` with the load balancer alongside the raw NVFP4 family, so per-slot migration stays byte-consistent.
 - `FUSED_COMM` backends use `ignore_allreduce=False` for EPLB statistic update because the fused kernel AllReduces routing stats internally.
+- Warmup expert placement (`MoeLoadBalancerConfig.warmup_placement`, standard mode only; `moe_warmup_placement.py`) learns the placement of the static balancer layers from the live rows of real requests: each round swaps at most `max_moved_fraction` of a layer's slots between heavy and light ranks and moves their per-slot tensors GPU to GPU in place (captured CUDA graphs stay valid); the placement freezes after `max_migrations` rounds. With extra slots (`num_slots > num_experts`) a layer keeps copies of experts, which hold the same bytes, so outputs are unchanged; each round also moves the copies towards hot experts (cold experts take the extra slots a layer does not need). A backend that `counts_routes` adds the picks in its routing launch; otherwise the schedulers issue a separate count launch. Only a backend that implements `on_expert_placement_changed` is re-placed: `TrtllmCutedslMegaMoeNvfp4Impl` applies a static placement itself (`maps_expert_slots`), so `FusedCommMoEScheduler` hands it expert ids and its route + quantize launch writes slots into the launch bucket. Layers on other backends keep their configured placement, and a model whose MoE layers all run other backends is rejected at load.
 - Per-layer dynamic EPLB uses `MoeConfig.load_balancer.mode=per_layer_dynamic` with
   `num_slots` greater than the model expert count. Backend resolution selects
   `MEGAMOE_CUTEDSL` when no concrete backend is requested and rejects an
@@ -1007,7 +1025,9 @@ set wrong has a test that catches it:
   `add_layer` returns a `PerLayerDynamicMoeLayerLoadBalancer` with
   `produces_replica_plan = True`. In every chunk `_load_balancer_route` plans,
   the backend reads `MoERunContext.replica_plan`, and the post-`run_moe` hook
-  releases the plan. The planner consumes logical routes, so the expert
+  releases the plan. Such a layer routes separately: `FusedCommMoEScheduler`
+  skips the backend's fused route + quantize launch, whose routes the plan has
+  not remapped. The planner consumes logical routes, so the expert
   statistics and the layer-wise calibrator record (or replay) them before the
   route; standard EPLB records the slots after it. When the forward raises,
   `MoeLoadBalancerIterContext` calls `abort_iter`, which releases the pending

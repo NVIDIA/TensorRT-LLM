@@ -80,6 +80,10 @@ struct HostCacheTierConfig
     //! failing, and so would not be the strictness that was asked for.
     bool allowRemoteNumaFallback = true;
 
+    //! The node the tier's host memory goes to instead of the GPU's; the policy is still
+    //! allowRemoteNumaFallback's. Last, so positional initializers of the fields above stay valid.
+    std::optional<int> numaNode;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::HOST_MEM;
@@ -91,6 +95,8 @@ struct HostCacheTierConfig
             throw std::invalid_argument("HostCacheTierConfig: quota must be > 0");
         if (maxQuota.has_value() && *maxQuota < quota)
             throw std::invalid_argument("HostCacheTierConfig: maxQuota must be >= quota");
+        if (numaNode && *numaNode < 0)
+            throw std::invalid_argument("HostCacheTierConfig: numa_node must be >= 0");
     }
 };
 

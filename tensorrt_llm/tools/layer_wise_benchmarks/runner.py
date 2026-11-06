@@ -23,6 +23,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import PostInitCaller, remove_weights, skip_forward
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._torch.modules.mhc.hyper_connection import HCState
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     BaseMoeLoadBalancer,
@@ -936,6 +937,10 @@ class Runner:
             else:
                 run_moe_orig = None
 
+            # A fused route+quant backend would bypass the replaced `routing_method.apply`.
+            if isinstance(moe_module, ConfigurableMoE):
+                moe_module.backend.fused_route_quant_enabled = False
+
             # Replace `forward_impl` to ensure that routing results are replaced
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
@@ -956,6 +961,8 @@ class Runner:
                 moe_module.routing_method.apply_with_sort = apply_with_sort_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
+                if isinstance(moe_module, ConfigurableMoE):
+                    del moe_module.backend.fused_route_quant_enabled
                 moe_module.forward_impl = forward_impl_orig
 
     @staticmethod

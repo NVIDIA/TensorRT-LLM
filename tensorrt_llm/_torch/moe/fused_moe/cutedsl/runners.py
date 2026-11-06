@@ -91,22 +91,50 @@ def _runner_tactics_match_tile_size(
 
 class CuteDslFusedMoENvfp4InputsHelper(GroupedGemmInputsHelper):
     def __init__(
-        self, num_experts: int, top_k: int, num_local_experts: int, local_expert_offset: int
+        self,
+        num_experts: int,
+        top_k: int,
+        num_local_experts: int,
+        local_expert_offset: int,
+        spread_num_tokens: bool = False,
     ) -> None:
         self.num_experts = num_experts
         self.top_k = top_k
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
+        # Profile with ``spread_num_tokens_per_expert`` instead of balanced counts.
+        self.spread_num_tokens = spread_num_tokens
 
     def infer_shape_num_tokens(self, input_shapes: list[torch.Size]) -> int:
         return input_shapes[0][0]
 
+    def spread_num_tokens_per_expert(self, num_tokens: int) -> list[int]:
+        """Per-expert rows with the balanced total, spread linearly from 0 to twice the mean.
+
+        Equal counts give every expert the same padding remainder, which near a tile
+        boundary misjudges the routing tile; real routing pads half a tile on average.
+        """
+        total = sum(self.generate_num_tokens_per_expert(num_tokens, approx_max_load=True))
+        num_experts = self.num_local_experts
+        counts = [
+            min(num_tokens, total * (2 * e + 1) // num_experts**2) for e in range(num_experts)
+        ]
+        for e in range(num_experts - 1, -1, -1):
+            extra = min(total - sum(counts), num_tokens - counts[e])
+            if extra <= 0:
+                break
+            counts[e] += extra
+        return counts
+
     def inputs_pre_hook(self, inputs: list[torch.Tensor]) -> list[torch.Tensor]:
         x, token_selected_experts, *others = inputs
         num_tokens = token_selected_experts.size(0)
-        num_tokens_per_expert = self.generate_num_tokens_per_expert(
-            num_tokens, approx_max_load=True
-        )
+        if self.spread_num_tokens:
+            num_tokens_per_expert = self.spread_num_tokens_per_expert(num_tokens)
+        else:
+            num_tokens_per_expert = self.generate_num_tokens_per_expert(
+                num_tokens, approx_max_load=True
+            )
 
         new_token_selected_experts = []
         for i, curr_num_tokens in enumerate(num_tokens_per_expert, start=self.local_expert_offset):
@@ -143,6 +171,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         use_locality_domain: bool = False,
         workload_identity: tuple | None = None,
         prime_inner_tactics: bool = False,
+        spread_tuning_tokens: bool = False,
     ) -> None:
         super().__init__()
         self.forward_impl = forward_impl
@@ -166,6 +195,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         # and accepts ``overlap_moe_output_memset``. Single-op backends must
         # leave this off.
         self.prime_inner_tactics = prime_inner_tactics
+        # Tuning profiles spread the expert loads (CuteDslFusedMoENvfp4InputsHelper).
+        self.spread_tuning_tokens = spread_tuning_tokens
 
     def unique_id(self) -> tuple:
         identity = (
@@ -207,7 +238,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         return 128
 
     def get_tuning_config(self) -> TuningConfig:
-        key = self.unique_id()
+        key = (self.unique_id(), self.spread_tuning_tokens)
         if key not in self.__class__.tuning_config_cache:
             if self.use_direct_expert_metadata:
                 # One tuning profile is shared by the 128- and 256-row
@@ -240,7 +271,11 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 )
             else:
                 helper = CuteDslFusedMoENvfp4InputsHelper(
-                    self.num_experts, self.top_k, self.num_local_experts, self.local_expert_offset
+                    self.num_experts,
+                    self.top_k,
+                    self.num_local_experts,
+                    self.local_expert_offset,
+                    spread_num_tokens=self.spread_tuning_tokens,
                 )
                 tuning_config = TuningConfig(
                     dynamic_tensor_specs=(

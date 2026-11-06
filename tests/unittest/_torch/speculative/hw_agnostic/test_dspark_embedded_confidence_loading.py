@@ -46,6 +46,7 @@ def _wrapper(monkeypatch, v41):
     )
     model.post_load_weights = Mock()
     model.cache_attn_weights_from_state_dict = Mock()
+    model.nvfp4_experts = False
     wrapper.dspark_model = model
     wrapper.config = model.config
     wrapper.num_stages = 1

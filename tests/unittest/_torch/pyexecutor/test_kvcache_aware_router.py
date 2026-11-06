@@ -59,6 +59,7 @@ def _make_request_item(
     item = MagicMock()
     item.id = req_id
     item.child_req_ids = None
+    item.num_input_tokens = None
     scheduling_params = MagicMock()
     scheduling_params.attention_dp_rank = target_dp_rank
     scheduling_params.attention_dp_relax = attention_dp_relax

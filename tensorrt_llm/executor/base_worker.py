@@ -31,7 +31,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.peft.lora.manager import LoraManager
-from .._torch.pyexecutor.kv_cache_stats import append_kv_cache_iteration_stats
+from .._torch.pyexecutor.iteration_stats_json import iteration_stats_row
 from .._torch.pyexecutor.llm_request import LlmResponse
 from .._torch.pyexecutor.request_inputs import (ExecutorRequest,
                                                 PythonRequestInputs)
@@ -418,10 +418,14 @@ class BaseWorker(GenerationExecutor):
         # If both forms exist, they are assumed to describe the same token ids;
         # in-place mutations of request.prompt_token_ids must clear the i32 buffer.
         i32_buf = getattr(request, "_prompt_token_ids_i32", None)
+        # Ids the frontend left out (executor/prompt_tail.py); the engine
+        # restores a full-length prompt from the tail and this count.
+        trimmed_prefix = request._prompt_trimmed_prefix
         if i32_buf is not None:
             prompt_token_ids = i32_buf
         else:
             prompt_token_ids = list(request.prompt_token_ids)
+        prompt_len = trimmed_prefix + len(prompt_token_ids)
         # MULTIMODAL
         # NOTE: Since, we only support PyTorch backend for multimodal, we send multimodal_data through the internal Python input payload
         # except `multimodal_input` as it needs to go through the C++ runtime.
@@ -473,16 +477,16 @@ class BaseWorker(GenerationExecutor):
                 else:
                     # use max_tokens if can't deduce default_max_tokens
                     return max_tokens
-            splited_prompt_len = int(len(prompt_token_ids) / cp_size)
+            splited_prompt_len = int(prompt_len / cp_size)
             if not self.engine.is_generation_model:
                 # The prompt runs in one forward and nothing is generated, so
                 # it may fill max_seq_len; max_tokens=1 has the request
                 # complete with that forward in every executor loop.
-                if len(prompt_token_ids) > max_seq_len * cp_size:
+                if prompt_len > max_seq_len * cp_size:
                     raise ValueError(
                         context_length_exceeded_message(
                             max_context_length=max_seq_len * cp_size,
-                            num_prompt_tokens=len(prompt_token_ids)))
+                            num_prompt_tokens=prompt_len))
                 return 1
             default_max_tokens = max_seq_len - splited_prompt_len
             if default_max_tokens <= 0:
@@ -494,7 +498,7 @@ class BaseWorker(GenerationExecutor):
                 raise ValueError(
                     context_length_exceeded_message(
                         max_context_length=max_seq_len * cp_size,
-                        num_prompt_tokens=len(prompt_token_ids)))
+                        num_prompt_tokens=prompt_len))
 
             # default_max_tokens is the biggest available value
             if max_tokens is None:
@@ -566,6 +570,7 @@ class BaseWorker(GenerationExecutor):
                     conversation_params=request.conversation_params,
                     kv_hints=request.kv_hints,
                     arrival_time=request.arrival_time,
+                    prompt_trimmed_prefix=trimmed_prefix,
                 ),
             )
 
@@ -1275,61 +1280,23 @@ class BaseWorker(GenerationExecutor):
         if (isinstance(stats, tuple) and len(stats) == 2
                 and stats[0] == "per_rank_dict"):
             return json.dumps(stats[1])
+        # Attention-DP fanout rows are serialized when rank 0 appends them.
+        if isinstance(stats, str):
+            return stats
 
-        iteration_stats, req_stats = stats[0], stats[1]
-        kv_iter_stats = stats[2] if len(stats) > 2 else None
-        attention_dp_rank = stats[3] if len(stats) > 3 else None
-        # Newer slots — guarded with len() checks so historical 4-tuples and
-        # any external code still appending the legacy shape keep working.
-        host_step_time_ms = stats[4] if len(stats) > 4 else None
-        prev_device_step_time_ms = stats[5] if len(stats) > 5 else None
-        scheduler_mode = stats[6] if len(stats) > 6 else None
-        gpu_forward_time_ms = stats[7] if len(stats) > 7 else None
-
-        stats_dict = json.loads(iteration_stats.to_json_str())
-        # Always tag the row so Dynamo's adapter can read
-        # stat["attentionDpRank"] without a missing-key branch. Non-ADP stats
-        # default to rank 0; ADP stats carry the rank supplied by PyExecutor.
-        stats_dict["attentionDpRank"] = (0 if attention_dp_rank is None else
-                                         attention_dp_rank)
-
-        if req_stats is not None and len(req_stats) > 0:
-            stats_dict["requestStats"] = []
-            for req_stat in req_stats:
-                stats_dict["requestStats"].append(
-                    json.loads(req_stat.to_json_str()))
-
-        append_kv_cache_iteration_stats(stats_dict, kv_iter_stats)
-
-        # Per-loop CPU wall captured by profile_step() — always a clean
-        # single-loop measurement, matching the log line's `host_step_time`.
-        # Prefer this over iterLatencyMS when you need absolute per-loop
-        # CPU cost, especially under the overlap scheduler where
-        # iterLatencyMS measures the batch's full lifecycle (~2 loops).
-        if host_step_time_ms is not None:
-            stats_dict["hostStepTimeMS"] = host_step_time_ms
-        # GPU forward time read via the ping-pong CUDA event pair in
-        # profile_step(). Note the "prev" in the name: under steady state
-        # the value lags its sibling host_step_time on the same record by
-        # one loop (the event-pair being read corresponds to the loop
-        # before the one host_step_time describes). See the ping-pong
-        # comment in PyExecutor._profiler for the design rationale.
-        if prev_device_step_time_ms is not None:
-            stats_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
-        # Batch-matched GPU forward time measured from the CUDA events around
-        # this record's _forward_step. This is the preferred field for
-        # ForwardPassMetrics wall_time.
-        if gpu_forward_time_ms is not None:
-            stats_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
-        # Scheduler mode for this record. "overlap" means iterLatencyMS
-        # spans ~2 loops (use hostStepTimeMS for clean per-loop cost);
-        # "non_overlap" means iterLatencyMS is itself the clean per-loop
-        # CPU wall. Set per-record so consumers do not need server config.
-        if scheduler_mode is not None:
-            stats_dict["schedulerMode"] = scheduler_mode
-
-        # Convert back to JSON string
-        return json.dumps(stats_dict)
+        # Newer slots are guarded with len() checks so historical 4-tuples
+        # and external code still appending the legacy shape keep working.
+        return json.dumps(
+            iteration_stats_row(
+                stats[0],
+                stats[1],
+                kv_iter_stats=stats[2] if len(stats) > 2 else None,
+                attention_dp_rank=stats[3] if len(stats) > 3 else None,
+                host_step_time_ms=stats[4] if len(stats) > 4 else None,
+                prev_device_step_time_ms=stats[5] if len(stats) > 5 else None,
+                scheduler_mode=stats[6] if len(stats) > 6 else None,
+                gpu_forward_time_ms=stats[7] if len(stats) > 7 else None,
+            ))
 
     @staticmethod
     def _kv_cache_capacity_serializer(capacity) -> str:

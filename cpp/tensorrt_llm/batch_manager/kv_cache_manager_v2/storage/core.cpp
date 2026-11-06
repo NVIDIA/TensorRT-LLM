@@ -120,7 +120,11 @@ Slot SlotAllocator::allocate()
         throw OutOfPagesError("SlotAllocator: no free slots");
     }
     scrubEvents();
+    return takeFreeSlot();
+}
 
+Slot SlotAllocator::takeFreeSlot()
+{
     Slot slot;
     if (mNumReadyRecycledSlots > 0)
     {
@@ -157,9 +161,11 @@ std::vector<Slot> SlotAllocator::allocateMultiple(SlotCount numSlots)
     }
     std::vector<Slot> result;
     result.reserve(slotCountToSizeT(numSlots));
+    // Slots released together share one event, so one readiness scan serves the whole batch.
+    scrubEvents();
     for (SlotCount slotCount{0}; slotCount < numSlots; ++slotCount)
     {
-        result.push_back(allocate());
+        result.push_back(takeFreeSlot());
     }
     return result;
 }
@@ -187,7 +193,8 @@ void SlotAllocator::release(Slot slot)
     {
         mOverflowSlots.push_back(std::move(slot));
     }
-    scrubEvents();
+    // Readiness is scanned at the next allocation: a request releases all its slots under one
+    // event, which would otherwise be queried once per slot.
     TLLM_CHECK_DEBUG(check());
 }
 
@@ -385,7 +392,9 @@ HostSlotPool::HostSlotPool(size_t slotSize, SlotCount numSlots, size_t vmSize, H
     // waitForFill = false: the owning pool group blocks per allocation on only the range
     // it hands out, so serving can start before the whole tier is committed.
     , mHostMem(std::max(vmSize, alignedSize(numSlots)), alignedSize(numSlots),
-          HostMemBackingOptions{.registerUnit = slotSize, .allowRemoteNumaFallback = options.allowRemoteNumaFallback},
+          HostMemBackingOptions{.registerUnit = slotSize,
+              .allowRemoteNumaFallback = options.allowRemoteNumaFallback,
+              .numaNode = options.numaNode},
           /*waitForFill=*/false)
 {
 }

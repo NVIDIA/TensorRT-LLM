@@ -51,7 +51,16 @@ def test_global_source_selection_preserves_cold_and_generation_rows(cache_config
             assert selected.flatten().tolist() == list(range(128, 134))
 
 
-def reference(model, metadata, ids, prefix=256, chunks=None, window=128):
+def _prepare_chunk(manager, request, offset, length):
+    request.context_current_position = offset
+    request.context_chunk_size = length
+    assert manager.resize_context(request, length)
+    scheduled = ScheduledRequests()
+    scheduled.context_requests_last_chunk = [request]
+    manager.prepare_resources(scheduled)
+
+
+def reference(model, metadata, ids, prefix=256, chunks=None, window=128, *, request):
     """Explicit frozen Global encoder and final-window Decoder, without replay plans."""
     start, end = max(0, prefix - window), ids.numel()
     body = model.model
@@ -60,6 +69,8 @@ def reference(model, metadata, ids, prefix=256, chunks=None, window=128):
     for index, length in enumerate(chunks):
         begin = start if index == 0 else offset
         stop = offset + length
+        manager = metadata.kv_cache_manager
+        _prepare_chunk(manager, request, offset, length)
         local_ids = ids[begin:stop]
         positions = torch.arange(begin, stop, device="cuda", dtype=torch.int32).view(1, -1)
         metadata.seq_lens = torch.tensor([stop - begin], dtype=torch.int32)
@@ -83,11 +94,13 @@ def reference(model, metadata, ids, prefix=256, chunks=None, window=128):
             decoder_begin = min(stop, max(begin, end - window))
             kept = stop - decoder_begin
             if not kept:
+                assert manager.kv_cache_map[request.py_request_id].resize(None, stop)
                 offset = stop
                 continue
             metadata.seq_lens = torch.tensor([kept], dtype=torch.int32)
             metadata.prompt_lens = [kept]
             metadata.kv_cache_params.num_cached_tokens_per_seq = [decoder_begin]
+            metadata.set_decoder_query_boundary(5)
             metadata.prepare()
             _apply_swa_floor(
                 metadata,
@@ -113,31 +126,38 @@ def reference(model, metadata, ids, prefix=256, chunks=None, window=128):
                 return model.logits_processor(
                     hidden, model.lm_head, None, return_context_logits=True
                 )
+        assert manager.kv_cache_map[request.py_request_id].resize(None, stop)
         offset = stop
     raise AssertionError("Reference chunks must cover the uncached suffix")
 
 
-@pytest.mark.parametrize("chunks", [(1,), (257,), (1, 127, 129)])
+@pytest.mark.parametrize(
+    "chunks,remote_tail", [((1,), False), ((257,), False), ((1, 127, 129), False), ((257,), True)]
+)
 @pytest.mark.parametrize(
     "block,prefix,window",
-    [(128, 128, 128), (128, 256, 128), (128, 255, 128), (256, 383, 128), (256, 511, 256)],
+    [(128, 128, 140), (128, 256, 140), (128, 255, 140), (256, 383, 140), (256, 511, 300)],
 )
 def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
-    model_and_config, monkeypatch, chunks, block, prefix, window
+    model_and_config, monkeypatch, chunks, remote_tail, block, prefix, window
 ):
+    if remote_tail and window != 140:
+        pytest.skip("Remote-tail transfer does not support embedded speculative decoding")
     model, config, sparse, dtype = model_and_config
     enable_ced(model)
     model.model.decoder_replay_window = window
     model.model.encoder_replay_enabled = True
     monkeypatch.setenv("TRTLLM_V41_DECODER_BOUNDED_REPLAY", "1")
     monkeypatch.setenv("TRTLLM_V41_ENCODER_REPLAY", "1")
+    monkeypatch.setenv("TRTLLM_V41_BOUNDED_REPLAY_TOKENS", str(window))
+    monkeypatch.setitem(config.extra_attrs, "bounded_replay_on_generation", remote_tail)
     spec = None
-    if window > 128:
+    if window > 140:
         from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
 
         # The embedded draft capture can exceed the target attention window.
         # Keep text/SWA geometry at 128 and enlarge the wrapper capture window.
-        monkeypatch.setattr(config.pretrained_config, "sliding_window", window)
+        monkeypatch.setattr(config.pretrained_config, "sliding_window", 256)
         spec = DSparkDecodingConfig(max_draft_len=5)
         spec.__dict__["draft_is_embedded_in_target"] = True
     total = prefix + sum(chunks)
@@ -152,6 +172,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
             [0],
             1,
             reuse=True,
+            scratch=True,
             spec_config=spec,
             tokens_per_block=block,
         ) as case,
@@ -160,7 +181,6 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
         manager = metadata.kv_cache_manager
         assert manager.layout.window_size == 128
         assert manager._decoder_replay_window == window
-        manager.enable_swa_scratch_reuse = False
         with ExitStack() as stack:
             stack.enter_context(canonical_routing())
             warm = LlmRequest(
@@ -199,12 +219,16 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                     sampling_config=SamplingConfig(),
                     is_streaming=False,
                 )
+                if remote_tail:
+                    req.py_csa2_remote_tail_mode = "source"
+                    req.py_csa2_remote_tail_start = total - window
+                    req.py_csa2_remote_tail_split = 5
                 assert manager.prepare_context(req)
                 assert req.context_current_position == prefix
-                assert encoder_replay_tokens(req) == window
+                assert encoder_replay_tokens(req) == min(prefix, window)
                 req.py_seq_slot = 0
-                req.context_chunk_size = total - prefix
-                assert manager.resize_context(req, total - prefix)
+                req.context_chunk_size = min(chunks[0], req.context_remaining_length)
+                assert manager.resize_context(req, req.context_chunk_size)
                 scheduled = ScheduledRequests()
                 scheduled.context_requests_last_chunk = [req]
                 manager.prepare_resources(scheduled)
@@ -212,8 +236,45 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                 metadata.num_contexts = 1
                 for layer in manager.pp_layers:
                     pages = manager.get_cache_indices(request_id, layer, CSA2CacheRole.SWA)
-                    assert pages[(prefix - window) // block] >= 0
+                    assert pages[max(0, prefix - window) // block] >= 0
                 return req
+
+            if remote_tail:
+                req = admit(1)
+                try:
+                    monkeypatch.setattr(model.model, "disagg_remote_tail_replay", True)
+                    monkeypatch.setattr(model.model, "disagg_context_only", True)
+                    # Clear writable Encoder pages to rule out stale pool data.
+                    for layer in range(5):
+                        data = manager.get_buffers(layer, CSA2CacheRole.SWA)
+                        pages = manager.get_cache_indices(1, layer, CSA2CacheRole.SWA)
+                        for page in pages[max(0, prefix - window) // block :]:
+                            if page >= 0:
+                                data[page].zero_()
+                    begin = prefix - encoder_replay_tokens(req)
+                    handoff = total - window
+                    run(model, metadata, [req], ids[begin:handoff], [begin], [handoff - begin], 1)
+                    assert req.py_ced_replay.consumed
+                    assert encoder_replay_tokens(req) == 0
+                    cache = manager.kv_cache_map[1]
+                    assert cache.resize(cache.capacity, handoff)
+                    manager._fill_fresh_kv_pages(1)
+                    torch.cuda.synchronize()
+                    for layer in range(5):
+                        pages = manager.get_cache_indices(1, layer, CSA2CacheRole.SWA)
+                        data = manager.get_buffers(layer, CSA2CacheRole.SWA)
+                        for ordinal in range(
+                            (handoff - 128) // block, (handoff + block - 1) // block
+                        ):
+                            assert pages[ordinal] >= 0
+                            start = max(handoff - 128 - ordinal * block, 0)
+                            end = min(handoff - ordinal * block, block)
+                            rows = data[pages[ordinal]].reshape(block, -1)[start:end]
+                            assert torch.all(torch.any(rows != 0, dim=-1))
+                finally:
+                    manager.kv_cache_map[1].stop_committing()
+                    manager.free_resources(req)
+                return
 
             ref_req = admit(1)
             with model_extra_attrs(
@@ -222,7 +283,9 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                 # CSA2 batches FMHA by context phase. Different chunk shapes
                 # can change reductions and subsequent FP4 rounding, so use
                 # the same encoder partitions in this independent reference.
-                expected = reference(model, metadata, ids, prefix, chunks, window).clone()
+                expected = reference(
+                    model, metadata, ids, prefix, chunks, window, request=ref_req
+                ).clone()
             for key, value in global_bytes(metadata, 0, prefix).items():
                 torch.testing.assert_close(value, frozen[key], rtol=0, atol=0)
             expected_global = global_bytes(metadata, prefix, total)
@@ -233,8 +296,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
             try:
                 offset = prefix
                 for chunk in chunks:
-                    req.context_current_position = offset
-                    req.context_chunk_size = chunk
+                    _prepare_chunk(manager, req, offset, chunk)
                     begin = offset - encoder_replay_tokens(req)
                     inputs = (
                         model,
@@ -251,6 +313,7 @@ def test_reused_global_is_immutable_and_chunked_recovery_matches_reference(
                         # Encoder forward consumes the already prepared views.
                         assert prepare.call_count == 1 + int(offset + chunk > total - window)
                     offset += chunk
+                    assert manager.kv_cache_map[req.py_request_id].resize(None, offset)
                     assert req.py_ced_replay.consumed
                     assert encoder_replay_tokens(req) == 0
                     for key, value in global_bytes(metadata, 0, prefix).items():

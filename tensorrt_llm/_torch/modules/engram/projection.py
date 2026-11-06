@@ -19,6 +19,7 @@ import torch
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from ...kernels.blackwell.engram.packed_projection import engram_packed_projection
 from ..linear import Linear, MXFP8LinearMethod
 
 
@@ -78,6 +79,25 @@ class EngramFp8Projection(Linear):
         """
         self.quant_config = QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32)
         super().create_weights()
+
+    def supports_packed_input(self) -> bool:
+        """Whether ``forward_packed`` can read this projection's native MXFP8 weight."""
+        method = self.quant_method
+        return (
+            isinstance(method, MXFP8LinearMethod)
+            and method.use_cutlass
+            and method.backend == "trtllm"
+            # The packed GEMM is validated on SM103 only.
+            and torch.cuda.get_device_capability() == (10, 3)
+        )
+
+    def forward_packed(self, packed: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """Project uint8 ``[num_sources, tokens, row_bytes]`` rows into the BF16 ``[tokens,
+        out_features]`` ``out``; source ``s`` holds features ``[s * local_k, (s + 1) * local_k)``
+        as E4M3 bytes, then UE8M0 codes, in rows padded to a multiple of 16 bytes."""
+        return engram_packed_projection(
+            packed, self.weight, self.weight_scale, self._mxfp8_alpha, out=out
+        )
 
     def load_weights(self, weights: list[dict]) -> None:
         """Load one replicated ``weight`` and checkpoint ``scale`` pair."""

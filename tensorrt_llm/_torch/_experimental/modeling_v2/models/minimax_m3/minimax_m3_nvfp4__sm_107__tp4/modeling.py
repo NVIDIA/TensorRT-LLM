@@ -1454,7 +1454,7 @@ def _linear(
     _record("linear", (n, k), rows, path, push is not None)
     output = None
     # MX-TAC: the decode-graph MXFP8 quantize and GEMM at the target's fixed tactics, no AutoTuner.
-    pinned = MX_TAC_TP4 and core.mxfp8.quant_method.tune_decode_graph_backends
+    pinned = MX_TAC_TP4 and core.mxfp8.quant_method.tune_mxfp8_backends
     if prequant is not None:
         act, act_scale = prequant
         if path == MX_GEMV_PATH:

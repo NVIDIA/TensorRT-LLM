@@ -46,17 +46,19 @@ def _worker(num_rows=2):
     worker._draft_seq_host = 0
     worker._draft_seq_cuda = torch.zeros((), dtype=torch.int32)
     worker._output_verify_lens = None
+    worker._prep_fork = None
     return worker
 
 
 def _draft_model():
     def forward(main_hidden, bonus, start_pos, **kwargs):
-        batch = main_hidden.shape[0]
+        batch = kwargs["main_x"].shape[0]
         confidence = torch.full((batch, 3), -3.0) if kwargs["return_confidence"] else None
         return None, confidence, torch.zeros(batch, 3, 4)
 
     return SimpleNamespace(
         block_size=3,
+        project_captured_rows=lambda captured, rows: captured[rows],
         forward_batched=Mock(side_effect=forward),
         write_context_windows_batched=Mock(),
     )
@@ -117,12 +119,12 @@ def test_mixed_ragged_draft_uses_generation_offsets_for_hidden_and_positions(ret
         positions=positions,
     )
 
-    args = model.forward_batched.call_args.args
-    assert args[0][:, 0].tolist() == [5.0, 8.0]
-    assert args[2].tolist() == [103, 202]
-    backfill = model.write_context_windows_batched.call_args.args
-    assert backfill[0][:, :, 0][backfill[3]].tolist() == [3.0, 4.0, 7.0]
-    assert backfill[3].tolist() == [[True, True, False], [True, False, False]]
+    call = model.forward_batched.call_args
+    assert call.kwargs["main_x"][:, 0].tolist() == [5.0, 8.0]
+    assert call.args[2].tolist() == [103, 202]
+    backfill = model.write_context_windows_batched.call_args
+    assert backfill.kwargs["main_x"][:, :, 0][backfill.args[3]].tolist() == [3.0, 4.0, 7.0]
+    assert backfill.args[3].tolist() == [[True, True, False], [True, False, False]]
 
 
 @pytest.mark.parametrize("offset, accepted_count", [(0, 3), (-1, 1)])
@@ -153,7 +155,7 @@ def test_padding_offsets_do_not_index_past_captured_hidden_or_positions():
         accepted_counts=[2, 2],
     )
 
-    assert model.forward_batched.call_args.args[0][0].tolist() == [2.0, 2.0]
+    assert model.forward_batched.call_args.kwargs["main_x"][0].tolist() == [2.0, 2.0]
     assert worker._confidence_logits[0].tolist() == [-3.0, -3.0, -3.0]
     assert worker._confidence_logits[worker._scratch_slot + 1].tolist() == [30.0, 30.0, 30.0]
 
@@ -161,7 +163,8 @@ def test_padding_offsets_do_not_index_past_captured_hidden_or_positions():
 def test_draft_stamp_matches_previous_sequence_after_next_step_bump():
     worker = _worker(2)
     assert worker.bump_draft_seq() == 0
-    _draft(worker, _draft_model(), torch.zeros(8, 2))
+    # Ragged windows equal to the uniform layout: the uniform advance is a CUDA kernel.
+    _draft(worker, _draft_model(), torch.zeros(8, 2), lengths=[4, 4], offsets=[0, 4, 8])
     assert worker.confidence_stamp_buffer()[:2].tolist() == [1, 1]
     assert worker.bump_draft_seq() == 1
     assert worker.verified_draft_seq_cuda().item() == 1
@@ -176,9 +179,12 @@ def test_warmup_restores_confidence_logits_and_their_matching_stamps(monkeypatch
     worker.guided_decoder = None
     worker._lazy_init = Mock()
     worker._execute_guided_decoder_if_present = Mock()
+    worker._output_verify_lens = torch.empty(1, dtype=torch.int32)
     accepted = torch.tensor([[1, 2, 3, 4]], dtype=torch.int32)
     counts = torch.tensor([2], dtype=torch.int32)
+    worker._fused_accept = Mock(return_value=None)
     worker.sample_and_accept_draft_tokens = Mock(return_value=(accepted, counts))
+    worker._can_reuse_draft_tokens = Mock(return_value=False)
     worker.sample_draft_tokens = Mock(return_value=torch.zeros(1, 3, dtype=torch.int32))
     worker.write_context_onehot_draft_probs = Mock()
     worker._prepare_next_new_tokens = Mock(return_value=accepted)
@@ -188,10 +194,12 @@ def test_warmup_restores_confidence_logits_and_their_matching_stamps(monkeypatch
     saved_logits = worker._confidence_logits.clone()
     saved_stamps = worker._confidence_stamp.clone()
     saved_addresses = (worker._confidence_logits.data_ptr(), worker._confidence_stamp.data_ptr())
+    # A ragged window keeps the draft on CPU (the uniform advance is a CUDA kernel).
     metadata = SimpleNamespace(
         is_cuda_graph=True,
-        qo_indptr=None,
-        verify_lens=None,
+        runtime_draft_len=3,
+        qo_indptr=torch.tensor([0, 4], dtype=torch.int32),
+        verify_lens=torch.tensor([4], dtype=torch.int32),
         get_hidden_states=lambda _num_tokens: torch.zeros(4, 2),
         draft_probs_last_dim=4,
         batch_indices_cuda=torch.tensor([0]),
