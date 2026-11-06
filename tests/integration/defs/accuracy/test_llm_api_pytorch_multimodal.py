@@ -14,6 +14,7 @@
 # limitations under the License.
 import json
 import os
+from pathlib import Path
 from typing import ClassVar
 
 import numpy as np
@@ -207,10 +208,8 @@ class TestGemma4_26B_A4B(LlmapiAccuracyTestHarness):
 class TestGemma4_31B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-4-31B-it"
 
-    def test_multi_image_encoder_budget(self, tmp_path):
+    def test_multi_image_encoder_budget(self, tmp_path: Path) -> None:
         """A request spanning several encoder steps completes, and the executor keeps serving."""
-        if not os.path.exists(self.MODEL_PATH):
-            pytest.skip(f"Model directory {self.MODEL_PATH} does not exist")
         # Raise every image to 1120 soft tokens (10,080 encoder patches) so 8 images need several
         # encoder steps.
         for name in os.listdir(self.MODEL_PATH):
@@ -235,8 +234,9 @@ class TestGemma4_31B(LlmapiAccuracyTestHarness):
             ],
             add_generation_prompt=True,
         )
+        rng = np.random.default_rng(0)
         images = [
-            Image.fromarray(np.random.randint(0, 255, (2000, 2000, 3), dtype=np.uint8))
+            Image.fromarray(rng.integers(0, 256, (2000, 2000, 3), dtype=np.uint8))
             for _ in range(num_images)
         ]
         sampling_params = SamplingParams(max_tokens=8)
@@ -253,6 +253,8 @@ class TestGemma4_31B(LlmapiAccuracyTestHarness):
             output = llm.generate(
                 {"prompt": prompt, "multi_modal_data": {"image": images}}, sampling_params
             )
+            # About 8.7k prompt tokens at 1120 soft tokens per image, about 2.1k at the default 280.
+            assert len(output.prompt_token_ids) > num_images * 1000
             assert output.outputs[0].token_ids
             output = llm.generate("Hello", sampling_params)
             assert output.outputs[0].token_ids
