@@ -27,6 +27,7 @@ from types import SimpleNamespace
 import pytest
 
 from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.executor.postprocessor_hook import emit, suppress, terminate
 from tensorrt_llm.executor.result import DetokenizedGenerationResultBase, Logprob
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -93,7 +94,7 @@ def test_outputs_match_their_tokens(streaming, n, best_of):
         reason = tllm.FinishReason.LENGTH if last_of_k else tllm.FinishReason.NOT_FINISHED
         result._handle_response(_response(k, chunk, reason, i == len(order) - 1))
         for j, out in enumerate(result._outputs):
-            if j != k:
+            if streaming and j != k:
                 # Outputs this response did not update report nothing new.
                 assert (
                     out.text_diff == "" and out.token_ids_diff == [] and len(out.logprobs_diff) == 0
@@ -172,3 +173,29 @@ def test_streaming_best_of_stop_word_trimmed_outside_top_n():
     assert selected is result._outputs[0]
     assert selected.token_ids == tok.encode("aa")
     assert selected.text == "aa"
+
+
+class _WithholdOutput0OnFinal:
+    def __init__(self, action):
+        self.action = action
+
+    def __call__(self, chunk):
+        if chunk.output_index == 0 and chunk.is_final:
+            return suppress() if self.action == "suppress" else terminate("blocked")
+        return emit(chunk.text_diff)
+
+
+@pytest.mark.parametrize("action", ["suppress", "terminate"])
+def test_non_streaming_hook_withholds_output_on_other_outputs_final_response(action):
+    """The request-final response carries output 1; withholding output 0 there must drop its tokens."""
+    sp = SamplingParams(n=2, best_of=2, temperature=1.0, max_tokens=64, logprobs=1)
+    tok = CharTokenizer()
+    sp._setup(tok, None, None)
+    result = DetokenizedGenerationResultBase(
+        0, sp, tokenizer=tok, streaming=False, post_processor_hook=_WithholdOutput0OnFinal(action)
+    )
+    result._handle_response(_response(0, tok.encode("ab"), tllm.FinishReason.LENGTH, False))
+    result._handle_response(_response(1, tok.encode("xyz"), tllm.FinishReason.LENGTH, True))
+    assert result._outputs[0].token_ids == []
+    assert len(result._outputs[0].logprobs) == 0
+    assert result._outputs[1].token_ids == tok.encode("xyz")

@@ -721,12 +721,15 @@ class GenerationResultBase:
                         output_token_ids=output_token_ids,
                         request_perf_metrics=request_perf_metrics)
             else:
-                # Each response carries one sequence. Mark every output's
-                # diffs as consumed so the outputs this response does not
-                # update report no new tokens or logprobs.
-                for output in self._outputs:
-                    output._last_token_ids_len = len(output.token_ids)
-                    output._last_logprobs_len = len(output.logprobs)
+                # Each response carries one sequence. When streaming, mark every
+                # output's diffs as consumed so the outputs this response does
+                # not update report no new tokens or logprobs. Non-streaming
+                # keeps the watermarks: the post-processor hook truncates a
+                # withheld output back to them.
+                if getattr(self, "_streaming", False):
+                    for output in self._outputs:
+                        output._last_token_ids_len = len(output.token_ids)
+                        output._last_logprobs_len = len(output.logprobs)
                 self._handle_sequence(finish_reasons,
                                       response_result,
                                       response_result.sequence_index,
