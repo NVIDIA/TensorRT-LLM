@@ -2855,8 +2855,15 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
         kv_cache = cfg.other_args.get("kv_cache_config") or {}
         if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
             return "a uniform KV cache dtype in both sections"
-        if kv_cache.get("tokens_per_block", 32) not in (16, 32, 64):
-            return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
+    # Each worker's gate decides which page sizes its drafter reads (a manager
+    # hosting draft layers also reads 128-token pages); equal pages, or pages
+    # every gate admits, keep both workers' decisions the same.
+    page_sizes = {(cfg.other_args.get("kv_cache_config")
+                   or {}).get("tokens_per_block", 32)
+                  for cfg in server_configs}
+    if len(page_sizes) > 1 and not page_sizes <= {16, 32, 64}:
+        return ("kv_cache_config.tokens_per_block to be equal in both "
+                "sections, or 16, 32, or 64 in both")
     return None
 
 

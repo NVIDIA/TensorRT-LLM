@@ -621,3 +621,44 @@ def test_launcher_checks_all_peer_configs(
         draft=_model_config(kv_heads=8, head_dim=128),
     )
     assert creator._should_unify_dflash_kv_cache() is shared
+
+
+@pytest.mark.parametrize(
+    ("context_tokens_per_block", "generation_tokens_per_block", "shared"),
+    [(128, 128, True), (64, 128, False), (16, 64, True)],
+    ids=["equal-128", "mismatch-64-128", "mixed-16-64"],
+)
+def test_launcher_leaves_equal_page_sizes_to_the_worker_gates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_tokens_per_block: int,
+    generation_tokens_per_block: int,
+    shared: bool,
+) -> None:
+    """Equal pages reach both worker gates; different pages outside 16/32/64 keep separate pools.
+
+    A manager hosting draft layers reads 128-token pages, so the launcher does not refuse them.
+    """
+    spec = {"decoding_type": "DSpark", "attention_backend": "TRTLLM"}
+    servers = [
+        {"speculative_config": spec, "kv_cache_config": {"tokens_per_block": tokens_per_block}}
+        for tokens_per_block in (context_tokens_per_block, generation_tokens_per_block)
+    ]
+    if not shared:
+        with pytest.raises(click.UsageError, match="tokens_per_block to be equal"):
+            _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+    monkeypatch.delenv(_SHARED_DRAFT_KV_ENV)
+    with pytest.raises(_StopLauncher):
+        _launch_from_disagg_config(monkeypatch, tmp_path, *servers)
+
+    assert os.environ[_SHARED_DRAFT_KV_ENV] == ("auto" if shared else "0")
+    if context_tokens_per_block == generation_tokens_per_block:
+        # A plain V2 manager refuses 128-token pages on both workers alike.
+        creator = _creator(
+            is_disagg=True,
+            target=_model_config(kv_heads=8, head_dim=128),
+            draft=_model_config(kv_heads=8, head_dim=128),
+        )
+        creator._tokens_per_block = context_tokens_per_block
+        assert "tokens_per_block is 128" in creator._dflash_unify_blocker()
+        assert not creator._should_unify_dflash_kv_cache()
