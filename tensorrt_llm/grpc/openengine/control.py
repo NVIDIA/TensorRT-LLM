@@ -296,6 +296,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
+        if getattr(self._inference, "encoder_role", ""):
+            info.extra.update({"trtllm_encoder_cache_release": True})
+        if getattr(self._inference, "encoder_role", "") == "consume":
+            info.extra.update({"trtllm_requires_encoder_cache": True})
         if supports_image_routing(self._llm, media_modalities):
             info.extra.update({"trtllm_image_routing_version": 1})
 
@@ -542,6 +546,43 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         context: grpc.aio.ServicerContext,
     ) -> lifecycle_pb2.AbortResponse:
         target = request.WhichOneof("target")
+
+        if target == "encoder_cache":
+            cache = getattr(self._inference, "_encoder_cache", None)
+            discard = getattr(cache, "discard", None)
+            if discard is None or getattr(self._inference, "encoder_role", "") != "encode":
+                await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
+                return
+            task = asyncio.create_task(asyncio.to_thread(discard, request.encoder_cache))
+            cleanup_tasks = getattr(self._inference, "_encoder_cleanup_tasks", None)
+            if cleanup_tasks is not None:
+                cleanup_tasks.add(task)
+
+            def completed(done):
+                if cleanup_tasks is not None:
+                    cleanup_tasks.discard(done)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(completed)
+            try:
+                removed = await asyncio.shield(task)
+            except ValueError as error:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+                return
+            except RuntimeError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+                return
+            except OSError as error:
+                await context.abort(grpc.StatusCode.INTERNAL, str(error))
+                return
+            return lifecycle_pb2.AbortResponse(
+                status=(
+                    lifecycle_pb2.ABORT_STATUS_ABORTED
+                    if removed
+                    else lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED
+                )
+            )
 
         if self._frontend is not None and target in ("request_id", "all_requests"):
             fields = {"request_id": request.request_id} if target == "request_id" else {}

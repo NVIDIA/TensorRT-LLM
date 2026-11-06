@@ -163,7 +163,7 @@ class EncoderCache:
             opaque_state=json.dumps(reference, separators=(",", ":")).encode(),
         )
 
-    def prepare(self, reference: Any, request: Any, llm: Any, sampling: Any):
+    def _path(self, reference: Any) -> Path:
         if reference.transfer_backend != BACKEND or len(reference.opaque_state) > 1024:
             raise ValueError("unsupported encoder cache reference")
         try:
@@ -187,7 +187,22 @@ class EncoderCache:
             or any(c not in "0123456789abcdef" for c in identity)
         ):
             raise ValueError("invalid encoder handoff id")
-        path = self.root / f"{identity}.safetensors"
+        return self.root / f"{identity}.safetensors"
+
+    def discard(self, reference: Any) -> bool:
+        path = self._path(reference)
+        with self._lock():
+            if path.is_symlink():
+                raise ValueError("invalid encoder handoff file")
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                return False
+            return True
+
+    def prepare(self, reference: Any, request: Any, llm: Any, sampling: Any):
+        path = self._path(reference)
+        identity = path.stem
         exports = []
         claimed = self.root / f"{identity}-{uuid.uuid4().hex}.tmp"
         try:
