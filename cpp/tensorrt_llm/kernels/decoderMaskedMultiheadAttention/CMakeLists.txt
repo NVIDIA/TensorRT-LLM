@@ -80,8 +80,10 @@ if(NOT WIN32)
   foreach(target ${DECODER_SHARED_TARGET_0} ${DECODER_SHARED_TARGET_1})
     target_link_libraries(${target} PUBLIC tllm::common_environment)
   endforeach()
-  target_link_libraries(${DECODER_SHARED_TARGET_0}
-                        PRIVATE tllm::kernel_cascade_attention)
+  # Export cascade workspace helpers even without MMHA references.
+  target_link_libraries(
+    ${DECODER_SHARED_TARGET_0}
+    PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm::kernel_cascade_attention>)
 else()
   target_sources(decoder_attention_src PRIVATE ${SRC_CPP})
   add_library(tllm_kernel_mmha_instantiations STATIC ${SRC_CU} ${SRC_CU_EXTRA})
