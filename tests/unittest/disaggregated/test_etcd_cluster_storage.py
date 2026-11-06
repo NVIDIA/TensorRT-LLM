@@ -176,9 +176,10 @@ def _bytes(data):
 class FakeEtcdClient:
     """The calls of the etcd client that Etcd3ClusterStorage makes, on a dict."""
 
-    def __init__(self):
-        self.data = {}
+    def __init__(self, data=None):
+        self.data = {} if data is None else data
         self.callbacks = {}
+        self.cancelled = []
 
     def put(self, key, value, lease=None):
         self.data[key] = value
@@ -205,10 +206,17 @@ class FakeEtcdClient:
         return prefix
 
     def cancel_watch(self, watch_id):
+        self.cancelled.append(watch_id)
         self.callbacks.pop(watch_id, None)
 
     def close(self):
-        pass
+        # Closing the channel ends the watch streams, as with the real client.
+        callbacks, self.callbacks = self.callbacks, {}
+        for callback in callbacks.values():
+            callback(None)
+
+    def send(self, prefix, *events):
+        self.callbacks[prefix](SimpleNamespace(events=list(events)))
 
 
 class PutEvent:
@@ -319,25 +327,117 @@ async def test_ignored_records_are_logged_with_the_key_escaped():
     assert "record_auth_key" in message and kwargs == {"key": message}
 
 
+def _changes(events):
+    return [(e.event_type.name, e.storage_item.key, e.storage_item.value) for e in events]
+
+
 @pytest.mark.asyncio
 async def test_watch_delivers_only_valid_records():
     client, storage = _storage()
     await storage.set(f"{PREFIX}/a", "value-a")
+    await storage.set(f"{PREFIX}/b", "value-b")
     handle = await storage.watch(PREFIX)
-    client.callbacks[PREFIX](
-        SimpleNamespace(
-            events=[
-                PutEvent(f"{PREFIX}/plain", "plain"),
-                PutEvent(f"{PREFIX}/a", client.data[f"{PREFIX}/a"]),
-                DeleteEvent(f"{PREFIX}/gone", ""),
-            ]
-        )
+    client.send(
+        PREFIX,
+        PutEvent(f"{PREFIX}/plain", "plain"),
+        DeleteEvent(f"{PREFIX}/plain", ""),
+        PutEvent(f"{PREFIX}/a", client.data[f"{PREFIX}/a"]),
+        PutEvent(f"{PREFIX}/a", client.data[f"{PREFIX}/a"]),
+        DeleteEvent(f"{PREFIX}/never-seen", ""),
+        PutEvent(f"{PREFIX}/b", client.data[f"{PREFIX}/b"]),
+        DeleteEvent(f"{PREFIX}/a", ""),
     )
     events = await asyncio.wait_for(handle.drain(), 1)
-    assert [(e.event_type, e.storage_item.key, e.storage_item.value) for e in events] == [
-        (WatchEventType.SET, f"{PREFIX}/a", "value-a"),
-        (WatchEventType.DELETE, f"{PREFIX}/gone", ""),
+    # Removals of records that were never queued, and repeated values, are not queued.
+    assert _changes(events) == [
+        ("SET", f"{PREFIX}/a", "value-a"),
+        ("SET", f"{PREFIX}/b", "value-b"),
+        ("DELETE", f"{PREFIX}/a", ""),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream_end", [None, _RpcError(grpc.StatusCode.UNAVAILABLE)])
+async def test_watch_continues_on_a_new_stream_with_the_changes_made_meanwhile(stream_end):
+    client, storage = _storage()
+    for name in "abc":
+        await storage.set(f"{PREFIX}/{name}", f"value-{name}")
+    handle = await storage.watch(PREFIX)
+    first_stream = client.callbacks[PREFIX]
+    client.send(PREFIX, *(PutEvent(f"{PREFIX}/{n}", client.data[f"{PREFIX}/{n}"]) for n in "abc"))
+    assert len(await asyncio.wait_for(handle.drain(), 1)) == 3
+
+    # While the stream is down: b is removed, c changes, d is added.
+    del client.data[f"{PREFIX}/b"]
+    await storage.set(f"{PREFIX}/c", "value-c2", overwrite_if_exists=True)
+    await storage.set(f"{PREFIX}/d", "value-d")
+    first_stream(stream_end)
+    await asyncio.sleep(0)
+    await asyncio.wait_for(handle.restart_task, 1)
+
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("SET", f"{PREFIX}/c", "value-c2"),
+        ("SET", f"{PREFIX}/d", "value-d"),
+        ("DELETE", f"{PREFIX}/b", ""),
+    ]
+    # Events of the ended stream are ignored; the new stream fills the queue.
+    late = {"value": "late", "signature": sign_record(RECORD_KEY, f"{PREFIX}/e", "late")}
+    first_stream(SimpleNamespace(events=[PutEvent(f"{PREFIX}/e", json.dumps(late))]))
+    client.send(PREFIX, DeleteEvent(f"{PREFIX}/d", ""))
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [("DELETE", f"{PREFIX}/d", "")]
+
+
+@pytest.mark.asyncio
+async def test_rejected_token_moves_an_active_watch_to_the_new_login():
+    stale = FakeEtcdClient()
+    fresh = FakeEtcdClient(stale.data)
+    stale.data[f"{PREFIX}/a"] = "value-a"
+    with _connect(stale, fresh) as connect:
+        storage = Etcd3ClusterStorage(ETCD_URI, "c", **LOGIN)
+        handle = await storage.watch(PREFIX)
+        stale.get = mock.Mock(side_effect=_RpcError(grpc.StatusCode.UNAUTHENTICATED))
+        assert await storage.get(f"{PREFIX}/a") is None
+        await asyncio.sleep(0)
+        await asyncio.wait_for(handle.restart_task, 1)
+    assert connect.call_count == 2
+    assert stale.cancelled == [PREFIX] and PREFIX in fresh.callbacks
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("SET", f"{PREFIX}/a", "value-a")
+    ]
+    fresh.send(PREFIX, PutEvent(f"{PREFIX}/b", "value-b"))
+    assert _changes(await asyncio.wait_for(handle.drain(), 1)) == [
+        ("SET", f"{PREFIX}/b", "value-b")
+    ]
+    await storage.unwatch(PREFIX)
+    assert fresh.cancelled == [PREFIX] and fresh.callbacks == {}
+
+
+@pytest.mark.asyncio
+async def test_watch_is_tried_again_until_etcd_answers(monkeypatch):
+    monkeypatch.setattr(cluster_storage, "_WATCH_RETRY_MIN_SEC", 0)
+    first, second = FakeEtcdClient(), FakeEtcdClient()
+    # etcd goes down: the stream ends, watching on the old client fails, and so does
+    # the next login; the login after that succeeds.
+    with _connect(first, _RpcError(grpc.StatusCode.UNAVAILABLE), second) as connect:
+        storage = Etcd3ClusterStorage(ETCD_URI, "c", **LOGIN)
+        handle = await storage.watch(PREFIX)
+        first.add_watch_prefix_callback = mock.Mock(
+            side_effect=cluster_storage.etcd3.exceptions.ConnectionFailedError()
+        )
+        first.callbacks[PREFIX](_RpcError(grpc.StatusCode.UNAVAILABLE))
+        await asyncio.sleep(0)
+        await asyncio.wait_for(handle.restart_task, 1)
+    assert connect.call_count == 3 and PREFIX in second.callbacks
+
+
+@pytest.mark.asyncio
+async def test_unwatched_prefix_is_not_watched_again():
+    client, storage = _storage()
+    handle = await storage.watch(PREFIX)
+    client.callbacks[PREFIX](None)  # the stream ends just before the unwatch
+    await storage.unwatch(PREFIX)
+    await asyncio.sleep(0)
+    assert handle.restart_task is None and client.callbacks == {}
 
 
 @pytest.mark.asyncio

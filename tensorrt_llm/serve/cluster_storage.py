@@ -545,20 +545,45 @@ def _decode_key(raw_key: bytes) -> Optional[str]:
         return None
 
 
-class Etcd3WatchEventQueue(WatchEventQueue):
+# Returns the value of the record stored under a key, or None if it is not valid.
+_DecodeRecord = Callable[[str, bytes], Optional[str]]
 
-    def __init__(self,
-                 key_prefix: str,
-                 decode_record: Callable[[str, bytes], Optional[str]],
-                 cancel_event: Optional[Callable[[], None]] = None) -> None:
+
+class Etcd3WatchEventQueue(WatchEventQueue):
+    """Events of an etcd watch, queued on the event loop that created the queue.
+
+    The queue outlives the watch stream that fills it: when a stream ends, the
+    storage watches on a new stream and queues the changes made meanwhile. Only
+    changes that the consumer has not seen are queued.
+    """
+
+    def __init__(self, key_prefix: str, decode_record: _DecodeRecord,
+                 on_stream_end: Callable[["Etcd3WatchEventQueue", int], None],
+                 loop: asyncio.AbstractEventLoop) -> None:
         self.key_prefix = key_prefix
         self.events = asyncio.Queue()
-        self._cancel_event = cancel_event
+        # Number of the watch stream that fills the queue; events and the end
+        # of an earlier stream are ignored.
+        self.stream = 0
+        self.stream_ended = False
+        self.restart_task: Optional[asyncio.Task] = None
+        self._cancel_event: Optional[Callable[[], None]] = None
         self._decode_record = decode_record
+        self._on_stream_end = on_stream_end
+        self._loop = loop
+        # Value of each key as last queued for the consumer.
+        self._values: Dict[str, str] = {}
 
     def cancel_event(self) -> None:
-        if self._cancel_event:
-            self._cancel_event()
+        """Cancel the current watch stream on the client that owns it."""
+        cancel, self._cancel_event = self._cancel_event, None
+        if cancel is None:
+            return
+        try:
+            cancel()
+        except (etcd3.Etcd3Exception, grpc.RpcError, ValueError) as e:
+            logger.debug(f"Could not cancel the etcd watch of "
+                         f"{self.key_prefix!r}: {_describe_error(e)}")
 
     def set_cancel_event(self, cancel_event: Callable[[], None]) -> None:
         self._cancel_event = cancel_event
@@ -566,30 +591,76 @@ class Etcd3WatchEventQueue(WatchEventQueue):
     def __del__(self):
         self.cancel_event()
 
-    def add_events_from_resp(self, watch_resp) -> None:
-        """Queue the events of a watch response, skipping records that are not valid."""
-        try:
-            for event in watch_resp.events:
-                # Event type is not in public interface of etcd3
-                event_type = WatchEventType.SET if "Put" in event.__class__.__name__ else WatchEventType.DELETE
-                key = _decode_key(event.key)
-                if key is None:
+    def add_events_from_resp(self, stream: int, watch_resp) -> None:
+        """Watch callback of stream ``stream``, run on the etcd watch thread.
+
+        The etcd client passes an exception or None instead of a response when
+        the stream ends. Records that are not valid are skipped.
+        """
+        if watch_resp is None or isinstance(watch_resp, Exception):
+            self._call_soon(self._on_stream_end, self, stream)
+            return
+        events = []
+        for event in watch_resp.events:
+            # Event type is not in public interface of etcd3
+            event_type = WatchEventType.SET if "Put" in event.__class__.__name__ else WatchEventType.DELETE
+            key = _decode_key(event.key)
+            if key is None:
+                continue
+            value = ""
+            if event_type == WatchEventType.SET:
+                value = self._decode_record(key, event.value)
+                if value is None:
                     continue
-                value = ""
-                if event_type == WatchEventType.SET:
-                    value = self._decode_record(key, event.value)
-                    if value is None:
-                        continue
-                self.events.put_nowait(
-                    WatchEvent(
-                        storage_item=StorageItem(key=key, value=value),
-                        event_type=event_type,
-                    ))
-            if self.events._loop:
-                self.events._loop.call_soon_threadsafe(lambda: None)
-        except Exception as e:
-            logger.error(f"Error adding event: {e}")
-            self.cancel_event()
+            events.append(
+                WatchEvent(storage_item=StorageItem(key=key, value=value),
+                           event_type=event_type))
+        self._call_soon(self._queue_stream_events, stream, events)
+
+    async def add_events(self, events: List[WatchEvent]) -> None:
+        """Queue events that the caller read itself, such as the records present when watching starts."""
+        self._queue(events)
+
+    def resync(self, records: Dict[str, str]) -> None:
+        """Queue the changes from what the consumer has seen to ``records``, the current records."""
+        events = [
+            WatchEvent(storage_item=StorageItem(key=key, value=value),
+                       event_type=WatchEventType.SET)
+            for key, value in records.items()
+        ] + [
+            WatchEvent(storage_item=StorageItem(key=key),
+                       event_type=WatchEventType.DELETE)
+            for key in self._values if key not in records
+        ]
+        self._queue(events)
+
+    def _call_soon(self, callback: Callable[..., None], *args: object) -> None:
+        """Run ``callback`` on the event loop of the queue; called on the etcd watch thread."""
+        try:
+            self._loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError:
+            # The event loop is closed, so nobody reads this queue any more.
+            pass
+
+    def _queue_stream_events(self, stream: int,
+                             events: List[WatchEvent]) -> None:
+        """Queue the events of watch stream ``stream`` unless a later stream replaced it."""
+        if stream == self.stream:
+            self._queue(events)
+
+    def _queue(self, events: List[WatchEvent]) -> None:
+        """Queue the events that change what the consumer has seen; runs on the event loop."""
+        for event in events:
+            key, value = event.storage_item.key, event.storage_item.value
+            if event.event_type == WatchEventType.SET:
+                if self._values.get(key) == value:
+                    continue
+                self._values[key] = value
+            elif self._values.pop(key, None) is None:
+                # A record that was never queued, for example one without a
+                # valid signature, has nothing to remove.
+                continue
+            self.events.put_nowait(event)
 
 
 # Details of the INVALID_ARGUMENT errors with which etcd rejects a login token
@@ -649,6 +720,11 @@ def handle_etcd_error(return_on_error: bool | None):
         return wrap
 
     return decorator
+
+
+# Delay before watching again after a failed attempt, doubled up to the maximum.
+_WATCH_RETRY_MIN_SEC = 1
+_WATCH_RETRY_MAX_SEC = 10
 
 
 class Etcd3ClusterStorage(ClusterStorage):
@@ -843,15 +919,61 @@ class Etcd3ClusterStorage(ClusterStorage):
     async def watch(self, key_prefix: str) -> WatchEventQueue:
         if key_prefix in self._watch_handles:
             return self._watch_handles[key_prefix]
-        watch_handle = Etcd3WatchEventQueue(key_prefix,
-                                            decode_record=self._decode_record)
-        client = self.client
-        watch_id = client.add_watch_prefix_callback(
-            key_prefix, watch_handle.add_events_from_resp)
-        # Cancel on the client that owns the watch, also after a reconnect.
-        watch_handle.set_cancel_event(partial(client.cancel_watch, watch_id))
+        watch_handle = Etcd3WatchEventQueue(key_prefix, self._decode_record,
+                                            self._on_watch_stream_end,
+                                            asyncio.get_running_loop())
+        await self._start_watch(watch_handle)
         self._watch_handles[key_prefix] = watch_handle
         return watch_handle
+
+    async def _start_watch(self, handle: Etcd3WatchEventQueue) -> None:
+        """Fill ``handle`` from a new watch stream on the current client."""
+        handle.cancel_event()
+        handle.stream += 1
+        client = self.client
+        watch_id = await asyncio.to_thread(
+            client.add_watch_prefix_callback, handle.key_prefix,
+            partial(handle.add_events_from_resp, handle.stream))
+        # Cancel on the client that owns the watch, also after a reconnect.
+        handle.set_cancel_event(partial(client.cancel_watch, watch_id))
+
+    def _on_watch_stream_end(self, handle: Etcd3WatchEventQueue,
+                             stream: int) -> None:
+        """Watch again when the current stream of a watched prefix ends."""
+        if (stream != handle.stream
+                or self._watch_handles.get(handle.key_prefix) is not handle):
+            return
+        handle.stream_ended = True
+        if handle.restart_task is None or handle.restart_task.done():
+            logger.warning(
+                f"The etcd watch of {handle.key_prefix!r} ended, watching again"
+            )
+            handle.restart_task = asyncio.create_task(
+                self._restart_watch(handle))
+
+    async def _restart_watch(self, handle: Etcd3WatchEventQueue) -> None:
+        """Watch on a new stream until one starts, then queue what changed meanwhile."""
+        delay = _WATCH_RETRY_MIN_SEC
+        while self._watch_handles.get(handle.key_prefix) is handle:
+            handle.stream_ended = False
+            try:
+                await self.connect()
+                await self._start_watch(handle)
+                # A read with the current login also catches a watch that etcd
+                # did not start because it rejected the login token.
+                handle.resync(self._read_prefix(handle.key_prefix))
+            except (etcd3.Etcd3Exception, grpc.RpcError, OSError,
+                    ValueError) as e:
+                handle.stream_ended = True
+                logger.warning(
+                    f"Could not watch {handle.key_prefix!r} again, trying "
+                    f"again in {delay} seconds: {_describe_error(e)}")
+                self.reconnect()
+            if not handle.stream_ended:
+                logger.info(f"Watching {handle.key_prefix!r} again")
+                return
+            await asyncio.sleep(delay)
+            delay = min(2 * delay, _WATCH_RETRY_MAX_SEC)
 
     async def unwatch(self, key_prefix: str) -> None:
         handle = self._watch_handles.pop(key_prefix)
