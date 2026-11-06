@@ -25,21 +25,26 @@ _MIN_AMAX = 1.0e-12
 
 @dataclass(frozen=True)
 class CompiledIndexerQSide:
-    """The compiled launcher and the rope mode it was compiled for."""
+    """The compiled launcher, the rope mode and the `wq` row pitch it was compiled for."""
 
     fn: Callable
     is_neox: bool
+    wq_pitch: int = _HEADS
 
 
-def build(device_id: int, *, is_neox: bool) -> CompiledIndexerQSide:
+def build(device_id: int, *, is_neox: bool, wq_pitch: int = _HEADS) -> CompiledIndexerQSide:
     """Compile the variant the target runs: ue8m0 row scales, PDL launch.
 
-    `is_neox` is a compile-time constant of the kernel. One compile, a few
-    seconds, cached per process by the kernel module; allocates nothing.
+    `is_neox` is a compile-time constant of the kernel, as is `wq_pitch`: 32 for packed
+    head weights, 160 to read them in place from the context indexer projection's fp32
+    `[T, 160]` output. One compile, a few seconds, cached per process by the kernel module;
+    allocates nothing.
     """
     with torch.cuda.device(device_id):
-        fn = _kernel.compile_indexer_q_side_fused(device_id, bool(is_neox), True, use_pdl=True)
-    return CompiledIndexerQSide(fn=fn, is_neox=bool(is_neox))
+        fn = _kernel.compile_indexer_q_side_fused(
+            device_id, bool(is_neox), True, use_pdl=True, wq_pitch=int(wq_pitch)
+        )
+    return CompiledIndexerQSide(fn=fn, is_neox=bool(is_neox), wq_pitch=int(wq_pitch))
 
 
 class CuteDslIndexerQSideFused(OpWrapper):
@@ -82,13 +87,30 @@ class CuteDslIndexerQSideFused(OpWrapper):
             why="an odd row count with long-context positions near the table end",
             spec=dict(tokens=300, positions="tail", max_pos=131072, is_neox=False),
         ),
+        # The served context path (`build(wq_pitch=160)`): `wq` is the head-weight columns
+        # 128..159 of the indexer projection's fp32 `[T, 160]` output, read in place.
+        Cell(
+            why="wq at pitch 160, 65 rows: the first context row count",
+            spec=dict(tokens=65, positions="arange", max_pos=8192, is_neox=False, wq_pitch=160),
+        ),
+        Cell(
+            why="wq at pitch 160, a 3001-row context chunk at long-context positions",
+            spec=dict(tokens=3001, positions="tail", max_pos=131072, is_neox=False, wq_pitch=160),
+        ),
+        Cell(
+            why="wq at pitch 160, max_num_tokens: 8192 rows, positions 0..8191",
+            spec=dict(tokens=8192, positions="arange", max_pos=8192, is_neox=False, wq_pitch=160),
+        ),
     )
 
     note = """
     `build(device_id, is_neox=...)` compiles the launcher once; the target calls
     it at load and passes the result as `compiled`. Row count is a runtime
     value, so one launcher serves decode and prefill and there is no stock-op
-    fallback at the call site.
+    fallback at the call site. With `TRTLLM_GLM52_CTX_IX_NOSPLIT=1` (the default)
+    the target also builds `wq_pitch=160` for context steps, which reads the head
+    weights in place from the projection output; its bytes equal the pitch-32
+    launcher's on the same values packed (the column split), which the test pins.
 
     The NeoX rope mode compiles and is verified by the kernel's own driver,
     but the target never builds it, so it is not certified here.
@@ -126,6 +148,7 @@ class CuteDslIndexerQSideFused(OpWrapper):
             use_ue8m0=True,
             compiled_fn=compiled.fn,
             use_pdl=True,
+            wq_pitch=compiled.wq_pitch,
         )
 
     def reference(

@@ -36,6 +36,9 @@ class GemmSchedule:
     swizzle_size: int = 1
     raster_along: Literal["m", "n"] = "m"
     use_tma_store: bool = True
+    # TMA-store epilogue subtile N (columns drained per TMEM load / smem store / TMA store
+    # round); None keeps the library rule (4096 elements, i.e. 32 at a 128-row CTA tile).
+    epilogue_tile_n: int | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +79,40 @@ class CompiledPersistentGemm:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
         self.compiled_bmm(a, b, c, stream)
 
+    def launch_rows(
+        self,
+        input_tensor: torch.Tensor,
+        weight: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        """Launch on ``1..compiled M`` rows: the same compiled object at a runtime row count.
+
+        Every operand is a dynamic-layout view (``_make_runtime_arguments``), so the tile
+        scheduler and the TMA descriptors take the row count from the tensors: the tiles past
+        the last row load zeros and store nothing. A row computes exactly what it computes
+        at the compiled M (same tile, same K order), so the output rows are bitwise those of
+        the compiled M with the input padded by any rows. Feature dimensions and the weight
+        must match the compile.
+
+        :raises ValueError: If a feature dimension or the weight differs from the compile,
+            or the row count is outside ``1..compiled M``.
+        """
+        rows = int(input_tensor.shape[0])
+        if (
+            not 0 < rows <= int(self.input_shape[0])
+            or tuple(input_tensor.shape[1:]) != tuple(self.input_shape[1:])
+            or weight.shape != self.weight_shape
+            or tuple(output.shape) != (rows, int(self.output_shape[1]))
+        ):
+            raise ValueError(
+                "compiled projection runtime-M mismatch: compiled input/weight/output="
+                f"{(self.input_shape, self.weight_shape, self.output_shape)}, got "
+                f"{(input_tensor.shape, weight.shape, output.shape)}"
+            )
+        a, b, c = _make_runtime_arguments(input_tensor, weight, output, self.orientation)
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.compiled_bmm(a, b, c, stream)
+
 
 def _check_glm_mma_tiler_and_cluster_shape(self) -> None:
     """Admit the measured SM103 BF16 MMA-N multiples of eight."""
@@ -99,10 +136,52 @@ def _check_glm_mma_tiler_and_cluster_shape(self) -> None:
         raise testing.CantImplementError(f"invalid cluster shape: {self.cluster_shape_mn}")
 
 
+def setup_attributes_with_epilogue_tile_n(gemm, library_setup_attributes) -> None:
+    """Run the library ``_setup_attributes`` with the epilogue subtile N set by the schedule.
+
+    The library sizes the TMA-store epilogue subtile for 4096 elements (``(128, 32)`` at a
+    128-row CTA tile, ``cutlass.utils.blackwell_helpers.compute_epilogue_tile_size``), so a
+    128 x 256 CTA tile drains in 8 serialized rounds of TMEM load -> convert -> smem store ->
+    proxy fence -> named barrier -> TMA store -> barrier.  When the mainloop per tile is short
+    (K = 192 for the absorbed-MLA K-B BMM: 3 k-blocks) that drain bounds the kernel.
+    ``gemm.glm_epilogue_tile_n`` (set from :attr:`GemmSchedule.epilogue_tile_n`) replaces only
+    the subtile N for this one call; the subtile M, the TMEM/smem copy atoms, the C smem
+    layout and the stage counts are then derived by the library from it as usual.  The
+    accumulation (mainloop, K order) is untouched, so the output bytes do not change.
+    """
+    tile_n = getattr(gemm, "glm_epilogue_tile_n", None)
+    if tile_n is None:
+        library_setup_attributes(gemm)
+        return
+    import cutlass.utils.blackwell_helpers as helpers
+
+    library_size = helpers.compute_epilogue_tile_size
+
+    def sized(cta_tile_m, cta_tile_n, *args, **kwargs):
+        tile_m, _ = library_size(cta_tile_m, cta_tile_n, *args, **kwargs)
+        if cta_tile_n % tile_n:
+            raise testing.CantImplementError(
+                f"epilogue_tile_n {tile_n} does not divide the CTA tile N {cta_tile_n}"
+            )
+        return tile_m, tile_n
+
+    helpers.compute_epilogue_tile_size = sized
+    try:
+        library_setup_attributes(gemm)
+    finally:
+        helpers.compute_epilogue_tile_size = library_size
+
+
 class _GlmPersistentDenseGemmKernel(_DENSE_GEMM.PersistentDenseGemmKernel):
     """Extend the example's conservative MMA-N gate for measured GLM tiles."""
 
     check_mma_tiler_and_cluster_shape = _check_glm_mma_tiler_and_cluster_shape
+    glm_epilogue_tile_n: int | None = None
+
+    def _setup_attributes(self):
+        setup_attributes_with_epilogue_tile_n(
+            self, _DENSE_GEMM.PersistentDenseGemmKernel._setup_attributes
+        )
 
 
 def _make_runtime_arguments(

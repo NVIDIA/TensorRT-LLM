@@ -30,10 +30,19 @@ the device kernel is unchanged; only the per-call Python (DLPack tensor
 construction, two transposes, stream wrapping) is gone.  The legacy path
 (decode ``make_build``; several times the host cost of ``torch.bmm`` per call
 at prefill row counts) stays available as ``build(op, launch_mode="legacy")``.
+
+FP8 q-base (K-B only, ``build("k_b", emit_fp8_q_base=True)``): the output is the
+``uint8`` ``quant_q_buffer[..., :512]`` view (same element strides ``(576, 9216, 1)``)
+and the epilogue writes e4m3(bf16(acc)) itself -- the bytes the context rope/append
+kernel's q-base groups would otherwise produce from a bf16 ``fused_q`` round trip
+(that kernel then runs with ``skip_q_base=True``). Same schedules except for the
+epilogue subtile (``FP8_Q_BASE_EPILOGUE_TILE_N``); the kernel is the decode module's
+PDL-chain variant (weight preload, wait, signal), which the FP8 epilogue requires.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Callable, Literal
 
@@ -65,6 +74,22 @@ SCHEDULE_LARGE_T = GemmSchedule(True, (256, 256), (2, 1), raster_along="n")
 SCHEDULE_SPLIT_ROWS = 2_048
 ROWS_SMALL = tuple(range(1, SCHEDULE_SPLIT_ROWS + 1))
 ROWS_LARGE = tuple(range(SCHEDULE_SPLIT_ROWS + 1, MAX_ROWS + 1))
+
+
+# FP8 q-base K-B only: drain the accumulator in 128-column epilogue subtiles instead of the
+# library's 32 (4096 elements). K = 192 leaves 3 k-blocks per tile, so the 8-round epilogue of
+# a 128 x 256 CTA tile (TMEM load -> FP32->BF16->E4M3 -> stmatrix -> fence -> barrier -> TMA
+# store -> barrier per round) bounded the kernel. Same accumulation, byte-identical output;
+# B300, L2 flushed: 30.4 -> 27.6 us at T=7896, 15.8 -> 14.0 at 3032, 8.5 -> 7.8 at 987.
+# The BF16 K-B and V-B builds stay on the library subtile: they are DRAM-bound at every
+# tested schedule and a larger subtile only shrinks their A/B pipeline (V-B 38.8 -> 40.2
+# us at 7896 with 128).
+FP8_Q_BASE_EPILOGUE_TILE_N = 128
+
+
+def _fp8_q_base_schedule(schedule: GemmSchedule) -> GemmSchedule:
+    """The FP8 q-base K-B variant of a schedule group (epilogue subtile only)."""
+    return dataclasses.replace(schedule, epilogue_tile_n=FP8_Q_BASE_EPILOGUE_TILE_N)
 
 
 @dataclass(frozen=True)
@@ -112,12 +137,24 @@ def make_abi(op: str, rows: int) -> BatchedGemmAbi:
     )
 
 
-def _build_legacy(op: str) -> Callable:
+def _build_legacy(op: str, emit_fp8_q_base: bool = False) -> Callable:
     """Decode-machinery launcher (per-call cute tensors + explicit stream)."""
+    pdl_role = _kbbmm.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE if emit_fp8_q_base else None
+    pick = _fp8_q_base_schedule if emit_fp8_q_base else (lambda schedule: schedule)
     small = _kbbmm.make_build(
-        make_abi(op, SCHEDULE_SPLIT_ROWS), SCHEDULE_SMALL_T, m_rows_allowed=ROWS_SMALL
+        make_abi(op, SCHEDULE_SPLIT_ROWS),
+        pick(SCHEDULE_SMALL_T),
+        pdl_role=pdl_role,
+        emit_fp8_q_base=emit_fp8_q_base,
+        m_rows_allowed=ROWS_SMALL,
     )()
-    large = _kbbmm.make_build(make_abi(op, MAX_ROWS), SCHEDULE_LARGE_T, m_rows_allowed=ROWS_LARGE)()
+    large = _kbbmm.make_build(
+        make_abi(op, MAX_ROWS),
+        pick(SCHEDULE_LARGE_T),
+        pdl_role=pdl_role,
+        emit_fp8_q_base=emit_fp8_q_base,
+        m_rows_allowed=ROWS_LARGE,
+    )()
 
     def launcher(input_tensor: torch.Tensor, weight: torch.Tensor, output: torch.Tensor):
         rows = int(input_tensor.shape[1])
@@ -162,6 +199,7 @@ def _compile_tvm_ffi(
     rows_allowed: tuple[int, ...],
     *,
     can_implement_rows: int,
+    emit_fp8_q_base: bool = False,
 ) -> Callable[[torch.Tensor, torch.Tensor, torch.Tensor], object]:
     """Compile one schedule group as a TVM-FFI function over the serving views.
 
@@ -170,8 +208,10 @@ def _compile_tvm_ffi(
     BF16 output); differs only in the host entry (``_bmm_serving_views``) and
     the export mode.
     """
-    _kbbmm.reject_unpredicated_store(abi.module_name, schedule, rows_allowed, emit_fp8_q_base=False)
-    _kbbmm._validate_contract(abi, input_tensor, weight, output)
+    _kbbmm.reject_unpredicated_store(
+        abi.module_name, schedule, rows_allowed, emit_fp8_q_base=emit_fp8_q_base
+    )
+    _kbbmm._validate_contract(abi, input_tensor, weight, output, fp8_output=emit_fp8_q_base)
     weight = weight.detach()
     a = from_dlpack(
         weight, assumed_align=_ALIGNMENT_BYTES, enable_tvm_ffi=True
@@ -179,8 +219,13 @@ def _compile_tvm_ffi(
     b = from_dlpack(
         input_tensor, assumed_align=_ALIGNMENT_BYTES, enable_tvm_ffi=True
     ).mark_layout_dynamic(leading_dim=2)
+    # FP8 q-base: the uint8 quant_q view is handed over as float8_e4m3fn (same
+    # bytes, same strides) so the C operand's element type is E4M3 at compile
+    # and at every call.
     c = from_dlpack(
-        output, assumed_align=_ALIGNMENT_BYTES, enable_tvm_ffi=True
+        output.view(torch.float8_e4m3fn) if emit_fp8_q_base else output,
+        assumed_align=_ALIGNMENT_BYTES,
+        enable_tvm_ffi=True,
     ).mark_layout_dynamic(leading_dim=2)
     mnkl = (
         abi.output_features,
@@ -189,21 +234,34 @@ def _compile_tvm_ffi(
         abi.num_heads,
     )
     cluster_size = schedule.cluster_shape_mn[0] * schedule.cluster_shape_mn[1]
-    max_active_clusters = _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
-        cluster_size
-    )
-    gemm = _kbbmm._GlmPersistentDenseGemmKernel(
-        cutlass.Float32,
-        schedule.use_2cta_instrs,
-        schedule.mma_tiler_mn,
-        schedule.cluster_shape_mn,
-        schedule.use_tma_store,
-        schedule.swizzle_size,
-        schedule.raster_along,
-    )
+    kernel_name_prefix = abi.kernel_name_prefix
+    if emit_fp8_q_base:
+        # The FP8 epilogue lives in the PDL-chain variant (decode module's
+        # _compile does the same): weight preload, wait for the producer of
+        # q_nope, signal after the store tail.
+        max_active_clusters = _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
+        gemm = _kbbmm.make_pdl_chain_kernel(
+            _fp8_q_base_schedule(schedule), _kbbmm.WAIT_SIGNAL_PRELOAD_WEIGHT_ROLE
+        )
+        kernel_name_prefix = f"{kernel_name_prefix}{_kbbmm.FP8_Q_BASE_KERNEL_SUFFIX}_pdl_chain"
+    else:
+        max_active_clusters = _kbbmm._DENSE_GEMM.utils.HardwareInfo().get_max_active_clusters(
+            cluster_size
+        )
+        gemm = _kbbmm._GlmPersistentDenseGemmKernel(
+            cutlass.Float32,
+            schedule.use_2cta_instrs,
+            schedule.mma_tiler_mn,
+            schedule.cluster_shape_mn,
+            schedule.use_tma_store,
+            schedule.swizzle_size,
+            schedule.raster_along,
+        )
     if not gemm.can_implement(mnkl, a.element_type, b.element_type, c.element_type, "k", "k", "m"):
         raise ValueError(f"{abi.module_name}: persistent schedule cannot implement {mnkl}")
-    gemm.kernel.set_name_prefix(abi.kernel_name_prefix, remove_cutlass_symbol=True)
+    gemm.kernel.set_name_prefix(kernel_name_prefix, remove_cutlass_symbol=True)
     return cute.compile(
         _bmm_serving_views,
         gemm,
@@ -225,8 +283,11 @@ class TvmFfiBmmLauncher:
     attribute checks + one TVM-FFI call on torch's current stream.
     """
 
-    def __init__(self, op: str) -> None:
+    def __init__(self, op: str, emit_fp8_q_base: bool = False) -> None:
+        if emit_fp8_q_base and op != "k_b":
+            raise ValueError("emit_fp8_q_base is K-B only")
         self.op = op
+        self.emit_fp8_q_base = emit_fp8_q_base
         self.spec = SPECS[op]
         self._compiled: dict[int, Callable] = {}
         self._weight_operand: dict[int, torch.Tensor] = {}
@@ -262,6 +323,7 @@ class TvmFfiBmmLauncher:
             output,
             rows_allowed,
             can_implement_rows=key,
+            emit_fp8_q_base=self.emit_fp8_q_base,
         )
         self._compiled[key] = compiled
         return compiled
@@ -299,8 +361,12 @@ class TvmFfiBmmLauncher:
                 f"{self.op}_bmm: serving strides {self.spec.input_stride} / {self.spec.output_stride} required, "
                 f"got {tuple(input_tensor.stride())} / {tuple(output.stride())}"
             )
-        if input_tensor.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
-            raise ValueError(f"{self.op}_bmm: input/output must be BF16")
+        out_dtype = torch.uint8 if self.emit_fp8_q_base else torch.bfloat16
+        if input_tensor.dtype != torch.bfloat16 or output.dtype != out_dtype:
+            raise ValueError(
+                f"{self.op}_bmm: input must be BF16 and output {out_dtype}, got "
+                f"{input_tensor.dtype} / {output.dtype}"
+            )
         # One launcher per process, compiled for the device of the first call: reject CPU or
         # cross-device operands as a contract error instead of a driver error inside the call.
         dev = input_tensor.device
@@ -324,15 +390,28 @@ class TvmFfiBmmLauncher:
             input_tensor = input_tensor.detach()
         if output.requires_grad:
             output = output.detach()
+        if self.emit_fp8_q_base:
+            output = output.view(torch.float8_e4m3fn)
         return compiled(weight_view, input_tensor, output)
 
 
-def build(op: str, launch_mode: LaunchMode = DEFAULT_LAUNCH_MODE):
-    """Registry entry: ``build(op) -> launcher(input, weight, output)`` serving every T <= MAX_ROWS."""
+def build(
+    op: str,
+    launch_mode: LaunchMode = DEFAULT_LAUNCH_MODE,
+    *,
+    emit_fp8_q_base: bool = False,
+):
+    """Registry entry: ``build(op) -> launcher(input, weight, output)`` serving every T <= MAX_ROWS.
+
+    ``emit_fp8_q_base`` (K-B only): ``output`` is the uint8 ``quant_q_buffer[..., :512]``
+    view and receives e4m3(bf16(acc)) bytes (module docstring).
+    """
     if op not in SPECS:
         raise ValueError(f"unknown prefill BMM {op!r}; known: {tuple(SPECS)}")
+    if emit_fp8_q_base and op != "k_b":
+        raise ValueError("emit_fp8_q_base is K-B only")
     if launch_mode == "tvm_ffi":
-        return TvmFfiBmmLauncher(op)
+        return TvmFfiBmmLauncher(op, emit_fp8_q_base=emit_fp8_q_base)
     if launch_mode == "legacy":
-        return _build_legacy(op)
+        return _build_legacy(op, emit_fp8_q_base=emit_fp8_q_base)
     raise ValueError(f"{op}_bmm: launch_mode must be tvm_ffi or legacy, got {launch_mode!r}")

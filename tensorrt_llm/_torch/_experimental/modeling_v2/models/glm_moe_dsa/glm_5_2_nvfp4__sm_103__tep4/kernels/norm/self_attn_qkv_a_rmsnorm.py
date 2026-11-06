@@ -42,8 +42,17 @@ from typing import Callable
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
+from cutlass._mlir import ir as _mlir_ir
+from cutlass._mlir.dialects import llvm as _llvm
+from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_stream, make_fake_tensor
+from cutlass.cutlass_dsl import T as _T
+from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.experimental import primitives as _prims
+from cutlass.experimental.primitives.nvvm_wrapper import FPRoundingMode as _FPRnd
 from cutlass.memory import SmemAllocator
+
+from ..common import self_attn_prefill_act_quant_mxf8 as _mxf8
 
 _Q_DIM = 2048
 _KV_DIM = 512
@@ -294,6 +303,225 @@ def _launch_qkv_a_rmsnorm(
 
 
 @cute.jit
+def _rmsnorm_row_q8(
+    src_ptr,
+    weight_ptr,
+    dst_ptr,
+    row: cutlass.Int32,
+    src_row_stride: cutlass.Int32,
+    dst_row_stride: cutlass.Int32,
+    warp_sums: cute.Tensor,
+    tidx: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    strided_dst: cutlass.Constexpr[bool],
+    q8_base,
+    sf_base,
+    q8_rows: cutlass.Int32,
+) -> None:
+    """``_rmsnorm_row`` for the q segment (``_Q_DIM`` = 256 threads x 8 columns, so every
+    thread owns a chunk) that also writes the row as MXF8: e4m3 bytes at ``q8_base``
+    (compact ``[q8_rows, _Q_DIM]``) and the blocked e8m0 scales at ``sf_base``, from the
+    BF16 values just stored -- the bytes ``self_attn_prefill_act_quant_mxf8`` writes.
+    Thread ``t`` holds columns ``8t .. 8t + 7``: a 32-column scale block is lanes
+    ``4j .. 4j + 3`` of one warp, all of which reach the block-max shuffles.  The BF16
+    arithmetic is ``_rmsnorm_row``'s instruction for instruction."""
+    WIDTH = _Q_DIM
+    lane_id = tidx % _WARP_SIZE
+    warp_id = tidx // _WARP_SIZE
+    col = tidx * _BF16_VEC_SIZE
+    src_offset = row * src_row_stride + col
+    if cutlass.const_expr(strided_dst):
+        dst_offset = row * dst_row_stride + col
+    else:
+        dst_offset = row * cutlass.Int32(WIDTH) + col
+
+    values = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.BFloat16)
+    weights = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.BFloat16)
+    loaded_weights = _load_bf16x8(weight_ptr, col)
+    for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+        weights[vec_lane] = loaded_weights[vec_lane]
+
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_wait()
+
+    local_sum_sq = cutlass.Float32(0.0)
+    loaded_values = _load_bf16x8(src_ptr, src_offset)
+    for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+        values[vec_lane] = loaded_values[vec_lane]
+        value_f32 = loaded_values[vec_lane].to(cutlass.Float32)
+        local_sum_sq = local_sum_sq + value_f32 * value_f32
+
+    warp_sum = _warp_sum_f32(local_sum_sq)
+    if lane_id == 0:
+        warp_sums[warp_id] = warp_sum
+
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
+
+    if tidx == 0:
+        total_sum = cutlass.Float32(0.0)
+        for warp_idx in cutlass.range_constexpr(_WARPS_PER_BLOCK):
+            total_sum = total_sum + warp_sums[warp_idx]
+        warp_sums[0] = cute.math.rsqrt(
+            total_sum * cutlass.Float32(1.0 / WIDTH) + eps,
+            fastmath=True,
+        )
+
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
+    inv_rms = warp_sums[0]
+
+    normalized = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.BFloat16)
+    vals = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+    for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+        norm_f32 = values[vec_lane].to(cutlass.Float32) * inv_rms
+        norm_f32 = norm_f32 * weights[vec_lane].to(cutlass.Float32)
+        normalized[vec_lane] = norm_f32.to(cutlass.BFloat16)
+        vals[vec_lane] = normalized[vec_lane].to(cutlass.Float32)
+    _store_bf16x8(dst_ptr, dst_offset, normalized)
+    _mxf8.mxf8_quant_store_x8(
+        vals,
+        q8_base,
+        cutlass.Int64(row) * WIDTH + cutlass.Int64(col),
+        sf_base,
+        cutlass.Int64(row),
+        cutlass.Int64(col),
+        cutlass.Int64(WIDTH // 128),
+        row < q8_rows,
+    )
+
+
+@cute.kernel
+def _qkv_a_rmsnorm_kernel_q8(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    strided_dst: cutlass.Constexpr[bool],
+    early_signal: cutlass.Constexpr[bool],
+) -> None:
+    """``_qkv_a_rmsnorm_kernel`` (one CTA per row and segment, decode rows) that also writes
+    the first ``q8_rows = q8_output.shape[0]`` normalized q rows as MXF8 (decode act-quant fusion: the
+    decode q_b launcher's scratch).  The kv-segment CTAs also write code 127 into the scale
+    rows ``q8_rows .. padded_rows(q8_rows) - 1`` after the PDL wait.  ``early_signal``
+    releases the dependent (q_b's decode GEMM) at entry; otherwise at the end, as the CTA
+    kernel does.  BF16 outputs bitwise ``_qkv_a_rmsnorm_kernel``'s."""
+    if cutlass.const_expr(use_pdl and early_signal):
+        cute.arch.griddepcontrol_launch_dependents()
+    row, segment, _ = cute.arch.block_idx()
+    grid_x, _, _ = cute.arch.grid_dim()
+    tidx, _, _ = cute.arch.thread_idx()
+    q8_rows = cute.size(q8_output, mode=[0])
+
+    smem = SmemAllocator()
+    warp_sums = smem.allocate_tensor(
+        cutlass.Float32,
+        cute.make_layout((_WARPS_PER_BLOCK,)),
+        byte_alignment=_ALIGNMENT_BYTES,
+    )
+
+    if segment == 0:
+        _rmsnorm_row_q8(
+            q_input.iterator,
+            q_weight.iterator,
+            q_output.iterator,
+            row,
+            q_row_stride,
+            q_dst_row_stride,
+            warp_sums,
+            tidx,
+            eps,
+            use_pdl,
+            strided_dst,
+            q8_output.iterator,
+            q8_scales.iterator,
+            q8_rows,
+        )
+    else:
+        _rmsnorm_row(
+            kv_input.iterator,
+            kv_weight.iterator,
+            kv_output.iterator,
+            row,
+            kv_row_stride,
+            kv_dst_row_stride,
+            warp_sums,
+            tidx,
+            eps,
+            use_pdl,
+            strided_dst,
+            _KV_DIM,
+        )
+        _mxf8.mxf8_fill_pad_scales(
+            q8_scales.iterator,
+            q8_rows,
+            cutlass.Int32(_Q_DIM // 128),
+            row * _THREADS_PER_BLOCK + tidx,
+            grid_x * _THREADS_PER_BLOCK,
+        )
+
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
+    if cutlass.const_expr(use_pdl and not early_signal):
+        if tidx == 0:
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def _launch_qkv_a_rmsnorm_q8(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    strided_dst: cutlass.Constexpr[bool],
+    early_signal: cutlass.Constexpr[bool],
+) -> None:
+    rows = cute.size(q_input, mode=[0])
+    _qkv_a_rmsnorm_kernel_q8(
+        q_input,
+        q_weight,
+        kv_input,
+        kv_weight,
+        q_output,
+        kv_output,
+        q8_output,
+        q8_scales,
+        q_row_stride,
+        kv_row_stride,
+        q_dst_row_stride,
+        kv_dst_row_stride,
+        eps,
+        use_pdl,
+        strided_dst,
+        early_signal,
+    ).launch(
+        grid=(rows, 2, 1),
+        block=(_THREADS_PER_BLOCK, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+@cute.jit
 def _rmsnorm_row_warp(
     src_ptr,
     weight_ptr,
@@ -306,9 +534,20 @@ def _rmsnorm_row_warp(
     use_pdl: cutlass.Constexpr[bool],
     strided_dst: cutlass.Constexpr[bool],
     WIDTH: cutlass.Constexpr[int],
+    q8_base,
+    sf_base,
+    q8_rows: cutlass.Int32,
+    emit_q8: cutlass.Constexpr[bool],
 ) -> None:
     """Normalize one row with a single warp; same FP32 reduction order as
-    ``_rmsnorm_row`` (see the module docstring), so the bytes are identical."""
+    ``_rmsnorm_row`` (see the module docstring), so the bytes are identical.
+
+    ``emit_q8``: rows ``< q8_rows`` are also written as MXF8 (e4m3 bytes at ``q8_base``,
+    compact ``[q8_rows, WIDTH]``, and the blocked e8m0 scales at ``sf_base``) from the BF16
+    values just stored -- the bytes ``self_attn_prefill_act_quant_mxf8`` writes for them.
+    Lane ``l`` of pass ``p`` holds columns ``(p * 32 + l) * 8``, so a 32-column scale block
+    is lanes ``4j .. 4j + 3`` of one pass; the whole warp shares the row, so every lane
+    reaches the block-max shuffles."""
 
     PASSES = WIDTH // (_WARP_SIZE * _BF16_VEC_SIZE)
     src_row = row * src_row_stride
@@ -354,6 +593,20 @@ def _rmsnorm_row_warp(
             norm_f32 = norm_f32 * loaded_weights[vec_lane].to(cutlass.Float32)
             normalized[vec_lane] = norm_f32.to(cutlass.BFloat16)
         _store_bf16x8_aligned(dst_ptr, dst_row + col, normalized)
+        if cutlass.const_expr(emit_q8):
+            vals = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+            for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+                vals[vec_lane] = normalized[vec_lane].to(cutlass.Float32)
+            _mxf8.mxf8_quant_store_x8(
+                vals,
+                q8_base,
+                cutlass.Int64(row) * WIDTH + cutlass.Int64(col),
+                sf_base,
+                cutlass.Int64(row),
+                cutlass.Int64(col),
+                cutlass.Int64(WIDTH // 128),
+                row < q8_rows,
+            )
 
 
 @cute.kernel
@@ -393,6 +646,10 @@ def _qkv_a_rmsnorm_kernel_warp_row(
                 use_pdl,
                 strided_dst,
                 _Q_DIM,
+                q_output.iterator,
+                q_output.iterator,
+                cutlass.Int32(0),
+                False,
             )
         else:
             _rmsnorm_row_warp(
@@ -407,6 +664,10 @@ def _qkv_a_rmsnorm_kernel_warp_row(
                 use_pdl,
                 strided_dst,
                 _KV_DIM,
+                kv_output.iterator,
+                kv_output.iterator,
+                cutlass.Int32(0),
+                False,
             )
 
     cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
@@ -447,6 +708,143 @@ def _launch_qkv_a_rmsnorm_warp_row(
         eps,
         use_pdl,
         strided_dst,
+    ).launch(
+        grid=(cute.ceil_div(rows, _WARPS_PER_BLOCK), 2, 1),
+        block=(_THREADS_PER_BLOCK, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+@cute.kernel
+def _qkv_a_rmsnorm_kernel_warp_row_q8(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    strided_dst: cutlass.Constexpr[bool],
+    early_signal: cutlass.Constexpr[bool],
+) -> None:
+    """``_qkv_a_rmsnorm_kernel_warp_row`` that also writes the first ``q8_rows =
+    q8_output.shape[0]`` normalized q rows as MXF8 (the FP8 context route's q_b operand).
+    The kv-segment CTAs (light: 512 columns) also write code 127 into the scale rows
+    ``q8_rows .. padded_rows(q8_rows) - 1``, after the PDL wait like every other store.
+
+    ``early_signal`` (decode act-quant fusion decode rows): release the dependent (q_b's decode GEMM, which
+    streams its weights before its own wait) at entry, as the standalone PDL act quant did,
+    instead of after the last store."""
+    if cutlass.const_expr(use_pdl and early_signal):
+        cute.arch.griddepcontrol_launch_dependents()
+    row_block, segment, _ = cute.arch.block_idx()
+    grid_x, _, _ = cute.arch.grid_dim()
+    tidx, _, _ = cute.arch.thread_idx()
+    rows = cute.size(q_input, mode=[0])
+    q8_rows = cute.size(q8_output, mode=[0])
+    lane_id = tidx % _WARP_SIZE
+    row = row_block * _WARPS_PER_BLOCK + tidx // _WARP_SIZE
+
+    if row < rows:
+        if segment == 0:
+            _rmsnorm_row_warp(
+                q_input.iterator,
+                q_weight.iterator,
+                q_output.iterator,
+                row,
+                q_row_stride,
+                q_dst_row_stride,
+                lane_id,
+                eps,
+                use_pdl,
+                strided_dst,
+                _Q_DIM,
+                q8_output.iterator,
+                q8_scales.iterator,
+                q8_rows,
+                True,
+            )
+        else:
+            _rmsnorm_row_warp(
+                kv_input.iterator,
+                kv_weight.iterator,
+                kv_output.iterator,
+                row,
+                kv_row_stride,
+                kv_dst_row_stride,
+                lane_id,
+                eps,
+                use_pdl,
+                strided_dst,
+                _KV_DIM,
+                kv_output.iterator,
+                kv_output.iterator,
+                cutlass.Int32(0),
+                False,
+            )
+    if segment == 1:
+        if cutlass.const_expr(use_pdl):
+            cute.arch.griddepcontrol_wait()
+        _mxf8.mxf8_fill_pad_scales(
+            q8_scales.iterator,
+            q8_rows,
+            cutlass.Int32(_Q_DIM // 128),
+            row_block * _THREADS_PER_BLOCK + tidx,
+            grid_x * _THREADS_PER_BLOCK,
+        )
+
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
+    if cutlass.const_expr(use_pdl):
+        if tidx == 0:
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def _launch_qkv_a_rmsnorm_warp_row_q8(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    strided_dst: cutlass.Constexpr[bool],
+    early_signal: cutlass.Constexpr[bool] = False,
+) -> None:
+    rows = cute.size(q_input, mode=[0])
+    _qkv_a_rmsnorm_kernel_warp_row_q8(
+        q_input,
+        q_weight,
+        kv_input,
+        kv_weight,
+        q_output,
+        kv_output,
+        q8_output,
+        q8_scales,
+        q_row_stride,
+        kv_row_stride,
+        q_dst_row_stride,
+        kv_dst_row_stride,
+        eps,
+        use_pdl,
+        strided_dst,
+        early_signal,
     ).launch(
         grid=(cute.ceil_div(rows, _WARPS_PER_BLOCK), 2, 1),
         block=(_THREADS_PER_BLOCK, 1, 1),
@@ -546,6 +944,750 @@ def compile_qkv_a_rmsnorm_warp_row(
     return compiled
 
 
+_WARP_ROW_Q8_COMPILE_CACHE: dict[tuple[int, float, bool, bool, bool], Callable] = {}
+
+
+def compile_qkv_a_rmsnorm_warp_row_q8(
+    device_id: int = 0,
+    eps: float = _DEFAULT_EPS,
+    *,
+    use_pdl: bool = True,
+    inplace_kv_view: bool = False,
+    early_signal: bool = False,
+) -> Callable:
+    """The warp-row kernel with the MXF8 q copy (``_qkv_a_rmsnorm_kernel_warp_row_q8``).
+
+    ``fn(q_in, q_w, kv_in, kv_w, q_out, kv_out, q8 [R8, 2048] uint8 (compact, R8 <= rows),
+    sf uint8 (>= act_quant sf_bytes(R8, 2048), 32-byte aligned), q_pitch, kv_pitch,
+    q_dst_pitch, kv_dst_pitch, stream)``; ``R8 >= 1``.  The host selects it only where it
+    would select the warp-row kernel (``_use_warp_row_path``) -- and (decode act-quant fusion) on decode
+    rows with ``q8`` the decode q_b launcher's 64-row scratch and ``early_signal=True``;
+    its BF16 outputs are bitwise the CTA kernel's (module docstring)."""
+    key = (
+        device_id,
+        float(eps),
+        bool(use_pdl),
+        bool(inplace_kv_view),
+        bool(early_signal),
+    )
+    if key in _WARP_ROW_Q8_COMPILE_CACHE:
+        return _WARP_ROW_Q8_COMPILE_CACHE[key]
+    cutlass.cuda.initialize_cuda_context(device_id)
+    fakes = _make_fake_rmsnorm_arguments(bool(inplace_kv_view), _ALIGNMENT_BYTES)
+    fake_q8 = make_fake_compact_tensor(
+        cutlass.Uint8,
+        (cute.sym_int32(), _Q_DIM),
+        stride_order=(1, 0),
+        assumed_align=_ALIGNMENT_BYTES,
+    )
+    fake_sf = make_fake_compact_tensor(cutlass.Uint8, (cute.sym_int32(),), assumed_align=32)
+    compiled = cute.compile(
+        _launch_qkv_a_rmsnorm_warp_row_q8,
+        *fakes,
+        fake_q8,
+        fake_sf,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        cutlass.Float32(eps),
+        bool(use_pdl),
+        bool(inplace_kv_view),
+        bool(early_signal),
+        options="--enable-tvm-ffi",
+    )
+    _WARP_ROW_Q8_COMPILE_CACHE[key] = compiled
+    return compiled
+
+
+# --------------------------------------------------------------------------- context-step stitch
+# Context-step variant of ``_qkv_a_rmsnorm_kernel_warp_row_q8`` (the served kernels above are
+# untouched; this is a separate symbol, ``..._warp_row_q8_ctx``). Same row work, same FP32
+# reduction order, same BF16 / MXF8 bytes, plus two context-only options:
+#
+# * ``q_store_from`` (runtime): the BF16 q row is stored only for rows >= ``q_store_from``.
+#   On a context step whose indexer takes the engine's substituted selection (``need_q``
+#   False) the MXF8 copy is q_b's whole operand and the only reader of the BF16 q_a is the
+#   generation rows' q_b cell, which reads at most the last 64 rows (``_Projection.tail``);
+#   the caller passes ``max(0, ctx_rows - 64)`` there and 0 everywhere else. At T ~ 7.3k that
+#   is 30 MB of the kernel's ~90 MB of DRAM traffic not written.
+# * ``kv_append`` (constexpr): the kv segment also writes each context row's normalized
+#   c_kv (rows < ``q8_rows`` = the step's context rows) as E4M3 into the layer's paged
+#   latent pool -- the bytes and the KVBlockArray address the prefill rope/append kernel's
+#   c_kv copy groups write (``cvt.rn.satfinite`` of the stored BF16 values, row ``pos`` of
+#   request ``b`` at ``block_offsets[b, 0, pos // tpb] * tpb * 576 + (pos % tpb) * 576``,
+#   ``pos = row - cu_seqlens[b] + cached_lens[b]``) -- so that kernel runs with
+#   ``skip_kv_copy`` and never re-reads the 7.5 MB of latent rows to copy them.
+_LATENT_ROW_BYTES = _KV_DIM + 64  # one E4M3 pool row: [c_kv 512 | k_pe 64]
+_CTX_MAX_REQUESTS = 64  # binary-search depth 6, as the rope/append kernel
+
+
+@cute.jit
+def _ctx_locate_request(cu_seqlens: cute.Tensor, num_requests, token) -> cutlass.Int32:
+    """The largest b < num_requests with cu_seqlens[b] <= token (the rope/append kernel's
+    ``_locate_request``: a fixed six-probe binary search over non-decreasing prefix sums)."""
+    req = cutlass.Int32(0)
+    for i in cutlass.range_constexpr(6):
+        cand = req + cutlass.Int32(_CTX_MAX_REQUESTS // 2 >> i)
+        if cand < num_requests:
+            if token >= cu_seqlens[cand]:
+                req = cand
+    return req
+
+
+@cute.jit
+def _rmsnorm_row_warp_ctx(
+    src_ptr,
+    weight_ptr,
+    dst_ptr,
+    row: cutlass.Int32,
+    src_row_stride: cutlass.Int32,
+    dst_row_stride: cutlass.Int32,
+    lane_id: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    WIDTH: cutlass.Constexpr[int],
+    q8_base,
+    sf_base,
+    q8_rows: cutlass.Int32,
+    emit_q8: cutlass.Constexpr[bool],
+    store_row: cutlass.Boolean,
+    pool_base,
+    cache_base: cutlass.Int64,
+    append: cutlass.Boolean,
+    kv_append: cutlass.Constexpr[bool],
+) -> None:
+    """``_rmsnorm_row_warp`` (strided destination) with the two context-step stitch options: the BF16
+    store only when ``store_row``, and, under ``kv_append``, the E4M3 copy of the stored row
+    at ``pool_base + cache_base`` when ``append``. The loads, the reduction, the normalize
+    and the MXF8 copy are the same instructions in the same order."""
+
+    PASSES = WIDTH // (_WARP_SIZE * _BF16_VEC_SIZE)
+    src_row = row * src_row_stride
+    dst_row = row * dst_row_stride
+
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_wait()
+
+    chunks = []
+    for pass_idx in cutlass.range_constexpr(PASSES):
+        col = (pass_idx * _WARP_SIZE + lane_id) * _BF16_VEC_SIZE
+        chunks.append(_load_bf16x8_aligned(src_ptr, src_row + col))
+
+    total_sum = cutlass.Float32(0.0)
+    for pass_idx in cutlass.range_constexpr(PASSES):
+        local_sum_sq = cutlass.Float32(0.0)
+        for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+            value_f32 = chunks[pass_idx][vec_lane].to(cutlass.Float32)
+            local_sum_sq = local_sum_sq + value_f32 * value_f32
+        total_sum = total_sum + _warp_sum_f32(local_sum_sq)
+
+    inv_rms = cute.math.rsqrt(
+        total_sum * cutlass.Float32(1.0 / WIDTH) + eps,
+        fastmath=True,
+    )
+
+    for pass_idx in cutlass.range_constexpr(PASSES):
+        col = (pass_idx * _WARP_SIZE + lane_id) * _BF16_VEC_SIZE
+        loaded_weights = _load_bf16x8_aligned(weight_ptr, col)
+        normalized = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.BFloat16)
+        for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+            norm_f32 = chunks[pass_idx][vec_lane].to(cutlass.Float32) * inv_rms
+            norm_f32 = norm_f32 * loaded_weights[vec_lane].to(cutlass.Float32)
+            normalized[vec_lane] = norm_f32.to(cutlass.BFloat16)
+        if store_row:
+            _store_bf16x8_aligned(dst_ptr, dst_row + col, normalized)
+        if cutlass.const_expr(emit_q8):
+            vals = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+            for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+                vals[vec_lane] = normalized[vec_lane].to(cutlass.Float32)
+            _mxf8.mxf8_quant_store_x8(
+                vals,
+                q8_base,
+                cutlass.Int64(row) * WIDTH + cutlass.Int64(col),
+                sf_base,
+                cutlass.Int64(row),
+                cutlass.Int64(col),
+                cutlass.Int64(WIDTH // 128),
+                row < q8_rows,
+            )
+        if cutlass.const_expr(kv_append):
+            if append:
+                kv_vals = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+                for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+                    kv_vals[vec_lane] = normalized[vec_lane].to(cutlass.Float32)
+                kv8 = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float8E4M3FN)
+                kv8.store(kv_vals.load().to(cutlass.Float8E4M3FN))
+                pool_dst = cute.make_tensor(
+                    cute.recast_ptr(
+                        pool_base + cute.assume(cache_base + cutlass.Int64(col), _BF16_VEC_SIZE),
+                        dtype=cutlass.Float8E4M3FN,
+                    ),
+                    cute.make_layout((_BF16_VEC_SIZE,)),
+                )
+                cute.autovec_copy(kv8, pool_dst)
+
+
+@cute.kernel
+def _qkv_a_rmsnorm_kernel_warp_row_q8_ctx(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    pool: cute.Tensor,
+    block_offsets: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    cached_lens: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    q_store_from: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    kv_append: cutlass.Constexpr[bool],
+    tokens_per_block: cutlass.Constexpr[int],
+) -> None:
+    """``_qkv_a_rmsnorm_kernel_warp_row_q8`` (strided destinations, no early signal) with the
+    context-step stitch options (block comment above). Grid ``(ceil(rows / 8), 2)``."""
+    row_block, segment, _ = cute.arch.block_idx()
+    grid_x, _, _ = cute.arch.grid_dim()
+    tidx, _, _ = cute.arch.thread_idx()
+    rows = cute.size(q_input, mode=[0])
+    q8_rows = cute.size(q8_output, mode=[0])
+    lane_id = tidx % _WARP_SIZE
+    row = row_block * _WARPS_PER_BLOCK + tidx // _WARP_SIZE
+
+    if row < rows:
+        if segment == 0:
+            _rmsnorm_row_warp_ctx(
+                q_input.iterator,
+                q_weight.iterator,
+                q_output.iterator,
+                row,
+                q_row_stride,
+                q_dst_row_stride,
+                lane_id,
+                eps,
+                use_pdl,
+                _Q_DIM,
+                q8_output.iterator,
+                q8_scales.iterator,
+                q8_rows,
+                True,
+                row >= q_store_from,
+                pool.iterator,
+                cutlass.Int64(0),
+                row < 0,
+                False,
+            )
+        else:
+            cache_base = cutlass.Int64(0)
+            append = cutlass.Int32(0)
+            if cutlass.const_expr(kv_append):
+                # the request tables are host uploads ahead of this step; read after the
+                # wait like every other operand
+                if cutlass.const_expr(use_pdl):
+                    cute.arch.griddepcontrol_wait()
+                if row < q8_rows:
+                    num_requests = cute.size(cached_lens, mode=[0])
+                    max_blocks = cute.size(block_offsets, mode=[2])
+                    req = _ctx_locate_request(cu_seqlens, num_requests, row)
+                    position = row - cu_seqlens[req] + cached_lens[req]
+                    block_in_seq = position // cutlass.Int32(tokens_per_block)
+                    local_token = position & cutlass.Int32(tokens_per_block - 1)
+                    if block_in_seq < max_blocks:
+                        block = block_offsets[req, 0, block_in_seq]
+                        cache_base = cutlass.Int64(block) * cutlass.Int64(
+                            tokens_per_block * _LATENT_ROW_BYTES
+                        ) + cutlass.Int64(local_token * _LATENT_ROW_BYTES)
+                        append = cutlass.Int32(1)
+            _rmsnorm_row_warp_ctx(
+                kv_input.iterator,
+                kv_weight.iterator,
+                kv_output.iterator,
+                row,
+                kv_row_stride,
+                kv_dst_row_stride,
+                lane_id,
+                eps,
+                use_pdl,
+                _KV_DIM,
+                kv_output.iterator,
+                kv_output.iterator,
+                cutlass.Int32(0),
+                False,
+                row >= 0,
+                pool.iterator,
+                cache_base,
+                append != 0,
+                kv_append,
+            )
+    if segment == 1:
+        if cutlass.const_expr(use_pdl):
+            cute.arch.griddepcontrol_wait()
+        _mxf8.mxf8_fill_pad_scales(
+            q8_scales.iterator,
+            q8_rows,
+            cutlass.Int32(_Q_DIM // 128),
+            row_block * _THREADS_PER_BLOCK + tidx,
+            grid_x * _THREADS_PER_BLOCK,
+        )
+
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
+    if cutlass.const_expr(use_pdl):
+        if tidx == 0:
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def _launch_qkv_a_rmsnorm_warp_row_q8_ctx(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    pool: cute.Pointer,
+    block_offsets: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    cached_lens: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    q_store_from: cutlass.Int32,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    kv_append: cutlass.Constexpr[bool],
+    tokens_per_block: cutlass.Constexpr[int],
+) -> None:
+    rows = cute.size(q_input, mode=[0])
+    storage = cute.make_tensor(pool, cute.make_layout((1,), stride=(1,)))
+    _qkv_a_rmsnorm_kernel_warp_row_q8_ctx(
+        q_input,
+        q_weight,
+        kv_input,
+        kv_weight,
+        q_output,
+        kv_output,
+        q8_output,
+        q8_scales,
+        storage,
+        block_offsets,
+        cu_seqlens,
+        cached_lens,
+        q_row_stride,
+        kv_row_stride,
+        q_dst_row_stride,
+        kv_dst_row_stride,
+        q_store_from,
+        eps,
+        use_pdl,
+        kv_append,
+        tokens_per_block,
+    ).launch(
+        grid=(cute.ceil_div(rows, _WARPS_PER_BLOCK), 2, 1),
+        block=(_THREADS_PER_BLOCK, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
+_WARP_ROW_Q8_CTX_COMPILE_CACHE: dict[tuple[int, float, bool, bool, int, bool], Callable] = {}
+
+
+def compile_qkv_a_rmsnorm_warp_row_q8_ctx(
+    device_id: int = 0,
+    eps: float = _DEFAULT_EPS,
+    *,
+    use_pdl: bool = True,
+    kv_append: bool = False,
+    tokens_per_block: int = 32,
+    ilp: bool = False,
+) -> Callable:
+    """The context-step warp-row q8 kernel with the context-step stitch options (in-place kv view).
+
+    ``fn(q_in, q_w, kv_in, kv_w, q_out, kv_out, q8 [R8, 2048] uint8, sf uint8, pool (int
+    layer base pointer, 16-byte aligned), block_offsets int32 [B, 2, max_blocks] contiguous,
+    cu_seqlens int32 [>= B + 1], cached_lens int32 [B], q_pitch, kv_pitch, q_dst_pitch,
+    kv_dst_pitch, q_store_from, stream)``. ``R8`` = the step's context rows (rows below it
+    get the MXF8 copy and, under ``kv_append``, the pool append); ``q_store_from = 0``
+    reproduces ``compile_qkv_a_rmsnorm_warp_row_q8``'s bytes exactly. Without ``kv_append``
+    the pool / table operands are not read (any valid tensors of the right dtypes).
+    ``ilp=True``: the ILP build (kernel ``..._warp_row_q8_ctx_ilp``; same ABI and output
+    bytes, fewer instructions per element -- block comment above ``_cvt_bf16x2_rn``)."""
+    if tokens_per_block <= 0 or tokens_per_block & (tokens_per_block - 1):
+        raise ValueError(f"tokens_per_block must be a power of two, got {tokens_per_block}")
+    if ilp and kv_append:
+        raise ValueError("ilp=True has no kv_append build")
+    key = (
+        device_id,
+        float(eps),
+        bool(use_pdl),
+        bool(kv_append),
+        int(tokens_per_block),
+        bool(ilp),
+    )
+    if key in _WARP_ROW_Q8_CTX_COMPILE_CACHE:
+        return _WARP_ROW_Q8_CTX_COMPILE_CACHE[key]
+    cutlass.cuda.initialize_cuda_context(device_id)
+    fakes = _make_fake_rmsnorm_arguments(True, _ALIGNMENT_BYTES)
+    fake_q8 = make_fake_compact_tensor(
+        cutlass.Uint8,
+        (cute.sym_int32(), _Q_DIM),
+        stride_order=(1, 0),
+        assumed_align=_ALIGNMENT_BYTES,
+    )
+    fake_sf = make_fake_compact_tensor(cutlass.Uint8, (cute.sym_int32(),), assumed_align=32)
+    fake_pool = cute.runtime.make_ptr(
+        cutlass.Uint8, 0, cutlass.AddressSpace.gmem, assumed_align=_ALIGNMENT_BYTES
+    )
+    sym_requests = cute.sym_int32()
+    fake_offsets = make_fake_compact_tensor(
+        cutlass.Int32,
+        (sym_requests, 2, cute.sym_int32()),
+        stride_order=(2, 1, 0),
+        assumed_align=4,
+    )
+    fake_cu = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int32(),), assumed_align=4)
+    fake_cached = make_fake_compact_tensor(cutlass.Int32, (sym_requests,), assumed_align=4)
+    compiled = cute.compile(
+        _launch_qkv_a_rmsnorm_warp_row_q8_ctx_ilp if ilp else _launch_qkv_a_rmsnorm_warp_row_q8_ctx,
+        *fakes,
+        fake_q8,
+        fake_sf,
+        fake_pool,
+        fake_offsets,
+        fake_cu,
+        fake_cached,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        cutlass.Float32(eps),
+        bool(use_pdl),
+        bool(kv_append),
+        int(tokens_per_block),
+        options="--enable-tvm-ffi",
+    )
+    _WARP_ROW_Q8_CTX_COMPILE_CACHE[key] = compiled
+    return compiled
+
+
+# ---------------------------------------------------------------------------------------------
+# The ILP build (option ``ilp=True`` of ``compile_qkv_a_rmsnorm_warp_row_q8_ctx``; separate
+# kernel symbol ``..._warp_row_q8_ctx_ilp``, the served build is untouched). The context norm is
+# issue-bound (issue slots 53 %, DRAM 27 %, ~21 SASS instructions per element per lane,
+# 12.1M warp instructions at T 7310). Same loads, reduction order, rsqrt and per-element
+# IEEE operations as ``_rmsnorm_row_warp_ctx``; fewer instructions for them:
+#   * normalize: ``x * inv_rms`` and ``* w`` as packed FMUL2 pairs (two FMUL each before);
+#   * BF16 rounding: one packed ``cvt.rn.bf16x2.f32`` (F2FP, ALU pipe) per pair instead of a scalar
+#     ``F2F.BF16.F32`` per value on the XU pipe; the quantizer's FP32 inputs are the two halves of
+#     the packed word (shift / mask), exactly the BF16 values the served path widens;
+#   * MXF8 block max: an FMNMX tree over |v| and FMNMX after each of the two lane shuffles (a
+#     compare + select per value before; the same value: |v| >= 0, maxNumber ignores NaN as
+#     ``a > m`` does);
+#   * the block scale's reciprocal from its exponent: the scale is a power of two 2^(c - 127) with
+#     c = code in [79, 247] (amax >= 1e-12, BF16 finite), so 1 / scale == bits (254 - c) << 23
+#     exactly (an FP32 division -- MUFU.RCP + Newton + special-case branch -- before).
+# Output bytes (BF16 q / kv rows, E4M3 q, every scale byte) are identical to the served build.
+# No ``kv_append``: appending the c_kv rows from this kernel measured slower.
+
+
+@dsl_user_op
+def _cvt_bf16x2_rn(hi, lo, *, loc=None, ip=None) -> cutlass.Int32:
+    """Round two FP32 values to BF16 (RN-even) with one packed ``cvt.rn.bf16x2.f32``: ``hi`` in
+    bits 31..16, ``lo`` in bits 15..0 (``F2FP.BF16.F32.PACK_AB``)."""
+    v = _nvvm.convert_f32x2_to_bf16x2(
+        _mlir_ir.VectorType.get([2], cutlass.BFloat16.mlir_type, loc=loc),
+        cutlass.Float32(hi).ir_value(loc=loc, ip=ip),
+        cutlass.Float32(lo).ir_value(loc=loc, ip=ip),
+        rnd=_nvvm.FPRoundingMode.RN,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(_llvm.bitcast(_T.i32(), v, loc=loc, ip=ip))
+
+
+@cute.jit
+def _mxf8_quant_store_x8_ilp(
+    vals: cute.Tensor,
+    local_max: cutlass.Float32,
+    q_base,
+    q_off: cutlass.Int64,
+    sf_base,
+    m: cutlass.Int64,
+    col: cutlass.Int64,
+    k_tiles: cutlass.Int64,
+    store: cutlass.Boolean,
+) -> None:
+    """``_mxf8.mxf8_quant_store_x8`` with the lane's ``local_max = max |vals|`` given: the block
+    max over lanes xor 1 / xor 2 by FMNMX, the scale rule of ``mxf8_code_and_inv_scale`` with the
+    power-of-two reciprocal taken from the exponent (block comment above). Same bytes."""
+    local_max = cute.arch.fmax(local_max, cute.arch.shuffle_sync_bfly(local_max, 1))
+    local_max = cute.arch.fmax(local_max, cute.arch.shuffle_sync_bfly(local_max, 2))
+    safe_amax = cute.arch.fmax(local_max, cutlass.Float32(_mxf8._MIN_AMAX))
+    scale = safe_amax * cutlass.Float32(_mxf8._INV_E4M3_MAX)
+    scale_bits = scale.bitcast(cutlass.Int32)
+    exp_bits = scale_bits & cutlass.Int32(0x7F800000)
+    if (scale_bits & cutlass.Int32(0x007FFFFF)) != cutlass.Int32(0):
+        exp_bits += cutlass.Int32(0x00800000)
+    code = exp_bits >> cutlass.Int32(23)
+    inv_scale = ((cutlass.Int32(254) - code) << cutlass.Int32(23)).bitcast(cutlass.Float32)
+    if store:
+        q8 = cute.make_rmem_tensor((_mxf8._VEC,), cutlass.Float8E4M3FN)
+        q8.store((vals.load() * inv_scale).to(cutlass.Float8E4M3FN))
+        dst = cute.make_tensor(
+            cute.recast_ptr(q_base + cute.assume(q_off, _mxf8._VEC), dtype=cutlass.Float8E4M3FN),
+            cute.make_layout((_mxf8._VEC,)),
+        )
+        cute.autovec_copy(q8, dst)
+        if (col % _mxf8._SF_VEC) == cutlass.Int64(0):
+            (sf_base + _mxf8.mxf8_sf_offset(m, col // _mxf8._SF_VEC, k_tiles)).store(
+                cutlass.Uint8(code)
+            )
+
+
+@cute.jit
+def _rmsnorm_row_warp_ctx_ilp(
+    src_ptr,
+    weight_ptr,
+    dst_ptr,
+    row: cutlass.Int32,
+    src_row_stride: cutlass.Int32,
+    dst_row_stride: cutlass.Int32,
+    lane_id: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    WIDTH: cutlass.Constexpr[int],
+    q8_base,
+    sf_base,
+    q8_rows: cutlass.Int32,
+    emit_q8: cutlass.Constexpr[bool],
+    store_row: cutlass.Boolean,
+) -> None:
+    """``_rmsnorm_row_warp_ctx`` (no kv_append) with the ILP build's instruction diet."""
+
+    PASSES = WIDTH // (_WARP_SIZE * _BF16_VEC_SIZE)
+    src_row = row * src_row_stride
+    dst_row = row * dst_row_stride
+
+    if cutlass.const_expr(use_pdl):
+        cute.arch.griddepcontrol_wait()
+
+    chunks = []
+    for pass_idx in cutlass.range_constexpr(PASSES):
+        col = (pass_idx * _WARP_SIZE + lane_id) * _BF16_VEC_SIZE
+        chunks.append(_load_bf16x8_aligned(src_ptr, src_row + col))
+
+    # the served reduction, instruction for instruction
+    total_sum = cutlass.Float32(0.0)
+    for pass_idx in cutlass.range_constexpr(PASSES):
+        local_sum_sq = cutlass.Float32(0.0)
+        for vec_lane in cutlass.range_constexpr(_BF16_VEC_SIZE):
+            value_f32 = chunks[pass_idx][vec_lane].to(cutlass.Float32)
+            local_sum_sq = local_sum_sq + value_f32 * value_f32
+        total_sum = total_sum + _warp_sum_f32(local_sum_sq)
+
+    inv_rms = cute.math.rsqrt(
+        total_sum * cutlass.Float32(1.0 / WIDTH) + eps,
+        fastmath=True,
+    )
+
+    for pass_idx in cutlass.range_constexpr(PASSES):
+        col = (pass_idx * _WARP_SIZE + lane_id) * _BF16_VEC_SIZE
+        loaded_weights = _load_bf16x8_aligned(weight_ptr, col)
+        words = cute.make_rmem_tensor((_BF16_VEC_SIZE // 2,), cutlass.Int32)
+        vals = cute.make_rmem_tensor((_BF16_VEC_SIZE,), cutlass.Float32)
+        for pair in cutlass.range_constexpr(_BF16_VEC_SIZE // 2):
+            x0 = chunks[pass_idx][2 * pair].to(cutlass.Float32)
+            x1 = chunks[pass_idx][2 * pair + 1].to(cutlass.Float32)
+            # rnd explicit: some cutlass-dsl builds default to RN, public cutlass-dsl 4.8 to none
+            n0, n1 = _prims.mul_packed_f32x2((x0, x1), (inv_rms, inv_rms), rnd=_FPRnd.RN)
+            n0, n1 = _prims.mul_packed_f32x2(
+                (n0, n1),
+                (
+                    loaded_weights[2 * pair].to(cutlass.Float32),
+                    loaded_weights[2 * pair + 1].to(cutlass.Float32),
+                ),
+                rnd=_FPRnd.RN,
+            )
+            packed = _cvt_bf16x2_rn(n1, n0)
+            words[pair] = packed
+            vals[2 * pair] = (packed << cutlass.Int32(16)).bitcast(cutlass.Float32)
+            vals[2 * pair + 1] = (packed & cutlass.Int32(-65536)).bitcast(cutlass.Float32)
+        if store_row:
+            dst = cute.make_tensor(
+                cute.recast_ptr(
+                    dst_ptr + cute.assume(dst_row + col, _BF16_VEC_SIZE),
+                    dtype=cutlass.Int32,
+                ),
+                cute.make_layout((_BF16_VEC_SIZE // 2,)),
+            )
+            cute.autovec_copy(words, dst)
+        if cutlass.const_expr(emit_q8):
+            m01 = cute.arch.fmax(cute.math.absf(vals[0]), cute.math.absf(vals[1]))
+            m23 = cute.arch.fmax(cute.math.absf(vals[2]), cute.math.absf(vals[3]))
+            m45 = cute.arch.fmax(cute.math.absf(vals[4]), cute.math.absf(vals[5]))
+            m67 = cute.arch.fmax(cute.math.absf(vals[6]), cute.math.absf(vals[7]))
+            local_max = cute.arch.fmax(cute.arch.fmax(m01, m23), cute.arch.fmax(m45, m67))
+            _mxf8_quant_store_x8_ilp(
+                vals,
+                local_max,
+                q8_base,
+                cutlass.Int64(row) * WIDTH + cutlass.Int64(col),
+                sf_base,
+                cutlass.Int64(row),
+                cutlass.Int64(col),
+                cutlass.Int64(WIDTH // 128),
+                row < q8_rows,
+            )
+
+
+@cute.kernel
+def _qkv_a_rmsnorm_kernel_warp_row_q8_ctx_ilp(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    q_store_from: cutlass.Int32,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+) -> None:
+    """``_qkv_a_rmsnorm_kernel_warp_row_q8_ctx`` (kv_append off) on the ILP build's row
+    function. Grid ``(ceil(rows / 8), 2)``."""
+    row_block, segment, _ = cute.arch.block_idx()
+    grid_x, _, _ = cute.arch.grid_dim()
+    tidx, _, _ = cute.arch.thread_idx()
+    rows = cute.size(q_input, mode=[0])
+    q8_rows = cute.size(q8_output, mode=[0])
+    lane_id = tidx % _WARP_SIZE
+    row = row_block * _WARPS_PER_BLOCK + tidx // _WARP_SIZE
+
+    if row < rows:
+        if segment == 0:
+            _rmsnorm_row_warp_ctx_ilp(
+                q_input.iterator,
+                q_weight.iterator,
+                q_output.iterator,
+                row,
+                q_row_stride,
+                q_dst_row_stride,
+                lane_id,
+                eps,
+                use_pdl,
+                _Q_DIM,
+                q8_output.iterator,
+                q8_scales.iterator,
+                q8_rows,
+                True,
+                row >= q_store_from,
+            )
+        else:
+            _rmsnorm_row_warp_ctx_ilp(
+                kv_input.iterator,
+                kv_weight.iterator,
+                kv_output.iterator,
+                row,
+                kv_row_stride,
+                kv_dst_row_stride,
+                lane_id,
+                eps,
+                use_pdl,
+                _KV_DIM,
+                kv_output.iterator,
+                kv_output.iterator,
+                cutlass.Int32(0),
+                False,
+                row >= 0,
+            )
+    if segment == 1:
+        if cutlass.const_expr(use_pdl):
+            cute.arch.griddepcontrol_wait()
+        _mxf8.mxf8_fill_pad_scales(
+            q8_scales.iterator,
+            q8_rows,
+            cutlass.Int32(_Q_DIM // 128),
+            row_block * _THREADS_PER_BLOCK + tidx,
+            grid_x * _THREADS_PER_BLOCK,
+        )
+
+    cute.arch.barrier(barrier_id=0, number_of_threads=_THREADS_PER_BLOCK)
+    if cutlass.const_expr(use_pdl):
+        if tidx == 0:
+            cute.arch.griddepcontrol_launch_dependents()
+
+
+@cute.jit
+def _launch_qkv_a_rmsnorm_warp_row_q8_ctx_ilp(
+    q_input: cute.Tensor,
+    q_weight: cute.Tensor,
+    kv_input: cute.Tensor,
+    kv_weight: cute.Tensor,
+    q_output: cute.Tensor,
+    kv_output: cute.Tensor,
+    q8_output: cute.Tensor,
+    q8_scales: cute.Tensor,
+    pool: cute.Pointer,
+    block_offsets: cute.Tensor,
+    cu_seqlens: cute.Tensor,
+    cached_lens: cute.Tensor,
+    q_row_stride: cutlass.Int32,
+    kv_row_stride: cutlass.Int32,
+    q_dst_row_stride: cutlass.Int32,
+    kv_dst_row_stride: cutlass.Int32,
+    q_store_from: cutlass.Int32,
+    stream: cuda.CUstream,
+    eps: cutlass.Constexpr[cutlass.Float32],
+    use_pdl: cutlass.Constexpr[bool],
+    kv_append: cutlass.Constexpr[bool],
+    tokens_per_block: cutlass.Constexpr[int],
+) -> None:
+    # the ABI of ``_launch_qkv_a_rmsnorm_warp_row_q8_ctx``; pool / request tables are not read
+    rows = cute.size(q_input, mode=[0])
+    _qkv_a_rmsnorm_kernel_warp_row_q8_ctx_ilp(
+        q_input,
+        q_weight,
+        kv_input,
+        kv_weight,
+        q_output,
+        kv_output,
+        q8_output,
+        q8_scales,
+        q_row_stride,
+        kv_row_stride,
+        q_dst_row_stride,
+        kv_dst_row_stride,
+        q_store_from,
+        eps,
+        use_pdl,
+    ).launch(
+        grid=(cute.ceil_div(rows, _WARPS_PER_BLOCK), 2, 1),
+        block=(_THREADS_PER_BLOCK, 1, 1),
+        stream=stream,
+        use_pdl=use_pdl,
+    )
+
+
 def compile_qkv_a_rmsnorm(
     device_id: int = 0,
     eps: float = _DEFAULT_EPS,
@@ -638,6 +1780,61 @@ def compile_qkv_a_rmsnorm(
         options="--enable-tvm-ffi",
     )
     _COMPILE_CACHE[key] = compiled
+    return compiled
+
+
+_Q8_COMPILE_CACHE: dict[tuple[int, float, bool, bool, bool], Callable] = {}
+
+
+def compile_qkv_a_rmsnorm_q8(
+    device_id: int = 0,
+    eps: float = _DEFAULT_EPS,
+    *,
+    use_pdl: bool = True,
+    inplace_kv_view: bool = False,
+    early_signal: bool = False,
+) -> Callable:
+    """The CTA kernel with the MXF8 q copy (``_qkv_a_rmsnorm_kernel_q8``, decode rows).
+
+    ``fn(q_in, q_w, kv_in, kv_w, q_out, kv_out, q8 [R8, 2048] uint8 (compact, R8 <= rows),
+    sf uint8 (>= act_quant sf_bytes(R8, 2048), 32-byte aligned), q_pitch, kv_pitch,
+    q_dst_pitch, kv_dst_pitch, stream)``; operands as ``compile_qkv_a_rmsnorm`` (2-byte
+    alignment) plus the q8 buffers (16 / 32 bytes)."""
+    key = (
+        device_id,
+        float(eps),
+        bool(use_pdl),
+        bool(inplace_kv_view),
+        bool(early_signal),
+    )
+    if key in _Q8_COMPILE_CACHE:
+        return _Q8_COMPILE_CACHE[key]
+    cutlass.cuda.initialize_cuda_context(device_id)
+    fakes = _make_fake_rmsnorm_arguments(bool(inplace_kv_view), 2)
+    fake_q8 = make_fake_compact_tensor(
+        cutlass.Uint8,
+        (cute.sym_int32(), _Q_DIM),
+        stride_order=(1, 0),
+        assumed_align=_ALIGNMENT_BYTES,
+    )
+    fake_sf = make_fake_compact_tensor(cutlass.Uint8, (cute.sym_int32(),), assumed_align=32)
+    compiled = cute.compile(
+        _launch_qkv_a_rmsnorm_q8,
+        *fakes,
+        fake_q8,
+        fake_sf,
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        cutlass.Int32(0),
+        make_fake_stream(),
+        cutlass.Float32(eps),
+        bool(use_pdl),
+        bool(inplace_kv_view),
+        bool(early_signal),
+        options="--enable-tvm-ffi",
+    )
+    _Q8_COMPILE_CACHE[key] = compiled
     return compiled
 
 

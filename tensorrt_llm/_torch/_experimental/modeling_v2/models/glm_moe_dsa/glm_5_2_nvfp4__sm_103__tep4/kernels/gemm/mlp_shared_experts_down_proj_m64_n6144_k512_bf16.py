@@ -39,14 +39,24 @@ def schedule_for_m(active_m: int) -> TgvSchedule:
     return TgvSchedule(cta_n, 128, 4)
 
 
-SCHEDULE_BY_M = {
-    active_m: tgv_instance(schedule_for_m(active_m)) for active_m in range(1, 65)
-} | context_instances(
-    persistent_instance(GemmSchedule(True, (128, 192), (2, 1))),
-    persistent_instance(GemmSchedule(True, (256, 192), (2, 1))),
-    persistent_instance(GemmSchedule(True, (256, 256), (2, 1))),
-    persistent_instance(GemmSchedule(True, (256, 256), (2, 1))),
+SCHEDULE_BY_M = (
+    {active_m: tgv_instance(schedule_for_m(active_m)) for active_m in range(1, 65)}
+    | {
+        # MTP3 / MTP5 decode batches (32 sequences x 4 / 6 rows), 96 CTAs each. B300, cold
+        # weights: 4.25 / 5.41 us, against 6.98 / 7.00 us on the shared expert's prefill down
+        # kernel and 6.04 us on the prefill GEMM those rows took.
+        128: tgv_instance(TgvSchedule(128, 128, 4)),
+        192: persistent_instance(GemmSchedule(False, (64, 192), (4, 1))),
+    }
+    | context_instances(
+        persistent_instance(GemmSchedule(True, (128, 192), (2, 1))),
+        persistent_instance(GemmSchedule(True, (256, 192), (2, 1))),
+        persistent_instance(GemmSchedule(True, (256, 256), (2, 1))),
+        persistent_instance(GemmSchedule(True, (256, 256), (2, 1))),
+    )
 )
 SUPPORTED_M_VALUES = tuple(SCHEDULE_BY_M)
+# The decode row counts above 64, built only for an engine drafting more than one token.
+MTP_DECODE_M_VALUES = (128, 192)
 
 build = make_build(ABI, SCHEDULE_BY_M)

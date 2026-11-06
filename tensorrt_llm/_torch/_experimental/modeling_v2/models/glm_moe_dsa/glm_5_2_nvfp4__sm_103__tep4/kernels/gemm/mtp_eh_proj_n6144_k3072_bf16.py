@@ -21,8 +21,8 @@ part of the public module ABI but are not included in local-GEMM timings.
 With ``max_draft_len=1``, generation M is the number of MTP draft rows, equal to
 the graph batch bucket: 1, 2, 4, 8, 16, 24, or 32.  It is not the target-model
 ``2 * batch`` token count.  The measured context/prefill buckets 48, 64, 128,
-256, 512, 1024, 2048, 4096, and 8192 are also specialized; other M values
-retain the TRT-LLM fallback.
+256, 512, 1024, 2048, 4096, and 8192 are also specialized, and 192 for MTP5's
+draft step 0 (``MTP_DECODE_M_VALUES``); other M values retain the TRT-LLM fallback.
 
 Implementation and module ABI
 -----------------------------
@@ -80,6 +80,10 @@ PERSISTENT_SCHEDULE_BY_M = {
     48: GemmSchedule(True, (128, 64), (4, 1), raster_along="n"),
     64: GemmSchedule(True, (128, 64), (4, 1), raster_along="n"),
     128: GemmSchedule(True, (128, 128), (2, 1)),
+    # MTP5's draft step 0 (32 sequences x 6 rows). B300, cold weights, with the norm shard
+    # in front: 13.2 us, against 15.8-16.8 us for (128, 96) / (64, 192) / the 128 schedule;
+    # the MXF8 norm + concat + replicated GEMM those rows took is 29.3 us (no collective).
+    192: GemmSchedule(True, (128, 192), (2, 1)),
     256: GemmSchedule(
         True,
         (256, 96),
@@ -95,6 +99,9 @@ PERSISTENT_SCHEDULE_BY_M = {
 }
 SCHEDULE_BY_M = TGV_SCHEDULE_BY_M | PERSISTENT_SCHEDULE_BY_M
 SUPPORTED_M_VALUES = tuple(SCHEDULE_BY_M)
+# The rows only a decode step of an engine drafting more than one token sends here (MTP5's
+# 192); a context step of that count keeps its own path.
+MTP_DECODE_M_VALUES = (192,)
 
 
 def _compile_projection(
@@ -106,7 +113,11 @@ def _compile_projection(
     """Compile the device implementation selected for one M bucket."""
     if isinstance(schedule, TgvSchedule):
         return compile_swapped_tgv_gemm(input_tensor, weight, output, schedule)
-    return compile_persistent_gemm(input_tensor, weight, output, schedule)
+    # Own symbol name: the shared persistent kernel otherwise inherits the prefix of
+    # whichever projection was compiled last.
+    return compile_persistent_gemm(
+        input_tensor, weight, output, schedule, kernel_name_prefix="glm52_mtp_eh_proj"
+    )
 
 
 def _validate_weight(weight: torch.nn.Parameter) -> None:
@@ -193,6 +204,41 @@ class GLMMtpEhProjAdapter(torch.nn.Module):
         if self.all_reduce is None:
             return local_output
         return self.all_reduce(local_output, all_reduce_params=all_reduce_params)
+
+    def forward_rows(self, input: torch.Tensor, bucket: int) -> torch.Tensor:
+        """``forward`` at ``input``'s row count on the ``bucket``-row instance, compiled for
+        more rows (``launch_rows``: the instances are compiled on dynamic layouts, so the
+        tiles past the last row load zeros and store nothing). Each row is bitwise what the
+        instance writes for it at its own row count. For a decode row count without an
+        instance of its own.
+
+        :raises ValueError: If ``bucket`` has no instance, the row count is outside
+            ``1..bucket``, or the input breaks the ``forward`` contract.
+        """
+        rows = int(input.shape[0]) if input.ndim == 2 else -1
+        kernel = self._kernels.get(int(bucket))
+        if kernel is None or not 0 < rows <= int(bucket):
+            raise ValueError(
+                f"MTP eh_proj: no runtime-M launch of {rows} rows on the {bucket}-row instance"
+            )
+        if (
+            input.shape[1] != LOCAL_INPUT_SIZE
+            or input.dtype != torch.bfloat16
+            or not input.is_cuda
+            or input.device != self.weight.device
+            or input.stride(1) != 1
+            or input.stride(0) not in (LOCAL_INPUT_SIZE, FULL_CONCAT_SIZE)
+        ):
+            raise ValueError(
+                f"MTP eh_proj input must be a CUDA BF16 [M,{LOCAL_INPUT_SIZE}] local shard or "
+                f"staged concat view on the weight's device, got shape={tuple(input.shape)} "
+                f"dtype={input.dtype} stride={input.stride()}"
+            )
+        local_output = input.new_empty((rows, HIDDEN_SIZE))
+        kernel.launch_rows(input, self.weight, local_output)
+        if self.all_reduce is None:
+            return local_output
+        return self.all_reduce(local_output)
 
 
 def make_trtllm_adapter(

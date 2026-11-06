@@ -49,7 +49,10 @@ Shapes and layouts follow the production op:
 
   A    (orig_m, k, 1)          NVFP4, K-major, gathered per token
   SFA  (orig_m, scale_k, 1)    E4M3, linear, one scale per 16 elements
-  B    (n, k, l)               NVFP4, K-major, up and gate interleaved every 64 columns
+  B    (n, k, l)               NVFP4, K-major, up and gate interleaved every 64 columns;
+                               row-major, or with ``b_kblock`` the k-block layout
+                               ``[l][n/128][k/256][128 rows][128 B]`` (``moe_fc1_kblock``),
+                               whose 128 x 128 B TMA boxes are each one contiguous 16 KB read
   SFB  512-byte atoms, (512, scale_k/4, n/128, l)
   C    (m, n/2, 1)             NVFP4, N-major
   SFC  512-byte atoms
@@ -249,6 +252,9 @@ def host_function(
     # passes the device SM count.
     num_sms: cutlass.Constexpr[int],
     stream: cuda_driver.CUstream,
+    # B in the k-block layout (`moe_fc1_kblock`): a 5-D descriptor over
+    # (128 B of K, 128 rows, k-block, row block, expert), the same box and smem image.
+    b_kblock: cutlass.Constexpr[bool] = False,
 ) -> None:
     """Host-side JIT for gather + grouped GEMM + SwiGLU + SFC.
 
@@ -322,18 +328,44 @@ def host_function(
 
     # B is a packed FP4x2 tensor, so the descriptor and its K box use packed-pair
     # coordinates. TMA copies the same packed bytes consumed by the scalar-FP4 MMA.
-    tma_b_desc = cuda.create_tensor_map_tiled_from_view(
-        b_tensor,
-        box_dims=(
-            mma_tiler_mnk[2] // fp4_lanes_per_storage,
-            mma_tiler_mnk[1],
-            1,
-        ),  # (Kx2_slice, N_tile, L_tile)
-        stride_order=(0, 1, 2),
-        swizzle=cuda.TensorMapSwizzle.s128b,
-        dtype=fp4x2_dtype,
-        tma_format=cuda.TensorMapDataFormat.BYTE,
-    )
+    if cutlass.const_expr(b_kblock and (mma_tiler_mnk[1] != 128 or mma_tiler_mnk[2] != 256)):
+        raise ValueError("b_kblock needs mma_tiler_n 128 and mma_tiler_k 256: one box per block")
+    if cutlass.const_expr(b_kblock):
+        # k-block B: each (row block, k-block) is 128 rows x 128 B stored contiguously, so the
+        # box below is one 16 KB read instead of 128 pieces of 128 B at a K/2 row pitch. The
+        # box lands in shared memory exactly as the row-major box does (128 rows of 128 B,
+        # 128 B swizzle). Strides are in 16 B units for dims 1..4.
+        kin = mma_tiler_mnk[2] // fp4_lanes_per_storage
+        rows_in = mma_tiler_mnk[1]
+        kk = b_tensor.shape[0]
+        nn = b_tensor.shape[1]
+        tma_b_desc = cuda.create_tensor_map_tiled(
+            b_tensor.iterator.toint(),
+            fp4x2_dtype,
+            global_dims=[kin, rows_in, kk // kin, nn // rows_in, b_tensor.shape[2]],
+            global_strides=[
+                kin // 16,
+                kin * rows_in // 16,
+                kk * rows_in // 16,
+                kk * nn // 16,
+            ],
+            box_dims=(kin, rows_in, 1, 1, 1),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+            tma_format=cuda.TensorMapDataFormat.BYTE,
+        )
+    else:
+        tma_b_desc = cuda.create_tensor_map_tiled_from_view(
+            b_tensor,
+            box_dims=(
+                mma_tiler_mnk[2] // fp4_lanes_per_storage,
+                mma_tiler_mnk[1],
+                1,
+            ),  # (Kx2_slice, N_tile, L_tile)
+            stride_order=(0, 1, 2),
+            swizzle=cuda.TensorMapSwizzle.s128b,
+            dtype=fp4x2_dtype,
+            tma_format=cuda.TensorMapDataFormat.BYTE,
+        )
 
     # C TMA descriptor. s32b swizzle (Swizzle<1,4,3>) matches what
     # sm100_utils.make_smem_layout_epi derives for (Float4E2M1FN, ROW_MAJOR, (128,64)).
@@ -475,6 +507,7 @@ def host_function(
         num_tmem_cols_per_kblock_sfa,
         num_tmem_cols_per_kblock_sfb,
         tile_sched_params,
+        b_kblock,
     ).launch(
         grid=grid,
         block=[threads_per_cta, 1, 1],
@@ -530,6 +563,7 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
     num_tmem_cols_per_kblock_sfa: cutlass.Constexpr[int],
     num_tmem_cols_per_kblock_sfb: cutlass.Constexpr[int],
     tile_sched_params: PersistentTileSchedulerParams,
+    b_kblock: cutlass.Constexpr[bool] = False,
 ) -> None:
     """GPU device kernel for contiguous grouped mixed precision block-scaled GEMM.
 
@@ -1044,13 +1078,24 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
                 if prims.elect_sync():
                     # TMA coordinates count packed FP4x2 elements; the descriptor
                     # covers the complete logical K tile in one transaction.
-                    prims.cp_async_bulk_tensor_shared_cta_global(
-                        sB_staged,
-                        tma_b_desc.get_ptr(),
-                        (coord_k_packed, coord_n, coord_l_b),
-                        ab_full_mbar_ptr.subview(current_ab_stage),
-                        l2_cache_hint=b_policy,
-                    )
+                    if cutlass.const_expr(b_kblock):
+                        # (byte in K, row, k-block, row block, expert): one N tile is one
+                        # row block.
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            sB_staged,
+                            tma_b_desc.get_ptr(),
+                            (0, 0, k_tile, tile_coord_n, coord_l_b),
+                            ab_full_mbar_ptr.subview(current_ab_stage),
+                            l2_cache_hint=b_policy,
+                        )
+                    else:
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            sB_staged,
+                            tma_b_desc.get_ptr(),
+                            (coord_k_packed, coord_n, coord_l_b),
+                            ab_full_mbar_ptr.subview(current_ab_stage),
+                            l2_cache_hint=b_policy,
+                        )
                     prims.cp_async_bulk_tensor_shared_cta_global(
                         sSFB_staged,
                         tma_sfb_desc.get_ptr(),
@@ -1062,6 +1107,22 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
             work_tile, sched_full_phase = sched_load_work_tile(
                 s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, sched_full_phase
             )
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so the
+        # MMA warp's last `num_ab_stage` commit-arrives are awaited here (as cutlass's
+        # PipelineTmaUmma.producer_tail). Nothing orders them against the accumulator commits
+        # the epilogue waits for, and an arrive still in flight at exit lands in the shared
+        # memory of the next CTA on this SM.
+        for _ in cutlass.range_constexpr(num_ab_stage):
+            while not prims.mbarrier_try_wait_parity(
+                ab_empty_mbar_ptr.subview(ab_stage_idx),
+                ab_mbar_empty_phase_bit,
+                time_limit=10_000_000,
+            ):
+                pass
+            ab_stage_idx = ab_stage_idx + 1
+            if ab_stage_idx == num_ab_stage:
+                ab_stage_idx = 0
+                ab_mbar_empty_phase_bit = ab_mbar_empty_phase_bit ^ 1
 
     # =========================================================================
     # MMA warp (warp 8): TMEM alloc, S2T copy, block-scaled tcgen05.mma compute
@@ -1412,6 +1473,12 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
             s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, 0
         )
         acc_stage_idx = 0
+        # The C staging stage alternates across tiles, not only within one. A per-tile
+        # reset put every tile's first store in stage 1, and with one output subtile per
+        # tile (tile_n 128) the next tile then rewrote that stage while the wait below
+        # (`epi_stages - 1` groups left in flight) still let the previous tile's TMA store
+        # read it: that store published the next tile's values.
+        epi_stage_idx = 0
         while work_tile.is_valid_tile:
             cur_tile_coord = work_tile.tile_idx
             tile_coord_m = cur_tile_coord[0]
@@ -1446,7 +1513,6 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
             else:
                 base_col_id = tmem_base_col + acc_stage_idx * cols_per_acc_stage
 
-            epi_stage_idx = 0
             sfc_local.store(cutlass.vector.full((4,), 0.0, cutlass.Float32))
 
             # Epilogue tiling loop — process pairs: (up_subtile, gate_subtile)
@@ -1634,6 +1700,11 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
             work_tile, sched_full_phase = sched_load_work_tile(
                 s_work_tile, sched_full_mbar_ptr, sched_empty_mbar_ptr, sched_full_phase
             )
+
+        # The last TMA stores must have read C staging before this CTA exits: its shared
+        # memory then goes to whatever CTA the SM runs next.
+        if warp_idx == epilog_warp_id[0]:
+            prims.cp_async_bulk_wait_group(0, read=True)
 
         # Deallocate TMEM after persistent loop — epilogue warps sync
         prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)

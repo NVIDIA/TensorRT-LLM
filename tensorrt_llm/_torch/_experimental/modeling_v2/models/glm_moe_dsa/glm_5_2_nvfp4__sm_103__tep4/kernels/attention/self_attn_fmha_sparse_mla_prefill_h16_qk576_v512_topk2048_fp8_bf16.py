@@ -129,6 +129,8 @@ import cutlass.experimental.cuda as cuda
 import torch
 from cutlass.experimental import primitives as prims
 
+from ..common.cuda_stream import raw_stream as _raw_stream
+
 IO_DTYPE = cutlass.Float8E4M3FN
 OUT_DTYPE = cutlass.BFloat16
 ACC_DTYPE = cutlass.Float32
@@ -247,9 +249,14 @@ NUM_TMEM_COLS_DC: int = 512
 # (latent) / 2 KiB (RoPE) offsets keep the 128-B / 64-B swizzle phase, so the
 # smem image and the dk/dkr/dv descriptors are those of the sparse path.
 KV_BOX_ROWS_DC: int = 32
-# Eight 16-KiB ring slots = one complete five-panel tile plus three panels of
-# look-ahead; nine do not fit the 227-KiB budget.
-ST_KV_DC: int = 8
+# Nine 16-KiB ring slots = one complete five-panel tile plus four panels of
+# look-ahead. The latent panels double as V and stay held until PV(kt) ends, so
+# with eight slots the last latent panel of tile kt+1 waited for PV(kt) plus a
+# TMA round trip and tiles ran back to back. The ninth slot is the 16 KiB the
+# epilogue frees by staging one token at a time (partial_o_tokens below), so
+# total SMEM is unchanged. 8x987 tokens: 180.2 -> 155.6 us; 4x1984: 285.5 ->
+# 224.2 us; output bitwise identical.
+ST_KV_DC: int = 9
 # Q is single-staged (N_DC rows x 576 B = 36 KiB).  q_empty is released by the
 # last QK commit of a group, well before its epilogue, so the next group's Q
 # load still overlaps the current group's softmax/PV tail.
@@ -374,7 +381,7 @@ def _device_index(tensor: torch.Tensor) -> int:
 
 
 def _current_stream(device_index: int) -> cuda_driver.CUstream:
-    return cuda_driver.CUstream(torch.cuda.current_stream(device_index).cuda_stream)
+    return cuda_driver.CUstream(_raw_stream(device_index))
 
 
 def _overlaps(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -1187,9 +1194,10 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
     # barrier, so all four softmax warps release s_empty (one arrival each);
     # the sparse path releases it from W0 lane 0 after the shared barrier.
     s_empty_arrivals: cutlass.Constexpr[int] = 4 if dense_causal else 1
-    # Epilogue staging: one token (16 rows x 512 BF16) on the sparse path, a
-    # half group of two tokens in dense_causal mode.
-    partial_o_tokens: cutlass.Constexpr[int] = 2 if dense_causal else 1
+    # Epilogue staging: one token (16 rows x 512 BF16) per pass on both paths;
+    # dense_causal mode used to stage a half group of two tokens and gave that
+    # 16 KiB up for the ninth K/V ring slot.
+    partial_o_tokens: cutlass.Constexpr[int] = 1
 
     # ---- SMEM ------------------------------------------------------------
     sQ = cutlass.Array(
@@ -1657,6 +1665,26 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     work_iteration,
                 )
                 work_iteration += cutlass.Int32(1)
+        # Producer tail: Q's empty barrier is waited on only to refill a slot, so the QK
+        # warp's last releases (a commit, or a plain arrive for an empty row) are awaited
+        # here. Nothing orders them against what the CTA does wait for, and an arrive still
+        # in flight at exit lands in the shared memory of the next CTA on this SM.
+        if cutlass.const_expr(dense_causal):
+            last = work_iteration - cutlass.Int32(1)
+            if last >= cutlass.Int32(0):
+                while not prims.mbarrier_try_wait_parity(
+                    q_empty.data_ptr(), last % cutlass.Int32(2)
+                ):
+                    pass
+        else:
+            for t in cutlass.range_constexpr(CLC_STAGES):
+                last = work_iteration - cutlass.Int32(CLC_STAGES - t)
+                if last >= cutlass.Int32(0):
+                    while not prims.mbarrier_try_wait_parity(
+                        q_empty.data_ptr() + last % cutlass.Int32(CLC_STAGES),
+                        (last // cutlass.Int32(CLC_STAGES)) % cutlass.Int32(2),
+                    ):
+                        pass
 
     # =====================================================================
     # W12-W15 - four independent direct sparse gather4 producers. Each warp
@@ -1854,6 +1882,20 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 work_iteration,
             )
             work_iteration += cutlass.Int32(1)
+        # Producer tail: a K/V panel's empty barrier is waited on only to refill the slot,
+        # so the last `st_kv` panels' releases (the QK and PV commits, the RoPE panel's
+        # commit and arrive) are awaited here. Nothing orders them against what the CTA does
+        # wait for, and an arrive still in flight at exit lands in the shared memory of the
+        # next CTA on this SM.
+        panels = tile_iteration * cutlass.Int32(K_HDIM_STAGES)
+        for t in cutlass.range_constexpr(st_kv):
+            last = panels - cutlass.Int32(st_kv - t)
+            if last >= cutlass.Int32(0):
+                while not prims.mbarrier_try_wait_parity(
+                    kv_empty.data_ptr() + last % cutlass.Int32(st_kv),
+                    (last // cutlass.Int32(st_kv)) & cutlass.Int32(1),
+                ):
+                    pass
 
     # =====================================================================
     # W8 — independent CTA1 QK consumer
@@ -2659,6 +2701,18 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                     work_iteration,
                 )
                 work_iteration += cutlass.Int32(1)
+        # Producer tail: P's empty barrier is waited on only to rewrite a stage, so the PV
+        # warp's last `ST_P` commit-arrives are awaited here. Nothing orders them against
+        # what the CTA does wait for, and an arrive still in flight at exit lands in the
+        # shared memory of the next CTA on this SM.
+        for t in cutlass.range_constexpr(ST_P):
+            last = tile_iteration - cutlass.Int32(ST_P - t)
+            if last >= cutlass.Int32(0):
+                while not prims.mbarrier_try_wait_parity(
+                    p_empty.data_ptr() + last % cutlass.Int32(ST_P),
+                    (last // cutlass.Int32(ST_P)) % cutlass.Int32(2),
+                ):
+                    pass
 
     # =====================================================================
     # W4-7 — correction / rescale / epilogue
@@ -2761,11 +2815,11 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 final_phase = (tile_iteration + num_kt - cutlass.Int32(1)) % cutlass.Int32(2)
                 while not prims.mbarrier_try_wait_parity(o_full, final_phase):
                     pass
-                for half in cutlass.range_constexpr(2):
-                    # CTA-uniform skip of a half whose two tokens are dummies.
-                    if cutlass.Int32(half * 2) < group_n_tok:
-                        for t_half in cutlass.range_constexpr(2):
-                            t: cutlass.Constexpr[int] = half * 2 + t_half
+                for half in cutlass.range_constexpr(G_TOK // partial_o_tokens):
+                    # CTA-uniform skip of a staging pass whose tokens are dummies.
+                    if cutlass.Int32(half * partial_o_tokens) < group_n_tok:
+                        for t_half in cutlass.range_constexpr(partial_o_tokens):
+                            t: cutlass.Constexpr[int] = half * partial_o_tokens + t_half
                             r_sum = cutlass.Vector.from_elements(
                                 tuple(r_sum_arr[t * 4 + i] for i in range(4)),
                                 dtype=ACC_DTYPE,
@@ -2842,8 +2896,8 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                         )
                         prims.barrier_cta_sync(BAR_CORR, thread_count=128)
                         for s in cutlass.range_constexpr(N_V):
-                            for t_half in cutlass.range_constexpr(2):
-                                t: cutlass.Constexpr[int] = half * 2 + t_half
+                            for t_half in cutlass.range_constexpr(partial_o_tokens):
+                                t: cutlass.Constexpr[int] = half * partial_o_tokens + t_half
                                 # Only real tokens are stored (CTA-uniform).
                                 if cutlass.Int32(t) < group_n_tok:
                                     head = corr_thread // cutlass.Int32(8)
@@ -3112,11 +3166,14 @@ def glm52_self_attn_fmha_sparse_mla_prefill_kernel(
                 tile_iteration += num_kt
 
     # The scheduler and all role warps consume the final invalid response
-    # before reconverging for the single persistent TMEM deallocation.
+    # before reconverging for the single persistent TMEM deallocation. The fence pair
+    # orders every warp's tcgen05 accesses before the barrier ahead of the dealloc.
+    prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
     prims.barrier_cta_sync(0)
     if tidx == 0:
         prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
     if warp_idx == W_MMA_PV:
+        prims.tcgen05_fence(prims.Tcgen05Fence.AFTER_THREAD_SYNC)
         prims.tcgen05_dealloc(tmem_ptr, num_tmem_cols, group="cta_1")
 
 

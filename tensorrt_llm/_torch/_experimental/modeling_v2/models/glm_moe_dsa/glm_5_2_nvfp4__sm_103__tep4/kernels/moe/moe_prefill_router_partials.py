@@ -159,6 +159,17 @@ def projection_kernel(
                     stage = cutlass.Int32(0)
                     if ordinal > stages:
                         empty_phase = empty_phase ^ 1
+        # Producer tail: the loop waits on a stage's empty barrier only to refill it, so
+        # the MMA's last `stages` commit-arrives are awaited here. Nothing orders them
+        # against the `acc_full` commits the epilogue waits for, and an arrive still in
+        # flight at exit lands in the shared memory of the next CTA on this SM.
+        for t in cutlass.range_constexpr(stages):
+            last = ordinal - cutlass.Int32(stages - t)
+            if last >= 0:
+                while not prims.mbarrier_try_wait_parity(
+                    empty.subview(last % stages), (last // stages) % 2
+                ):
+                    pass
 
     if warp == 1:
         stage = cutlass.Int32(0)
