@@ -15,6 +15,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 import torch
@@ -36,8 +37,8 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
-    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.locality_domain.autotune import LocalityDomainConcurrentTunableRunner
@@ -5935,8 +5936,12 @@ _MXFP8_FUSED_FC12_CASES = [
 
 
 @pytest.mark.skipif(
-    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+    not (
+        (get_sm_version() == 107 and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_RUBIN_AVAILABLE)
+        or (get_sm_version() in (100, 103) and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE)
+    ),
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) or data-center Blackwell (SM100/SM103) "
+    "with a CuTe DSL build that supports the fused FC12 kernel",
 )
 def test_moe_module_mxfp8_chunked_forward_with_aux_stream():
     """A layer whose ``moe_max_num_tokens`` is below the batch gets an aux
@@ -6120,8 +6125,8 @@ def test_mxfp8_fused_fc12_moe_blackwell(
 
 
 def _run_mxfp8_fused_fc12_moe_case(
-    fused_op,
-    runner_cls,
+    fused_op: Callable[..., None],
+    runner_cls: type,
     num_tokens: int,
     top_k: int,
     ep_size: int,
