@@ -84,9 +84,12 @@ def parse_test_entry(line: str):
     if line.startswith("- "):
         line = line[2:].strip()
     if line.startswith("case:"):
+        original_line = line
         line = line[len("case:"):].strip()
+        if len(line) >= 2 and line[0] in ("'", '"') and line[-1] == line[0]:
+            line = line[1:-1].strip()
         if not line:
-            return None
+            return "MALFORMED", original_line, None, None
     token = line.split()[0]
     if "::" not in token:
         return None

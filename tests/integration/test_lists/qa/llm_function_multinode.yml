@@ -21,19 +21,19 @@ tests:
       mode: per_node
       nodes: 2
       tasks_per_node: 1
-      gpus_per_node: 2
+      gpus_per_node: 4
   - case: test_e2e.py::test_openai_disagg_multi_nodes_completion[ctx_tp1pp2-gen_tp1pp2]
     launch:
       mode: per_node
       nodes: 2
       tasks_per_node: 1
-      gpus_per_node: 2
+      gpus_per_node: 4
   - case: test_e2e.py::test_openai_disagg_multi_nodes_completion_service_discovery[etcd]
     launch:
       mode: per_node
       nodes: 2
       tasks_per_node: 1
-      gpus_per_node: 1
+      gpus_per_node: 4
   - case: accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[baseline]
   - case: accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[dspark]
   - case: accuracy/test_kimi3.py::TestKimiK3::test_w4a16_mxfp4[reuse]

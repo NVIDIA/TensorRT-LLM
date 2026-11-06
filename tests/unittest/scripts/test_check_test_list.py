@@ -40,15 +40,16 @@ def mod():
     return module
 
 
-def test_collect_multinode_yaml_entries(mod, tmp_path):
+@pytest.mark.parametrize("quote", ["", "'", '"'])
+def test_collect_multinode_yaml_entries(mod, tmp_path, quote):
     path = tmp_path / "multinode.yml"
     path.write_text(
         "tests:\n"
-        "  - case: accuracy/test_model.py::TestModel::test_accuracy[baseline]\n"
+        f"  - case: {quote}accuracy/test_model.py::TestModel::test_accuracy[baseline]{quote}\n"
         "    launch:\n"
         "      mode: mpi\n"
         "      world_size: 16\n"
-        "  - case: test_e2e.py::test_disagg\n"
+        f"  - case: {quote}test_e2e.py::test_disagg{quote}\n"
         "    launch:\n"
         "      mode: per_node\n"
         "      nodes: 2\n"
@@ -62,6 +63,15 @@ def test_collect_multinode_yaml_entries(mod, tmp_path):
         ("accuracy/test_model.py", "TestModel", "test_accuracy", "baseline"): [f"{path}:2"],
         ("test_e2e.py", None, "test_disagg", None): [f"{path}:6"],
     }
+
+
+@pytest.mark.parametrize("value", ["", "   ", "''", '""', "'   '", '"   "'])
+def test_collect_multinode_yaml_blank_case(mod, tmp_path, value):
+    path = tmp_path / "multinode.yml"
+    path.write_text(f"tests:\n  - case: {value}\n", encoding="utf-8")
+    entries, malformed = mod.collect_entries(str(tmp_path))
+    assert not entries
+    assert malformed == [f"{path}:2: case: {value}".rstrip()]
 
 
 def _index(mod, tmp_path, src: str, name: str = "mod_under_test.py"):
