@@ -1119,9 +1119,6 @@ MERGE_MXFP8_HANDOFF = True
 MSA_KV_UPDATE = True
 MSA_SKIP_UNCHANGED_BLOCK_OFFSETS = True
 MSA_REUSE_POOL_VIEWS = True
-# Step-input preparation fills the MSA block-id table by slice-copying each request's page-index view (MSA
-# RuntimeHooks.block_ids_from_views) instead of building a Python list of the whole padded row; the table is the same.
-MSA_BLOCK_IDS_FROM_VIEWS = True
 
 FAST_PATHS: Tuple[RowRange, ...] = (
     EMBED_FIRSTNORM,
@@ -5560,7 +5557,6 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
             kv_update=_msa_kv_update_kernel.msa_kv_update if MSA_KV_UPDATE else None,
             skip_unchanged_block_offsets=MSA_SKIP_UNCHANGED_BLOCK_OFFSETS,
             reuse_pool_views=MSA_REUSE_POOL_VIEWS,
-            block_ids_from_views=MSA_BLOCK_IDS_FROM_VIEWS,
         ),
     )
 

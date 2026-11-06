@@ -6086,7 +6086,6 @@ def _runtime_hooks(spec_fold: Optional[M3SpecStepFold]) -> RuntimeHooks:
             kv_update=_msa_kv_update_kernel.msa_kv_update,
             skip_unchanged_block_offsets=True,
             reuse_pool_views=True,
-            block_ids_from_views=True,
         ),
     )
 

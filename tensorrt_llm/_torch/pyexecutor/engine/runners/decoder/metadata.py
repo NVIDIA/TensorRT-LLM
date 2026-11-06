@@ -144,7 +144,6 @@ class DecoderMetadata:
         kv_cache_manager.configure_decode_shortcuts(
             skip_unchanged_block_offsets=msa.skip_unchanged_block_offsets,
             reuse_pool_views=msa.reuse_pool_views,
-            block_ids_from_views=msa.block_ids_from_views,
         )
 
     def setup_speculative(

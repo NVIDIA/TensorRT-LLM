@@ -144,9 +144,6 @@ class MsaRuntimePolicy:
     skip_unchanged_block_offsets: bool = False
     # Build each KV pool view once per pool geometry instead of on every attention call.
     reuse_pool_views: bool = False
-    # Fill the per-request block-id table by slice-copying each request's page-index view instead of
-    # building a Python list of the whole padded row (max_seq_len / tokens_per_block entries) first.
-    block_ids_from_views: bool = False
 
 
 class DecodePrologue(Protocol):
