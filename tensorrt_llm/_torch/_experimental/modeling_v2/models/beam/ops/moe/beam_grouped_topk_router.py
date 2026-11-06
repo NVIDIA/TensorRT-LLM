@@ -7,12 +7,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
-    Arch,
-    Cell,
-    OpWrapper,
-    true_fp32_matmul,
-)
+from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+from tensorrt_llm._torch._experimental.modeling_v2.catalog.gemm.cublas_mm import cublas_mm
 
 #: Block 3's router: 256 experts in 8 groups of 32, 4 groups kept, 8 experts per token.
 _BLOCK3 = dict(hidden_size=5120, num_experts=256, n_group=8, topk_group=4, top_k=8, eps=1e-20)
@@ -21,7 +17,8 @@ _BLOCK3 = dict(hidden_size=5120, num_experts=256, n_group=8, topk_group=4, top_k
 class BeamGroupedTopkRouter(OpWrapper):
     """Route `hidden_states [T, hidden]` with `weight [E, hidden]` and `correction_bias [E]`.
 
-    Every step is fp32, with TF32 and autocast off for the call::
+    Every step is fp32. The projection uses explicit FP32 cuBLAS computation;
+    autocast is disabled without changing the caller's global matmul policy::
 
         logits = hidden_states @ weight^T                    [T, E]
         scores = sigmoid(logits)                             unbiased
@@ -76,8 +73,9 @@ class BeamGroupedTopkRouter(OpWrapper):
         eps: float,
     ) -> dict[str, torch.Tensor]:
         with torch.autocast("cuda", enabled=False):
-            with true_fp32_matmul():
-                logits = F.linear(hidden_states.float(), weight)
+            logits = cublas_mm(
+                hidden_states.float().contiguous(), weight.contiguous().t(), out_dtype=torch.float32
+            )
             scores = logits.sigmoid()
             selection_scores = scores + correction_bias
             tokens, num_experts = selection_scores.shape
@@ -118,14 +116,14 @@ class BeamGroupedTopkRouter(OpWrapper):
         top_k: int,
         eps: float,
     ) -> dict[str, torch.Tensor]:
-        """The routing in plain torch: fp32 operands, TF32 and autocast off.
+        """The routing in plain torch, with FP32 reference precision set by the test caller.
 
         Exclusion is written as group membership and each group's score as the first two
         entries of a descending sort; both are exact, so the result is the source routing's
         bit for bit. The two selections stay `topk(..., sorted=True)`, the source's own
         call, because the order of tied scores is whatever that call returns.
         """
-        with torch.autocast("cuda", enabled=False), true_fp32_matmul():
+        with torch.autocast("cuda", enabled=False):
             logits = F.linear(hidden_states.to(torch.float32), weight.to(torch.float32))
             scores = torch.sigmoid(logits)
             selection_scores = scores + correction_bias.to(torch.float32)
