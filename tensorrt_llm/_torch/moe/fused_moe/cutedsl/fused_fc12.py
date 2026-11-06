@@ -330,8 +330,15 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
-        if not self.weights_die_major and self._die_major_applies():
-            self._place_weights_die_major()
+        if not self.weights_die_major and self._die_major_allowed:
+            unmet = self._die_major_unmet()
+            if unmet is None:
+                self._place_weights_die_major()
+            else:
+                logger.info_once(
+                    f"The MoE expert weights keep the loaded layout, not die-major: {unmet}",
+                    key="fc12_die_major_off",
+                )
         if self.small_batch_max_tokens and self._small_batch_counters is None:
             self._small_batch_counters = new_small_batch_moe_counters(self.w3_w1_weight.device)
 
@@ -358,19 +365,28 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self.weights_die_major = False
 
     def _die_major_applies(self) -> bool:
-        """Die-major weights need the model's opt-in, two locality domains, halves of whole
-        128-row blocks (the FC12 tactics then keep to N tiles that divide a half) and weights that
-        stay where they are loaded (no EPLB, no DWDP)."""
+        """Die-major weights need the model's opt-in and every condition of
+        ``_die_major_unmet``."""
+        return self._die_major_allowed and self._die_major_unmet() is None
+
+    def _die_major_unmet(self) -> str | None:
+        """The first unmet condition of die-major weights besides the opt-in, None when all hold:
+        halves of whole 128-row blocks (the FC12 tactics then keep to N tiles that divide a half),
+        weights that stay where they are loaded (no EPLB, no DWDP) and two locality domains."""
         from ....pyexecutor.dwdp import get_global_dwdp_manager
 
-        return (
-            self._die_major_allowed
-            and (2 * self.intermediate_size_per_partition) % 256 == 0
-            and self.hidden_size % 256 == 0
-            and not self._using_load_balancer()
-            and get_global_dwdp_manager() is None
-            and is_locality_domain_enabled()
-        )
+        if (2 * self.intermediate_size_per_partition) % 256 or self.hidden_size % 256:
+            return "the expert halves are not whole 128-row blocks"
+        if self._using_load_balancer():
+            return "EPLB migrates the expert weights"
+        if get_global_dwdp_manager() is not None:
+            return "DWDP rebinds the expert weights"
+        if not is_locality_domain_enabled():
+            return (
+                "no two locality domains (is_locality_domain_enabled: SM107, a build with "
+                "CUDA >= 13.4, a driver reporting two domains, DISABLE_LOCALITY_DOMAINS unset)"
+            )
+        return None
 
     def _place_weights_die_major(self) -> None:
         """Re-home the expert weights and block scales die-major (same parameter shapes, new

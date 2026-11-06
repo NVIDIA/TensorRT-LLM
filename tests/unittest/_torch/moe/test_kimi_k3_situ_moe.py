@@ -2394,6 +2394,33 @@ def test_die_major_weights_need_the_model_opt_in():
     assert backend._die_major_allowed
 
 
+def test_die_major_unmet_names_the_condition(monkeypatch):
+    """After the opt-in, the FC12 backend names the condition that keeps the loaded layout (what
+    ``post_load_weights`` logs once) and applies die-major weights when none is unmet."""
+    import importlib
+
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslFusedFc12Nvfp4Impl
+    from tensorrt_llm._torch.pyexecutor import dwdp
+
+    fused_fc12 = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12")
+    monkeypatch.setattr(dwdp, "get_global_dwdp_manager", lambda: None)
+    monkeypatch.setattr(fused_fc12, "is_locality_domain_enabled", lambda: False)
+    backend = object.__new__(TrtllmCutedslFusedFc12Nvfp4Impl)
+    backend.allow_die_major_weights()
+    # Kimi K3 under MoE TP4: 768 intermediate per rank on the 3584-wide latent
+    backend.intermediate_size_per_partition, backend.hidden_size = 768, 3584
+    backend._using_load_balancer = lambda: False
+    assert "locality domains" in backend._die_major_unmet()
+    assert not backend._die_major_applies()
+    monkeypatch.setattr(fused_fc12, "is_locality_domain_enabled", lambda: True)
+    assert backend._die_major_unmet() is None and backend._die_major_applies()
+    backend._using_load_balancer = lambda: True
+    assert "EPLB" in backend._die_major_unmet()
+    backend._using_load_balancer = lambda: False
+    backend.intermediate_size_per_partition = 64
+    assert "128-row" in backend._die_major_unmet()
+
+
 def test_fp8_block_scaled_dequantization():
     """FP8_PB_WO attention weights must be dequantized, never reinterpreted.
 
