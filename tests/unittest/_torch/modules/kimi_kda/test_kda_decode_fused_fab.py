@@ -307,3 +307,72 @@ def test_fused_gate_cuda_graph(batch, num_spec):
         ref["x"] = x_new
         for state in (ref, graphed):
             _next_acceptance(state, batch, num_spec, seed=90 + rnd)
+
+
+def _low_m_o_proj(n, k, seed):
+    """FP8 ``[n, k]`` weight with power-of-two 128x128 block scales, and its packed scale."""
+    from tensorrt_llm.quantization.utils.fp8_utils import transform_sf_into_required_layout
+
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    w = torch.randn((n, k), device="cuda", generator=gen) * 0.02
+    blocks = w.view(n // 128, 128, k // 128, 128)
+    amax = blocks.abs().amax(dim=(1, 3)).clamp(min=1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    w_fp8 = (blocks / scale[:, None, :, None]).to(torch.float8_e4m3fn).view(n, k)
+    packed = transform_sf_into_required_layout(
+        scale.float(), mn=n, k=k, recipe=(1, 128, 128), is_sfa=False
+    )
+    return w_fp8, packed
+
+
+@pytest.mark.parametrize("batch,num_spec", [(1, 7), (4, 7)])
+@torch.no_grad()
+def test_pdl_verify_releases_o_proj_cuda_graph(batch, num_spec):
+    """The PDL verify releases its dependent before it completes: the low-M o_proj GEMM behind
+    it (which streams its weights before its griddepcontrol.wait) still projects the completed
+    output, captured and replayed."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if torch.cuda.get_device_capability() == (10, 7) and not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("the SM107 low-M GEMM needs a Rubin-capable CuTe DSL")
+    from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm  # noqa: F401
+
+    m, dim = batch * (num_spec + 1), H * K
+    w_fp8, packed = _low_m_o_proj(HIDDEN, dim, seed=5)
+
+    def o_proj(core):
+        return torch.ops.trtllm.fp8_block_scale_low_m_gemm(core.reshape(m, dim), w_fp8, packed)
+
+    lay = _layer(batch, num_spec, seed=31 + batch)
+    ref, graphed = _clone(lay), _clone(lay)
+    x_static = lay["x"].clone()
+
+    def step(state):
+        bfa = torch.ops.trtllm.k3_kda_fab_fa(x_static, state["w_bfa"], H, state["w_fb"])
+        out = _ops()(**_decode_kwargs(state, batch, num_spec, bfa=bfa, use_pdl=True))
+        return out, o_proj(out)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        step(_clone(lay))  # compiles and creates the fab workspace outside capture
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out_graph, proj_graph = step(graphed)
+    torch.cuda.synchronize()
+    for rnd in range(3):
+        out_ref = _reference(ref, batch, num_spec)
+        proj_ref = o_proj(out_ref)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_same(f"replay {rnd} out", out_graph, out_ref)
+        _assert_same(f"replay {rnd} o_proj", proj_graph, proj_ref)
+        for key in MUTATED:
+            _assert_same(f"replay {rnd} {key}", graphed[key], ref[key])
+        x_new = (lay["x"].float() * (0.5 + 0.25 * rnd)).bfloat16()
+        x_static.copy_(x_new)
+        ref["x"] = x_new
+        for state in (ref, graphed):
+            _next_acceptance(state, batch, num_spec, seed=70 + rnd)

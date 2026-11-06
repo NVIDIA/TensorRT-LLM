@@ -43,7 +43,9 @@ Optional (compile-time) variants, both bitwise identical to the plain kernel fed
 
 * **PDL.** Launched as a programmatic dependent of the projection GEMM: the slot, accepted count,
   S0 TMA, replay entries, conv windows and weights are loaded before ``griddepcontrol.wait``,
-  only the new-token rows (and the TMEM allocation) after it.
+  only the new-token rows (and the TMEM allocation) after it. Each CTA releases the dependent
+  grid (o_proj) once it holds its tensor memory, so o_proj streams its weights during the
+  recurrence.
 * **Fused forget gate.** The kernel reads ``f_a`` (``k3_kda_fab`` in f_a mode) instead of the
   gate and computes ``bf16(f_a @ W_fb[h]^T)`` itself: warps 8..15 each own 16 ``W_fb`` rows
   (TMA-loaded into free scratch words up front) and run eight ``mma.sync`` k16 steps on f_a
@@ -59,7 +61,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from .....kernels.blackwell.raw_ptx import ldsm_x4 as ldmatrix_x4
 from .....kernels.blackwell.raw_ptx import mma_bf16 as mma_bf16_16816
-from .....kernels.blackwell.utils import griddepcontrol_wait
+from .....kernels.blackwell.utils import griddepcontrol_launch_dependents, griddepcontrol_wait
 from .kda_mtp_decode import (
     NUM_THREADS,
     SCRATCH_FLOATS,
@@ -374,7 +376,8 @@ def kda_decode_mtp_v2_kernel(
 
     ``PDL``: launched as a programmatic dependent; everything that does not depend on this
     layer's projections (slot, accepted count, state TMA, replay entries, conv windows, weights)
-    is loaded before ``griddepcontrol.wait``, the new-token rows and TMEM after it.
+    is loaded before ``griddepcontrol.wait``, the new-token rows and TMEM after it; the dependent
+    grid is released once TMEM is allocated.
     ``FUSED_FB``: ``fa`` holds the BF16 ``f_a`` rows ``[1, T, 128]`` instead of the forget gate;
     the CTA computes its head's gate ``bf16(f_a @ W_fb[h]^T)`` with ``mma.sync`` (``W_fb`` rows
     TMA-loaded via ``tma_atom_fb`` before ``griddepcontrol.wait``, f_a fragments loaded with the
@@ -661,6 +664,11 @@ def kda_decode_mtp_v2_kernel(
     # follows griddepcontrol.wait, so a waiting CTA never holds tensor memory.
     if warp_idx == 0:
         cute.arch.alloc_tmem(TMEM_COLS, tmem_holder)
+        if cutlass.const_expr(PDL):
+            # A dependent reads this grid's outputs only after its own griddepcontrol.wait, i.e.
+            # after this grid completed. Released after the allocation, so that a dependent CTA
+            # resident on this SM cannot take the tensor memory this CTA still needs.
+            griddepcontrol_launch_dependents()
     # (3) placement: the slot-independent operands first, the token rows once the accepted count
     #     is in. Smem rows keep the [row][channel] fp32 layout of the precompute.
     if quad < 3:
