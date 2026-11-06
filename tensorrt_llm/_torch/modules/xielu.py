@@ -14,21 +14,31 @@
 # limitations under the License.
 """xIELU activation (https://arxiv.org/abs/2411.13010)."""
 
+import functools
 import math
+import os
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 
-def xielu_reference(
-    x: torch.Tensor, a_p: float, a_n: float, beta: float, eps: float
-) -> torch.Tensor:
-    """xIELU on post-softplus coefficients, computed in fp32 and rounded once to ``x.dtype``."""
+def xielu_reference(x: torch.Tensor, a_p, a_n, beta, eps) -> torch.Tensor:
+    """xIELU on post-softplus coefficients, computed in fp32 and rounded once to ``x.dtype``.
+
+    The coefficients are Python floats or fp32 0-d tensors on ``x``'s device.
+    """
     xf = x.float()
     pos = a_p * xf * xf + beta * xf
     neg = (torch.expm1(torch.clamp_max(xf, eps)) - xf) * a_n + beta * xf
     return torch.where(xf > 0, pos, neg).to(x.dtype)
+
+
+@functools.lru_cache(maxsize=1)
+def _xielu_op_available() -> bool:
+    # Set TRTLLM_XIELU_CUDA=0 to use the PyTorch expression instead of the kernel.
+    return os.environ.get("TRTLLM_XIELU_CUDA", "1") == "1" and hasattr(torch.ops.trtllm, "xielu")
 
 
 class XIELU(nn.Module):
@@ -36,9 +46,14 @@ class XIELU(nn.Module):
 
     ``alpha_p`` and ``alpha_n`` are stored in the checkpoint's pre-softplus
     form. The effective coefficients ``a_p = softplus(alpha_p)`` and
-    ``a_n = beta + softplus(alpha_n)`` are constant at inference time, so they
-    are derived once in fp32 by :meth:`cache_derived_state` and passed to the
-    kernels as plain floats.
+    ``a_n = beta + softplus(alpha_n)`` are constant at inference time, so
+    :meth:`cache_derived_state` derives them once, in fp32 and on the weights'
+    device, into ``_coeffs = [a_p, a_n, beta, eps]``. Both the kernel and the
+    PyTorch expression read that tensor on the device, and later calls update it
+    in place, so a captured CUDA graph follows an in-place weight update without
+    recapture. ``_coeffs`` is a plain attribute rather than a buffer, so
+    ``Module.to(dtype)`` keeps it in fp32 and read-only weight sharing does not
+    import it.
     """
 
     def __init__(
@@ -59,10 +74,7 @@ class XIELU(nn.Module):
         )
         self.register_buffer("beta", torch.tensor(beta, dtype=dtype))
         self.register_buffer("eps", torch.tensor(eps, dtype=dtype))
-        self.a_p = alpha_p_init
-        self.a_n = alpha_n_init
-        self.beta_value = beta
-        self.eps_value = eps
+        self._coeffs: Optional[torch.Tensor] = None
 
     def load_weights(self, weights: list[dict], allow_partial_loading: bool = False):
         assert len(weights) == 1
@@ -80,21 +92,58 @@ class XIELU(nn.Module):
             target.data.copy_(value.reshape(target.shape))
         self.cache_derived_state()
 
+    @torch.no_grad()
     def cache_derived_state(self) -> None:
-        beta = self.beta.float().item()
-        self.a_p = F.softplus(self.alpha_p.float()).item()
-        self.a_n = beta + F.softplus(self.alpha_n.float()).item()
-        self.beta_value = beta
-        self.eps_value = self.eps.float().item()
+        if self.alpha_p.is_meta:
+            return
+        beta = self.beta.float().reshape(1)
+        coeffs = torch.cat(
+            [
+                F.softplus(self.alpha_p.float()).reshape(1),
+                beta + F.softplus(self.alpha_n.float()).reshape(1),
+                beta,
+                self.eps.float().reshape(1).to(beta.device),
+            ]
+        )
+        if self._coeffs is not None and self._coeffs.device == coeffs.device:
+            self._coeffs.copy_(coeffs)
+        else:
+            self._coeffs = coeffs
+
+    @property
+    def coeffs(self) -> torch.Tensor:
+        """fp32 ``[a_p, a_n, beta, eps]`` on the weights' device."""
+        if self._coeffs is None or self._coeffs.device != self.alpha_p.device:
+            self.cache_derived_state()
+        return self._coeffs
 
     def post_load_weights(self) -> None:
         self.cache_derived_state()
 
+    # Host copies of the coefficients, for inspection. Each read synchronizes with the device.
+    @property
+    def a_p(self) -> float:
+        return self.coeffs[0].item()
+
+    @property
+    def a_n(self) -> float:
+        return self.coeffs[1].item()
+
+    @property
+    def beta_value(self) -> float:
+        return self.coeffs[2].item()
+
+    @property
+    def eps_value(self) -> float:
+        return self.coeffs[3].item()
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return xielu_reference(x, self.a_p, self.a_n, self.beta_value, self.eps_value)
+        if x.is_cuda and x.dtype in (torch.float16, torch.bfloat16) and _xielu_op_available():
+            return torch.ops.trtllm.xielu(x, self.coeffs)
+        return xielu_reference(x, *self.coeffs.unbind())
 
     def extra_repr(self) -> str:
-        return (
-            f"a_p={self.a_p:.6g}, a_n={self.a_n:.6g}, beta={self.beta_value:.6g}, "
-            f"eps={self.eps_value:.6g}"
-        )
+        if self.alpha_p.is_meta:
+            return ""
+        a_p, a_n, beta, eps = self.coeffs.tolist()
+        return f"a_p={a_p:.6g}, a_n={a_n:.6g}, beta={beta:.6g}, eps={eps:.6g}"

@@ -417,17 +417,17 @@ class TestApertus(unittest.TestCase):
         """The comparison above must fail if the checkpoint's xIELU coefficients are ignored."""
         saved = []
         for layer in model.model.layers:
-            act = layer.mlp.activation
-            saved.append((act.a_p, act.a_n))
-            act.a_p, act.a_n = 0.8, 0.8
+            coeffs = layer.mlp.activation.coeffs
+            saved.append(coeffs.clone())
+            coeffs[:2] = 0.8
         try:
             attn_metadata.prepare()
             wrong = model.forward(
                 input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
             )
         finally:
-            for layer, (a_p, a_n) in zip(model.model.layers, saved):
-                layer.mlp.activation.a_p, layer.mlp.activation.a_n = a_p, a_n
+            for layer, coeffs in zip(model.model.layers, saved):
+                layer.mlp.activation.coeffs.copy_(coeffs)
         with self.assertRaises(AssertionError):
             self._assert_logits_close(wrong, ref, "default xIELU coefficients")
 
