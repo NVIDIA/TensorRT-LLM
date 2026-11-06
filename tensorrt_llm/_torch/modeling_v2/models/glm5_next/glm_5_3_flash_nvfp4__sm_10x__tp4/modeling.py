@@ -12,14 +12,14 @@ expert of 2048), clamped SwiGLU (10), and one MTP layer (index 45). Routed exper
 MLPs are W4A4 NVFP4; attention, router, shared experts and the whole MTP layer are BF16. The
 checkpoint is the text half of `Glm5NextForConditionalGeneration`; the vision tower is not built.
 
-A forward is one call into this target's step program (`kernels/`: the decoder layers, the
-vocabulary-parallel LM head and the MTP draft chain as CUDA kernels, compiled at first use for the
-device's sm_100a / sm_103a) over the TensorRT-LLM runtime's buffers: scheduling, the glm5_next V2
-cache manager (latent and INDEX_KEY pages of the 12 sparse layers, KDA recurrent / conv state
-slots and the drafts' replay buffers, prefix reuse), CUDA graphs and the sampler are the
-runtime's. The step program launches its kernels on the current stream (and its own side
-streams, forked from and joined to it), so a decode step is captured whole into the runtime's
-CUDA graph.
+A forward is one call into this target's step program (`csrc/`: the decoder layers, the
+vocabulary-parallel LM head and the MTP draft chain as CUDA kernels, built for sm_100a and sm_103a
+into the family library `libth_modeling_v2_glm5_next.so`) over the TensorRT-LLM runtime's
+buffers: scheduling, the glm5_next V2 cache manager (latent and INDEX_KEY pages of the 12 sparse
+layers, KDA recurrent / conv state slots and the drafts' replay buffers, prefix reuse), CUDA
+graphs and the sampler are the runtime's. The step program launches its kernels on the current
+stream (and its own side streams, forked from and joined to it), so a decode step is captured
+whole into the runtime's CUDA graph.
 
 Topology (tp4; the mapping's MoE split selects one of two layouts): attention, the dense MLPs,
 the shared expert and the LM head are tensor parallel over 4 ranks (16 KDA heads, 16 MLA heads,
