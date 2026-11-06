@@ -4,6 +4,7 @@
 
 import bisect
 import functools
+import re
 import threading
 
 import torch
@@ -34,6 +35,10 @@ _SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 _SUPPORTED_Q_DTYPES = (torch.float16, torch.bfloat16)
 _SUPPORTED_KV_DTYPES = (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
 _FP8_MAX = 448.0
+# Positional arguments the vendored metadata plan passes to run_fixed. A
+# flashinfer wheel whose metadata csrc is older or newer than the vendored
+# tree fails the TVM-FFI arity check at the first run instead of launching.
+_METADATA_RUN_FIXED_ARGS = 15
 
 
 @functools.cache
@@ -57,6 +62,22 @@ def prims_ts_available() -> bool:
     return _prims_ts_api() is not None
 
 
+@functools.cache
+def _metadata_module_reason() -> str | None:
+    from ...prims_ts import q_token_kv_block_sparse_metadata as metadata
+
+    try:
+        # Zero arguments never launch; TVM-FFI reports the bound arity.
+        metadata._get_prims_ts_q_token_kv_block_sparse_metadata_module().run_fixed()
+    except (TypeError, RuntimeError) as error:
+        arity = re.search(r"Expected (\d+) but got", str(error))
+        if arity is None:
+            return f"the metadata module is unavailable: {error}"
+        if int(arity.group(1)) != _METADATA_RUN_FIXED_ARGS:
+            return f"the flashinfer metadata module does not match the vendored tree: {error}"
+    return None
+
+
 def _unsupported_reason(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -76,7 +97,7 @@ def _unsupported_reason(
         return f"page size {page_size} is not a multiple of the sparse block size 4"
     if q.shape[-1] not in (64, 128, 256):
         return f"unsupported head_dim {q.shape[-1]}"
-    return None
+    return _metadata_module_reason()
 
 
 @functools.cache
