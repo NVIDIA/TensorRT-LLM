@@ -575,6 +575,12 @@ class _DcGroupsUploader:
 
 
 class GlmMoeDsaTep4ModelingV2(DecoderModel):
+    # Off unless `__init__` reads them on (`TRTLLM_GLM52_MOE_DEC_UNPAD*`): a core built without
+    # `__init__` (the MoE unit tests) keeps the padded decode path.
+    _moe_dec_unpad = False
+    _moe_dec_unpad_signal = False
+    _moe_topk_signaled = False
+
     def __init__(self, model_config: ModelConfig):
         super().__init__(model_config)
         cfg = model_config.pretrained_config
@@ -768,6 +774,24 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # FC2 accumulates onto them (`_moe_begin_layer`), as at the power-of-two widths: no
         # clear, and no separate shared + routed add on the critical chain after FC2.
         self._moe_acc_padded = os.environ.get("TRTLLM_GLM52_MOE_ACC_PADDED", "1") == "1"
+        # TRTLLM_GLM52_MOE_DEC_UNPAD (default 1; 0 restores the padding): a trunk MoE layer at a
+        # decode width up to 64 that is not a power of two (MTP5 at 1-3 requests: 6 / 12 / 18)
+        # runs its grouped GEMMs on the fused top-k's own maps at the exact row count
+        # (`_moe_dec_unpadded`), as the power-of-two widths do. Padding it cost seven launches
+        # per layer between the top-k and FC1 (two id / weight fills and cats, two staging
+        # copies, the routing kernel: 8.3 us of the critical chain at 12 rows on B300)
+        # and dropped the decode replicas' maps for the routing kernel's home mapping.
+        self._moe_dec_unpad = os.environ.get("TRTLLM_GLM52_MOE_DEC_UNPAD", "1") == "1"
+        # TRTLLM_GLM52_MOE_DEC_UNPAD_SIGNAL (default 1): on an MTP3 / MTP5 engine the unpadded
+        # trunk widths that are multiples of `max_draft_len + 1` and not powers of two also get
+        # a top-k handle that releases FC1 early (`k.topk_sig`), as the power-of-two widths'
+        # do: FC1 follows the top-k directly there. The MTP layer keeps the plain handles.
+        self._moe_dec_unpad_signal = os.environ.get("TRTLLM_GLM52_MOE_DEC_UNPAD_SIGNAL", "1") == "1"
+        # TRTLLM_GLM52_MOE_L2_PREFETCH (default 1; 0 skips building the decode L2 prefetch).
+        self._moe_l2_prefetch = os.environ.get("TRTLLM_GLM52_MOE_L2_PREFETCH", "1") == "1"
+        # Set by `_moe_topk` when a trunk layer selected on an early-release handle: that
+        # layer's grouped GEMMs must then follow the top-k directly (`_moe_experts`).
+        self._moe_topk_signaled = False
         # The fused shared-expert cells at those row counts (`_SHARED_FUSED_UP_SEQS`).
         self._shared_gu_swiglu_up: dict = {}
         self._ix_pre_split_rag = None
@@ -2018,7 +2042,11 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # o_proj end, ranked by the counts the same layer's previous decode step's top-k wrote
         # into its row of `hist` (one row per MoE call site, the MTP layer's included).
         self._pf = None
-        pf = _try_build("decode MoE L2 prefetch", lambda: _l2pf_op.compile(dev))
+        pf = (
+            _try_build("decode MoE L2 prefetch", lambda: _l2pf_op.compile(dev))
+            if self._moe_l2_prefetch
+            else None
+        )
         if pf is not None:
             self._pf = SimpleNamespace(
                 compiled=pf,
@@ -2057,6 +2085,39 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 for i, ids in self.dec_hot.items()
             }
             self._dec_hot_none = torch.full((self.dec_replicas,), -1, dtype=torch.int32, device=dev)
+        # Early-release top-k handles for the unpadded trunk decode widths that are not powers
+        # of two (`TRTLLM_GLM52_MOE_DEC_UNPAD_SIGNAL`): the decode step widths of an MTP3 /
+        # MTP5 engine, `requests * (max_draft_len + 1)` up to 64 rows. Trunk only: the MTP
+        # layer pads those widths and runs the routing kernel after its top-k, which must not
+        # be released early (it does not wait for the ids).
+        k.topk_sig = {}
+        if self._moe_dec_unpad and self._moe_dec_unpad_signal and self.max_draft_len > 1:
+            step = self.max_draft_len + 1
+            sig_widths = [w for w in range(step, _DECODE_MAX_ROWS + 1, step) if w & (w - 1)]
+
+            def build_sig(w):
+                if w in k.topk_rep:
+                    return _moe_topk_rep_op.build_decode(
+                        w,
+                        _moe_router_op.decode_splits(w),
+                        self.dec_replicas,
+                        dev,
+                        signal_gg1=True,
+                        expert_hist=self._pf is not None,
+                    )
+                return _moe_topk_op.build_decode(
+                    w,
+                    _moe_router_op.decode_splits(w),
+                    dev,
+                    signal_gg1=True,
+                    expert_hist=self._pf is not None and _moe_topk_op.uses_push_path(w),
+                )
+
+            built = _try_build(
+                "MoE unpadded decode early-release top-k",
+                lambda: {w: build_sig(w) for w in sig_widths},
+            )
+            k.topk_sig = built or {}
         # The MTP3 / MTP5 decode widths' front end (`_moe_decode_exact`, 65..256 rows): the
         # wide decode router's split-K partials, and the fused top-k summing them, one handle
         # per row range, writing the L2 prefetch's counts. MTP1 and no speculation build
@@ -3601,6 +3662,17 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
             return rows
         return _pow2(rows)
 
+    def _moe_dec_unpadded(self, rows: int) -> bool:
+        """Whether a trunk MoE layer's decode width `rows` (1..64) runs unpadded on the fused
+        top-k's maps (`TRTLLM_GLM52_MOE_DEC_UNPAD`). Only the trunk asks: there the collective
+        writes the NVFP4 input (`_moe_prequant`) and the shared expert the output's partial
+        (`_moe_begin_layer`), so no per-width quantize or clear runs (both are compiled for
+        the powers of two only). The MTP layer quantizes and clears itself and keeps the
+        padding. Every decode width has its own top-k handle (`k.topk`, `k.topk_rep`), whose
+        maps the grouped GEMMs take at that width: they are compiled for the capacity and
+        read the live tile count from the maps."""
+        return self._moe_dec_unpad and 1 <= rows <= _DECODE_MAX_ROWS and rows in self._moe_k.topk
+
     def _moe_begin_layer(self, rows: int, exact: bool = False):
         """Open one layer: advance the slot for the router, top-k and grouped GEMMs, and
         return the routed output rows for the shared expert to write into, or None. At a
@@ -3621,7 +3693,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         self._moe_slot ^= 1
         if rows > _MOE_MAX_T:
             return None
-        if self._moe_padded_rows(rows, exact) != rows:
+        if self._moe_padded_rows(rows, exact) != rows and not self._moe_dec_unpadded(rows):
             if rows > _DECODE_MAX_ROWS or not self._moe_acc_padded:
                 return None
             self._count("moe_acc_padded", True)
@@ -3732,9 +3804,13 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         rows = int(logits.shape[0])
         s = self._moe_slots[slot]
         k = self._moe_k
+        sig = None
+        if self._moe_dec_unpadded(rows) and layer < self.num_layers:
+            sig = getattr(k, "topk_sig", {}).get(rows)
+        self._moe_topk_signaled = sig is not None
         if rows in k.topk_rep:
             # Decode expert replicas: this layer's hot ids (none on the MTP layer).
-            handle = k.topk_rep[rows]
+            handle = sig if sig is not None else k.topk_rep[rows]
             hot = self._dec_hot_ids.get(layer, self._dec_hot_none)
             if hot is not self._dec_hot_none:
                 self._count("moe_dec_replica", True)
@@ -3749,7 +3825,7 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
                 expert_hist=self._pf.hist[layer] if handle.expert_hist else None,
             )
         if rows <= _DECODE_MAX_ROWS:
-            handle = k.topk[rows]
+            handle = sig if sig is not None else k.topk[rows]
             return cute_dsl_moe_topk_routing(
                 logits,
                 m.router_bias,
@@ -3855,6 +3931,27 @@ class GlmMoeDsaTep4ModelingV2(DecoderModel):
         # wide decode step any count: its prefill top-k's maps need no routing launch.
         use_pair = self._moe_pair_ok(rows)
         padded = self._moe_padded_rows(rows, exact)
+        if (
+            padded != rows
+            and began
+            and acc
+            and prequantized
+            and topk_maps is not None
+            and self._moe_dec_unpadded(rows)
+        ):
+            # A trunk decode width that is not a power of two: the top-k's maps at the exact
+            # rows, no padding, staging or routing launch (`_moe_dec_unpadded`).
+            padded = rows
+            self._count("moe_dec_unpad", True)
+        if self._moe_topk_signaled:
+            self._moe_topk_signaled = False
+            if padded != rows:
+                # Fail fast: a routing launch after an early-release top-k reads the ids
+                # mid-write (a hang, not a wrong answer).
+                raise RuntimeError(
+                    f"modeling_v2 GLM-5.2: early-release top-k at {rows} rows took the padded path"
+                )
+            self._count("moe_dec_unpad_signal", True)
         if padded != rows:
             pad = padded - rows
             if not prequantized:
