@@ -525,5 +525,10 @@
 /cpp/tensorrt_llm/kernels/glmMoeDsaRubin @dongfengy @Tabrizian @xwang233
 /cpp/tensorrt_llm/thop/glmMoeDsaRubin/ @dongfengy @Tabrizian @xwang233
 
+# GLM-5.3-Flash (glm5_next): routing, targets with their native code, and tests
+/tensorrt_llm/_torch/_experimental/modeling_v2/models/glm5_next @kaiyux
+/tests/unittest/_torch/modeling_v2/models/glm5_next @kaiyux
+/tests/integration/defs/accuracy/modeling_v2/test_glm5_next.py @kaiyux
+
 # Uncomment only on release branches (e.g. release/0.19):
 # * @NVIDIA/trt-llm-release-branch-approval
