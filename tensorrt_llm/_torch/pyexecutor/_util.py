@@ -56,6 +56,8 @@ from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+from ..speculative.dflash_attention import (DFLASH_CONTEXT_LOWERING,
+                                            dflash_trtllm_supports_page_size)
 from ..speculative.spec_sampler_base import SpecSampler
 from . import config_utils
 from .config_utils import (MambaKVCacheParams, _is_sliding_attention_layer,
@@ -2339,6 +2341,24 @@ class KvCacheCreator:
                     and os.environ.get("TRTLLM_DISAGG_SHARED_DRAFT_KV")
                     not in ("1", "auto"))
 
+    def _kv_cache_manager_hosts_draft_layers(self) -> bool:
+        """Whether the target's specialized manager accepts explicit draft layer specs."""
+        manager_cls = self._kv_cache_manager_cls
+        return (isinstance(manager_cls, type)
+                and issubclass(manager_cls, KVCacheManagerV2)
+                and manager_cls.hosts_unified_draft_layers)
+
+    def _unified_drafter_reads_page_size(self, tokens_per_block: int) -> bool:
+        """Whether the drafter's TRTLLM ops can read the target's pages."""
+        draft_model = getattr(self._model_engine.model, "draft_model", None)
+        lowerings = getattr(draft_model, "validate_block_attention_windows",
+                            None)
+        # Without the drafter's lowerings, assume the non-causal context kernel.
+        has_context_attention = (lowerings is None
+                                 or DFLASH_CONTEXT_LOWERING in lowerings())
+        return dflash_trtllm_supports_page_size(
+            tokens_per_block, has_context_attention=has_context_attention)
+
     def _check_shared_draft_kv_request(self) -> None:
         """Fail at startup when TRTLLM_DISAGG_SHARED_DRAFT_KV=1 cannot be honored."""
         if (not self._is_disagg
@@ -2360,7 +2380,13 @@ class KvCacheCreator:
         backend = self._unified_drafter_attention_backend()
         if backend != "TRTLLM":
             return f"the drafter attention_backend is {backend}, not TRTLLM"
-        if self._tokens_per_block not in (16, 32, 64):
+        hosts_draft_layers = self._kv_cache_manager_hosts_draft_layers()
+        if hosts_draft_layers:
+            if not self._unified_drafter_reads_page_size(
+                    self._tokens_per_block):
+                return (f"the drafter's TRTLLM attention cannot read the "
+                        f"target's {self._tokens_per_block}-token pages")
+        elif self._tokens_per_block not in (16, 32, 64):
             return f"tokens_per_block is {self._tokens_per_block}, not 16, 32, or 64"
         if not spec_config._allow_separate_draft_kv_cache:
             return "a separate draft KV cache is not allowed for this configuration"
@@ -2383,8 +2409,10 @@ class KvCacheCreator:
         if self._llm_args.kv_cache_compression_config is not None:
             return "KV cache compression is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
-        # external drafter cannot yet describe. Keep their existing fallback.
-        if self._kv_cache_manager_cls is not KVCacheManagerV2:
+        # external drafter cannot yet describe. Keep their existing fallback
+        # unless the manager hosts explicit draft layer specs.
+        if (self._kv_cache_manager_cls is not KVCacheManagerV2
+                and not hosts_draft_layers):
             return "the target does not use KVCacheManagerV2"
         target_layout = self._dflash_kv_layout(
             self._model_engine.model.model_config,
@@ -2417,7 +2445,9 @@ class KvCacheCreator:
                 key="dflash_mixed_draft_windows_fallback")
             return "the draft layers use different attention windows"
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
-                target_layout, draft_layout):
+                target_layout,
+                draft_layout,
+                nvfp4_target_with_other_draft=hosts_draft_layers):
             logger.info_once(
                 f"{self._unified_drafter_name()}: draft KV layout "
                 "(kv_heads, head_dim, dtype, k_only)="
@@ -2433,22 +2463,27 @@ class KvCacheCreator:
     @staticmethod
     def _dflash_disagg_layouts_compatible(
             target_layout: tuple[int, int, object, bool],
-            draft_layout: tuple[int, int, object, bool]) -> bool:
+            draft_layout: tuple[int, int, object, bool],
+            *,
+            nvfp4_target_with_other_draft: bool = False) -> bool:
         """Whether the transceiver can move draft layers with the target's.
 
         Heads are resharded in bytes: a view's bytes per head are its own
         per-layer bytes over the rank's KV-head count, so dtype and head_dim
         may differ. The KV-head count and K-only flag come from the rank's
         single AttentionInfo and must match. NVFP4 adds block-scale views, so
-        an NVFP4 side is only paired with an identical layout.
+        an NVFP4 side is only paired with an identical layout, unless the
+        manager keeps a non-NVFP4 draft in pools of its own
+        (``nvfp4_target_with_other_draft``).
         """
         target_heads, _, target_dtype, target_k_only = target_layout
         draft_heads, _, draft_dtype, draft_k_only = draft_layout
         if (target_heads, target_k_only) != (draft_heads, draft_k_only):
             return False
         nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
-        return target_dtype == draft_dtype or nvfp4 not in (target_dtype,
-                                                            draft_dtype)
+        return (target_dtype == draft_dtype
+                or nvfp4 not in (target_dtype, draft_dtype)
+                or (nvfp4_target_with_other_draft and draft_dtype != nvfp4))
 
     def _dflash_kv_layout(
             self, model_config: ModelConfig,

@@ -152,6 +152,28 @@ def get_dflash_trtllm_gen_ops() -> DFlashTrtllmGenOps:
     )
 
 
+# trtllm-gen's dynamic page-size kernels start here (kDynamicNumTokensPerPageThreshold).
+_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS = 128
+
+
+def dflash_trtllm_supports_page_size(tokens_per_block: int, *, has_context_attention: bool) -> bool:
+    """Whether the DFlash TRTLLM ops serve ``tokens_per_block``-token context pages.
+
+    On power-of-two pages from 128 tokens, trtllm-gen's dynamic page-size kernels cover the
+    generation kernels (causal and windowed non-causal layers) but not the context kernel.
+    """
+    from ..attention.backends.fmha.flashinfer_trtllm_gen import FlashInferTrtllmGenFmha
+
+    if tokens_per_block in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK:
+        return True
+    is_power_of_two = tokens_per_block > 0 and (tokens_per_block & (tokens_per_block - 1)) == 0
+    return (
+        not has_context_attention
+        and is_power_of_two
+        and tokens_per_block >= _TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS
+    )
+
+
 def validate_dflash_trtllm_gen_runtime(
     *,
     dtype: torch.dtype,
@@ -180,11 +202,14 @@ def validate_dflash_trtllm_gen_runtime(
             f"{heads_ratio}; maximum is "
             f"{FlashInferTrtllmGenFmha.MAX_HEADS_RATIO_GENERATION}."
         )
-    if tokens_per_block not in FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK:
+    if not dflash_trtllm_supports_page_size(
+        tokens_per_block, has_context_attention=has_context_attention
+    ):
         supported = sorted(FlashInferTrtllmGenFmha.SUPPORTED_TOKENS_PER_BLOCK)
         raise RuntimeError(
             "DFlash TRTLLM attention does not support context-cache page size "
-            f"{tokens_per_block}; supported sizes are {supported}."
+            f"{tokens_per_block}; supported sizes are {supported}, plus powers of two "
+            f">= {_TRTLLM_GEN_DYNAMIC_PAGE_MIN_TOKENS} without the non-causal context kernel."
         )
     if has_context_attention and head_dim in FlashInferTrtllmGenFmha.UNSUPPORTED_HEAD_SIZES_CONTEXT:
         raise RuntimeError(

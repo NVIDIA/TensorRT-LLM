@@ -24,6 +24,8 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager import (
     MiniMaxM3KVCacheManagerV2,
 )
+from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_CONTEXT_LOWERING
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
     KVCacheLayerSpec,
@@ -34,6 +36,8 @@ from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantMode
 
 NUM_TARGET = 4  # M3 convention without a checkpoint: layers 0..2 dense, 3 sparse
 NUM_DRAFT = 2
@@ -427,4 +431,102 @@ def test_window_sized_draft_ratio(is_disagg: bool, pp_size: int) -> None:
     )
     assert (
         manager._windowed_draft_pool_ratio(_configs(manager.layer_specs, 0), 1 << 30, 128) is None
+    )
+
+
+def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCacheCreator:
+    """A creator for an NVFP4 MiniMax-M3 target with a BF16 standalone DSpark drafter."""
+
+    def model_config(kv_quant_algo=None) -> SimpleNamespace:
+        return SimpleNamespace(
+            pretrained_config=SimpleNamespace(
+                num_hidden_layers=2,
+                num_attention_heads=16,
+                num_key_value_heads=4,
+                head_dim=HEAD_DIM,
+                hidden_size=16 * HEAD_DIM,
+                torch_dtype=torch.bfloat16,
+            ),
+            quant_config=SimpleNamespace(
+                quant_mode=QuantMode.from_quant_algo(kv_cache_quant_algo=kv_quant_algo)
+            ),
+        )
+
+    target, draft = model_config(QuantAlgo.NVFP4), model_config()
+    lowering = DFLASH_CONTEXT_LOWERING if context_kernel else "causal decode + future-block merge"
+    creator = object.__new__(KvCacheCreator)
+    creator._speculative_config = SimpleNamespace(
+        spec_dec_mode=SimpleNamespace(is_dflash=lambda: False, is_dspark=lambda: True),
+        attention_backend="AUTO",
+        draft_is_embedded_in_target=False,
+        _allow_separate_draft_kv_cache=True,
+        draft_len_schedule=None,
+    )
+    creator._draft_config = draft
+    creator._mapping = SimpleNamespace(
+        pp_size=1, cp_size=1, tp_size=2, enable_attention_dp=False, pp_layers=range
+    )
+    creator._llm_args = SimpleNamespace(attn_backend="TRTLLM", kv_cache_compression_config=None)
+    creator._model_engine = SimpleNamespace(
+        model=SimpleNamespace(
+            model_config=target,
+            config=target.pretrained_config,
+            draft_model=SimpleNamespace(
+                dflash_attention_backend="TRTLLM",
+                validate_block_attention_windows=lambda: [lowering] * 2,
+            ),
+        ),
+    )
+    creator._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2
+    creator._kv_cache_config = SimpleNamespace(max_attention_window=None)
+    creator._tokens_per_block = 128
+    creator._unification_max_seq_len = 8192
+    creator._max_seq_len = 8192
+    creator._is_disagg = is_disagg
+    creator._get_draft_kv_model_config = lambda: draft
+    creator._get_draft_max_attention_window = lambda *_: [4096]
+    return creator
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_m3_unifies_a_dspark_drafter(monkeypatch, is_disagg: bool) -> None:
+    """MiniMax-M3's manager hosts a DSpark drafter that reads its 128-token pages."""
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
+    assert _dspark_creator(is_disagg=is_disagg)._dflash_unify_blocker() is None
+    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache()
+
+    # The disagg opt-out keeps the separate draft KV cache.
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "0")
+    assert _dspark_creator(is_disagg=is_disagg)._should_unify_dflash_kv_cache() is not is_disagg
+
+    # A drafter running the non-causal context kernel cannot read 128-token pages.
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
+    blocker = _dspark_creator(is_disagg=is_disagg, context_kernel=True)._dflash_unify_blocker()
+    assert blocker is not None and "128-token pages" in blocker
+
+
+@pytest.mark.cpu_only
+def test_dflash_trtllm_page_sizes() -> None:
+    """Pages from 128 tokens serve the generation kernels but not the context kernel."""
+    from tensorrt_llm._torch.speculative.dflash_attention import dflash_trtllm_supports_page_size
+
+    for tokens_per_block in (16, 32, 64):
+        assert dflash_trtllm_supports_page_size(tokens_per_block, has_context_attention=True)
+    assert dflash_trtllm_supports_page_size(128, has_context_attention=False)
+    assert dflash_trtllm_supports_page_size(256, has_context_attention=False)
+    assert not dflash_trtllm_supports_page_size(128, has_context_attention=True)
+    assert not dflash_trtllm_supports_page_size(96, has_context_attention=False)
+
+
+@pytest.mark.cpu_only
+def test_nvfp4_target_with_bf16_draft_needs_a_hosting_manager() -> None:
+    """An NVFP4 target transfers with a BF16 draft only when the draft has pools of its own."""
+    target = (1, 128, DataType.NVFP4, False)
+    draft = (1, 128, DataType.BF16, False)
+    compatible = KvCacheCreator._dflash_disagg_layouts_compatible
+    assert not compatible(target, draft)
+    assert compatible(target, draft, nvfp4_target_with_other_draft=True)
+    assert not compatible(
+        target, (2, 128, DataType.BF16, False), nvfp4_target_with_other_draft=True
     )
