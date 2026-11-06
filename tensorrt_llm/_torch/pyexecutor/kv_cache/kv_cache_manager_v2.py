@@ -2068,8 +2068,9 @@ class KVCacheManagerV2(BaseResourceManager):
     # the speculation layers and may therefore support the protocol when the
     # pool holding the model's own layers does not.
     _supports_draft_reuse_match_backoff = True
-    # Opt-in for a subclass whose target truncates reuse to a coarse grid,
-    # where the draft's one-token backoff costs it a whole interval.
+    # Set by a subclass whose target truncates reuse to a coarse grid, where the
+    # draft's one-token backoff costs it a whole interval. Takes effect only
+    # with TLLM_DRAFT_REUSE_SKIP_BACKOFF=1; see _skips_draft_reuse_backoff.
     _drop_advisory_draft_lookahead = False
     # A subclass whose pools are not all addressed at `tokens_per_block` token
     # granularity opts out of *partial*-block reuse. Full-block reuse stays on.
@@ -2457,16 +2458,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.reuse_match_backoff = self._draft_prompt_lookahead
         if not supports_backoff:
             self.reuse_match_backoff = 0
-        elif (
-            self.is_draft
-            and joint_kv_cache_reuse
-            and self._drop_advisory_draft_lookahead
-            and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
-        ):
-            # The trim is advisory, but the scheduler caps the target at the
-            # draft's claim, so on a snapshot-grid target one token costs a
-            # whole interval. Exact verification already rejects a bad draft
-            # token; relaxed acceptance does not, so it keeps the trim.
+        elif self._skips_draft_reuse_backoff(spec_config, joint_kv_cache_reuse):
             self.reuse_match_backoff = 0
         self.enable_partial_reuse = _effective_partial_reuse(
             kv_cache_config.enable_partial_reuse,
@@ -6206,6 +6198,23 @@ class KVCacheManagerV2(BaseResourceManager):
             del points_by_id[request.py_request_id]
             return
         request.expect_snapshot_points = sorted({*request.expect_snapshot_points, *points})
+
+    def _skips_draft_reuse_backoff(self, spec_config, joint_kv_cache_reuse: bool) -> bool:
+        """Whether a paired draft pool drops its one-token reuse-match backoff.
+
+        The scheduler caps the target at the draft's claim, so on a snapshot-grid
+        target the trim costs a whole interval. Dropping it reuses draft KV that
+        may have been computed with a different next token, which can lower
+        acceptance, so it requires ``TLLM_DRAFT_REUSE_SKIP_BACKOFF=1``. Relaxed
+        acceptance does not reject a bad draft token, so it always keeps the trim.
+        """
+        return (
+            self.is_draft
+            and joint_kv_cache_reuse
+            and self._drop_advisory_draft_lookahead
+            and os.environ.get("TLLM_DRAFT_REUSE_SKIP_BACKOFF", "0") == "1"
+            and not getattr(spec_config, "use_relaxed_acceptance_for_thinking", False)
+        )
 
     def note_context_fork(self, req: LlmRequest, fork: int) -> None:
         """Hook for recurrent-state managers; the attention-only base ignores the hint."""
