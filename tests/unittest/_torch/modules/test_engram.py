@@ -316,3 +316,145 @@ def test_v41_engram_gate_parity(monkeypatch: pytest.MonkeyPatch, add_residual: b
     v41.DeepseekV41ForCausalLM.release_request_state(model, 41)
     assert 41 not in generation._pending_history_seeds
     assert 41 not in generation._history_row_of
+
+
+def _multi_token_hash_providers(
+    monkeypatch: pytest.MonkeyPatch, vocab: int
+) -> tuple[EngramHashProvider, EngramHashProvider]:
+    """Two providers with the same constants; the reference always takes the general path."""
+    generator = torch.Generator().manual_seed(1234)
+    config = EngramConfig(
+        layer_ids=[1, 3],
+        max_ngram_size=4,
+        n_head_per_ngram=2,
+        n_embed_per_ngram=256,
+        hidden_size=256,
+        hc_mult=4,
+        norm_eps=1e-20,
+        dtype=torch.bfloat16,
+    )
+    mapping = SimpleNamespace(
+        compressed_tokenizer=SimpleNamespace(
+            lookup_table=torch.randint(0, vocab - 3, (vocab,), generator=generator)
+        ),
+        pad_id=2,
+        layer_multipliers={
+            1: torch.tensor([3, 1000003, 999999937, 2147483647]),
+            3: torch.tensor([5, 7919, 104729, 1299709]),
+        },
+        vocab_size_across_layers={
+            1: [[100003, 100019], [100043, 100049], [100057, 100069]],
+            3: [[99991, 99989], [99971, 99961], [99929, 99923]],
+        },
+    )
+    monkeypatch.setattr(engram_module, "NgramHashMapping", lambda **kwargs: mapping)
+    reference, candidate = EngramHashProvider(config), EngramHashProvider(config)
+    monkeypatch.setattr(reference, "_compute_history_hashes", lambda *args, **kwargs: None)
+    return reference, candidate
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Engram hash kernels require CUDA")
+@torch.no_grad()
+def test_multi_token_history_hashes_match_general_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    vocab, max_seq_len = 1000, 512
+    reference, candidate = _multi_token_hash_providers(monkeypatch, vocab)
+    taken = []
+    history_hashes = candidate._compute_history_hashes
+
+    def record(*args, **kwargs):
+        result = history_hashes(*args, **kwargs)
+        taken.append(result is not None)
+        return result
+
+    monkeypatch.setattr(candidate, "_compute_history_hashes", record)
+    generator = torch.Generator().manual_seed(4321)
+
+    def tokens(count: int, low: int = 0, high: int = vocab) -> list[int]:
+        return torch.randint(low, high, (count,), generator=generator).tolist()
+
+    def forward(
+        request_ids: list[int],
+        lengths: list[int],
+        positions: list[int],
+        token_ids: list[int],
+        *,
+        padded: int | None = None,
+        mask: list[bool] | None = None,
+        dtype: torch.dtype = torch.long,
+    ) -> dict[int, int]:
+        input_ids = torch.tensor(token_ids, dtype=dtype, device="cuda")
+        position_ids = torch.tensor(positions, dtype=dtype, device="cuda")
+        seq_lens_host = torch.tensor(lengths, dtype=torch.int32)
+        token_mask = None if mask is None else torch.tensor(mask, device="cuda")
+        calls = len(taken)
+        outputs = [
+            provider.compute_hashes(
+                input_ids,
+                seq_lens=seq_lens_host.cuda(),
+                position_ids=position_ids,
+                request_ids=list(request_ids),
+                seq_lens_host=seq_lens_host,
+                max_seq_len=max_seq_len,
+                token_mask=token_mask,
+                padded_num_tokens=padded,
+            )
+            for provider in (reference, candidate)
+        ]
+        assert taken[calls:] == [True], "the multi-token history path must handle this forward"
+        expected, actual = outputs
+        assert expected.keys() == actual.keys()
+        for layer_id in expected:
+            torch.testing.assert_close(actual[layer_id], expected[layer_id], rtol=0, atol=0)
+        torch.testing.assert_close(candidate._history, reference._history, rtol=0, atol=0)
+        assert candidate._history_row_of == reference._history_row_of
+        assert sorted(candidate._history_free_rows) == sorted(reference._history_free_rows)
+        assert candidate._cached_hashes_store.keys() == reference._cached_hashes_store.keys()
+        return {layer_id: value.data_ptr() for layer_id, value in actual.items()}
+
+    seeds = {101: tokens(3), 102: tokens(2)}
+    for provider in (reference, candidate):
+        provider.queue_history_seed(101, 47, seeds[101])
+        provider.queue_history_seed(102, 10, seeds[102])
+    # Context chunks, one of them continuing a seeded prompt.
+    forward([100, 101], [37, 20], list(range(37)) + list(range(50, 70)), tokens(57))
+    forward([102], [5], list(range(12, 17)), tokens(5))
+    forward([103], [9], list(range(9)), tokens(9))
+    next_position = {100: 37, 101: 70, 102: 17, 103: 9}
+    request_ids = [100, 101, 102, 103]
+
+    def draft_positions(offset: int = 0) -> list[int]:
+        return [
+            position
+            for request_id in request_ids
+            for position in range(
+                next_position[request_id] + offset, next_position[request_id] + offset + 6
+            )
+        ]
+
+    # Speculative steps with 6 tokens per request and CUDA graph padding. Accepting
+    # 1-6 tokens makes the next step overwrite the history cells of rejected drafts.
+    pointers = None
+    for step in range(8):
+        step_pointers = forward(request_ids, [6] * 4, draft_positions(), tokens(24), padded=32)
+        assert pointers is None or step_pointers == pointers, "graph buffers must be reused"
+        pointers = step_pointers
+        for index, request_id in enumerate(request_ids):
+            next_position[request_id] += 1 + (step + index) % 6
+    forward(request_ids, [6] * 4, draft_positions(), tokens(24))
+    forward(request_ids, [6] * 4, draft_positions(), tokens(24), padded=32, dtype=torch.int32)
+    out_of_vocab = tokens(12) + [-5, vocab + 7, 0, vocab - 1] + tokens(8)
+    forward(request_ids, [6] * 4, draft_positions(6), out_of_vocab, padded=32)
+    mask = [index not in (3, 10, 17) for index in range(24)]
+    forward(request_ids, [6] * 4, draft_positions(), tokens(24), padded=32, mask=mask)
+    aliased = list(range(next_position[100], next_position[100] + 6)) * 2
+    aliased += list(range(next_position[101], next_position[101] + 6)) * 2
+    forward([100, 100, 101, 101], [6] * 4, aliased, tokens(24), padded=32)
+    for provider in (reference, candidate):
+        provider.release_request_state(102)
+        provider.queue_history_seed(200, 30, seeds[101])
+    recycled = list(range(next_position[100], next_position[100] + 6))
+    recycled += list(range(next_position[101], next_position[101] + 6)) + list(range(33, 39))
+    recycled += list(range(next_position[103], next_position[103] + 6))
+    forward([100, 101, 200, 103], [6] * 4, recycled, tokens(24), padded=32)
+    mixed = list(range(next_position[100], next_position[100] + 6)) + list(range(50))
+    forward([100, 300], [6, 50], mixed, tokens(56))
