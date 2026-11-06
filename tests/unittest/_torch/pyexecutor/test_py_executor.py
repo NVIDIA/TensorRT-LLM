@@ -1559,6 +1559,19 @@ def test_published_output_is_consumed_once(encoder_input, tp_size, sync, recorde
     assert _cross_kv_reservation(request) == (False, None)
 
 
+def test_cancel_before_submission_leaves_the_encoder_window():
+    request = _make_encoder_decoder_request(1, "token", 4)
+    scheduler = object.__new__(KVCacheV2Scheduler)
+    scheduler.no_schedule_until_state = LlmRequestState.ENCODER_INIT
+    scheduler.no_schedule_after_state = LlmRequestState.GENERATION_TO_COMPLETE
+    assert scheduler.is_request_in_schedulable_state(request)
+
+    _cancel_requests(_make_handoff_executor(), [request])
+
+    assert request.is_finished
+    assert not scheduler.is_request_in_schedulable_state(request)
+
+
 @pytest.mark.parametrize("encoder_input", ["token", "feature"])
 def test_cancel_while_step_pending_is_not_revived(encoder_input):
     requests = [
