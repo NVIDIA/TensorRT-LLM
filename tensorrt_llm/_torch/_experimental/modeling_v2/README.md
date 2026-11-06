@@ -265,26 +265,33 @@ mode the target uses.
 
   | Key | Shape | Contents |
   |---|---|---|
-  | `logits` | verify rows x vocabulary | The verify logits |
+  | `logits` | verify rows x vocabulary, or empty | The verify logits; empty when the step samples without materializing them |
   | `new_tokens` | `[B, K+1]` | The tokens accepted this step; a context request defines column 0 only |
   | `new_tokens_lens` | `[B]` | Tokens accepted per request: 1 + accepted drafts |
   | `next_draft_tokens` | `[B, K]` | The drafts to verify next step |
   | `next_new_tokens` | `[B, K+1]` | Each request's last accepted token, then its drafts: the next step's input under the overlap scheduler |
 
   With `K = 0` the dict has the same keys, and `next_draft_tokens` is
-  `[B, 0]`.
-* **Naming.** Name the fused target after its split sibling, with a suffix on
-  the parallel segment that names the mode, for example
-  `<checkpoint>__<sm>__<parallel>_mtp_fused`. The class name carries the
-  suffix too, for example `ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused`.
+  `[B, 0]`. A target that returns empty `logits` refuses, in
+  `validate_request`, the requests that need them, such as requests with
+  logits post-processors; the speculative sampler already refuses logprobs
+  and context or generation logits.
+* **Naming.** When a fused target and a split target serve the same
+  checkpoint, GPU and parallel layout, name the fused target after its split
+  sibling, with a suffix on the parallel segment that names the mode, for
+  example `<checkpoint>__<sm>__<parallel>_mtp_fused`, and carry the suffix
+  into the class name, for example
+  `ModelingV2Glm53FlashNvfp4Sm100DefaultMtpFused`. A target that has no split
+  sibling, and runs both without speculation and with fused speculation,
+  follows the plain target naming in [Families and targets](#families-and-targets)
+  and states the modes it fuses in its module docstring.
 
 #### Recommendations
 
-* **Engine attributes.** Set `spec_worker = None`. Set `draft_config` to the
-  config of a separate draft checkpoint, from which the loader loads
-  `draft_model`, or to `None` when the draft weights are in the target's
-  checkpoint. Set `use_separate_draft_kv_cache` to what the engine decides,
-  `should_use_separate_draft_kv_cache(spec_config)`.
+* **Engine attributes.** The engine reads `spec_worker` with a `None`
+  default; set `spec_worker = None` to state that no worker runs. It reads
+  `draft_config` only when it loads a separate draft checkpoint into
+  `draft_model`, so set it only for such a drafter.
 * **Routing.** Decline what the fused target does not support in `route`,
   not only in its constructor, so the deployment falls to the split target
   instead of failing. Write each target's unsupported conditions as one
