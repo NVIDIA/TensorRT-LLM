@@ -117,6 +117,9 @@ class CutlassFusedMoEBase(MoEImplBase):
     #: Round ``hidden_size`` and ``intermediate_size_per_partition`` up to a
     #: multiple of this at construction, before the weights are allocated.
     pad_hidden_and_intermediate_to: int | None = None
+    #: As above for ``intermediate_size_per_partition`` alone, and only at MoE TP
+    #: size 1: a TP shard would split a block from its scale.
+    pad_intermediate_on_single_tp_rank_to: int | None = None
     #: Whether the layer is a routed-expert LoRA target; only
     #: ``CutlassMoELoraMixin._init_moe_lora`` sets it.
     _moe_lora_enabled: bool = False
@@ -204,6 +207,11 @@ class CutlassFusedMoEBase(MoEImplBase):
         alignment = self.pad_hidden_and_intermediate_to
         if alignment is not None:
             self.hidden_size = pad_up(self.hidden_size, alignment)
+            self.intermediate_size_per_partition = pad_up(
+                self.intermediate_size_per_partition, alignment
+            )
+        alignment = self.pad_intermediate_on_single_tp_rank_to
+        if alignment is not None and self.tp_size == 1:
             self.intermediate_size_per_partition = pad_up(
                 self.intermediate_size_per_partition, alignment
             )

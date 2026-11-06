@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 NVIDIA Corporation. All rights reserved.
 """
-Triton FP8 block-scale MoE forward pass for SM120.
+Triton FP8 block-scale MoE forward pass for SM120/SM121.
 """
 
 import torch
@@ -525,7 +525,7 @@ def run_triton_fp8_block_scale_moe(
     Complete MoE forward pass using Triton FP8 block-scale GEMMs.
 
     This is a drop-in replacement for torch.ops.trtllm.fused_moe() for
-    SM120 + FP8_BLOCK_SCALES, matching the weight layout produced by
+    SM120/SM121 + FP8_BLOCK_SCALES, matching the weight layout produced by
     DeepSeekFP8BlockScalesFusedMoEMethod.
 
     Args:
@@ -546,10 +546,13 @@ def run_triton_fp8_block_scale_moe(
         (T, H) output tensor.
     """
     from tensorrt_llm._torch.moe.fused_moe.interface import ActivationType
+    from tensorrt_llm._torch.utils import relu2
 
     num_tokens, hidden = x.shape
     num_experts, gate_up_size, _ = w3_w1.shape
-    intermediate = gate_up_size // 2
+    # Non-gated experts (e.g. Relu2) have no gate half, so w3_w1 is only as wide as w2's input.
+    is_gated = gate_up_size != w2.shape[2]
+    intermediate = gate_up_size // 2 if is_gated else gate_up_size
     top_k = token_selected_experts.shape[1]
     device = x.device
 
@@ -577,25 +580,36 @@ def run_triton_fp8_block_scale_moe(
         top_k=top_k,
     )
 
-    if act_int in (swiglu, silu):
-        activation_id = 0
-    elif act_int in (geglu, gelu):
-        activation_id = 1
-    else:
-        raise ValueError(f"Unsupported activation_type={act_int} in Triton FP8 block-scale MoE")
+    if is_gated:
+        if act_int in (swiglu, silu):
+            activation_id = 0
+        elif act_int in (geglu, gelu):
+            activation_id = 1
+        else:
+            raise ValueError(f"Unsupported activation_type={act_int} in Triton FP8 block-scale MoE")
 
-    if swiglu_limit is not None and activation_id != 0:
-        raise ValueError(
-            f"Triton FP8 block-scale MoE clamps SwiGLU only, got activation_type={act_int}"
+        if swiglu_limit is not None and activation_id != 0:
+            raise ValueError(
+                f"Triton FP8 block-scale MoE clamps SwiGLU only, got activation_type={act_int}"
+            )
+
+        ic2 = torch.empty((num_tokens * top_k, intermediate), dtype=torch.bfloat16, device=device)
+        _invoke_gated_activation_kernel(
+            ic1.view(num_tokens * top_k, gate_up_size),
+            ic2,
+            activation_id,
+            swiglu_limit,
         )
-
-    ic2 = torch.empty((num_tokens * top_k, intermediate), dtype=torch.bfloat16, device=device)
-    _invoke_gated_activation_kernel(
-        ic1.view(num_tokens * top_k, gate_up_size),
-        ic2,
-        activation_id,
-        swiglu_limit,
-    )
+    elif act_int == int(ActivationType.Relu2):
+        if swiglu_limit is not None:
+            raise ValueError(
+                f"Triton FP8 block-scale MoE clamps SwiGLU only, got activation_type={act_int}"
+            )
+        ic2 = relu2(ic1.view(num_tokens * top_k, gate_up_size))
+    else:
+        raise ValueError(
+            f"Unsupported non-gated activation_type={act_int} in Triton FP8 block-scale MoE"
+        )
 
     # The kernel constexpr `top_k=1` here means each ic2 row is already one
     # (token, expert) pair (not to be confused with the model's `top_k`).
