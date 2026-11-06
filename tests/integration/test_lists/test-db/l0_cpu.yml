@@ -53,9 +53,6 @@ l0_cpu:
   - unittest/_torch/compilation/test_auto_multi_stream.py
   - unittest/_torch/compilation/test_phase_selective_forward.py
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
-  # b12x NVFP4 weight load: normalized E4M3 block scales, decoupled FC1 scale.
-  - unittest/_torch/moe/test_b12x_nvfp4_scale_math.py
-  - unittest/_torch/moe/test_cute_dsl_b12x_moe_backend.py::test_nvfp4_post_load_keeps_normalized_scales_and_decouples_fc1
   - unittest/_torch/distributed
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py

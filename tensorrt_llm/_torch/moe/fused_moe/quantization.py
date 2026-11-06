@@ -3990,7 +3990,7 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
     On top of that base layout, ``transform_weights`` materialises the
     b12x-specific weight tensors: the checkpoint's normalized FP8 block
     scales in ``convert_sf_to_mma_layout`` order, per-expert ``w*_alpha``
-    weight scales, the decoupled FC1 ``input_global_scale``, and a
+    output multipliers, the decoupled FC1 ``input_global_scale``, and a
     ``B12xMoEWrapper`` instance with a shared cross-layer output buffer.
     The wrapper and the bundled weight dict are attached to the MoE module
     as ``module.b12x_wrapper`` / ``module._b12x_weights`` so the backend's
@@ -4039,21 +4039,18 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
         w3w1_in_dim = module.hidden_size
         w2_in_dim = w2_in_packed * 16
 
-        # ``w1_alpha`` is both the FC1 epilogue output-dequant multiplier and,
-        # unless ``input_global_scale`` is supplied, the online activation
-        # quantizer's global scale. Keep the checkpoint's normalized FP8 block
-        # scales and carry ``weight_scale_2 = fc_alpha * fc_input_scale`` in
-        # ``w1_alpha`` instead of multiplying it into the E4M3 block scales:
-        # a ~2e-5 ``weight_scale_2`` drives the product below E4M3's normal
-        # range. The FC1 input scale is passed separately as
-        # ``input_global_scale``, so the wrapper folds it into the output
-        # multiplier while the kernel keeps using it as the quantizer grid.
-        # FC2 has no such dual use: ``fc2_input_scale`` stays separate and
-        # ``w2_alpha`` carries ``weight_scale_2 * fc2_input_scale``.
+        # FC1: ``w1_alpha`` is the epilogue output multiplier and
+        # ``input_global_scale`` is the activation-quant grid; the wrapper
+        # folds ``w1_alpha * input_global_scale``. The grid is materialised
+        # per expert here because the kernel expands a scalar on every
+        # launch. FC2: ``w2_alpha`` carries
+        # ``weight_scale_2 / module.fc2_input_scale``, and the kernel divides
+        # activations by ``module.fc2_input_scale``.
         w1_w_scale_2 = (module.fc31_alpha * module.fc31_input_scale).to(
             torch.float32)
         w2_w_scale_2 = (module.fc2_alpha * module.fc2_input_scale).to(
             torch.float32)
+        w1_alpha_b12x = w1_w_scale_2
 
         w1_sf_fp8 = module.w3_w1_weight_scale.view(torch.float8_e4m3fn)
         w2_sf_fp8 = module.w2_weight_scale.view(torch.float8_e4m3fn)
@@ -4071,22 +4068,15 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             # W4A16 path: BF16 activations multiplied by FP4 weights.
             # FlashInfer's W4A16 packer expects the ModelOpt scale contract:
             # normalized FP8 block scales plus per-expert ``weight_global_scale``.
-            w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
-            w2_alpha_b12x = w2_w_scale_2.to(torch.float32).contiguous()
+            w2_alpha_b12x = w2_w_scale_2
             fc2_input_scale_b12x = None
             input_global_scale_b12x = None
         else:
             fc2_input_scale_b12x = (1.0 / module.fc2_input_scale).to(
                 torch.float32)
             input_global_scale_b12x = (1.0 / module.fc31_input_scale).to(
-                torch.float32)
-            # The wrapper folds ``input_global_scale`` into ``w1_alpha`` and
-            # the kernel uses it as the FC1 activation grid, so the net weight
-            # multiplier is ``w1_alpha`` alone. FC2 folds ``fc2_input_scale``
-            # into ``w2_alpha`` itself.
-            w1_alpha_b12x = w1_w_scale_2.to(torch.float32).contiguous()
-            w2_alpha_b12x = (w2_w_scale_2 * fc2_input_scale_b12x).to(
-                torch.float32).contiguous()
+                torch.float32).expand(num_local_experts).contiguous()
+            w2_alpha_b12x = w2_w_scale_2 * fc2_input_scale_b12x
 
         # TRT-LLM packs 16 FP4 values per int64. flashinfer's internal
         # ``view(torch.float4_e2m1fn_x2)`` requires byte-contiguous storage
@@ -4100,9 +4090,8 @@ class NVFP4CuteDslB12xFusedMoEMethod(NVFP4CutlassFusedMoEMethod):
             w2_weight_sf=w2_sf_b12x,
             w2_alpha=w2_alpha_b12x,
             fc2_input_scale=fc2_input_scale_b12x,
+            input_global_scale=input_global_scale_b12x,
         )
-        if input_global_scale_b12x is not None:
-            b12x_weights["input_global_scale"] = input_global_scale_b12x
         module._b12x_weights = b12x_weights
 
         if module.activation_type not in self._ACTIVATION_MAP:
