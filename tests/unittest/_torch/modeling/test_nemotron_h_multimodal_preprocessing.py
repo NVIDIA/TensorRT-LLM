@@ -28,6 +28,8 @@ from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
     video_to_pixel_values,
 )
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
     MultimodalParams,
     MultimodalRuntimeData,
     _compute_mm_masks,
@@ -36,6 +38,10 @@ from tensorrt_llm.inputs.multimodal import (
 from tensorrt_llm.inputs.multimodal_data import AudioData, VideoData
 
 pytestmark = pytest.mark.cpu_only
+
+
+def test_nemotron_vision_gpu_normalize_remains_opted_out():
+    assert NemotronHMultimodalModel.supports_vision_gpu_normalize is False
 
 
 def make_tiler(**overrides):
@@ -676,6 +682,40 @@ class TestGetVideoTargetSizeAndFeatureSize:
 
 class TestVideoToPixelValues:
     """Tests for `video_to_pixel_values`."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("image_mode", ["RGB", "L"])
+    @pytest.mark.parametrize(
+        "mean, std",
+        [
+            ((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+            ((0.123, 0.456, 0.789), (0.321, 0.654, 0.987)),
+        ],
+        ids=["checkpoint", "custom"],
+    )
+    def test_float_resize_cannot_be_represented_as_uint8(self, dtype, image_mode, mean, std):
+        values = np.arange(256, dtype=np.uint8).reshape(16, 16)
+        image = Image.fromarray(values)
+        if image_mode == "RGB":
+            image = Image.merge(
+                "RGB", (image, image.transpose(Image.Transpose.FLIP_LEFT_RIGHT), image)
+            )
+        norm_mean = torch.tensor(mean).reshape(3, 1, 1)
+        norm_std = torch.tensor(std).reshape(3, 1, 1)
+        expected = video_to_pixel_values(
+            [image], input_size=20, norm_mean=norm_mean, norm_std=norm_std
+        )
+
+        raw = torch.from_numpy(np.array(image.convert("RGB"))).permute(2, 0, 1).float()
+        resized = torch.nn.functional.interpolate(
+            raw.unsqueeze(0), size=(20, 20), mode="bicubic", align_corners=False, antialias=True
+        ).clamp(0, 255)
+        quantized = resized.round().to(torch.uint8).float().div_(255.0)
+        quantized = quantized.sub_(norm_mean).div_(norm_std)
+
+        # Bicubic interpolation produces fractional pixels before normalization.
+        assert torch.any(resized != resized.round())
+        assert not torch.equal(expected.to(dtype), quantized.to(dtype))
 
     @pytest.mark.parametrize(
         "image_func",
@@ -2523,19 +2563,25 @@ class TestNemotronEpdEvs:
             {"tensor_size": [sum(item), 2], "metadata": {"retained_token_counts": item}}
             for item in counts
         ]
-        handoff = processor.build_disagg_prefill_multimodal_inputs(inputs, handles)
+        prompt_token_ids, params = processor.build_disagg_prefill_multimodal_inputs(
+            inputs, handles, mm_hashes=[[i] * 8 for i in range(len(handles))]
+        )
         expected = [101]
         for item in counts:
             for count in item:
                 expected.extend([100, 500, *([20] * count), 501])
         expected.append(102)
-        assert handoff.prompt_token_ids == expected
-        assert handoff.multimodal_embedding_lengths == list(map(sum, counts))
-        assert handoff.multimodal_lengths == [sum(item) + 2 * len(item) for item in counts]
-        assert handoff.multimodal_item_run_cu_offsets == [
+        assert prompt_token_ids == expected
+        assert params.item_metadata.output_embedding_lengths == tuple(map(sum, counts))
+        assert params.multimodal_input.multimodal_lengths == [
+            sum(item) + 2 * len(item) for item in counts
+        ]
+        assert params.multimodal_input.multimodal_item_run_cu_offsets == [
             sum(len(item) for item in counts[:i]) for i in range(len(counts) + 1)
         ]
-        assert handoff.multimodal_run_lengths == [count + 2 for item in counts for count in item]
+        assert params.multimodal_input.multimodal_run_lengths == [
+            count + 2 for item in counts for count in item
+        ]
 
     @pytest.mark.parametrize("item_counts", [None, [3], [-1, 4], [2, 2], [True, 2], [1.0, 2]])
     def test_handoff_rejects_invalid_retained_counts(
@@ -2562,13 +2608,17 @@ class TestNemotronEpdEvs:
             MultimodalParams(
                 multimodal_data={
                     "video": {"video_size": [(3, 1, 32, 32), (5, 1, 32, 32)]},
-                    "multimodal_embedding_lengths": [3, 4],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("video", 0), ("video", 1)], output_embedding_lengths=[3, 4]
+                    ),
                 }
             ),
             MultimodalParams(
                 multimodal_data={
                     "image": {},
-                    "multimodal_embedding_lengths": [1],
+                    MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                        [("image", 0)], output_embedding_lengths=[1]
+                    ),
                 }
             ),
         ]

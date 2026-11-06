@@ -81,6 +81,10 @@ def test_int8_kv_pool_accounting(manager_type: type) -> None:
     manager.total_num_kv_heads_per_layer = [2, 2]
     manager.head_dim = 64
     manager.head_dim_per_layer = [64, 64]
+    if manager_type is KVCacheManagerV2:
+        manager.layer_specs = None
+        manager.pp_layers = [0, 1]
+        manager.mixed_precision_low_dtype = None
     assert manager.get_cache_bytes_per_token() == 512
     manager.dtype = DataType.BF16
     assert manager.get_cache_bytes_per_token() == 1024
@@ -109,6 +113,7 @@ def _create_test_manager(
     )
     return _create_kv_cache_manager(
         model_engine=engine,
+        dtype=torch.bfloat16,
         kv_cache_manager_cls=_CaptureCacheManager,
         mapping=Mapping(),
         kv_cache_config=KvCacheConfig(enable_block_reuse=reuse),

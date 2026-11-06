@@ -5,15 +5,18 @@
 import functools
 import itertools
 import logging
+import sys
 import threading
+from contextlib import ExitStack
 from contextvars import ContextVar
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Hashable, Optional
 
 import torch
 from cuda.bindings import runtime as rt
 
 from tensorrt_llm._utils import CUASSERT
 
+from ...nccl_window_graph import nccl_window_graph_owner
 from ...utils import make_weak_ref
 
 logger = logging.getLogger(__name__)
@@ -150,8 +153,62 @@ def _copy_output(destination: Any, source: Any) -> Any:
     return source
 
 
-def eager_on_graph(inner: Callable) -> Callable:
-    """Run a callable eagerly between captured CUDA graph segments."""
+class _GraphedBreak:
+    """An eager break that replays as one CUDA graph per key of its launch sequence."""
+
+    def __init__(
+        self,
+        eager_fn: Callable[[], Any],
+        graph_fn: Callable[[], Any],
+        graph_key: Callable[[], Optional[Hashable]],
+    ) -> None:
+        self._eager_fn = eager_fn
+        self._graph_fn = graph_fn
+        self._graph_key = graph_key
+        self.graphs: dict[Hashable, torch.cuda.CUDAGraph] = {}
+
+    def __call__(self, capture_pool=None) -> None:
+        key = self._graph_key()
+        graph = None if key is None else self.graphs.get(key)
+        if graph is not None:
+            graph.replay()
+        elif key is not None and capture_pool is not None:
+            # Run the key's launches once eagerly (JIT compilation, autotuning),
+            # then capture them; the eager run is this replay's execution.
+            self._graph_fn()
+            graph = torch.cuda.CUDAGraph()
+            graph.capture_begin(pool=capture_pool)
+            try:
+                self._graph_fn()
+            finally:
+                graph.capture_end()
+            self.graphs[key] = graph
+        else:
+            self._eager_fn()
+
+    def reset(self) -> None:
+        for graph in self.graphs.values():
+            graph.reset()
+        self.graphs.clear()
+
+
+def eager_on_graph(
+    inner: Optional[Callable] = None,
+    *,
+    graph_key: Optional[Callable[..., Optional[Hashable]]] = None,
+    graph_body: Optional[Callable] = None,
+) -> Callable:
+    """Run a callable eagerly between captured CUDA graph segments.
+
+    With ``graph_key``, the break can replay as CUDA graphs instead. Called with
+    the break's arguments at each replay, ``graph_key`` returns a key naming
+    everything besides those arguments that fixes the launches of ``graph_body``
+    (default: ``inner``), or None to run ``inner``. A key's graph is captured
+    only by a replay given a capture pool (``BreakableCUDAGraph.replay``); other
+    replays run ``inner`` for a key without one.
+    """
+    if inner is None:
+        return functools.partial(eager_on_graph, graph_key=graph_key, graph_body=graph_body)
 
     @functools.wraps(inner)
     def wrapper(*args, **kwargs):
@@ -172,11 +229,20 @@ def eager_on_graph(inner: Callable) -> Callable:
         captured_kwargs = {key: make_weak_ref(value) for key, value in kwargs.items()}
         captured_output = output
 
-        def replay_fn() -> Any:
-            new_output = inner(*captured_args, **captured_kwargs)
+        def replay_fn(fn: Callable = inner) -> Any:
+            new_output = fn(*captured_args, **captured_kwargs)
             return _copy_output(captured_output, new_output)
 
-        capture.cuda_graph._break_functions.append(replay_fn)
+        if graph_key is None:
+            capture.cuda_graph._break_functions.append(replay_fn)
+        else:
+            capture.cuda_graph._break_functions.append(
+                _GraphedBreak(
+                    replay_fn,
+                    functools.partial(replay_fn, graph_body or inner),
+                    functools.partial(graph_key, *captured_args, **captured_kwargs),
+                )
+            )
         capture._begin_new_segment()
         return output
 
@@ -198,19 +264,40 @@ class BreakableCUDAGraph:
     def num_breaks(self) -> int:
         return len(self._break_functions)
 
+    @property
+    def has_graphable_breaks(self) -> bool:
+        """Whether a break can replay as CUDA graphs (see ``eager_on_graph``)."""
+        return any(isinstance(fn, _GraphedBreak) for fn in self._break_functions)
+
+    @property
+    def num_break_graphs(self) -> int:
+        """CUDA graphs captured for the breaks (see ``eager_on_graph``)."""
+        return sum(len(fn.graphs) for fn in self._break_functions if isinstance(fn, _GraphedBreak))
+
     def pool(self):
         if not self._segments:
             raise RuntimeError("Cannot get the pool of an empty BCG")
         return self._segments[0].pool()
 
-    def replay(self) -> None:
+    def replay(self, break_graph_pool=None) -> None:
+        """Replay the segments and breaks.
+
+        Args:
+            break_graph_pool: Memory pool to capture the CUDA graph of a graphable
+                break's key in when it has none; None runs such breaks eagerly.
+                Capturing needs a non-default current stream.
+        """
         stream_token = _current_stream.set(torch.cuda.current_stream())
         replay_token = _current_replay_token.set(next(_replay_token_counter))
         try:
             for index, segment in enumerate(self._segments):
                 segment.replay()
                 if index < len(self._break_functions):
-                    self._break_functions[index]()
+                    fn = self._break_functions[index]
+                    if isinstance(fn, _GraphedBreak):
+                        fn(break_graph_pool)
+                    else:
+                        fn()
         finally:
             _current_replay_token.reset(replay_token)
             _current_stream.reset(stream_token)
@@ -218,6 +305,9 @@ class BreakableCUDAGraph:
     def reset(self) -> None:
         for segment in self._segments:
             segment.reset()
+        for fn in self._break_functions:
+            if isinstance(fn, _GraphedBreak):
+                fn.reset()
         self._segments.clear()
         self._break_functions.clear()
 
@@ -238,37 +328,41 @@ class BreakableCUDAGraphCapture:
         self._pool = (0, 0) if pool is None else pool
         self._stream = stream
         self._capture_error_mode = capture_error_mode
-        self._stream_context = None
-        self._capture_token = None
-        self._stream_token = None
-        self._forked_token = None
+        self._exit_stack: Optional[ExitStack] = None
 
     def __enter__(self) -> "BreakableCUDAGraphCapture":
-        _install_wait_stream_hook()
-        if self._stream is not None:
-            self._stream_context = torch.cuda.stream(self._stream)
-            self._stream_context.__enter__()
-        self._capture_token = _current_capture.set(self)
-        self._stream_token = _current_stream.set(self._stream or torch.cuda.current_stream())
-        self._forked_token = _forked_streams.set(set())
+        stack = ExitStack()
+        self._exit_stack = stack
         try:
+            _install_wait_stream_hook()
+            stack.callback(_uninstall_wait_stream_hook)
+            stack.enter_context(nccl_window_graph_owner(self._pool))
+            if self._stream is not None:
+                stack.enter_context(torch.cuda.stream(self._stream))
+            capture_token = _current_capture.set(self)
+            stack.callback(_current_capture.reset, capture_token)
+            stream_token = _current_stream.set(self._stream or torch.cuda.current_stream())
+            stack.callback(_current_stream.reset, stream_token)
+            forked_token = _forked_streams.set(set())
+            stack.callback(_forked_streams.reset, forked_token)
             self._begin_new_segment()
-        except Exception:
-            _uninstall_wait_stream_hook()
+        except BaseException:
+            self._exit_stack = None
+            stack.__exit__(*sys.exc_info())
             raise
         return self
 
     def __exit__(self, *args: object) -> bool:
         try:
             self._end_current_segment()
+        except BaseException:
+            args = sys.exc_info()
+            raise
         finally:
-            _forked_streams.reset(self._forked_token)
-            _current_stream.reset(self._stream_token)
-            _current_capture.reset(self._capture_token)
-            if self._stream_context is not None:
-                self._stream_context.__exit__(*args)
-                self._stream_context = None
-            _uninstall_wait_stream_hook()
+            stack = self._exit_stack
+            self._exit_stack = None
+            if stack is not None:
+                stack.__exit__(*args)
         return False
 
     def _begin_new_segment(self) -> None:

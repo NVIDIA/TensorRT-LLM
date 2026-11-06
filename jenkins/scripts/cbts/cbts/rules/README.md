@@ -11,16 +11,30 @@ for the overall CBTS architecture.
 
 | File | Class | Scope | Triggers on |
 |---|---|---|---|
+| `python_formatting.py` | `PythonFormattingRule` | `noop` | Python files with verified equivalent complete ASTs and unchanged comments |
 | `waives.py` | `WaivesRule` | `waiveonly` | `tests/integration/test_lists/waives.txt` |
 | `tests_def.py` | `TestsDefRule` | `testdefonly` | `tests/**/*` (any file under tests/) |
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
-| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs) |
+| `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**` (excl. docs) |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+| `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+
+## PythonFormattingRule
+
+Claims Python files only after the raw patch matches the checked-out source
+and both complete source images have identical ASTs, including docstrings and
+type comments. Comment text must also match, preserving encoding and lint
+directives. Missing or mismatched patches, syntax errors, empty pre-images,
+and explicit rename/mode changes retain their normal impact. Repeated patches
+for old/new rename paths are not classified as formatting.
+
+Verified files are excluded from source rules and contribute `scope=noop`;
+the entry point still retains the always-run CPU stages. A mixed PR continues
+through the normal rules for every remaining changed file.
 
 ## DocsRule
 
@@ -28,10 +42,12 @@ Claims every file under `docs/` plus Markdown and reStructuredText files
 anywhere in the repository, excluding paths recognized by `is_out_of_scope`.
 The same exclusion applies to Python docstring contributions. Every claim contributes the literal
 `CPU-Build_Docs` stage, which runs Doxygen and Sphinx `make html`. Changes under
-`docs/` additionally keep every block and entry in `l0_cpu.yml`, because CPU
-tests directly read documentation sources such as `model-express.md` and import
-the telemetry extension under `docs/source/_ext/`. If the CPU test-db blocks or
-stages cannot be resolved for a `docs/` change, the rule forces fallback instead
+`docs/` additionally select registered documentation-related CPU tests: docs
+helpers, API stability, tools, usage/telemetry, serving-schema validation, and
+model-loader documentation checks. A parent YAML entry retains its complete
+suite and options. This preserves tests reading `model-express.md` and importing
+the extensions under `docs/source/_ext/` without running unrelated CPU entries.
+If the CPU test-db blocks or stages cannot be resolved for a `docs/` change, the rule forces fallback instead
 of silently running docs alone. Markdown and reStructuredText outside `docs/`
 run only the docs build, matching the legacy Docs path without adding unrelated
 CPU tests.
@@ -48,7 +64,7 @@ classes, and functions. The input analyzer checks the unmodified patch against
 the post-image, parses both images, and separates literal docstring lines from
 code lines. A Python file with only those edits is claimed by `DocsRule` and
 excluded from the other rules. For a mixed file, the rule contributes the docs
-build and complete CPU validation without claiming the file; other rules and
+build and the same documentation-related CPU tests without claiming the file; other rules and
 coverage analyze the remaining executable edits. The original patch remains
 available to coverage to reconstruct the pre-image. Selections combine by
 union, including the independent docs stage when coverage narrows the residual.
@@ -80,6 +96,13 @@ Outcomes:
   `l0_sanity_check`.
 
 ## TestsDefRule
+
+Changes to `tests/integration/defs/perf/test_perf.py`, its shared `utils.py`,
+or their statically discovered imported helpers also select
+`unittest/others/test_perf_qa_functional.py` in the CPU test list.
+This protects the QA harness without scheduling a GPU benchmark. Existing
+PerfSanity matches are retained for shared helpers; helpers imported only by
+the QA test select its CPU coverage. Missing CPU coverage forces fallback.
 
 For each file under `tests/` in the diff:
 
@@ -203,8 +226,10 @@ Outcomes:
 
 Path-only rule. Claims source files under `examples/visual_gen/`,
 `scripts/visualgen_eval/`, `tensorrt_llm/_torch/visual_gen/`,
-`tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding `.md`,
-which `OutOfScopeRule` claims as noop). fused-DiT paths stay unclaimed:
+`tensorrt_llm/media/`, and `tensorrt_llm/visual_gen/` (excluding documentation,
+which `DocsRule` handles). It also claims the exact generated schema
+`tensorrt_llm/schemas/trtllm-serve-visual-gen-config.schema.json`.
+Fused-DiT paths stay unclaimed:
 those diffs also touch `inplace_info()` in
 `tensorrt_llm/_torch/compilation/utils.py`, which no VG rule claims.
 Image suffixes are intentionally NOT excluded: VG ships reference images
@@ -222,16 +247,25 @@ live in `backend: pytorch` and `backend: tensorrt` blocks. A block
 
 For each matched block, `block_filters` keeps only the VG entries.
 Non-VG siblings in the same block stay governed by other rules.
+Schema changes additionally keep the complete
+`unittest/llmapi/test_trtllm_serve_config_schemas.py` validation entry (or
+its enclosing test-directory entry). Missing validation stages force fallback.
+Other generated schemas remain unclaimed.
 
-Outward-facing fallback: VisualGen public symbols and
-`tensorrt_llm.media.*` are imported eagerly by non-VG startup paths such
-as `commands/serve.py`, `commands/utils.py`, and
-`serve/openai_server.py`. Both package prefixes
-(`tensorrt_llm/visual_gen/`, `tensorrt_llm/media/`) are listed in
-`_VG_OUTWARD_PREFIXES`; touching any non-doc file under them claims the
-changed files but emits `scope=None` so Selector falls back to baseline.
-This protects trtllm-serve / trtllm-bench startup paths from VG
-signature drift slipping through pre-merge.
+Shared serving validation: changes under `tensorrt_llm/visual_gen/` or
+`tensorrt_llm/media/` also keep every entry in `l0_cpu`, plus shared test
+families under `test_e2e.py`, `examples/serve`, `disaggregated`, `llmapi`,
+`unittest/llmapi`, and `unittest/disaggregated`. These cover public config,
+protocol/media imports, normal and disaggregated serving, multimodal requests,
+and online benchmarks. PackageSanityCheck and PerfSanity remain enabled.
+
+The CPU suite must contain runnable API stability, serve-schema, lazy-server
+import, and lazy-model-zoo validation. The serving chat/completions examples and
+config-override precedence test must also resolve to stages scheduled in the trigger mode;
+OnDemand stages and optional
+pre-merge multi-GPU stages cannot satisfy this requirement. Missing or filtered
+required validation keeps `scope=None`. Public changes therefore get a wider
+test set than internal VG changes without requiring all unrelated GPU tests.
 
 Outcomes:
 
@@ -240,10 +274,11 @@ Outcomes:
   `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
   → `scope=visualgenonly`;
   sanity off (VG changes don't affect wheel sanity); perfsanity on iff
-  a matched block lives in `l0_perf` or `*perf_sanity*`.
+  a matched block lives in `*perf_sanity*`.
 - VG source touched, any outward-facing path under
-  `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=None`
-  (fallback).
+  `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=visualgenonly`
+  with shared serving, full CPU, package sanity, and performance sanity.
+  Missing required shared validation → `scope=None` (fallback).
 - VG source touched but no VG block found anywhere (defensive) →
   `scope=None` (fallback).
 
@@ -303,7 +338,20 @@ Outcomes:
 Path-only rule. Claims non-documentation source changes under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
-from a catalog of op wrappers).
+from a catalog of op wrappers), including each family's native code
+(`models/<family>/csrc/`, `models/<family>/<target>/csrc/`: one torch-op library
+per model family, loaded only when routing picks one of the family's targets),
+plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
+native build module `cpp/cmake/modules/modeling_v2.cmake`.
+
+Scope — per model node, else all of modeling_v2: source changes under
+`models/` (native `csrc/` included) select the nearest model node's unit tests
+and the accuracy gates of its targets. Family-shared code selects the whole
+family. A covering directory entry is retained when no more specific entry
+exists, unless it ignores that node. Whole-tree unit checks are always retained.
+Shared Python or native infrastructure selects every modeling_v2 entry, as does
+an unreadable routing tree. If no modeling_v2 entry matches, the rule falls back
+to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -318,9 +366,10 @@ in `backend: pytorch` blocks beside everything else. A block belongs to
 modeling_v2 iff one of its `tests:` entries matches
 `_MV2_ENTRY_PATTERNS`:
 
-- `unittest/_torch/modeling_v2/` — the op-level catalog matrix, carried
-  as whole-directory entries (one on `l0_gb300`, one on
-  `l0_gb300_multi_gpus` for the 4-rank collectives).
+- `unittest/_torch/modeling_v2/` — the unit tests: one directory entry
+  (`--ignore` of `comm/`) that collects the catalog matrix and every
+  family's tests under `models/<family>`, plus `comm/` on
+  `l0_gb300_multi_gpus` for the 4-rank collectives.
 - `test_modeling_v2_` — the accuracy gates, and any future unit file.
 
 Both markers are exact by construction rather than by luck: every test
@@ -331,9 +380,9 @@ carve-out is needed.
 
 Outward fallback: not needed, and by design rather than by accident.
 Nothing beyond the resolver module is imported unless `LLM(modeling_v2=...)`
-is on — the model loader calls `modeling_v2_resolve`, which returns
-immediately when the switch is off, and the routing modules are imported
-lazily behind it. The callers outside the subtree,
+is on — the model loader calls `modeling_v2_resolve_on_all_ranks`, which
+returns immediately when the switch is off, and the routing modules are
+imported lazily behind it. The callers outside the subtree,
 `tensorrt_llm/_torch/pyexecutor/model_loader.py` (decides) and
 `tensorrt_llm/_torch/models/modeling_auto.py` (reads the decision off
 `ModelConfig`), are deliberately left unclaimed: a change to the shared
@@ -353,9 +402,8 @@ Source changed but no modeling_v2 block in any yaml (defensive) →
 
 Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db
 entries under `unittest/grpc/openengine/`. The stub-based tests are registered in `l0_cpu.yml`, so
-they resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
-unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline and fallback
-pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
+they explicitly resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each.
+CBTS adds no unrelated CPU tests to this selection. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
 adding `A10-PyTorch-*`: an OpenEngine change does pull one GPU shard. Any GPU serves — the model is
 TinyLlama-1.1B — so it sits with the other gateway tests rather than claiming a scarcer type.
 OpenEngine's private bindings and gRPC runtime are base package dependencies, so no stage-name guard
@@ -367,12 +415,17 @@ source-plus-test changes combine through the `testsonly` scope family.
 
 ## OutOfScopeRule
 
-Claims changes outside product-test selection as `scope=noop`, contributing no
-test stages or block filters. The main entry point still retains the always-run
-CPU stages. With only noop contributions, the source `l0_cpu` list runs without
-case filtering. In a mixed PR, other rules or coverage select the remaining
-changes; noop adds no requirement to retain the entire CPU suite. Build and
-repository checks remain upstream.
+Claims changes outside product-test selection, including reviewed metadata, issue
+templates, developer-assistant configuration, QA/dev lists, timing caches,
+microbenchmarks, and verified static-check-only pyproject edits. These contribute
+`scope=noop` without CPU stages. Every rule owns its test contributions; the
+entry point never appends a generic CPU suite. Coverage Tier 2 retains its
+separate policy of preserving CPU tests; fallback uses the baseline pipeline.
+
+CBTS infrastructure changes contribute `scope=testsonly` with the registered
+`unittest/scripts` CPU suite, including CBTS regression tests. Missing CPU scripts
+registration forces fallback. Other out-of-scope files in the same PR add no
+CPU tests. Build and repository checks remain upstream.
 
 `OUT_OF_SCOPE_EXACT_PATHS` lists reviewed metadata files by complete repository
 path. A new YAML, JSON, TOML, or template file is not automatically exempt,
