@@ -303,6 +303,10 @@ class Gemma4ToolParser(BaseToolParser):
     - Supports: strings, numbers, booleans, null, nested objects, arrays
 
     Multiple tool calls are placed sequentially with no separator.
+
+    Streaming sends a call's name once the text up to its ``{`` has arrived, and
+    its arguments in one piece once the call closes, as the JSON
+    ``detect_and_parse`` makes of them.
     """
 
     needs_raw_special_tokens: bool = True
@@ -438,24 +442,8 @@ class Gemma4ToolParser(BaseToolParser):
                                 ]
                             )
 
-                # Stream raw argument text incrementally
-                if self._current_func_name is not None:
-                    prefix = BOT_TOKEN + CALL_PREFIX + self._current_func_name + "{"
-                    if current_text.startswith(prefix) and len(current_text) > len(prefix):
-                        args_so_far = current_text[len(prefix) :]
-                        already_sent = self.streamed_args_for_tool[self.current_tool_id]
-                        if len(args_so_far) > len(already_sent):
-                            diff = args_so_far[len(already_sent) :]
-                            self.streamed_args_for_tool[self.current_tool_id] += diff
-                            return StreamingParseResult(
-                                calls=[
-                                    ToolCallItem(
-                                        tool_index=self.current_tool_id,
-                                        parameters=diff,
-                                    )
-                                ]
-                            )
-
+                # The argument text is not JSON: it is held until the end token
+                # arrives, and the arguments then go out once, parsed.
                 return StreamingParseResult()
 
             # Found end token - complete the tool call
@@ -535,6 +523,22 @@ class Gemma4ToolParser(BaseToolParser):
             self._current_func_name = None
             self._buffer = ""
             return StreamingParseResult()
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Report the complete calls still in the buffer when the stream ends.
+
+        An increment returns the text before a call or one step of a call and
+        keeps the rest for the next one, so the last increment can leave whole
+        calls behind: one that arrived with text before it, or after the end of
+        another call. As in ``detect_and_parse``, the text left behind (it follows
+        a call) is dropped and a call that never closed is not reported.
+        """
+        calls: List[ToolCallItem] = []
+        while True:
+            start = 0 if self._is_inside_tool_call else self._buffer.find(BOT_TOKEN)
+            if start == -1 or self._buffer.find(EOT_TOKEN, start) == -1:
+                return StreamingParseResult(calls=calls)
+            calls.extend(self.parse_streaming_increment("", tools).calls)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
