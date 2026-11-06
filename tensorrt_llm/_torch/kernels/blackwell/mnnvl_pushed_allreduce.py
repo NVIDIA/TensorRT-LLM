@@ -242,31 +242,39 @@ def reduce_chunk(world: int, one_shot: bool) -> int:
     return (world if world <= 8 else 8) if one_shot else min(world, 16)
 
 
+#: Largest group whose slots :func:`reduce_slots_v4` polls in one round (``4 * world`` words in
+#: registers); larger groups are polled one chunk of ranks at a time.
+POLL_ALL_MAX_WORLD = 16
+
+
 @cute.jit
 def reduce_slots_v4(base: Int64, slot_bytes: int, world: int, chunk: int):
     """Sum the ``world`` 16-byte slots at ``base + r * slot_bytes`` in the C++ order (``chunk``
     ranks per partial sum, :func:`reduce_chunk`); returns eight FP32 values (four BF16 pairs).
-    Like the C++ kernel, each chunk of ranks is polled until every word has arrived and then
-    summed, so only one chunk's slots are live."""
+    Up to :data:`POLL_ALL_MAX_WORLD` ranks every slot is polled in one round until every word has
+    arrived, so the sum follows the last rank's data by one load round trip; larger groups poll
+    one chunk at a time, so only one chunk's slots are live."""
+    poll = world if world <= POLL_ALL_MAX_WORLD else chunk
     acc = [cutlass.Float32(0.0)] * 8
-    for c0 in cutlass.range_constexpr(0, world, chunk):
-        words = cute.make_rmem_tensor((chunk * 4,), Int32)
+    for p0 in cutlass.range_constexpr(0, world, poll):
+        words = cute.make_rmem_tensor((poll * 4,), Int32)
         ready = Int32(0)
         while ready == 0:
             ready = Int32(1)
-            for r in cutlass.range_constexpr(chunk):
-                w = ld_volatile_v4(base + Int64((c0 + r) * slot_bytes))
+            for r in cutlass.range_constexpr(poll):
+                w = ld_volatile_v4(base + Int64((p0 + r) * slot_bytes))
                 for e in cutlass.range_constexpr(4):
                     words[r * 4 + e] = w[e]
                 ready = ready & arrived_v4(*w)
-        part = [cutlass.Float32(0.0)] * 8
-        for r in cutlass.range_constexpr(chunk):
-            for q in cutlass.range_constexpr(4):
-                part[2 * q], part[2 * q + 1] = _acc_bf16x2(
-                    words[r * 4 + q], part[2 * q], part[2 * q + 1]
-                )
-        for i in cutlass.range_constexpr(8):
-            acc[i] = _add_f32(acc[i], part[i])
+        for c0 in cutlass.range_constexpr(0, poll, chunk):
+            part = [cutlass.Float32(0.0)] * 8
+            for r in cutlass.range_constexpr(c0, c0 + chunk):
+                for q in cutlass.range_constexpr(4):
+                    part[2 * q], part[2 * q + 1] = _acc_bf16x2(
+                        words[r * 4 + q], part[2 * q], part[2 * q + 1]
+                    )
+            for i in cutlass.range_constexpr(8):
+                acc[i] = _add_f32(acc[i], part[i])
     return acc
 
 

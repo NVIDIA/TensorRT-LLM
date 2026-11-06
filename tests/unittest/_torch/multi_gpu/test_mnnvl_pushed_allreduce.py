@@ -855,12 +855,12 @@ def test_small_batch_moe_output_push_without_local_experts(mpi_pool_executor):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("world", [4, 16, 64])
+@pytest.mark.parametrize("world", [4, 16, 32, 64])
 def test_one_shot_finish_sums_rank_chunks(world):
-    """The one-shot finish kernel at world sizes whose sum spans several chunks of ranks
-    (polled and summed one chunk at a time) against the C++ order, on one GPU: the pushed slots
-    of every rank are written into the local Lamport buffer, which is all a one-shot finish
-    reads."""
+    """The one-shot finish kernel at world sizes whose sum spans several chunks of ranks (polled
+    in one round up to ``POLL_ALL_MAX_WORLD`` ranks, one chunk at a time above) against the C++
+    order, on one GPU: the pushed slots of every rank are written into the local Lamport buffer,
+    which is all a one-shot finish reads."""
     from tensorrt_llm._torch.distributed.ops import LamportWorkspaceView, mnnvl_allreduce_transport
     from tensorrt_llm._torch.kernels.blackwell import mnnvl_pushed_allreduce as pushed
 
