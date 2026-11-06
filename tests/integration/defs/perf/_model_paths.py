@@ -104,6 +104,7 @@ MODEL_PATH_DICT = {
     "kimi_k2.5_fp4": "Kimi-K2.5-NVFP4",
     # Kimi K3 (KDA linear attention + MLA MoE, MXFP4 routed experts)
     "kimi_k3": "Kimi-K3",
+    "kimi_k3_mxfp4": "Kimi-K3",
     # Kimi K3 NVFP4 requant (MIXED_PRECISION routed experts). Its DSpark drafter
     # is the separate Inferact-Kimi-K3-DSpark checkpoint, given per config as
     # `speculative_model`.
