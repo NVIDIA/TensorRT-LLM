@@ -247,7 +247,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
     monkeypatch.setattr(torch.cuda, "Event", Mock())
     monkeypatch.setattr(torch.cuda, "current_stream", Mock())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
-    monkeypatch.setattr(executor_module, "_distributed_warmup_guard", lambda *args: nullcontext())
+    monkeypatch.setattr(executor_module, "distributed_warmup_guard", lambda *args: nullcontext())
     monkeypatch.setattr(executor_module.ADPRouter, "create", Mock())
     monkeypatch.setattr(executor_module, "HangDetector", Mock())
     monkeypatch.setattr(executor_module, "ExecutorRequestQueue", Mock())

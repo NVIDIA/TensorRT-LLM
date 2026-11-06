@@ -569,7 +569,7 @@ def test_constructor_initializes_remote_tail_adp_before_starting_worker(
     monkeypatch.setattr(torch.cuda, "Event", Mock())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
     monkeypatch.setattr(torch.cuda, "stream", stream_scope)
-    monkeypatch.setattr(executor_module, "_distributed_warmup_guard", lambda *_: nullcontext())
+    monkeypatch.setattr(executor_module, "distributed_warmup_guard", lambda *_: nullcontext())
     monkeypatch.setattr(executor_module, "ExecutorRequestQueue", Mock())
     monkeypatch.setattr(executor_module, "mpi_disabled", lambda: True)
     monkeypatch.setattr(PyExecutor, "_set_global_steady_clock_offset", lambda _self: None)

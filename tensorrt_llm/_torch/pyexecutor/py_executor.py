@@ -30,9 +30,9 @@ except ImportError:
 from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm._utils import (CUASSERT, customized_gc_thresholds,
                                  get_steady_clock_now_in_seconds,
-                                 global_mpi_size, is_trace_enabled, mpi_comm,
-                                 mpi_disabled, nvtx_range,
-                                 set_thread_local_mpi_comm, trace_func)
+                                 is_trace_enabled, mpi_comm, mpi_disabled,
+                                 nvtx_range, set_thread_local_mpi_comm,
+                                 trace_func)
 # yapf: disable
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
@@ -54,7 +54,7 @@ from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
 from tensorrt_llm.llmapi.utils import \
     _reapply_current_thread_affinity_to_all_threads
 from tensorrt_llm.logger import logger
-from tensorrt_llm.mapping import CpType, Mapping
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
@@ -96,7 +96,7 @@ from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
 from .handle_logits import HandleLogits
-from .hang_detector import (HangDetector, all_ranks_crashed,
+from .hang_detector import (HangDetector, distributed_warmup_guard,
                             hard_kill_on_rank_crash, propagate_hard_kill,
                             start_rank_crash_kill_watchdog)
 from .hang_diagnostics import create_executor_hang_diagnostics
@@ -472,56 +472,6 @@ def _recv_sleep_wakeup_ack(comm, source: int, timeout_s: float) -> dict:
     """Receive a sleep/wakeup ACK with a bounded nonblocking poll loop."""
     return _recv_sleep_wakeup_ack_until(comm, source,
                                         time.monotonic() + timeout_s)
-
-
-@contextmanager
-def _distributed_warmup_guard(dist: Distributed,
-                              mapping: Mapping) -> Iterator[None]:
-    """Arm the rank-crash watchdog when warmup fails on a subset of ranks.
-
-    Warmup runs from ``PyExecutor.__init__``, before the executor loop and so
-    before ``_event_loop_wrapper`` arms this watchdog itself. A rank that
-    raises here leaves every peer blocked in a warmup collective it will
-    never join, until that peer's own HangDetector times out.
-
-    The watchdog's grace period is what keeps the failure diagnosable: the
-    worker's setup/RPC error path reports the exception before the abort
-    tears the world down, and ``TLLM_RANK_CRASH_HARD_KILL_GRACE`` tunes it.
-
-    ``SystemExit`` / ``KeyboardInterrupt`` are excluded for the same reason
-    ``_event_loop_wrapper`` leaves them unarmed: they are teardown signals
-    the launcher is already acting on, and an MPI_Abort on top would turn a
-    clean Ctrl-C into exit 137.
-
-    A SYMMETRIC crash -- every rank raising out of warmup, e.g. an OOM every
-    rank hits at the same allocation -- arms no watchdog at all: the
-    ``all_ranks_crashed`` probe proves nobody is stranded in a collective, so
-    the error can propagate through the worker's setup/RPC path and the serve
-    front end can tear the world down cleanly. This matters because the kill
-    armed here (``error_delivered=None``) cannot be suppressed, and in the
-    launcher-spawned (mgmn) deployment the rank processes host a persistent
-    MPI task loop that legitimately outlives a failed engine.
-
-    Peer count spans the model communicator and ``MPI.COMM_WORLD``: DWDP
-    peers live only in the latter, while a TorchDist launch can have several
-    model ranks in a single-process MPI world. The symmetric-crash probe only
-    trusts a communicator that spans the whole peer count, so a DWDP mismatch
-    falls back to arming the watchdog.
-    """
-    try:
-        yield
-    except Exception:
-        if dist.world_size > 1 or mapping.dwdp_enabled:
-            world = max(dist.world_size, global_mpi_size())
-            if all_ranks_crashed(world):
-                logger.error(
-                    f"Warmup failed on all {world} ranks (symmetric crash): "
-                    "no peer is stranded in a collective, so the cross-rank "
-                    "hard kill is not armed and the error propagates to a "
-                    "clean shutdown.")
-            else:
-                start_rank_crash_kill_watchdog(world, error_delivered=None)
-        raise
 
 
 @dataclasses.dataclass
@@ -1279,7 +1229,7 @@ class PyExecutor:
         with self.warmup_scope():
             self.execution_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.execution_stream), \
-                    _distributed_warmup_guard(self.dist, self.dist.mapping):
+                    distributed_warmup_guard(self.dist, self.dist.mapping):
                 self.model_engine.warmup(self.resource_manager)
                 if self.draft_model_engine is not None:
                     self.draft_model_engine.warmup(self.resource_manager)
@@ -1292,7 +1242,7 @@ class PyExecutor:
                 # The model's actions after warmup and graph capture, on every
                 # rank (some are collective, so every rank reaches this point,
                 # and a rank-local failure arms the rank-crash watchdog).
-                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                with distributed_warmup_guard(self.dist, self.dist.mapping):
                     self._executor_events.after_warmup()
             self.encoder_launch_executor = (ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="encoder-launch") if
@@ -1302,7 +1252,7 @@ class PyExecutor:
                 # CUDA graph capture inherits per-thread CUDA library state. Capture
                 # on the same single worker that owns every runtime encoder replay.
                 self.encoder_stream.wait_stream(self.execution_stream)
-                with _distributed_warmup_guard(self.dist, self.dist.mapping):
+                with distributed_warmup_guard(self.dist, self.dist.mapping):
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
