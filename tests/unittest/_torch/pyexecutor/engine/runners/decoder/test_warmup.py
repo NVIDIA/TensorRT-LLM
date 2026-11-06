@@ -1111,7 +1111,7 @@ class TestWarmupCleanup(unittest.TestCase):
         return engine, resource_manager, get_num_available_tokens
 
     @pytest.mark.cpu_only
-    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self):
+    def test_generation_only_autotuner_warmup_tunes_one_full_generation_batch(self) -> None:
         """Disaggregated Helix CP tunes on max_batch_size generation requests
         (bounded by max_num_tokens), without the context batch."""
         engine, resource_manager, get_num_available_tokens = self._run_stubbed_autotuner_warmup(

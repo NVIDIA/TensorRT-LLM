@@ -1050,11 +1050,9 @@ class KvCacheCreator:
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
-        # Estimation can shrink _max_seq_len; cache ownership must stay fixed.
+        # Estimation can shrink _max_seq_len; cache ownership and workspace
+        # reserves must stay sized for the configured value.
         self._unification_max_seq_len = max_seq_len
-        # The estimation KV manager can lower _max_seq_len to what its small
-        # pool fits; serving restores this value.
-        self._configured_max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
         self._net_max_seq_len = net_max_seq_len
         self._dummy_reqs = None
@@ -2048,7 +2046,7 @@ class KvCacheCreator:
             self._mapping,
             max_batch_size=self._max_batch_size,
             max_num_tokens=self._max_num_tokens,
-            max_seq_len=self._configured_max_seq_len,
+            max_seq_len=self._unification_max_seq_len,
             enable_cuda_graph=self._llm_args.cuda_graph_config is not None,
         )
         # A decode arena can first appear after the peak prefill step. Reserve
@@ -2081,7 +2079,7 @@ class KvCacheCreator:
         if getattr(self._sparse_attention_config, "algorithm",
                    None) == "deepseek_v4":
             workspace_memory = get_indexer_mqa_logits_workspace_bytes(
-                self._max_num_tokens, self._configured_max_seq_len)
+                self._max_num_tokens, self._unification_max_seq_len)
             budget_before = kv_cache_max_memory
             workspace_reserve = get_indexer_mqa_logits_workspace_reserve(
                 budget_before, workspace_memory)
@@ -2123,7 +2121,7 @@ class KvCacheCreator:
             self._kv_cache_config,
             self._max_batch_size,
             self._max_num_tokens,
-            self._configured_max_seq_len,
+            self._unification_max_seq_len,
             self._llm_args.enable_chunked_prefill,
             workspace_is_chunked_prefill_bounded,
             chunked_workspace_profiled=profiled_mla_chunks,
