@@ -189,6 +189,86 @@ LLM(model=..., modeling_v2=...)  ->  ModelLoader
                                      returns that class; the registry is not consulted
 ```
 
+## Speculative decoding
+
+A target runs speculative decoding in one of two ways.
+
+* **Stock.** The target implements the main model and leaves speculation to
+  the engine's speculative worker. Inherit `SpecDecOneEngineForCausalLM`: it
+  builds the drafter and the worker from the speculative config, and its
+  `forward` hands the target's hidden states and logits to the worker, which
+  verifies, accepts and drafts. For one-model MTP, the stock drafter builds
+  the MTP layer that the target's decoder model names in `mtp_layer_cls`, so
+  the target runs its own MTP layer rather than the Modeling V1 one.
+* **Fused.** The target runs the whole speculative step in its own
+  `forward`: the main model, verification, acceptance, the commit of any
+  per-token state and the draft chain. It builds no speculative worker
+  (`spec_worker = None`, `draft_config = None`,
+  `use_separate_draft_kv_cache = False`) and returns the dict the speculative
+  sampler reads: `logits`, `new_tokens`, `new_tokens_lens`,
+  `next_draft_tokens` and `next_new_tokens`. Input packing, the speculative
+  sampler and the KV rewind stay in the engine.
+
+Start with a stock target. A fused target is an optimization of a stock target
+for the same checkpoint: write it once the stock target exists, and compare
+against it. The
+[GLM-5.3-Flash family](models/glm5_next/) has one of each:
+`glm_5_3_flash_nvfp4__sm_100__default` runs on the stock framework, and
+`glm_5_3_flash_nvfp4__sm_100__default_mtp_fused` runs one-model MTP-Eagle in
+its forward.
+
+### Rules for a fused target
+
+* **The target owns the step; a worker does not own the target.** Do not
+  subclass a speculative worker so that its `_forward_impl` calls back into
+  the target's main model. A speculative worker runs after the target and
+  receives its hidden states and logits; a fused target has no worker at
+  all.
+* **Route the fused target first, and the stock target for the rest.**
+  `route` returns the fused target when it supports the deployment, and
+  otherwise the stock target. The fused target admits only the speculative
+  configurations it computes and whose acceptance was measured: the mode,
+  the draft length, a linear chain or a tree, rejection sampling, relaxed
+  acceptance, penalties, `sa_config`, `draft_len_schedule`, and engine-wide
+  features it does not run, such as guided decoding. Decline in `route`,
+  not only in the constructor, so the deployment falls to the stock target
+  instead of failing at construction.
+* **Commit per-token state for the accepted tokens only.** Recurrent, conv
+  or indexer state written for each draft token is committed for the
+  accepted count, for example through the cache manager's
+  `update_mamba_states`.
+* **Restore what the step rewrites.** The draft chain rewrites the attention
+  metadata (sequence and KV lengths, speculative masks). Restore it in a
+  `finally` block, so a failed step, such as an out-of-memory error during
+  warmup, does not leave it changed for the next forward.
+* **Do not drop outputs silently.** A step that returns no logits, or only
+  this rank's vocabulary shard, cannot serve requests that need logits
+  (logprobs, logits post-processors). Refuse those in the target's
+  `validate_request`, which fails that request only, or keep a path that
+  computes the logits for them.
+* **Keep only what the fused mode needs.** No compatibility code for modes
+  the target declines, and no environment variables that switch to a stock
+  path for comparison: the stock target is the comparison.
+
+### Recommendations
+
+* **Naming.** Name the fused target after its stock sibling, with a suffix on
+  the parallel segment, for example
+  `<checkpoint>__<sm>__<parallel>_mtp_fused`. The class name carries the
+  suffix too.
+* **Test the step against the stock worker.** Run both on the same synthetic
+  batches, including context-only, generation-only and mixed batches, and
+  require the same tokens, accepted counts, committed state and attention
+  metadata. The
+  [GLM-5.3-Flash step test](../../../../tests/unittest/_torch/modeling_v2/models/glm5_next/glm_5_3_flash_nvfp4__sm_100__default_mtp_fused/spec/test_modeling_v2_mtp_step.py)
+  is an example.
+* **Gate accuracy and acceptance against the stock target**, and record the
+  performance comparison in the PR description.
+* **Optimize one change at a time.** Fusing the LM head with the argmax,
+  running the draft MoE only on drafting rows, or fusing all-reduces with
+  the residual add and norm each change what the step computes. Measure
+  each on its own.
+
 ## Writing operations
 
 Wrap each kernel call in a thin, stateless operation class that makes its
