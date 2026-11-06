@@ -13,13 +13,12 @@ at interpreter startup). Instead:
   via ``modeling_utils.get_registered_model_class`` and
   ``MODEL_ARCH_TO_MODULE``.
 """
-import importlib
-
 # Importing _torch.configs triggers AutoConfig registration for TRT-LLM-only
 # model_types (deepseek_v32, kimi_k2, gemma4_unified) so AutoConfig /
 # AutoTokenizer.from_pretrained work under transformers >= 5.5; this must stay
 # eager — see _torch/configs/__init__.py.
 import tensorrt_llm._torch.configs  # noqa: F401
+from tensorrt_llm._lazy_import import lazy_imports
 
 from ._arch_index import MODEL_CLASS_TO_MODULE
 from .modeling_auto import AutoModelForCausalLM
@@ -104,44 +103,4 @@ __all__ = [
     "get_model_architecture",
 ]
 
-
-def __getattr__(name: str):
-    module_name = MODEL_CLASS_TO_MODULE.get(name)
-    if module_name is not None:
-        try:
-            module = importlib.import_module(f".{module_name}", __name__)
-        except AttributeError as e:
-            # An AttributeError escaping the module is a bug inside it, not a
-            # missing name here. Raised as is, hasattr() and getattr() with a
-            # default would hide it, and ``from ... import`` would run the
-            # module twice (losing the cause unless the name is a submodule).
-            raise ImportError(
-                f"cannot import {name!r} from {__name__!r}: importing "
-                f"{__name__}.{module_name} raised {e!r}",
-                name=__name__) from e
-        attr = getattr(module, name)
-        globals()[name] = attr  # cache: subsequent access skips __getattr__
-        return attr
-    # Also resolve bare submodule access (models.modeling_llama,
-    # models.checkpoints, models.hf_parameter_utils, ...) so callers that
-    # relied on the previously-eager submodule attributes keep working.
-    try:
-        return importlib.import_module(f".{name}", __name__)
-    except ModuleNotFoundError as e:
-        # Only translate "no such submodule" into AttributeError; a
-        # ModuleNotFoundError raised *inside* an existing submodule
-        # (missing dependency) must propagate unchanged.
-        if e.name != f"{__name__}.{name}":
-            raise
-        raise AttributeError(
-            f"module {__name__!r} has no attribute {name!r}") from None
-    except AttributeError as e:
-        # Same as above: a bug inside the submodule, not a missing name.
-        raise ImportError(
-            f"cannot import {name!r} from {__name__!r}: importing "
-            f"{__name__}.{name} raised {e!r}",
-            name=__name__) from e
-
-
-def __dir__():
-    return sorted(set(__all__) | set(globals()))
+__getattr__, __dir__ = lazy_imports(__name__, globals(), MODEL_CLASS_TO_MODULE)

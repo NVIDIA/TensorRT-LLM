@@ -112,6 +112,10 @@ class BaseCheckpointLoader(ABC):
 
     @classmethod
     def get(cls, checkpoint_format: str, **kwargs) -> "BaseCheckpointLoader":
+        from ._registry import ensure_registered
+
+        ensure_registered(CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
+                          "register_checkpoint_loader", checkpoint_format)
         try:
             return CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[checkpoint_format](
                 **kwargs)

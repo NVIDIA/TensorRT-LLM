@@ -92,6 +92,53 @@ def test_lazy_attribute_access_resolves_and_caches():
         assert "SamplingParams" in vars(tensorrt_llm)
         assert "SamplingParams" in dir(tensorrt_llm)
 
+        import sys
+        from tensorrt_llm._torch.models import checkpoints
+
+        assert not any(
+            name.startswith("tensorrt_llm._torch.models.checkpoints.")
+            for name in sys.modules
+        )
+        assert set(checkpoints.__all__) <= set(dir(checkpoints))
+        assert not hasattr(checkpoints, "definitely_not_an_attribute")
+        loader = checkpoints.BaseCheckpointLoader
+        assert loader is checkpoints.BaseCheckpointLoader
+        assert "BaseCheckpointLoader" in vars(checkpoints)
+        assert "tensorrt_llm._torch.models.checkpoints.hf.gemma4_weight_mapper" not in sys.modules
+
+        from tensorrt_llm._torch.models.checkpoints.auto_mapper import AutoCheckpointMapper
+        from tensorrt_llm._torch.models.modeling_utils import (
+            get_config_loader, get_checkpoint_weight_loader,
+            MODEL_CLASS_MAPPER_MAPPING)
+
+        assert get_config_loader("HF") is checkpoints.HfConfigLoader
+        assert get_config_loader("mistral") is checkpoints.MistralConfigLoader
+        assert get_checkpoint_weight_loader("HF") is checkpoints.HfWeightLoader
+        assert type(AutoCheckpointMapper.get("HF", "Qwen3MoeForCausalLM")) is checkpoints.Qwen3MoeHfWeightMapper
+        assert type(AutoCheckpointMapper.get("MX", "Qwen3MoeForCausalLM")) is checkpoints.Qwen3MoeHfWeightMapper
+        assert type(AutoCheckpointMapper.get("HF", "UnknownArchitecture")) is checkpoints.HfWeightMapper
+        try:
+            loader.get("unknown_format")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unknown checkpoint format did not raise")
+        from tensorrt_llm._torch.models.checkpoints._registry import ensure_registered
+        from tensorrt_llm._torch.models.modeling_utils import CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
+        for fmt, cls_name in (("HF", "HfCheckpointLoader"),
+                              ("mistral", "MistralCheckpointLoader"),
+                              ("mistral_large_3", "MistralLarge3CheckpointLoader"),
+                              ("MX", "MXCheckpointLoader")):
+            ensure_registered(CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING,
+                              "register_checkpoint_loader", fmt)
+            assert CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[fmt] is getattr(checkpoints, cls_name)
+
+        class CustomMapper:
+            pass
+
+        MODEL_CLASS_MAPPER_MAPPING["Gemma4ForCausalLM_HF"] = CustomMapper
+        assert type(AutoCheckpointMapper.get("HF", "Gemma4ForCausalLM")) is CustomMapper
+
         try:
             tensorrt_llm.definitely_not_an_attribute
         except AttributeError:
@@ -278,6 +325,29 @@ def test_class_index_matches_package_all():
         if class_name not in defined:
             undefined[class_name] = f"{module_name}: name not defined at module level"
     assert not undefined, f"index maps classes to modules that do not define them: {undefined}"
+
+    from tensorrt_llm._torch.models.checkpoints import _CHECKPOINT_CLASS_TO_MODULE
+    from tensorrt_llm._torch.models.checkpoints._registry import _PROVIDERS
+
+    checkpoint_tree = ast.parse((_MODELS_DIR / "checkpoints" / "__init__.py").read_text())
+    checkpoint_exports = next(
+        ast.literal_eval(node.value)
+        for node in checkpoint_tree.body
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "__all__"
+    )
+    assert set(checkpoint_exports) == set(_CHECKPOINT_CLASS_TO_MODULE)
+    registrations = {kind: {} for kind in _PROVIDERS}
+    for module in set(_CHECKPOINT_CLASS_TO_MODULE.values()):
+        path = _MODELS_DIR / "checkpoints" / (module.replace(".", "/") + ".py")
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+                continue
+            kind = node.func.id
+            if kind in registrations:
+                args = [ast.literal_eval(arg) for arg in node.args]
+                key = f"{args[1]}_{args[0]}" if len(args) == 2 else args[0]
+                registrations[kind][key] = module
+    assert registrations == _PROVIDERS
 
 
 def test_models_package_missing_submodule_is_attribute_error():

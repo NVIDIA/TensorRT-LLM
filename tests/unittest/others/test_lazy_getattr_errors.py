@@ -51,6 +51,16 @@ CASES = [
         "modeling_starcoder2",
         "tensorrt_llm._torch.models.modeling_starcoder2",
     ),
+    (
+        "tensorrt_llm._torch.models.checkpoints",
+        "Qwen4ExpHfWeightMapper",
+        "tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper",
+    ),
+    (
+        "tensorrt_llm._torch.models.checkpoints",
+        "auto_mapper",
+        "tensorrt_llm._torch.models.checkpoints.auto_mapper",
+    ),
     ("tensorrt_llm.visual_gen", "VisualGenParams", "tensorrt_llm.visual_gen.params"),
     ("tensorrt_llm.visual_gen", "sparse_attention", "tensorrt_llm.visual_gen.sparse_attention"),
     (
