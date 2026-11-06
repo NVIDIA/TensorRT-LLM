@@ -182,6 +182,8 @@ class RecvReqInfo:
         ]
         from_older_release = _OLDER_RELEASE_REQUEST_KEY in d
         d.pop(_OLDER_RELEASE_REQUEST_KEY, None)
+        # The report token comes only from its own checked REQUEST_DATA frame.
+        d.pop("kv_result_report_token", None)
         info = cls(**d)
         if from_older_release:
             raise OlderReleaseRequestError(info)

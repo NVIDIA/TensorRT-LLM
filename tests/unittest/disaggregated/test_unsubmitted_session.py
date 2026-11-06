@@ -628,6 +628,17 @@ def test_request_data_from_an_older_release_names_the_release_mismatch(bounce_ds
     assert error.value.req_info.unique_rid == 401
 
 
+def test_request_info_takes_no_report_token_from_the_request_body() -> None:
+    current = msgpack.unpackb(_request_info().to_bytes(), raw=False)
+    older = msgpack.unpackb(_older_release_request_info_bytes(None), raw=False)
+    for fields in (current, older):
+        fields["kv_result_report_token"] = b"x" * 64
+    assert transfer_mod.RecvReqInfo.from_bytes(msgpack.packb(current)).kv_result_report_token == b""
+    with pytest.raises(transfer_mod.OlderReleaseRequestError) as error:
+        transfer_mod.RecvReqInfo.from_bytes(msgpack.packb(older))
+    assert error.value.req_info.kv_result_report_token == b""
+
+
 @pytest.mark.parametrize("ownership", [False, True])
 def test_request_data_from_an_older_generation_server_fails_it_at_once(
     ownership: bool, monkeypatch: pytest.MonkeyPatch
