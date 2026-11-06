@@ -672,8 +672,10 @@ def _chi2_pvalue(tokens, probs, min_expected=20.0):
 
 def test_chi2_emitted_tokens_follow_target():
     """P(first emitted = x) = p_0(x) and P(second = y | first accepted) = p_1(y) for a proposal
-    that differs from the target (rejection sampling is lossless for any proposal); the trials
-    are consecutive offset windows of the same requests, as in decoding."""
+    that differs from the target (rejection sampling is lossless for any proposal). Every request
+    draws from its own offset window in every trial, as unseeded requests do in decoding: the
+    acceptance stream depends only on the seed and the offset, so requests that share both would
+    draw the same numbers."""
     gen = torch.Generator(device=DEV).manual_seed(2024)
     g = 16
     tgt_one = _small_support_logits(K + 1, gen)
@@ -687,7 +689,7 @@ def test_chi2_emitted_tokens_follow_target():
     first, second = [], []
     for t in range(3000):
         seeds = torch.full((g,), 7, dtype=torch.int64, device=DEV)
-        offs = torch.full((g,), (K + 1) * t, dtype=torch.int64, device=DEV)
+        offs = (K + 1) * (t * g + torch.arange(g, dtype=torch.int64, device=DEV))
         drafts = frs.fast_rs_draft_block(drf, temps_req, slots, -1, buf, seeds, offs, 1)
         acc, num = frs.fast_rs_verify(
             tgt, temps_tok, drafts.view(g, K), slots, -1, buf, seeds, offs
@@ -739,9 +741,10 @@ def _independence_pvalue(pairs):
 
 def test_consecutive_steps_are_independent():
     """Lossless across steps, not just within one: the token drawn after a rejection at position
-    0 must not predict whether the next step (offset advanced by K + 1) accepts its position 0.
-    Each step's offset selects its own Philox subsequence, so the two draws are independent (the
-    reference's p-value is printed, not asserted)."""
+    0 must not predict whether the next step accepts its position 0. Every request draws from its
+    own offset window in every step, as unseeded requests do in decoding, and each window selects
+    its own Philox subsequence, so the two draws are independent (the reference's p-value is
+    printed, not asserted)."""
     gen = torch.Generator(device=DEV).manual_seed(31)
     g = 16
     tgt_one = _small_support_logits(K + 1, gen)
@@ -754,7 +757,7 @@ def test_consecutive_steps_are_independent():
     seeds = torch.full((g,), 11, dtype=torch.int64, device=DEV)
     steps = {"fused": [], "reference": []}
     for t in range(2500):
-        offs = torch.full((g,), (K + 1) * t, dtype=torch.int64, device=DEV)
+        offs = (K + 1) * (t * g + torch.arange(g, dtype=torch.int64, device=DEV))
         drafts = frs.fast_rs_draft_block(drf, temps_req, slots, -1, buf, seeds, offs, 1)
         drafts = drafts.view(g, K).contiguous()
         acc, num = frs.fast_rs_verify(tgt, temps_tok, drafts, slots, -1, buf, seeds, offs)
