@@ -1341,7 +1341,7 @@ def _build_cold_creator(
     return resources, creator
 
 
-def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -> None:
+def test_cold_provider_is_kept_for_estimation_and_dropped_for_active_nvfp4(monkeypatch) -> None:
     monkeypatch.setattr(util_mod, "is_sm_100f", lambda: True)
     build = partial(_build_cold_creator, ColdPageQuantizationCompressionConfig())
 
