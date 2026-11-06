@@ -8,16 +8,21 @@ import pytest
 import torch
 from torch.profiler import ProfilerActivity, profile
 
+from tensorrt_llm._torch._experimental.modeling_v2._native import NoTarget
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import true_fp32_matmul
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
-    ACT_TYPE_SWIGLU,
-    FUSED_ROUTER_WORKSPACE_WORDS,
-    ROUTING_METHOD_DEEPSEEK_V3,
-    make_fused_router_workspace,
-)
-from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
-    routed_experts as op,
-)
+
+try:
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
+        ACT_TYPE_SWIGLU,
+        FUSED_ROUTER_WORKSPACE_WORDS,
+        ROUTING_METHOD_DEEPSEEK_V3,
+        make_fused_router_workspace,
+    )
+    from tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa.glm_5_2_nvfp4__sm_107__low_latency.ops.moe.routed_experts import (  # noqa: E501
+        routed_experts as op,
+    )
+except NoTarget as exc:
+    pytest.skip(str(exc), allow_module_level=True)
 from tensorrt_llm._utils import get_sm_version
 
 __extra_import_path__ = ["../../../.."]
