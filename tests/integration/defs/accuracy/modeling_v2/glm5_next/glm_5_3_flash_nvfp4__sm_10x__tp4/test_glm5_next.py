@@ -33,7 +33,7 @@ from .....conftest import llm_models_root
 from ....accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 from ..._env import scoped_env_overrides
 
-# The target's kernels are sm_100a / sm_103a code, built at first use for the device's SM.
+# The target's kernels are sm_100a / sm_103a code; the family library carries both builds.
 skip_not_sm10x = pytest.mark.skipif(
     get_sm_version() not in (100, 103),
     reason="the glm5_next modeling_v2 target is built for sm_100 and sm_103 only",
