@@ -186,6 +186,161 @@ def test_runtime_lora_checks_target_component_quantization(tmp_path, target_comp
         assert config.runtime_lora.target_components == [target_component]
 
 
+_HOOK_STUB_ID = "org/hook-stub"
+_STATIC_NVFP4 = {
+    "quant_algo": "NVFP4",
+    "config_groups": {
+        "default": {"weights": {"dynamic": False}, "input_activations": {"dynamic": False}}
+    },
+    "ignore": ["proj_out"],
+}
+
+
+def _register_hook_stub(monkeypatch) -> list:
+    """Register a pipeline whose loader hooks follow pipeline_config; returns the hook calls."""
+    from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
+    from tensorrt_llm._torch.visual_gen.pipeline_registry import PIPELINE_REGISTRY, _PipelineEntry
+
+    calls = []
+
+    class HookStubPipeline(BasePipeline):
+        @classmethod
+        def hf_download_patterns(cls, patterns, pipeline_config):
+            calls.append(("download", pipeline_config))
+            extra = pipeline_config["extra"]
+            if extra == "everything":
+                return []
+            return patterns if extra is None else [*patterns, f"extra/{extra}/*"]
+
+        @classmethod
+        def resolve_component_configs(
+            cls, checkpoint_dir, component_configs, pipeline_config, quant_config
+        ):
+            calls.append(
+                ("config", checkpoint_dir, component_configs, pipeline_config, quant_config)
+            )
+            if not pipeline_config.get("quantized"):
+                return component_configs
+            transformer = {**component_configs["transformer"], "quantization_config": _STATIC_NVFP4}
+            return {**component_configs, "transformer": transformer}
+
+    entry = _PipelineEntry(
+        pipeline_cls=HookStubPipeline,
+        hf_ids=[_HOOK_STUB_ID],
+        defaults={"extra": None, "quantized": False},
+        download_patterns=["model_index.json", "transformer/*"],
+    )
+    monkeypatch.setitem(PIPELINE_REGISTRY, "HookStubPipeline", entry)
+    return calls
+
+
+def _write_hook_stub_checkpoint(path) -> None:
+    (path / "model_index.json").write_text(
+        json.dumps({"_class_name": "HookStubPipeline", "transformer": ["diffusers", "Stub"]})
+    )
+    (path / "transformer").mkdir()
+    (path / "transformer" / "config.json").write_text(json.dumps({"num_layers": 2}))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "pipeline_config, partial_patterns",
+    [
+        pytest.param({}, ["model_index.json", "transformer/*"], id="registered"),
+        pytest.param(
+            {"extra": "a"}, ["model_index.json", "transformer/*", "extra/a/*"], id="extended"
+        ),
+        pytest.param({"extra": "everything"}, None, id="whole_repo"),
+    ],
+)
+def test_hub_download_patterns_come_from_the_pipeline_hook(
+    monkeypatch, tmp_path, pipeline_config, partial_patterns
+):
+    """One download at args.revision, with the patterns the hook derives from pipeline_config."""
+    from tensorrt_llm._torch.visual_gen import pipeline_loader
+    from tensorrt_llm.visual_gen.args import VisualGenArgs
+
+    calls = _register_hook_stub(monkeypatch)
+    downloads = []
+
+    def download_partial(model, allow_patterns, revision=None):
+        downloads.append(("partial", model, allow_patterns, revision))
+        return tmp_path
+
+    def download_full(model, revision=None):
+        downloads.append(("full", model, None, revision))
+        return tmp_path
+
+    monkeypatch.setattr(pipeline_loader, "download_hf_partial", download_partial)
+    monkeypatch.setattr(pipeline_loader, "download_hf_model", download_full)
+    args = VisualGenArgs(model=_HOOK_STUB_ID, revision="abc123", pipeline_config=pipeline_config)
+    loader = pipeline_loader.PipelineLoader(args, device="cpu")
+    assert loader._resolve_checkpoint_dir(_HOOK_STUB_ID) == str(tmp_path)
+
+    kind = "full" if partial_patterns is None else "partial"
+    assert downloads == [(kind, _HOOK_STUB_ID, partial_patterns, "abc123")]
+    assert calls == [("download", {"extra": None, "quantized": False, **pipeline_config})]
+
+    # Local directories are used as they are.
+    calls.clear()
+    _write_hook_stub_checkpoint(tmp_path)
+    assert loader._resolve_checkpoint_dir(str(tmp_path)) == str(tmp_path)
+    assert calls == [] and len(downloads) == 1
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "user_quant, expected_algo, expected_dynamic_weights",
+    [
+        pytest.param(None, QuantAlgo.NVFP4, False, id="hook_config"),
+        pytest.param(
+            {"quant_algo": "FP8", "dynamic": True}, QuantAlgo.FP8, True, id="user_algo_wins"
+        ),
+    ],
+)
+def test_component_config_hook_runs_before_quantization_is_resolved(
+    monkeypatch, tmp_path, user_quant, expected_algo, expected_dynamic_weights
+):
+    """A quantization_config returned by the hook resolves like one read from config.json."""
+    from tensorrt_llm._torch.modules.linear import NVFP4LinearMethod
+    from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+    from tensorrt_llm.visual_gen.args import RuntimeLoRAConfig, VisualGenArgs
+
+    calls = _register_hook_stub(monkeypatch)
+    monkeypatch.setattr(NVFP4LinearMethod, "use_tunable_quantize", False)
+    _write_hook_stub_checkpoint(tmp_path)
+
+    def load(**kwargs):
+        args = VisualGenArgs(model=str(tmp_path), quant_config=user_quant, **kwargs)
+        return DiffusionPipelineConfig.from_pretrained(str(tmp_path), args=args, device="cpu")
+
+    # The hook keeps the configs by default.
+    unchanged = load().model_configs["transformer"]
+    assert vars(unchanged.pretrained_config).keys() == {"num_layers", "_name_or_path"}
+
+    calls.clear()
+    config = load(pipeline_config={"quantized": True})
+    ((_, checkpoint_dir, component_configs, pipeline_config, quant_config),) = calls
+    assert checkpoint_dir == str(tmp_path)
+    assert component_configs == {"transformer": {"num_layers": 2}}
+    assert pipeline_config == {"quantized": True}
+    assert quant_config == (user_quant if user_quant is not None else QuantConfig())
+
+    transformer = config.model_configs["transformer"]
+    assert transformer.pretrained_config.quantization_config == _STATIC_NVFP4
+    assert transformer.quant_config.quant_algo == expected_algo
+    assert transformer.dynamic_weight_quant is expected_dynamic_weights
+    assert config.quant_config == transformer.quant_config
+    if expected_algo == QuantAlgo.NVFP4:
+        assert transformer.quant_config.exclude_modules == ["proj_out"]
+        assert not transformer.force_dynamic_quantization
+        assert NVFP4LinearMethod.use_tunable_quantize
+
+    lora = RuntimeLoRAConfig(path=str(tmp_path / "adapter.safetensors"))
+    with pytest.raises(ValueError, match="runtime_lora_config does not currently support"):
+        load(pipeline_config={"quantized": True}, runtime_lora_config=lora)
+
+
 def test_pipeline_loader_applies_runtime_lora_after_post_load_hooks(monkeypatch):
     from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
     from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
