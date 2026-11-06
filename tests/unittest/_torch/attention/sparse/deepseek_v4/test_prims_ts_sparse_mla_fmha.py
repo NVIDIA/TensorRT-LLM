@@ -350,6 +350,10 @@ class _OffloadAttn:
         )
 
 
+class _WeakrefableNamespace(SimpleNamespace):
+    """A manager stand-in; the adapter's pool-view cache holds its owner weakly."""
+
+
 def _run_adapter(attn, manager, query, indices, lengths, extra_lengths, offload_layers):
     """Run the adapter's forward on one generation-only BF16 batch and return the output."""
     rows, heads = query.shape[0], attn.num_heads
@@ -419,7 +423,7 @@ def test_offloaded_layer_reads_the_sparse_cache_arena(monkeypatch):
     extra_lengths.clamp_(min=2)
     extra_indices[:, :2] = torch.randint(0, pool_rows, (rows, 2), dtype=torch.int32, device=device)
 
-    manager = SimpleNamespace(
+    manager = _WeakrefableNamespace(
         dtype=torch.bfloat16,
         swa_pool_ptr=swa.data_ptr(),
         compress_pool_ptrs={4: compress.data_ptr()},

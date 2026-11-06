@@ -9292,7 +9292,7 @@ class KVCacheManagerV2(BaseResourceManager):
         """Key of the rows ``copy_batch_block_offsets`` writes for ``request_ids``: equal keys mean an identical
         copy for a batch of fewer than two blocks' tokens per request and step. Per request: its block count and
         the page indices of its last blocks (beam 0). None where the device table is not a plain copy of the host
-        table (per-layer page tables, sparse metadata) or blocks can change otherwise (block or scratch reuse, a
+        table (per-layer page tables, sparse KV offload) or blocks can change otherwise (block or scratch reuse, a
         finite attention window freeing earlier blocks, other beams)."""
         if (
             self.enable_swa_scratch_reuse
@@ -9303,7 +9303,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 for window in self.max_attention_window_vec
             )
             or self._use_per_layer_page_tables
-            or self.sparse_metadata_batch is not None
+            or self._sparse_kv_offload is not None
         ):
             return None
         host = self.host_kv_cache_block_offsets.numpy()
