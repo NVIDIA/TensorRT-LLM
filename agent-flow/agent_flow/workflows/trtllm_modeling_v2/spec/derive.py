@@ -34,6 +34,7 @@ import yaml
 from ..operators import tree_anchors
 from .schema_keys import reject_unknown_keys
 from .task_schema import (
+    DEFAULT_BOOT_MAX_TOKENS,
     DEFAULT_PERF_CONCURRENCY,
     DISAGG_FEATURE,
     DISAGG_KEYS,
@@ -69,7 +70,7 @@ DEFAULT_BOOT: dict[str, Any] = {
         {"prompt": "The capital of France is", "keywords_any": ["Paris"]},
         "In one sentence, photosynthesis is",
     ],
-    "max_tokens": 32,
+    "max_tokens": DEFAULT_BOOT_MAX_TOKENS,
 }
 DEFAULT_BENCHMARK = "gsm8k"
 

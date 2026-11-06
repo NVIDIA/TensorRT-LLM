@@ -25,7 +25,7 @@ import yaml
 
 from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
-from ..spec.task_schema import TaskSchemaError, parse_parallel_segment
+from ..spec.task_schema import DEFAULT_BOOT_MAX_TOKENS, TaskSchemaError, parse_parallel_segment
 from .boot import DEFAULT_BOOT_IMAGE_PROMPT, BootSpec, missing_keywords, resolve_boot_spec
 from .check_config import check_configuration, order_members_by_cost
 from .check_runtime import (
@@ -49,7 +49,7 @@ COMPLETIONS = "/v1/completions"
 CHAT_COMPLETIONS = "/v1/chat/completions"
 
 DEFAULT_PROMPT = "The capital of France is"
-DEFAULT_MAX_TOKENS = 32
+DEFAULT_MAX_TOKENS = DEFAULT_BOOT_MAX_TOKENS
 #: Seconds one request may take once the server is healthy.
 REQUEST_TIMEOUT_S = 600
 #: Seconds the job may spend stopping the server and reaping its ranks: the
@@ -160,7 +160,9 @@ def serve_requests(
     keywords; a prompt with checks of its own goes as a completion, or with
     its first image as a chat. Each carries ``boot`` (``["prompt", n]`` or
     ``["item", n]``), its place in the workload, so :func:`judge` holds its
-    answer to that prompt's checks. A pre-rendered (``render: raw``) image
+    answer to that prompt's checks, and may generate the larger of the serve
+    and the boot workload's ``max_tokens``: at least the room the boot gate
+    gives the same answer. A pre-rendered (``render: raw``) image
     prompt is sent as :data:`~.boot.DEFAULT_BOOT_IMAGE_PROMPT`: the server
     applies the chat template and places the image itself.
     """
@@ -183,16 +185,17 @@ def serve_requests(
 
     requests: list[dict[str, Any]] = [completion("text", spec.prompt, spec.max_tokens, None)]
     workload = boot.requests(task_data.get("trtllm_repo_path"))
+    answer_tokens = max(spec.max_tokens, boot.max_tokens)
     plain = len(boot.prompts)
     if boot.keywords:
         for n in range(plain):
-            requests.append(completion(f"boot{n}", boot.prompts[n], spec.max_tokens, ["prompt", n]))
+            requests.append(completion(f"boot{n}", boot.prompts[n], answer_tokens, ["prompt", n]))
     for n, item in enumerate(boot.items):
         if not (item.images or item.keywords or item.keywords_any):
             continue
         request = workload[plain + n]
         if not request.get("images"):
-            requests.append(completion(f"item{n}", item.prompt, spec.max_tokens, ["item", n]))
+            requests.append(completion(f"item{n}", item.prompt, answer_tokens, ["item", n]))
             continue
         text = item.prompt if item.render == "loader" else DEFAULT_BOOT_IMAGE_PROMPT
         content = [
@@ -206,7 +209,7 @@ def serve_requests(
                 "body": {
                     "model": model,
                     "messages": [{"role": "user", "content": content}],
-                    "max_tokens": spec.max_tokens,
+                    "max_tokens": answer_tokens,
                     "temperature": 0.0,
                 },
                 "boot": ["item", n],
