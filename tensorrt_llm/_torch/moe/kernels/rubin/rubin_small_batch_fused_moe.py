@@ -74,7 +74,8 @@ tables, and writes every element of the routed output.
   a one-shot MNNVL all-reduce (``mnnvl_pushed_allreduce.push_slot``, ``-0`` sent as ``+0``), for
   a consumer that finishes that all-reduce. Without a local expert the token warps push zero rows.
 * PDL: barrier setup and TMEM allocation run before ``griddepcontrol.wait``; the dependents are
-  released right after it (every consumer of the output waits for the whole grid).
+  released right after it, with published routing right after the tables (every consumer of the
+  output waits for the whole grid).
 """
 
 import cuda.bindings.driver as cuda
@@ -1075,6 +1076,10 @@ class RubinSmallBatchFusedMoeKernel:
             self._published_tables(
                 st, alpha2, expanded_idx_to_permuted_idx, ctr_ptr, orig_m, expert_offset, tidx
             )
+            if cutlass.const_expr(self.use_pdl):
+                # every earlier grid completed before the routing kernel published (its producer
+                # waited for them); every consumer of the output waits for this whole grid
+                griddepcontrol_launch_dependents()
             nt = st.sNt.get_tensor(cute.make_layout(4))[0]
             if warp_idx == self.tma_warp:
                 lane = cute.arch.lane_idx()
@@ -1151,7 +1156,6 @@ class RubinSmallBatchFusedMoeKernel:
             if cutlass.const_expr(self.published_routing and self.use_pdl):
                 # the token scales and the output come with the routing grid's end
                 griddepcontrol_wait()
-                griddepcontrol_launch_dependents()
             if wg == 0:
                 if w1 > 0:
                     self._token_scales_to_smem(st, x_sf_ptr, orig_m, et)
