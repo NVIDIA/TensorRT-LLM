@@ -210,7 +210,12 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "table, "
         "Tensor(a!) flags, Tensor(b!) layout, int rank, int nranks, int buffer_bytes) -> (Tensor, Tensor, Tensor, "
         "Tensor)");
-    m.def("glm_intra_node_reduce_supported", &TRTLLM_MV2_NS::torch_ext::glmIntraNodeReduceSupported);
+    m.def("glm_intra_node_reduce_supported(int rows, int hidden, int nranks, bool finalize) -> bool");
+}
+
+TRTLLM_MV2_LIBRARY_IMPL(CompositeExplicitAutograd, m)
+{
+    m.impl("glm_intra_node_reduce_supported", &TRTLLM_MV2_NS::torch_ext::glmIntraNodeReduceSupported);
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)

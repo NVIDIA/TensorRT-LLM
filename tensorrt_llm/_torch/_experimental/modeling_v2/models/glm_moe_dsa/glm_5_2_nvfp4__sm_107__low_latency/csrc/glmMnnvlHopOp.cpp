@@ -209,7 +209,12 @@ TRTLLM_MV2_LIBRARY_FRAGMENT(m)
         "glm_mnnvl_moe_finalize_hop(Tensor gemm2_output, Tensor expert_weights, Tensor expanded_idx_to_permuted_idx, "
         "Tensor addend, Tensor residual, Tensor gamma, float epsilon, Tensor(a!) comm_buffer, Tensor(b!) buffer_flags) "
         "-> Tensor[]");
-    m.def("glm_mnnvl_hop_supported", &TRTLLM_MV2_NS::torch_ext::glmMnnvlHopSupported);
+    m.def("glm_mnnvl_hop_supported(int num_tokens, int hidden_size, int num_ranks) -> bool");
+}
+
+TRTLLM_MV2_LIBRARY_IMPL(CompositeExplicitAutograd, m)
+{
+    m.impl("glm_mnnvl_hop_supported", &TRTLLM_MV2_NS::torch_ext::glmMnnvlHopSupported);
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
