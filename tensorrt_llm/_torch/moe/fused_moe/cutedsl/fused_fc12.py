@@ -336,8 +336,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             self._small_batch_counters = new_small_batch_moe_counters(self.w3_w1_weight.device)
 
     def output_push_max_tokens(self) -> int:
-        """The small-batch kernel pushes its output rows (slice combine) at the token counts it
-        serves."""
+        """The small-batch kernel pushes its output rows at the token counts it serves."""
         return self.small_batch_max_tokens
 
     def published_routing_word(self, num_tokens: int) -> torch.Tensor | None:

@@ -68,10 +68,11 @@ tables, and writes every element of the routed output.
   local experts in ascending order are the tiles, ``moe_sort``'s tile order at <= 32 tokens) and
   start the weight stream without waiting for the routing grid; the token warp and the epilogue
   wait for it before they read the tokens or write the output. Same tables, same arithmetic.
-* Output push (``output_push_world``, slice combine): the task that combines an m-tile also
-  stores its BF16 rows into slot ``(token, rank)`` of every rank's current buffer of a one-shot
-  MNNVL all-reduce (``mnnvl_pushed_allreduce.push_slot``, ``-0`` sent as ``+0``), for a consumer
-  that finishes that all-reduce. Without a local expert the token warps push zero rows.
+* Output push (``output_push_world``): the task that combines an m-tile (slice combine), or the
+  task whose arrival completes the m-tile after its reds (red combine: it reads the m-tile's rows
+  back), also stores the BF16 rows into slot ``(token, rank)`` of every rank's current buffer of
+  a one-shot MNNVL all-reduce (``mnnvl_pushed_allreduce.push_slot``, ``-0`` sent as ``+0``), for
+  a consumer that finishes that all-reduce. Without a local expert the token warps push zero rows.
 * PDL: barrier setup and TMEM allocation run before ``griddepcontrol.wait``; the dependents are
   released right after it (every consumer of the output waits for the whole grid).
 """
@@ -315,6 +316,20 @@ def _ldg_cg_f32_pred(addr, pred, *, loc=None, ip=None):
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def _ldg_cg_v4(addr, *, loc=None, ip=None):
+    """16 bytes at ``addr`` read from L2 (other CTAs' reds), as four 32-bit words."""
+    res = _asm(
+        llvm.StructType.get_literal([T.i32()] * 4),
+        [Int64(addr).ir_value(loc=loc, ip=ip)],
+        "ld.global.cg.v4.b32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        loc=loc,
+        ip=ip,
+    )
+    return tuple(Int32(llvm.extractvalue(T.i32(), res, [i], loc=loc, ip=ip)) for i in range(4))
 
 
 @dsl_user_op
@@ -577,7 +592,7 @@ class RubinSmallBatchFusedMoeKernel:
     :param published_routing: Tables built in the kernel from the top-k the routing kernel
         publishes (token-indexed layout only).
     :param output_push_world: Also push the output rows into a one-shot all-reduce over that many
-        ranks (slice combine only; 0: off).
+        ranks (either combine; 0: off).
     """
 
     @staticmethod
@@ -622,7 +637,6 @@ class RubinSmallBatchFusedMoeKernel:
         output_push_world: int = 0,
     ):
         assert self.supports(n_tok, n1, k1), (n_tok, n1, k1)
-        assert not output_push_world or deterministic_combine, "the push follows the slice combine"
         self.output_push_world = output_push_world
         assert not published_routing or token_indexed, "published routing is token-indexed"
         self.published_routing = published_routing
@@ -2209,6 +2223,10 @@ class RubinSmallBatchFusedMoeKernel:
                                 )
                         # the next task's accumulator reset must not overtake these reads
                         self._wg_barrier(wg)
+                        if cutlass.const_expr(self.output_push_world > 0):
+                            self._red_push(
+                                ctr, out_base, out_row_bytes, sflag, c, ns, orig_m, et, wg, push
+                            )
                     else:
                         self._fc2_combine(
                             ws,
@@ -2230,6 +2248,59 @@ class RubinSmallBatchFusedMoeKernel:
                         )
             e += 1
             u, _g = self._q_read(st, e)
+
+    @cute.jit
+    def _red_push(
+        self,
+        ctr,
+        out_base,
+        out_row_bytes,
+        sflag,
+        c,
+        ns,
+        orig_m,
+        et,
+        wg,
+        push,
+    ):
+        """Red combine with the output push: the task's arrival on its m-tile (acq_rel, after the
+        warpgroup barrier that follows its reds); the task that completes the m-tile's ``ns``
+        arrivals reads the m-tile's BF16 output rows of every token (every task's reds precede
+        its arrival) and stores them into the token's slot of the all-reduce, as
+        :meth:`_push_rows` does for the slice combine."""
+        if et == 0:
+            old = _atom_add_acq_rel(ctr + Int64(CTR_MTILE_BASE + c) * 4, 1)
+            flag = Int32(0)
+            if old == ns - 1:
+                flag = Int32(1)
+            sflag[wg] = flag
+        self._wg_barrier(wg)
+        if sflag[wg] != 0:
+            push_mc, push_flags, push_rank = push
+            cur, _, nbytes, _, _, _, _, _ = pushed_ar.lamport_state(push_flags)
+            # 16 threads per token row, 8 channels (16 bytes) each, as the reds
+            ch8 = (et % 16) * 8
+            for rb in cutlass.range_constexpr(0, self.n_tok, 8):
+                tk = rb + et // 16
+                if tk < orig_m:
+                    w = _ldg_cg_v4(out_base + Int64(tk) * out_row_bytes + (c * _MMA_M + ch8) * 2)
+                    dst = pushed_ar.push_slot(
+                        push_mc,
+                        push_mc,
+                        cur,
+                        nbytes,
+                        tk,
+                        push_rank,
+                        c * _MMA_M + ch8,
+                        self.output_push_world,
+                        self.n2,
+                        True,
+                    )
+                    pushed_ar.push_v4(dst, w[0], w[1], w[2], w[3], True)
+            if et == 0:
+                _st_relaxed_u32(ctr + Int64(CTR_MTILE_BASE + c) * 4, 0)
+        # sflag is reused by the next task's arrival
+        self._wg_barrier(wg)
 
     @cute.jit
     def _fc2_combine(

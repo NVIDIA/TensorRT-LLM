@@ -188,9 +188,6 @@ class _SmallBatchMoeRunner:
         assert m // 128 <= _MAX_TILES and counters.numel() >= counter_words(m // 128)
         assert expanded_idx_to_permuted_idx.numel() == orig_m * top_k
         n_tok = n_tok_for(orig_m)
-        if push_world:
-            # the push follows the slice combine
-            deterministic_combine = True
         if num_ctas <= 0:
             num_ctas = _persistent_ctas(x.device.index, sm_reserve + global_sm_reserve())
         h = torch.empty(m, k2 // 2, dtype=torch.uint8, device=x.device)
@@ -350,7 +347,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     ``num_ctas`` > 0 overrides the persistent CTA count, which is otherwise one per SM less
     ``sm_reserve`` (SMs left to concurrent kernels) and ``cute_dsl_utils.sm_reserve()``.
     ``deterministic_combine``: the schedule-independent slice combine instead of BF16 vector reds
-    (a test reference).
+    (a test reference; the reds' order, so the output's bits, may change from run to run).
     ``die_major``: the four weight tensors hold :func:`die_major_layout` bytes under their
     ``[L, rows, cols]`` shapes (see ``RubinSmallBatchFusedMoeKernel``). ``published_routing``
     (``token_indexed``): instead of the tables, ``expanded_idx_to_permuted_idx`` holds the top-k
@@ -358,7 +355,7 @@ def cute_dsl_nvfp4_small_batch_moe_rubin(
     (the other four tables are None); ``expert_offset``: this rank's first expert.
     ``push_world`` > 0: also push the output rows into slot ``(token, push_rank)`` of the
     one-shot MNNVL all-reduce over ``push_world`` ranks whose multicast base is ``push_mc`` and
-    state ``push_flags`` (its consumer finishes it); runs the slice combine.
+    state ``push_flags`` (its consumer finishes it), with either combine.
     """
     if die_major:
         fc1_weight, fc1_weight_scale, fc2_weight, fc2_weight_scale = (

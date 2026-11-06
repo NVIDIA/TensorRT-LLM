@@ -711,7 +711,9 @@ def _run_rank_small_batch_moe_push(world_size):
     """The small-batch MoE kernel's output push on every rank of an expert-parallel group,
     finished by the finish kernel, against the C++ all-reduce of its unpushed outputs; with the
     experts of every rank and of rank 0 only (the others push the rows of a rank without a local
-    expert), every routing mode, the default and a single CTA."""
+    expert), every routing mode, the default and a single CTA. With the red combine (whose bits
+    depend on the order of its reds) the pushed slots are the kernel's own output: the finish
+    equals the C++ all-reduce of that output, which is the slice combine's within BF16 rounding."""
     from tensorrt_llm._torch.distributed import AllReduce, AllReduceStrategy
     from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
         new_small_batch_moe_counters,
@@ -737,28 +739,40 @@ def _run_rank_small_batch_moe_push(world_size):
                 for mode in ("permuted", "token_indexed", "published"):
                     kwargs = dict(
                         token_indexed=mode != "permuted",
-                        deterministic=True,
                         published=mode == "published",
                     )
                     out = torch.full((m, h), float("nan"), dtype=torch.bfloat16, device="cuda")
-                    run_small_batch_moe(d, out, counters, **kwargs)
+                    run_small_batch_moe(d, out, counters, deterministic=True, **kwargs)
                     ref = allreduce(out)
-                    for num_ctas in (0, 1):
+                    for deterministic, num_ctas in ((True, 0), (True, 1), (False, 0), (False, 1)):
                         target = allreduce.push_target(m, h)
                         assert target is not None and target.one_shot
                         pushed = torch.full_like(out, float("nan"))
                         run_small_batch_moe(
-                            d, pushed, counters, num_ctas=num_ctas, push=target.view, **kwargs
+                            d,
+                            pushed,
+                            counters,
+                            deterministic=deterministic,
+                            num_ctas=num_ctas,
+                            push=target.view,
+                            **kwargs,
                         )
                         torch.cuda.synchronize()
                         comm.Barrier()
                         missing = _unpushed_ranks(target, m, h)
                         assert not missing, (
-                            f"m={m} owners={owners} {mode} ctas={num_ctas}: "
-                            f"slots of ranks {missing} never pushed"
+                            f"m={m} owners={owners} {mode} deterministic={deterministic} "
+                            f"ctas={num_ctas}: slots of ranks {missing} never pushed"
                         )
-                        bad += _differ(out, pushed)
-                        bad += _differ(ref, allreduce.finish_push(target))
+                        result = allreduce.finish_push(target)
+                        if deterministic:
+                            bad += _differ(out, pushed)
+                            bad += _differ(ref, result)
+                        else:
+                            bad += _differ(allreduce(pushed), result)
+                            a, b = pushed.float(), out.float()
+                            rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
+                            assert rel < 1e-2, f"red combine off the slice combine by {rel}"
                         torch.cuda.synchronize()
                         assert int(counters.abs().sum().item()) == 0, "counters not reset"
         assert comm.allreduce(bad) == 0, f"rank {rank}: {bad} values differ"
