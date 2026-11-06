@@ -145,19 +145,23 @@ pre-image view (`iter_diff_pre_image`: context + `-` lines, in-hunk
 order), where a deleted class's `class` statement or a deleted section's
 key line is directly visible:
 
-- `.py`: `_recover_deleted_scope_anchors` runs only after post-image
-  mapping already failed, so modification diffs keep their finer
-  method-level anchors. `_py_class_scopes_from_deletions` attributes at
-  class level — a method-level walk would have to guess which `def` a
-  stray decorator line belongs to.
+- `.py`: first reconstruct the complete pre-image from the raw patch,
+  verifying its context and added lines against the checked-out source.
+  AST mapping then combines the deleted lines' old test scopes with the
+  added lines' new scopes, including decorators. This keeps a top-level
+  test's decorator replacement scoped to that test and preserves both
+  sides of a rename. Module-level changes retain the file fallback.
+  If reconstruction fails, `_recover_deleted_scope_anchors` uses the
+  hunk-local class attribution from `_py_class_scopes_from_deletions`.
 - reference YAML: `_yaml_top_keys_from_deletions` reads `-` lines,
   `iter_diff_added_post_line_numbers` reads `+` lines off the post-image.
 
-Both return `None` — forcing the file-level fallback — when a `-` line's
-owning scope is not visible inside its hunk, since only 3 context lines
-are guaranteed. Pre-image *line numbers* are never used:
-`strip_noop_diff_lines` drops blank / comment-only `-` lines, which
-shifts every later pre-image number.
+The hunk-local readers return `None` — forcing the file-level fallback —
+when a `-` line's owning scope is not visible inside its hunk, since only
+3 context lines are guaranteed. Complete-source AST mapping uses pre-image
+line numbers from the raw patch. Never derive these from normalized diffs:
+`strip_noop_diff_lines` drops blank / comment-only `-` lines, shifting every
+later pre-image number.
 
 ### accuracy/references/*.yaml
 
