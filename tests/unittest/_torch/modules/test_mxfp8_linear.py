@@ -45,6 +45,7 @@ from tensorrt_llm._torch.modules.linear import (
     get_quant_method,
 )
 from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight, quant_bf16_to_mxfp8
+from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -193,6 +194,44 @@ def _mock_mxfp8_ops(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("retain_bf16", [False, True])
+def test_mxfp8_carrier_is_consumed_without_requantization(monkeypatch, retain_bf16) -> None:
+    act, sf, quantize, native, expected, _, _ = _mock_mxfp8_ops(monkeypatch)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    method.tune_decode_graph_backends = False
+    method.backend = "cutlass"
+    method.use_native_autotuner = False
+    module = Mock(spec_set=["weight", "weight_scale", "_mxfp8_alpha", "dtype", "_use_ctx_clc_gemm"])
+    module.weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
+    module.weight_scale = torch.empty(512, dtype=torch.uint8)
+    module._mxfp8_alpha = torch.ones(1)
+    module.dtype = torch.bfloat16
+    module._use_ctx_clc_gemm = False
+    hidden = torch.ones((2, 4), dtype=torch.bfloat16) if retain_bf16 else None
+    carrier = MxFp8QuantizedTensor(act, sf, True, hidden)
+    actual = method.apply(module, carrier, None)
+    assert actual is expected
+    quantize.assert_not_called()
+    native.assert_called_once_with(
+        act, sf, module.weight, module.weight_scale, module._mxfp8_alpha, module.dtype
+    )
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_bf16_only_consumer_rejects_an_omitted_view() -> None:
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = False
+    carrier = MxFp8QuantizedTensor(
+        torch.empty((2, 4), dtype=torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=True,
+    )
+    with pytest.raises(ValueError, match="no unquantized hidden-state view"):
+        method.apply(Mock(spec_set=[]), carrier, None)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("opted_in", [False, True])
 @pytest.mark.parametrize("platform_available", [False, True])
 def test_mxfp8_clc_requires_explicit_model_opt_in(
@@ -202,7 +241,6 @@ def test_mxfp8_clc_requires_explicit_model_opt_in(
     monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
     monkeypatch.setattr(linear_module, "mxfp8_gemm_backend_override", lambda: None)
     _, _, quantize, native, _, _, _ = _mock_mxfp8_ops(monkeypatch)
-    monkeypatch.setattr(linear_module, "take_prequantized_mxfp8", lambda x: None)
     monkeypatch.setattr(linear_module, "ctx_eager_only", lambda: True)
     available = Mock(spec_set=linear_module.ctx_clc_gemm_enabled, return_value=platform_available)
     monkeypatch.setattr(linear_module, "ctx_clc_gemm_enabled", available)

@@ -47,9 +47,9 @@ from ..locality_domain.policy import (DISABLED_PLAN, LinearPartitionPlan,
                                       LocalityDomainPolicy)
 from ..locality_domain.runtime import LocalityDomainRuntime
 from ..locality_domain_utils import _copy_to_new_cuda_allocation
-from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, replace_parameter_and_save_metadata,
-                     unswizzle_sf)
+from ..utils import (Fp4QuantizedTensor, MxFp8QuantizedTensor,
+                     get_model_extra_attrs, is_torch_compiling,
+                     replace_parameter_and_save_metadata, unswizzle_sf)
 from .low_m_gemm import (_should_apply_low_m_gemm, apply_low_m_gemm,
                          low_m_gemm_dispatcher)
 from .m3_ctx_clc_gemm import (clear_ctx_clc_weight_cache, ctx_clc_gemm_enabled,
@@ -3602,82 +3602,9 @@ def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
         _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.reset(token)
 
 
-# One pending MXFP8 activation produced by a fused norm + quantize kernel for the very next MXFP8 linear that
-# consumes its BF16 output (MiniMax-M3 CTX prefill). The slot holds the BF16 tensor itself, so its memory can't be
-# reused for another tensor while the entry is pending; a consumer takes the entry only on the same storage and
-# shape, and any other input quantizes as usual.
-_PREQUANTIZED_MXFP8: list = [None]
-# Number of entries a consumer actually took (a producer can tell a take from a drop on mismatch).
-_PREQUANTIZED_MXFP8_TAKES: list = [0]
-# Per producer tag: [set, taken, dropped on mismatch, unconsumed (overwritten or cleared before any take)]. TRTLLM_MXFP8_SLOT_AUDIT=N logs
-# them every N sets (diagnostic; counting itself is host-side integer adds only).
-_PREQUANTIZED_MXFP8_STATS: dict = {}
-_PREQUANTIZED_MXFP8_AUDIT = int(os.environ.get("TRTLLM_MXFP8_SLOT_AUDIT", "0"))
-_PREQUANTIZED_MXFP8_SETS: list = [0]
-
-
 def ctx_eager_only() -> bool:
-    """True only in eager execution: neither the compile-dispatch flag nor a Dynamo trace. The CTX slots and
-    the CLC GEMM dispatch compare data pointers, which Dynamo cannot trace."""
+    """Whether CTX dispatch may use eager-only capability and data-pointer checks."""
     return not (is_torch_compiling() or torch.compiler.is_compiling())
-
-
-def _prequantized_mxfp8_stats(tag: str) -> list:
-    stats = _PREQUANTIZED_MXFP8_STATS.get(tag)
-    if stats is None:
-        stats = _PREQUANTIZED_MXFP8_STATS[tag] = [0, 0, 0, 0]
-    return stats
-
-
-def set_prequantized_mxfp8(source: torch.Tensor,
-                           act_e4m3: torch.Tensor,
-                           act_sf: torch.Tensor,
-                           tag: str = "untagged") -> None:
-    pending = _PREQUANTIZED_MXFP8[0]
-    if pending is not None:
-        _prequantized_mxfp8_stats(pending[3])[3] += 1
-    # The producing stream: a take on another stream (the MoE shared expert's aux stream) records its use of the pair.
-    _PREQUANTIZED_MXFP8[0] = (source, act_e4m3, act_sf, tag,
-                              torch.cuda.current_stream(act_e4m3.device))
-    _prequantized_mxfp8_stats(tag)[0] += 1
-    _PREQUANTIZED_MXFP8_SETS[0] += 1
-    if _PREQUANTIZED_MXFP8_AUDIT and _PREQUANTIZED_MXFP8_SETS[
-            0] % _PREQUANTIZED_MXFP8_AUDIT == 0:
-        logger.info("[MXFP8 slot audit] " + " ".join(
-            f"{t}: set={s[0]} taken={s[1]} dropped={s[2]} unconsumed={s[3]}"
-            for t, s in sorted(_PREQUANTIZED_MXFP8_STATS.items())))
-
-
-def prequantized_mxfp8_pending(source: torch.Tensor) -> bool:
-    """Whether the slot still holds the entry set for ``source`` (no MXFP8 linear consumed it)."""
-    entry = _PREQUANTIZED_MXFP8[0]
-    return entry is not None and entry[0] is source
-
-
-def take_prequantized_mxfp8(input: torch.Tensor):
-    """The pre-quantized pair for ``input`` if it is the slot's source; the slot only serves the next MXFP8 linear,
-    so an entry for any other input is dropped. Never taken while compiling (eager prefill only)."""
-    if not ctx_eager_only():
-        return None
-    entry = _PREQUANTIZED_MXFP8[0]
-    if entry is None:
-        return None
-    _PREQUANTIZED_MXFP8[0] = None
-    source, act_e4m3, act_sf, tag, producer = entry
-    if (input.data_ptr() != source.data_ptr()
-            or input.numel() != source.numel()
-            or input.shape[-1] != source.shape[-1]):
-        _prequantized_mxfp8_stats(tag)[2] += 1
-        return None
-    _PREQUANTIZED_MXFP8_TAKES[0] += 1
-    _prequantized_mxfp8_stats(tag)[1] += 1
-    consumer = torch.cuda.current_stream(act_e4m3.device)
-    if consumer != producer and not torch.cuda.is_current_stream_capturing():
-        # The pair was allocated on the producing stream: without this the allocator could hand its memory to a new
-        # tensor there while the consuming stream's GEMM still reads it.
-        act_e4m3.record_stream(consumer)
-        act_sf.record_stream(consumer)
-    return act_e4m3.view(input.shape), act_sf
 
 
 class MXFP8LinearMethod(LinearMethodBase):
@@ -3852,9 +3779,17 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self, module: Linear, input: torch.Tensor | MxFp8QuantizedTensor,
+              bias: Optional[torch.Tensor]) -> torch.Tensor:
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
+        quantized_input = input if isinstance(input,
+                                              MxFp8QuantizedTensor) else None
+        if quantized_input is not None:
+            if not quantized_input.is_sf_swizzled:
+                raise ValueError(
+                    "MXFP8 Linear requires swizzled activation scales")
+            input = (quantized_input.fp8_tensor
+                     if self.use_cutlass else quantized_input.unquantized())
         original_shape = input.shape
         if input.dim() > 2:
             input = input.reshape(-1, input.shape[-1])
@@ -3864,6 +3799,8 @@ class MXFP8LinearMethod(LinearMethodBase):
             if (self.tune_decode_graph_backends and not is_torch_compiling()
                     and _FLASHINFER_MXFP8_DECODE_GRAPH_CAPTURE_ACTIVE.get()):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
+                if quantized_input is not None:
+                    input = quantized_input.unquantized()
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
                     module.weight,
@@ -3874,10 +3811,9 @@ class MXFP8LinearMethod(LinearMethodBase):
             else:
                 # Dynamic MXFP8 activation quantization (swizzled SF layout),
                 # then the CUTLASS block-scaled e4m3xe4m3 GEMM.
-                prequantized = take_prequantized_mxfp8(input)
-                act_e4m3, act_sf = (prequantized if prequantized is not None
-                                    else torch.ops.trtllm.mxfp8_quantize(
-                                        input, True))
+                act_e4m3, act_sf = (
+                    quantized_input.quantized() if quantized_input is not None
+                    else torch.ops.trtllm.mxfp8_quantize(input, True))
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or
@@ -4821,12 +4757,16 @@ class Linear(nn.Module):
 
     def forward(
         self,
-        input: Union[torch.Tensor, Fp4QuantizedTensor],
+        input: Union[torch.Tensor, Fp4QuantizedTensor, MxFp8QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
+        if isinstance(input, MxFp8QuantizedTensor) and (
+                not isinstance(self.quant_method, MXFP8LinearMethod) or
+            (self.lora is not None and bool(lora_params))):
+            input = input.unquantized()
         if self.tp_mode == TensorParallelMode.ROW:
             use_locality_domain = self.partition_plan.enabled
             # The fused GEMM-allreduce and NCCL-window GEMM paths consume the

@@ -11,6 +11,7 @@ CPU only: nothing here launches a kernel.
 """
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,6 +22,10 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.minimax_m3_
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops import (
     context as m3_context,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
+)
+from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 
 pytestmark = pytest.mark.cpu_only
 
@@ -168,3 +173,55 @@ def test_a_captured_4096_row_bucket_takes_the_breakable_boundary(monkeypatch) ->
     out, pushed = modeling.PrefillTarget._attention(target, 5, None, hidden, step)
     assert out is packed and pushed is False
     assert linears == ["l5_qkv_w", "l5_o_w"] and eager == [5]
+
+
+@pytest.mark.parametrize("flashinfer", [False, True])
+def test_ctx_projection_consumes_explicit_carrier(monkeypatch, flashinfer) -> None:
+    core = Mock(spec_set=["w", "mxfp8", "mx_alpha"])
+    core.w = {
+        "w": torch.empty((3, 128), dtype=torch.float8_e4m3fn),
+        "s": torch.empty(512, dtype=torch.uint8),
+    }
+    core.mxfp8 = object()
+    core.mx_alpha = torch.ones(1)
+    mode = Mock(spec_set=["decode_graph", "flashinfer", "native_tuning"])
+    mode.decode_graph, mode.flashinfer, mode.native_tuning = False, flashinfer, False
+    monkeypatch.setattr(modeling, "_mx_mode", lambda value: mode)
+    monkeypatch.setattr(modeling, "_record", Mock(spec_set=modeling._record))
+    fallback = Mock(spec_set=modeling._linear)
+    monkeypatch.setattr(modeling, "_linear", fallback)
+    expected = torch.ones((2, 3), dtype=torch.bfloat16)
+    kernel = Mock(return_value=expected)
+    name = "flashinfer_mm_mxfp8" if flashinfer else "mxfp8_mxfp8_gemm"
+    monkeypatch.setattr(torch.ops.trtllm, name, kernel)
+    carrier = MxFp8QuantizedTensor(
+        torch.empty((2, 128), dtype=torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=True,
+    )
+    assert modeling._ctx_prequant_linear(core, carrier, "w", "s", True) is expected
+    args = kernel.call_args.args
+    assert args[0] is carrier.fp8_tensor and args[1] is carrier.scaling_factor
+    assert args[2] is core.w["w"] and args[3] is core.w["s"]
+    assert args[-1] == torch.bfloat16
+    fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_ctx_attention_forwards_only_a_complete_rows_request(monkeypatch, padded) -> None:
+    core = Mock(
+        spec_set=["sparse_layers", "main_kv_is_nvfp4", "attn", "inv_kv_scales", "kv_scales"]
+    )
+    core.sparse_layers, core.main_kv_is_nvfp4 = {3}, False
+    core.attn = {3: object()}
+    metadata = Mock(spec_set=["num_tokens"])
+    metadata.num_tokens = 2
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=True, mxfp8_skip_bf16=True)
+    output = torch.empty((4 if padded else 2, 128), dtype=torch.bfloat16)
+    dispatch = Mock(spec_set=modeling.m3_msa_attention)
+    monkeypatch.setattr(modeling, "m3_msa_attention", dispatch)
+    monkeypatch.setattr(modeling, "_record", Mock(spec_set=modeling._record))
+    modeling._msa_attention_live(core, 3, output, None, None, output, metadata, output, request)
+    received = dispatch.call_args.kwargs["sparse_backend_args"]
+    assert received is (None if padded else request)
+    assert dispatch.call_args.args[1].shape[0] == 2

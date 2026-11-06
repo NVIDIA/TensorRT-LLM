@@ -110,6 +110,8 @@ if TYPE_CHECKING:
         TrtllmAttentionMetadata,
     )
 
+    from ..sparse.minimax_m3.common import MiniMaxM3BackendForwardArgs
+
 
 def run_msa_sparse_gqa(
     q: torch.Tensor,
@@ -397,6 +399,7 @@ def run_msa_nvfp4_sparse_gqa(
     v_global_scale: torch.Tensor,
     num_rows: Optional[int] = None,
     out: torch.Tensor,
+    mxfp8_output: Optional["MiniMaxM3BackendForwardArgs"] = None,
 ) -> None:
     """Run sparse attention over M3's packed NVFP4 cache with the MSA CSR kernel.
 
@@ -507,11 +510,12 @@ def run_msa_nvfp4_sparse_gqa(
         )
         if identity is not None:
             metadata._msa_identity_csr = (identity, csr_key, (k2q_row_ptr, k2q_q_indices, schedule))
-    from .msa_combine_mxfp8 import combine_kwargs, publish
+    from .msa_combine_mxfp8 import combine_kwargs, quantized_output
 
     out_kwargs = _nvfp4_sparse_out_kwargs(sparse, out)
-    # Host CTX (b): the combine also writes the o_proj input as MXFP8 when the attention module armed it.
-    mxfp8_kwargs = combine_kwargs(sparse, out, metadata, in_place=bool(out_kwargs))
+    mxfp8_kwargs = combine_kwargs(
+        sparse, out, metadata, in_place=bool(out_kwargs), request=mxfp8_output
+    )
     result = sparse.sparse_atten_nvfp4_kv_func(
         q,
         k_paged.view(torch.uint8),
@@ -541,7 +545,8 @@ def run_msa_nvfp4_sparse_gqa(
     if result is not out:
         out.copy_(result)
     if mxfp8_kwargs is not None:
-        publish(out, mxfp8_kwargs)
+        assert mxfp8_output is not None
+        mxfp8_output.mxfp8_result = quantized_output(out, mxfp8_kwargs)
 
 
 @functools.lru_cache(maxsize=None)
@@ -732,6 +737,7 @@ def run_msa_prefill_gqa(
     row_first: int,
     num_rows: int,
     kv_scale_quant_orig: Optional[torch.Tensor] = None,
+    mxfp8_output: Optional["MiniMaxM3BackendForwardArgs"] = None,
 ) -> None:
     """Run paged GQA over one row range into output in place.
 
@@ -775,6 +781,7 @@ def run_msa_prefill_gqa(
             v_global_scale=v_scale,
             num_rows=num_rows,
             out=out_view,
+            mxfp8_output=mxfp8_output,
         )
         return
 
@@ -882,8 +889,13 @@ class MsaPrefillFmha(PhasedFmha):
         return phase is FmhaPhase.CONTEXT
 
     def run_context(self, params: FmhaParams) -> None:
+        from ..sparse.minimax_m3.common import MiniMaxM3BackendForwardArgs
         from ..sparse.minimax_m3.kernels.msa_utils import write_msa_phase_kv
 
+        request = params.fwd.sparse_backend_args
+        mxfp8_output = request if isinstance(request, MiniMaxM3BackendForwardArgs) else None
+        if mxfp8_output is not None:
+            mxfp8_output.mxfp8_result = None
         metadata = params.meta
         write_msa_phase_kv(
             params.attn,
@@ -916,6 +928,7 @@ class MsaPrefillFmha(PhasedFmha):
             row_first=params.seq_offset,
             num_rows=metadata.num_contexts,
             kv_scale_quant_orig=params.fwd.kv_scale_quant_orig,
+            mxfp8_output=mxfp8_output,
         )
 
 

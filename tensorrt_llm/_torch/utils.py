@@ -254,11 +254,16 @@ class MxFp8QuantizedTensor:
         is_sf_swizzled: Whether ``scaling_factor`` uses a backend-specific
             swizzled layout. The carrier's ``split`` method requires the
             default row-major layout and only supports the token dimension.
+        unquantized_hidden_states: Optional original activation, retained only
+            when the producer wrote it, for consumers requiring BF16/FP16.
+        producer_stream: Stream that allocated the quantized payload buffers.
     """
 
     fp8_tensor: torch.Tensor
     scaling_factor: torch.Tensor
     is_sf_swizzled: bool = False
+    unquantized_hidden_states: Optional[torch.Tensor] = None
+    producer_stream: Optional[torch.cuda.Stream] = None
 
     @property
     def shape(self) -> torch.Size:
@@ -271,6 +276,27 @@ class MxFp8QuantizedTensor:
     def numel(self) -> int:
         return self.fp8_tensor.numel()
 
+    def unquantized(self) -> torch.Tensor:
+        """Return the producer's BF16/FP16 view; never reconstruct an omitted output."""
+        if self.unquantized_hidden_states is None:
+            raise ValueError("MXFP8 input has no unquantized hidden-state view")
+        return self.unquantized_hidden_states
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Keep both payload buffers alive on a consumer stream."""
+        if stream != self.producer_stream:
+            self.fp8_tensor.record_stream(stream)
+            self.scaling_factor.record_stream(stream)
+
+    def quantized(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the payload, retaining it on a different eager consumer stream."""
+        if self.fp8_tensor.is_cuda:
+            consumer = torch.cuda.current_stream(self.fp8_tensor.device)
+            if (consumer != self.producer_stream
+                    and not torch.cuda.is_current_stream_capturing()):
+                self.record_stream(consumer)
+        return self.fp8_tensor, self.scaling_factor
+
     def split(
         self,
         split_size_or_sections: int | list[int],
@@ -281,11 +307,18 @@ class MxFp8QuantizedTensor:
             raise ValueError(
                 "MxFp8QuantizedTensor can only be split along the token dimension"
             )
+        if self.is_sf_swizzled:
+            raise ValueError(
+                "MxFp8QuantizedTensor.split requires row-major scaling factors")
         fp8_chunks = self.fp8_tensor.split(split_size_or_sections, dim=dim)
         sf_chunks = self.scaling_factor.split(split_size_or_sections, dim=dim)
+        hidden_chunks = (self.unquantized_hidden_states.split(
+            split_size_or_sections, dim=dim) if self.unquantized_hidden_states
+                         is not None else (None, ) * len(fp8_chunks))
         return tuple(
-            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled)
-            for fp8_chunk, sf_chunk in zip(fp8_chunks, sf_chunks))
+            MxFp8QuantizedTensor(fp8_chunk, sf_chunk, self.is_sf_swizzled,
+                                 hidden, self.producer_stream) for fp8_chunk,
+            sf_chunk, hidden in zip(fp8_chunks, sf_chunks, hidden_chunks))
 
 
 def compute_swizzled_sf_shape(row: int, col: int):

@@ -13,6 +13,9 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionForwardArgs,
     SparseBackendForwardArgs,
 )
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
+)
 
 
 class MsaAttentionBase(OpWrapper):
@@ -28,6 +31,7 @@ class MsaAttentionBase(OpWrapper):
         sparse: bool,
         kv_scale_orig_quant: Optional[torch.Tensor],
         kv_scale_quant_orig: Optional[torch.Tensor],
+        sparse_backend_args: Optional[MiniMaxM3BackendForwardArgs] = None,
     ) -> torch.Tensor:
         if k is not None:
             backend.write_layer_caches(
@@ -35,9 +39,13 @@ class MsaAttentionBase(OpWrapper):
             )
         if sparse:
             blocks = backend.run_indexer(idx_q, None, metadata, idx_k_prewritten=True)
-            args = AttentionForwardArgs(
-                output=output, sparse_backend_args=SparseBackendForwardArgs(topk_indices=blocks)
+            sparse_args = (
+                sparse_backend_args
+                if sparse_backend_args is not None
+                else SparseBackendForwardArgs()
             )
+            sparse_args.topk_indices = blocks
+            args = AttentionForwardArgs(output=output, sparse_backend_args=sparse_args)
         else:
             args = AttentionForwardArgs(output=output)
         args.kv_scale_orig_quant = kv_scale_orig_quant
@@ -59,6 +67,7 @@ class GroupedMsaAttentionBase(MsaAttentionBase):
         sparse: bool,
         kv_scale_orig_quant: Optional[torch.Tensor],
         kv_scale_quant_orig: Optional[torch.Tensor],
+        sparse_backend_args: Optional[MiniMaxM3BackendForwardArgs] = None,
     ) -> torch.Tensor:
         """``output`` as the call is supposed to write it, [T, heads * 128] in ``output``'s dtype.
 

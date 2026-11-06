@@ -22,7 +22,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import os
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 from typing import Mapping as TMapping
 
 import torch
@@ -85,7 +85,11 @@ from ..attention.backends.sparse.minimax_m3 import (
     _gather_paged_batched,
     _write_main_kv_slots_to_pool,
 )
-from ..attention.backends.sparse.minimax_m3.common import get_sparse_layer_ids, index_head_range
+from ..attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
+    get_sparse_layer_ids,
+    index_head_range,
+)
 from ..attention.backends.sparse.params import SparseBackendForwardArgs
 from ..attention.backends.trtllm import TrtllmAttention
 from ..distributed import AllReduce, AllReduceFusionOp, AllReduceParams, MiniMaxAllReduceRMS
@@ -102,8 +106,6 @@ from ..modules.linear import (
     copy_weight,
     ctx_eager_only,
     load_weight_shard,
-    prequantized_mxfp8_pending,
-    set_prequantized_mxfp8,
 )
 from ..modules.multi_stream_utils import do_multi_stream, maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
@@ -117,6 +119,7 @@ from ..utils import (
     AuxStreamType,
     EventType,
     Fp4QuantizedTensor,
+    MxFp8QuantizedTensor,
     get_model_extra_attrs,
     is_torch_compiling,
 )
@@ -594,6 +597,25 @@ _CTX_SWIGLU_MXFP8_LOGGED = False
 class _SwigluOaiMLP(GatedMLP):
     """GatedMLP whose prefill-sized activation hands the MXFP8 down_proj a pre-quantized input."""
 
+    def forward(
+        self,
+        x: torch.Tensor | MxFp8QuantizedTensor,
+        all_rank_num_tokens=None,
+        final_all_reduce_params: Optional[AllReduceParams] = None,
+        lora_params: Optional[dict] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        # The parent's LoRA adapter reads x before invoking the base projection.
+        if isinstance(x, MxFp8QuantizedTensor) and lora_params:
+            x = x.unquantized()
+        return super().forward(
+            x,
+            all_rank_num_tokens=all_rank_num_tokens,
+            final_all_reduce_params=final_all_reduce_params,
+            lora_params=lora_params,
+            **kwargs,
+        )
+
     def _swiglu_mxfp8_eligible(self, x: torch.Tensor, has_lora: bool) -> bool:
         from ..modules.linear import MXFP8LinearMethod
 
@@ -613,7 +635,9 @@ class _SwigluOaiMLP(GatedMLP):
             and getattr(method, "use_cutlass", False)
         )
 
-    def _apply_activation(self, x, *, has_lora: bool = False):
+    def _apply_activation(
+        self, x: torch.Tensor, *, has_lora: bool = False
+    ) -> torch.Tensor | MxFp8QuantizedTensor:
         if not self._swiglu_mxfp8_eligible(x, has_lora):
             return super()._apply_activation(x, has_lora=has_lora)
         act_e4m3, act_sf = swiglu_mxfp8(
@@ -622,31 +646,16 @@ class _SwigluOaiMLP(GatedMLP):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
         )
-        # Stands in for the BF16 activation: down_proj takes the MXFP8 pair keyed on it and never reads it.
-        placeholder = torch.empty(act_e4m3.shape, dtype=x.dtype, device=x.device)
-        set_prequantized_mxfp8(placeholder, act_e4m3, act_sf, tag="ctx_swiglu")
-        self._swiglu_mxfp8_source = placeholder
-        self._swiglu_mxfp8_takes = linear_module._PREQUANTIZED_MXFP8_TAKES[0]
         global _CTX_SWIGLU_MXFP8_LOGGED
         if not _CTX_SWIGLU_MXFP8_LOGGED:
             _CTX_SWIGLU_MXFP8_LOGGED = True
             logger.info(f"MiniMax-M3 CTX SwiGLU+MXFP8 fused path taken (rows {x.shape[0]})")
-        return placeholder
-
-    def forward(self, *args, **kwargs):
-        self._swiglu_mxfp8_source = None
-        output = super().forward(*args, **kwargs)
-        source, self._swiglu_mxfp8_source = self._swiglu_mxfp8_source, None
-        # The placeholder is never written: down_proj must have TAKEN the pair (a dropped entry would quantize it).
-        # The take count is snapshotted when the pair is set, after gate_up's own take of the norm slot.
-        if source is not None and (
-            prequantized_mxfp8_pending(source)
-            or linear_module._PREQUANTIZED_MXFP8_TAKES[0] == self._swiglu_mxfp8_takes
-        ):
-            raise RuntimeError(
-                "MiniMax-M3 SwiGLU+MXFP8: down_proj did not consume the pre-quantized activation"
-            )
-        return output
+        return MxFp8QuantizedTensor(
+            act_e4m3,
+            act_sf,
+            is_sf_swizzled=True,
+            producer_stream=torch.cuda.current_stream(x.device),
+        )
 
 
 def _build_swiglu_oai_dense_mlp(
@@ -1402,12 +1411,15 @@ class MiniMaxM3MoE(nn.Module):
 
     def forward(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MxFp8QuantizedTensor,
         attn_metadata: AttentionMetadata,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         global _FOLD_SHARED_LOGGED
+        shared_input = hidden_states
+        if isinstance(hidden_states, MxFp8QuantizedTensor):
+            hidden_states = hidden_states.unquantized()
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
         prequantized = None
         if ctx_eager_only():
@@ -1461,7 +1473,7 @@ class MiniMaxM3MoE(nn.Module):
             )
 
         def _compute_shared_output():
-            return self.shared_experts(hidden_states, lora_params=lora_params)
+            return self.shared_experts(shared_input, lora_params=lora_params)
 
         if self.shared_experts is None:
             routed_output = _compute_routed_output()
@@ -1712,6 +1724,7 @@ def _dispatch_attention_over_live_tokens(
     idx_k: Optional[torch.Tensor],
     attn_metadata: AttentionMetadata,
     output: torch.Tensor,
+    mxfp8_output: Optional[MiniMaxM3BackendForwardArgs] = None,
 ) -> None:
     """Run the attention core over the step's live tokens alone.
 
@@ -1734,6 +1747,7 @@ def _dispatch_attention_over_live_tokens(
         idx_k[:num_tokens] if idx_k is not None else None,
         attn_metadata,
         output[:num_tokens],
+        mxfp8_output=mxfp8_output if output.shape[0] == num_tokens else None,
     )
 
 
@@ -2295,6 +2309,8 @@ class MiniMaxM3Attention(Attention):
         rope = self.pos_embd_params.rope if self.pos_embd_params is not None else None
         rotary_dim = int(rope.dim) if rope is not None else 0
         source = packed if packed is not None else hidden_states
+        if isinstance(source, MxFp8QuantizedTensor):
+            source = source.unquantized()
         if (
             source is None
             or source.dtype != torch.bfloat16
@@ -2455,7 +2471,7 @@ class MiniMaxM3Attention(Attention):
 
     def _ctx_fused_qkv_gemm_producer(
         self,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MxFp8QuantizedTensor,
         buffers: torch.Tensor,
         scale_buffers: torch.Tensor,
         index_k_cache: torch.Tensor,
@@ -2465,8 +2481,11 @@ class MiniMaxM3Attention(Attention):
         norm_eps: float,
     ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """The QKV-index MXFP8 GEMM with the NVFP4 producer in its epilogue (see _CTX_QKV_FUSED), or None."""
-        from ..modules.linear import MXFP8LinearMethod, take_prequantized_mxfp8
+        from ..modules.linear import MXFP8LinearMethod
 
+        quantized_input = hidden_states if isinstance(hidden_states, MxFp8QuantizedTensor) else None
+        if quantized_input is not None:
+            hidden_states = quantized_input.unquantized()
         proj = self.qkv_proj
         method = getattr(proj, "quant_method", None)
         num_tokens = int(hidden_states.shape[0])
@@ -2499,7 +2518,7 @@ class MiniMaxM3Attention(Attention):
             (num_tokens, self.sparse_num_index_heads, self.head_dim), dtype=torch.float8_e4m3fn
         )
         out_cache_loc, *_, rotary_cos_sin, position_ids = common_args
-        prequantized = take_prequantized_mxfp8(hidden_states)
+        prequantized = quantized_input.quantized() if quantized_input is not None else None
         act, act_sf = (
             prequantized
             if prequantized is not None
@@ -2624,7 +2643,7 @@ class MiniMaxM3Attention(Attention):
     def _dense_forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MxFp8QuantizedTensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
@@ -2849,6 +2868,7 @@ class MiniMaxM3Attention(Attention):
         idx_q: Optional[torch.Tensor],
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
+        mxfp8_output: Optional[MiniMaxM3BackendForwardArgs] = None,
     ) -> torch.Tensor:
         # q may be FP8 on the MSA FP8-KV path, so pin the output to the compute
         # dtype rather than inheriting it from q.
@@ -2871,7 +2891,9 @@ class MiniMaxM3Attention(Attention):
         else:
             # A step that runs here rather than through compile is padded all
             # the same, since the bucket is agreed across ranks.
-            _dispatch_attention_over_live_tokens(self, q, k, v, idx_q, idx_k, attn_metadata, output)
+            _dispatch_attention_over_live_tokens(
+                self, q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output
+            )
         return output
 
     def _dispatch_attention_backend(
@@ -2883,6 +2905,7 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        mxfp8_output: Optional[MiniMaxM3BackendForwardArgs] = None,
     ) -> torch.Tensor:
         """Route the attention core to the configured backend.
 
@@ -2896,7 +2919,9 @@ class MiniMaxM3Attention(Attention):
         * Dense → generic TRTLLM paged attention
         """
         if isinstance(self.attn, MiniMaxM3MsaSparseAttention):
-            return self._msa_attention_core(q, k, v, idx_q, idx_k, attn_metadata, output)
+            return self._msa_attention_core(
+                q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output
+            )
         assert k is not None and v is not None
         if self.is_sparse_attention_layer:
             assert idx_q is not None and idx_k is not None
@@ -2930,6 +2955,7 @@ class MiniMaxM3Attention(Attention):
         idx_k: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
+        mxfp8_output: Optional[MiniMaxM3BackendForwardArgs] = None,
     ) -> torch.Tensor:
         """Run the MSA backend (:class:`MiniMaxM3MsaSparseAttention`).
 
@@ -2972,10 +2998,9 @@ class MiniMaxM3Attention(Attention):
             kv_block_indexes = self.attn.run_indexer(
                 idx_q, idx_k, attn_metadata, idx_k_prewritten=True
             )
-            forward_args = AttentionForwardArgs(
-                output=output,
-                sparse_backend_args=SparseBackendForwardArgs(topk_indices=kv_block_indexes),
-            )
+            sparse_args = mxfp8_output if mxfp8_output is not None else SparseBackendForwardArgs()
+            sparse_args.topk_indices = kv_block_indexes
+            forward_args = AttentionForwardArgs(output=output, sparse_backend_args=sparse_args)
         else:
             assert idx_q is None and idx_k is None
             if k is not None:
@@ -2992,7 +3017,7 @@ class MiniMaxM3Attention(Attention):
     def _sparse_forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MxFp8QuantizedTensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         **kwargs,
@@ -3031,6 +3056,9 @@ class MiniMaxM3Attention(Attention):
         ``cuda_graph=True`` hard path because the build does
         CPU->GPU copies.
         """
+        projection_input = hidden_states
+        if isinstance(hidden_states, MxFp8QuantizedTensor):
+            hidden_states = hidden_states.unquantized()
         if attn_metadata is None:
             raise RuntimeError(
                 f"MiniMax-M3 sparse forward (layer {self.layer_idx}) requires "
@@ -3111,14 +3139,14 @@ class MiniMaxM3Attention(Attention):
                 )
                 return self.o_proj(output, all_reduce_params=all_reduce_params)
             horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
-                None, position_ids, attn_metadata, hidden_states=hidden_states
+                None, position_ids, attn_metadata, hidden_states=projection_input
             )
             if horizontal is not None:
                 q, idx_q = horizontal
                 if _CTX_P5A_COMBINE_MXFP8:
                     return self._core_then_o_proj(
-                        lambda: self._forward_attention_core(
-                            q, None, None, idx_q, None, attn_metadata
+                        lambda request: self._forward_attention_core(
+                            q, None, None, idx_q, None, attn_metadata, request
                         ),
                         all_reduce_params,
                         site="p5a",
@@ -3126,14 +3154,16 @@ class MiniMaxM3Attention(Attention):
                     )
                 o = self._forward_attention_core(q, None, None, idx_q, None, attn_metadata)
                 return self.o_proj(o, all_reduce_params=all_reduce_params)
-            packed = self.qkv_proj(hidden_states)
+            packed = self.qkv_proj(projection_input)
             horizontal = self._fused_fp8_qkv_indexer_norm_rope_kv_insert(
                 packed, position_ids, attn_metadata
             )
             if horizontal is not None:
                 q, idx_q = horizontal
                 return self._core_then_o_proj(
-                    lambda: self._forward_attention_core(q, None, None, idx_q, None, attn_metadata),
+                    lambda request: self._forward_attention_core(
+                        q, None, None, idx_q, None, attn_metadata, request
+                    ),
                     all_reduce_params,
                     site="horizontal",
                     padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
@@ -3147,7 +3177,7 @@ class MiniMaxM3Attention(Attention):
         # index branches. Both read only hidden_states and write disjoint
         # outputs, so they overlap on the aux stream and join before attention.
         def _main_norm_rope():
-            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(hidden_states)
+            qkv = packed_qkv if packed_qkv is not None else self.qkv_proj(projection_input)
             fused_qkv = self._fused_qk_norm_rope(
                 qkv,
                 position_ids,
@@ -3230,30 +3260,36 @@ class MiniMaxM3Attention(Attention):
         # Passing None preserves the standalone o_proj reduction used by the
         # single-GPU, attention-DP, and fusion-disabled paths.
         return self._core_then_o_proj(
-            lambda: self._forward_attention_core(q, k, v, idx_q, idx_k, attn_metadata),
+            lambda request: self._forward_attention_core(
+                q, k, v, idx_q, idx_k, attn_metadata, request
+            ),
             all_reduce_params,
             site="general",
             padded=getattr(attn_metadata, "padded_num_tokens", None) is not None,
         )
 
-    def _core_then_o_proj(self, core, all_reduce_params, site, padded=False):
-        """The sparse attention core, then its o_proj. In eager prefill the core's NVFP4 combine may also write the
-        o_proj input as MXFP8 into the prequant slot (msa_combine_mxfp8, TRTLLM_CTX_COMBINE_MXFP8); the o_proj takes
-        it. Never armed while compiling (the slot is not taken there), nor on a padded step (an eager breakable-graph
-        warmup or fallback step): the combine covers only the live rows while the o_proj input carries the pad rows,
-        so the slot would not be taken and, with the bf16 store skipped, the o_proj input would be unwritten."""
+    def _core_then_o_proj(
+        self,
+        core: Callable[[Optional[MiniMaxM3BackendForwardArgs]], torch.Tensor],
+        all_reduce_params: Optional[AllReduceParams],
+        site: str,
+        padded: bool = False,
+    ) -> torch.Tensor:
+        """Pass a complete eager combine's quantized output directly to its projection."""
         if not ctx_eager_only() or padded:
-            return self.o_proj(core(), all_reduce_params=all_reduce_params)
+            return self.o_proj(core(None), all_reduce_params=all_reduce_params)
         from ..attention.backends.fmha import msa_combine_mxfp8
 
-        skip_bf16_ok = msa_combine_mxfp8.SKIP_BF16 and msa_combine_mxfp8.o_proj_takes_slot(
-            self.o_proj
+        accepts_mxfp8 = msa_combine_mxfp8.o_proj_accepts_mxfp8(self.o_proj)
+        request = MiniMaxM3BackendForwardArgs(
+            mxfp8_output=accepts_mxfp8,
+            mxfp8_skip_bf16=accepts_mxfp8,
         )
-        with msa_combine_mxfp8.armed(site, skip_bf16_ok):
-            o = core()
-        out = self.o_proj(o, all_reduce_params=all_reduce_params)
-        msa_combine_mxfp8.after_o_proj(o)
-        return out
+        output = core(request)
+        projection_input = request.mxfp8_result if request.mxfp8_result is not None else output
+        projected = self.o_proj(projection_input, all_reduce_params=all_reduce_params)
+        msa_combine_mxfp8.log_consumed(projection_input)
+        return projected
 
     def _triton_sparse_attention_core(
         self,
@@ -3467,7 +3503,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
     def forward(
         self,
         position_ids: torch.IntTensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor | MxFp8QuantizedTensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
@@ -3562,7 +3598,7 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
 
         The plain AllReduce is followed by one kernel that does the RESIDUAL_RMS_NORM epilogue's residual add +
         RMSNorm (the same arithmetic as the stock SM107 rows kernel) and the next MXFP8 linear's activation
-        quantization; the MXFP8 pair waits in a one-entry slot for that linear. Only for rows at or above
+        quantization; the returned carrier owns the MXFP8 pair for that linear. Only for rows at or above
         _CTX_NORM_MXFP8_MIN_ROWS, where the stock AUTO strategy reduces with NCCL and normalizes with that same
         rows kernel; returns None (stock path) otherwise. With moe (the pre-MoE norm), the same kernel also writes
         the routed experts' NVFP4 input, handed to moe as a one-shot Fp4QuantizedTensor.
@@ -3596,7 +3632,6 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
                 reduced, residual, norm.weight, norm.variance_epsilon, True, fp4_scale
             )
         normed, act_e4m3, act_sf = outs[:3]
-        set_prequantized_mxfp8(normed, act_e4m3, act_sf, tag="ctx_norm")
         if fp4_scale is not None:
             moe._prequantized_fp4 = (
                 normed,
@@ -3616,7 +3651,13 @@ class MiniMaxM3DecoderLayer(DecoderLayer):
             logger.info(
                 f"MiniMax-M3 CTX norm+MXFP8 fused path taken (rows {hidden_states.shape[0]})"
             )
-        return normed, reduced
+        return MxFp8QuantizedTensor(
+            act_e4m3,
+            act_sf,
+            is_sf_swizzled=True,
+            unquantized_hidden_states=normed,
+            producer_stream=torch.cuda.current_stream(normed.device),
+        ), reduced
 
     def _apply_next_layer_layernorm(
         self,

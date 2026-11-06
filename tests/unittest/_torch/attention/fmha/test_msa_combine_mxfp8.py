@@ -1,24 +1,25 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""MiniMax-M3 CTX: when the NVFP4 sparse prefill's combine writes the o_proj input as MXFP8 (msa_combine_mxfp8)."""
+"""Call-owned MiniMax-M3 combine buffers and safe BF16 fallback contracts."""
 
-from types import SimpleNamespace
+from contextlib import nullcontext
+from unittest.mock import Mock
 
 import pytest
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha import msa_combine_mxfp8 as m
+from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
+from tensorrt_llm._torch.attention.backends.fmha.phased import FmhaParams
+from tensorrt_llm._torch.attention.backends.interface import AttentionForwardArgs
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
+)
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels import msa_utils
 from tensorrt_llm._torch.modules import linear
+from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
 
 pytestmark = pytest.mark.cpu_only
-
-
-@pytest.fixture(autouse=True)
-def _one_stream(monkeypatch):
-    # The slot records its producing stream; on CPU tensors every set and take is on one stream.
-    stream = object()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: stream)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
 
 
 class _Sparse:
@@ -31,154 +32,227 @@ class _OldSparse:
         pass
 
 
-def _out(rows=200, heads=32):
+def _out(rows: int = 200, heads: int = 32) -> torch.Tensor:
     return torch.zeros((rows, heads, 128), dtype=torch.bfloat16)
 
 
-CTX = SimpleNamespace(num_generations=0)
+def _metadata(generations: int = 0) -> Mock:
+    metadata = Mock(spec_set=["num_generations"])
+    metadata.num_generations = generations
+    return metadata
 
 
-def test_engages_only_when_armed_pure_context_in_place_and_supported(monkeypatch):
+def test_engages_only_for_explicit_pure_context_in_place_and_supported(monkeypatch) -> None:
     monkeypatch.setattr(m, "ENABLED", True)
-    out = _out()
-    assert m.combine_kwargs(_Sparse(), out, CTX, in_place=True) is None, "not armed"
-    with m.armed():
-        kw = m.combine_kwargs(_Sparse(), out, CTX, in_place=True)
-        assert kw is not None and kw["write_bf16"] is True
-        assert kw["o_fp8"].shape == (200, 32 * 128) and kw["o_fp8"].dtype == torch.float8_e4m3fn
-        assert kw["sf_out"].numel() == 256 * 32 * 128 // 32
-        assert int(kw["sf_out"][-128 * 32 * 128 // 32 :].sum()) == 0, "padding tile zeroed"
-        assert (
-            m.combine_kwargs(_Sparse(), out, SimpleNamespace(num_generations=3), in_place=True)
-            is None
-        )
-        assert m.combine_kwargs(_Sparse(), out, CTX, in_place=False) is None
-        assert m.combine_kwargs(_OldSparse(), out, CTX, in_place=True) is None
-        assert m.combine_kwargs(_Sparse(), out.view(200, -1), CTX, in_place=True) is None
-        assert m.combine_kwargs(_Sparse(), _out().float(), CTX, in_place=True) is None
-    assert m.combine_kwargs(_Sparse(), out, CTX, in_place=True) is None, "disarmed on exit"
+    out, metadata = _out(), _metadata()
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=True)
+    assert m.combine_kwargs(_Sparse(), out, metadata, in_place=True) is None
+    kw = m.combine_kwargs(_Sparse(), out, metadata, in_place=True, request=request)
+    assert kw is not None and kw["write_bf16"] is True
+    assert kw["o_fp8"].shape == (200, 32 * 128) and kw["o_fp8"].dtype == torch.float8_e4m3fn
+    assert kw["sf_out"].numel() == 256 * 32 * 128 // 32
+    assert int(kw["sf_out"][-128 * 32 * 128 // 32 :].sum()) == 0
+    for sparse, output, meta, in_place in (
+        (_Sparse(), out, _metadata(3), True),
+        (_Sparse(), out, metadata, False),
+        (_OldSparse(), out, metadata, True),
+        (_Sparse(), out.view(200, -1), metadata, True),
+        (_Sparse(), _out().float(), metadata, True),
+        (_Sparse(), out.transpose(0, 1), metadata, True),
+    ):
+        assert m.combine_kwargs(sparse, output, meta, in_place, request) is None
+    assert m.combine_kwargs(_Sparse(), out, metadata, in_place=True) is None
 
 
-def test_kill_switch(monkeypatch):
-    monkeypatch.setattr(m, "ENABLED", False)
-    with m.armed():
-        assert m.combine_kwargs(_Sparse(), _out(), CTX, in_place=True) is None
+@pytest.mark.parametrize(
+    "enabled,requested,eager", [(False, True, True), (True, False, True), (True, True, False)]
+)
+def test_disabled_unrequested_or_compiling_declines(monkeypatch, enabled, requested, eager) -> None:
+    monkeypatch.setattr(m, "ENABLED", enabled)
+    monkeypatch.setattr(linear, "ctx_eager_only", lambda: eager)
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=requested)
+    assert m.combine_kwargs(_Sparse(), _out(), _metadata(), True, request) is None
 
 
-class _Log:
-    def __init__(self):
-        self.info, self.warning = [], []
-
-    def info_once(self, msg, key=None):
-        self.info.append(msg)
-
-    def warning_once(self, msg, key=None):
-        self.warning.append(msg)
-
-
-def _publish(monkeypatch):
+@pytest.mark.parametrize(
+    "skip,proven,write", [(False, True, True), (True, False, True), (True, True, False)]
+)
+def test_bf16_skip_only_when_enabled_and_proven(monkeypatch, skip, proven, write) -> None:
     monkeypatch.setattr(m, "ENABLED", True)
-    log = _Log()
-    monkeypatch.setattr(m, "logger", log)
+    monkeypatch.setattr(m, "SKIP_BF16", skip)
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=True, mxfp8_skip_bf16=proven)
     out = _out()
-    with m.armed():
-        kw = m.combine_kwargs(_Sparse(), out, CTX, in_place=True)
-    m.publish(out, kw)
-    return out, kw, log
+    kwargs = m.combine_kwargs(_Sparse(), out, _metadata(), True, request)
+    assert kwargs["write_bf16"] is write
+    result = m.quantized_output(out, kwargs)
+    act, sf = result.quantized()
+    assert act is kwargs["o_fp8"] and sf is kwargs["sf_out"]
+    assert result.is_sf_swizzled
+    if write:
+        assert result.unquantized().data_ptr() == out.data_ptr()
+        assert result.unquantized().shape == act.shape
+    else:
+        with pytest.raises(ValueError, match="no unquantized hidden-state view"):
+            result.unquantized()
 
 
-def test_engagement_is_logged_only_when_the_o_proj_takes_the_pair(monkeypatch):
-    out, kw, log = _publish(monkeypatch)
-    assert not log.info, "publishing alone is not engagement"
-    o = out.view(200, -1)  # the o_proj input: same storage and shape
-    act, sf = linear.take_prequantized_mxfp8(o)
-    assert act.data_ptr() == kw["o_fp8"].data_ptr() and sf is kw["sf_out"]
-    m.after_o_proj(o)
-    assert linear._PREQUANTIZED_MXFP8[0] is None
-    assert log.info == ["[M3 CTX] combine MXFP8 o_proj input taken"] and not log.warning
-
-
-def test_a_take_on_mismatched_rows_is_a_miss(monkeypatch):
-    out, _, log = _publish(monkeypatch)
-    padded = torch.zeros((256, 32 * 128), dtype=torch.bfloat16)  # e.g. a padded o_proj input
-    assert linear.take_prequantized_mxfp8(padded) is None, "dropped, the o_proj quantizes"
-    m.after_o_proj(padded)
-    assert not log.info and len(log.warning) == 1 and "not consumed" in log.warning[0]
-
-
-def test_a_pair_the_o_proj_never_looked_at_is_cleared_and_a_miss(monkeypatch):
-    _, _, log = _publish(monkeypatch)
-    m.after_o_proj()
-    assert linear._PREQUANTIZED_MXFP8[0] is None
-    assert not log.info and len(log.warning) == 1
-
-
-def test_slot_audit_counts_takes_drops_unconsumed_and_declines(monkeypatch):
-    monkeypatch.setattr(linear, "_PREQUANTIZED_MXFP8_STATS", {})
+def test_interleaved_requests_retain_their_own_payloads(monkeypatch) -> None:
     monkeypatch.setattr(m, "ENABLED", True)
-    monkeypatch.setattr(m, "logger", _Log())
-    out = _out()
-    o = out.view(200, -1)
-    for take_input in (o, torch.zeros((256, 32 * 128), dtype=torch.bfloat16), None):
-        with m.armed("general"):
-            kw = m.combine_kwargs(_Sparse(), out, CTX, in_place=True)
-            m.publish(out, kw)
-        if take_input is not None:
-            linear.take_prequantized_mxfp8(take_input)
-        m.after_o_proj(take_input)
-    with m.armed("general"):
-        assert (
-            m.combine_kwargs(_Sparse(), out, SimpleNamespace(num_generations=1), in_place=True)
-            is None
-        )
-        assert m.combine_kwargs(_Sparse(), out, CTX, in_place=False) is None
-    stats = linear._PREQUANTIZED_MXFP8_STATS
-    assert stats["combine_general"] == [3, 1, 1, 1]  # set, taken, dropped, unconsumed
-    assert stats["combine_general_declined_mixed_step"][0] == 1
-    assert stats["combine_general_declined_not_in_place"][0] == 1
+    requests = [MiniMaxM3BackendForwardArgs(mxfp8_output=True) for _ in range(2)]
+    payloads = []
+    for request, rows in zip(requests, (200, 128)):
+        out = _out(rows)
+        kwargs = m.combine_kwargs(_Sparse(), out, _metadata(), True, request)
+        request.mxfp8_result = m.quantized_output(out, kwargs)
+        payloads.append((kwargs["o_fp8"], kwargs["sf_out"]))
+    for request, (act, sf) in zip(reversed(requests), reversed(payloads)):
+        first, second = request.mxfp8_result.quantized()
+        assert first is act and second is sf
+    assert requests[0].mxfp8_result is not requests[1].mxfp8_result
+    assert requests[0].mxfp8_result.quantized()[0] is payloads[0][0]
 
 
-def _mxfp8_o_proj(use_cutlass=True, lora=None):
+@pytest.mark.parametrize(
+    "use_cutlass,decode_graph,expected",
+    [(True, False, True), (False, False, False), (True, True, False)],
+)
+def test_projection_capability_requires_a_consuming_method(
+    use_cutlass, decode_graph, expected
+) -> None:
     method = object.__new__(linear.MXFP8LinearMethod)
     method.use_cutlass = use_cutlass
-    return SimpleNamespace(quant_method=method, lora=lora)
+    projection = Mock(spec_set=["quant_method"])
+    projection.quant_method = method
+    with linear.flashinfer_mxfp8_decode_graph_capture() if decode_graph else nullcontext():
+        assert m.o_proj_accepts_mxfp8(projection) is expected
+    projection.quant_method = object()
+    assert not m.o_proj_accepts_mxfp8(projection)
 
 
-def test_o_proj_takes_slot_only_for_an_mxfp8_cutlass_linear():
-    assert m.o_proj_takes_slot(_mxfp8_o_proj())
-    assert not m.o_proj_takes_slot(_mxfp8_o_proj(use_cutlass=False))
-    assert m.o_proj_takes_slot(_mxfp8_o_proj(lora=object())), (
-        "a LoRA layer reads only when lora_params are passed"
-    )
-    assert not m.o_proj_takes_slot(SimpleNamespace(quant_method=object(), lora=None))
+def test_carrier_row_splits_retain_bf16_views_and_reject_swizzled_scales() -> None:
+    hidden = torch.arange(128, dtype=torch.float32).reshape(4, 32).to(torch.bfloat16)
+    act = hidden.to(torch.float8_e4m3fn)
+    scales = torch.ones(4, 1, dtype=torch.uint8)
+    carrier = MxFp8QuantizedTensor(act, scales, unquantized_hidden_states=hidden)
+    chunks = carrier.split([1, 3])
+    assert [chunk.shape[0] for chunk in chunks] == [1, 3]
+    for chunk, expected in zip(chunks, hidden.split([1, 3])):
+        assert chunk.unquantized().data_ptr() == expected.data_ptr()
+        torch.testing.assert_close(chunk.unquantized(), expected, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="token dimension"):
+        carrier.split(1, dim=1)
+    carrier.is_sf_swizzled = True
+    with pytest.raises(ValueError, match="row-major"):
+        carrier.split(1)
 
 
-def test_bf16_skip_only_when_enabled_and_proven(monkeypatch):
-    monkeypatch.setattr(m, "ENABLED", True)
-    out = _out()
-    for skip, ok, expect_write in ((False, True, True), (True, False, True), (True, True, False)):
-        monkeypatch.setattr(m, "SKIP_BF16", skip)
-        with m.armed("general", skip_bf16_ok=ok):
-            assert (
-                m.combine_kwargs(_Sparse(), out, CTX, in_place=True)["write_bf16"] is expect_write
-            )
-
-
-def test_bf16_skipped_pair_not_taken_raises(monkeypatch):
+def test_fmha_publishes_quantized_result_and_clears_a_declined_reuse(monkeypatch) -> None:
     monkeypatch.setattr(m, "ENABLED", True)
     monkeypatch.setattr(m, "SKIP_BF16", True)
-    monkeypatch.setattr(m, "logger", _Log())
-    out = _out()
-    with m.armed("general", skip_bf16_ok=True):
-        kw = m.combine_kwargs(_Sparse(), out, CTX, in_place=True)
-        m.publish(out, kw)
-    with pytest.raises(RuntimeError, match="bf16 input was not written"):
-        m.after_o_proj(torch.zeros((256, 32 * 128), dtype=torch.bfloat16))
-    # Taken: no raise.
-    with m.armed("general", skip_bf16_ok=True):
-        kw = m.combine_kwargs(_Sparse(), out, CTX, in_place=True)
-        m.publish(out, kw)
-    o = out.view(200, -1)
-    assert linear.take_prequantized_mxfp8(o) is not None
-    m.after_o_proj(o)
-    assert "[M3 CTX] combine MXFP8 o_proj input taken (bf16 store skipped)" in m.logger.info
+    monkeypatch.setattr(msa_prefill, "_SM107_NVFP4_SPARSE_OUT_IN_PLACE", True)
+    monkeypatch.setattr(msa_prefill, "get_sm_version", lambda: 107)
+    monkeypatch.setattr(msa_prefill._nvfp4_sparse_takes_out, "_cached", None, raising=False)
+    calls = []
+
+    class SparseKernel:
+        def build_k2q_csr(self, *args, **kwargs):
+            raise AssertionError("prepared identity CSR should be reused")
+
+        def sparse_atten_nvfp4_kv_func(
+            self, q, *args, out=None, o_fp8=None, sf_out=None, write_bf16=True, **kwargs
+        ):
+            calls.append((o_fp8, sf_out, write_bf16))
+            if o_fp8 is not None:
+                o_fp8.fill_(1)
+                sf_out.fill_(127)
+            if write_bf16:
+                out.fill_(3)
+            return out
+
+    library = Mock(spec_set=["sparse"])
+    library.sparse = SparseKernel()
+    monkeypatch.setattr(msa_utils, "require_msa_module", lambda: library)
+    manager = Mock(spec_set=["get_buffers", "get_block_scale_buffers", "is_nvfp4_layer"])
+    manager.get_buffers.return_value = torch.zeros((1, 2, 1, 128, 64), dtype=torch.uint8)
+    manager.get_block_scale_buffers.return_value = torch.zeros((1, 2, 1, 128, 8), dtype=torch.uint8)
+    manager.is_nvfp4_layer.return_value = True
+    metadata = Mock(
+        spec_set=[
+            "kv_cache_manager",
+            "num_contexts",
+            "num_generations",
+            "_msa_live_batch",
+            "_msa_max_q_len",
+            "_msa_max_kv_len_all",
+            "_msa_total_k",
+            "_msa_total_k_rows",
+            "_msa_context_prefix_bounds",
+            "msa_cu_q_lens",
+            "msa_cu_kv_lens",
+            "_msa_prefill_identity",
+            "_msa_identity_csr",
+            "msa_block_table",
+            "msa_seq_lens_cuda",
+            "msa_prefill_gqa_plan",
+        ]
+    )
+    metadata.kv_cache_manager = manager
+    metadata.num_contexts, metadata.num_generations = 1, 0
+    metadata._msa_live_batch = 1
+    metadata._msa_max_q_len = metadata._msa_max_kv_len_all = metadata._msa_total_k = 2
+    metadata._msa_total_k_rows = 1
+    metadata._msa_context_prefix_bounds = (2, 2, 2, 1)
+    metadata.msa_cu_q_lens = metadata.msa_cu_kv_lens = torch.tensor([0, 2], dtype=torch.int32)
+    metadata._msa_prefill_identity = object()
+    metadata._msa_identity_csr = (
+        metadata._msa_prefill_identity,
+        (1, 2),
+        (torch.tensor([0, 2], dtype=torch.int32), torch.tensor([0, 1], dtype=torch.int32), None),
+    )
+    metadata.msa_block_table = torch.zeros((1, 1), dtype=torch.int32)
+    metadata.msa_seq_lens_cuda = torch.tensor([2], dtype=torch.int32)
+    metadata.msa_prefill_gqa_plan = None
+    attn = Mock(
+        spec_set=[
+            "head_dim",
+            "num_heads",
+            "layer_idx",
+            "q_scaling",
+            "_msa_nvfp4_dequant_scales",
+            "_msa_nvfp4_dequant_scale_source_ptr",
+        ]
+    )
+    attn.head_dim, attn.num_heads, attn.layer_idx, attn.q_scaling = 128, 1, 3, 1.0
+    attn._msa_nvfp4_dequant_scales = attn._msa_nvfp4_dequant_scale_source_ptr = None
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=True, mxfp8_skip_bf16=True)
+    output = torch.full((2, 128), float("nan"), dtype=torch.bfloat16)
+    forward = AttentionForwardArgs(
+        output=output,
+        sparse_backend_args=request,
+        kv_scale_quant_orig=torch.ones(3),
+    )
+    forward.sparse_runtime_params.sparse_attn_indices = torch.zeros(
+        (2, 1, msa_utils.MSA_REQUIRED_TOPK), dtype=torch.int32
+    )
+    params = FmhaParams(
+        attn=attn,
+        meta=metadata,
+        fwd=forward,
+        workspace=torch.empty(0),
+        query_input=torch.zeros((2, 128), dtype=torch.bfloat16),
+        output=output,
+        num_tokens=2,
+    )
+    # All three forwarding/publication functions execute; only the external MSA library is replaced.
+    fmha = object.__new__(msa_prefill.MsaPrefillFmha)
+    fmha.run_context(params)
+    result = request.mxfp8_result
+    assert isinstance(result, MxFp8QuantizedTensor)
+    assert result.fp8_tensor is calls[0][0] and result.scaling_factor is calls[0][1]
+    assert calls[0][2] is False and result.unquantized_hidden_states is None
+    assert output.isnan().all(), "the skipped BF16 buffer must not be used as a fallback"
+    monkeypatch.setattr(m, "ENABLED", False)
+    fmha.run_context(params)
+    assert request.mxfp8_result is None, "a declined call must clear the earlier result"
+    assert calls[1] == (None, None, True)
+    torch.testing.assert_close(output, torch.full_like(output, 3), rtol=0, atol=0)

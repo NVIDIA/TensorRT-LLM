@@ -52,6 +52,7 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
     MiniMaxM3KVCacheManagerV2,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
     MiniMaxM3SparseConfig,
     MiniMaxM3SparseMetadataParams,
     MiniMaxM3SparseParams,
@@ -92,6 +93,7 @@ from tensorrt_llm._torch.models.modeling_minimaxm3 import (
 from tensorrt_llm._torch.models.modeling_speculative import SpecDecOneEngineForCausalLM
 from tensorrt_llm._torch.models.modeling_utils import _load_weights_impl_v2
 from tensorrt_llm._torch.modules import linear as linear_module
+from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod, _load_kv_cache_scales
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.grouped_gemm.nvfp4 import (
@@ -104,7 +106,7 @@ from tensorrt_llm._torch.moe.fused_moe.routing import (
     MiniMaxM3MoeRoutingMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen.trtllm_nvfp4 import TrtllmTrtllmGenNvfp4Impl
-from tensorrt_llm._torch.utils import AuxStreamType, EventType
+from tensorrt_llm._torch.utils import AuxStreamType, EventType, MxFp8QuantizedTensor
 from tensorrt_llm.llmapi import MiniMaxM3SparseAttentionConfig, RocketSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -645,7 +647,9 @@ def test_piecewise_attention_boundary_runs_horizontal_producer(monkeypatch) -> N
             )
             return packed[:, :3].clone(), packed[:, :1].clone()
 
-        def _dispatch_attention_backend(self, q, k, v, idx_q, idx_k, attn_metadata, output) -> None:
+        def _dispatch_attention_backend(
+            self, q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output=None
+        ) -> None:
             assert k is None and v is None and idx_k is None
             assert idx_q.shape == (attn_metadata.num_tokens, 1)
             output.copy_(q)
@@ -1026,7 +1030,7 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
         aux_stream=None,
         _forward_attention_core=Mock(return_value=torch.empty((4, 128), dtype=torch.bfloat16)),
         o_proj=lambda output, all_reduce_params: output,
-        _core_then_o_proj=lambda core, all_reduce_params, site, padded=False: core(),
+        _core_then_o_proj=lambda core, all_reduce_params, site, padded=False: core(None),
     )
     monkeypatch.setattr(modeling_minimaxm3, "is_torch_compiling", lambda: True)
     monkeypatch.setattr(
@@ -1040,7 +1044,7 @@ def test_piecewise_unfused_indexer_keeps_cache_write_eager(monkeypatch: pytest.M
     layer._fused_fp8_index_qk_norm_rope.assert_not_called()
     assert layer._fused_qk_norm_rope.call_count == 2
     assert all(call.kwargs["out_fp8"] for call in layer._fused_qk_norm_rope.call_args_list)
-    layer._forward_attention_core.assert_called_once_with(q, k, v, idx_q, idx_k, metadata)
+    layer._forward_attention_core.assert_called_once_with(q, k, v, idx_q, idx_k, metadata, None)
 
 
 @pytest.mark.cpu_only
@@ -1254,7 +1258,7 @@ def test_attention_dispatch_clips_the_piecewise_token_pad():
     are left as the buffer supplied them."""
     seen = {}
 
-    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output=None):
         del attn_metadata
         seen["rows"] = [None if t is None else int(t.shape[0]) for t in (q, k, v, idx_q, idx_k)]
         seen["out_rows"] = int(output.shape[0])
@@ -1287,7 +1291,7 @@ def test_attention_dispatch_leaves_an_unpadded_step_alone():
     """No pad, so nothing to clip."""
     seen = {}
 
-    def capture(q, k, v, idx_q, idx_k, attn_metadata, output):
+    def capture(q, k, v, idx_q, idx_k, attn_metadata, output, mxfp8_output=None):
         del q, k, v, idx_q, idx_k, attn_metadata
         seen["out"] = output
 
@@ -3551,7 +3555,6 @@ def test_ctx_qkv_invalid_arguments_keep_stock_fallback(monkeypatch, error_type) 
     monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
     monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
     monkeypatch.setattr(modeling_minimaxm3, "_autotuner_tuning", lambda: False)
-    monkeypatch.setattr(linear_module, "take_prequantized_mxfp8", lambda hidden: None)
     runner = Mock(spec_set=["make_args", "run_args"])
     runner.make_args.side_effect = error_type("unsupported cache layout")
     monkeypatch.setattr(modeling_minimaxm3, "_ctx_qkv_fused_runner", lambda *heads: runner)
@@ -3626,3 +3629,93 @@ def test_minimax_m3_opts_in_only_its_routed_moe_config(
     assert routed_config.extra_attrs["scope_sentinel"] is sentinel
     assert config.extra_attrs == original_attrs
     assert routed_config.pretrained_config is config.pretrained_config
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("produces_mxfp8", [False, True])
+def test_ctx_combine_passes_its_explicit_result_to_o_proj(monkeypatch, produces_mxfp8) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: True)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    output = torch.zeros((2, 128), dtype=torch.bfloat16)
+    projected = torch.ones_like(output)
+    layer = Mock(spec_set=["o_proj"])
+    layer.o_proj.quant_method = method
+    layer.o_proj.return_value = projected
+    carrier = MxFp8QuantizedTensor(
+        torch.empty((2, 128), dtype=torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=True,
+    )
+    seen = []
+
+    def core(request):
+        assert isinstance(request, MiniMaxM3BackendForwardArgs)
+        assert request.mxfp8_output and request.mxfp8_skip_bf16
+        assert request.mxfp8_result is None
+        if produces_mxfp8:
+            request.mxfp8_result = carrier
+        seen.append(request)
+        return output
+
+    for _ in range(2):
+        result = MiniMaxM3Attention._core_then_o_proj(layer, core, None, "test")
+        assert result is projected
+        assert layer.o_proj.call_args.args[0] is (carrier if produces_mxfp8 else output)
+    assert seen[0] is not seen[1]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("eager,padded", [(False, False), (True, True)])
+def test_ctx_combine_keeps_compile_and_padded_handoff_tensor_only(
+    monkeypatch, eager, padded
+) -> None:
+    monkeypatch.setattr(modeling_minimaxm3, "ctx_eager_only", lambda: eager)
+    output = torch.zeros((2, 128), dtype=torch.bfloat16)
+    layer = Mock(spec_set=["o_proj"])
+    core = Mock(spec_set=lambda request: None, return_value=output)
+    MiniMaxM3Attention._core_then_o_proj(layer, core, None, "test", padded=padded)
+    core.assert_called_once_with(None)
+    assert layer.o_proj.call_args.args[0] is output
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("padded", [False, True])
+def test_ctx_combine_declines_live_row_mismatch(padded) -> None:
+    metadata = Mock(spec_set=["num_tokens"])
+    metadata.num_tokens = 2
+    output = torch.zeros((4 if padded else 2, 128), dtype=torch.bfloat16)
+    request = MiniMaxM3BackendForwardArgs(mxfp8_output=True, mxfp8_skip_bf16=True)
+    layer = Mock(spec_set=["_dispatch_attention_backend"])
+    _dispatch_attention_over_live_tokens(
+        layer, output, None, None, None, None, metadata, output, request
+    )
+    received = layer._dispatch_attention_backend.call_args.kwargs["mxfp8_output"]
+    assert received is (None if padded else request)
+    assert layer._dispatch_attention_backend.call_args.args[-1].shape[0] == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("has_lora", [False, True])
+def test_ctx_mlp_unwraps_carrier_before_lora_adapter(monkeypatch, has_lora) -> None:
+    hidden = torch.zeros((2, 128), dtype=torch.bfloat16)
+    carrier = MxFp8QuantizedTensor(
+        hidden.to(torch.float8_e4m3fn),
+        torch.empty(512, dtype=torch.uint8),
+        is_sf_swizzled=True,
+        unquantized_hidden_states=hidden,
+    )
+    mlp = modeling_minimaxm3._SwigluOaiMLP.__new__(modeling_minimaxm3._SwigluOaiMLP)
+    nn.Module.__init__(mlp)
+    parent = create_autospec(GatedMLP.forward, spec_set=True, return_value=hidden)
+    monkeypatch.setattr(GatedMLP, "forward", parent)
+    params = {"adapter": object()} if has_lora else None
+    assert mlp(carrier, lora_params=params) is hidden
+    assert parent.call_args.args[0] is mlp
+    assert parent.call_args.args[1] is (hidden if has_lora else carrier)
+    assert parent.call_args.kwargs["lora_params"] is params
+    if has_lora:
+        carrier.unquantized_hidden_states = None
+        with pytest.raises(ValueError, match="no unquantized hidden-state view"):
+            mlp(carrier, lora_params=params)
+        assert parent.call_count == 1

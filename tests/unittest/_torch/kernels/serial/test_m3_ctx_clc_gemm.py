@@ -231,10 +231,10 @@ def gate(name, m, log=print, hpt=None):
 
 
 def dispatch(log=print, name="o_proj"):
-    """MXFP8 Linear through the real loader: engagement, slot, threshold and kill switch."""
+    """MXFP8 Linear through the real loader: engagement, carrier, threshold and kill switch."""
     mod = _dispatch_module()
-    from tensorrt_llm._torch.modules import linear as linear_module
     from tensorrt_llm._torch.modules.linear import Linear, MXFP8LinearMethod
+    from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
     from tensorrt_llm.logger import logger as trt_logger
     from tensorrt_llm.models.modeling_utils import QuantConfig
     from tensorrt_llm.quantization.mode import QuantAlgo
@@ -295,14 +295,17 @@ def dispatch(log=print, name="o_proj"):
         )
         ok &= res
 
-        # The pre-quantized slot is consumed by the CLC path (same act / act_sf as CUTLASS would take).
-        linear_module.set_prequantized_mxfp8(x, act, act_sf)
-        got_slot = lin(x)
-        res = (
-            torch.equal(_bits(got_slot), _bits(want))
-            and linear_module._PREQUANTIZED_MXFP8[0] is None
+        # The CLC path directly consumes the same activation / scales as CUTLASS.
+        carrier = MxFp8QuantizedTensor(
+            act,
+            act_sf,
+            is_sf_swizzled=True,
+            unquantized_hidden_states=x,
+            producer_stream=torch.cuda.current_stream(),
         )
-        log(f"DISPATCH {name} M={m}: prequantized slot {'OK' if res else 'FAIL'}")
+        got_carrier = lin(carrier)
+        res = torch.equal(_bits(got_carrier), _bits(want))
+        log(f"DISPATCH {name} M={m}: prequantized carrier {'OK' if res else 'FAIL'}")
         ok &= res
 
         # Kill switch: the unchanged CUTLASS call, bitwise.

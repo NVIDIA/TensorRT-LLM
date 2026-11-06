@@ -150,6 +150,13 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_fixed_router_refit_preserves_allocation
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_unsupported_fixed_geometry_uses_stock
   - unittest/_torch/modules/test_m3_ctx_clc_dispatch.py
+  - unittest/_torch/attention/fmha/test_msa_combine_mxfp8.py
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_mxfp8_carrier_is_consumed_without_requantization
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_mxfp8_bf16_only_consumer_rejects_an_omitted_view
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_combine_passes_its_explicit_result_to_o_proj
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_combine_keeps_compile_and_padded_handoff_tensor_only
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_combine_declines_live_row_mismatch
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_mlp_unwraps_carrier_before_lora_adapter
   - unittest/_torch/models/test_minimax_m3_drafter_rows.py
   - unittest/_torch/kernels/serial/test_m3_qkv_contract.py
   - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_invalid_arguments_keep_stock_fallback
