@@ -122,8 +122,10 @@ must change before that.
    with it: the run never changes a shared entry, so other models are not disturbed mid-run.
 3. **Prove and deliver:** checks measure fixed-commit snapshots against framework-owned references.
    A verdict counts only on the tree it measured: the same gate-relevant files, native libraries
-   and inputs. Missing engine facts stay unknown. Delivery requires the contract, tests and files
-   to agree.
+   and inputs. Checks run as the work that claims them lands and as the planner asks; once the
+   required work is done, one final round re-runs every claimed check not measured on the final
+   tree, the delivery tier last. Missing engine facts stay unknown. Delivery requires the
+   contract, tests and files to agree.
 4. **Resume:** checkpoints, decision identities and task receipts recover completed work without
    adopting another attempt's answer. Compute sessions own resource allocation and safe cancellation;
    you or the launching agent handle cluster allocations and session renewal.

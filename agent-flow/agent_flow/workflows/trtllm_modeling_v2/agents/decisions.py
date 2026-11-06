@@ -116,7 +116,8 @@ DECISIONS: dict[str, tuple[Decision, ...]] = {
         Decision(
             "DONE",
             "you believe every required check holds",
-            "the orchestrator verifies, and delivers once full support holds",
+            "the orchestrator re-runs each claimed check not measured on the final tree, the "
+            "delivery tier last, and delivers once full support holds",
         ),
         Decision(
             "ESCALATE",

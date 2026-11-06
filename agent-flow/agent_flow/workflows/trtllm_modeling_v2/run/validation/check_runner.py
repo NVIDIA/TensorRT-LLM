@@ -159,8 +159,9 @@ class CheckRunner:
 
         A gate whose job was cancelled through the spool measured nothing either,
         but its session is fine: it raises `_SessionLost` at once, so the check
-        has no verdict (it is missing, not failed) and runs again later, as a
-        re-check, not straight back into the queue it was taken out of.
+        has no verdict (it is missing, not failed) and runs again later, in a
+        `check` task or the final round, not straight back into the queue it was
+        taken out of.
         """
         lost_in_a_row = 0
         while True:
