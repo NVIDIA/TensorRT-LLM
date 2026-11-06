@@ -142,13 +142,28 @@ def test_mixed_decode_matches_decode_only(
         else None
     )
     actual_conv, actual_state = conv.clone(), state.clone()
-    with patch.object(
-        gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
-    ) as prefill_call:
+    # The prefill scan has two entry points (the adapter, and the single-launch direct
+    # path taken with a preallocated output); both run for real, only observed.
+    with (
+        patch.object(
+            gdn_mixer, "chunk_gated_delta_rule", wraps=gdn_mixer.chunk_gated_delta_rule
+        ) as scan_call,
+        patch.object(
+            gdn_mixer,
+            "chunk_gated_delta_rule_indexed_direct",
+            wraps=gdn_mixer.chunk_gated_delta_rule_indexed_direct,
+        ) as direct_call,
+    ):
         actual = layer.forward_extend(actual_conv, actual_state, output=output, **common)
-    # Only the prefill requests go through the prefill kernel.
-    assert prefill_call.call_count == 1
-    assert prefill_call.call_args.kwargs["cu_seqlens"].shape[0] == num_prefills + 1
+    # Only the prefill requests go through the prefill kernel, in a single scan.
+    assert scan_call.call_count + direct_call.call_count == 1
+    scan_cu_seqlens = (
+        scan_call.call_args.kwargs["cu_seqlens"]
+        if scan_call.call_count
+        # (q, k, v, g, beta), output, cu_seqlens, ssm_states, state_indices
+        else direct_call.call_args.args[6]
+    )
+    assert scan_cu_seqlens.shape[0] == num_prefills + 1
 
     torch.testing.assert_close(actual[:, prefill_length:], expected_decode, rtol=0, atol=0)
     torch.testing.assert_close(

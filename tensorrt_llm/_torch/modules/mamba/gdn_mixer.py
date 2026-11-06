@@ -625,6 +625,21 @@ class _GdnPrefillScratch:
 
 
 _gdn_prefill_scratch = _GdnPrefillScratch()
+
+
+def _prefill_scratch() -> _GdnPrefillScratch:
+    """The scratch buffers of the prefill path for the current stream.
+
+    The shared scratch grows on demand and frees the buffer it replaces, so a CUDA
+    graph captured against it would replay on freed memory once a larger one grows
+    the scratch. A capture gets buffers of its own (they live in its memory pool)
+    and otherwise runs the same launches.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return _GdnPrefillScratch()
+    return _gdn_prefill_scratch
+
+
 # TLLM_PWCG_NVTX_PROBE=1 brackets the eager GDN op body in an NVTX range (host attribution).
 _GDN_NVTX_PROBE = os.environ.get("TLLM_PWCG_NVTX_PROBE", "0") == "1"
 
@@ -2239,7 +2254,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
     def _prefill_conv_input(self, mixed_qkv_p: torch.Tensor) -> torch.Tensor:
         """Transposed ``[conv_dim, num_prefill_tokens]`` conv input of the prefill rows."""
         num_tokens, width = mixed_qkv_p.shape
-        out = _gdn_prefill_scratch.conv_input(
+        out = _prefill_scratch().conv_input(
             width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
         )
         return extract_transpose_prefill_slice(
@@ -2260,7 +2275,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         launch, no copy). Returns the ``[conv_dim, tokens]`` conv output view."""
         if self._token_major_conv and mixed_qkv_p.stride(1) == 1:
             num_tokens, width = mixed_qkv_p.shape
-            out = _gdn_prefill_scratch.conv_out(
+            out = _prefill_scratch().conv_out(
                 width, num_tokens, mixed_qkv_p.dtype, mixed_qkv_p.device
             )
             return causal_conv1d_fn(
@@ -2300,8 +2315,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             prefill_t.dtype,
             prefill_t.device,
         )
-        out = _gdn_prefill_scratch.post_conv(*shape)
-        packed = _gdn_prefill_scratch.post_conv_packed(*shape)
+        scratch = _prefill_scratch()
+        out = scratch.post_conv(*shape)
+        packed = scratch.post_conv_packed(*shape)
         q, k, v, g, beta = fused_gdn_post_conv(
             prefill_t,
             decode,
@@ -2338,6 +2354,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         per mixed iteration on the aggregated engine, almost all of it for nothing.
         Managers that expose no all-layer pool keep the per-layer reset.
         """
+        if torch.cuda.is_current_stream_capturing():
+            # A captured graph replays on later iterations, whose host-side gating
+            # (``prefill_needs_state_reset`` / ``state_reset_done``) differs from this
+            # one's: it records its own masked reset, which the device-side
+            # ``has_initial_states`` mask makes a no-op where none is needed.
+            reset_recurrent_state_rows(
+                ssm_states, state_indices_p, has_initial_states_p, conv_states
+            )
+            return
         if not getattr(mamba_metadata, "prefill_needs_state_reset", True):
             return
         if getattr(mamba_metadata, "state_reset_done", False):
