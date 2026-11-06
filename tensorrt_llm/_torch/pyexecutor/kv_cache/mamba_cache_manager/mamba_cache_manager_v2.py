@@ -230,11 +230,6 @@ def _equal_state_slices(capacity: int, num_states: int) -> List[KVCacheDesc]:
     ]
 
 
-def _dtype_name(dtype: torch.dtype) -> str:
-    """A torch element type by name, such as ``"bfloat16"``, as a page layout states it."""
-    return str(dtype).removeprefix("torch.")
-
-
 class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     """Hybrid Mamba cache manager backed by KVCacheManagerV2.
 
@@ -812,11 +807,11 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                             int(dim) * d_conv_m1 * self.conv_state_dtype.itemsize
                             for dim in self.conv_section_dims
                         ),
-                        dtype=_dtype_name(self.conv_state_dtype),
+                        dtype=self.conv_state_dtype,
                     ),
                     MambaRole.SSM_STATE: ByHead(
                         head_bytes=int(head_dim) * int(d_state) * self.ssm_state_dtype.itemsize,
-                        dtype=_dtype_name(self.ssm_state_dtype),
+                        dtype=self.ssm_state_dtype,
                     ),
                 },
             )

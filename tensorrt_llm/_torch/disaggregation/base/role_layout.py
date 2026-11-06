@@ -61,9 +61,9 @@ def _integer(value: int, name: str, minimum: int = 0) -> int:
 
 
 GRID_DIMENSIONS = ("tp", "cp")
-"""Parallel dimensions a layout may split over (``RoleLayout.split``): "tp" the tensor-parallel ranks of
-one attention data-parallel group, "cp" the context-parallel ranks. Pipeline ranks hold other
-layers and data-parallel ranks other requests, so neither splits a page."""
+"""Parallel dimensions a layout may split over (``RoleLayout.split``): "tp" the tensor-parallel
+ranks of one attention data-parallel group, "cp" the context-parallel ranks. Pipeline ranks hold
+other layers and data-parallel ranks other requests, so neither splits a page."""
 
 
 def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
@@ -146,9 +146,9 @@ class RoleLayout:
     each byte of it the destination holds comes from one of the source ranks holding it.
 
     A subclass is one way of laying a role out, a frozen dataclass whose fields are its data,
-    named (``name``) for peers and for ``layout_id``. A new way is one subclass, here or in a
-    model's own module, giving ``pieces`` and ``space``; one of token positions (``positional``),
-    as ``RingSlots``, also gives ``positions``, ``index_of`` and ``stride``. A manager's spec
+    named (``name``) for peers. A new way is one subclass, here or in a model's own module, giving
+    ``pieces`` and ``space``; one of token positions (``positional``), as ``RingSlots``, also
+    gives ``positions``, ``index_of`` and ``stride``. A manager's spec
     (``page_table.PageTableSpec``) names a layout per role; each buffer's is that layout resolved
     from the buffer's facts (``resolve``).
 
@@ -239,8 +239,8 @@ class RoleLayout:
         return {"name": self.name, **_sparse(self)}
 
     def document(self) -> dict:
-        """What ``layout_id`` hashes of the layout: its name and its fields not at their defaults,
-        but the element type."""
+        """The layout apart from its element type, for an identity that names the element type on
+        its own: its name and its fields not at their defaults."""
         fields = _sparse(self)
         fields.pop("dtype", None)
         return {"layout": self.name, **fields}
@@ -260,8 +260,16 @@ def role_layout_from_dict(data: Mapping) -> RoleLayout:
 
 
 def _dtype(layout: RoleLayout) -> None:
+    """Name the layout's element type as torch does, without its module: ``"bfloat16"`` for
+    ``torch.bfloat16``."""
     if layout.dtype is not None:
-        object.__setattr__(layout, "dtype", str(layout.dtype))
+        object.__setattr__(layout, "dtype", str(layout.dtype).removeprefix("torch."))
+
+
+def _typed(layout: RoleLayout, space: tuple) -> tuple:
+    """``space`` with the layout's element type where it states one, so that peers whose elements
+    differ in type lay out different spaces."""
+    return space if layout.dtype is None else (*space, layout.dtype)
 
 
 @dataclass(frozen=True)
@@ -359,7 +367,7 @@ class Sectioned(RoleLayout):
         return tuple(out)
 
     def space(self, size: int, ranks: int) -> tuple:
-        return ("sectioned", tuple(ranks * n for n in self.section_bytes))
+        return _typed(self, ("sectioned", tuple(ranks * n for n in self.section_bytes)))
 
 
 @dataclass(frozen=True)
@@ -377,15 +385,17 @@ class ByHead(RoleLayout):
     In a manager's spec, an attention buffer's heads are by default the layer's KV heads: K of a
     layer of 8 KV heads on TP2 holds 4 heads of ``size // 4`` bytes. A buffer of heads of its own
     states their bytes (``head_bytes``), and for attention their total over all ranks
-    (``total``); recurrent state's total is its heads on this rank times the ranks. A buffer
-    whose heads are unknown, or whose size they do not divide, is this rank's own share
-    (``Own``).
+    (``total``); recurrent state's total is its heads on this rank times the ranks. A spec states
+    the total alone where the layer's KV heads over all ranks are not it, as MLA's one latent head,
+    which every rank holds whole (``total=1``). A buffer whose heads are unknown, or whose size
+    they do not divide, is this rank's own share (``Own``); with a stated total, ``resolve``
+    refuses it (ValueError).
 
     Attributes:
         token_major: Tokens outermost ([token, head, ...], NHD) rather than heads (HND).
         head_bytes: Positive bytes of one head of a page; None in a spec, for the layer's KV heads.
         total: Positive heads over the ranks of the split; None in a spec, for the layer's KV
-            heads or for recurrent state.
+            heads or for recurrent state, or stated where the layer's KV heads are not it.
         tokens: Positive token positions of a page of a token-major layout; resolved from the
             buffer.
         split: Parallel dimensions from ``GRID_DIMENSIONS``, outer to inner; the tensor-parallel
@@ -419,13 +429,19 @@ class ByHead(RoleLayout):
         if head_bytes is None and not site.state:
             kv_heads, kv_total = site.kv_heads
             if kv_heads > 0 and site.size % kv_heads == 0:
-                head_bytes, total = site.size // kv_heads, kv_total
+                head_bytes = site.size // kv_heads
+                total = kv_total if total is None else total
         elif head_bytes is not None and not site.state and total is None:
             raise ValueError(
                 f"heads of {head_bytes} bytes are an attention buffer's own; state how many lie "
                 "over all tensor ranks (total)"
             )
         if head_bytes is None or site.size % head_bytes:
+            if self.total is not None:
+                raise ValueError(
+                    f"a split of {self.total} heads states heads a buffer of {site.size} bytes "
+                    "does not hold whole"
+                )
             return Own(site.split)
         return dataclasses.replace(
             self,
@@ -470,8 +486,10 @@ class ByHead(RoleLayout):
 
     def space(self, size: int, ranks: int) -> tuple:
         if self.token_major:
-            return ("token_major", self.tokens, self.total, self.head_bytes // self.tokens)
-        return ("head_major", self.total, self.head_bytes)
+            space = ("token_major", self.tokens, self.total, self.head_bytes // self.tokens)
+        else:
+            space = ("head_major", self.total, self.head_bytes)
+        return _typed(self, space)
 
     def even(self, ranks: int) -> bool:
         return self.total % ranks == 0 or ranks % self.total == 0
@@ -511,7 +529,7 @@ class RingSlots(RoleLayout):
         return (Piece(0, 0, size // self.slots),)
 
     def space(self, size: int, ranks: int) -> tuple:
-        return ("ring", size // self.slots)
+        return _typed(self, ("ring", size // self.slots))
 
     def positions(self, page: int, end: int, tokens_per_page: int) -> range:
         first = page * tokens_per_page
