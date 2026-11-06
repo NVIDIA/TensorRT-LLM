@@ -175,7 +175,6 @@ add_tllm_kernel_library(
   LINK_LIBRARIES
   tllm::common_cublas
   tllm::kernel_cutlass_headers
-  tllm::runtime_buffers
   tllm::common_environment)
 
 add_tllm_kernel_library(tllm_kernel_quantization SOURCES quantization.cu
