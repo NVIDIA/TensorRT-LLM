@@ -3641,22 +3641,26 @@ def translate_speculators_dspark_config(config_dict: dict) -> dict:
 def dflash_context_attention_window(draft_config: Any) -> Optional[int]:
     """Widest context-attention window over a DFlash/DSpark drafter's layers.
 
-    Layers resolve as in ``DFlashForCausalLM``: the ``dflash_config`` SWA
-    window first, then the HF fields. None when any layer attends to its whole
-    context, or when no layers are declared.
+    Layers resolve as in ``DFlashForCausalLM`` (``dspark_layer_window_size``):
+    the ``dflash_config`` SWA window first, then the HF fields. With the SWA
+    window on, a drafter whose layer types name no sliding layer is windowed on
+    every layer. None when any layer attends to its whole context, or when no
+    layers are declared.
     """
-    from tensorrt_llm._torch.pyexecutor.config_utils import \
-        get_layer_attention_window
+    from tensorrt_llm._torch.pyexecutor.config_utils import (
+        _is_sliding_attention_layer, get_layer_attention_window)
     dflash_cfg = getattr(draft_config, "dflash_config", None) or {}
     swa_window = int(dflash_cfg.get("swa_window_size", 0) or 0)
     use_swa = bool(dflash_cfg.get("use_swa", False)) and swa_window > 0
     layer_types = getattr(draft_config, "layer_types", None)
+    any_sliding = layer_types is not None and any(
+        _is_sliding_attention_layer(layer_type) for layer_type in layer_types)
     num_layers = int(getattr(draft_config, "num_hidden_layers", 0) or 0)
     windows = []
     for layer_idx in range(num_layers):
-        if use_swa and not (layer_types is not None
-                            and layer_idx < len(layer_types)
-                            and layer_types[layer_idx] != "sliding_attention"):
+        if use_swa and not (
+                any_sliding and layer_idx < len(layer_types)
+                and not _is_sliding_attention_layer(layer_types[layer_idx])):
             window = swa_window
         else:
             window = get_layer_attention_window(draft_config, layer_idx)

@@ -241,6 +241,21 @@ class TestWindowResolution:
     def test_plain_dflash_spellings(self, config: dict, expected: Optional[int]) -> None:
         assert dflash_context_attention_window(SimpleNamespace(**config)) == expected
 
+    @pytest.mark.parametrize(
+        "layer_types",
+        [None, [FULL, FULL], [SLIDING, FULL], ["sliding_window", FULL], ["sliding_window"] * 2],
+    )
+    def test_the_dflash_window_matches_the_runtime_layer_rule(self, layer_types) -> None:
+        """With the dflash_config window on, the widest window is the one the block decode applies."""
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            layer_types=layer_types,
+            dflash_config={"use_swa": True, "swa_window_size": 512},
+        )
+        lefts = [dspark_layer_window_size(True, 512, layer_types, i)[0] for i in range(2)]
+        expected = None if min(lefts) < 0 else max(lefts) + 1
+        assert dflash_context_attention_window(config) == expected
+
 
 def _spec(tmp_path: Path, config: Optional[dict] = None, **kwargs: Any) -> DSparkDecodingConfig:
     """A standalone DSpark config whose drafter checkpoint is ``tmp_path``."""
