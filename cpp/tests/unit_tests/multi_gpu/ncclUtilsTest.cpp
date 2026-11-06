@@ -48,6 +48,12 @@ namespace tensorrt_llm::common::nccl_util
 class NCCLWindowAllocatorTestAccess
 {
 public:
+    static NCCLWindowBuffer allocateWithRegistration(
+        NCCLWindowAllocator& allocator, ncclComm_t comm, NCCLWindowAllocator::WindowRegisterFunc registerWindow)
+    {
+        return allocator.allocateAndRegisterBuffer(comm, 1024 * 1024, 0, nullptr, registerWindow);
+    }
+
     static void recordSymmetricFailure(NCCLWindowAllocator& allocator, ncclComm_t comm, size_t size)
     {
         std::lock_guard<std::mutex> lock(allocator.mMutex);
@@ -465,6 +471,52 @@ TEST_F(NCCLWindowAllocatorTest, BasicAllocation)
 
     // Release the buffer
     allocator.releaseBuffer(*mComm, buffer.ptr);
+}
+
+TEST_F(NCCLWindowAllocatorTest, AsymmetricRegistrationFallsBackOnEveryRank)
+{
+    auto& allocator = nccl_util::NCCLWindowAllocator::getInstance();
+    // Both ranks enter real registration; only rank zero reports an unavailable window.
+    // Exercise both an explicit error and NCCL's successful-but-null result.
+    for (bool const nullSuccess : {false, true})
+    {
+        auto const registerWithError = [](ncclComm_t comm, void* ptr, size_t size, ncclWindow_t* window, int flags)
+        {
+            auto const result = ncclCommWindowRegister(comm, ptr, size, window, flags);
+            if (result == ncclSuccess && mpi::MpiComm::world().getRank() == 0)
+            {
+                TLLM_NCCL_CHECK(ncclCommWindowDeregister(comm, *window));
+                *window = nullptr;
+                return ncclSystemError;
+            }
+            return result;
+        };
+        auto const registerWithNull = [](ncclComm_t comm, void* ptr, size_t size, ncclWindow_t* window, int flags)
+        {
+            auto const result = ncclCommWindowRegister(comm, ptr, size, window, flags);
+            if (result == ncclSuccess && mpi::MpiComm::world().getRank() == 0)
+            {
+                TLLM_NCCL_CHECK(ncclCommWindowDeregister(comm, *window));
+                *window = nullptr;
+            }
+            return result;
+        };
+        auto const buffer = nccl_util::NCCLWindowAllocatorTestAccess::allocateWithRegistration(
+            allocator, *mComm, nullSuccess ? +registerWithNull : +registerWithError);
+        EXPECT_FALSE(buffer.isValid());
+        if (buffer.isValid())
+        {
+            TLLM_NCCL_CHECK(ncclCommWindowDeregister(*mComm, buffer.window));
+            TLLM_NCCL_CHECK(ncclMemFree(buffer.ptr));
+        }
+    }
+    // Rollback must leave the communicator usable for a subsequent pooled allocation.
+    auto const buffer = allocator.requestBuffer(*mComm, 1024 * 1024);
+    EXPECT_TRUE(buffer.isValid());
+    if (buffer.isValid())
+    {
+        allocator.releaseBuffer(*mComm, buffer.ptr);
+    }
 }
 
 TEST_F(NCCLWindowAllocatorTest, ExplicitStreamAllocationAndCapture)

@@ -16,7 +16,7 @@ import threading
 import time
 import types
 from contextlib import contextmanager, nullcontext
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 import numpy as np
 import pytest
@@ -115,7 +115,10 @@ def _run_forward_step(executor, batch, new_tensors=None):
         ("release_resources", False),
     ],
 )
-def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_graphs: bool) -> None:
+@pytest.mark.parametrize("cuda_available", [False, True])
+def test_shutdown_graph_lifecycle(
+    shutdown_method: str, releases_model_owned_graphs: bool, cuda_available: bool
+) -> None:
     engine = Mock()
     executor = object.__new__(PyExecutor)
     executor._closed = False
@@ -149,14 +152,52 @@ def test_shutdown_graph_lifecycle(shutdown_method: str, releases_model_owned_gra
     executor.dwdp_manager = None
     executor._profile_manager = Mock()
 
-    with patch("torch.cuda.is_available", return_value=False):
+    lifecycle = Mock()
+    lifecycle.attach_mock(engine, "engine")
+    with (
+        patch("torch.cuda.is_available", return_value=cuda_available),
+        patch("torch.cuda.synchronize") as synchronize,
+    ):
+        lifecycle.attach_mock(synchronize, "synchronize")
         getattr(executor, shutdown_method)()
+
+    expected_calls = [
+        call.engine.release_executor_resources(
+            release_model_owned_graphs=releases_model_owned_graphs
+        ),
+    ]
+    if cuda_available:
+        expected_calls.append(call.synchronize())
+    if releases_model_owned_graphs:
+        expected_calls.append(call.engine.release_communication_resources())
+    assert lifecycle.mock_calls == expected_calls
 
     executor.executor_request_queue.enqueue_shutdown_request.assert_called_once()
     executor._profile_manager.cleanup.assert_called_once()
     engine.release_executor_resources.assert_called_once_with(
         release_model_owned_graphs=releases_model_owned_graphs
     )
+    if releases_model_owned_graphs:
+        assert engine.method_calls == [
+            call.release_executor_resources(release_model_owned_graphs=True),
+            call.release_communication_resources(),
+        ]
+    else:
+        engine.release_communication_resources.assert_not_called()
+        lifecycle.reset_mock()
+        with (
+            patch("torch.cuda.is_available", return_value=cuda_available),
+            patch("torch.cuda.synchronize") as synchronize,
+        ):
+            lifecycle.attach_mock(synchronize, "synchronize")
+            executor.shutdown()
+        expected_calls = [
+            call.engine.release_executor_resources(release_model_owned_graphs=True),
+        ]
+        if cuda_available:
+            expected_calls.append(call.synchronize())
+        expected_calls.append(call.engine.release_communication_resources())
+        assert lifecycle.mock_calls == expected_calls
 
 
 @pytest.mark.parametrize(

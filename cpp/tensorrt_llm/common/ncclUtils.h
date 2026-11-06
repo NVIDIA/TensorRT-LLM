@@ -295,6 +295,9 @@ public:
     // teardown because destructor timing and stream identity are not rank-deterministic.
     void releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId);
 
+    // Explicitly quarantine a raw reservation until communicator teardown. Never makes it reusable.
+    void abandonReservation(ncclComm_t comm, void* ptr, uint64_t leaseId);
+
     // Get the window handle for a specific buffer pointer
     ncclWindow_t getWindow(ncclComm_t comm, void* ptr) const;
 
@@ -327,7 +330,9 @@ private:
     ~NCCLWindowAllocator() = default;
 
     // Allocate a new buffer and register it with NCCL as a window
-    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle, cudaStream_t stream);
+    using WindowRegisterFunc = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
+    NCCLWindowBuffer allocateAndRegisterBuffer(ncclComm_t comm, size_t size, int handle, cudaStream_t stream,
+        WindowRegisterFunc registerWindow = ncclCommWindowRegister);
 
     // Record a failed new symmetric allocation (assumes mMutex is already locked).
     void recordSymmetricFailureLocked(ncclComm_t comm, size_t size);

@@ -21,7 +21,10 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
-from typing import TYPE_CHECKING, Optional
+import time
+from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Iterator, Optional
 
 import torch
 from packaging.version import InvalidVersion, Version
@@ -119,6 +122,9 @@ class _NcclEpGroupTimeoutProxy:
 # hidden, max_top_k, use_internal_fp8_dispatch, layout).
 _ep_group_cache: dict = {}
 _ep_group_refcounts: dict = {}
+# Keep native resources and incomplete MPI requests alive after a shutdown timeout.
+_abandoned_contexts: list = []
+_SHUTDOWN_RENDEZVOUS_SECONDS = 60.0
 
 
 class NcclEpContext:
@@ -201,20 +207,12 @@ class NcclEpContext:
         # a downgraded library, but do not probe a non-public config field.
         self.kernel_resets_recv_topk_idx = nccl_ep_supports_version("0.2")
 
-        # Capability probe for the opportunistic zero-copy dispatch path.
-        # When the Pythonic GroupConfig facade exposes `zero_copy` (i.e.,
-        # the wheel was built against a libnccl_ep.so that has the field
-        # in ncclEpGroupConfig_t), we allocate a VMM-backed,
-        # window-registered dispatch output buffer; the LL dispatch
-        # opportunistically picks zero-copy when recv_x->win_hdl is set
-        # (nvlink-only + rank-major + !fp8). The config flag itself stays
-        # AUTO/OFF -- strict zero_copy=ON requires combine inputs to be
-        # windowed too, which would force a caller-side interface change
-        # (the MLP output is caller-owned). The C-side strict-ON check
-        # remains in the library for future use.
-        self.zerocopy_enabled = not (
-            use_internal_fp8_dispatch or external_fp8 or external_nvfp4
-        ) and "zero_copy" in getattr(GroupConfig, "__dataclass_fields__", {})
+        # NCCL-EP selects direct access to registered windows
+        # or staging for each operation in its default opportunistic mode.
+        # The TRT-LLM window pool still bootstraps its communicator through MPI.
+        self.window_buffers_supported = not mpi_disabled() and "zero_copy" in getattr(
+            GroupConfig, "__dataclass_fields__", {}
+        )
 
         # Ray actors have singleton MPI worlds; bootstrap from their torch EP
         # group. MPI workers and microbenchmarks need no torch process group.
@@ -272,14 +270,7 @@ class NcclEpContext:
         device_id = torch.cuda.current_device()
         device = torch.device("cuda", device_id)
 
-        # Dispatch output tokens: 3D [ep_size, max_tokens_per_rank, hidden]
-        # for LL rank-major. When zerocopy is enabled the buffer must be
-        # VMM-backed (cuMemMap) so ncclCommWindowRegister's internal
-        # cuMemGetAddressRange call succeeds -- torch's caching
-        # allocator returns plain cudaMalloc memory which fails that
-        # check with CUDA_ERROR_INVALID_VALUE. Allocate via
-        # nccl.core.mem_alloc (VMM-backed) then build a zero-copy torch
-        # view over the raw pointer via the TRT-LLM CAI wrapper.
+        # LL rank-major dispatch output: [ep_size, max_tokens_per_rank, token_width].
         token_dtype = torch.float8_e4m3fn if use_internal_fp8_dispatch else torch.bfloat16
         token_width = (
             hidden_size // 2
@@ -289,105 +280,273 @@ class NcclEpContext:
             else hidden_size
         )
         token_shape = (self.ep_size, max_tokens_per_rank, token_width)
-        # The operation-scoped zero-copy path acquires a registered window
-        # from TRT-LLM's NCCL pool in NcclEP.dispatch.  Keep this ordinary
-        # tensor only as the non-window fallback/template.
+        # Receive storage belongs to this context, outside temporary tensor
+        # scopes. Unrelated pool users must never borrow a remote-write target.
         self.output_tokens_buf = torch.empty(
             *token_shape,
             dtype=token_dtype,
             device=device,
         )
-        # Received topk indices: int32 [ep_size, max_tokens_per_rank, max_top_k]
-        # for the LL rank-major dispatch contract. -1 marks invalid rows.
-        # Downstream consumers want 2D [max_recv, max_top_k]; flatten via view.
-        self.recv_topk_idx_buf = torch.empty(
-            self.ep_size,
-            max_tokens_per_rank,
-            max_top_k,
-            dtype=torch.int32,
-            device=device,
+        self._dispatch_reservation = None
+        self.dispatch_window = None
+        # Allocate the PG vote before acquiring a reservation or attempting the
+        # remaining allocations, so reporting an allocation failure needs no new storage.
+        construction_status = (
+            torch.zeros(1, dtype=torch.int32, device=device) if self._ep_mpi_comm is None else None
         )
-        # Received topk weights: float32 [ep_size, max_tokens_per_rank, max_top_k]
-        self.recv_topk_weights_buf = torch.empty(
-            self.ep_size,
-            max_tokens_per_rank,
-            max_top_k,
-            dtype=torch.float32,
-            device=device,
-        )
-        # Per-source-rank received-token counter (passed via
-        # LayoutInfo.src_rank_counters at dispatch time).
-        self.recv_rank_counter_buf = torch.empty(
-            self.ep_size,
-            dtype=torch.int32,
-            device=device,
-        )
-        # DeepSeek FP8 dispatch produces one FP32 scale per 128 logical
-        # elements. LL rank-major outputs mirror the token leading dimensions.
-        self.scales_buf: Optional[torch.Tensor] = None
-        if use_internal_fp8_dispatch:
-            if hidden_size % 512 != 0:
-                raise ValueError(f"FP8 dispatch requires hidden % 512 == 0, got {hidden_size}")
-            self.scales_buf = torch.empty(
-                self.ep_size,
-                max_tokens_per_rank,
-                hidden_size // 128,
-                dtype=torch.float32,
-                device=device,
-            )
-        elif external_nvfp4:
-            self.scales_buf = torch.empty(
-                self.ep_size,
-                max_tokens_per_rank,
-                hidden_size // 16,
-                dtype=torch.uint8,
-                device=device,
-            )
+        with ExitStack() as rollback:
+            # A failed constructor never transfers ownership to the context
+            # cache. Retain and quarantine any acquired remote-write target.
+            rollback.callback(self._abandon_shutdown)
+            if self.window_buffers_supported:
+                self._reserve_dispatch_tokens()
+            with self._construction_rendezvous(construction_status):
+                # Received topk indices: int32 [ep_size, max_tokens_per_rank, max_top_k]
+                # for the LL rank-major dispatch contract. -1 marks invalid rows.
+                # Downstream consumers want 2D [max_recv, max_top_k]; flatten via view.
+                self.recv_topk_idx_buf = torch.empty(
+                    self.ep_size,
+                    max_tokens_per_rank,
+                    max_top_k,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                # Received topk weights: float32 [ep_size, max_tokens_per_rank, max_top_k]
+                self.recv_topk_weights_buf = torch.empty(
+                    self.ep_size,
+                    max_tokens_per_rank,
+                    max_top_k,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                # Per-source-rank received-token counter (passed via
+                # LayoutInfo.src_rank_counters at dispatch time).
+                self.recv_rank_counter_buf = torch.empty(
+                    self.ep_size,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                # DeepSeek FP8 dispatch produces one FP32 scale per 128 logical
+                # elements. LL rank-major outputs mirror the token leading dimensions.
+                self.scales_buf: Optional[torch.Tensor] = None
+                if use_internal_fp8_dispatch:
+                    if hidden_size % 512 != 0:
+                        raise ValueError(
+                            f"FP8 dispatch requires hidden % 512 == 0, got {hidden_size}"
+                        )
+                    self.scales_buf = torch.empty(
+                        self.ep_size,
+                        max_tokens_per_rank,
+                        hidden_size // 128,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                elif external_nvfp4:
+                    self.scales_buf = torch.empty(
+                        self.ep_size,
+                        max_tokens_per_rank,
+                        hidden_size // 16,
+                        dtype=torch.uint8,
+                        device=device,
+                    )
 
-        # Wrap each persistent buffer as a Tensor descriptor. Torch owns the
-        # storage; the descriptor only carries shape + a pointer (+ window
-        # handle on dispatch output when zerocopy is on, so libnccl_ep's
-        # opportunistic LL zero-copy path can fire).
-        self.output_tokens_nd = Tensor(self.output_tokens_buf)
-        self.recv_topk_idx_nd = Tensor(self.recv_topk_idx_buf)
-        self.recv_topk_weights_nd = Tensor(self.recv_topk_weights_buf)
-        self.recv_rank_counter_nd = Tensor(self.recv_rank_counter_buf)
-        self.scales_nd: Optional[Tensor] = (
-            Tensor(self.scales_buf) if self.scales_buf is not None else None
-        )
+                self.output_tokens_nd = (
+                    Tensor(self.output_tokens_buf, window=self.dispatch_window, window_offset=0)
+                    if self.dispatch_window is not None
+                    else Tensor(self.output_tokens_buf)
+                )
+                self.recv_topk_idx_nd = Tensor(self.recv_topk_idx_buf)
+                self.recv_topk_weights_nd = Tensor(self.recv_topk_weights_buf)
+                self.recv_rank_counter_nd = Tensor(self.recv_rank_counter_buf)
+                self.scales_nd: Optional[Tensor] = (
+                    Tensor(self.scales_buf) if self.scales_buf is not None else None
+                )
 
-        # These describe context-owned, fixed-address receive buffers and
-        # immutable dispatch policy. Constructing them once keeps the eager
-        # dispatch hot path to dynamic input descriptors plus handle update/
-        # dispatch. The compatibility fallback remains the only path that
-        # launches a pre-dispatch torch fill kernel.
-        from nccl.ep import DispatchQuantizationRecipe
+                # These describe context-owned, fixed-address receive buffers and
+                # immutable dispatch policy. Constructing them once keeps the eager
+                # dispatch hot path to dynamic input descriptors plus handle update/
+                # dispatch. The compatibility fallback remains the only path that
+                # launches a pre-dispatch torch fill kernel.
+                from nccl.ep import DispatchQuantizationRecipe
 
-        self.dispatch_config = DispatchConfig(
-            round_scales=0,
-            quantization_recipe=(
-                DispatchQuantizationRecipe.DS_FP8E3M4
-                if use_internal_fp8_dispatch
-                else DispatchQuantizationRecipe.FWD
-                if external_nvfp4
-                else DispatchQuantizationRecipe.NONE
-            ),
+                self.dispatch_config = DispatchConfig(
+                    round_scales=0,
+                    quantization_recipe=(
+                        DispatchQuantizationRecipe.DS_FP8E3M4
+                        if use_internal_fp8_dispatch
+                        else DispatchQuantizationRecipe.FWD
+                        if external_nvfp4
+                        else DispatchQuantizationRecipe.NONE
+                    ),
+                )
+                self.dispatch_outputs = DispatchOutputs(
+                    tokens=self.output_tokens_nd,
+                    topk_weights=self.recv_topk_weights_nd,
+                    topk_idx=self.recv_topk_idx_nd,
+                    scales=self.scales_nd,
+                )
+                self.dispatch_layout_info = LayoutInfo(src_rank_counters=self.recv_rank_counter_nd)
+                if self._expert_id_kind_global is not None:
+                    self.dispatch_layout_info._lowpp.recv_topk_idx_kind = (
+                        self._expert_id_kind_global
+                    )
+            rollback.pop_all()
+
+    @contextmanager
+    def _construction_rendezvous(self, status: Optional[torch.Tensor]) -> Iterator[None]:
+        """Agree on local initialization success before any rank exposes its context.
+
+        Reservation setup has already completed on all ranks. Failures inside
+        earlier collectives still require the launcher's distributed error handling.
+        """
+        errors = (RuntimeError, OSError)
+        if self._ep_mpi_comm is not None:
+            from mpi4py import MPI
+
+            errors += (MPI.Exception,)
+        succeeded = False
+        try:
+            yield
+            succeeded = True
+        finally:
+            try:
+                if self._ep_mpi_comm is not None:
+                    failed = self._ep_mpi_comm.allreduce(int(not succeeded)) != 0
+                else:
+                    assert status is not None
+                    status.fill_(int(not succeeded))
+                    torch.distributed.all_reduce(
+                        status,
+                        op=torch.distributed.ReduceOp.MAX,
+                        group=self.mapping.moe_ep_group_pg,
+                    )
+                    failed = bool(status.item())
+            except errors as exc:
+                if succeeded:
+                    raise
+                # Keep the local construction exception as the primary error.
+                # The outer rollback guard remains armed if this exchange fails.
+                logger.warning(f"NCCL EP construction status exchange failed: {exc}")
+            else:
+                if succeeded and failed:
+                    raise RuntimeError("NCCL EP context construction failed on a peer rank")
+
+    def _reserve_dispatch_tokens(self) -> None:
+        """Reserve registered pool storage for this context's complete lifetime."""
+        self._dispatch_reservation = torch.classes.trtllm.NCCLWindowReservation(
+            self.output_tokens_buf, self.mapping.moe_ep_group
         )
-        self.dispatch_outputs = DispatchOutputs(
-            tokens=self.output_tokens_nd,
-            topk_weights=self.recv_topk_weights_nd,
-            topk_idx=self.recv_topk_idx_nd,
-            scales=self.scales_nd,
-        )
-        self.dispatch_layout_info = LayoutInfo(src_rank_counters=self.recv_rank_counter_nd)
-        if self._expert_id_kind_global is not None:
-            self.dispatch_layout_info._lowpp.recv_topk_idx_kind = self._expert_id_kind_global
+        handle = self._dispatch_reservation.window()
+        if self.window_buffers_supported:
+            # All ranks must rendezvous even if registration fell back locally.
+            # A pool checkout can have prior unrelated users. Local stream order
+            # is insufficient before peers start writing into this destination.
+            torch.cuda.synchronize(self.output_tokens_buf.device)
+            if self._ep_mpi_comm is not None:
+                self._ep_mpi_comm.Barrier()
+            else:
+                torch.distributed.barrier(group=self.mapping.moe_ep_group_pg)
+        if handle:
+            self.output_tokens_buf = self._dispatch_reservation.tensor()
+            self.dispatch_window = SimpleNamespace(handle=handle)
 
     def get_stream(self) -> int:
         """Current CUDA stream as a raw int handle (accepted by ``nccl.ep`` APIs)."""
         return torch.cuda.current_stream().cuda_stream
 
-    def destroy(self):
+    def _abandon_shutdown(self) -> None:
+        """Retain remote targets and pending rendezvous until process exit."""
+        if getattr(self, "_abandoned", False):
+            return
+        self._abandoned = True
+        _abandoned_contexts.append(self)
+        # MPI collective requests cannot be cancelled or freed. Torch work and
+        # its process group must also remain alive while a collective is pending.
+        # Quarantine the reservation instead of returning it to the pool.
+        if self._dispatch_reservation is not None:
+            self._dispatch_reservation.abandon()
+        if self.ep_group is not None:
+            unregister_moe_comm_timeout_proxy(self._timeout_proxy)
+
+    def _prepare_shutdown(self) -> bool:
+        """Drain a terminal context and rendezvous before destroying any handles.
+
+        All EP ranks must call destroy, after retiring graphs and stopping new
+        submissions. The timeouts mitigate missing callers; they do not replace
+        that collective contract or bound CUDA/native teardown.
+        """
+        if getattr(self, "_abandoned", False):
+            return False
+        if getattr(self, "_shutdown_ready", False):
+            return True
+        self._shutdown_started = True
+        try:
+            torch.cuda.synchronize(self.output_tokens_buf.device)
+        except _NCCL_RUNTIME_ERRORS as exc:
+            self._abandon_shutdown()
+            logger.warning(
+                f"NCCL EP device drain failed: {exc}; retaining resources until process exit."
+            )
+            return False
+        # A late rank can complete phase 1 using a timed-out rank's outstanding
+        # request. Phase 2 excludes ranks that abandoned phase 1. Generous
+        # deadlines tolerate ordinary skew. This is not fault-tolerant agreement:
+        # a rank delayed past phase 2's deadline can still leave peers blocked in
+        # native collective destruction. Callers must honor collective teardown.
+        uses_mpi = self._ep_mpi_comm is not None
+        errors = _NCCL_RUNTIME_ERRORS
+        if uses_mpi:
+            from mpi4py import MPI
+
+            errors += (MPI.Exception,)
+        if not uses_mpi:
+            # Retain the exact EP process group, including on timeout. Ray's
+            # singleton MPI communicator cannot rendezvous with its EP peers.
+            self._shutdown_group = self.mapping.moe_ep_group_pg
+        for phase in (1, 2):
+            try:
+                if uses_mpi:
+                    self._shutdown_request = self._ep_mpi_comm.Ibarrier()
+                    is_completed = self._shutdown_request.Test
+                else:
+                    self._shutdown_request = torch.distributed.barrier(
+                        group=self._shutdown_group, async_op=True
+                    )
+                    is_completed = self._shutdown_request.is_completed
+                deadline = time.monotonic() + _SHUTDOWN_RENDEZVOUS_SECONDS
+                while not is_completed():
+                    if time.monotonic() >= deadline:
+                        self._abandon_shutdown()
+                        logger.warning(
+                            f"NCCL EP shutdown rendezvous phase {phase} timed out; "
+                            "retaining resources until process exit. Restart workers before reusing EP."
+                        )
+                        return False
+                    time.sleep(0.01)
+                if not uses_mpi:
+                    # Completed work can carry a backend error. Check it before
+                    # treating this phase as proof of peer quiescence.
+                    self._shutdown_request.wait()
+            except errors as exc:
+                self._abandon_shutdown()
+                logger.warning(
+                    f"NCCL EP shutdown rendezvous phase {phase} failed: {exc}; "
+                    "retaining resources until process exit. Restart workers before reusing EP."
+                )
+                return False
+            self._shutdown_request = None
+        self._shutdown_ready = True
+        return True
+
+    def destroy(self) -> None:
+        """Collectively retire the context, quarantining resources on cleanup failure."""
+        try:
+            self._destroy()
+        except _NCCL_RUNTIME_ERRORS:
+            self._abandon_shutdown()
+            raise
+
+    def _destroy(self) -> None:
         """Release EP group, NCCL comm, and MPI sub-comm in LIFO order.
 
         Avoids relying on Python GC ordering between the group, the comm it
@@ -395,30 +554,21 @@ class NcclEpContext:
         first (uses the comm), then ``finalize`` + ``destroy`` on the comm
         (the recommended nccl4py pattern), then ``Free`` on the MPI comm.
         """
+        if getattr(self, "_destroyed", False) or not self._prepare_shutdown():
+            return
         if self.ep_group is not None:
             unregister_moe_comm_timeout_proxy(self._timeout_proxy)
-            try:
-                self.ep_group.destroy()
-            except _NCCL_RUNTIME_ERRORS as e:
-                logger.warning(f"NCCL EP group destroy error: {e}")
+            self.ep_group.destroy()
             self.ep_group = None
 
-        # Deregister windows before the comm goes away. close() is
-        # idempotent and local; the comm would auto-close any leftover
-        # windows on destroy, but explicit LIFO release matches the rest
-        # of this teardown path. Both dispatch-output and combine-input
-        # windows are registered only when zerocopy is on.
-        for attr in ("_combine_input_window",):
-            w = getattr(self, attr, None)
-            if w is not None:
-                try:
-                    w.close()
-                except _NCCL_RUNTIME_ERRORS as e:
-                    logger.warning(f"NCCL EP window close error ({attr}): {e}")
-                setattr(self, attr, None)
-
+        if self.dispatch_window is not None:
+            self.dispatch_window = None
+        if self._dispatch_reservation is not None:
+            self._dispatch_reservation.release()
+        self.dispatch_outputs = None
         self.output_tokens_nd = None
         self.output_tokens_buf = None
+        self._dispatch_reservation = None
 
         if self.comm is not None:
             try:
@@ -436,6 +586,7 @@ class NcclEpContext:
             except MPI.Exception as e:
                 logger.warning(f"EP MPI sub-comm free error: {e}")
             self._ep_mpi_comm = None
+        self._destroyed = True
 
 
 def get_nccl_ep_context(
@@ -450,6 +601,8 @@ def get_nccl_ep_context(
     external_nvfp4: bool = False,
 ) -> NcclEpContext:
     """Get or create a singleton :class:`NcclEpContext` for the given configuration."""
+    if _abandoned_contexts:
+        raise RuntimeError("NCCL EP shutdown was abandoned; restart workers before reusing EP.")
     from nccl.ep import Layout
 
     if layout is None:
@@ -478,6 +631,8 @@ def get_nccl_ep_context(
             external_fp8,
             external_nvfp4,
         )
+    if getattr(_ep_group_cache[key], "_shutdown_started", False):
+        raise RuntimeError("NCCL EP context is shutting down and cannot acquire more users.")
     _ep_group_refcounts[key] = _ep_group_refcounts.get(key, 0) + 1
     return _ep_group_cache[key]
 

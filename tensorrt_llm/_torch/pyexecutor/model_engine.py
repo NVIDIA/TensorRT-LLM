@@ -1046,6 +1046,20 @@ class ModelEngine:
             self.max_num_tokens, max_seq_len=self.max_seq_len, max_batch_size=self.batch_size
         )
 
+    def release_communication_resources(self) -> None:
+        """Release opted-in communications after graphs and GPU work drain on all ranks."""
+        from tensorrt_llm._torch.moe.fused_moe.communication.base import Communication
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return
+        released = set()
+        for module in model.modules():
+            comm = getattr(module, "comm", None)
+            if isinstance(comm, Communication) and id(comm) not in released:
+                comm.release_executor_resources()
+                released.add(id(comm))
+
     def _release_model_owned_cuda_graphs(
         self,
         *,

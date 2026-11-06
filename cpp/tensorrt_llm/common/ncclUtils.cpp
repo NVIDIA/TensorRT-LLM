@@ -58,13 +58,16 @@ struct CudaMallocGuard
     CudaMallocGuard& operator=(CudaMallocGuard const&) = delete;
 };
 
-// RAII guard for ncclMemAlloc. Frees the pointer on destruction, logging a warning on failure.
+// Roll back a window before freeing its allocation; failed deregistration retains the storage.
 struct NcclMemGuard
 {
     void* ptr{nullptr};
+    ncclComm_t comm;
+    ncclWindow_t window{nullptr};
 
-    explicit NcclMemGuard(void* p) noexcept
+    NcclMemGuard(void* p, ncclComm_t c) noexcept
         : ptr(p)
+        , comm(c)
     {
     }
 
@@ -72,6 +75,16 @@ struct NcclMemGuard
     {
         if (ptr)
         {
+            if (window)
+            {
+                auto const result = ncclCommWindowDeregister(comm, window);
+                TLLM_NCCL_CHECK_WARN(result);
+                if (result != ncclSuccess)
+                {
+                    TLLM_LOG_WARNING("[NCCLUtil] Retaining allocation after failed window rollback.");
+                    return;
+                }
+            }
             TLLM_NCCL_CHECK_WARN(ncclMemFree(ptr));
         }
     }
@@ -994,10 +1007,16 @@ void NCCLWindowAllocator::quarantineTensorLeaseLocked(TensorLease const& tensorL
             entry.graphPoolOwner.reset();
             entry.releaseOwnerWhenUnused = false;
         }
-        TLLM_LOG_DEBUG("[NCCLUtil] Quarantining NCCL window lease %llu on comm %p after a failed tensor lease scope.",
+        TLLM_LOG_DEBUG("[NCCLUtil] Quarantining NCCL window lease %llu on comm %p.",
             static_cast<unsigned long long>(tensorLease.leaseId), static_cast<void*>(tensorLease.comm));
         return;
     }
+}
+
+void NCCLWindowAllocator::abandonReservation(ncclComm_t comm, void* ptr, uint64_t leaseId)
+{
+    std::lock_guard<std::mutex> lock(mMutex);
+    quarantineTensorLeaseLocked(TensorLease{comm, ptr, leaseId});
 }
 
 void NCCLWindowAllocator::releaseBufferFromDestructor(ncclComm_t comm, void* ptr, uint64_t leaseId)
@@ -1136,7 +1155,7 @@ bool NCCLWindowAllocator::isCommValid(ncclComm_t comm) const noexcept
 }
 
 NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
-    ncclComm_t comm, size_t size, int handle, cudaStream_t stream)
+    ncclComm_t comm, size_t size, int handle, cudaStream_t stream, WindowRegisterFunc registerWindow)
 {
     // Step 1: Pre-allocate the rank-sync flag before ncclMemAlloc. ncclMemAlloc can fail
     // asymmetrically with ncclUnhandledCudaError on configurations where the symmetric/VMM path
@@ -1156,7 +1175,7 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
     void* ncclPtr = nullptr;
     TLLM_NCCL_CHECK_WARN(ncclMemAlloc(&ncclPtr, size));
     int const localAllocOk = (ncclPtr != nullptr) ? 1 : 0;
-    NcclMemGuard ncclGuard{ncclPtr}; // frees ncclPtr on any early return or exception
+    NcclMemGuard ncclGuard{ncclPtr, comm}; // frees ncclPtr on any early return or exception
     clearCudaErrorIfSymmetricAllocationFailed(localAllocOk);
 
     // Step 3: ncclCommWindowRegister is collective. If any rank skips it, all other ranks hang.
@@ -1189,12 +1208,30 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(
 
     // Step 4: Register with NCCL as a window. This is collective, so all ranks must reach it.
     // Failure here is non-fatal: warn and fall back to regular allreduce.
-    // ncclGuard frees ncclPtr on return.
+    // Initialize the vote before registration can leave a CUDA error behind.
+    TLLM_CUDA_CHECK(cudaMemsetAsync(rankSyncFlag, 0, sizeof(int), stream));
     ncclWindow_t window = nullptr;
-    ncclResult_t const regResult = ncclCommWindowRegister(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
+    ncclResult_t const regResult = registerWindow(comm, ncclPtr, size, &window, NCCL_WIN_COLL_SYMMETRIC);
+    ncclGuard.window = window;
     TLLM_NCCL_CHECK_WARN(regResult);
-    if (regResult != ncclSuccess)
+    int const localRegisterOk = (regResult == ncclSuccess && window != nullptr) ? 1 : 0;
+    // A collective registration call does not establish identical local outcomes.
+    // Agree before adding any buffer to the pool, including success with a null window.
+    clearCudaErrorIfSymmetricAllocationFailed(localRegisterOk);
+    if (localRegisterOk)
     {
+        TLLM_CUDA_CHECK_WARN(
+            cudaMemcpyAsync(rankSyncFlag, &localRegisterOk, sizeof(int), cudaMemcpyHostToDevice, stream));
+    }
+    TLLM_NCCL_CHECK(ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream));
+    TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+    int allRegisterOk = 0;
+    TLLM_CUDA_CHECK(cudaMemcpy(&allRegisterOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost));
+    if (!allRegisterOk)
+    {
+        // No caller has seen these windows. Local deregistration rolls back the
+        // successful registrations before their allocations are freed by ncclGuard.
+        TLLM_LOG_WARNING("[NCCLUtil] Window registration unavailable on at least one rank; falling back on all ranks.");
         return NCCLWindowBuffer{};
     }
 
