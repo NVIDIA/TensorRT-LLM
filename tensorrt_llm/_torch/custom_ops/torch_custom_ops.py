@@ -2242,11 +2242,13 @@ class fp8SwapABGemmRunner(TunableRunner):
     # and inference falls back to a slower uncompiled path.
     # `exclude_from_cache=True` keeps the in-process cache working but
     # ensures the tuning (and the JIT warmup it triggers) repeats on
-    # every process startup.
+    # every process startup. `share_jit_builds=True` lets the ranks split
+    # those builds when they share DeepGEMM's (TLLM_DEEP_GEMM_JIT_SHARE_DIR).
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, deep_gemm_jit_warmup_buckets), ),
         exclude_from_cache=True,
+        share_jit_builds=True,
     )
 
     def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
@@ -2302,6 +2304,7 @@ class Fp8PrequantizedSwapABGemmRunner(TunableRunner):
         constraint_specs=(ConstraintSpec(
             1, 0, lambda input_shapes: input_shapes[0][0]), ),
         exclude_from_cache=True,
+        share_jit_builds=True,
     )
 
     def __init__(self, output_dtype: torch.dtype,
