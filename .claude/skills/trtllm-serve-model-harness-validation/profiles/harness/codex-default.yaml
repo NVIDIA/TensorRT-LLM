@@ -1,0 +1,59 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Harness profile: codex-cli with its default configuration, pointed at trtllm-serve through a
+# custom model provider. Derived from contracts/codex-default.md. Validator-owned.
+schema: trtllm-serve-model-harness-validation/harness-profile@1
+id: codex-default
+harness: codex
+version: codex-cli 0.155.1
+configuration: default (model_providers.trtllm, wire_api=responses)
+contract: contracts/codex-default.md
+status: measured            # captured against the fake server; re-measure on upgrade
+protocol: responses
+routes:
+  - {method: POST, path: /v1/responses, stream: always}
+
+identity:
+  session: {body: prompt_cache_key}
+  thread: {body: client_metadata.thread_id}
+
+tools:
+  declared_in: [tools]                      # top-level JSON functions
+  namespaces: true                          # multi_agent_v1.*
+  custom_tools: false
+  known: [exec_command, write_stdin, request_user_input, view_image, get_goal, create_goal,
+          update_goal, web_search]
+  nested: null
+  tolerated_payload: [additionalProperties]  # an argument a tool does not declare: codex-rs ignores it
+                                            # (exec_command: no deny_unknown_fields) and runs the call; a
+                                            # tool that denies unknown fields fails to parse it, which H-01
+                                            # counts as arguments_rejected. An extra argument the harness
+                                            # ignores is not serving's to control, so not rated in M-01
+parallel_tool_calls: true                   # sent as true: nothing to enforce
+
+outcomes:                                   # codex-rs's own strings, whatever the configuration
+  aborted: {exact: aborted}
+  unsupported: {prefix: "unsupported call:"}
+  arguments_rejected: {prefix: "failed to parse function arguments"}
+  unavailable_in_mode: {regex: 'is unavailable in (\w+) mode'}
+
+errors:
+  overlength: {shape: in_stream, event: response.failed, code: context_length_exceeded}
+
+timeouts:
+  first_event_s: 120
+  idle_s: 120
+
+echo:
+  text: exact                 # measured (codex-cli 0.155.1, contracts/codex-default.md): a reply's text
+  reasoning: exact            # and reasoning items come back unchanged in the next request
+
+reasoning:
+  carrier: encrypted_content
+  request: {reasoning: {summary: auto}}
+
+stream:
+  records_items_on: response.output_item.done
+
+compaction:
+  trigger: model_context_window (set it to the served window), or in-stream context_length_exceeded
