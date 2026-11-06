@@ -378,7 +378,9 @@ def test_generation_capture_passes_local_speculation_state(fails: bool) -> None:
 def test_generation_capture_runs_one_pass_per_kv_regime() -> None:
     runner = decoder_graphs(
         decoder_config(max_seq_len=20000),
-        cuda_graph_runner=Mock(enabled=True, is_warmup_only=False),
+        cuda_graph_runner=Mock(
+            enabled=True, is_warmup_only=False, short_long_seq_len_threshold=None
+        ),
     )
     resource_manager = Mock()
     warmup_lengths = []

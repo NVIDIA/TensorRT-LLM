@@ -883,8 +883,9 @@ class DecoderCudaGraphs:
         else:
             max_seq_len_list = [effective_max_seq_len]
 
+        # Without a resolver (every decode but the FP4 MLA 4x one) the capture
+        # leaves the graph runner's KV-regime state alone.
         kv_regime_resolver = self._kv_regime_resolver(resource_manager)
-        self.cuda_graph_runner.set_kv_regime_resolver(kv_regime_resolver)
 
         def _length_passes(bs: int, draft_len: int) -> list[tuple[int, int | None]]:
             """(warm-up length, KV regime) passes of one graph shape."""
@@ -893,6 +894,7 @@ class DecoderCudaGraphs:
             return _kv_regime_length_passes(max_seq_len_list, kv_regime_resolver(bs, draft_len))
 
         if kv_regime_resolver is not None:
+            self.cuda_graph_runner.set_kv_regime_resolver(kv_regime_resolver)
             shapes = sorted(
                 {
                     entry[:2]
@@ -930,7 +932,8 @@ class DecoderCudaGraphs:
                         continue
 
                     for max_seq_len, kv_regime in _length_passes(bs, draft_len):
-                        self.cuda_graph_runner.set_capture_kv_regime(kv_regime)
+                        if kv_regime_resolver is not None:
+                            self.cuda_graph_runner.set_capture_kv_regime(kv_regime)
                         warmup_request = self._dummy_requests.create_cuda_graph_warmup_request(
                             resource_manager,
                             bs,
@@ -986,7 +989,8 @@ class DecoderCudaGraphs:
             finally:
                 self._force_lora_graph_for_capture = None
                 self.cuda_graph_runner.set_capture_sample_type(None)
-                self.cuda_graph_runner.set_capture_kv_regime(None)
+                if kv_regime_resolver is not None:
+                    self.cuda_graph_runner.set_capture_kv_regime(None)
                 if self._inputs is not None and self._inputs._dspark_confidence_enabled:
                     self.cuda_graph_runner.agreed_ragged_bucket = None
 

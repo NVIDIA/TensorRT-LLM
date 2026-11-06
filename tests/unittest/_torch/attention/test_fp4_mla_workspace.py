@@ -9,6 +9,11 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_4x_plan as plan4x
 from tensorrt_llm._torch.attention.backends.fp4_mla import layout, packed_plan
+from tensorrt_llm._torch.attention.backends.fp4_mla.config import (
+    FP4_MLA_ATTENTION_BACKEND_ENV,
+    FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV,
+    FP4_MLA_PACKED_Q_ENV,
+)
 
 CPU = torch.device("cpu")
 
@@ -288,8 +293,12 @@ def test_unshared_capacity_is_the_per_state_entry(pool):
 
 @pytest.mark.parametrize("max_requests", [64, 128, 256, 576])
 def test_packed_split_scratch_bound_covers_every_query_width(monkeypatch, max_requests):
-    monkeypatch.setenv("TRTLLM_FP4_MLA_PACKED_Q", "1")
+    # Packed Q needs the CuTe DSL backend, the default on SM107 only.
+    monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "cutedsl")
+    monkeypatch.delenv(FP4_MLA_CUTEDSL_FUSED_V_TRANSPOSE_ENV, raising=False)
+    monkeypatch.setenv(FP4_MLA_PACKED_Q_ENV, "1")
     monkeypatch.delenv(packed_plan._FP4_MLA_SPLIT_KV_ENV, raising=False)
+    assert all(packed_plan._fp4_mla_packed_rows_per_seq(128, q) > 0 for q in (1, 2, 3, 4))
     monkeypatch.setattr(packed_plan, "_get_sm_count", lambda device: 212)
     meta = SimpleNamespace(max_num_sequences=max_requests, max_total_draft_tokens=3)
     slots, slot_rows = packed_plan.packed_split_scratch_bound(
