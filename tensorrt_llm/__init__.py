@@ -42,6 +42,8 @@ from typing import TYPE_CHECKING
 # ImportError: libc10.so: cannot open shared object file: No such file or directory
 import torch  # noqa
 
+# Initialize process-start custom region selection.
+from . import _profiler  # noqa: E402
 from .logger import logger
 from .version import __version__
 
