@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
+from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.connectors.kv_cache_connector import (
     AsyncRequests,
     KvCacheConnectorManager,
@@ -80,10 +81,30 @@ def _manager(rank: int = 1) -> KvCacheConnectorManager:
 def _configure_recovery_controls(executor: "PyExecutor") -> None:
     from tensorrt_llm._torch.pyexecutor.executor_request_queue import ExecutorRequestQueue
 
-    executor.dist = MagicMock(tp_size=1, cp_size=1, pp_size=1)
+    executor._closed = False
+    executor._resources_released = False
+    executor.worker_started = True
+    executor.dist = MagicMock(
+        spec_set=Distributed,
+        tp_size=1,
+        cp_size=1,
+        pp_size=1,
+        tp_rank=0,
+        rank=0,
+        cp_rank=0,
+        has_cp_helix=False,
+        has_pp=False,
+        cp_config={},
+    )
+    executor.dist.tp_cp_allgather_int64.side_effect = partial(
+        Distributed.tp_cp_allgather_int64, executor.dist
+    )
     executor.enable_attention_dp = True
     executor.enable_early_first_token_response = False
+    executor.gather_all_responses = False
     executor.kv_connector_manager = None
+    executor.kv_cache_transceiver = None
+    executor.dwdp_manager = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
     executor._kv_cache_capacity = {}
@@ -93,6 +114,8 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.hang_detector = MagicMock()
     executor.hang_detector.detected.return_value = False
     executor._profile_manager = MagicMock()
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
+    executor.draft_model_engine = None
     executor.sampler = None
     executor.worker_thread = MagicMock()
     executor._shutdown_sleep_wakeup_listeners = MagicMock()
@@ -414,6 +437,7 @@ def test_batch_start_combines_readiness_with_status(batch_sizes: tuple[int, int]
         _configure_recovery_controls(executor)
         executor.kv_connector_manager = _manager(rank)
         executor.dist.tp_size = 2
+        executor.dist.tp_rank = executor.dist.rank = rank
         executor.dist.tp_allgather_int64.side_effect = partial(collective.gather_int64, rank)
         executors.append(executor)
 
@@ -632,7 +656,6 @@ def test_shutdown_drains_save_before_loop_exit(
         executor._profiler = lambda: nullcontext(MagicMock())
         executor.hang_detector = MagicMock()
         executor.hang_detector.detected.return_value = False
-        executor._disagg_coordinator = MagicMock()
         executor._poll_encoder_steps = MagicMock()
         executor._wait_for_model_engine_input_copy = MagicMock()
         executor._flush_pending_transfer_responses = MagicMock()
@@ -646,6 +669,7 @@ def test_shutdown_drains_save_before_loop_exit(
         executor.virtual_memory_pools = {}
         executor.sampler = None
         executor.dwdp_manager = None
+        executor.dense_dwdp_manager = None
         executor.resource_manager = MagicMock()
         resource = MagicMock()
         executor.resource_manager.resource_managers = {"kv": resource}
@@ -1214,8 +1238,8 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.request_broadcaster = MagicMock()
-        executor.request_broadcaster.broadcast.return_value = ([], {})
-        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor.request_broadcaster.broadcast.return_value = []
+        executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor.executor_request_queue.get_from_request_queue = MagicMock(return_value=[])
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
@@ -1364,7 +1388,7 @@ def test_control_drain_keeps_owner_collectives_aligned(loading_rank: int) -> Non
         executor.waiting_queue = MagicMock()
         executor.waiting_queue.__len__.return_value = 0
         executor.enable_iter_perf_stats = False
-        executor._pop_from_waiting_queue = MagicMock(return_value=[])
+        executor._pop_from_waiting_queue = MagicMock(return_value=([], None))
         executor._enable_non_overlap_adp_forward_intent = True
         executor.disable_overlap_scheduler = False
         executor.previous_batch = None
@@ -1511,7 +1535,6 @@ def test_prefix_load_recovery_lifetime(
     executor._wait_for_model_engine_input_copy = MagicMock()
     executor._prepare_and_schedule_batch = MagicMock(return_value=(batch, None))
     executor.is_benchmark_disagg = False
-    executor._disagg_coordinator = MagicMock()
     executor._check_benchmark_disagg_gate = MagicMock(return_value=(True, False))
     executor._terminate_requests = MagicMock()
     executor._pause_requests = MagicMock()

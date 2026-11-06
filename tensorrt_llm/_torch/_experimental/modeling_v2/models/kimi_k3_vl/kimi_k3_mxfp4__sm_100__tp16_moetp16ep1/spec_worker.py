@@ -61,6 +61,9 @@ class KimiK3DFlashWorker(DFlashWorker):
     # inputs as trtllm::k3_spec_accept, keep the target logits vocabulary-sharded and write the drafter's context
     # K/V with trtllm::k3_ctx_kv.
     k3_decode = False
+    # The generation-step preparation below reads _ctx_block_tables, not the
+    # rebased view, so every drafter slot numbers from 0.
+    _ctx_reads_rebased_view = False
 
     def _mask_token_id(self, draft_model) -> int:
         """The drafter's mask token id, resolved once."""
@@ -95,8 +98,8 @@ class KimiK3DFlashWorker(DFlashWorker):
 
         That mode: a decode step (no context requests, at most 8 gen requests) with greedy strict acceptance (no
         rejection sampling, penalties or guided decoding, the base draft-token and logits layouts), fp32 target
-        logits of a vocabulary the kernel splits, the V2 Mamba manager's KDA replay record, the draft pool's block
-        table, and an unsharded bf16 draft embedding. Any other step keeps the torch path.
+        logits of a vocabulary the kernel splits, the V2 Mamba manager's KDA replay record, the block table of a draft
+        pool without sliding windows, and an unsharded bf16 draft embedding. Any other step keeps the torch path.
         """
         if not self._k3_accept_step_applies(
             attn_metadata, spec_metadata, draft_model, num_contexts, num_gens
@@ -159,8 +162,11 @@ class KimiK3DFlashWorker(DFlashWorker):
             or mamba_metadata.state_indices.dtype != torch.int32
         ):
             return False
+        # The kernel's block counts are backed entries, which a sliding-window
+        # pool's released entries put below the extent the drafter writes to.
         if (
             self._ctx_block_tables is None
+            or self._ctx_pool_windowed
             or getattr(attn_metadata, "draft_kv_cache_block_offsets", None) is None
             or getattr(attn_metadata, "kv_lens_cuda", None) is None
         ):
@@ -1082,7 +1088,6 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         draft_model,
         gen_logits: torch.Tensor,
         first_prev_tokens: torch.Tensor,
-        spec_metadata,
     ) -> torch.Tensor:
         """Apply the dspark vanilla-Markov intra-block bias to block logits.
 
@@ -1096,8 +1101,7 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
 
         Block logits the Kimi K3 decode path kept vocab-sharded (see ``_draft_block_logits``) run the
         whole chain as ``trtllm::k3_markov``, which also returns the greedy draft tokens and
-        next_new_tokens. Other TP-sharded logits slice markov_w2's rows to this rank's contiguous
-        shard and chain through the TP-aware global argmax.
+        next_new_tokens. Every other case runs ``DSparkWorker``'s chain.
         """
         # The d2t guard lives in set_draft_model: it is model-static, so raising
         # it here would surface a load-time config error per decode step.
@@ -1110,36 +1114,21 @@ class KimiK3DSparkWorker(KimiK3DFlashWorker, DSparkWorker):
         k3_sharded, self._k3_sharded_block_logits = self._k3_sharded_block_logits, False
         full_vocab = draft_model.markov_w2.shape[0]
         shard = gen_logits.shape[-1]
-        vocab_slice = None
-        if shard != full_vocab:
-            mapping = self.mapping
-            if (
-                mapping is None
-                or getattr(mapping, "enable_attention_dp", False)
-                or shard * mapping.tp_size != full_vocab
-            ):
-                raise NotImplementedError(
-                    f"DSpark Markov head: draft logits width {shard} does not "
-                    f"match the drafter vocab {full_vocab} and is not a plain "
-                    "TP column shard of it."
-                )
-            vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
-            if k3_sharded:
-                return self._k3_markov_chain(
-                    draft_model, gen_logits, first_prev_tokens, vocab_slice
-                )
-
-        def argmax_fn(step_logits):
-            # Full-vocab token ids (TP-aware when sharded); tokens stay in
-            # draft-vocab space, which is what markov_w1 indexes.
-            return self.greedy_sample_draft_with_tp_gather(step_logits, spec_metadata).long()
-
-        return draft_model.apply_markov_chain_logits(
-            gen_logits,
-            first_prev_tokens,
-            argmax_fn=argmax_fn,
-            vocab_slice=vocab_slice,
-        )
+        if not k3_sharded or shard == full_vocab:
+            return super()._apply_dspark_markov_bias(draft_model, gen_logits, first_prev_tokens)
+        mapping = self.mapping
+        if (
+            mapping is None
+            or getattr(mapping, "enable_attention_dp", False)
+            or shard * mapping.tp_size != full_vocab
+        ):
+            raise NotImplementedError(
+                f"DSpark Markov head: draft logits width {shard} does not "
+                f"match the drafter vocab {full_vocab} and is not a plain "
+                "TP column shard of it."
+            )
+        vocab_slice = slice(mapping.tp_rank * shard, (mapping.tp_rank + 1) * shard)
+        return self._k3_markov_chain(draft_model, gen_logits, first_prev_tokens, vocab_slice)
 
     def _keep_draft_logits_sharded(self, draft_model, spec_metadata, num_gens: int) -> bool:
         """Keep the draft logits vocab-sharded: ``trtllm::k3_markov`` reduces across the ranks itself.

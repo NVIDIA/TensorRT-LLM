@@ -27,6 +27,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from tensorrt_llm.serve.openai_protocol import NamespacedFunctionToolParam
 from tensorrt_llm.serve.responses_utils import (
     CUSTOM_TOOL_INPUT_ARG,
     _get_chat_completion_function_tools,
@@ -195,6 +196,42 @@ def test_namespaced_custom_tool_is_recognised():
     assert resolution["edit.apply_patch"] == ("edit", "apply_patch", True)
     # The bare spelling resolves too when unambiguous - the model writes both.
     assert resolution["apply_patch"] == ("edit", "apply_patch", True)
+
+
+def test_a_namespaced_tool_keeps_its_declaration_beside_the_flattened_function():
+    """A model whose renderer shows namespaces needs the declaration itself."""
+    namespace = SimpleNamespace(
+        type="namespace",
+        name="collaboration",
+        description="Agent collaboration.",
+        tools=[
+            SimpleNamespace(type="function", name="spawn_agent", description=None, parameters=None),
+            SimpleNamespace(type="custom", name="exec", description="Run code."),
+        ],
+    )
+
+    spawn, exec_ = _get_chat_completion_function_tools([namespace])
+    (top_level,) = _get_chat_completion_function_tools([_custom_tool()])
+
+    # A chat template is given the flattened function, as before.
+    assert spawn.model_dump() == {
+        "type": "function",
+        "function": {
+            "name": "collaboration.spawn_agent",
+            "description": "Agent collaboration.",
+            "parameters": {"type": "object", "properties": {}},
+            "strict": None,
+        },
+    }
+    declarations = [
+        (tool.namespace, tool.namespace_description, tool.declared_name, tool.declared_description)
+        for tool in (spawn, exec_)
+    ]
+    assert declarations == [
+        ("collaboration", "Agent collaboration.", "spawn_agent", None),
+        ("collaboration", "Agent collaboration.", "exec", "Run code."),
+    ]
+    assert not isinstance(top_level, NamespacedFunctionToolParam)
 
 
 def test_namespaced_call_replays_under_its_qualified_name():

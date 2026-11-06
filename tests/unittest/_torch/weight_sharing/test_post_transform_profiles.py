@@ -27,6 +27,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformQualificationDecision,
     PostTransformQualificationReason,
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
@@ -85,6 +86,7 @@ def _runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
@@ -209,7 +211,10 @@ def test_registry_selects_exact_speculative_mode_profile() -> None:
     assert decision.profile is mtp_profile
 
 
-def test_optional_feature_requires_explicit_profile_support() -> None:
+@pytest.mark.parametrize("feature", list(PostTransformFeature))
+def test_optional_feature_requires_explicit_profile_support(
+    feature: PostTransformFeature,
+) -> None:
     profile = _profile()
     registry = PostTransformProfileRegistry((profile,))
 
@@ -220,13 +225,50 @@ def test_optional_feature_requires_explicit_profile_support() -> None:
         speculative_mode=None,
         protocol_version=1,
         transfer_scope=PostTransformTransferScope.TARGET_MODEL,
-        enabled_features=frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL}),
+        enabled_features=frozenset({feature}),
     )
 
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
     assert decision.profile is profile
-    assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+    assert decision.unsupported_features == frozenset({feature})
+
+
+@pytest.mark.parametrize(
+    "decision, expected",
+    [
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+            ),
+            "reason=root_model_class_not_registered",
+            id="reason-only",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED,
+                unsupported_runtime_dimensions=frozenset({"tp_size", "moe_backend"}),
+            ),
+            "reason=runtime_config_not_supported; "
+            "unsupported_runtime_dimensions=moe_backend,tp_size",
+            id="runtime-dimensions",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+                unsupported_features=frozenset(
+                    {PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP}
+                ),
+            ),
+            "reason=feature_not_supported; unsupported_features=dwdp,moe_load_balancer",
+            id="features",
+        ),
+    ],
+)
+def test_decision_describes_only_the_details_it_reports(
+    decision: PostTransformQualificationDecision, expected: str
+) -> None:
+    assert decision.describe() == expected
 
 
 def test_explicitly_supported_optional_feature_is_qualified() -> None:
@@ -277,6 +319,7 @@ def test_runtime_constraints_qualify_only_declared_rows() -> None:
         pytest.param({"tp_size": 4}, "tp_size", id="tp-size"),
         pytest.param({"rope_type": "yarn"}, "rope_type", id="rope-type"),
         pytest.param({"sliding_window": "uniform"}, "sliding_window", id="sliding-window"),
+        pytest.param({"moe_cluster_size": 2}, "moe_cluster_size", id="moe-cluster-size"),
     ],
 )
 def test_runtime_constraints_report_unsupported_dimension(
@@ -289,6 +332,7 @@ def test_runtime_constraints_report_unsupported_dimension(
             tp_sizes=frozenset({1, 2}),
             rope_types=frozenset({"default"}),
             sliding_windows=frozenset({"none"}),
+            moe_cluster_sizes=frozenset({1}),
         )
     )
     registry = PostTransformProfileRegistry((profile,))
@@ -408,6 +452,7 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
             cp_size=1,
             moe_tp_size=2,
             moe_ep_size=1,
+            moe_cluster_size=1,
             attn_tp_size=2,
             attn_cp_size=1,
             enable_attention_dp=False,
@@ -421,6 +466,23 @@ def test_runtime_config_is_captured_from_final_model_config() -> None:
         rope_fusion=None,
         sliding_window=None,
     )
+
+
+@pytest.mark.parametrize(
+    "mapping, expected_cluster_size",
+    [
+        pytest.param(SimpleNamespace(moe_cluster_size=2), 2, id="cluster-2"),
+        pytest.param(SimpleNamespace(), None, id="missing"),
+    ],
+)
+def test_runtime_config_captures_moe_cluster_size(
+    mapping: SimpleNamespace,
+    expected_cluster_size: int | None,
+) -> None:
+    mapping.is_multi_node = lambda: False
+    runtime_config = PostTransformRuntimeConfig.from_model_config(SimpleNamespace(mapping=mapping))
+
+    assert runtime_config.moe_cluster_size == expected_cluster_size
 
 
 def test_runtime_config_uses_resolved_dtype_when_checkpoint_dtype_is_missing() -> None:
