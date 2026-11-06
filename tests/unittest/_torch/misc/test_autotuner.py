@@ -2261,14 +2261,18 @@ def test_parallel_rank_dealt_no_pair_runs_the_merged_winner(monkeypatch):
     gathered = {}
 
     class _AllgatherDist:
-        """tp_cp_allgather of the ranks run so far, in rank order."""
+        """tp_cp_allgather of the ranks run so far, in rank order, matched call by call."""
 
         def __init__(self, rank):
             self.rank = rank
 
         def tp_cp_allgather(self, obj):
-            gathered[self.rank] = obj
-            return [gathered[r] for r in sorted(gathered)]
+            calls = gathered.setdefault(self.rank, [])
+            calls.append(obj)
+            n = len(calls) - 1
+            return [
+                gathered[r][n] for r in sorted(gathered) if len(gathered[r]) > n
+            ]
 
     op = "autotuner_test::parallel_rank_without_pairs"
     config = TuningConfig(
