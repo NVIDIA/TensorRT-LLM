@@ -66,8 +66,8 @@ def _register_custom_configs_with_transformers() -> None:
     # tokenizer can be constructed. Bypass AutoConfig.register's model_type
     # consistency check for aliases (for example, DeepseekV3Config.model_type
     # is "deepseek_v3") by writing into the underlying mapping directly.
-    # Registration only fills gaps: when the installed transformers already
-    # ships a model_type, the native class wins.
+    # Prefer native classes except where TRT-LLM needs config normalization
+    # that those classes do not provide.
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
     from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
 
@@ -123,12 +123,20 @@ def _register_custom_configs_with_transformers() -> None:
     # alias is only present in newer transformers releases.
     if "qwen3_vl_vision" not in CONFIG_MAPPING:
         CONFIG_MAPPING.register("qwen3_vl_vision", Qwen3VLVisionConfig, exist_ok=True)
+    # Edge requires interleaved mRoPE and projector-derived vision fields.
+    # Keep AutoConfig consistent with load_pretrained_config's Edge configs.
+    edge_config_types = {
+        "cosmos3_edge",
+        "cosmos3_edge_text",
+        "cosmos3_edge_vision",
+        "cosmos3_edge_projector",
+    }
     for model_type, config_class in custom_configs.items():
-        if model_type in CONFIG_MAPPING:
+        if model_type in CONFIG_MAPPING and model_type not in edge_config_types:
             continue
         CONFIG_MAPPING.register(model_type, config_class, exist_ok=True)
 
-    # `nemotron_h` is the one model_type we override rather than gap-fill.
+    # `nemotron_h` also needs an override rather than gap-fill.
     # transformers 5.5.x ships a native NemotronHConfig, but it cannot represent
     # dense Nemotron-H checkpoints: `hybrid_override_pattern` strings containing
     # "-" (MLP) layers raise `KeyError: '-'` during config construction, so

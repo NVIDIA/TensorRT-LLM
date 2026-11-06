@@ -62,15 +62,26 @@ def _normalize_exaone4_5_mtp_layer_types(text_config: dict) -> None:
     text_config["layer_types"] = layer_types[:num_hidden_layers]
 
 
-# transformers >= 5.8 ships native Exaone4.5 configs with the same
-# sub-config-instantiation logic we'd otherwise re-implement here. Prefer
-# the HF classes when available and only register local fallbacks on older
-# releases (where the modules don't exist at all).
+# Retain native sub-config handling while normalizing checkpoint MTP metadata.
+# Older Transformers releases need the local composite-config fallback.
 try:
     from transformers.models.exaone4_5.configuration_exaone4_5 import (
-        Exaone4_5_Config as Exaone4_5Config,
+        Exaone4_5_Config as HFExaone4_5Config,
     )
     from transformers.models.exaone4_5.configuration_exaone4_5 import Exaone4_5_VisionConfig
+
+    # AutoProcessor resolves configs through the native class name.
+    class Exaone4_5_Config(HFExaone4_5Config):
+        def __post_init__(self, **kwargs) -> None:
+            if isinstance(self.text_config, dict):
+                self.text_config = copy.deepcopy(self.text_config)
+                _normalize_exaone4_5_mtp_layer_types(self.text_config)
+            if isinstance(self.vision_config, dict):
+                self.vision_config = copy.deepcopy(self.vision_config)
+            super().__post_init__(**kwargs)
+
+    Exaone4_5Config = Exaone4_5_Config
+    AutoConfig.register(Exaone4_5Config.model_type, Exaone4_5Config, exist_ok=True)
 except ImportError:
 
     class Exaone4_5_VisionConfig(PretrainedConfig):
@@ -217,6 +228,18 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
 
         self.model_config = model_config
         self.config = model_config.pretrained_config
+        self._mm_token_ids = torch.tensor(
+            [
+                token_id
+                for token_id in (
+                    getattr(self.config, "image_token_id", None),
+                    getattr(self.config, "vision_token_id", None),
+                    getattr(self.config, "video_token_id", None),
+                )
+                if token_id is not None
+            ],
+            dtype=torch.int32,
+        )
 
         if model_config.attn_backend != "TRTLLM":
             raise ValueError("Exaone4.5 only supports TRTLLM backend")
@@ -274,7 +297,9 @@ class Exaone4_5_ForConditionalGeneration(Qwen2VLModelBase):
             self.llm.model.embed_tokens,
             input_ids,
             mm_embeds,
-            **kwargs,
+            mm_token_ids=self.mm_token_ids,
+            text_token_indices=kwargs.get("text_token_indices"),
+            mm_token_indices=kwargs.get("mm_token_indices"),
         )
 
         output_prob = self.llm.forward(
