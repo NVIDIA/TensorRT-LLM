@@ -1,0 +1,42 @@
+{
+  "_comment": [
+    "Resource markers: marks whose first argument is a requirement, not a condition.",
+    "",
+    "'description' the line `defs/pytest.ini` declares the marker with, copied byte",
+    "              for byte.",
+    "'bounds'      the machine fact the requirement is compared with: gpus,",
+    "              device_memory_mib or device_name. null: not evaluated.",
+    "'read'        how `defs/conftest.py` looks the marker up: closest",
+    "              (get_closest_marker) or every_level (iter_markers).",
+    "",
+    "`skip_less_mpi_world_size` bounds gpus: one rank per GPU."
+  ],
+
+  "markers": {
+    "skip_less_device": {
+      "description": "skip when less device detected than the declared",
+      "bounds": "gpus",
+      "read": "closest"
+    },
+    "skip_less_mpi_world_size": {
+      "description": "skip when less mpi world size detected than the declared",
+      "bounds": "gpus",
+      "read": "closest"
+    },
+    "skip_less_device_memory": {
+      "description": "skip when less device memory detected than the requested",
+      "bounds": "device_memory_mib",
+      "read": "every_level"
+    },
+    "skip_less_host_memory": {
+      "description": "skip when less host memory detected than the requested",
+      "bounds": null,
+      "read": "closest"
+    },
+    "skip_device_not_contain": {
+      "description": "skip when the device does not contain the specified keyword",
+      "bounds": "device_name",
+      "read": "closest"
+    }
+  }
+}
