@@ -12,10 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""One layer of causal-rollout attention, four ways.
+"""One layer of causal-rollout attention, five ways.
 
     cudnn_paged    cuDNN backend over PagedRolloutKVCache: staging the new K/V + paged SDPA
     cutedsl_paged  CuTe DSL backend over the same cache: staging the new K/V + paged FMHA
+    flashinfer_paged  FlashInfer backend over the same cache: staging the new K/V + the
+                   TRTLLM-Gen paged context FMHA
     sdpa_resident  one contiguous K/V buffer per layer: in-place write + torch SDPA
                    (PyTorch picks the kernel) over the resident history
     naive          materialised torch.cat of all K/V + SDPA (the VANILLA path)
@@ -63,6 +65,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.cute_dsl import CuTeDSLAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.flashinfer import FlashInferAttention
 from tensorrt_llm._torch.visual_gen.cache import PagedRolloutKVCache, RolloutSpec
 
 # The fp32 reference shared with the unit tests lives in the unittest tree.
@@ -389,7 +392,18 @@ def sdpa(q, k, v):
     )[0].transpose(0, 1)
 
 
+PAGED_VARIANTS = ("cudnn_paged", "cutedsl_paged", "flashinfer_paged")
+
+
 def make_attn(backend: str, g: Geometry, layer_idx: int):
+    if backend == "flashinfer_paged":
+        return FlashInferAttention(
+            layer_idx=layer_idx,
+            num_heads=g.num_heads,
+            head_dim=g.head_dim,
+            num_kv_heads=g.num_kv_heads,
+            dtype=g.torch_dtype,
+        )
     if backend == "cutedsl_paged":
         return CuTeDSLAttention(
             layer_idx=layer_idx,
@@ -420,7 +434,9 @@ def chunk_cycle(args, g: Geometry, gen) -> None:
     attns = [make_attn(args.backend, g, i) for i in range(layers)]
 
     def forward_layer(attn, causal_block_size):
-        return attn.forward(q4, k4, v4, kv=mgr.plan(chunk, causal_block_size))
+        return attn.forward(
+            q4, k4, v4, batch_size=1, seq_len=chunk, kv=mgr.plan(chunk, causal_block_size)
+        )
 
     def forward(causal_block_size):
         for attn in attns:
@@ -511,7 +527,7 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--variant",
-        choices=["cudnn_paged", "cutedsl_paged", "sdpa_resident", "naive", "all"],
+        choices=[*PAGED_VARIANTS, "sdpa_resident", "naive", "all"],
         default="all",
     )
     ap.add_argument("--iters", type=int, default=50)
@@ -564,7 +580,7 @@ def parse_args():
     )
     ap.add_argument("--layers", type=int, default=36)
     ap.add_argument("--denoise-steps", type=int, default=4)
-    ap.add_argument("--backend", choices=["cudnn_paged", "cutedsl_paged"], default="cudnn_paged")
+    ap.add_argument("--backend", choices=PAGED_VARIANTS, default="cudnn_paged")
     return ap.parse_args()
 
 
@@ -622,6 +638,7 @@ def main() -> None:
 
     cudnn_attn = make_attn("cudnn_paged", g, 0)
     cutedsl_attn = make_attn("cutedsl_paged", g, 0)
+    flashinfer_attn = make_attn("flashinfer_paged", g, 0)
     q4, k4, v4 = q[None], k[None], v[None]
     plan = mgr.plan(chunk, causal_block_size)
 
@@ -630,6 +647,9 @@ def main() -> None:
 
     def run_cutedsl_paged():
         return cutedsl_attn.forward(q4, k4, v4, kv=plan)
+
+    def run_flashinfer_paged():
+        return flashinfer_attn.forward(q4, k4, v4, kv=plan)
 
     # Dense paths have no per-causal-block key count, so causal blocks cost them one launch each:
     # that is the per-frame clean pass as the reference runs it.
@@ -663,6 +683,7 @@ def main() -> None:
     variants = {
         "cudnn_paged": run_cudnn_paged,
         "cutedsl_paged": run_cutedsl_paged,
+        "flashinfer_paged": run_flashinfer_paged,
         "sdpa_resident": run_sdpa_resident,
         "naive": run_naive,
     }
@@ -688,7 +709,7 @@ def main() -> None:
     for name in chosen:
         out = variants[name]().reshape(chunk, g.num_heads, g.head_dim).float()
         torch.cuda.synchronize()
-        if name in ("cudnn_paged", "cutedsl_paged"):
+        if name in PAGED_VARIANTS:
             checks[name] = check(name, out, ref_exact, ref_resident, chunk_only, "exact window")
         else:
             checks[name] = check(name, out, ref_resident, ref_exact, chunk_only, "resident")
@@ -721,7 +742,7 @@ def main() -> None:
             {
                 "variant": name,
                 "causal_block_size": causal_block_size,
-                "pool_bytes": pool if name in ("cudnn_paged", "cutedsl_paged") else None,
+                "pool_bytes": pool if name in PAGED_VARIANTS else None,
                 **checks[name],
                 **r,
             }
