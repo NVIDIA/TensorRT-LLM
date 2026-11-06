@@ -182,13 +182,23 @@ class ServeTestEnv:
         """
         model_dir = self.tmp_dir / f"model-{model_type}"
         model_dir.mkdir(parents=True, exist_ok=True)
-        architectures = {
-            "llama": ["LlamaForCausalLM"],
-            "gpt_oss": ["GptOssForCausalLM"],
-        }[model_type]
-        (model_dir / "config.json").write_text(
-            json.dumps({"model_type": model_type, "architectures": architectures})
-        )
+        configs = {
+            "llama": {"model_type": "llama", "architectures": ["LlamaForCausalLM"]},
+            "gpt_oss": {"model_type": "gpt_oss", "architectures": ["GptOssForCausalLM"]},
+            # The composite checkpoint shape: a bare kimi_k3 config loads as its
+            # kimi_linear text config and resolves to that model type instead.
+            "kimi_k3": {
+                "model_type": "kimi_k3",
+                "architectures": ["KimiK3ForConditionalGeneration"],
+                "text_config": {
+                    "model_type": "kimi_linear",
+                    "architectures": ["KimiLinearForCausalLM"],
+                    "vocab_size": 163840,
+                },
+                "vision_config": {"model_type": "moonvit"},
+            },
+        }
+        (model_dir / "config.json").write_text(json.dumps(configs[model_type]))
         return model_dir
 
     def build_openai_server(self, config: AggConfig) -> OpenAIServer:

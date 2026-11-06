@@ -17,16 +17,21 @@
 Implements the Kimi/Moonshot API semantics layered on the OpenAI chat surface:
 message-level (dynamic) tool validation, the optional pinned sampling-parameter
 policy, default streaming usage, request-field to chat-template-kwarg
-derivation, and the K3 XTML placement of guided-decoding constraints.
+derivation, and the K3 XTML placement of guided-decoding constraints. On the
+Responses surface it derives the same chat-template kwargs from the Responses
+request fields and adapts a replayed conversation to the way the K3 renderer
+binds tool results to their calls.
 """
 
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    ResponsesRequest,
     StreamOptions,
 )
 from tensorrt_llm.serve.serving_extensions import ServingExtension, register_serving_extension
@@ -39,17 +44,20 @@ _RESPONSE_CHANNEL_OPEN = "<|open|>response<|sep|>"
 _RESPONSE_CHANNEL_CLOSE = "<|close|>response<|sep|>"
 
 
-def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
+def enforce_kimi_param_policy(request: Union[ChatCompletionRequest, ResponsesRequest]) -> None:
     """Enforce Kimi's pinned sampling-parameter policy when opted in.
 
     Kimi's API pins top_p, the penalties, and n, and bounds temperature to
     [0, 1]; out-of-policy values fail fast with HTTP 400 rather than generate.
     top_p unset or the OpenAI-default 1.0 is coerced to the pinned 0.95 instead
-    of rejected. Off unless ``TRTLLM_KIMI_PARAM_POLICY=1``, so deployments keep
+    of rejected. Each rule applies to the sampling fields the request type
+    declares: a chat request has them all, a Responses request only temperature
+    and top_p. Off unless ``TRTLLM_KIMI_PARAM_POLICY=1``, so deployments keep
     accepting the requests they accept without the policy.
     """
     if os.getenv("TRTLLM_KIMI_PARAM_POLICY", "0") != "1":
         return
+    declared = type(request).model_fields
     if request.top_p is None or request.top_p == 1.0:
         # None would fall back to 1.0 in to_sampling_params; an explicit 1.0
         # is the OpenAI SDK default many clients send unconditionally. Coerce
@@ -61,16 +69,156 @@ def enforce_kimi_param_policy(request: ChatCompletionRequest) -> None:
         )
     if request.top_p is not None and request.top_p != 0.95:
         raise ValueError(f"top_p is fixed at 0.95 for this model; got {request.top_p}.")
-    if request.presence_penalty:
+    if "presence_penalty" in declared and request.presence_penalty:
         raise ValueError(
             f"presence_penalty is fixed at 0 for this model; got {request.presence_penalty}."
         )
-    if request.frequency_penalty:
+    if "frequency_penalty" in declared and request.frequency_penalty:
         raise ValueError(
             f"frequency_penalty is fixed at 0 for this model; got {request.frequency_penalty}."
         )
-    if request.n != 1:
+    if "n" in declared and request.n != 1:
         raise ValueError(f"n is fixed at 1 for this model; got {request.n}.")
+
+
+# OpenAI's Responses `reasoning.effort` levels on the three the kimi_k3 template
+# accepts for `thinking_effort` (low/high/max). Each level maps to the nearest K3
+# level at or above it, so a request never gets less thinking than it asked for.
+# "none" is not a level: it turns thinking off (see apply_responses_extensions).
+# No effort at all leaves the template default (max).
+_THINKING_EFFORT_BY_RESPONSES_EFFORT = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+
+
+def _joined_tool_content(first: Any, second: Any) -> Any:
+    """Two segments of one call's result, in order, as one content value."""
+    if isinstance(first, str) and isinstance(second, str):
+        if not first or first.endswith("\n"):
+            return first + second
+        return first + "\n" + second
+
+    def parts(content: Any) -> list:
+        if isinstance(content, list):
+            return list(content)
+        return [{"type": "text", "text": content or ""}]
+
+    return parts(first) + parts(second)
+
+
+def _merge_split_tool_results(
+    messages: List[ChatCompletionMessageParam],
+) -> List[ChatCompletionMessageParam]:
+    """Give each call at most one result message within a run of results.
+
+    A client can return one call's result in more than one item, all with the
+    same ``call_id``. The K3 renderer sorts a run of results by the position of
+    the call each one names but numbers them by counting result messages, so a
+    second segment of one call takes the next call's index and every later
+    result in the turn names the wrong call. Within each run of consecutive
+    tool messages, the segments of one call are joined into its first message
+    in the order they came; calls keep the order of their first segment.
+    Nothing is dropped and nothing moves out of its run, so a result that
+    arrived in a later turn stays there.
+    """
+    merged: List[ChatCompletionMessageParam] = []
+    first_index_by_call: Dict[str, int] = {}
+    joined = 0
+    for message in messages:
+        if message.get("role") != "tool":
+            first_index_by_call = {}
+            merged.append(message)
+            continue
+        call_id = message.get("tool_call_id")
+        key = None if call_id is None else str(call_id)
+        if key is not None and key in first_index_by_call:
+            first = merged[first_index_by_call[key]]
+            merged[first_index_by_call[key]] = {
+                **first,
+                "content": _joined_tool_content(first.get("content"), message.get("content")),
+            }
+            joined += 1
+            continue
+        if key is not None:
+            first_index_by_call[key] = len(merged)
+        merged.append(message)
+    if joined:
+        logger.warning_once(
+            "Responses API: a tool call came back with its result split across several "
+            "items; kimi_k3 numbers results by count, so the segments are joined into one "
+            "result per call.",
+            key="kimi_k3_responses_split_tool_results",
+        )
+    return merged
+
+
+def _orphan_tool_result_note(message: ChatCompletionMessageParam) -> ChatCompletionMessageParam:
+    """A tool result no call claims, as a plain user note carrying its output."""
+    header = (
+        f"[Output of tool call {message.get('tool_call_id')!r}, which matches no tool call "
+        "before it:]"
+    )
+    content = message.get("content")
+    parts = (
+        list(content) if isinstance(content, list) else [{"type": "text", "text": content or ""}]
+    )
+    return {"role": "user", "content": [{"type": "text", "text": header}, *parts]}
+
+
+def _settle_orphan_tool_results(
+    messages: List[ChatCompletionMessageParam],
+) -> List[ChatCompletionMessageParam]:
+    """Keep the K3 renderer from rejecting a tool result it cannot bind to a call.
+
+    The renderer binds each run of tool results to the most recent assistant
+    message's ``tool_calls`` by id, falls back to position when any result in
+    the run is unmatched, and raises when a result then has no call at all. A
+    client that replays its whole history every turn would fail every later
+    turn of the session on one result without a call (its call compacted away,
+    or a late result for a turn the client abandoned), and the positional
+    fallback pins the wrong call's name on a result when it does not raise.
+
+    A result whose ``tool_call_id`` matches no call of the assistant message in
+    front of it, the renderer's own test, is therefore replayed as a user note
+    carrying its output, placed after its run of results so the rest of the run
+    still binds by id. Nothing the client sent is dropped, and the conversion is
+    deterministic, so the replayed history stays a stable prompt prefix.
+    """
+    settled: List[ChatCompletionMessageParam] = []
+    notes: List[ChatCompletionMessageParam] = []
+    call_ids: set = set()
+    orphans = 0
+    for message in messages:
+        if message.get("role") == "tool":
+            call_id = message.get("tool_call_id")
+            if call_id is not None and str(call_id) in call_ids:
+                settled.append(message)
+            else:
+                notes.append(_orphan_tool_result_note(message))
+                orphans += 1
+            continue
+        settled.extend(notes)
+        notes = []
+        if message.get("role") == "assistant":
+            call_ids = {
+                str(call["id"])
+                for call in message.get("tool_calls") or []
+                if isinstance(call, dict) and call.get("id") is not None
+            }
+        settled.append(message)
+    settled.extend(notes)
+    if orphans:
+        logger.warning_once(
+            "Responses API: a tool result matched no tool call in the conversation; "
+            "kimi_k3 cannot render that, so it is replayed as a user note carrying the output.",
+            key="kimi_k3_responses_orphan_tool_results",
+        )
+    return settled
 
 
 def _derive_from_reasoning_effort(kwargs: dict[str, Any], effort: object) -> None:
@@ -139,7 +287,7 @@ def validate_kimi_dynamic_tools(request: ChatCompletionRequest) -> None:
 
 @register_serving_extension(model_types=("kimi_k3",), reasoning_parsers=("kimi_k3",))
 class KimiK3ServingExtension(ServingExtension):
-    """Kimi/Moonshot API semantics for kimi_k3 chat requests."""
+    """Kimi/Moonshot API semantics for kimi_k3 chat and Responses requests."""
 
     render_version = 2
 
@@ -279,6 +427,57 @@ class KimiK3ServingExtension(ServingExtension):
             )
         if derived or translated:
             request.chat_template_kwargs = chat_template_kwargs
+
+    def apply_responses_extensions(self, request: ResponsesRequest) -> None:
+        """Derive chat-template kwargs from a Responses request and apply the sampling policy.
+
+        The kimi_k3 template reads thinking effort, tool_choice and
+        response_format only from chat-template kwargs, so they are derived
+        from the request's own fields: ``reasoning.effort`` becomes
+        ``thinking_effort`` on K3's low/high/max scale (``"none"`` turns
+        thinking off; no effort leaves the template default), ``tool_choice``
+        ``"required"`` or ``"none"`` with tools declared becomes
+        ``tool_choice``, and ``text.format`` of type json_object or json_schema
+        becomes ``response_format`` (with ``response_schema`` for a schema).
+        Explicit client-supplied ``chat_template_kwargs``, an accepted extra
+        field on this endpoint, win over derived values, as on chat. The same
+        kwargs steer the kimi_k3 reasoning parser's initial channel, so the
+        parser starts in the channel the prompt opened. The sampling-parameter
+        policy applies to the fields this endpoint has (temperature, top_p).
+        """
+        enforce_kimi_param_policy(request)
+        derived: dict[str, Any] = {}
+        effort = request.reasoning.effort if request.reasoning is not None else None
+        if effort == "none":
+            derived["thinking"] = False
+        elif effort in _THINKING_EFFORT_BY_RESPONSES_EFFORT:
+            derived["thinking_effort"] = _THINKING_EFFORT_BY_RESPONSES_EFFORT[effort]
+        if request.tools and request.tool_choice in ("required", "none"):
+            derived["tool_choice"] = request.tool_choice
+        text_format = request.text.format if request.text is not None else None
+        if text_format is not None and text_format.type in ("json_object", "json_schema"):
+            derived["response_format"] = text_format.type
+            if text_format.type == "json_schema":
+                derived["response_schema"] = text_format.schema_
+        if derived:
+            explicit = getattr(request, "chat_template_kwargs", None)
+            request.chat_template_kwargs = {
+                **derived,
+                **(explicit if isinstance(explicit, dict) else {}),
+            }
+
+    def prepare_responses_history(
+        self, messages: List[ChatCompletionMessageParam]
+    ) -> List[ChatCompletionMessageParam]:
+        """Adapt a replayed conversation to how the K3 renderer binds tool results.
+
+        The renderer numbers a run of tool results by counting result messages
+        and rejects a result it cannot bind to a call, so each call gets at
+        most one result message per run (``_merge_split_tool_results``) and a
+        result no call claims becomes a user note carrying its output
+        (``_settle_orphan_tool_results``).
+        """
+        return _settle_orphan_tool_results(_merge_split_tool_results(messages))
 
     def structured_output_format(
         self, content: Dict[str, Any], chat_template_kwargs: Optional[Dict[str, Any]]
