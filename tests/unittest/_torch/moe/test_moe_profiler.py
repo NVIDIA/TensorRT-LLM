@@ -75,14 +75,24 @@ def trace_routing(tmp_path: Path) -> Iterator[TraceRouting]:
         nodes = [
             node
             for node in json.loads(execution.read_text())["nodes"]
-            if node["name"] == "trtllm::moe_routing"
+            if node["name"] in {"trtllm::moe_routing", "trtllm::moe_routing_ids"}
         ]
         events = json.loads(chrome.read_text())["traceEvents"]
-        assert sum(event.get("name") == "trtllm::moe_routing" for event in events) == len(nodes)
+        assert sum(
+            event.get("name") in {"trtllm::moe_routing", "trtllm::moe_routing_ids"}
+            for event in events
+        ) == len(nodes)
         records = []
         for node in nodes:
             region, fields = decode_profiler_metadata(node["inputs"]["values"][0])
             assert region == "moe"
+            if node["name"] == "trtllm::moe_routing":
+                assert set(fields) == {
+                    "moe.layer",
+                    "moe.num_tokens",
+                    "moe.num_experts",
+                    "moe.experts_per_token",
+                }
             records.append(fields)
         return records
 
@@ -236,35 +246,30 @@ def _replay_buffer(device: torch.device | str = "cpu") -> RouteCapture:
 @pytest.mark.cpu_only
 class TestMoeProfilerCPU:
     @pytest.mark.parametrize("layer", [None, 7])
-    @pytest.mark.parametrize("weights_available", [False, True])
-    def test_exact_noncontiguous_metadata(
-        self,
-        layer: int | None,
-        weights_available: bool,
-        trace_routing: TraceRouting,
+    def test_shape_only_noncontiguous_metadata(
+        self, layer: int | None, monkeypatch: pytest.MonkeyPatch, trace_routing: TraceRouting
     ) -> None:
-        """Verify routing metadata preserves noncontiguous IDs and optional
-        weights.
-        """
+        """Describe routing shape without reading values or copying the source."""
         ids = torch.tensor([[3, 99, 1, 99], [0, 99, 2, 99]], dtype=torch.int32)[:, ::2]
-        weights = torch.tensor([[0.125, 99, 0.75, 99], [0.5, 99, 0.25, 99]])[:, ::2]
-        records = trace_routing(
-            lambda: profiler.record_moe_routing(
-                layer, 4, ids, weights if weights_available else None
-            )
-        )
-        assert records == [
+
+        def forbidden(*args: object, **kwargs: object) -> None:
+            raise AssertionError("shape observation must not read or copy tensor values")
+
+        def run() -> None:
+            with monkeypatch.context() as patches:
+                for name in ("detach", "cpu", "tolist", "clone"):
+                    patches.setattr(torch.Tensor, name, forbidden)
+                profiler.record_moe_routing(layer, 4, ids)
+
+        assert trace_routing(run) == [
             {
                 "moe.layer": layer,
                 "moe.num_tokens": 2,
                 "moe.num_experts": 4,
                 "moe.experts_per_token": 2,
-                "moe.selected_expert_ids": [[3, 1], [0, 2]],
-                "moe.routing_weights": [[0.125, 0.75], [0.5, 0.25]] if weights_available else None,
             }
         ]
         assert ids.tolist() == [[3, 1], [0, 2]]
-        assert weights.tolist() == [[0.125, 0.75], [0.5, 0.25]]
 
     @pytest.mark.parametrize("selected,active", [(False, True), (True, False), (False, False)])
     def test_inactive_never_inspects_tensors_or_cuda(
@@ -287,7 +292,7 @@ class TestMoeProfilerCPU:
         monkeypatch.setattr(torch.Tensor, "tolist", forbidden)
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", forbidden)
         monkeypatch.setattr(profiler, "_encode_metadata", forbidden)
-        profiler.record_moe_routing(0, 2, ids, None)
+        profiler.record_moe_routing(0, 2, ids)
         assert inspected == []
 
     def test_cpu_active_does_not_query_or_initialize_cuda(
@@ -300,15 +305,11 @@ class TestMoeProfilerCPU:
 
         monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", forbidden)
         records = trace_routing(
-            lambda: profiler.record_moe_routing(
-                7, 4, torch.empty((0, 2), dtype=torch.int32), torch.empty((0, 2))
-            )
+            lambda: profiler.record_moe_routing(7, 4, torch.empty((0, 2), dtype=torch.int32))
         )
         assert len(records) == 1
         assert records[0]["moe.num_tokens"] == 0
         assert records[0]["moe.experts_per_token"] == 2
-        assert records[0]["moe.selected_expert_ids"] == []
-        assert records[0]["moe.routing_weights"] == []
 
     @pytest.mark.parametrize("fused", [False, True])
     def test_pre_eplb_trace_and_router_replay_preserve_execution(
@@ -329,15 +330,15 @@ class TestMoeProfilerCPU:
         run = _fused if fused else _external
         records = trace_routing(lambda: outputs.append(run(moe, x, logits)))
         assert len(records) == 1
-        assert records[0]["moe.selected_expert_ids"] == [[0, 2], [1, 3]]
+        assert replay._buf[:2, 0].tolist() == [[0, 2], [1, 3]]
         assert moe.routing_method.last is not None
         ids, weights = moe.routing_method.last
-        assert records[0]["moe.routing_weights"] == weights.tolist()
         assert torch.equal(replay._buf[:2, 0], ids)
         context = moe.backend.contexts[0]
         assert torch.equal(context.token_selected_experts, ids + 4)
         expected_dtype = torch.float32 if fused else torch.bfloat16
         assert context.token_final_scales.dtype == expected_dtype
+        torch.testing.assert_close(context.token_final_scales, weights.to(expected_dtype))
         assert torch.equal(outputs[0], x)
         enabled_ledger = moe.ledger.copy()
         monkeypatch.setattr(profiler, "_CUSTOM_REGIONS", frozenset())
@@ -357,7 +358,7 @@ class TestMoeProfilerCPU:
         ]
         assert moe.repeat_idx == 0
 
-    def test_input_weight_fold_keeps_original_trace_weights(
+    def test_shape_observation_preserves_input_weight_fold(
         self, trace_routing: TraceRouting
     ) -> None:
         moe = _Moe(fold=True, top_k=1)
@@ -365,9 +366,9 @@ class TestMoeProfilerCPU:
         logits = torch.tensor([[4.0, 1.0, 3.0, 0.0], [0.0, 5.0, 2.0, 4.0]])
         outputs = []
         records = trace_routing(lambda: outputs.append(_external(moe, x, logits)))
+        assert len(records) == 1
         assert moe.routing_method.last is not None
         _, weights = moe.routing_method.last
-        assert records[0]["moe.routing_weights"] == weights.tolist()
         assert moe.backend.contexts[0].token_final_scales is None
         assert torch.equal(outputs[0], x * weights.to(torch.bfloat16).to(x.dtype))
 
@@ -381,8 +382,11 @@ class TestMoeProfilerCPU:
         sf = torch.tensor([[2.0]])
         moe.backend.fused_result = ids, weights, quantized, sf
         records = trace_routing(lambda: _external(moe, torch.zeros((1, 4)), torch.zeros((1, 4))))
-        assert records[0]["moe.selected_expert_ids"] == [[3, 1]]
-        assert records[0]["moe.routing_weights"] == [[0.125, 0.75]]
+        assert records[0]["moe.num_tokens"] == 1
+        torch.testing.assert_close(moe.backend.contexts[0].token_selected_experts, ids)
+        torch.testing.assert_close(
+            moe.backend.contexts[0].token_final_scales, weights.to(torch.bfloat16)
+        )
         assert moe.ledger == [
             "start_wait:True",
             "try_fused",
@@ -449,8 +453,6 @@ class TestMoeProfilerCPU:
                     "moe.num_tokens": 2,
                     "moe.num_experts": 4,
                     "moe.experts_per_token": 2,
-                    "moe.selected_expert_ids": [[3, 1], [0, 2]],
-                    "moe.routing_weights": [[0.25, 0.75], [0.5, 0.5]],
                 }
             ]
             if active and selected
@@ -519,8 +521,6 @@ class TestMoeProfilerCPU:
             )
         )
         assert [record["moe.num_tokens"] for record in records] == [1, 0]
-        assert records[1]["moe.selected_expert_ids"] == []
-        assert records[1]["moe.routing_weights"] == []
         assert [len(context.x) for context in moe.backend.contexts] == [1, 0]
         assert moe.ledger.count("quantize") == moe.ledger.count("run") == 2
         assert torch.equal(outputs[0], x[:1])
@@ -566,12 +566,10 @@ class TestMoeProfilerCPU:
         assert trace_routing(run) == []
 
     @pytest.mark.parametrize("fused", [False, True])
-    def test_optional_helper_weights_do_not_relax_scheduler_contract(
+    def test_shape_observation_preserves_scheduler_weight_contract(
         self, fused: bool, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Verify optional profiler weights do not relax scheduler weight
-        requirements.
-        """
+        """Keep scheduler weight requirements even though profiling reads only shape."""
         moe = _Moe()
 
         def missing_weights(
@@ -584,6 +582,94 @@ class TestMoeProfilerCPU:
         with pytest.raises(AttributeError):
             run(moe, torch.ones((1, 4)), torch.zeros((1, 4)))
         assert moe.backend.contexts == []
+
+
+@pytest.mark.cpu_only
+def test_completed_cpu_ids_keep_layer_mapping_and_step(
+    trace_routing: TraceRouting,
+) -> None:
+    """Serialize completed R3 rows in top-k order with their original attribution."""
+    host_rows = torch.tensor(
+        [[[0, 99, 1, 99], [3, 99, 2, 99]], [[2, 99, 3, 99], [1, 99, 0, 99]]],
+        dtype=torch.int32,
+    )[:, :, ::2]
+    records = trace_routing(
+        lambda: profiler.record_moe_routing_ids(
+            host_rows, step=37, rank=2, layer_pos=((7, 1), (3, 0))
+        )
+    )
+    assert sorted(records, key=lambda fields: fields["moe.layer"]) == [
+        {
+            "moe.layer": layer,
+            "moe.step": 37,
+            "moe.rank": 2,
+            "moe.num_tokens": 2,
+            "moe.experts_per_token": 2,
+            "moe.recorded_tokens": 2,
+            "moe.truncated": False,
+            "moe.selected_expert_ids": values,
+        }
+        for layer, values in ((3, [[0, 1], [2, 3]]), (7, [[3, 2], [1, 0]]))
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("rows,top_k,recorded", [(65, 2, 64), (3, 2048, 2)])
+def test_completed_cpu_ids_bound_rows_and_total_values(
+    rows: int, top_k: int, recorded: int, trace_routing: TraceRouting
+) -> None:
+    """Truncate whole token rows while preserving the source shape and top-k order."""
+    host_rows = torch.arange(rows * top_k, dtype=torch.int32).reshape(rows, 1, top_k)
+    records = trace_routing(
+        lambda: profiler.record_moe_routing_ids(host_rows, step=None, rank=0, layer_pos=((7, 0),))
+    )
+    assert records == [
+        {
+            "moe.layer": 7,
+            "moe.step": None,
+            "moe.rank": 0,
+            "moe.num_tokens": rows,
+            "moe.experts_per_token": top_k,
+            "moe.recorded_tokens": recorded,
+            "moe.truncated": True,
+            "moe.selected_expert_ids": host_rows[:recorded, 0].tolist(),
+        }
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("selected,active", [(False, True), (True, False), (False, False)])
+def test_completed_ids_inactive_never_inspect_rows(
+    selected: bool, active: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep completed-copy observation lazy when its region or profiler is inactive."""
+    monkeypatch.setattr(
+        profiler, "_CUSTOM_REGIONS", frozenset({"moe"}) if selected else frozenset()
+    )
+    monkeypatch.setattr(torch.autograd, "_profiler_enabled", lambda: active)
+    profiler.record_moe_routing_ids(
+        cast(torch.Tensor, object()), step=1, rank=0, layer_pos=((7, 0),)
+    )
+
+
+@pytest.mark.cpu_only
+def test_completed_ids_metadata_failure_does_not_mutate_host_rows(
+    monkeypatch: pytest.MonkeyPatch, trace_routing: TraceRouting
+) -> None:
+    """Drop a failed annotation without changing completed R3 data or caller flow."""
+    host_rows = torch.tensor([[[3, 1]]], dtype=torch.int32)
+
+    def fail(region: str, metadata: object) -> str:
+        raise ValueError("failed completed-ID annotation")
+
+    monkeypatch.setattr(profiler, "_encode_metadata", fail)
+    assert (
+        trace_routing(
+            lambda: profiler.record_moe_routing_ids(host_rows, step=1, rank=0, layer_pos=((7, 0),))
+        )
+        == []
+    )
+    assert host_rows.tolist() == [[[3, 1]]]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="local/QA genuine CUDA graph gate")
@@ -629,11 +715,91 @@ def test_graph_capture_skips_only_profiler_serialization(
     assert replay._buf[0, 0].tolist() == [1, 3]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="local/QA real R3 D2H gate")
+def test_completed_r3_copy_emits_ids_without_an_additional_d2h(
+    monkeypatch: pytest.MonkeyPatch, trace_routing: TraceRouting
+) -> None:
+    """Annotate the existing completed host copy while retaining the R3 commit."""
+    from tensorrt_llm._torch.route_capture import RouteCopier
+
+    device_rows = torch.tensor([[[3, 1]], [[0, 2]]], dtype=torch.int32, device="cuda")
+    copier = RouteCopier(device_rows.device, tuple(device_rows.shape))
+    copies: list[int] = []
+    committed: list[object] = []
+    original_copy = torch.Tensor.copy_
+
+    def copy(
+        destination: torch.Tensor, source: torch.Tensor, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        if destination.device.type == "cpu" and source.is_cuda:
+            copies.append(source.numel())
+        return original_copy(destination, source, *args, **kwargs)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("completed R3 data must not trigger Tensor.cpu()")
+
+    def commit(rows: torch.Tensor, layout: list) -> None:
+        committed.append(rows.tolist())
+
+    def ready(rows: torch.Tensor) -> None:
+        profiler.record_moe_routing_ids(rows, step=17, rank=2, layer_pos=((7, 0),))
+
+    def run() -> None:
+        with monkeypatch.context() as patches:
+            patches.setattr(torch.Tensor, "copy_", copy)
+            patches.setattr(torch.Tensor, "cpu", forbidden)
+            copier.stage(device_rows, 2, [(1, 0), (1, 1)], commit, on_ready=ready)
+            copier.drain(commit, force=True)
+
+    assert trace_routing(run) == [
+        {
+            "moe.layer": 7,
+            "moe.step": 17,
+            "moe.rank": 2,
+            "moe.num_tokens": 2,
+            "moe.experts_per_token": 2,
+            "moe.recorded_tokens": 2,
+            "moe.truncated": False,
+            "moe.selected_expert_ids": [[3, 1], [0, 2]],
+        }
+    ]
+    assert copies == [4]
+    assert committed == [[[[3, 1]], [[0, 2]]]]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="local/QA CUDA shape/CPU-only gate")
+def test_cuda_shape_only_scope_and_cpu_ids_device_guard(
+    monkeypatch: pytest.MonkeyPatch, trace_routing: TraceRouting
+) -> None:
+    """Read only CUDA shape and reject CUDA values at the completed-CPU boundary."""
+    device_rows = torch.tensor([[[3, 1]]], dtype=torch.int32, device="cuda")
+    ids = device_rows[:, 0, :]
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("these observation boundaries must not read CUDA values")
+
+    def run() -> None:
+        with monkeypatch.context() as patches:
+            for name in ("detach", "cpu", "tolist", "clone"):
+                patches.setattr(torch.Tensor, name, forbidden)
+            profiler.record_moe_routing(7, 4, ids)
+            profiler.record_moe_routing_ids(device_rows, step=1, rank=0, layer_pos=((7, 0),))
+
+    assert trace_routing(run) == [
+        {
+            "moe.layer": 7,
+            "moe.num_tokens": 1,
+            "moe.num_experts": 4,
+            "moe.experts_per_token": 2,
+        }
+    ]
+
+
 @pytest.mark.cpu_only
 def test_moe_observation_is_fullgraph_compile_safe() -> None:
     def forward(logits: torch.Tensor) -> torch.Tensor:
         weights, ids = torch.topk(torch.softmax(logits, dim=-1), k=2, dim=-1)
-        profiler.record_moe_routing(None, logits.shape[-1], ids, weights)
+        profiler.record_moe_routing(None, logits.shape[-1], ids)
         return weights + 1
 
     logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
