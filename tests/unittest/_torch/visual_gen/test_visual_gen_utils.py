@@ -1078,13 +1078,26 @@ class TestPathResponseSwitch:
         visual_gen_utils.check_path_response_policy()
         assert visual_gen_utils.path_response_is_disabled() is False
 
-    def test_the_former_name_keeps_the_server_from_starting(self, monkeypatch):
-        """Silently ignoring the former name would turn path responses back on
-        for a deployment that relied on it, so the startup check refuses it."""
-        monkeypatch.setenv(self._FORMER_ENV, "1")
+    @pytest.mark.parametrize("value", ["1", "true"])
+    def test_the_former_name_set_to_disable_keeps_the_server_from_starting(
+        self, monkeypatch, value
+    ):
+        """Ignoring the former name would turn path responses back on for a
+        deployment that relied on it, so the startup check refuses it."""
+        monkeypatch.setenv(self._FORMER_ENV, value)
 
-        with pytest.raises(ValueError, match=f"renamed.*{self._ENV}"):
+        with pytest.raises(ValueError, match=f"renamed.*{self._ENV}=1"):
             visual_gen_utils.check_path_response_policy()
+
+    @pytest.mark.parametrize("value", ["", "0"])
+    def test_the_former_name_set_to_allow_only_warns(self, monkeypatch, value):
+        """``0`` or empty asked for the default, which still holds."""
+        monkeypatch.setenv(self._FORMER_ENV, value)
+        warnings = self._capture(monkeypatch, "warning")
+
+        visual_gen_utils.check_path_response_policy()
+        assert any(self._FORMER_ENV in w for w in warnings)
+        assert visual_gen_utils.path_response_is_disabled() is False
 
     def test_the_startup_check_logs_a_disabled_switch(self, monkeypatch):
         """Silent by default; the switch is reported when the server starts,

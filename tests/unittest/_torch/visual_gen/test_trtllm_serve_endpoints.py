@@ -3694,3 +3694,53 @@ def test_server_shutdown_stops_the_media_load_pool(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError):
         server._media_load_executor.submit(int)
     assert BaseMediaIO._executor is None
+
+
+class TestPathResponseStartupCheck:
+    """The path-response startup check runs on VisualGen servers only."""
+
+    _FORMER_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
+
+    def test_a_visual_gen_server_refuses_the_former_name_before_its_pools(self, monkeypatch):
+        from tensorrt_llm.inputs.media_io import BaseMediaIO
+        from tensorrt_llm.llmapi.disagg_utils import ServerRole
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        monkeypatch.setattr(BaseMediaIO, "_executor", None)
+        monkeypatch.setenv(self._FORMER_ENV, "1")
+        with patch("tensorrt_llm.serve.openai_server._is_visual_gen_instance", return_value=True):
+            with pytest.raises(ValueError, match="renamed"):
+                OpenAIServer(
+                    generator=MockVisualGen(image_output=_make_dummy_image_tensor()),
+                    model="test-model",
+                    tool_parser=None,
+                    server_role=ServerRole.VISUAL_GEN,
+                    metadata_server_cfg=None,
+                )
+        assert BaseMediaIO._executor is None
+
+    def test_other_servers_ignore_the_former_name(self, monkeypatch):
+        """The variable only ever applied to VisualGen, so an LLM server
+        reaches its own initialization with it set."""
+        from types import SimpleNamespace
+
+        from tensorrt_llm.inputs.media_io import BaseMediaIO
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        class _ReachedLlmInit(Exception):
+            pass
+
+        def _init_llm(self, chat_template=None):
+            raise _ReachedLlmInit
+
+        monkeypatch.setattr(BaseMediaIO, "_executor", None)
+        monkeypatch.setenv(self._FORMER_ENV, "1")
+        monkeypatch.setattr(OpenAIServer, "_init_llm", _init_llm)
+        with pytest.raises(_ReachedLlmInit):
+            OpenAIServer(
+                generator=SimpleNamespace(),
+                model="test-model",
+                tool_parser=None,
+                server_role=None,
+                metadata_server_cfg=None,
+            )

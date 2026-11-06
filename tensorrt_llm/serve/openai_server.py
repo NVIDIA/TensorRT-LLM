@@ -679,6 +679,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.host = None
         self.port = None
 
+        if self._is_visual_gen:
+            check_path_response_policy()
+
         # Dedicated thread pools for the chat / completion path. Keeping
         # multimodal preprocessing and decode work off the asyncio default
         # executor avoids contention with unrelated `to_thread` callers and
@@ -693,7 +696,6 @@ class OpenAIServer(_VideoRoutesMixin):
         )
         BaseMediaIO.set_executor(self._media_load_executor)
         log_allowed_local_media_path()
-        check_path_response_policy()
         # /metrics reads iteration stats with a blocking call that waits up to
         # 2 s. A dedicated thread keeps those waits off the default executor,
         # which request handling also uses; get_iteration_stats runs at most

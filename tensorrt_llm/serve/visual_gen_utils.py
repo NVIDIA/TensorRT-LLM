@@ -115,10 +115,10 @@ def _merge_extra_params(
 
 
 _PATH_RESPONSE_DISABLED_ENV = "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE"
-# The switch's former name. A server started with it set refuses to start
-# (`check_path_response_policy`) rather than reading it as an alias or
-# ignoring it: a deployment that relied on it to keep path responses off
-# must not come back up with them on.
+# The switch's former name. A VisualGen server started with it set to turn path
+# responses off refuses to start (`check_path_response_policy`) rather than
+# reading it as an alias or ignoring it: a deployment that relied on it must not
+# come back up with path responses on.
 _FORMER_PATH_RESPONSE_DISABLED_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
 
 
@@ -138,19 +138,23 @@ def path_response_is_disabled() -> bool:
 
 
 def check_path_response_policy() -> None:
-    """Refuse the switch's former name or an unrecognized value at server start.
+    """Check the path-response switch when a VisualGen server starts.
 
-    ``TRTLLM_DISALLOW_LOCAL_MEDIA_PATH`` has shipped, so a deployment may still
-    set it to keep path responses off. Treating it as an alias would keep an
-    outdated name alive, and ignoring it would silently turn path responses
-    back on; failing to start names the variable to set instead. An
-    unrecognized value of the switch is refused too, since reading it either
-    way could be wrong.
+    Refuses an unrecognized value of the switch, since reading it either way
+    could be wrong, and refuses the former name when it is set to turn path
+    responses off, since ignoring it would turn them back on. The former name
+    set to ``0`` or empty asked for the default, so it only logs a warning.
     """
-    if _FORMER_PATH_RESPONSE_DISABLED_ENV in os.environ:
+    former = os.environ.get(_FORMER_PATH_RESPONSE_DISABLED_ENV)
+    if former in ("", "0"):
+        logger.warning(
+            f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} is no longer read; unset it. "
+            "Path responses stay allowed."
+        )
+    elif former is not None:
         raise ValueError(
             f"{_FORMER_PATH_RESPONSE_DISABLED_ENV} has been renamed; unset it and "
-            f"set {_PATH_RESPONSE_DISABLED_ENV} instead."
+            f"set {_PATH_RESPONSE_DISABLED_ENV}=1 to keep path responses off."
         )
     raw = os.environ.get(_PATH_RESPONSE_DISABLED_ENV, "")
     if raw not in ("", "0", "1"):
