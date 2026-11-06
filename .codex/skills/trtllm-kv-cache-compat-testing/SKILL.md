@@ -94,7 +94,7 @@ Rules for the decision:
 |---|---|---|
 | CPU configuration and admission | Parsing, defaults, serialization, rejection of unsupported combinations with the right error | `tests/unittest/llmapi/`, the feature's CPU tests |
 | KV cache manager and bookkeeping | Pools, page counts, lengths, reuse counts, hook cadence, state release, item by item | `tests/unittest/_torch/pyexecutor/kv_cache/`, `tests/unittest/kv_cache_manager_v2_tests/` |
-| Kernels and data movement | Byte-exact movement, compaction, encode/decode against a CPU reference implementation; non-contiguous, partial and large batches | `tests/unittest/_torch/kv_cache_compression/`, C++ unit tests |
+| Kernels and data movement | Byte-exact movement and compaction; layout of cold-page codecs and conversions (spans, scale groups, lossless parts); non-contiguous, partial and large batches. Lossy numerics are checked locally and reported in the PR description | `tests/unittest/_torch/kv_cache_compression/`, C++ unit tests |
 | Small end-to-end smoke | The production executor runs with the feature, activation is proven, and the claimed combinations run | The feature's integration tests |
 | Accuracy | Model-quality contract | Separate evaluation with `trtllm-kv-cache-accuracy-eval` (`../trtllm-kv-cache-accuracy-eval/SKILL.md`), not pytest |
 | Performance | Throughput and latency contract | Separate measurement with `perf-kv-cache-tuning` (`../perf-kv-cache-tuning/SKILL.md`), not pytest |
@@ -121,11 +121,13 @@ Rules for the decision:
   - the round trip is stable;
   - lossless spans are byte-exact;
   - scale geometry is right;
-  - repeated encode/decode is idempotent where the format promises it;
-  - for every supported runtime dtype, decoded values match the production
-    quantization routine for the same format byte for byte, or stay within
-    the bound that the format's step size defines. A codec that returns
-    zeros must fail this check.
+  - repeated encode/decode is idempotent where the format promises it.
+
+  Keep pytest small and cheap, with few GPU tests. Check lossy kernel
+  numerics, such as the encode/decode round trip for every supported runtime
+  dtype that the compression development guide asks for, and end-to-end
+  behavior locally on real runs. Write the commands and results in the PR
+  description.
 - **Mocks**: a bare `MagicMock` attribute is truthy, so gates like
   `if getattr(cfg, "feature", None):` pass on mocks and hide the real branch.
   Use real configuration objects or `spec`'d mocks.

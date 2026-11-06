@@ -103,17 +103,20 @@ compilation cost.
 
 ## 5. Test It
 
-1. **Standalone.** Compare against a CPU reference implementation. Use
-   byte-exact comparisons where the operation is exact, and invariants where
-   it is lossy: spans, scale groups, lossless parts, round-trip stability.
-   Cover non-contiguous, partial, and large batches, and non-default streams.
+1. **Standalone, during development.** Compare against a CPU reference
+   implementation. Use byte-exact comparisons where the operation is exact,
+   and invariants where it is lossy: spans, scale groups, lossless parts,
+   round-trip stability. Cover non-contiguous, partial, and large batches,
+   and non-default streams. Keep only small, fast checks of this kind in
+   pytest; run the lossy numeric checks locally and write their results in
+   the PR description.
 2. **C++ gtest.** For C++ kernels, register it with `add_tllm_gtest(<name>
    OWNER ... SOURCES ... LINK_LIBRARIES ... LABELS "unit;kernels;...;gpu")` in
    `cpp/tests/unit_tests/kernels/CMakeLists.txt`. Make sure a CI stage runs
    the binary: some integration fixtures build and run only named binaries,
    and must be extended.
 3. **Python tests.** Add them under the feature's test directory, and register
-   new files in the test-db.
+   new files in the test-db. Keep them small, with few GPU tests.
 4. **In the pipeline.** Run under CUDA graphs and the overlap scheduler, with
    the KV cache manager V2 debug fills on, and compare against the
    feature-off path.

@@ -166,7 +166,9 @@ behind them are in `lessons-learned.md`.
   their expected values with the code under test, check trivial getters, or
   repeat another test with different numbers. Never edit, skip, delete, or
   loosen a test, or special-case test inputs, to make it pass: fix the code,
-  or stop and report the conflict.
+  or stop and report the conflict. Keep pytest small, with few GPU tests;
+  check lossy numerics and end-to-end behavior locally on real runs, and
+  write the commands and results in the PR description.
 - **Preserve algorithm semantics.** Do not change selection rules or
   granularity, and do not remove modes for convenience. Parallel runs must
   match single-GPU semantics.

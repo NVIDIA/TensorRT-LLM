@@ -74,7 +74,9 @@ the result correct and reviewable. `references/engineering-rules.md` and
    identical to main.
 7. Write few, strong tests: each one runs the real path and fails if the
    feature breaks. Never edit, skip, or loosen a test to make it pass; fix
-   the code, or stop and report the conflict.
+   the code, or stop and report the conflict. Keep pytest small, with few
+   GPU tests; check lossy numerics and end-to-end behavior locally, and write
+   the commands and results in the PR description.
 8. Decide and test every compatibility axis, including block reuse, CUDA
    graphs, the overlap scheduler, disaggregated serving, speculative
    decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`),

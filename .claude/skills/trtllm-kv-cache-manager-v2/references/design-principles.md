@@ -295,7 +295,9 @@ Tests protect a working feature; they do not replace running it.
 - Skip tests of trivial getters, and parametrize only over axes that change
   the behavior.
 - Unit tests check function: the path runs, bookkeeping matches exactly, and
-  unsupported combinations are rejected. Accuracy and end-to-end performance
-  are measured in their own runs, not in unit tests.
+  unsupported combinations are rejected. Keep pytest small and cheap, with
+  few GPU tests. Lossy kernel numerics, accuracy, and end-to-end behavior and
+  performance are checked locally on real runs, and the commands and results
+  go in the PR description.
 - Never edit, skip, delete, or loosen a test, or special-case its inputs, to
   make it pass. If the test contradicts the requirement, stop and report it.

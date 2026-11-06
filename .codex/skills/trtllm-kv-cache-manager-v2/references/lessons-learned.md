@@ -290,7 +290,9 @@ read the category you are working in before starting.
   - unsupported configurations are rejected.
 
   Kernel-numeric references with tolerances, accuracy thresholds, and
-  model-quality checks stay out of unit tests. Small end-to-end smoke tests
+  model-quality checks stay out of unit tests, and GPU tests stay few. Check
+  lossy numerics and end-to-end behavior locally on real runs, and write the
+  commands and results in the PR description. Small end-to-end smoke tests
   that only prove activation belong in the integration tests; see
   `trtllm-kv-cache-compat-testing`
   (`../../trtllm-kv-cache-compat-testing/SKILL.md`).

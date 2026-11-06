@@ -318,7 +318,8 @@ and quantize whole vectors. To add a model:
     drifts on every round trip.
   - Design it so that re-encoding a decoded page reproduces the same codes,
     or measure and document the drift.
-  - Test several round trips, not one.
+  - Test several round trips, not one, locally on real KV cache data, and
+    write the results in the PR description.
 - **Hand-written reference implementations can be wrong**, for example by
   grouping dimensions in a different order than the kernel. Test the layout
   contract instead: spans, scale groups, byte-exact lossless parts,
