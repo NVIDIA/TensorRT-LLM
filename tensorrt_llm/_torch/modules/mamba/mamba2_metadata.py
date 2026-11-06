@@ -433,6 +433,19 @@ class Mamba2Metadata:
         # CUDA graph replays.
         self._state_indices_aliased_ptr = None
 
+        # Replay-history slot of each request. Managers that keep replay
+        # history in its own slot lifecycle fill this static buffer; otherwise
+        # it aliases ``state_indices``.
+        self.replay_state_indices = self.state_indices
+        self._replay_state_indices = torch.zeros(max_batch_size,
+                                                 dtype=torch.int32,
+                                                 device="cuda")
+        self._replay_state_indices_cpu = torch.zeros(max_batch_size,
+                                                     dtype=torch.int32,
+                                                     pin_memory=prefer_pinned())
+        self._replay_state_indices_buffer = DeviceCopyBuffer(
+            self._replay_state_indices, pin_memory=prefer_pinned())
+
         self.replay_work_items = torch.zeros(max_batch_size,
                                              REPLAY_WORK_ITEM_WIDTH,
                                              dtype=torch.int32,
@@ -610,6 +623,24 @@ class Mamba2Metadata:
                                                    length - tail, tail)
         return plan
 
+    def _prepare_replay_state_indices(self, kv_cache_manager,
+                                      batch_request_ids) -> None:
+        """Fill the static replay-slot buffer, or alias the state slots."""
+        if getattr(kv_cache_manager, "replay_layer_group_id", None) is None:
+            self.replay_state_indices = self.state_indices
+            return
+        batch_size = len(batch_request_ids)
+        indices = kv_cache_manager.get_replay_state_indices(batch_request_ids)
+        assert len(indices) == batch_size, (
+            f"get_replay_state_indices() returned {len(indices)} entries for "
+            f"a batch of {batch_size} requests.")
+        self._replay_state_indices_cpu[:batch_size].copy_(
+            torch.as_tensor(indices,
+                            dtype=self._replay_state_indices_cpu.dtype))
+        self._replay_state_indices_buffer.update(
+            self._replay_state_indices_cpu[:batch_size])
+        self.replay_state_indices = self._replay_state_indices
+
     def prepare(self, attn_metadata: AttentionMetadata):
         batch_size = attn_metadata.seq_lens.shape[0]
         num_contexts = attn_metadata.num_contexts
@@ -671,6 +702,10 @@ class Mamba2Metadata:
                                     dtype=self.state_indices_cpu.dtype))
                 self._state_indices_buffer.update(
                     self.state_indices_cpu[:batch_size])
+            self._prepare_replay_state_indices(kv_cache_manager,
+                                               batch_request_ids)
+        else:
+            self.replay_state_indices = self.state_indices
 
         self._prepare_replay_work_items(kv_cache_manager, batch_size,
                                         num_contexts)
