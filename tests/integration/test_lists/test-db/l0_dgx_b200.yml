@@ -395,3 +395,7 @@ l0_dgx_b200:
   # logits parity on TP=4 (skips cleanly when the Kimi-K3 checkpoint is not
   # staged under LLM_MODELS_ROOT).
   - test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity TIMEOUT (45)
+  # GLM-5.3-Flash ModelingV2 target (glm5_next): GSM8K without and with MTP 3, and the MTP
+  # acceptance length, at both of its tp4 layouts.
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4] TIMEOUT (45)
+  - accuracy/modeling_v2/glm5_next/glm_5_3_flash_nvfp4__sm_10x__tp4/test_glm5_next.py::TestModelingV2Glm53FlashNvfp4Sm10xTp4::test_gsm8k_identity_vs_mtp3_and_acceptance[tp4_ep4] TIMEOUT (45)
