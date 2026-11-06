@@ -885,8 +885,7 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         runner.graph_metadata = {}
         key = KeyType(batch_size=1, draft_len=0, kv_regime=8192)
         runner.get_graph_key.return_value = key
-        fp4_mla_state = SimpleNamespace(kv_regime_max_kv=None)
-        graph_metadata = SimpleNamespace(is_cuda_graph=True, fp4_mla_state=fp4_mla_state)
+        graph_metadata = SimpleNamespace(is_cuda_graph=True, set_decode_kv_regime=Mock())
         attn_metadata = SimpleNamespace(
             create_cuda_graph_metadata=Mock(return_value=graph_metadata)
         )
@@ -901,8 +900,8 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
             )
 
         self.assertEqual(result, (graph_metadata, None, key))
-        # the dispatcher of the captured graph decides on the regime ceiling, not the capacity
-        self.assertEqual(fp4_mla_state.kv_regime_max_kv, 8192)
+        # the decode of the captured graph decides on the regime ceiling, not the capacity
+        graph_metadata.set_decode_kv_regime.assert_called_once_with(8192)
 
     def test_lookup_rounds_a_missing_regime_up_to_a_captured_graph(self) -> None:
         runner = self._lookup_runner()
@@ -925,16 +924,13 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
 
     def test_strict_replay_rejects_metadata_of_another_regime(self) -> None:
         key = KeyType(batch_size=1, draft_len=0, kv_regime=8192)
-        same = {
-            "attn_metadata": SimpleNamespace(fp4_mla_state=SimpleNamespace(kv_regime_max_kv=8192))
-        }
-        other = {
-            "attn_metadata": SimpleNamespace(fp4_mla_state=SimpleNamespace(kv_regime_max_kv=16384))
-        }
-        no_state = {"attn_metadata": SimpleNamespace(fp4_mla_state=None)}
+        same = {"attn_metadata": SimpleNamespace(decode_kv_regime=8192)}
+        other = {"attn_metadata": SimpleNamespace(decode_kv_regime=16384)}
+        # a backend whose decode does not depend on the KV length ignores the regime
+        ignored = {"attn_metadata": SimpleNamespace(decode_kv_regime=None)}
         with patch.object(cuda_graph_runner_module, "_STRICT_BUFFER_CHECK", True):
             CUDAGraphRunner._check_kv_regime_metadata(key, same)
-            CUDAGraphRunner._check_kv_regime_metadata(key, no_state)
+            CUDAGraphRunner._check_kv_regime_metadata(key, ignored)
             CUDAGraphRunner._check_kv_regime_metadata(key._replace(kv_regime=None), other)
             with self.assertRaises(AssertionError):
                 CUDAGraphRunner._check_kv_regime_metadata(key, other)

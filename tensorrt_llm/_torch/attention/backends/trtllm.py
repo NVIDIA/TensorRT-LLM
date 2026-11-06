@@ -783,6 +783,16 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         finally:
             self.fp4_mla_state = saved
 
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+        for state in self._fp4_mla_states():
+            state.kv_regime_max_kv = kv_regime
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        state = self.fp4_mla_state
+        return None if state is None else state.kv_regime_max_kv
+
     def fp4_mla_state_for_layer(self, layer_idx: int) -> Optional[Fp4MlaState]:
         """The draft-lifecycle FP4 state if it serves ``layer_idx``, else None."""
         state = self.fp4_mla_draft_state
