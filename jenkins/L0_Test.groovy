@@ -2646,8 +2646,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                 // Generate Job Launch Script
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                // Multi-node perf-sanity and SingleNvlinkDomain stages must land in one NVLink
-                // domain: across racks the wide-EP MoE all-to-all cannot use MNNVL.
+                // Request one Slurm segment for multi-node disaggregated/aggregated perf-sanity
+                // and SingleNvlinkDomain stages; the cluster defines its topology constraints.
                 String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || aggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
@@ -7296,6 +7296,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
         "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        // Keep this functional stage on AWS-PDX for EFA coverage.
+        "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-1": ["b300-flex-aws-pdx", "l0_dgx_b300_efa_multi_nodes", 1, 1, 2, 2, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test

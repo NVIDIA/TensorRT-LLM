@@ -701,6 +701,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     import cutlass.cute as cute
 
     from ..kernels.blackwell import fp8_block_scale_low_m_gemm as fp8_low_m
+    from ..kernels.blackwell import kimi_k3_attn_res
     from ..kernels.blackwell.blockwise_gemm.blockwise_gemm import \
         Sm100BlockwiseGemmKernel
     from ..kernels.blackwell.dense_blockscaled_gemm_act_fusion import \
@@ -721,7 +722,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         STATE_SIZE as CLUSTER_TOPK_STATE_SIZE
     from ..kernels.blackwell.top_k.single_pass_multi_cta_radix_topk_cluster import (
         SinglePassMultiCTARadixTopKClusterKernel, _query_max_cluster_size)
-    from ..kernels.blackwell.utils import make_ptr
+    from ..kernels.blackwell.utils import TRTLLM_ENABLE_PDL, make_ptr
     from ..moe.kernels.blackwell.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
         BlockScaledContiguousGatherGroupedGemmKernel, validate_activation_type)
     from ..moe.kernels.blackwell.blockscaled_contiguous_grouped_gemm import \
@@ -5621,26 +5622,231 @@ if IS_CUTLASS_DSL_AVAILABLE:
     @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm",
                              mutates_args=(),
                              device_types="cuda")
-    def fp8_block_scale_low_m_gemm(input: torch.Tensor, weight: torch.Tensor,
-                                   weight_scale: torch.Tensor) -> torch.Tensor:
+    def fp8_block_scale_low_m_gemm(input: torch.Tensor,
+                                   weight: torch.Tensor,
+                                   weight_scale: torch.Tensor,
+                                   gate: Optional[torch.Tensor] = None,
+                                   sigmoid: bool = False) -> torch.Tensor:
         """FP8 block-scale GEMM for few rows (``fp8_block_scale_low_m_gemm.py``).
 
         Takes the operands of ``fp8_swap_ab_gemm(..., disable_ue8m0_cast=True)``:
         BF16 ``input [M, K]`` with ``1 <= M <= 256``, the UE8M0-resmoothed FP8
         ``weight [N, K]`` and its DeepGEMM-packed UE8M0 ``weight_scale``.
-        Returns BF16 ``[M, N]``.
+        Returns BF16 ``[M, N]``: ``bf16(input * gate) @ weight^T`` with a
+        ``gate``, ``sigmoid`` of the result with ``sigmoid`` (both for M in the
+        low-M kernel's range only).
         """
         fp8_low_m.check_inputs(input, weight, weight_scale)
+        if gate is not None:
+            fp8_low_m.check_gate(input, gate)
         output = torch.empty((input.shape[0], weight.shape[0]),
                              dtype=torch.bfloat16,
                              device=input.device)
-        return fp8_low_m.run_low_m_gemm(input, weight, weight_scale, output)
+        return fp8_low_m.run_low_m_gemm(input,
+                                        weight,
+                                        weight_scale,
+                                        output,
+                                        gate=gate,
+                                        sigmoid=sigmoid,
+                                        use_pdl=TRTLLM_ENABLE_PDL)
 
     @torch.library.register_fake("trtllm::fp8_block_scale_low_m_gemm")
-    def _(input: torch.Tensor, weight: torch.Tensor,
+    def _(input: torch.Tensor,
+          weight: torch.Tensor,
+          weight_scale: torch.Tensor,
+          gate: Optional[torch.Tensor] = None,
+          sigmoid: bool = False) -> torch.Tensor:
+        return input.new_empty((input.shape[0], weight.shape[0]),
+                               dtype=torch.bfloat16)
+
+    @torch.library.custom_op("trtllm::fp8_block_scale_low_m_gemm_prequantized",
+                             mutates_args=(),
+                             device_types="cuda")
+    def fp8_block_scale_low_m_gemm_prequantized(
+            input: torch.Tensor, input_scale: torch.Tensor,
+            weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
+        """``fp8_block_scale_low_m_gemm`` on an MXFP8 activation quantized
+        upstream: E4M3 ``input [M, K]`` (``M`` in the low-M kernel's range)
+        and its UE8M0 1x32 ``input_scale`` in the R128c4 layout. Bitwise the
+        GEMM of the BF16 activation the operand quantizes."""
+        fp8_low_m.check_prequantized_inputs(input, input_scale, weight,
+                                            weight_scale)
+        output = torch.empty((input.shape[0], weight.shape[0]),
+                             dtype=torch.bfloat16,
+                             device=input.device)
+        return fp8_low_m.run_low_m_gemm_prequantized(input,
+                                                     input_scale,
+                                                     weight,
+                                                     weight_scale,
+                                                     output,
+                                                     use_pdl=TRTLLM_ENABLE_PDL)
+
+    @torch.library.register_fake(
+        "trtllm::fp8_block_scale_low_m_gemm_prequantized")
+    def _(input: torch.Tensor, input_scale: torch.Tensor, weight: torch.Tensor,
           weight_scale: torch.Tensor) -> torch.Tensor:
         return input.new_empty((input.shape[0], weight.shape[0]),
                                dtype=torch.bfloat16)
+
+    # Kimi-K3 decode attention-residual mix + RMSNorm with a PDL prologue
+    # (``kimi_k3_attn_res.py``). ``layer``/``prefix``/``residual`` and the
+    # addends are BF16 ``[M, H]``, ``block`` BF16 ``[N - 1, M, H]``, the
+    # weights BF16 ``[H]``; inputs as ``kimi_k3_attn_res.can_run`` accepts.
+
+    def _check_kimi_k3_attn_res_inputs(layer: torch.Tensor,
+                                       addends: Tuple[torch.Tensor,
+                                                      ...], block: torch.Tensor,
+                                       *weights: torch.Tensor) -> None:
+        # Host-side checks only: the kernel does not validate its operands.
+        if not kimi_k3_attn_res.can_run(layer, addends, block, *weights):
+            raise ValueError("kimi_k3_attn_res: unsupported inputs (layer "
+                             f"{tuple(layer.shape)} {layer.dtype}, block "
+                             f"{tuple(block.shape)}, addends "
+                             f"{[tuple(a.shape) for a in addends]}); see "
+                             "kimi_k3_attn_res.can_run")
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_rmsnorm(
+            layer: torch.Tensor,
+            block: torch.Tensor,
+            res_weight: torch.Tensor,
+            rms_weight: torch.Tensor,
+            out_weight: torch.Tensor,
+            rms_eps: float,
+            out_eps: float,
+            snapshots_after_wait: bool = False) -> torch.Tensor:
+        """Attention-residual mix of ``block`` and ``layer``, then RMSNorm.
+
+        ``snapshots_after_wait``: ``block`` was written by the kernel launched
+        immediately before this op, so the kernel loads it after its PDL wait.
+        """
+        _check_kimi_k3_attn_res_inputs(layer, (), block, res_weight, rms_weight,
+                                       out_weight)
+        output = torch.empty_like(layer)
+        kimi_k3_attn_res.run_attn_res(layer, (),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      None,
+                                      snapshots_after_wait=snapshots_after_wait)
+        return output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_rmsnorm")
+    def _(layer: torch.Tensor,
+          block: torch.Tensor,
+          res_weight: torch.Tensor,
+          rms_weight: torch.Tensor,
+          out_weight: torch.Tensor,
+          rms_eps: float,
+          out_eps: float,
+          snapshots_after_wait: bool = False) -> torch.Tensor:
+        return torch.empty_like(layer)
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_add_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_add_rmsnorm(
+            prefix: torch.Tensor, addend: torch.Tensor, block: torch.Tensor,
+            res_weight: torch.Tensor, rms_weight: torch.Tensor,
+            out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(bf16(prefix + addend), output)``: the residual add, then the mix
+        and RMSNorm on the updated prefix sum."""
+        _check_kimi_k3_attn_res_inputs(prefix, (addend, ), block, res_weight,
+                                       rms_weight, out_weight)
+        output = torch.empty_like(prefix)
+        updated = torch.empty_like(prefix)
+        kimi_k3_attn_res.run_attn_res(prefix, (addend, ), block, res_weight,
+                                      rms_weight, out_weight, rms_eps, out_eps,
+                                      output, updated)
+        return updated, output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_add_rmsnorm")
+    def _(prefix: torch.Tensor, addend: torch.Tensor, block: torch.Tensor,
+          res_weight: torch.Tensor, rms_weight: torch.Tensor,
+          out_weight: torch.Tensor, rms_eps: float,
+          out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(prefix), torch.empty_like(prefix)
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_moe_add_rmsnorm(
+            residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+            block: torch.Tensor, res_weight: torch.Tensor,
+            rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+            out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(prefix, output)`` with ``prefix = bf16(residual + bf16(routed +
+        shared))``, a MoE layer's residual update, then the mix and RMSNorm on
+        ``prefix``."""
+        _check_kimi_k3_attn_res_inputs(residual, (routed, shared), block,
+                                       res_weight, rms_weight, out_weight)
+        output = torch.empty_like(residual)
+        prefix = torch.empty_like(residual)
+        kimi_k3_attn_res.run_attn_res(residual, (routed, shared), block,
+                                      res_weight, rms_weight, out_weight,
+                                      rms_eps, out_eps, output, prefix)
+        return prefix, output
+
+    @torch.library.register_fake("trtllm::kimi_k3_attn_res_moe_add_rmsnorm")
+    def _(residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+          block: torch.Tensor, res_weight: torch.Tensor,
+          rms_weight: torch.Tensor, out_weight: torch.Tensor, rms_eps: float,
+          out_eps: float) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.empty_like(residual), torch.empty_like(residual)
+
+    def _kimi_k3_attn_res_mxfp8_outputs(
+            rows: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        xq = torch.empty_like(rows, dtype=torch.float8_e4m3fn)
+        xs = torch.empty(kimi_k3_attn_res.mxfp8_scale_numel(*rows.shape),
+                         dtype=torch.uint8,
+                         device=rows.device)
+        return xq, xs
+
+    @torch.library.custom_op("trtllm::kimi_k3_attn_res_moe_add_rmsnorm_mxfp8",
+                             mutates_args=(),
+                             device_types="cuda")
+    def kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
+        residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
+        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``kimi_k3_attn_res_moe_add_rmsnorm`` plus the MXFP8 form ``(xq,
+        xs)`` of its output: E4M3 ``[M, H]`` and UE8M0 1x32 scales in the
+        R128c4 layout, the bits the FP8 low-M GEMM's in-kernel quantization
+        makes of the output."""
+        _check_kimi_k3_attn_res_inputs(residual, (routed, shared), block,
+                                       res_weight, rms_weight, out_weight)
+        output = torch.empty_like(residual)
+        prefix = torch.empty_like(residual)
+        xq, xs = _kimi_k3_attn_res_mxfp8_outputs(residual)
+        kimi_k3_attn_res.run_attn_res(residual, (routed, shared),
+                                      block,
+                                      res_weight,
+                                      rms_weight,
+                                      out_weight,
+                                      rms_eps,
+                                      out_eps,
+                                      output,
+                                      prefix,
+                                      mxfp8_out=(xq, xs))
+        return prefix, output, xq, xs
+
+    @torch.library.register_fake(
+        "trtllm::kimi_k3_attn_res_moe_add_rmsnorm_mxfp8")
+    def _(
+        residual: torch.Tensor, routed: torch.Tensor, shared: torch.Tensor,
+        block: torch.Tensor, res_weight: torch.Tensor, rms_weight: torch.Tensor,
+        out_weight: torch.Tensor, rms_eps: float, out_eps: float
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        return (torch.empty_like(residual), torch.empty_like(residual),
+                *_kimi_k3_attn_res_mxfp8_outputs(residual))
 
     # =============================================================================
     # Dense GEMM with SwiGLU Fusion (FC1 Kernel for MoE as Dense GEMM)
