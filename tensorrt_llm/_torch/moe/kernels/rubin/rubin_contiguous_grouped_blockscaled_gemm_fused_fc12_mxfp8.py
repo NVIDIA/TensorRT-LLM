@@ -4390,6 +4390,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                 self.epilog_sync_barrier.arrive_and_wait()
                 if warp_idx == self.epilog_warp_id[0]:
                     with cute.arch.elect_one():
+                        # fc1_sfc is written with generic stores and read by
+                        # FC2's TMA (async proxy) loads; order those stores
+                        # before the release, as the consumer orders its
+                        # acquire before the loads.
+                        cute.arch.fence_proxy("async.global")
                         red_add_release_gpu(
                             fc1_ready,
                             mma_tile_coord_mnl[0],
