@@ -4478,14 +4478,23 @@ class KVCacheManagerV2(BaseResourceManager):
         split by KV head, head-major (HND), as the TRTLLM attention kernels write them; a K-only
         (MLA) cache holds one latent head, which every tensor rank holds whole. The cache type is
         the manager's (``kv_factor``); layers that differ in it (``layer_specs`` mixing K-only and
-        K/V caches) are not laid out apart. It names every layer its storage holds
-        (``_disagg_layer_names``). A manager registering other roles (``Role.INDEX_KEY``
-        included) or laying these out otherwise returns its own, usually this one with some fields
-        replaced (``dataclasses.replace``). A role that moves and that its spec does not lay out
-        has no layout (``PageTableSpec.layout_of``)."""
+        K/V caches) are not laid out apart. The roles its regions rebuild on the receiving worker
+        (``RegionTransfer.rebuilt_roles``) never move; a region transferring roles of its own is
+        not laid out yet. It names every layer its storage holds (``_disagg_layer_names``). A
+        manager registering other roles (``Role.INDEX_KEY`` included) or laying these out
+        otherwise returns its own, usually this one with some fields replaced
+        (``dataclasses.replace``). A role that moves and that its spec does not lay out has no
+        layout (``PageTableSpec.layout_of``)."""
         head_split = ByHead(total=1) if self.kv_factor == 1 else ByHead()
         names = self._disagg_layer_names()
         layer_ids = {layer: names[layer] for layers in layer_groups(self) for layer in layers}
+        regions = self.region_layout.regions
+        if any(region.transfer.mapper_kinds or region.transfer.role_layouts for region in regions):
+            raise NotImplementedError(
+                "a region's transferred roles are not laid out in the page table spec yet"
+            )
+        # Roles a region's receiving worker rebuilds or starts afresh never move.
+        rebuilt = frozenset(role for region in regions for role in region.transfer.rebuilt_roles)
         mixed_precision = None
         if self.mixed_precision_low_dtype is not None:
             mixed_precision = (
@@ -4494,6 +4503,7 @@ class KVCacheManagerV2(BaseResourceManager):
             )
         return PageTableSpec(
             role_layouts={role: head_split for role in _HEAD_SPLIT_ROLES},
+            untransferred_roles=rebuilt,
             layer_ids=layer_ids,
             quant_mode={"FP8": "fp8", "NVFP4": "nvfp4"}.get(kv_dtype_name(self)),
             mixed_precision=mixed_precision,

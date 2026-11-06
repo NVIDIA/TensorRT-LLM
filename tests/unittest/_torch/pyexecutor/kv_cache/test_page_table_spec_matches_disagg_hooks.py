@@ -67,6 +67,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import (
     RingSlots,
     Sectioned,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionLayout, RegionTransfer
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.runtime.kv_cache_manager_v2 import DataRole, LayerId
 
@@ -399,8 +400,10 @@ def test_qwen4_exp_side_caches_are_alike_on_every_rank():
 @pytest.mark.parametrize("kda_replay", [False, True])
 def test_kda_replay_caches_never_move(manager_cls, kda_replay):
     replay_role = DataRole("kda_test_replay")
-    replay = SimpleNamespace(disagg_ignored_roles=lambda layout: frozenset({replay_role}))
-    manager = _hybrid(manager_cls, _kda_replay=replay if kda_replay else None, _state_layout=None)
+    # The replay state is a region whose receiving worker starts it afresh.
+    replay = SimpleNamespace(transfer=RegionTransfer(rebuilt_roles=frozenset({replay_role})))
+    regions = RegionLayout(regions=(replay,) if kda_replay else ())
+    manager = _hybrid(manager_cls, _kda_replay=None, _region_layout=regions)
     # Without replay the manager registers no replay cache.
     roles = (*KV_ROLES, *STATE_ROLES, *((replay_role,) if kda_replay else ()))
     if manager_cls is Glm5NextCacheManager:

@@ -51,6 +51,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     _compute_index_mapper_capacity,
     _read_guard_page_setting,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Sectioned
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     AllocationUnit,
     HandOff,
@@ -61,7 +62,6 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.regions import (
     RegionProvider,
     RegionTransfer,
 )
-from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import ByHead, PageTableSpec, Sectioned
 from tensorrt_llm._torch.pyexecutor.kv_cache_stats import KVCacheV2IterationStatsReport
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
