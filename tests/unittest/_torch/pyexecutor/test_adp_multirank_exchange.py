@@ -180,8 +180,8 @@ def _worker_packed_extras_reject_a_width_mismatch(rank):
 
 def _worker_zero_hint_then_empty_probe_agree(rank):
     broadcaster = RequestBroadcaster(_GlooDist(), _NoHangDetector())
-    received, py_objects = broadcaster.broadcast([], known_nonempty=False)
-    assert received == [] and py_objects is None
+    received = broadcaster.broadcast([], known_nonempty=False)
+    assert received == []
 
 
 def _worker_drain_waits_for_the_busiest_rank(rank):

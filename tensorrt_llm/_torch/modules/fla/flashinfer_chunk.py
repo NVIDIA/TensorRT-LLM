@@ -93,7 +93,7 @@ def _int32_cu_seqlens(cu_seqlens: torch.Tensor) -> torch.Tensor:
     """``cu_seqlens`` as int32, cast at most once per iteration per buffer."""
     if cu_seqlens.dtype == torch.int32:
         return cu_seqlens
-    if torch.cuda.is_current_stream_capturing():
+    if cu_seqlens.is_cuda and torch.cuda.is_current_stream_capturing():
         # A graph replays on later iterations: it must record the cast itself
         # instead of reading the cached cast of the iteration it was captured in.
         return cu_seqlens.to(torch.int32)
