@@ -533,12 +533,6 @@ class Verdict:
     void: str = ""
     #: The check's :attr:`Check.inputs` when it ran.
     inputs: str = ""
-    #: What the check read of the tree: the id of its list of Python files
-    #: (``workflow._narrowed``), and the target's marker narrowed to them on
-    #: the commit it measured. With both, the verdict holds on any later state
-    #: of the target whose narrowed marker is the same (:func:`evaluate`).
-    reads: str = ""
-    reads_marker: str = ""
     #: How long the check's gate ran, in seconds; 0 when it did not say.
     duration_s: float = 0.0
     #: The score a benchmark measured (``GateResult.measured``), pass or fail.
@@ -550,8 +544,6 @@ _UNSAID: dict[str, Any] = {
     "imported": [],
     "void": "",
     "inputs": "",
-    "reads": "",
-    "reads_marker": "",
     "duration_s": 0.0,
     "measured": None,
 }
@@ -594,22 +586,13 @@ class ContractStatus:
                     )
         return cls(path=path, verdicts=verdicts)
 
-    def record(
-        self,
-        unit: str,
-        result: Any,
-        marker: str = "",
-        inputs: str = "",
-        *,
-        reads: tuple[str, str] = ("", ""),
-    ) -> Verdict:
+    def record(self, unit: str, result: Any, marker: str = "", inputs: str = "") -> Verdict:
         """Append one gate result, as returned by any gate, for ``unit``.
 
         ``marker`` is the target's state when the check was started; a result
         measured on a snapshot names the commit's own (``GateResult.marker``),
         and is recorded under that. ``inputs`` is the check's
-        (:attr:`Check.inputs`). ``reads`` is what it read of the tree, as
-        :attr:`Verdict.reads` and :attr:`Verdict.reads_marker`.
+        (:attr:`Check.inputs`).
         """
         void = str(getattr(result, "void", "") or "")
         verdict = Verdict(
@@ -623,8 +606,6 @@ class ContractStatus:
             imported=[str(i) for i in getattr(result, "imported", ()) or ()],
             void=void,
             inputs=inputs,
-            reads=reads[0],
-            reads_marker=reads[1],
             duration_s=_seconds(getattr(result, "duration_s", 0.0)),
             measured=_score(getattr(result, "measured", None)),
         )
@@ -670,20 +651,18 @@ def evaluate(
     contract: Contract,
     verdicts: Iterable[Verdict] | ContractStatus,
     marker: str | None = None,
-    holds: Callable[[Verdict], bool] | None = None,
 ) -> Evaluation:
     """Each required check against its latest verdict.
 
     With ``marker``, a verdict recorded against another state of the target is
-    stale and the check counts as missing, unless ``holds`` says it holds there
-    still (what it read of the tree is unchanged: :attr:`Verdict.reads`); so is
-    one whose :attr:`Verdict.inputs` are not the check's (one without inputs
-    counts as the check's). With an established ``marker``, a check with no
-    verdict of its own passes when an equivalent check (the same
-    :attr:`Check.equivalence`) passed on this state of the target. A check's own
-    verdict always wins over an equivalent's, so a check that failed here stays
-    failed, and two verdicts recorded where the marker was not established are
-    never taken to be about one tree.
+    stale and the check counts as missing; so is one whose
+    :attr:`Verdict.inputs` are not the check's (one without inputs counts as
+    the check's). With an established ``marker``, a check with no verdict of
+    its own passes when an equivalent check (the same :attr:`Check.equivalence`)
+    passed on this state of the target. A check's own verdict always wins over
+    an equivalent's, so a check that failed here stays failed, and two verdicts
+    recorded where the marker was not established are never taken to be about
+    one tree.
     """
     latest = (
         verdicts.latest()
@@ -691,11 +670,7 @@ def evaluate(
         else {f"{v.unit}:{v.gate}@{v.member}": v for v in verdicts}
     )
     if marker is not None:
-        latest = {
-            k: v
-            for k, v in latest.items()
-            if v.marker == marker or (marker and holds is not None and holds(v))
-        }
+        latest = {k: v for k, v in latest.items() if v.marker == marker}
     checks = {c.key: c for c in contract.checks}
     latest = {
         k: v
@@ -724,19 +699,10 @@ def evaluate(
     return Evaluation(tuple(passed), tuple(failed), tuple(missing), tuple(shared))
 
 
-def verdict_on(
-    status: ContractStatus,
-    key: str,
-    marker: str,
-    holds: Callable[[Verdict], bool] | None = None,
-) -> Verdict | None:
+def verdict_on(status: ContractStatus, key: str, marker: str) -> Verdict | None:
     """``key``'s latest verdict if it is about the target at ``marker``, as :func:`evaluate` reads it."""
     verdict = status.latest().get(key)
-    if verdict is None:
-        return None
-    if verdict.marker == marker or (marker and holds is not None and holds(verdict)):
-        return verdict
-    return None
+    return verdict if verdict is not None and verdict.marker == marker else None
 
 
 def measured_commit(

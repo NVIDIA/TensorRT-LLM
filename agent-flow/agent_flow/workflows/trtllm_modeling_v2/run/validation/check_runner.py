@@ -480,8 +480,7 @@ class CheckRunner:
         key = f"{base}:{check.gate}@{check.member}"
         marker = self.pin.marker if self.pin else self.workflow._target_marker()
         status = getattr(self.workflow, "_contract_status", None)
-        holds = getattr(self.workflow, "_verdict_holds", None)
-        verdict = contract_mod.verdict_on(status(), key, marker, holds) if status else None
+        verdict = contract_mod.verdict_on(status(), key, marker) if status else None
         if verdict is not None:
             score, why = verdict.measured, verdict.detail
         else:

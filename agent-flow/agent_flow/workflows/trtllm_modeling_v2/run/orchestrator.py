@@ -186,12 +186,6 @@ class Services:
     #: What the stage has for the planner outside any task since last asked (the
     #: operator's messages): each an event of the next turn.
     stage_notes: Callable[[], list[str]] | None = None
-    #: What a gate result read of the tree, as the contract records it
-    #: (:attr:`~.contract.Verdict.reads`, ``reads_marker``).
-    narrow: Callable[[Any], tuple[str, str]] | None = None
-    #: Whether a verdict recorded on another state of the target holds on it as it
-    #: is now: what it read of the tree is unchanged.
-    holds: Callable[[contract_mod.Verdict], bool] | None = None
     #: One regression check (no agent turn): run the package tests after its batch of
     #: changes to shared code and return what failed, one line each (blocking; on the check
     #: pool). ``None``: a regression check passes with nothing run.
@@ -541,7 +535,7 @@ class GraphOrchestrator:
             with self._check_lock(first.key):
                 marker = self.s.marker()
                 with self._status_lock:
-                    had = contract_mod.verdict_on(self.status, first.key, marker, self.s.holds)
+                    had = contract_mod.verdict_on(self.status, first.key, marker)
                 if had is None:
                     self._run_check(first)
         with self._check_lock(check.key):
@@ -551,15 +545,12 @@ class GraphOrchestrator:
         marker = self.s.marker()
         if marker:
             with self._status_lock:
-                evaluation = contract_mod.evaluate(
-                    self.contract, self.status, marker=marker, holds=self.s.holds
-                )
+                evaluation = contract_mod.evaluate(self.contract, self.status, marker=marker)
             if check.key in {c.key for c in evaluation.passed}:
                 return True
         result = self.s.check(check)
-        reads = self.s.narrow(result) if self.s.narrow is not None else ("", "")
         with self._status_lock:
-            self.status.record(check.unit, result, marker=marker, inputs=check.inputs, reads=reads)
+            self.status.record(check.unit, result, marker=marker, inputs=check.inputs)
         return bool(result.passed)
 
     def _submit_checks(
@@ -669,9 +660,7 @@ class GraphOrchestrator:
         """The target's marker now, and the contract evaluated on it."""
         marker = self.s.marker()
         with self._status_lock:
-            return marker, contract_mod.evaluate(
-                self.contract, self.status, marker=marker, holds=self.s.holds
-            )
+            return marker, contract_mod.evaluate(self.contract, self.status, marker=marker)
 
     def _completion(
         self,

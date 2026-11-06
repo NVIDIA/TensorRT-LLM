@@ -165,8 +165,6 @@ class ExecutionStage:
             cells=getattr(self.workflow, "_mark_cells", None),
             delivery_files=lambda: deliver.delivery_failures(self.workflow),
             stage_notes=self._take_stage_notes,
-            narrow=getattr(self.workflow, "_narrowed", None),
-            holds=getattr(self.workflow, "_verdict_holds", None),
             regression=self._run_regression_check,
         )
         self._own_paths = self._regression_paths()
@@ -224,10 +222,7 @@ class ExecutionStage:
         self.campaign = orchestrator.campaign
         marker = self.workflow._target_marker()
         evaluation = contract_mod.evaluate(
-            contract,
-            self.workflow._contract_status(),
-            marker=marker,
-            holds=getattr(self.workflow, "_verdict_holds", None),
+            contract, self.workflow._contract_status(), marker=marker
         )
         self.workflow.journal.section(
             f"execution stage: {verdict}",
