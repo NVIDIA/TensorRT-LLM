@@ -172,7 +172,7 @@ def test_rewritten_history_is_identical_to_full_tokenization(tokenizer: Any) -> 
         assert cache.divergent_hits == 0
 
 
-def test_a_split_inside_a_multi_token_character_is_not_used() -> None:
+def test_a_split_is_moved_to_the_first_token_of_a_multi_token_character() -> None:
     tokenizer, cache = _ExpandingTokenizer(), _cache()
     text = _PREAMBLE
     for i in range(12):
@@ -181,6 +181,9 @@ def test_a_split_inside_a_multi_token_character_is_not_used() -> None:
         assert cache.encode(tokenizer, text) == tokenizer(text)["input_ids"]
         rewritten = text[:-10] + "rewritten. "
         assert cache.encode(tokenizer, rewritten) == tokenizer(rewritten)["input_ids"]
+    # The splits are usable, not rejected at the seam.
+    assert cache.resync_failures == 0
+    assert cache.divergent_hits > 0
 
 
 def test_short_prompts_are_tokenized_but_not_cached() -> None:

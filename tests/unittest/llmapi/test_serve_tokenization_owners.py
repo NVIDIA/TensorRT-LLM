@@ -18,6 +18,9 @@ Two frontends are simulated in one process: each has its own cache and serves it
 on its own socket, as two trtllm-serve frontend processes do.
 """
 
+import os
+import socket
+import time
 from typing import Any
 
 import pytest
@@ -27,7 +30,7 @@ from tensorrt_llm.inputs.prefix_token_cache import (
     PrefixTokenCacheConfig,
     tokenization_routing_key,
 )
-from tensorrt_llm.serve.tokenization_owners import TokenizationOwners, owner_of
+from tensorrt_llm.serve.tokenization_owners import SOCKET_NAME, TokenizationOwners, owner_of
 
 pytestmark = pytest.mark.cpu_only
 
@@ -101,7 +104,7 @@ class _FailingTokenizer(_CharTokenizer):
 
 def test_a_prompt_is_tokenized_locally_when_its_owner_does_not_tokenize_it(tmp_path) -> None:
     tokenizer, cache = _CharTokenizer(), _cache()
-    owners = [TokenizationOwners(str(tmp_path), 0, 2, cache, tokenizer)]
+    owners = [TokenizationOwners(str(tmp_path), 0, 2, cache, tokenizer, retry_after_s=0.0)]
     try:
         prompt = _turns(1)[0]
         with tokenization_routing_key(_key_owned_by(1, 2)):
@@ -118,6 +121,28 @@ def test_a_prompt_is_tokenized_locally_when_its_owner_does_not_tokenize_it(tmp_p
     finally:
         for owner in owners:
             owner.close()
+
+
+def test_a_hung_owner_is_skipped_after_it_times_out(tmp_path) -> None:
+    tokenizer, cache = _CharTokenizer(), _cache()
+    # Frontend 1 accepts connections but never answers.
+    hung = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    hung.bind(os.path.join(str(tmp_path), SOCKET_NAME.format(1)))
+    hung.listen()
+    owners = TokenizationOwners(str(tmp_path), 0, 2, cache, tokenizer, timeout_s=0.5)
+    try:
+        prompt = _turns(1)[0]
+        with tokenization_routing_key(_key_owned_by(1, 2)):
+            for _ in range(3):
+                start = time.monotonic()
+                assert cache.encode(tokenizer, prompt) == [ord(c) for c in prompt]
+                elapsed = time.monotonic() - start
+            # Only the first prompt waited for the owner.
+            assert elapsed < 0.25
+        assert (cache.routed, cache.route_failures) == (0, 3)
+    finally:
+        owners.close()
+        hung.close()
 
 
 def test_a_conversation_id_with_a_lone_surrogate_has_an_owner() -> None:

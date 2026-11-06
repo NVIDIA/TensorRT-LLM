@@ -44,6 +44,7 @@ from typing import Callable, ClassVar, Iterator, Mapping, NamedTuple, Protocol, 
 from ..logger import logger
 
 __all__ = [
+    "OffsetTokenizer",
     "PrefixTokenCache",
     "PrefixTokenCacheConfig",
     "RouteFailed",
@@ -146,12 +147,14 @@ class _Entry:
     text: str
     ids: array  # int32
     # Every prompt that keeps ``text[:split_char]`` is re-tokenized from the same
-    # place: token ``split_token``, which starts at character ``split_char``.
+    # place: token ``split_token``, the first token of character ``split_char``.
     split_token: int
     split_char: int
     probe: str  # the PROBE_CHARS characters of ``text`` before ``split_char``
-    # Start character of every ``checkpoint_tokens``-th token (0, C, 2C, ...),
-    # where a prompt that diverges from ``text`` can be re-tokenized from.
+    # Where a prompt that diverges from ``text`` can be re-tokenized from: the
+    # first token of the character holding every ``checkpoint_tokens``-th token
+    # (0, C, 2C, ...), and the start character of that token.
+    checkpoint_tokens: array  # int32
     checkpoints: array  # int32
 
 
@@ -243,7 +246,7 @@ class PrefixTokenCache:
         if found is not None:
             entry = found.entry
             tail_ids, tail_offsets = self._tokenize(tokenizer, text[found.split_char :])
-            if self._resynced(entry, found.split_token, tail_ids, tail_offsets):
+            if self._resynced(entry, found.split_token, tail_ids):
                 ids = entry.ids[: found.split_token].tolist() + list(tail_ids)
                 base_token, base_char = found.split_token, found.split_char
         if ids is None:
@@ -253,6 +256,9 @@ class PrefixTokenCache:
         # Where a prompt extending this one will be re-tokenized from.
         split_token = len(ids) - self._config.overlap
         tail_index = split_token - base_token
+        if tail_index >= 0:
+            tail_index = _first_of_char(tail_offsets, tail_index)
+            split_token = base_token + tail_index
 
         with self._lock:
             if found is None:
@@ -269,11 +275,16 @@ class PrefixTokenCache:
             if found is not None and found.extends:
                 self._remove(found.eid)
             if split_token > 0 and tail_index >= 0:
-                checkpoints = self._checkpoints(
+                checkpoint_tokens, checkpoints = self._checkpoints(
                     found, base_token, base_char, tail_offsets, len(ids)
                 )
                 self._insert(
-                    text, ids, split_token, base_char + tail_offsets[tail_index][0], checkpoints
+                    text,
+                    ids,
+                    split_token,
+                    base_char + tail_offsets[tail_index][0],
+                    checkpoint_tokens,
+                    checkpoints,
                 )
             report = (self.hits + self.misses) % LOG_EVERY_REQUESTS == 0
             summary = self.summary() if report else None
@@ -295,31 +306,21 @@ class PrefixTokenCache:
         base_char: int,
         tail_offsets: Sequence[tuple[int, int]],
         num_ids: int,
-    ) -> array:
-        """Checkpoints of a prompt whose ids are ``base_token`` cached ids plus a tail."""
+    ) -> tuple[array, array]:
+        """Checkpoint tokens and chars of ``base_token`` cached ids plus a tail."""
         step = self._config.checkpoint_tokens
         # Spliced ids before base_token are the cached entry's, at the same chars.
-        num_kept = -(-base_token // step)
-        out = array("i", found.entry.checkpoints[:num_kept] if base_token else ())
+        num_kept = -(-base_token // step) if base_token else 0
+        tokens = array("i", found.entry.checkpoint_tokens[:num_kept] if num_kept else ())
+        chars = array("i", found.entry.checkpoints[:num_kept] if num_kept else ())
         for index in range(num_kept * step, num_ids, step):
-            out.append(base_char + tail_offsets[index - base_token][0])
-        return out
+            tail_index = _first_of_char(tail_offsets, index - base_token)
+            tokens.append(base_token + tail_index)
+            chars.append(base_char + tail_offsets[tail_index][0])
+        return tokens, chars
 
-    def _resynced(
-        self,
-        entry: _Entry,
-        split_token: int,
-        tail_ids: Sequence[int],
-        tail_offsets: Sequence[tuple[int, int]],
-    ) -> bool:
+    def _resynced(self, entry: _Entry, split_token: int, tail_ids: Sequence[int]) -> bool:
         """Whether the tokenizer re-synchronized with the cached ids at the seam."""
-        # A character tokenized into several tokens (a byte-fallback character,
-        # an expanded ligature) reports the same start for each. If the tail
-        # opens with one, the split token may not be the first of them and the
-        # tail would repeat the cached ids before it, which a run of equal ids
-        # can hide from the comparison below.
-        if len(tail_offsets) > 1 and tail_offsets[1][0] == tail_offsets[0][0]:
-            return False
         cached_tail = entry.ids[split_token:]
         span = min(self._config.resync, len(tail_ids), len(cached_tail))
         return span > 0 and list(tail_ids[:span]) == cached_tail[:span].tolist()
@@ -328,7 +329,7 @@ class PrefixTokenCache:
         return hash(text[: self._config.min_chars])
 
     def _lookup(self, text: str) -> _Match | None:
-        """Best cached entry to splice ``text`` from, promoted to MRU.
+        """Best cached entry to splice ``text`` from, promoted to MRU if ``text`` extends it.
 
         The entry with the longest re-tokenization prefix that ``text`` keeps
         wins. Without one, the
@@ -356,7 +357,9 @@ class PrefixTokenCache:
                 match = self._divergent_match(eid, entry, text)
                 if match is not None and (best is None or match.split_token > best.split_token):
                     best = match
-        if best is not None:
+        # A diverging prompt is not promoted: when the history was rewritten
+        # rather than branched, the entry it diverged from is dead.
+        if best is not None and best.extends:
             with self._lock:
                 if best.eid in self._entries:
                     self._entries.move_to_end(best.eid)
@@ -370,8 +373,7 @@ class PrefixTokenCache:
         index = bisect.bisect_right(entry.checkpoints, common) - 2
         if index < 1:
             return None
-        split_token = index * self._config.checkpoint_tokens
-        return _Match(eid, entry, split_token, entry.checkpoints[index], False)
+        return _Match(eid, entry, entry.checkpoint_tokens[index], entry.checkpoints[index], False)
 
     def _insert(
         self,
@@ -379,6 +381,7 @@ class PrefixTokenCache:
         ids: Sequence[int],
         split_token: int,
         split_char: int,
+        checkpoint_tokens: array,
         checkpoints: array,
     ) -> None:
         """Caller holds the lock."""
@@ -388,7 +391,9 @@ class PrefixTokenCache:
             return  # concurrent misses on the same prompt
         eid, self._next_id = self._next_id, self._next_id + 1
         probe = text[max(split_char - PROBE_CHARS, 0) : split_char]
-        entry = _Entry(text, array("i", ids), split_token, split_char, probe, checkpoints)
+        entry = _Entry(
+            text, array("i", ids), split_token, split_char, probe, checkpoint_tokens, checkpoints
+        )
         self._entries[eid] = entry
         bucket[eid] = entry
         self._total_chars += len(text)
@@ -416,9 +421,27 @@ def _common_prefix_len(a: str, b: str) -> int:
     n, i, block = min(len(a), len(b)), 0, 4096
     while i < n and a[i : i + block] == b[i : i + block]:
         i += block
-    while i < n and a[i] == b[i]:
-        i += 1
-    return min(i, n)
+    # The first mismatch, if any, lies in the block at i; halve it to find it.
+    lo, hi = min(i, n), min(i + block, n)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if a[lo:mid] == b[lo:mid]:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+def _first_of_char(offsets: Sequence[tuple[int, int]], index: int) -> int:
+    """First token of the character token ``index`` starts in.
+
+    A character tokenized into several tokens (a byte-fallback character, an
+    expanded ligature) reports the same start for each; a split must not
+    separate them, or the tail would repeat the tokens of that character.
+    """
+    while index > 0 and offsets[index - 1][0] == offsets[index][0]:
+        index -= 1
+    return index
 
 
 def create_prefix_token_cache(tokenizer: object) -> PrefixTokenCache | None:
