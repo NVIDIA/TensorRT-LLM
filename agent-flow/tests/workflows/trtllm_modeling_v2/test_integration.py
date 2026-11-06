@@ -517,35 +517,6 @@ def test_only_a_commit_a_gate_can_see_changes_the_marker(checkout, name, seen):
     assert (workflow._target_marker() != before) is seen
 
 
-def test_a_verdict_stops_holding_once_the_native_libraries_are_rebuilt(checkout):
-    """A rebuild under the same commit changes what every check ran, though no commit moved."""
-    with (checkout / ".git" / "info" / "exclude").open("a") as exclude:
-        exclude.write("*.so\n")
-    library = checkout / "tensorrt_llm" / "libs" / "libth_common.so"
-    library.parent.mkdir(parents=True)
-    library.write_bytes(b"\x7fELF")
-    workflow = _workflow_marker_workflow(checkout)
-    commit = _git(checkout, "rev-parse", "HEAD").strip()
-    boot = check_result.GateResult(
-        name="boot",
-        member="tp1",
-        passed=True,
-        detail="",
-        tree_state=commit[:10],
-        marker=workflow._target_marker(),
-        imported=(commit,),
-        reads=("tensorrt_llm/models/target.py",),
-    )
-    status = contract_mod.ContractStatus.load(workflow.workspace)
-    verdict = status.record("core", boot, reads=workflow._narrowed(boot))
-    # A Python file the check never imported: the verdict holds on the new head.
-    _workflow_marker_commit(checkout, "tensorrt_llm/models/other.py", "O = 1\n")
-    assert workflow._verdict_holds(verdict)
-
-    library.write_bytes(b"\x7fELF, rebuilt")
-    assert not workflow._verdict_holds(verdict)
-
-
 def _planned_writer(tmp_path, monkeypatch, decision="LANDED"):
     wf = _workflow(tmp_path)
     wf._turns.keep_records(wf.workspace / "turns")

@@ -273,9 +273,8 @@ def test_a_standalone_tune_takes_its_tested_source_from_the_onboarding_it_names(
             (contract_mod.Check("core", "boot", "tp1", contract_mod.TIER_INNER),)
         ),
         _head=lambda: head,
-        _commit_marker=lambda sha, reads=None: f"m-{sha}",
+        _commit_marker=lambda sha: f"m-{sha}",
         _contract_status=lambda: contract_mod.ContractStatus.load(standalone),
-        _verdict_holds=lambda verdict, workspace=None: False,
         _checkpoint=lambda state: None,
     )
     wf.task_data = task

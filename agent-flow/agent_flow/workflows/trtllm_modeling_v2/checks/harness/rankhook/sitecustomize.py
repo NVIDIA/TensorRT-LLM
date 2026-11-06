@@ -11,10 +11,6 @@ imported and wraps ``BaseWorker.setup_engine``: once the worker's engine is
 set up, the worker prints one ``MV2FLOW_RANK_ENGINE`` record carrying its
 rank (``engine_facts.emit_rank``).
 
-With ``MV2FLOW_READS_DIR`` and ``MV2FLOW_TREE`` set, every process also
-writes which of the tree's Python modules it imported (:func:`_dump_reads`),
-once the engine is up and at exit.
-
 Without the variable this module only hands on to the next ``sitecustomize``
 on ``sys.path``, the one it shadows; that hand-on moves forward along
 ``sys.path`` only, so two hooks of this kind never hand on to each other in a
@@ -23,50 +19,14 @@ loop.
 Standard library only.
 """
 
-import atexit
 import importlib.util
-import json
 import os
-import socket
 import sys
 
 _HERE = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
 _ENABLED = os.environ.get("MV2FLOW_RANK_FACTS") == "1"
 _MODULE = "tensorrt_llm.executor.base_worker"
 _FACTS = os.path.join(os.path.dirname(_HERE), "engine_facts.py")
-#: Where each process writes what it read of the tree under test (``MV2FLOW_TREE``).
-_READS_DIR = os.environ.get("MV2FLOW_READS_DIR", "")
-_TREE = os.environ.get("MV2FLOW_TREE", "")
-
-
-def _dump_reads():
-    """Write the tree's modules this process imported, relative to the tree, to ``_READS_DIR``.
-
-    One file per process, rewritten whole each time with everything imported
-    so far: once the engine is up, and again at exit (``run/workspace/snapshots.py``
-    reads them).
-    """
-    if not (_READS_DIR and _TREE):
-        return
-    root = os.path.realpath(_TREE) + os.sep
-    found = set()
-    for module in list(sys.modules.values()):
-        path = getattr(module, "__file__", None)
-        if not path:
-            continue
-        real = os.path.realpath(path)
-        if real.startswith(root) and real.endswith(".py"):
-            found.add(real[len(root) :])
-    target = os.path.join(_READS_DIR, f"{socket.gethostname()}-{os.getpid()}.json")
-    try:
-        os.makedirs(_READS_DIR, exist_ok=True)
-        partial = f"{target}.{os.getpid()}.tmp"
-        with open(partial, "w", encoding="utf-8") as handle:
-            json.dump(sorted(found), handle)
-        os.replace(partial, target)
-    # What a process read is an observation; failing to write it never stops the process.
-    except (OSError, ValueError):
-        pass
 
 
 def _report(worker):
@@ -84,7 +44,6 @@ def _wrap(module):
 
     def setup_engine(worker, *args, **kwargs):
         result = original(worker, *args, **kwargs)
-        _dump_reads()
         try:
             _report(worker)
         # An observation of an engine that is up must never stop it.
@@ -155,6 +114,4 @@ def _chain():
 
 if _ENABLED:
     sys.meta_path.insert(0, _Watcher())
-if _READS_DIR:
-    atexit.register(_dump_reads)
 _chain()
