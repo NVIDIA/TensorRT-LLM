@@ -32,7 +32,6 @@ DWDP ([Tech Blog 19](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Pe
   - [Accuracy](#accuracy)
   - [Reproducing Steps](#reproducing-steps)
 - [Summary](#summary)
-- [Future Work](#future-work)
 - [Acknowledgment](#acknowledgment)
 
 ## Motivation
@@ -420,24 +419,6 @@ Launch the context workers with `--server_role CONTEXT`, then replay the AgentX 
 - The freed memory is worth what it buys: longer prefill chunks and a larger KV cache. On Vera Rubin NVL72 this lets the context tier serve the same agentic load with fewer GPUs, for 6.1% to 19.1% more output throughput per GPU along the Pareto curve.
 - Fewer context GPUs means more load per GPU. At the throughput end the context tier can be sized to the TTFT budget, from lower latency at the same GPUs to the most throughput with a longer tail.
 - Dense DWDP needs high-bandwidth peer memory access and a compute window that covers the expert prefetch, which is why it targets context servers on NVL72 systems.
-
-## Future Work
-
-### Dense DWDP on Generation Servers
-
-Generation GPUs replicate the same dense weights. At the throughput end of the curve, a generation GPU's decode batch is limited by its KV cache: each request holds about 4 GB of KV cache and recurrent state, so a GPU runs about 16 requests. Freeing the dense weights would add about 45 GiB of KV cache per GPU and allow about 28. The catch is the transfer: a decode step reads every layer's weights, so each GPU would gather about 55 GB per step, against about 170 tokens of work per step at batch 28. The gathers hide only if NVLink reaches at least 2.35 times the efficiency of the decode step itself, about 1.2 TB/s per direction at today's decode efficiency. Our first measurement on a DEP16 generation server shows the other cost: at batch 16 the gathers slowed the decode kernels that ran next to them and the step time rose from 45.9 to 67.8 ms. Making this pay off needs a gather that runs much closer to the NVLink peak next to decode, and far less interference with the decode kernels.
-
-### Throughput in Standalone Mode
-
-The standalone mode works on a DEP16 context instance and gives each GPU about 40 GiB more KV cache, but in our context-only test it did not raise throughput yet: with the SM gather it served 1.6% fewer requests per second, and with copy engines it slowed the KV cache transfers to the generation servers. We will study where the freed memory pays off on attention-DP context servers.
-
-### Better Rate Matching Between Context and Generation
-
-The TTFT tail at aggressive context tiers comes from queueing behind long prefills, not from slower prefill. Scheduling that lets short prefills pass long ones, together with finer-grained context tiers, should let deployments take more of the throughput gain within a TTFT budget.
-
-### More Models and Execution Modes
-
-Dense DWDP supports Kimi-K3 today. Any model whose decoder layers declare their dense roots can use it, and supporting CUDA graphs and the overlap scheduler on attached context servers would widen where it applies.
 
 ## Acknowledgment
 
