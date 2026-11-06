@@ -15,19 +15,23 @@
 """How the bytes of a role's buffers spread over ranks, and what one rank sends another of them;
 the standard library only.
 
-A role's layout (``RoleLayout``) says how its bytes spread over ranks. The buffers of one layer and
-role on all ranks together hold one space of bytes, of which each rank's buffer holds pieces
-(``RoleLayout.pieces``):
+A role's layout (``RoleLayoutV2``) says how its bytes spread over ranks. The buffers of one layer
+and role on all ranks together hold one space of bytes, of which each rank's buffer holds pieces
+(``RoleLayoutV2.pieces``):
 
     ByHead(head_bytes=256, total=8)  # 8 heads of 256 B; TP2 rank 1 holds heads 4..7, bytes 1024..
     Sectioned((32, 16, 16))          # [x | B | C], each section split by byte over the ranks
     Replicated()                     # the whole buffer alike on every rank
     RingSlots(19)                    # token position p in slot p % 19, alike on every rank
 
-A new way of laying a role out is one ``RoleLayout`` subclass saying which pieces a rank holds.
+A new way of laying a role out is one ``RoleLayoutV2`` subclass saying which pieces a rank holds.
 What a source rank sends a destination rank of one role follows from the two layouts alone. A KV
-cache manager names a layout per role (``pyexecutor.kv_cache.page_table.PageTableSpec``). This
-module imports the standard library alone, so that any transfer backend may read the layouts."""
+cache manager names a layout per role (``page_table.PageTableSpec``). The layouts describe memory
+the KV cache owns, so they live beside it rather than in the transfer package; this module imports
+the standard library alone, so that any transfer backend may read them.
+
+``RoleLayoutV2`` is not the resharding geometry the ``get_disagg_*`` hooks return
+(``disaggregation.resource.page.RoleLayout``)."""
 
 from __future__ import annotations
 
@@ -45,7 +49,7 @@ __all__ = [
     "RankTopology",
     "Replicated",
     "RingSlots",
-    "RoleLayout",
+    "RoleLayoutV2",
     "Sectioned",
     "check_pieces",
     "grid_place",
@@ -61,7 +65,7 @@ def _integer(value: int, name: str, minimum: int = 0) -> int:
 
 
 GRID_DIMENSIONS = ("tp", "cp")
-"""Parallel dimensions a layout may split over (``RoleLayout.split``): "tp" the tensor-parallel
+"""Parallel dimensions a layout may split over (``RoleLayoutV2.split``): "tp" the tensor-parallel
 ranks of one attention data-parallel group, "cp" the context-parallel ranks. Pipeline ranks hold
 other layers and data-parallel ranks other requests, so neither splits a page."""
 
@@ -82,7 +86,7 @@ def grid_place(topology: RankTopology, dims: Sequence[str]) -> tuple[int, int]:
     return size, rank
 
 
-_ROLE_LAYOUTS: dict[str, type[RoleLayout]] = {}
+_ROLE_LAYOUTS: dict[str, type[RoleLayoutV2]] = {}
 
 
 def _register(registry: dict, cls: type, what: str) -> None:
@@ -136,7 +140,7 @@ class Piece:
 
 
 @dataclass(frozen=True)
-class RoleLayout:
+class RoleLayoutV2:
     """How the bytes of a role's buffers spread over ranks.
 
     The buffers of one layer and role on all ranks together hold one space of bytes. A rank's
@@ -169,9 +173,9 @@ class RoleLayout:
     def __init_subclass__(cls, **kwargs) -> None:
         super().__init_subclass__(**kwargs)
         if cls.positional and (
-            cls.positions is RoleLayout.positions
-            or cls.index_of is RoleLayout.index_of
-            or cls.stride is RoleLayout.stride
+            cls.positions is RoleLayoutV2.positions
+            or cls.index_of is RoleLayoutV2.index_of
+            or cls.stride is RoleLayoutV2.stride
         ):
             raise TypeError(
                 f"role layout {cls.__name__} holds token positions but does not say which a page "
@@ -193,7 +197,7 @@ class RoleLayout:
         spec as a whole (``quant_mode``, ``mixed_precision``) and peers' byte sizes."""
         return None
 
-    def resolve(self, site: Any) -> RoleLayout:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         """The layout of one buffer, filling what a manager's spec leaves to each buffer from its
         facts (its size, tokens, heads, and the dimensions its layer group splits over): this
         layout itself by default."""
@@ -248,8 +252,8 @@ class RoleLayout:
         return {"layout": self.name, **fields}
 
 
-def role_layout_from_dict(data: Mapping) -> RoleLayout:
-    """The role layout ``RoleLayout.to_dict`` wrote, checked as its constructor checks it.
+def role_layout_from_dict(data: Mapping) -> RoleLayoutV2:
+    """The role layout ``RoleLayoutV2.to_dict`` wrote, checked as its constructor checks it.
 
     Raises:
         ValueError: If it names no registered layout.
@@ -261,21 +265,21 @@ def role_layout_from_dict(data: Mapping) -> RoleLayout:
     return _ROLE_LAYOUTS[name](**fields)
 
 
-def _dtype(layout: RoleLayout) -> None:
+def _dtype(layout: RoleLayoutV2) -> None:
     """Name the layout's element type as torch does, without its module: ``"bfloat16"`` for
     ``torch.bfloat16``."""
     if layout.dtype is not None:
         object.__setattr__(layout, "dtype", str(layout.dtype).removeprefix("torch."))
 
 
-def _typed(layout: RoleLayout, space: tuple) -> tuple:
+def _typed(layout: RoleLayoutV2, space: tuple) -> tuple:
     """``space`` with the layout's element type where it states one, so that peers whose elements
     differ in type lay out different spaces."""
     return space if layout.dtype is None else (*space, layout.dtype)
 
 
 @dataclass(frozen=True)
-class Replicated(RoleLayout):
+class Replicated(RoleLayoutV2):
     """The whole buffer alike on every rank, as an index-K cache is."""
 
     name: ClassVar[str] = "replicated"
@@ -288,7 +292,7 @@ class Replicated(RoleLayout):
 
 
 @dataclass(frozen=True)
-class Own(RoleLayout):
+class Own(RoleLayoutV2):
     """Each rank's own share among the ranks of ``split``, which pairs only with the same rank's:
     the layout of a buffer whose split the manager does not describe further, or that never moves.
 
@@ -308,7 +312,7 @@ class Own(RoleLayout):
     def __post_init__(self) -> None:
         object.__setattr__(self, "split", _split(self.split, "an owned layout"))
 
-    def resolve(self, site: Any) -> RoleLayout:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         return dataclasses.replace(self, split=site.split)
 
     def pieces(self, size: int, ranks: int, rank: int) -> tuple[Piece, ...]:
@@ -319,7 +323,7 @@ class Own(RoleLayout):
 
 
 @dataclass(frozen=True)
-class Sectioned(RoleLayout):
+class Sectioned(RoleLayoutV2):
     """Consecutive sections, each this rank's share of its own part of the space, split by byte
     over the ranks of ``split``, as Mamba2's conv state ``[x | B | C]`` is: with sections of 32,
     16 and 16 bytes on each of two ranks, rank 1 holds bytes 32..63, 80..95 and 112..127 of a
@@ -351,7 +355,7 @@ class Sectioned(RoleLayout):
         object.__setattr__(self, "split", _split(self.split, "a sectioned layout"))
         _dtype(self)
 
-    def resolve(self, site: Any) -> RoleLayout:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         return dataclasses.replace(self, split=site.split)
 
     def check(self, size: int) -> None:
@@ -373,7 +377,7 @@ class Sectioned(RoleLayout):
 
 
 @dataclass(frozen=True)
-class ByHead(RoleLayout):
+class ByHead(RoleLayoutV2):
     """Split by head over the ranks of ``split``, head-major or, with ``token_major``,
     token-major.
 
@@ -426,7 +430,7 @@ class ByHead(RoleLayout):
         object.__setattr__(self, "split", _split(self.split, "a head split"))
         _dtype(self)
 
-    def resolve(self, site: Any) -> RoleLayout:
+    def resolve(self, site: Any) -> RoleLayoutV2:
         head_bytes, total = self.head_bytes, self.total
         if head_bytes is None and not site.state:
             kv_heads, kv_total = site.kv_heads
@@ -501,7 +505,7 @@ class ByHead(RoleLayout):
 
 
 @dataclass(frozen=True)
-class RingSlots(RoleLayout):
+class RingSlots(RoleLayoutV2):
     """A ring of ``slots`` token positions alike on every rank: of its page's tokens, position
     ``p`` lies in slot ``p % slots``, so the buffer keeps the latest ``slots`` positions the page
     has written. Each side sizes it as it keeps, so peers may differ in its slots.
@@ -548,7 +552,7 @@ class RingSlots(RoleLayout):
         return size // self.slots
 
 
-def check_pieces(layout: RoleLayout, size: int, ranks: int, rank: int) -> None:
+def check_pieces(layout: RoleLayoutV2, size: int, ranks: int, rank: int) -> None:
     """Check that the pieces a ``size``-byte buffer laid out by ``layout`` holds at place ``rank``
     of ``ranks`` lie back to back over it (over one position's bytes for a positional layout),
     holding no byte of the space twice: bytes no piece describes would never move, or be moved
