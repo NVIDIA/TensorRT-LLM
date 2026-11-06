@@ -1472,6 +1472,25 @@ class DFlashWorker(SpecWorkerBase):
             indptr = self._ctx_kv_indptr
         return table.flatten().contiguous(), indptr
 
+    def _ctx_alloc_tokens(self, request_ids) -> List[int]:
+        """Each context row's allocated length in tokens, in whole ctx pages.
+
+        Read from the KV cache manager's host-side capacity, which it sized
+        before this forward. The device block-table extent
+        (``_ctx_block_counts``) holds the same bound, but reading it back is a
+        D2H copy that waits for every kernel queued ahead of it, i.e. the
+        whole context forward, and so serializes the host with the GPU on
+        every context iteration. A manager without a host-side capacity keeps
+        that read.
+        """
+        kv_cache_map = getattr(self._ctx_kv_manager, "kv_cache_map", None)
+        page = self._ctx_page_size
+        if kv_cache_map is not None:
+            caches = [kv_cache_map.get(req_id) for req_id in request_ids]
+            if all(cache is not None for cache in caches):
+                return [-(-cache.capacity // page) * page for cache in caches]
+        return (self._ctx_block_counts[: len(request_ids)] * page).tolist()
+
     def _assign_slot(self, req_id: int, reset: bool = False, updates: Optional[dict] = None):
         """Get (or refresh) this request's context slot; None when none is free.
 
@@ -1870,10 +1889,8 @@ class DFlashWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         # A context write addresses pages through row i of the block table, so
         # it must fit that row's allocation as well as the arena's length.
-        # One tolist() for the whole loop: the lengths themselves come from
-        # _ctx_len_host, so the loop body below stays sync-free.
         ctx_alloc = (
-            (self._ctx_block_counts[:num_contexts] * self._ctx_page_size).tolist()
+            self._ctx_alloc_tokens(spec_metadata.request_ids[:num_contexts])
             if self._ctx_block_tables is not None
             else None
         )
