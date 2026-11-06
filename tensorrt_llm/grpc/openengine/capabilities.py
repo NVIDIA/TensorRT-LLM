@@ -88,14 +88,14 @@ def supports_image_routing(llm: Any, modalities: Collection[str]) -> bool:
 
 
 def resolve_media_capabilities(
-    llm: Any, implemented_modalities: Collection[str]
+    llm: Any, implemented_modalities: Collection[str], *, encoder_handoff: bool = False
 ) -> MediaCapabilities:
     """Intersect model support with implemented request handlers.
 
     A live registered processor prevents registry-only false positives.
     """
     input_processor = getattr(llm, "input_processor", None)
-    if getattr(getattr(llm, "args", None), "disable_mm_encoder", False):
+    if getattr(getattr(llm, "args", None), "disable_mm_encoder", False) and not encoder_handoff:
         return MediaCapabilities({})
 
     model_type = _loaded_model_type(llm)

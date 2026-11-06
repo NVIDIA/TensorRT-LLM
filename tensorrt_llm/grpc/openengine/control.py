@@ -28,6 +28,7 @@ from .bindings import (
     MINIMUM_CLIENT_REVISION,
     SCHEMA_RELEASE,
     SCHEMA_REVISION,
+    generation_pb2,
     kv_pb2,
     lifecycle_pb2,
     lora_pb2,
@@ -37,7 +38,7 @@ from .bindings import (
 )
 from .capabilities import supported_guides, supports_image_routing
 from .coordinator import CoordinationError, FrontendClient, InvalidRequestIdError
-from .errors import AbortFailedError
+from .errors import ENCODER_TRANSFER_REJECTED_METADATA, AbortFailedError, EncoderTransferRejected
 from .kv_events import data_parallel_size, events_config
 from .request_mapping import conversation_affinity_enabled, token_ids_input_supported
 
@@ -137,6 +138,37 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
                 self._load_snapshot_deadline = time.monotonic() + _LOAD_SNAPSHOT_CACHE_SECONDS
         return self._load_snapshot
 
+    async def TransferEncoderCache(self, request, context):
+        cache = getattr(self._inference, "_encoder_cache", None)
+        transfer = getattr(cache, "transfer", None)
+        if not transfer or self._inference.encoder_role != "encode":
+            await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder transfer is not enabled")
+            return
+        # Keep the task alive through cancellation: source buffers remain owned
+        # by the transfer until native completion or transport quarantine.
+        task = asyncio.create_task(asyncio.to_thread(transfer, request.cache, request.destination))
+        self._inference._encoder_cleanup_tasks.add(task)
+
+        def completed(done):
+            self._inference._encoder_cleanup_tasks.discard(done)
+            if not done.cancelled():
+                done.exception()  # Observe failures even when the requesting RPC was cancelled.
+
+        task.add_done_callback(completed)
+        try:
+            await asyncio.shield(task)
+        except EncoderTransferRejected as error:
+            await context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT,
+                str(error),
+                trailing_metadata=(ENCODER_TRANSFER_REJECTED_METADATA,),
+            )
+            return
+        except (RuntimeError, ValueError) as error:
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+            return
+        return generation_pb2.TransferEncoderCacheResponse()
+
     def _engine_is_healthy(self) -> bool:
         """Readiness via the predicate the engine's own HTTP /health uses.
 
@@ -145,6 +177,10 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         but not yet promoted is caught, and the proxy polls MPI worker liveness.
         It also covers encode-only engines, where `_executor` is None.
         """
+        if getattr(self._inference, "_encoder_cleanup_failed", False):
+            return False
+        if getattr(getattr(self._inference, "_encoder_cache", None), "failed", False):
+            return False
         check = getattr(self._llm, "_check_health", None)
         if callable(check):
             try:
@@ -296,6 +332,19 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
             reasoning_parser=str(self._llm.args.reasoning_parser or ""),
         )
         info.extra.update({"trtllm_supported_modalities": sorted(media_modalities)})
+        role = getattr(self._inference, "encoder_role", "")
+        if role:
+            info.extra.update({"trtllm_encoder_cache_release": True})
+            info.encoder.CopyFrom(
+                model_pb2.EncoderCapabilities(
+                    schema_version=1,
+                    encoder_only=role == "encode",
+                    accepts_cache=role == "consume",
+                    transfer_backends=[self._inference._encoder_cache.backend],
+                )
+            )
+        if role == "consume":
+            info.extra.update({"trtllm_requires_encoder_cache": True})
         if supports_image_routing(self._llm, media_modalities):
             info.extra.update({"trtllm_image_routing_version": 1})
 
@@ -310,6 +359,16 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         # discovery-becomes-a-per-request-failure case this service exists to
         # avoid. Unset means "unknown", which is the honest claim.
 
+        if role == "encode":
+            info.generation.CopyFrom(
+                model_pb2.GenerationCapabilities(
+                    prompt_logprobs=model_pb2.LogprobCapabilities(supported=False),
+                    output_logprobs=model_pb2.LogprobCapabilities(supported=False),
+                    guided_decoding=model_pb2.GuidedDecodingCapabilities(supported=False),
+                    max_num_sequences=1,
+                )
+            )
+            return info
         generation = model_pb2.GenerationCapabilities()
         # The bound is enforced per request, so it is known rather than unknown.
         logprobs = model_pb2.LogprobCapabilities(
@@ -478,6 +537,15 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
     async def _run_inference_probe(self, model: str) -> lifecycle_pb2.HealthCheck:
         from tensorrt_llm.sampling_params import SamplingParams
 
+        if getattr(self._inference, "encoder_role", "") == "encode":
+            return lifecycle_pb2.HealthCheck(
+                name="inference_probe",
+                state=lifecycle_pb2.HEALTH_STATE_READY,
+                message=(
+                    "probe not applicable: encoder-only engine does not generate tokens; "
+                    "inference liveness was not tested"
+                ),
+            )
         if not token_ids_input_supported(self._llm):
             return lifecycle_pb2.HealthCheck(
                 name="inference_probe",
@@ -542,6 +610,43 @@ class OpenEngineControlServicer(openengine_pb2_grpc.ControlServicer):
         context: grpc.aio.ServicerContext,
     ) -> lifecycle_pb2.AbortResponse:
         target = request.WhichOneof("target")
+
+        if target == "encoder_cache":
+            cache = getattr(self._inference, "_encoder_cache", None)
+            discard = getattr(cache, "discard", None)
+            if discard is None or getattr(self._inference, "encoder_role", "") != "encode":
+                await context.abort(grpc.StatusCode.UNIMPLEMENTED, "encoder release is not enabled")
+                return
+            task = asyncio.create_task(asyncio.to_thread(discard, request.encoder_cache))
+            cleanup_tasks = getattr(self._inference, "_encoder_cleanup_tasks", None)
+            if cleanup_tasks is not None:
+                cleanup_tasks.add(task)
+
+            def completed(done):
+                if cleanup_tasks is not None:
+                    cleanup_tasks.discard(done)
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(completed)
+            try:
+                removed = await asyncio.shield(task)
+            except ValueError as error:
+                await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(error))
+                return
+            except RuntimeError as error:
+                await context.abort(grpc.StatusCode.UNAVAILABLE, str(error))
+                return
+            except OSError as error:
+                await context.abort(grpc.StatusCode.INTERNAL, str(error))
+                return
+            return lifecycle_pb2.AbortResponse(
+                status=(
+                    lifecycle_pb2.ABORT_STATUS_ABORTED
+                    if removed
+                    else lifecycle_pb2.ABORT_STATUS_ALREADY_FINISHED
+                )
+            )
 
         if self._frontend is not None and target in ("request_id", "all_requests"):
             fields = {"request_id": request.request_id} if target == "request_id" else {}

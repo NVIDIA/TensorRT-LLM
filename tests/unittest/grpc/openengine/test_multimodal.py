@@ -11,7 +11,7 @@ import sys
 import threading
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 import pytest
+import torch
 
 grpc = pytest.importorskip(
     "grpc", reason='gRPC runtime not installed (pip install "grpcio>=1.67.1,<2")'
@@ -27,9 +28,12 @@ grpc = pytest.importorskip(
 from conftest import AbortError, FakeServicerContext  # noqa: E402
 
 import tensorrt_llm.grpc.openengine.request_mapping as request_mapping  # noqa: E402
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer  # noqa: E402
+from tensorrt_llm.disaggregated_params import DisaggregatedParams  # noqa: E402
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
     generation_pb2,
     model_pb2,
+    openengine_pb2_grpc,
     server_pb2,
 )
 from tensorrt_llm.grpc.openengine.capabilities import MediaCapabilities  # noqa: E402
@@ -2562,3 +2566,193 @@ async def test_raw_audio_mime_type_is_validated(image_video_audio_llm):
 
     with pytest.raises(ValueError, match="must start with audio/"):
         await request_mapping._input_from_request(request, image_video_audio_llm)
+
+
+@pytest.mark.asyncio
+@pytest.mark.threadleak(enabled=False)  # grpc.aio owns a process-lifetime polling thread.
+@pytest.mark.parametrize("request_type", ["", "context_and_generation", "context_only"])
+async def test_image_e_pd_over_grpc_uses_encoder_cache_without_downstream_fetch(
+    image_llm, monkeypatch, tmp_path, request_type
+):
+    separate_prefill_decode = request_type == "context_only"
+    capability_llm, _ = image_llm
+    processor = capability_llm.input_processor
+    processor.support_mm_disagg = True
+    processor.config.to_dict = lambda: {"model_type": processor.config.model_type}
+    encoder = _ImageLlm(processor, processor.config)
+    consumer = _ImageLlm(processor, processor.config)
+    decoder = _ImageLlm(processor, processor.config)
+    encoder.args.mm_encoder_only = True
+    consumer.args.disable_mm_encoder = True
+    decoder.args.disable_mm_encoder = True
+    if separate_prefill_decode:
+        consumer.result_handle._result.outputs[0].disaggregated_params = DisaggregatedParams(
+            request_type="context_only", ctx_request_id=123, opaque_state=b"kv-state"
+        )
+    expected = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    encoder.result_handle._result.disaggregated_params = DisaggregatedParams(
+        multimodal_embedding_handles=[SharedTensorContainer.from_tensor(expected).dump_to_dict()],
+        multimodal_hashes=[[1] * 8],
+    )
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    calls = []
+
+    class ImageIo:
+        @classmethod
+        def create(cls, defaults, runtime):
+            return cls()
+
+        async def async_load_bytes(self, data):
+            calls.append(data)
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+
+    monkeypatch.setattr(request_mapping, "ImageMediaIO", ImageIo)
+    received = []
+    prepared_state = {}
+    restored_state = []
+
+    @contextmanager
+    def capture_decode_state():
+        yield prepared_state
+
+    def restore_decode_state(state, prompt_length, **kwargs):
+        restored_state.append((state, prompt_length))
+        return {}
+
+    monkeypatch.setattr(
+        processor, "capture_decode_state", capture_decode_state if separate_prefill_decode else None
+    )
+    monkeypatch.setattr(processor, "restore_decode_state", restore_decode_state)
+
+    def consume(inputs, sampling, params):
+        assert "multi_modal_data" not in inputs
+        assert params.request_type == (
+            "context_only" if separate_prefill_decode else "context_and_generation"
+        )
+        prepared_state.update(prompt_token_ids=[1, 2, 3, 4, 5, 6], state={"position": 5})
+        received.append(
+            SharedTensorContainer.from_dict(params.multimodal_embedding_handles[0])
+            .get_local_view()
+            .clone()
+        )
+        return inputs
+
+    consumer.preprocess = consume
+    decoder.preprocess = lambda *_: pytest.fail("decode must reuse prefill preparation")
+    servers = []
+    channels = []
+    try:
+        clients = []
+        for llm in (encoder, consumer, decoder):
+            server = grpc.aio.server()
+            openengine_pb2_grpc.add_InferenceServicer_to_server(
+                OpenEngineInferenceServicer(llm, "image-model"), server
+            )
+            port = server.add_insecure_port("127.0.0.1:0")
+            await server.start()
+            servers.append(server)
+            channel = grpc.aio.insecure_channel(f"127.0.0.1:{port}")
+            channels.append(channel)
+            clients.append(openengine_pb2_grpc.InferenceStub(channel))
+        request = generation_pb2.GenerateRequest(
+            request_id="e",
+            model="image-model",
+            prompt="<image_1> describe",
+            media=[
+                generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+            ],
+            encoder=generation_pb2.EncoderOptions(encode_only=True),
+        )
+        responses = [value async for value in clients[0].Generate(request, timeout=10)]
+        assert [value.WhichOneof("event") for value in responses] == ["encoder_ready"]
+        request.request_id = "pd"
+        request.encoder.CopyFrom(
+            generation_pb2.EncoderOptions(cache=responses[0].encoder_ready.cache)
+        )
+        if request_type:
+            request.extra.update({"request_type": request_type})
+        responses = [value async for value in clients[1].Generate(request, timeout=10)]
+        if separate_prefill_decode:
+            assert responses[-1].WhichOneof("event") == "prefill_ready"
+            session = responses[-1].prefill_ready.kv_session
+            assert "trtllm_decode_preparation" in session.attributes_struct.fields
+            request.request_id = "d"
+            request.ClearField("encoder")
+            request.ClearField("extra")
+            request.kv.session.CopyFrom(session)
+            responses = [value async for value in clients[2].Generate(request, timeout=10)]
+            assert restored_state == [({"position": 5}, 6)]
+            assert isinstance(decoder.generate_kwargs["inputs"], PreprocessedInputs)
+        assert responses[-1].WhichOneof("event") == "finished"
+        assert responses[-1].usage.completion_tokens > 0
+        assert len(calls) == 1
+        assert len(received) == 1 and torch.equal(received[0], expected)
+        assert not list(tmp_path.glob("*.safetensors"))
+    finally:
+        for channel in channels:
+            await channel.close()
+        for server in servers:
+            await server.stop(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing_hook", "missing_state", "oversized_state"])
+async def test_encoder_prefill_rejects_unusable_decode_state_and_reclaims_inputs(
+    image_llm, monkeypatch, tmp_path, failure
+):
+    capability_llm, _ = image_llm
+    processor = capability_llm.input_processor
+    processor.support_mm_disagg = True
+    processor.config.to_dict = lambda: {"model_type": processor.config.model_type}
+    consumer = _ImageLlm(processor, processor.config)
+    consumer.args.disable_mm_encoder = True
+    monkeypatch.setenv("TRTLLM_OPENENGINE_ENCODER_CACHE_DIR", str(tmp_path))
+    inference = OpenEngineInferenceServicer(consumer, "image-model")
+    released = []
+    claimed = []
+    inputs = PreprocessedInputs(
+        prompt_token_ids=[1, 2, 3, 4, 5, 6],
+        multimodal_params=SimpleNamespace(
+            multimodal_input=None, release_handles=lambda: released.append(True)
+        ),
+    )
+
+    def prepare(*args):
+        claimed.append(True)
+        return inputs, args[-1]
+
+    @contextmanager
+    def capture_decode_state():
+        yield (
+            {
+                "prompt_token_ids": inputs.prompt_token_ids,
+                "state": {"padding": "x" * (2 * 1024 * 1024)},
+            }
+            if failure == "oversized_state"
+            else {}
+        )
+
+    monkeypatch.setattr(inference._encoder_cache, "prepare", prepare)
+    monkeypatch.setattr(
+        processor,
+        "capture_decode_state",
+        None if failure == "missing_hook" else capture_decode_state,
+    )
+    request = generation_pb2.GenerateRequest(
+        request_id="prefill-without-decode-state",
+        model="image-model",
+        prompt="<image_1> describe",
+        media=[
+            generation_pb2.MediaItem(modality=generation_pb2.MODALITY_IMAGE, raw_bytes=b"image")
+        ],
+        encoder=generation_pb2.EncoderOptions(
+            cache=generation_pb2.EncoderCacheRef(transfer_backend="unused", opaque_state=b"cache")
+        ),
+        extra={"request_type": "context_only"},
+    )
+    context = FakeServicerContext()
+    with pytest.raises(AbortError, match="requires portable decode preparation"):
+        _ = [response async for response in inference.Generate(request, context)]
+    assert context.abort_code == grpc.StatusCode.UNIMPLEMENTED
+    assert consumer.generate_kwargs is None
+    assert claimed == released == ([] if failure == "missing_hook" else [True])
