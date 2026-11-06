@@ -25,6 +25,8 @@ l0_b300:
   - unittest/_torch/modules/test_engram_replay.py
   - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
   - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_mma_split_k_deterministic
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_small_m_fma_candidates_agree
   # Covers the GPU cases of tests/unittest/_torch/attention/ on B300, except the paths
   # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
   # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
@@ -154,7 +156,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/quantization TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_103__tep4 TIMEOUT (30)
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16 TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__tp1 TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py --import-mode=importlib TIMEOUT (30)
