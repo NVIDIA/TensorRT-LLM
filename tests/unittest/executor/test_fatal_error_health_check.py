@@ -27,6 +27,7 @@ Tests cover:
 
 # Import classify_error directly from the source file to avoid triggering
 # the heavy tensorrt_llm.__init__ (which loads C++ extensions).
+import asyncio
 import importlib.util
 import logging
 import pathlib
@@ -909,35 +910,133 @@ class TestOpenAIHealthEndpoint:
         ],
     )
     async def test_health(self, check_healthy, fatal_error, expect_code, sigint):
-        """Verify status code and SIGINT behavior for different health states."""
-        from starlette.responses import Response
+        """Verify status code and SIGINT behavior for different health states.
 
-        server = MagicMock()
+        Calls the real ``OpenAIServer.health()`` rather than reimplementing
+        its logic inline -- the old inline reimplementation tested the
+        pre-#18663-fix guard (``not getattr(executor, 'doing_shutdown',
+        True)``) even after that guard was replaced, silently exercising
+        dead code instead of the real method.
+        """
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        server = object.__new__(OpenAIServer)
         server._check_health = Mock(return_value=check_healthy)
+        server._shutdown_signal_sent = False
         executor = Mock()
         executor._fatal_error = fatal_error
-        executor.doing_shutdown = False
         server.generator = Mock()
         server.generator._executor = executor
 
         with patch.object(signal, "raise_signal") as mock_sig:
-            if server._check_health():
-                response = Response(status_code=200)
-            else:
-                ex = getattr(server.generator, "_executor", None)
-                if (
-                    ex is not None
-                    and getattr(ex, "_fatal_error", None) is not None
-                    and not getattr(ex, "doing_shutdown", True)
-                ):
-                    signal.raise_signal(signal.SIGINT)
-                response = Response(status_code=503)
+            response = await server.health()
 
-            assert response.status_code == expect_code
-            if sigint:
-                mock_sig.assert_called_once_with(signal.SIGINT)
-            else:
-                mock_sig.assert_not_called()
+        assert response.status_code == expect_code
+        if sigint:
+            mock_sig.assert_called_once_with(signal.SIGINT)
+        else:
+            mock_sig.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_health_concurrent_calls_raise_sigint_once(self):
+        """Empirically backs the no-lock design for concurrent /health calls.
+
+        health() is `async def` with no `await` between the guard and
+        `signal.raise_signal()`, and uvicorn runs single-worker/single-event-
+        loop, so two concurrent /health probes racing a fatal error should
+        still only raise SIGINT once -- not just by argument, but
+        demonstrated under ``asyncio.gather``.
+        """
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        server = object.__new__(OpenAIServer)
+        server._check_health = Mock(return_value=False)
+        server._shutdown_signal_sent = False
+        executor = Mock()
+        executor._fatal_error = RuntimeError("MPI worker exited unexpectedly")
+        server.generator = Mock()
+        server.generator._executor = executor
+
+        with patch.object(signal, "raise_signal") as mock_sig:
+            responses = await asyncio.gather(server.health(), server.health())
+
+        assert all(r.status_code == 503 for r in responses)
+        mock_sig.assert_called_once_with(signal.SIGINT)
+
+    @pytest.mark.asyncio
+    async def test_health_sigint_fires_when_doing_shutdown_already_true(self):
+        """Regression test for #18663.
+
+        GenerationExecutorProxy's background error-monitor thread sets
+        `doing_shutdown = True` autonomously the moment it detects a dead
+        MPI rank, before any /health call arrives. This reproduces exactly
+        that race and calls the real ``OpenAIServer.health()`` (not a
+        reimplementation) so it fails against the pre-fix guard
+        (``not getattr(executor, 'doing_shutdown', True)``, always False
+        here) and passes once health() uses its own one-shot
+        ``_shutdown_signal_sent`` latch instead.
+        """
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        server = object.__new__(OpenAIServer)
+        server._check_health = Mock(return_value=False)
+        server._shutdown_signal_sent = False
+        executor = Mock()
+        executor._fatal_error = RuntimeError("MPI worker rank 4 (pid 357) exited unexpectedly")
+        executor.doing_shutdown = True
+        server.generator = Mock()
+        server.generator._executor = executor
+
+        with patch.object(signal, "raise_signal") as mock_sig:
+            response = await server.health()
+
+        assert response.status_code == 503
+        mock_sig.assert_called_once_with(signal.SIGINT)
+        assert server._shutdown_signal_sent is True
+
+    @pytest.mark.asyncio
+    async def test_health_sigint_idempotent_across_calls(self):
+        """Once fired, `_shutdown_signal_sent` prevents a second SIGINT.
+
+        Covers a later /health probe during the (possibly slow) shutdown
+        drain. This is a post-fix idempotency guarantee, not an independent
+        regression proof -- it fails pre-fix for the same reason as the test
+        above (SIGINT never fires at all), not because of double-firing.
+        """
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        server = object.__new__(OpenAIServer)
+        server._check_health = Mock(return_value=False)
+        server._shutdown_signal_sent = False
+        executor = Mock()
+        executor._fatal_error = RuntimeError("MPI worker exited unexpectedly")
+        executor.doing_shutdown = True
+        server.generator = Mock()
+        server.generator._executor = executor
+
+        with patch.object(signal, "raise_signal") as mock_sig:
+            first = await server.health()
+            second = await server.health()
+
+        assert first.status_code == 503
+        assert second.status_code == 503
+        mock_sig.assert_called_once_with(signal.SIGINT)
+
+    def test_shutdown_signal_sent_initialized_by_init(self):
+        """Guard against a missing/typo'd `_shutdown_signal_sent` init line.
+
+        Neither test above exercises real __init__ — both inject
+        `_shutdown_signal_sent` manually via object.__new__, so a missing or
+        typo'd init line (the same "untested wiring" failure mode that let
+        the original bug ship) would go undetected. Assert the attribute is
+        assigned in OpenAIServer.__init__'s source instead.
+        """
+        import inspect
+
+        from tensorrt_llm.serve.openai_server import OpenAIServer
+
+        source = inspect.getsource(OpenAIServer.__init__)
+        assert "self._shutdown_signal_sent = False" in source
 
 
 # ---------------------------------------------------------------------------
