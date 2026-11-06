@@ -25,8 +25,9 @@ NaN or infinity (the fp32 sum canonicalizes a NaN's sign and payload).
 Larger calls (long prefill chunks) run the built-in path; a prefill chunk of
 at most ``MAX_ROWS`` ids takes the gather, with the same bits (the sharded
 partials are one owner row and zero rows, whatever all-reduce sums them).
-Every rank sees the same row count for a call, so every rank takes the same
-branch and the all-reduce call sequence stays identical across ranks.
+Every rank sees the same row count for a call, so
+every rank takes the same branch and the all-reduce call sequence stays
+identical across ranks.
 """
 
 from __future__ import annotations
@@ -49,6 +50,10 @@ from ...ops.embedding.replicated_gather import replicated_embedding_gather
 #: one more row per request (the drafter's bonus and mask ids, the DFlash
 #: noise block). The gather has no row limit of its own.
 MAX_ROWS = 576
+
+#: Attribute of the re-classed module that holds the largest call its table serves.
+ROWS_ATTR = "_replicated_max_rows"
+
 
 #: Shard rows all-gathered per collective while the table is built.
 GATHER_ROWS = 2048
@@ -73,7 +78,7 @@ class ReplicatedEmbedding(Embedding):
             and input.device == table.device
             and not input.dtype.is_floating_point
             and input.dtype != torch.bool
-            and 1 <= input.numel() <= MAX_ROWS
+            and 1 <= input.numel() <= self.__dict__.get(ROWS_ATTR, MAX_ROWS)
         ):
             return replicated_embedding_gather(table, input.contiguous())
         return super().forward(input)
@@ -154,8 +159,10 @@ def _value_census(table: torch.Tensor) -> tuple[int, int, int]:
     return subnormal, non_finite, negative_zero
 
 
-def install(text_model, mapping: Mapping) -> None:
+def install(text_model, mapping: Mapping, context_rows: bool = False) -> None:
     """Build the replicated table and re-class ``text_model.embed_tokens``; collective over TP.
+
+    The table serves calls of at most ``MAX_ROWS`` ids; ``context_rows`` is ignored.
 
     Every rank must call this at the same point, after the weights are final
     and before any CUDA graph is captured (the shell's ``load_weights``). A
@@ -213,7 +220,9 @@ def install(text_model, mapping: Mapping) -> None:
     )
     if reason is not None:
         raise ValueError(reason)
+    rows = MAX_ROWS
     embedding.__dict__[TABLE_ATTR] = table
+    embedding.__dict__[ROWS_ATTR] = rows
     changed = type(embedding) is not ReplicatedEmbedding
     embedding.__class__ = ReplicatedEmbedding
     torch.cuda.synchronize()
@@ -222,7 +231,7 @@ def install(text_model, mapping: Mapping) -> None:
     if changed or previous is None:
         logger.info(
             f"[musespark_open] replicated_embedding: replicated token embedding {tuple(table.shape)} bf16 for calls "
-            f"of at most {MAX_ROWS} ids (+{table.numel() * table.element_size() / 2**30:.2f} GiB "
+            f"of at most {rows} ids (+{table.numel() * table.element_size() / 2**30:.2f} GiB "
             f"table, device +{added / 2**30:.2f} GiB; {negative_zero} -0.0 entries written as "
             "+0.0, no subnormal or non-finite values)"
         )

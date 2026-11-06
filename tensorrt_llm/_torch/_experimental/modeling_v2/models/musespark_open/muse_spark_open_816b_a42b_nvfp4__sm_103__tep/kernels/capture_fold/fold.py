@@ -50,7 +50,7 @@ This rests on built-in code: the decoder layer's forward
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import FrozenSet, Optional, Tuple
 
 import torch
 
@@ -67,6 +67,29 @@ from ..projection_gathers.gathers import (
 
 #: The layer keyword ``DecodeTarget`` passes on decode steps.
 LAYER_KWARG = "capture_fold"
+
+
+def capture_rows(join, wide: bool) -> int:
+    """The most rows of a call whose capture the post-FFN ``join``'s boundary may store.
+
+    Host-side reads only: under a CUDA graph a per-capture constant.
+    """
+    return fused_rows(join)
+
+
+#: The row counts above 8 whose first capture stored by the wide direct boundary was logged.
+_LOGGED_WIDE_ROWS: FrozenSet[int] = frozenset()
+
+
+def _log_wide_once(rows: int) -> None:
+    global _LOGGED_WIDE_ROWS
+    if rows in _LOGGED_WIDE_ROWS:
+        return
+    _LOGGED_WIDE_ROWS = _LOGGED_WIDE_ROWS | {rows}
+    logger.info(
+        f"[musespark_open] capture_fold: on {rows}-row decode steps the wide direct boundary writes "
+        "the DFlash capture"
+    )
 
 
 def capture_layers(spec_config) -> Tuple[int, ...]:
@@ -161,10 +184,12 @@ class MuseSparkOpenTepCaptureDecoderLayer(MuseSparkOpenTepDecoderLayer):
 
     ``_capture_folded``: ``install`` counted this layer as folded (``folded_layers``).
     ``_capture_fold_fallbacks``: the reasons already logged for this layer.
+    ``_capture_fold_wide``: ``install``'s ``wide`` (see ``capture_rows``).
     """
 
     _capture_folded: bool = False
     _capture_fold_fallbacks: frozenset = frozenset()
+    _capture_fold_wide: bool = False
 
     def forward(
         self,
@@ -179,7 +204,12 @@ class MuseSparkOpenTepCaptureDecoderLayer(MuseSparkOpenTepDecoderLayer):
     ):
         spec_metadata = kwargs.get("spec_metadata")
         view, reason = (
-            _destination(spec_metadata, self.layer_idx, hidden_states, fused_rows(self.add_ffn))
+            _destination(
+                spec_metadata,
+                self.layer_idx,
+                hidden_states,
+                capture_rows(self.add_ffn, self._capture_fold_wide),
+            )
             if capture_fold
             else (None, None)
         )
@@ -217,6 +247,8 @@ class MuseSparkOpenTepCaptureDecoderLayer(MuseSparkOpenTepDecoderLayer):
             join._capture_fold = None
             join._capture_stored = False
         updated = result[0] if isinstance(result, tuple) else result
+        if stored and view.shape[0] > MAX_ROWS:
+            _log_wide_once(int(view.shape[0]))
         if not stored:
             # The boundary took the built-in path: the built-in capture, where the
             # built-in layer makes it (after its last kernel).
@@ -253,7 +285,7 @@ def folded_layers(model, spec_config) -> frozenset:
     return frozenset(layer for layer in capture_layers(spec_config) if 0 <= layer < last)
 
 
-def install(model, spec_config) -> dict:
+def install(model, spec_config, wide: bool = False) -> dict:
     """Re-class every decoder layer for ``capture_fold``; the layer keyword ``DecodeTarget`` passes.
 
     Run after ``projection_gathers.install`` fused the unpool site.

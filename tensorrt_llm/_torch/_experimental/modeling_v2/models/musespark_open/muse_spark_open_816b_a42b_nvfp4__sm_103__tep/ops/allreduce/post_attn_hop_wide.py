@@ -22,6 +22,18 @@ vector per thread -- statement for statement, at every row count. So:
   only difference is the summation order of the two variance reductions (FP32 sums of
   8192 squares); every other rounding point is the same.
 
+Row split (``cluster``). A row runs on a cluster of 4 CTAs of 256 threads (the default),
+2 of 512 or 1 of 1024. Thread ``t`` of the row (``t = cta_in_cluster * threads + tid``)
+owns column vector ``t`` in every split, and both variance reductions add the row's 32
+warp sums in warp order ``t // 32`` (over DSMEM between the cluster's CTAs, within the
+CTA when the cluster is one CTA), so the three splits compute the same bits; they differ
+in the CTAs per row (grid ``rows * cluster``). ``cluster_rows`` limits a workspace's split
+to calls of those row counts; every other call of the workspace runs the 4-CTA split.
+Every rank shares a call's row count, so every rank runs the same split for it, and the
+transport is the same for every split (thread ``t`` of a row writes and reads the slots of
+column vector ``t``, and every call adds ``GRID_STEP`` to the arrival counter), so calls
+of either split may follow each other on one workspace.
+
 Transport (Lamport). Every slot of the receive memory starts as the sentinel word
 ``0x80000000``; a 32-bit word that still holds it has not arrived. No payload word is
 the sentinel: a partial has BF16 ``-0`` cleared, and the BF16 rounding of an FP32 sum
@@ -98,7 +110,7 @@ kernel with the capacity's scatter and gather strides and grid step.
 from __future__ import annotations
 
 import functools
-from typing import Optional, Sequence, Tuple
+from typing import FrozenSet, Optional, Sequence, Tuple
 
 import torch
 
@@ -128,27 +140,25 @@ CAPACITIES = (MAX_ROWS, WIDE_MAX_ROWS)
 #: Fewest rows a call takes the two-shot transport for (one-shot below): on GB300 at four
 #: ranks the one-shot is the faster transport up to 24 rows, the two-shot from 32.
 TWO_SHOT_ROWS = 32
-# ``configure`` sets the settings from here to its definition (``lever_settings.apply`` calls it
-# from the model's plan before any install); their defaults keep the paths they refine.
 #: The served workspace's publication: unicast stores to each peer (the two-shot gather
-#: then skips the owner's own copy). ``configure(multicast=True)`` publishes with one multimem
+#: then skips the owner's own copy). ``multicast=True`` publishes with one multimem
 #: store per published vector instead (the one-shot slab, the two-shot gather): the same values
 #: in the same slots, bitwise.
 SERVED_MULTICAST = False
 #: The served workspace's launch mode: after the o_proj GEMM rather than as its programmatic
 #: dependent, so the hop's CTAs do not take SM slots from the GEMM's last wave.
-#: ``configure(early_launch=True)`` launches the hop as o_proj's programmatic dependent (at TEP8
+#: ``early_launch=True`` launches the hop as o_proj's programmatic dependent (at TEP8
 #: o_proj's split-K is one wave of 128 CTAs and triggers after its A loads, so the hop's
 #: ``4 * rows`` CTAs become resident on the free SMs and wait in griddepcontrol.wait). Launch
 #: mode only: bitwise. layers.py passes both settings to ``shared_wide_workspace``.
 SERVED_EARLY_LAUNCH = False
 #: Two rows per CTA on two-shot calls of at least ``SERVED_R2_MIN_ROWS`` (even) rows on 8-rank
-#: groups (``configure(r2="1")``). CTA ``b`` takes rows ``2 (b // CLUSTER)`` and
+#: groups (``r2=True``). CTA ``b`` takes rows ``2 (b // CLUSTER)`` and
 #: ``2 (b // CLUSTER) + 1`` and the ``b % CLUSTER``-th quarter of both; every thread keeps its
 #: one 16-byte column vector, now of both rows, so each row's sum, cluster reduction slots and
 #: order, and boundary are the one-row kernel's statement for statement (bitwise). Halves the
 #: grid, so an early-launched hop packs half as many CTAs onto the SMs o_proj leaves free.
-#: ``r2="w"`` (``SERVED_R2_WIDE``) instead runs two rows per 512-thread CTA (each 256-thread half
+#: ``r2_wide=True`` (``SERVED_R2_WIDE``) instead runs two rows per 512-thread CTA (each 256-thread half
 #: is the one-row kernel's CTA of its row, so each thread's work is unchanged; bitwise likewise).
 SERVED_R2 = False
 SERVED_R2_WIDE = False
@@ -160,60 +170,16 @@ SERVED_SMEM_PAD = 0
 #: The row counts ``(lo, hi)`` whose calls take the pad (default every row count); e.g.
 #: ``(9, 40)`` pads the one-row grid only where its clusters fit one CTA per SM.
 SERVED_PAD_ROWS = (0, 1024)
-#: ``tep8_direct_hop``: o_proj of a TEP8 decode step of ``SERVED_DIRECT_ROWS`` rows stores its
-#: partial straight into the owners' scatter slots (the wide64 split-K kernel's scatter
-#: epilogue, called by the dense GEMM dispatcher) and the joins run the direct consumer
-#: (``WideDirectWorkspace``). Built and armed by layers.py.
-SERVED_DIRECT = False
-
-
-def configure(
-    *,
-    direct: bool = False,
-    early_launch: bool = False,
-    multicast: bool = False,
-    pad_rows: Tuple[int, int] = (0, 1024),
-    r2: str = "0",
-    r2_min_rows: int = 33,
-    smem_pad: int = 0,
-) -> None:
-    """Set the served wide workspace's publication, launch mode and grid, and the direct hop.
-
-    ``lever_settings.apply`` calls it from the model's plan before any install: each workspace
-    and the direct publication take these settings when they are built.
-
-    Args:
-        direct: o_proj of the TEP8 decode steps of ``SERVED_DIRECT_ROWS`` rows publishes
-            straight into the owners' scatter slots (``SERVED_DIRECT``).
-        early_launch: launch the hop as o_proj's programmatic dependent (``SERVED_EARLY_LAUNCH``).
-        multicast: publish with one multimem store per vector (``SERVED_MULTICAST``).
-        pad_rows: the row counts ``(lo, hi)`` whose calls take the SMEM pad (``SERVED_PAD_ROWS``).
-        r2: ``"0"`` one row per CTA, ``"1"`` two rows per CTA (each thread both), ``"w"`` two
-            rows per 512-thread CTA (``SERVED_R2``, ``SERVED_R2_WIDE``).
-        r2_min_rows: the fewest rows of a two-row call (``SERVED_R2_MIN_ROWS``).
-        smem_pad: extra dynamic shared memory per CTA, in bytes (``SERVED_SMEM_PAD``).
-
-    Raises:
-        ValueError: for an ``r2`` other than ``"0"``, ``"1"`` or ``"w"``.
-    """
-    global SERVED_DIRECT, SERVED_EARLY_LAUNCH, SERVED_MULTICAST, SERVED_PAD_ROWS
-    global SERVED_R2, SERVED_R2_WIDE, SERVED_R2_MIN_ROWS, SERVED_SMEM_PAD
-    if r2 not in ("0", "1", "w"):
-        raise ValueError(f"r2 is '0', '1' or 'w', got {r2!r}")
-    SERVED_DIRECT = bool(direct)
-    SERVED_EARLY_LAUNCH = bool(early_launch)
-    SERVED_MULTICAST = bool(multicast)
-    SERVED_PAD_ROWS = (int(pad_rows[0]), int(pad_rows[1]))
-    SERVED_R2 = r2 in ("1", "w")
-    SERVED_R2_WIDE = r2 == "w"
-    SERVED_R2_MIN_ROWS = int(r2_min_rows)
-    SERVED_SMEM_PAD = int(smem_pad)
 
 
 ROW_BYTES = HIDDEN * 2
 #: The cluster boundary's split for 9..32 rows; this entry uses it at every row count.
 CLUSTER = 4
 THREADS = HIDDEN // (CLUSTER * VECTOR)
+#: The row's CTA splits a workspace may take: a cluster of 4, 2 or 1 CTAs of 256, 512 or 1024
+#: threads. Every split keeps the thread -> column-vector map and the 32 warp slots of the
+#: variance reductions in the same order, so the three give the same bits.
+CLUSTERS = (4, 2, 1)
 #: What one call adds to the arrival counter, whatever its grid (at most CLUSTER * MAX_ROWS CTAs),
 #: on the served workspace.
 GRID_SHIFT = 11
@@ -228,6 +194,8 @@ def grid_shift(max_rows: int) -> int:
 
 
 assert grid_shift(MAX_ROWS) == GRID_SHIFT
+
+
 assert (1 << grid_shift(WIDE_MAX_ROWS)) >= CLUSTER * WIDE_MAX_ROWS
 CONTROL_WORDS = 4
 
@@ -245,8 +213,6 @@ if HAS_CUTE_DSL:
 
     from .post_attn_hop import (
         _arrive,
-        _direct_reset_x4,
-        _direct_stale_bit,
         _float_bits,
         _load_counter,
         _load_x4,
@@ -277,9 +243,10 @@ if HAS_CUTE_DSL:
     class _WideHopKernel:
         """All-reduce + attention-side cluster boundary for 9..``max_rows`` rows.
 
-        CTA ``b`` handles row ``b // CLUSTER`` and the ``b % CLUSTER``-th quarter of the
-        8192 columns; each of its 256 threads owns one 16-byte column vector -- the
-        cluster boundary's 9..32-row map, which fixes the variance reduction order.
+        CTA ``b`` handles row ``b // cluster`` and the ``b % cluster``-th slice of the
+        8192 columns; each of its ``8192 / (8 * cluster)`` threads owns one 16-byte column
+        vector -- the cluster boundary's 9..32-row map at ``cluster = 4``, which fixes the
+        variance reduction order (the same order at every split).
         ``two_shot`` selects the transport; ``one_shot_rows`` sizes the one-shot slabs,
         which come first in the receive memory, followed by the two-shot scatter and
         gather areas. ``early_launch`` launches the grid as a programmatic dependent of
@@ -303,15 +270,21 @@ if HAS_CUTE_DSL:
             early_launch: bool,
             max_rows: int = MAX_ROWS,
             smem_pad: int = 0,
+            cluster: int = CLUSTER,
         ):
+            if cluster not in CLUSTERS:
+                raise ValueError(f"cluster must be one of {CLUSTERS}, got {cluster}")
             self.ranks = ranks
             self.smem_pad = int(smem_pad)
             self.max_rows = max_rows
             self.grid_shift = grid_shift(max_rows)
             self.grid_step = 1 << self.grid_shift
-            self.cluster = CLUSTER
-            self.threads = THREADS
-            self.iters = HIDDEN // (CLUSTER * THREADS * VECTOR)
+            self.cluster = cluster
+            self.threads = HIDDEN // (cluster * VECTOR)
+            self.iters = HIDDEN // (cluster * self.threads * VECTOR)
+            #: Resident CTAs per SM the registers are bounded for: a 1024-thread CTA needs at
+            #: most 64 registers per thread to launch at all.
+            self.min_blocks = {4: 0, 2: 2, 1: 1}[cluster]
             self.warps = self.threads // 32
             self.slots = self.cluster * self.warps
             self.multicast = multicast
@@ -351,7 +324,7 @@ if HAS_CUTE_DSL:
             dry: Int32,
             stream: cuda.CUstream,
         ):
-            self.kernel(
+            launcher = self.kernel(
                 partial,
                 residual,
                 alpha,
@@ -373,14 +346,26 @@ if HAS_CUTE_DSL:
                 rows,
                 rank,
                 dry,
-            ).launch(
-                grid=[rows * self.cluster, 1, 1],
-                block=[self.threads, 1, 1],
-                cluster=[self.cluster, 1, 1],
-                smem=self.slots * 4 * 4 * 2 + 16 + self.smem_pad,
-                stream=stream,
-                use_pdl=self.pdl and self.early_launch,
             )
+            if cutlass.const_expr(self.min_blocks > 0):
+                launcher.launch(
+                    grid=[rows * self.cluster, 1, 1],
+                    block=[self.threads, 1, 1],
+                    cluster=[self.cluster, 1, 1],
+                    smem=self.slots * 4 * 4 * 2 + 16 + self.smem_pad,
+                    stream=stream,
+                    use_pdl=self.pdl and self.early_launch,
+                    min_blocks_per_mp=self.min_blocks,
+                )
+            else:
+                launcher.launch(
+                    grid=[rows * self.cluster, 1, 1],
+                    block=[self.threads, 1, 1],
+                    cluster=[self.cluster, 1, 1],
+                    smem=self.slots * 4 * 4 * 2 + 16 + self.smem_pad,
+                    stream=stream,
+                    use_pdl=self.pdl and self.early_launch,
+                )
 
         @cute.jit
         def load(self, ptr: cute.Pointer, dtype: cutlass.Constexpr):
@@ -766,7 +751,7 @@ if HAS_CUTE_DSL:
                     _arrive(control_address + 4, amount)
 
     class _WideHop2Kernel(_WideHopKernel):
-        """The two-shot ``_WideHopKernel`` with two rows per CTA (``configure(r2="1")``).
+        """The two-shot ``_WideHopKernel`` with two rows per CTA (``r2=True``).
 
         CTA ``b`` handles rows ``2 (b // CLUSTER)`` and ``2 (b // CLUSTER) + 1`` and the
         ``b % CLUSTER``-th quarter of the 8192 columns of both; each of its 256 threads owns the
@@ -1607,419 +1592,6 @@ if HAS_CUTE_DSL:
                         amount = Uint32(self.grid_step + 1 - blocks)
                     _arrive(control_address + 4, amount)
 
-    class _WideDirectKernel(_WideHop2wKernel):
-        """The two-shot hop's consumer half on a direct transport (``tep8_direct_hop``).
-
-        The o_proj GEMM stores row ``t`` of its BF16 partial straight into the scatter slab of this
-        rank on the row's owner ``t % ranks`` (its epilogue, through the group's contiguous unicast
-        window), so this kernel neither loads nor publishes the partial. The owner of a row polls the
-        row's eight source slots of its local scatter area -- its own included -- with the direct
-        transport's sentinel (``0xFFFE`` per BF16 half: no GEMM writes it, so ``-0`` needs no
-        clearing), resets them, sums them in rank order from ``+0`` and rounds once (the two-shot
-        owner's sum of ``_WideHopKernel``: a ``-0`` addend leaves a sum from ``+0`` unchanged), and
-        publishes the BF16 sum into the row's gather slot of every rank (``0x80000000`` sentinel,
-        as ``_WideHopKernel``'s gather). Every other rank polls that gather slot. Then the
-        boundary, statement for statement. The buffer index is the call site's ``parity`` (the
-        producer cannot read a counter). Grid: ``_WideHopKernel``'s 4 CTAs per row, or with
-        ``wide`` two rows per 512-thread CTA (``_WideHop2wKernel``'s map).
-        ``wait_first``: ``griddepcontrol.wait`` before the polls (the 8-row direct consumer's
-        order); otherwise after them, before the residual load (the polls are Lamport, the
-        coefficients immutable).
-        """
-
-        def __init__(
-            self,
-            ranks,
-            multicast,
-            post_eps,
-            pre_eps,
-            norm_fp32,
-            pdl,
-            early_launch,
-            max_rows,
-            wide,
-            smem_pad,
-            wait_first,
-            fb_layout=False,
-        ):
-            super().__init__(
-                ranks,
-                multicast,
-                post_eps,
-                pre_eps,
-                norm_fp32,
-                pdl,
-                True,
-                0,
-                early_launch,
-                max_rows,
-                smem_pad,
-            )
-            # Scatter slots feature-block-major ([64-feature block][max_rows / ranks slots][64])
-            # instead of [slot][8192] (``fb_layout``): the producer's per-owner runs are then
-            # contiguous.
-            self.fb_layout = bool(fb_layout)
-            self.wide = bool(wide)
-            self.wait_first = bool(wait_first)
-            self.src_bytes = (max_rows // ranks) * ROW_BYTES
-            self.d_gather_base = BUFFERS * ranks * self.src_bytes
-
-        @cute.jit
-        def __call__(
-            self,
-            residual: cute.Pointer,
-            alpha: cute.Pointer,
-            beta: cute.Pointer,
-            weight: cute.Pointer,
-            output: cute.Pointer,
-            next_output: cute.Pointer,
-            receive: cute.Pointer,
-            mcast: cute.Pointer,
-            peer0: cute.Pointer,
-            peer1: cute.Pointer,
-            peer2: cute.Pointer,
-            peer3: cute.Pointer,
-            peer4: cute.Pointer,
-            peer5: cute.Pointer,
-            peer6: cute.Pointer,
-            peer7: cute.Pointer,
-            rows: Int32,
-            rank: Int32,
-            parity: Int32,
-            dry: Int32,
-            stream: cuda.CUstream,
-        ):
-            if cutlass.const_expr(self.wide):
-                grid = [(rows // 2) * self.cluster, 1, 1]
-                block = [2 * self.threads, 1, 1]
-            else:
-                grid = [rows * self.cluster, 1, 1]
-                block = [self.threads, 1, 1]
-            self.kernel(
-                residual,
-                alpha,
-                beta,
-                weight,
-                output,
-                next_output,
-                receive,
-                mcast,
-                peer0,
-                peer1,
-                peer2,
-                peer3,
-                peer4,
-                peer5,
-                peer6,
-                peer7,
-                rows,
-                rank,
-                parity,
-                dry,
-            ).launch(
-                grid=grid,
-                block=block,
-                cluster=[self.cluster, 1, 1],
-                smem=self.slots * 4 * 4 * 4 + 32 + self.smem_pad,
-                stream=stream,
-                use_pdl=self.pdl and self.early_launch,
-            )
-
-        @cute.kernel
-        def kernel(
-            self,
-            residual: cute.Pointer,
-            alpha: cute.Pointer,
-            beta: cute.Pointer,
-            weight: cute.Pointer,
-            output: cute.Pointer,
-            next_output: cute.Pointer,
-            receive: cute.Pointer,
-            mcast: cute.Pointer,
-            peer0: cute.Pointer,
-            peer1: cute.Pointer,
-            peer2: cute.Pointer,
-            peer3: cute.Pointer,
-            peer4: cute.Pointer,
-            peer5: cute.Pointer,
-            peer6: cute.Pointer,
-            peer7: cute.Pointer,
-            rows: Int32,
-            rank: Int32,
-            parity: Int32,
-            dry: Int32,
-        ):
-            peers = (peer0, peer1, peer2, peer3, peer4, peer5, peer6, peer7)
-            tid = cute.arch.thread_idx()[0]
-            crank = cute.arch.block_idx()[0] % self.cluster
-            if cutlass.const_expr(self.wide):
-                half = tid // self.threads
-                t = tid % self.threads
-                row = (cute.arch.block_idx()[0] // self.cluster) * 2 + half
-            else:
-                half = 0
-                t = tid
-                row = cute.arch.block_idx()[0] // self.cluster
-            offset = cute.assume((crank * self.threads + t) * 8, divby=8)
-            smem = utils.SmemAllocator()
-            partials = smem.allocate_tensor(
-                Float32, cute.make_layout((self.slots * 4 * 4,)), byte_alignment=16
-            )
-            bars = smem.allocate_tensor(cutlass.Uint64, cute.make_layout((4,)), byte_alignment=8)
-            if dry == 0:
-                if tid < 4:
-                    cute.arch.mbarrier_init(bars.iterator + tid, 1)
-                    cute.arch.mbarrier_arrive_and_expect_tx(bars.iterator + tid, self.slots * 16)
-                cute.arch.mbarrier_init_fence()
-                cute.arch.barrier()
-                cute.arch.cluster_arrive_relaxed()
-                cute.arch.cluster_wait()
-                if cutlass.const_expr(self.pdl and self.wait_first):
-                    cute.arch.griddepcontrol_wait()
-                # Immutable operands (the kernel's whole lifetime): safe before the wait.
-                a = self.load(alpha + offset, Float32)
-                b = self.load(beta + offset, Float32)
-                w = self.load(weight + offset, cutlass.BFloat16)
-
-                buffer = Int64(parity)
-                slot = (Int64(row) * HIDDEN + Int64(offset)) * 2
-                receive_address = receive.toint()
-                owner = row % self.ranks
-                if cutlass.const_expr(self.fb_layout):
-                    scatter = (
-                        buffer * (self.ranks * self.src_bytes)
-                        + Int64(offset // 64) * ((self.max_rows // self.ranks) * 128)
-                        + Int64(row // self.ranks) * 128
-                        + Int64(offset % 64) * 2
-                    )
-                else:
-                    scatter = (
-                        buffer * (self.ranks * self.src_bytes)
-                        + Int64(row // self.ranks) * ROW_BYTES
-                        + Int64(offset) * 2
-                    )
-                gather = Int64(self.d_gather_base) + buffer * (self.max_rows * ROW_BYTES) + slot
-                reduced = cute.make_rmem_tensor(cute.make_layout((4,)), Uint32)
-                values = cute.make_rmem_tensor(cute.make_layout((self.ranks, 4)), Uint32)
-                x = cute.make_rmem_tensor(cute.make_layout((8, self.iters)), cutlass.BFloat16)
-                if owner == rank:
-                    for p in cutlass.range_constexpr(self.ranks):
-                        v0, v1, v2, v3 = _poll_x4(
-                            receive_address + scatter + p * self.src_bytes,
-                            Uint32(1),
-                            Uint32(0),
-                            Uint32(0),
-                            Uint32(0),
-                            Uint32(0),
-                        )
-                        values[p, 0] = v0
-                        values[p, 1] = v1
-                        values[p, 2] = v2
-                        values[p, 3] = v3
-                    stale = Uint32(0)
-                    for p in cutlass.range_constexpr(self.ranks):
-                        stale = stale | _direct_stale_bit(
-                            values[p, 0], values[p, 1], values[p, 2], values[p, 3], Uint32(1 << p)
-                        )
-                    while stale != Uint32(0):
-                        polled = stale
-                        for p in cutlass.range_constexpr(self.ranks):
-                            v0, v1, v2, v3 = _poll_x4(
-                                receive_address + scatter + p * self.src_bytes,
-                                (polled >> Uint32(p)) & Uint32(1),
-                                values[p, 0],
-                                values[p, 1],
-                                values[p, 2],
-                                values[p, 3],
-                            )
-                            values[p, 0] = v0
-                            values[p, 1] = v1
-                            values[p, 2] = v2
-                            values[p, 3] = v3
-                        stale = Uint32(0)
-                        for p in cutlass.range_constexpr(self.ranks):
-                            stale = stale | _direct_stale_bit(
-                                values[p, 0],
-                                values[p, 1],
-                                values[p, 2],
-                                values[p, 3],
-                                Uint32(1 << p),
-                            )
-                    for p in cutlass.range_constexpr(self.ranks):
-                        _direct_reset_x4(receive_address + scatter + p * self.src_bytes)
-                    # The two-shot owner's sum: FP32 from +0, ranks in order, one RN round; a -0
-                    # addend (nothing clears it here) leaves a sum from +0 unchanged.
-                    sums = [Float32(0.0)] * VECTOR
-                    for p in cutlass.range_constexpr(self.ranks):
-                        for k in cutlass.range_constexpr(4):
-                            lo, hi = _unpack_bf16x2(values[p, k])
-                            sums[2 * k] = sums[2 * k] + lo
-                            sums[2 * k + 1] = sums[2 * k + 1] + hi
-                    for k in cutlass.range_constexpr(4):
-                        reduced[k] = _pack_bf16x2(sums[2 * k], sums[2 * k + 1])
-                    if cutlass.const_expr(self.multicast):
-                        _store_multicast_x4(
-                            mcast.toint() + gather, reduced[0], reduced[1], reduced[2], reduced[3]
-                        )
-                    else:
-                        for p in cutlass.range_constexpr(self.ranks):
-                            if rank != p:
-                                _store_peer_x4(
-                                    peers[p].toint() + gather,
-                                    reduced[0],
-                                    reduced[1],
-                                    reduced[2],
-                                    reduced[3],
-                                )
-                else:
-                    g0, g1, g2, g3 = _poll_x4(
-                        receive_address + gather,
-                        Uint32(1),
-                        Uint32(0),
-                        Uint32(0),
-                        Uint32(0),
-                        Uint32(0),
-                    )
-                    reduced[0] = g0
-                    reduced[1] = g1
-                    reduced[2] = g2
-                    reduced[3] = g3
-                    waiting = _stale_bit(reduced[0], reduced[1], reduced[2], reduced[3], Uint32(1))
-                    while waiting != Uint32(0):
-                        h0, h1, h2, h3 = _poll_x4(
-                            receive_address + gather,
-                            Uint32(1),
-                            reduced[0],
-                            reduced[1],
-                            reduced[2],
-                            reduced[3],
-                        )
-                        reduced[0] = h0
-                        reduced[1] = h1
-                        reduced[2] = h2
-                        reduced[3] = h3
-                        waiting = _stale_bit(
-                            reduced[0], reduced[1], reduced[2], reduced[3], Uint32(1)
-                        )
-                    _reset_x4(receive_address + gather, Uint32(1))
-                if cutlass.const_expr(self.pdl):
-                    cute.arch.griddepcontrol_launch_dependents()
-                if cutlass.const_expr(self.pdl and not self.wait_first):
-                    cute.arch.griddepcontrol_wait()
-                r = self.load(residual + row * HIDDEN + offset, Float32)
-                for k in cutlass.range_constexpr(4):
-                    low, high = _unpack_bf16x2(reduced[k])
-                    x[2 * k, 0] = cutlass.BFloat16(low)
-                    x[2 * k + 1, 0] = cutlass.BFloat16(high)
-
-                scaled = cute.make_rmem_tensor(cute.make_layout((8, self.iters)), Float32)
-                updated = cute.make_rmem_tensor(cute.make_layout((8, self.iters)), Float32)
-                normed = cute.make_rmem_tensor(cute.make_layout((8, self.iters)), cutlass.BFloat16)
-                total = Float32(0)
-                for p in cutlass.range_constexpr(self.iters):
-                    for v in cutlass.range_constexpr(8):
-                        value = Float32(x[v, p])
-                        scaled[v, p] = value
-                        total += value * value
-                total = self.reduce_w(total, partials, bars, 0, half, t)
-                inv = cute.math.rsqrt(total / Float32(8192) + Float32(self.post_eps), fastmath=True)
-                total = Float32(0)
-                for p in cutlass.range_constexpr(self.iters):
-                    for v in cutlass.range_constexpr(8):
-                        value = Float32(cutlass.BFloat16(scaled[v, p] * inv))
-                        u = a[v, p] * r[v, p] + b[v, p] * value
-                        updated[v, p] = u
-                        if cutlass.const_expr(self.norm_fp32):
-                            scaled[v, p] = u
-                            total += u * u
-                        else:
-                            rounded = Float32(cutlass.BFloat16(u))
-                            scaled[v, p] = rounded
-                            total += rounded * rounded
-                total = self.reduce_w(total, partials, bars, 1, half, t)
-                inv = cute.math.rsqrt(total / Float32(8192) + Float32(self.pre_eps), fastmath=True)
-                for p in cutlass.range_constexpr(self.iters):
-                    for v in cutlass.range_constexpr(8):
-                        normed[v, p] = cutlass.BFloat16(
-                            scaled[v, p] * inv * (Float32(w[v, p]) + Float32(1))
-                        )
-                layout = cute.make_layout(
-                    (8, self.iters), stride=(1, self.threads * self.cluster * 8)
-                )
-                atom32 = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
-                )
-                atom16 = cute.make_copy_atom(
-                    cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128
-                )
-                cute.copy(
-                    atom32,
-                    updated,
-                    cute.make_tensor((output + row * HIDDEN + offset).align(16), layout),
-                )
-                cute.copy(
-                    atom16,
-                    normed,
-                    cute.make_tensor((next_output + row * HIDDEN + offset).align(16), layout),
-                )
-
-    _DIRECT_POINTER_DTYPES = (
-        Float32,  # residual
-        Float32,  # alpha
-        Float32,  # beta
-        BFloat16,  # weight
-        Float32,  # output
-        BFloat16,  # next_output
-        Uint32,  # receive
-        Uint32,  # mcast
-    ) + (Uint32,) * _hop.MAX_RANKS
-
-    @functools.lru_cache(maxsize=32)
-    def _compiled_direct(
-        device_index: int,
-        ranks: int,
-        multicast: bool,
-        post_eps: float,
-        pre_eps: float,
-        norm_fp32: bool,
-        pdl: bool,
-        early_launch: bool,
-        max_rows: int,
-        wide: bool,
-        smem_pad: int,
-        wait_first: bool,
-        fb_layout: bool = False,
-    ):
-        kernel = _WideDirectKernel(
-            ranks,
-            multicast,
-            post_eps,
-            pre_eps,
-            norm_fp32,
-            pdl,
-            early_launch,
-            max_rows,
-            wide,
-            smem_pad,
-            wait_first,
-            fb_layout,
-        )
-        with torch.cuda.device(device_index):
-            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-            return cute.compile(
-                kernel,
-                *[
-                    make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
-                    for dtype in _DIRECT_POINTER_DTYPES
-                ],
-                Int32(MIN_ROWS + 1),
-                Int32(0),
-                Int32(0),
-                Int32(1),
-                stream,
-                options="--enable-tvm-ffi",
-            )
-
     _POINTER_DTYPES = (
         BFloat16,  # partial
         Float32,  # residual
@@ -2048,6 +1620,7 @@ if HAS_CUTE_DSL:
         max_rows: int = MAX_ROWS,
         rows_per_cta: int = 1,
         smem_pad: int = 0,
+        cluster: int = CLUSTER,
     ):
         # rows_per_cta: 1 one row per CTA (_WideHopKernel); 2 two rows per thread (_WideHop2Kernel);
         # 3 two rows per 512-thread CTA (_WideHop2wKernel, the key's third value).
@@ -2064,6 +1637,7 @@ if HAS_CUTE_DSL:
             early_launch,
             max_rows,
             smem_pad,
+            cluster,
         )
         with torch.cuda.device(device_index):
             stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -2116,7 +1690,9 @@ class WideHopWorkspace:
     ``TWO_SHOT_ROWS``, ``SERVED_EARLY_LAUNCH``) on the served capacity ``MAX_ROWS``;
     ``max_rows=WIDE_MAX_ROWS`` builds the larger transport. A setting left None (the
     publication, the launch mode, the two-row grid and the SMEM pad) takes the module's
-    ``SERVED_*`` setting (``configure``) at construction.
+    ``SERVED_*`` setting at construction. ``cluster`` is the row split of the
+    one-row-per-CTA calls of ``cluster_rows`` rows (every such call when None); the others run
+    ``CLUSTER``.
     """
 
     def __init__(
@@ -2133,6 +1709,8 @@ class WideHopWorkspace:
         smem_pad: Optional[int] = None,
         r2_wide: Optional[bool] = None,
         pad_rows: Optional[Tuple[int, int]] = None,
+        cluster: int = CLUSTER,
+        cluster_rows: Optional[FrozenSet[int]] = None,
     ):
         from tensorrt_llm._torch.distributed.ops import (
             _get_mnnvl_workspace_comm,
@@ -2165,6 +1743,13 @@ class WideHopWorkspace:
             raise ValueError(f"the wide hop serves 4 or 8 ranks, got {self.ranks}")
         self.two_shot_rows = int(two_shot_rows)
         self.max_rows = int(max_rows)
+        if int(cluster) not in CLUSTERS:
+            raise ValueError(f"cluster must be one of {CLUSTERS}, got {cluster}")
+        self.cluster = int(cluster)
+        # The row counts ``cluster`` applies to (None: every call); the others run ``CLUSTER``.
+        self.cluster_rows = (
+            None if cluster_rows is None else frozenset(int(r) for r in cluster_rows)
+        )
         self.one_shot_rows, self.workspace_bytes = receive_layout(
             self.ranks, self.two_shot_rows, self.max_rows
         )
@@ -2175,8 +1760,8 @@ class WideHopWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the wide hop runs on SM103 and SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the wide hop runs on SM103 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, self.workspace_bytes, mapping, use_fabric
@@ -2223,10 +1808,15 @@ class WideHopWorkspace:
         error: Optional[BaseException] = None
         try:
             low = MIN_ROWS if self.max_rows == MAX_ROWS else MAX_ROWS + 1
-            kinds = sorted({self.variant(rows) for rows in range(low, self.max_rows + 1)})
+            kinds = sorted(
+                {
+                    (*self.variant(rows), self.cluster_for(rows))
+                    for rows in range(low, self.max_rows + 1)
+                }
+            )
             for post_eps, pre_eps, norm_fp32 in variants:
-                for two_shot, rows_per_cta, pad in kinds:
-                    self._kernel(post_eps, pre_eps, norm_fp32, two_shot, rows_per_cta, pad)
+                for two_shot, rows_per_cta, pad, cluster in kinds:
+                    self._kernel(post_eps, pre_eps, norm_fp32, two_shot, rows_per_cta, pad, cluster)
             torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
             error = exc
@@ -2236,6 +1826,22 @@ class WideHopWorkspace:
                 f"{f' (this rank: {error!r})' if error is not None else ''}"
             ) from error
 
+    def clusters(self) -> Tuple[int, ...]:
+        """The row splits this workspace's calls run: ``cluster``, and ``CLUSTER`` for the
+        row counts outside ``cluster_rows``."""
+        if self.cluster_rows is None or self.cluster == CLUSTER:
+            return (self.cluster,)
+        return (self.cluster, CLUSTER)
+
+    def cluster_for(self, rows: int) -> int:
+        """The row split of a call of ``rows`` rows (the same on every rank); a two-row call
+        (``takes_r2``) keeps ``CLUSTER``."""
+        if self.takes_r2(rows):
+            return CLUSTER
+        if self.cluster_rows is None or rows in self.cluster_rows:
+            return self.cluster
+        return CLUSTER
+
     def _kernel(
         self,
         post_eps: float,
@@ -2244,7 +1850,11 @@ class WideHopWorkspace:
         two_shot: bool,
         rows_per_cta: int = 1,
         pad: int = 0,
+        cluster: Optional[int] = None,
     ):
+        cluster = self.cluster if cluster is None else int(cluster)
+        if int(rows_per_cta) != 1 and cluster != CLUSTER:
+            raise ValueError(f"a two-row wide hop runs the {CLUSTER}-CTA split, got {cluster}")
         key = (
             float(post_eps),
             float(pre_eps),
@@ -2253,6 +1863,9 @@ class WideHopWorkspace:
             int(rows_per_cta),
             int(pad),
         )
+        if cluster != CLUSTER:
+            # The default split keeps the key of a workspace without a split.
+            key += (cluster,)
         compiled = self._kernels.get(key)
         if compiled is not None:
             return compiled
@@ -2274,6 +1887,7 @@ class WideHopWorkspace:
             self.max_rows,
             int(rows_per_cta),
             int(pad),
+            cluster,
         )
         # A dry launch loads the module now, not inside a capture (MIN_ROWS: the grid of a dry launch
         # is never run past its dry check, whatever the kernel's rows per CTA).
@@ -2318,7 +1932,9 @@ class WideHopWorkspace:
             raise ValueError(
                 f"post_attn_hop_wide: {rows} rows on a workspace of capacity {self.max_rows}"
             )
-        compiled = self._kernel(post_eps, pre_eps, norm_fp32, *self.variant(rows))
+        compiled = self._kernel(
+            post_eps, pre_eps, norm_fp32, *self.variant(rows), self.cluster_for(rows)
+        )
         updated = torch.empty_like(residual)
         normalized = torch.empty_like(partial)
         compiled(
@@ -2338,295 +1954,6 @@ class WideHopWorkspace:
         return updated, normalized
 
 
-class WideDirectWorkspace:
-    """The direct transport of the wide two-shot hop for one TP group (``tep8_direct_hop``).
-
-    Receive memory per rank (a fabric allocation of its own, never shared): the scatter area
-    ``[2 parities][ranks sources][max_rows / ranks slots][8192]`` BF16 at offset 0, filled with
-    the direct sentinel ``0xFFFEFFFE``, then the gather area ``[2][max_rows][8192]`` BF16, filled
-    with ``0x80000000``. The producer of call parity ``q`` on rank ``r`` stores token row ``t`` of
-    its partial at ``producer_base(q) + (t % ranks) * peer_stride + (t // ranks) * ROW_BYTES``
-    (bytes; ``producer_base(q)`` = rank 0's unicast mapping + ``q`` parity area + ``r``'s slab):
-    the group's unicast mappings are one contiguous window (checked here).
-    """
-
-    def __init__(
-        self,
-        mapping: Mapping,
-        *,
-        multicast: bool = True,
-        variants: Sequence[Tuple[float, float, bool]] = (),
-        early_launch: bool = True,
-        max_rows: int = 64,
-        wide_min_rows: int = 41,
-        smem_pad: int = 177408,
-        pad_rows: Tuple[int, int] = (9, 40),
-        wait_first: bool = True,
-        fb_layout: bool = False,
-    ):
-        from tensorrt_llm._torch.distributed.ops import (
-            _get_mnnvl_workspace_comm,
-            _make_mnnvl_mcast_buffer,
-            _mnnvl_device_index,
-            _mnnvl_workspace_all_succeeded,
-        )
-
-        self.ranks = mapping.tp_size
-        self.rank = mapping.tp_rank
-        self.multicast = bool(multicast)
-        self.pdl = _LAUNCH_PDL
-        self.early_launch = bool(early_launch)
-        self.max_rows = int(max_rows)
-        self.wide_min_rows = int(wide_min_rows)
-        self.smem_pad = int(smem_pad)
-        self.pad_rows = (int(pad_rows[0]), int(pad_rows[1]))
-        self.wait_first = bool(wait_first)
-        self.fb_layout = bool(fb_layout)
-        if self.ranks not in (4, _hop.MAX_RANKS) or self.max_rows % self.ranks:
-            raise ValueError(f"the direct wide hop serves 4 or 8 ranks, got {self.ranks}")
-        self.src_bytes = (self.max_rows // self.ranks) * ROW_BYTES
-        self.scatter_bytes = BUFFERS * self.ranks * self.src_bytes
-        self.workspace_bytes = self.scatter_bytes + BUFFERS * self.max_rows * ROW_BYTES
-        self.device = torch.device("cuda", _mnnvl_device_index(mapping))
-        self._kernels = {}
-        self._comm = _get_mnnvl_workspace_comm(mapping)
-        error: Optional[BaseException] = None
-        try:
-            if not HAS_CUTE_DSL:
-                raise RuntimeError("CuTe DSL is unavailable")
-            self._handle = _make_mnnvl_mcast_buffer(
-                self._comm, self.workspace_bytes, mapping, mapping.is_multi_node()
-            )
-            words = self.workspace_bytes // 4
-            self._uc = [
-                self._handle.get_uc_buffer(peer, (words,), torch.int32, 0)
-                for peer in range(self.ranks)
-            ]
-            self._mc = self._handle.get_mc_buffer((words,), torch.int32, 0)
-            base = self._uc[0].data_ptr()
-            self.peer_stride = self._uc[1].data_ptr() - base
-            if any(
-                self._uc[p].data_ptr() - base != p * self.peer_stride for p in range(self.ranks)
-            ):
-                raise RuntimeError("the group's unicast mappings are not one evenly strided window")
-            with torch.cuda.device(self.device):
-                local = self._uc[self.rank]
-                local[: self.scatter_bytes // 4].fill_(_hop._DIRECT_SENTINEL_I32)
-                local[self.scatter_bytes // 4 :].fill_(-(2**31))
-                torch.cuda.synchronize(self.device)
-        except Exception as exc:  # noqa: BLE001
-            error = exc
-        if not _mnnvl_workspace_all_succeeded(self._comm, error is None):
-            raise RuntimeError(
-                f"direct wide hop workspace failed on at least one rank"
-                f"{f' (this rank: {error!r})' if error is not None else ''}"
-            ) from error
-        receive = self._uc[self.rank].data_ptr()
-        peers = [t.data_ptr() for t in self._uc] + [receive] * (_hop.MAX_RANKS - self.ranks)
-        self._fixed = (receive, self._mc.data_ptr(), *peers)
-        for post_eps, pre_eps, norm_fp32 in variants:
-            for kind in sorted(
-                {self.variant(rows) for rows in range(MIN_ROWS + 1, self.max_rows + 1, 2)}
-            ):
-                self._kernel(post_eps, pre_eps, norm_fp32, *kind)
-        torch.cuda.synchronize(self.device)
-
-    def variant(self, rows: int) -> Tuple[bool, int]:
-        """``(wide, pad)`` of a call of ``rows`` rows (the row count only: the same on every rank)."""
-        wide = rows >= self.wide_min_rows and rows % 2 == 0
-        pad = self.smem_pad if self.pad_rows[0] <= rows <= self.pad_rows[1] else 0
-        return wide, pad
-
-    def producer_views(self):
-        """The producer's output tensors, one per parity: BF16 ``[max_rows, 8192]`` views whose origin is this
-        rank's slab on rank 0 of the window (only their address and shape are used by the scatter epilogue)."""
-        flat = self._uc[0].view(torch.bfloat16)
-        views = []
-        for parity in range(BUFFERS):
-            off = (self.producer_base(parity) - self._uc[0].data_ptr()) // 2
-            views.append(flat[off : off + self.max_rows * HIDDEN].view(self.max_rows, HIDDEN))
-        return views
-
-    def scatter_copy(self, branch: torch.Tensor, parity: int) -> None:
-        """Store ``branch`` (this rank's partial, BF16 ``[rows, 8192]``) into the owners' slots of ``parity`` as the
-        scatter epilogue would (a fallback for a partial that did not come from the scatter producer)."""
-        slots = self.max_rows // self.ranks
-        for p in range(self.ranks):
-            part = branch[p :: self.ranks]
-            n = part.shape[0]
-            if n == 0:
-                continue
-            flat = self._uc[p].view(torch.bfloat16)
-            off = (parity * self.ranks + self.rank) * self.src_bytes // 2
-            slab = flat[off : off + self.src_bytes // 2]
-            if self.fb_layout:
-                slab.view(HIDDEN // 64, slots, 64)[:, :n, :].copy_(
-                    part.view(n, HIDDEN // 64, 64).transpose(0, 1)
-                )
-            else:
-                slab.view(slots, HIDDEN)[:n].copy_(part)
-
-    def reset(self) -> None:
-        """Every slot back to its sentinel on every rank (collective)."""
-        from tensorrt_llm._torch.distributed.ops import _mnnvl_workspace_all_succeeded
-
-        torch.cuda.synchronize(self.device)
-        local = self._uc[self.rank]
-        local[: self.scatter_bytes // 4].fill_(_hop._DIRECT_SENTINEL_I32)
-        local[self.scatter_bytes // 4 :].fill_(-(2**31))
-        torch.cuda.synchronize(self.device)
-        if not _mnnvl_workspace_all_succeeded(self._comm, True):
-            raise RuntimeError("direct wide hop reset failed on at least one rank")
-
-    def producer_base(self, parity: int) -> int:
-        """Where this rank's producer of a call of ``parity`` writes token row 0 (rank 0's window)."""
-        return (
-            self._uc[0].data_ptr()
-            + parity * self.ranks * self.src_bytes
-            + self.rank * self.src_bytes
-        )
-
-    def _kernel(self, post_eps, pre_eps, norm_fp32, wide, pad):
-        key = (float(post_eps), float(pre_eps), bool(norm_fp32), bool(wide), int(pad))
-        compiled = self._kernels.get(key)
-        if compiled is not None:
-            return compiled
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(f"direct wide hop variant {key} was not built before graph capture")
-        compiled = _compiled_direct(
-            self.device.index,
-            self.ranks,
-            self.multicast,
-            float(post_eps),
-            float(pre_eps),
-            bool(norm_fp32),
-            self.pdl,
-            self.early_launch,
-            self.max_rows,
-            bool(wide),
-            int(pad),
-            self.wait_first,
-            self.fb_layout,
-        )
-        dummy = self._fixed[0]
-        stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
-        compiled(*([dummy] * 6), *self._fixed, MIN_ROWS + 1, self.rank, 0, 1, stream)
-        self._kernels[key] = compiled
-        return compiled
-
-    def launch(self, residual, alpha, beta, next_weight, post_eps, pre_eps, norm_fp32, parity: int):
-        rows = residual.shape[0]
-        if not MIN_ROWS <= rows <= self.max_rows:
-            raise ValueError(f"direct wide hop: {rows} rows on a workspace of {self.max_rows}")
-        compiled = self._kernel(post_eps, pre_eps, norm_fp32, *self.variant(rows))
-        updated = torch.empty_like(residual)
-        normalized = torch.empty(residual.shape, dtype=torch.bfloat16, device=residual.device)
-        stream = cuda.CUstream(torch.cuda.current_stream(self.device).cuda_stream)
-        compiled(
-            residual.data_ptr(),
-            alpha.data_ptr(),
-            beta.data_ptr(),
-            next_weight.data_ptr(),
-            updated.data_ptr(),
-            normalized.data_ptr(),
-            *self._fixed,
-            rows,
-            self.rank,
-            int(parity),
-            0,
-            stream,
-        )
-        return updated, normalized
-
-
-#: The row counts ``(lo, hi)`` of the TEP8 decode steps that publish directly when
-#: ``SERVED_DIRECT`` is on (``hi`` capped by the workspace's capacity).
-SERVED_DIRECT_ROWS = (33, 64)
-#: The direct consumer's grid: two rows per 512-thread CTA from this many (even) rows; its SMEM
-#: pad (bytes, 0 off).
-SERVED_DIRECT_WIDE_MIN_ROWS = 41
-SERVED_DIRECT_PAD = 177408
-
-
-class DirectPublication:
-    """One model's direct publication (``tep8_direct_hop``): the workspace, the claimed o_proj
-    dispatchers (by identity; layer ``l`` publishes with parity ``l % 2``, as ``DirectPublish``),
-    the joins and the armed step."""
-
-    def __init__(self, workspace: "WideDirectWorkspace", dispatchers, joins) -> None:
-        if len(dispatchers) != len(joins) or len(joins) % 2:
-            raise ValueError(
-                "the direct publication needs one o_proj per join and an even layer count"
-            )
-        self.workspace = workspace
-        self.parity = {id(d): i % 2 for i, d in enumerate(dispatchers)}
-        self.dispatchers = tuple(dispatchers)
-        self.joins = tuple(joins)
-        self.views = workspace.producer_views()
-        self.rows: Optional[int] = None
-        self.poisoned: Optional[str] = None
-
-    def takes(self, rows: int) -> bool:
-        """Whether a decode step of ``rows`` rows publishes directly (the row count only: every rank alike)."""
-        lo, hi = SERVED_DIRECT_ROWS
-        return max(lo, MIN_ROWS) <= rows <= min(hi, self.workspace.max_rows)
-
-    def target(self, dispatcher, rows: int):
-        """``(view, peer_stride, fb_layout)`` for a claimed o_proj dispatcher's call of the armed step, else None."""
-        if self.rows is None or rows != self.rows:
-            return None
-        parity = self.parity.get(id(dispatcher))
-        if parity is None:
-            return None
-        return self.views[parity][:rows], self.workspace.peer_stride, self.workspace.fb_layout
-
-    def arm(self, rows: int) -> None:
-        if self.poisoned is not None:
-            raise RuntimeError(
-                "[musespark_open] tep8_direct_hop: the transport was not reset after a failed step "
-                f"({self.poisoned})"
-            )
-        self.rows = int(rows)
-        for index, join in enumerate(self.joins):
-            join._wide_direct = index % 2
-
-    def disarm(self) -> None:
-        self.rows = None
-        for join in self.joins:
-            join._wide_direct = None
-
-    def recover(self, error: BaseException) -> None:
-        try:
-            if torch.cuda.is_current_stream_capturing():
-                return
-        except RuntimeError:
-            pass
-        logger.error(
-            f"[musespark_open] tep8_direct_hop: a decode step raised ({error!r}); "
-            "resetting the transport"
-        )
-        try:
-            self.workspace.reset()
-        except Exception as reset_error:  # noqa: BLE001
-            self.poisoned = repr(reset_error)
-
-    def consume(self, parity, branch, residual, alpha, beta, weight, post_eps, pre_eps, norm_fp32):
-        if branch.data_ptr() != self.views[parity].data_ptr():
-            logger.warning_once(
-                "[musespark_open] tep8_direct_hop: an o_proj partial did not come from the scatter "
-                "producer; copied into the slots before the consumer",
-                key="musespark_open.tep8_direct_hop.copied_partial",
-            )
-            self.workspace.scatter_copy(branch, parity)
-        return self.workspace.launch(
-            residual, alpha, beta, weight, post_eps, pre_eps, norm_fp32, parity
-        )
-
-
-#: The model's direct publication (layers.py sets it when it builds one); the dispatcher reads it.
-_DIRECT_PUBLICATION: Optional[DirectPublication] = None
-
-
 _SHARED: dict = {}
 
 
@@ -2637,11 +1964,13 @@ def shared_wide_workspace(
     variants: Sequence[Tuple[float, float, bool]] = (),
     early_launch: Optional[bool] = None,
     max_rows: int = MAX_ROWS,
+    cluster: int = CLUSTER,
+    cluster_rows: Optional[FrozenSet[int]] = None,
 ) -> WideHopWorkspace:
-    """The one wide-hop workspace of this group, publication, launch mode and capacity, built
-    on first use. The larger capacity (``WIDE_MAX_ROWS``) takes only calls of more than
-    ``MAX_ROWS`` rows, so it is two-shot only. ``multicast`` and ``early_launch`` left None
-    take the module's settings (``SERVED_MULTICAST``, ``SERVED_EARLY_LAUNCH``).
+    """The one wide-hop workspace of this group, publication, launch mode, capacity and row
+    split, built on first use. The larger capacity (``WIDE_MAX_ROWS``) takes only calls of
+    more than ``MAX_ROWS`` rows, so it is two-shot only. ``multicast`` and ``early_launch``
+    left None take the module's settings (``SERVED_MULTICAST``, ``SERVED_EARLY_LAUNCH``).
 
     Collective on first use.
     """
@@ -2649,6 +1978,8 @@ def shared_wide_workspace(
     early_launch = SERVED_EARLY_LAUNCH if early_launch is None else early_launch
     two_shot_rows = TWO_SHOT_ROWS if max_rows == MAX_ROWS else MIN_ROWS
     key = (mapping, bool(multicast), _LAUNCH_PDL, two_shot_rows, bool(early_launch), max_rows)
+    if int(cluster) != CLUSTER:
+        key += (int(cluster), None if cluster_rows is None else frozenset(cluster_rows))
     workspace = _SHARED.get(key)
     if workspace is None:
         workspace = WideHopWorkspace(
@@ -2658,6 +1989,8 @@ def shared_wide_workspace(
             two_shot_rows=two_shot_rows,
             early_launch=early_launch,
             max_rows=max_rows,
+            cluster=cluster,
+            cluster_rows=cluster_rows,
         )
         _SHARED[key] = workspace
     else:
@@ -2732,7 +2065,7 @@ class PostAttnHopWide(OpWrapper):
     itself with ``norm_fp32``).
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of
@@ -2820,8 +2153,10 @@ def log_once_enabled(
     r2: Optional[bool] = None,
     r2_wide: Optional[bool] = None,
     smem_pad: Optional[int] = None,
+    cluster: int = CLUSTER,
+    cluster_rows: Optional[FrozenSet[int]] = None,
 ) -> None:
-    # A setting left None reads the module's (``configure``).
+    # A setting left None reads the module's ``SERVED_*`` setting.
     early_launch = SERVED_EARLY_LAUNCH if early_launch is None else early_launch
     r2 = SERVED_R2 if r2 is None else r2
     r2_wide = SERVED_R2_WIDE if r2_wide is None else r2_wide
@@ -2839,6 +2174,9 @@ def log_once_enabled(
         f"; two-shot AR at {MAX_ROWS + 1}..{WIDE_MAX_ROWS} rows on a second transport "
         "built on the first such eager step"
     )
+    if cluster != CLUSTER:
+        where = "" if cluster_rows is None else f" at {len(cluster_rows)} row counts"
+        transports += f"; {cluster} CTA(s) of {HIDDEN // (cluster * VECTOR)} threads per row{where}"
     launch = (
         "launched as a programmatic dependent" if early_launch else "launched after its producer"
     )
@@ -2854,544 +2192,3 @@ def log_once_enabled(
             f" SMEM pad {smem_pad} B at {SERVED_PAD_ROWS[0]}..{SERVED_PAD_ROWS[1]} rows"
         )
     )
-
-
-# ------------------------------------------------------------------------------------------------
-# The producer of the direct transport (``tep8_direct_hop``): o_proj's wide64 split-K kernel with
-# the scatter epilogue (``run_splitk_scatter``), called by the dense GEMM dispatcher.
-# ------------------------------------------------------------------------------------------------
-try:
-    import cuda.bindings.driver as _cuda
-    import cutlass.utils.blackwell_helpers as sm100_utils
-    import torch as _torch
-    from cutlass.cute import experimental as cute_ext
-
-    from ..gemm.splitk_gemm import (
-        _AB_BUFFER_ALIGN_BYTES,
-        _MAILBOX_ALIGN_BYTES,
-        _MBARRIER_BYTES,
-        _TMEM_POINTER_BYTES,
-        OWNER_RANK,
-        SplitKDenseGemmKernel,
-        SplitKTactic,
-        _make_compile_repr_tensors,
-        _store_shared_remote_v4,
-        _to_cute_swap,
-        _validate_runtime_tensors,
-        validate_tactic,
-    )
-
-    HAS_SCATTER_GEMM = HAS_CUTE_DSL
-except Exception:  # noqa: BLE001 - no scatter producer: the direct transport refuses to build
-    HAS_SCATTER_GEMM = False
-
-if HAS_SCATTER_GEMM:
-
-    class SplitKScatterKernel(SplitKDenseGemmKernel):
-        """``ops/gemm/splitk_gemm.SplitKDenseGemmKernel`` (flashinfer's, moved into this target) at
-        split_k 1 whose epilogue stores the tile as the TEP8 post-attention hop's direct scatter
-        (``scatter_store``). Its ``kernel`` / ``epilog_warp_scatter`` are the base class's
-        ``kernel`` / ``epilog_warp`` with the scatter scalars threaded through and the final store
-        replaced: same mainloop, same rounding, bitwise the same values; only the addresses of the
-        final stores differ. Defined here (not in the kernel file) so the split-K kernel's device
-        code -- and the TP8 publish certification keyed on it (``producer_key``) -- stays
-        unchanged."""
-
-        def __init__(self, *, tactic: SplitKTactic, use_pdl: bool, fb_layout: bool = False) -> None:
-            super().__init__(tactic=tactic, use_pdl=use_pdl, has_bias=False, mailbox_v4=True)
-            if tactic.split_k != 1 or (fb_layout and (tactic.mma_m != 64 or tactic.mma_n != 64)):
-                raise ValueError(
-                    f"the scatter epilogue serves split_k 1 (fb layout: 64 x 64 tiles) only, got {tactic}"
-                )
-            self.scatter = True
-            self.fb_layout = bool(fb_layout)
-
-        @cute.experimental.jit
-        def __call__(
-            self,
-            a: cute.Tensor,
-            b: cute.Tensor,
-            c: cute.Tensor,
-            peer_stride_el: cutlass.Int64,
-            rows: cutlass.Int32,
-            stream: _cuda.CUstream,
-        ):
-            self.kernel(a, b, c, c, peer_stride_el, rows).launch(
-                grid=(
-                    cute.ceil_div(c.layout.shape[0], self.cta_m),
-                    cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
-                    c.layout.shape[2],
-                ),
-                block=(self.threads_per_cta, 1, 1),
-                cluster=self.cluster_shape,
-                smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
-                stream=stream,
-                use_pdl=self.use_pdl,
-            )
-
-        @cute.experimental.kernel
-        def kernel(
-            self,
-            mA: cute.Tensor,  # (Gemm_M, Gemm_K, Gemm_L), K-major
-            mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
-            mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
-            mBias: cute.Tensor,  # Broadcast bias; dead when has_bias=False
-            peer_stride_el: cutlass.Int64,
-            rows: cutlass.Int32,
-        ):
-            """Allocate storage and dispatch the specialized warps."""
-            stages = self.num_ab_stage
-
-            ab_dtype = mA.element_type
-            tiled_mma = sm100_utils.make_trivial_tiled_mma(
-                ab_dtype,
-                ab_dtype,
-                utils.LayoutEnum.from_tensor(mA).mma_major_mode(),
-                utils.LayoutEnum.from_tensor(mB).mma_major_mode(),
-                self.acc_dtype,
-                self.cta_group,
-                self.mma_tiler_mn,
-            )
-
-            mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
-            block_idx = cute.arch.block_idx()
-            bidx = block_idx[0]
-            split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            n_idx = block_idx[1] // self.split_k
-            l_idx = block_idx[2]
-            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
-            sA = cute_ext.allocate(
-                ab_dtype,
-                cute.AddressSpace.smem,
-                sm100_utils.make_smem_layout_a(tiled_mma, mnk_tiler, ab_dtype, stages),
-                alignment=_AB_BUFFER_ALIGN_BYTES,
-            )
-            sB = cute_ext.allocate(
-                ab_dtype,
-                cute.AddressSpace.smem,
-                sm100_utils.make_smem_layout_b(tiled_mma, mnk_tiler, ab_dtype, stages),
-                alignment=_AB_BUFFER_ALIGN_BYTES,
-            )
-
-            acc_layout = cute_ext.make_tmem_layout_acc(tiled_mma, self.mma_tiler_mn, acc_stage=1)
-            c_tiler_mn = (self.cta_m, self.cta_n)
-
-            bar_full = cute_ext.allocate(
-                cutlass.Int64,
-                cute.AddressSpace.smem,
-                cute.make_layout(stages),
-                alignment=_MBARRIER_BYTES,
-            ).iterator
-            bar_empty = cute_ext.allocate(
-                cutlass.Int64,
-                cute.AddressSpace.smem,
-                cute.make_layout(stages),
-                alignment=_MBARRIER_BYTES,
-            ).iterator
-            bar_tma_epilog = cute_ext.allocate(
-                cutlass.Int64,
-                cute.AddressSpace.smem,
-                cute.make_layout(1),
-                alignment=_MBARRIER_BYTES,
-            ).iterator
-            bar_mma_epilog = cute_ext.allocate(
-                cutlass.Int64,
-                cute.AddressSpace.smem,
-                cute.make_layout(1),
-                alignment=_MBARRIER_BYTES,
-            ).iterator
-            bar_tmem_alloc = cute_ext.allocate(
-                cutlass.Int64,
-                cute.AddressSpace.smem,
-                cute.make_layout(1),
-                alignment=_MBARRIER_BYTES,
-            ).iterator
-            tmem_base_ptr = cute_ext.allocate(
-                cutlass.Int32,
-                cute.AddressSpace.smem,
-                cute.make_layout(1),
-                alignment=_TMEM_POINTER_BYTES,
-            ).iterator
-
-            if cutlass.const_expr(self.split_k > 1):
-                mailbox = cute_ext.allocate(
-                    cutlass.Float32,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(self.mailbox_elements),
-                    alignment=_MAILBOX_ALIGN_BYTES,
-                )
-                bar_reduce = cute_ext.allocate(
-                    cutlass.Int64,
-                    cute.AddressSpace.smem,
-                    cute.make_layout(1),
-                    alignment=_MBARRIER_BYTES,
-                ).iterator
-            else:
-                # Dummy operands for the compile-time-elided reduction.
-                mailbox = sA
-                bar_reduce = bar_mma_epilog
-
-            if warp_idx == 0:
-                with cute.arch.elect_one():
-                    for i in range(stages):
-                        cute.arch.mbarrier_init(bar_full + i, 2)
-                        cute.arch.mbarrier_init(bar_empty + i, 1)
-                    cute.arch.mbarrier_init(bar_tma_epilog, 32)
-                    cute.arch.mbarrier_init(bar_mma_epilog, 1)
-                    cute.arch.mbarrier_init(bar_tmem_alloc, 160)
-
-                    if cutlass.const_expr(self.split_k > 1):
-                        # Owner arrival plus peer transaction-byte credits.
-                        cute.arch.mbarrier_init(bar_reduce, 1)
-
-            cute.arch.mbarrier_init_fence()
-            if cutlass.const_expr(self.split_k > 1):
-                # Publish peer barriers before cross-CTA stores.
-                cute.arch.cluster_arrive_relaxed()
-            else:
-                cute.arch.barrier()
-
-            # Host validation guarantees an equal, tail-free K partition.
-            k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
-            k_tile_start = split_rank * k_tile_count
-
-            if cutlass.const_expr(self.split_k > 1):
-                cute.arch.cluster_wait()
-
-            # Warp 3 is idle; warps 4-7 run the epilogue.
-            if warp_idx == 0:
-                self.dma_warp(
-                    bar_full,
-                    bar_empty,
-                    bar_tma_epilog,
-                    cute.local_tile(mA, (self.cta_m, self.cta_k), (bidx, None, l_idx)),
-                    sA,
-                    cute_ext.get_cta_v_map_ab(mA, mnk_tiler, tiled_mma, "A"),
-                    k_tile_start,
-                    k_tile_count,
-                    True,
-                )
-            elif warp_idx == 1:
-                self.dma_warp(
-                    bar_full,
-                    bar_empty,
-                    bar_tma_epilog,
-                    cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx)),
-                    sB,
-                    cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B"),
-                    k_tile_start,
-                    k_tile_count,
-                    False,
-                )
-            elif warp_idx == 2:
-                self.mma_warp(
-                    bar_full,
-                    bar_empty,
-                    bar_mma_epilog,
-                    bar_tmem_alloc,
-                    tiled_mma,
-                    sA,
-                    sB,
-                    tmem_base_ptr,
-                    acc_layout,
-                    self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2]),
-                    k_tile_count,
-                )
-            elif warp_idx >= 4:
-                self.epilog_warp_scatter(
-                    bar_tma_epilog,
-                    bar_mma_epilog,
-                    bar_tmem_alloc,
-                    tmem_base_ptr,
-                    acc_layout,
-                    cute.local_tile(mC, c_tiler_mn, (bidx, n_idx, l_idx)),
-                    cute.local_tile(mBias, c_tiler_mn, (bidx, n_idx, l_idx)),
-                    cute.arch.thread_idx()[0] - 128,
-                    mC.element_type,
-                    utils.LayoutEnum.from_tensor(mC),
-                    mailbox,
-                    bar_reduce,
-                    split_rank,
-                    sA,
-                    peer_stride_el,
-                    rows,
-                )
-
-        @cute.experimental.jit
-        def epilog_warp_scatter(
-            self,
-            bar_tma_epilog,
-            bar_mma_epilog,
-            bar_tmem_alloc,
-            tmem_base_ptr,
-            acc_layout: cutlass.Constexpr,
-            gD_tile: cute.Tensor,
-            gBias_tile: cute.Tensor,
-            epi_tid: cutlass.Int32,
-            c_dtype: cutlass.Constexpr,
-            d_layout: cutlass.Constexpr,
-            mailbox,
-            bar_reduce,
-            split_rank: cutlass.Int32,
-            sA,
-            peer_stride_el,
-            rows,
-        ):
-            # Wait until MMA publishes the TMEM base pointer.
-            cute.arch.mbarrier_arrive(bar_tmem_alloc)
-            cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
-
-            acc_view = cute.make_tensor(
-                cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
-                acc_layout,
-            )[((None, None), 0, 0, 0)]
-
-            epi_tile = (self.cta_m, self.cta_n)
-            tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(
-                sm100_utils.get_tmem_load_op(
-                    (self.cta_m, self.cta_n, self.cta_k),
-                    d_layout,
-                    c_dtype,
-                    self.acc_dtype,
-                    epi_tile,
-                    False,
-                ),
-                acc_view,
-            )
-            gD_epi = cute.flat_divide(gD_tile, epi_tile)
-
-            # Match each epilogue thread's TMEM partition in RMEM.
-            rmem_layout = cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, gD_epi, epi_tid)
-            rAcc = cute_ext.allocate(
-                self.acc_dtype,
-                cute.AddressSpace.rmem,
-                rmem_layout,
-                alignment=32,
-            )
-            rD = cute_ext.allocate(
-                c_dtype,
-                cute.AddressSpace.rmem,
-                rmem_layout,
-                alignment=32,
-            )
-            thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
-
-            if cutlass.const_expr(self.has_bias):
-                bias_dtype = gBias_tile.element_type
-                rBias = cute_ext.allocate(
-                    bias_dtype,
-                    cute.AddressSpace.rmem,
-                    rmem_layout,
-                    alignment=32,
-                )
-                rBiasAcc = cute_ext.allocate(
-                    self.acc_dtype,
-                    cute.AddressSpace.rmem,
-                    rmem_layout,
-                    alignment=32,
-                )
-                if split_rank == OWNER_RANK:
-                    cute.arch.mbarrier_wait(bar_tma_epilog, 0)
-                    cute_ext.partition_and_copy(
-                        cute.make_tiled_copy_D(
-                            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), bias_dtype),
-                            tiled_copy_t2r,
-                        ).get_slice(epi_tid),
-                        cute.flat_divide(gBias_tile, epi_tile)[None, None, 0, 0],
-                        rBias,
-                    )
-                    rBiasAcc.store(rBias.load().to(self.acc_dtype))
-
-            cute.arch.mbarrier_wait(bar_mma_epilog, 0)
-            cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
-            # Make tcgen05.ld visible before TMEM release and RMEM use.
-            cute.arch.fence_view_async_tmem_load()
-            cute.arch.mbarrier_arrive(bar_tmem_alloc)
-
-            # Peers publish FP32 partials; only rank 0 reduces and stores.
-            if cutlass.const_expr(self.split_k > 1):
-                assert cute.size(rmem_layout) == self.mailbox_elements // (
-                    (self.split_k - 1) * self.epilog_threads
-                )
-                values_per_thread = cutlass.const_expr(cute.size(rmem_layout))
-                values_per_peer = cutlass.const_expr(self.epilog_threads * values_per_thread)
-                if split_rank != OWNER_RANK:
-                    for value_idx in cutlass.range_constexpr(0, values_per_thread, 4):
-                        if cutlass.const_expr(self.mailbox_v4):
-                            # A warp's 16-byte stores of one value group are contiguous (512 bytes).
-                            slot = (value_idx // 4) * (self.epilog_threads * 4) + epi_tid * 4
-                        else:
-                            slot = epi_tid * values_per_thread + value_idx
-                        _store_shared_remote_v4(
-                            rAcc[value_idx],
-                            rAcc[value_idx + 1],
-                            rAcc[value_idx + 2],
-                            rAcc[value_idx + 3],
-                            mailbox.iterator + (split_rank - Int32(1)) * values_per_peer + slot,
-                            bar_reduce,
-                            Int32(OWNER_RANK),
-                        )
-                else:
-                    if epi_tid == 0:
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            bar_reduce, self.expected_transaction_bytes
-                        )
-                    cute.arch.mbarrier_wait(bar_reduce, 0)
-                    for peer in cutlass.range_constexpr(self.split_k - 1):
-                        for value_idx in cutlass.range_constexpr(values_per_thread):
-                            if cutlass.const_expr(self.mailbox_v4):
-                                slot = (
-                                    (value_idx // 4) * (self.epilog_threads * 4)
-                                    + epi_tid * 4
-                                    + value_idx % 4
-                                )
-                            else:
-                                slot = epi_tid * values_per_thread + value_idx
-                            # Same additions in the same order (own, then peers in rank order).
-                            rAcc[value_idx] = (
-                                rAcc[value_idx] + mailbox[peer * values_per_peer + slot]
-                            )
-
-            if split_rank == OWNER_RANK:
-                if cutlass.const_expr(self.has_bias):
-                    rAcc.store(rAcc.load() + rBiasAcc.load())
-
-                rD.store(rAcc.load().to(c_dtype))
-                # Preserve TMEM coordinates; the copy predicates output tails.
-                self.scatter_store(thr_t2r, rD, sA, gD_tile, epi_tid, c_dtype, peer_stride_el, rows)
-
-            # The reduction mbarrier covers remote stores; no cluster barrier needed.
-
-        @cute.experimental.jit
-        def scatter_store(
-            self,
-            thr_t2r,
-            rD,
-            sA,
-            gD_tile: cute.Tensor,
-            epi_tid: cutlass.Int32,
-            c_dtype: cutlass.Constexpr,
-            peer_stride_el,
-            rows,
-        ):
-            """The tile's store as the TEP8 hop's direct scatter. Token row t of the
-            tile goes to the scatter slab this rank writes on the row's owner t % 8: element (feature m,
-            token t) at C + (t % 8) * peer_stride_el + (t // 8) * 8192 + m, where C (gD_tile's origin, feature
-            m0 = bidx * cta_m, token 0) is this rank's slab on rank 0 of the group's contiguous unicast window.
-            rD's values (the bits) are staged token-major in sA (free once bar_mma_epilog completed: the last
-            MMA read it and every TMA load into it landed before), then each token's cta_m features go out as
-            16-byte stores of 8 adjacent threads (one 128 B run per token and CTA at cta_m 64)."""
-            pitch = self.cta_m + 8
-            bidx = cute.arch.block_idx()[0]
-            sT = cute.make_tensor(
-                cute.recast_ptr(sA.iterator, dtype=c_dtype),
-                cute.make_layout((self.cta_m, self.cta_n), stride=(1, pitch)),
-            )
-            cute_ext.partition_and_copy(thr_t2r, rD, sT)
-            cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
-            chunks = self.cta_m // 8
-            atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), c_dtype, num_bits_per_copy=128)
-            vec = cute.make_rmem_tensor(cute.make_layout((8,)), c_dtype)
-            if cutlass.const_expr(self.fb_layout):
-                # Feature-block-major slots: owner p's area holds [feature block of cta_m][8 slots][cta_m features],
-                # so this CTA's 8 tokens for owner p are one contiguous (8 * cta_m * 2)-byte run, and each warp
-                # instruction writes 4 consecutive slots (4 x 128 B, contiguous) of one owner.
-                warp = epi_tid // 32
-                lane = epi_tid % 32
-                fchunk = lane % chunks
-                for j in cutlass.range_constexpr(4):
-                    p = warp + 4 * (j // 2)
-                    s = 4 * (j % 2) + lane // chunks
-                    tok = p + 8 * s
-                    if tok < rows:
-                        cute.copy(
-                            atom,
-                            cute.make_tensor(
-                                (sT.iterator + tok * pitch + fchunk * 8).align(16),
-                                cute.make_layout((8,)),
-                            ),
-                            vec,
-                        )
-                        dst = (
-                            gD_tile.iterator
-                            + cutlass.Int64(bidx) * (7 * self.cta_m)
-                            + cutlass.Int64(p) * peer_stride_el
-                            + s * self.cta_m
-                            + fchunk * 8
-                        )
-                        cute.copy(
-                            atom, vec, cute.make_tensor(dst.align(16), cute.make_layout((8,)))
-                        )
-            for j in cutlass.range_constexpr(
-                0 if self.fb_layout else (self.cta_m * self.cta_n) // 8 // self.epilog_threads
-            ):
-                idx = epi_tid + j * self.epilog_threads
-                tok = idx // chunks
-                chunk = idx % chunks
-                if tok < rows:
-                    cute.copy(
-                        atom,
-                        cute.make_tensor(
-                            (sT.iterator + tok * pitch + chunk * 8).align(16),
-                            cute.make_layout((8,)),
-                        ),
-                        vec,
-                    )
-                    dst = (
-                        gD_tile.iterator
-                        + cutlass.Int64(tok % 8) * peer_stride_el
-                        + cutlass.Int64(tok // 8) * 8192
-                        + chunk * 8
-                    )
-                    cute.copy(atom, vec, cute.make_tensor(dst.align(16), cute.make_layout((8,))))
-
-            # The reduction mbarrier covers remote stores; no cluster barrier needed.
-
-    @cute.experimental.jit
-    def _bmm_scatter(
-        gemm_op: cutlass.Constexpr,
-        a: cute.Tensor,
-        b: cute.Tensor,
-        c: cute.Tensor,
-        peer_stride_el: cutlass.Int64,
-        rows: cutlass.Int32,
-        stream: _cuda.CUstream,
-    ):
-        gemm_op(
-            cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0])),
-            cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0])),
-            cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0])),
-            peer_stride_el,
-            rows,
-            stream,
-        )
-
-    @functools.cache
-    def _get_compiled_scatter_kernel(
-        dtype, tactic: SplitKTactic, use_pdl: bool, leading_dims, fb_layout: bool = False
-    ):
-        kernel = SplitKScatterKernel(tactic=tactic, use_pdl=use_pdl, fb_layout=fb_layout)
-        a_rep, b_rep, c_rep, _ = _make_compile_repr_tensors(dtype, False, *leading_dims)
-        stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-        return cute_ext.compile(
-            _bmm_scatter, kernel, a_rep, b_rep, c_rep, cutlass.Int64(0), cutlass.Int32(0), stream
-        )
-
-    def run_splitk_scatter(
-        a, b, out, pdl: bool, tactic: SplitKTactic, peer_stride_bytes: int, fb_layout: bool = False
-    ):
-        """``A @ B`` stored as the hop's direct scatter: ``out`` [M, N] is a view whose origin is
-        this rank's scatter slab on rank 0 of the window (only its address is used); token row t lands at
-        ``out`` + (t % 8) * peer_stride_bytes + (t // 8) * N * 2."""
-        m, n, k = _validate_runtime_tensors(a, b, None, out)
-        validate_tactic(tactic, m, n, k)
-        if m > tactic.mma_n or n != 8192 or peer_stride_bytes % 16:
-            raise ValueError(f"scatter epilogue: rows <= mma_n, 8192 columns; got {m} x {n}")
-        cute_tensors = _to_cute_swap(a, b, out, None)
-        compiled = _get_compiled_scatter_kernel(
-            a.dtype, tactic, pdl, cute_tensors[4], bool(fb_layout)
-        )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-        compiled(*cute_tensors[:3], cutlass.Int64(peer_stride_bytes // 2), cutlass.Int32(m), stream)
-        return out

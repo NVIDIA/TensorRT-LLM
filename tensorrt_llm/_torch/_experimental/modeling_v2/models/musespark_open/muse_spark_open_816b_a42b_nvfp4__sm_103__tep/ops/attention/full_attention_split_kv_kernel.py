@@ -3,7 +3,7 @@
 """CuTe DSL kernel behind ``full_attention_split_kv``: page-split decode attention partials (tcgen05, sm_103).
 
 ``full_attention_split_kv`` imports this module to build its kernels, only when the op is
-called; ``configure`` (``lever_settings.apply``) sets the TMA ring depth they are built with. The
+called. The
 op module states the contract, the ownership and progress argument
 and the PDL memory-order record; the comments here say what each role does.
 
@@ -64,29 +64,8 @@ BF16 = cutlass.BFloat16
 F16 = cutlass.Float16
 
 #: Pages of the TMA ring every split-KV kernel is built with (the op's build and the prep-fold
-#: builds; ``configure``'s ``stages``, lever ``split_kv_deep_rings``): 16, or another multiple of 4
-#: (20 is the deepest that fits one CTA's shared memory). Buffering only: the same tiles, in the
-#: same order, through the same MMAs, so the same bits. 20 measured -4.15 / -2.60 us per layer at
-#: 524k context with 3 / 2 requests, ~0 at <= 262k. Read when a kernel object is built.
+#: builds): 16. Read when a kernel object is built.
 _FA_STAGES = 16
-
-
-def configure(*, stages: int = 16) -> None:
-    """Set the TMA ring depth (pages) the split-KV kernels are built with.
-
-    ``lever_settings.apply`` sets it from the model's plan before any install. A kernel built
-    afterwards takes it; ``full_attention_split_kv`` keys each compiled build on it, so a build
-    compiled at another depth is never reused for this one.
-
-    Raises:
-        ValueError: for a depth that is not a positive multiple of ``PAGES_PER_TILE``.
-    """
-    global _FA_STAGES
-    if stages <= 0 or stages % PAGES_PER_TILE:
-        raise ValueError(
-            f"split-KV ring depth must be a positive multiple of {PAGES_PER_TILE}, got {stages}"
-        )
-    _FA_STAGES = int(stages)
 
 
 #: Tokens per KV page, head width, KV heads and query heads per KV head of one CTA (one pair
@@ -322,7 +301,6 @@ class FullAttnSplitKvKernel:
         self.evict_first = evict_first
         self.k_tile = k_tile
         if stages is None:
-            # The ring depth ``configure`` set, read when the kernel object is built.
             stages = _FA_STAGES
         assert stages % PAGES_PER_TILE == 0, stages
         self.stages = stages

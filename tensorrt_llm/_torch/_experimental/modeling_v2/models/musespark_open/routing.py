@@ -13,15 +13,24 @@ flat ``MuseSparkOpenConfig`` and writes ``MuseSparkOpenOmniForCausalLM`` as its
 architecture, so ``_router_index`` keys on that name and every criterion below is
 read off the flat config.
 
-The target claims every tensor-parallel size of its layout. Which fast paths a
+There is one target per GPU architecture: ``muse_spark_open_816b_a42b_nvfp4__sm_103__tep``
+on sm103 and ``muse_spark_open_816b_a42b_nvfp4__sm_107__tep`` on sm107. They share no
+code. Each claims every tensor-parallel size of its layout. Which fast paths a
 deployment runs is the target's own decision at construction
-(``dispatch.compose``): the composition of its GPU architecture and
-tensor-parallel size when the GPU topology and the speculative decoding mode
-are the ones the compositions are written for, and the built-in forward
-through the target otherwise. So
-``route`` reads neither the speculative-decoding config nor the GPUs per node
+(``dispatch.compose``): the composition of its tensor-parallel size when the GPU
+topology and the speculative decoding mode are the ones the compositions are
+written for, and the built-in forward through the target otherwise. So
+``route`` decides on neither the speculative-decoding config nor the GPUs per node
 (launcher state: the visible devices, or the tensor-parallel size under Ray),
-and a deployment the target serves without fast paths still lands here.
+and a deployment a target serves without fast paths still lands there.
+
+When it returns the sm107 target, ``route`` applies that target's forced-acceptance
+policy to the speculative config (``rs_common.apply_forced_policy_to_spec_config``:
+under ``TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS`` rejection sampling is off at
+TP8, where the ``rejection_sampler`` fast path is built, unless that lever is
+turned off; ``rs_common.policy_applies``). It is the engine's own config object,
+and this is the one point the target sees it before the model loader deep-copies
+the model config for the model. Elsewhere, and on sm103, the config is left as it is.
 
 The quantization is not a criterion either: the open-format translation drops
 the inline ``quantization_config`` (``hf_quant_config.json`` is the one copy the
@@ -36,10 +45,11 @@ from typing import Any, Optional, Tuple
 
 from ..._router_index import NoTarget
 
-# The GPU architectures the target is routed on: sm103 and sm107. Each has its own
-# compositions (``modeling.TARGET_PATHS``); the sm107 ones need the built-in fused
-# kernels opted in (``dispatch.SM107_FUSED_KERNELS``).
-_SMS = ((10, 3), (10, 7))
+# The GPU architectures routed here, one target each: GB300 (sm103) and Vera Rubin
+# (sm107). The sm107 target's compositions need the built-in fused kernels opted in
+# (its ``dispatch.SM107_FUSED_KERNELS``).
+_SM103 = (10, 3)
+_SM107 = (10, 7)
 
 # The checkpoint's config shape, read off the flat config; see the gpt_oss routing
 # module for what shape-sniffing does and does not pin. The attention fields fix
@@ -88,9 +98,14 @@ def route(
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 
-    ``spec_config`` is part of the routing signature and is not read here (see the
-    module docstring). The target is imported where it is returned, so declining
-    costs no import of modeling code.
+    ``spec_config`` does not take part in the decision (see the module docstring);
+    when the sm107 target is returned, its forced-acceptance policy is applied to it
+    (at TP8 only).
+    Each target is imported where it is returned, so declining costs no import of
+    modeling code.
+
+    Raises:
+        NoTarget: the deployment is neither target's.
     """
     # A config without one of these fields is another assembly: it reads as None
     # and the shape does not match.
@@ -98,25 +113,39 @@ def route(
 
     # Muse-Spark-Open-816B-A42B on sm103 or sm107, tensor-parallel attention and
     # expert-parallel MoE over the same ranks.
-    served = tuple(compute_capability) in _SMS and shape == _SHAPE and _tep(mapping)
+    capability = tuple(compute_capability)
+    served = capability in (_SM103, _SM107) and shape == _SHAPE and _tep(mapping)
     if not served:
         raise NoTarget(
             f"compute capability {compute_capability}, "
             f"config shape {shape}, parallel ws={mapping.world_size} tp={mapping.tp_size} "
             f"pp={mapping.pp_size} cp={mapping.cp_size} moe_ep={mapping.moe_ep_size} "
-            f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp}; the one "
-            "musespark_open target is Muse-Spark-Open-816B-A42B on sm103 or sm107, attention "
-            "tensor-parallel and the experts expert-parallel over the same ranks at any size "
-            "(moe_tp 1, pp 1, cp 1, no attention DP)"
+            f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp}; the "
+            "musespark_open targets are Muse-Spark-Open-816B-A42B on sm103 and on sm107, "
+            "attention tensor-parallel and the experts expert-parallel over the same ranks at "
+            "any size (moe_tp 1, pp 1, cp 1, no attention DP)"
         )
 
-    # One line, and at this depth, on purpose: the claims suite reads the routed
-    # targets off `from .<target>.modeling import <Class>` lines, so the import
+    # One line per target, and at this depth, on purpose: the claims suite reads the
+    # routed targets off `from .<target>.modeling import <Class>` lines, so the imports
     # cannot be wrapped to fit the line limit.
+    if capability == _SM103:
+        # fmt: off
+        # isort: off
+        from .muse_spark_open_816b_a42b_nvfp4__sm_103__tep.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
+        # isort: on
+        # fmt: on
+        return ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
+
     # fmt: off
     # isort: off
-    from .muse_spark_open_816b_a42b_nvfp4__sm_103__tep.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
+    from .muse_spark_open_816b_a42b_nvfp4__sm_107__tep.modeling import ModelingV2MuseSparkOpen816bA42bNvfp4Sm107Tep
     # isort: on
     # fmt: on
+    from .muse_spark_open_816b_a42b_nvfp4__sm_107__tep.kernels.rs_sampler import rs_common
 
-    return ModelingV2MuseSparkOpen816bA42bNvfp4Sm103Tep
+    major, minor = compute_capability
+    rs_common.apply_forced_policy_to_spec_config(
+        spec_config, 10 * int(major) + int(minor), mapping.tp_size
+    )
+    return ModelingV2MuseSparkOpen816bA42bNvfp4Sm107Tep

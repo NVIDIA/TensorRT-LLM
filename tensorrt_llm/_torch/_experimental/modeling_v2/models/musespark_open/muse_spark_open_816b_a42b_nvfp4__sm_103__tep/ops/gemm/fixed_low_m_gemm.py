@@ -10,7 +10,7 @@ sites never reach it. This entry is the split-K kernel the dispatcher would
 launch, with the tactic chosen by the caller: one tactic per shape, the same
 on every rank, measured once per target GPU and TP size (``SPLITK_TACTICS_BY_SM_TP``).
 The kernel is this target's copy (``ops/gemm/splitk_gemm.py``) of flashinfer's
-``dense_bf16_gemm_sm100_splitk``, with the changes ``splitk_gemm.configure`` sets.
+``dense_bf16_gemm_sm100_splitk``.
 
 The kernel accumulates in fp32 and rounds once; its K-split differs from
 cuBLAS's, so results differ from ``F.linear`` in the last bf16 place on a few
@@ -44,113 +44,6 @@ SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     # DFlash fc, one TP8 column shard (``drafter_fc_shard``).
     (8, 40960, 1024): (64, 8, 4, 12),
 }
-
-#: The same shapes on sm107 (212 SMs), each tactic chosen there the same way.
-SM107_SPLITK_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
-    (8, 8192, 2048): (64, 8, 4, 10),
-    (8, 8192, 1280): (64, 8, 4, 12),
-    (8, 1024, 8192): (64, 8, 1, 10),
-    (8, 3584, 8192): (64, 8, 1, 12),
-    (8, 8192, 7168): (64, 16, 1, 9),
-    (8, 40960, 1024): (64, 8, 4, 12),
-}
-
-#: ``tep8_drafter_wide`` (``configure``) adds the tep8 sm107 drafter's 2..4-request blocks (16, 24
-#: and 32 rows), and with ``tep8_wide64`` (the split-K kernel's 64-wide tiles) its 5..8-request
-#: blocks (40..64 rows), which otherwise run cuBLAS (nvjet, plus a cublasLt splitKreduce launch on
-#: four of the five per-layer projections: 20-23 reduce launches per step on the TEP8 bs4/bs8
-#: critical path). Each shape keeps the ``split_k`` of its 8-row cell, so every row of a block gets
-#: the bits it gets in a one-request step (the split-K kernel sums the same K slices in the same
-#: order whatever the tile widths); against cuBLAS a row differs in the last BF16 place on some
-#: elements, as the 8-row cells already do (o_proj and down_proj, split_k 1: equal in isolated
-#: tests). Tile widths and stages: the fastest measured behind an early-releasing predecessor with
-#: PDL, which is what the drafter's predecessors are (hop, block convolution, window-attention
-#: merge, SiLU-mul all release their dependents early: the 8-row split-K GEMMs start 1.5-4.7 us
-#: before them in TEP8 bs1 traces).
-#: (mma_m, mma_n, split_k, ab_stages) per row count and site: the fastest split-K tile behind an
-#: early-releasing predecessor with PDL, measured on sm107 at the 8-row cell's split_k.
-_TP8_DRAFTER_WIDE_SHAPES = {
-    "conv_coef": (8192, 2048),
-    "qkv": (8192, 1280),
-    "o_proj": (1024, 8192),
-    "down": (3584, 8192),
-    "gate_up": (8192, 7168),
-}  # qkv: also the context K/V
-_TP8_DRAFTER_WIDE_TILES = {
-    16: {
-        "conv_coef": (64, 16, 4, 10),
-        "qkv": (64, 16, 4, 10),
-        "o_proj": (64, 16, 1, 11),
-        "down": (64, 16, 1, 11),
-        "gate_up": (64, 16, 1, 11),
-    },
-    24: {
-        "conv_coef": (64, 32, 4, 8),
-        "qkv": (64, 32, 4, 8),
-        "o_proj": (64, 32, 1, 9),
-        "down": (64, 32, 1, 9),
-        "gate_up": (64, 32, 1, 9),
-    },
-    32: {
-        "conv_coef": (64, 32, 4, 8),
-        "qkv": (64, 32, 4, 8),
-        "o_proj": (64, 32, 1, 9),
-        "down": (64, 32, 1, 9),
-        "gate_up": (64, 32, 1, 9),
-    },
-    40: {
-        "conv_coef": (64, 64, 4, 5),
-        "qkv": (64, 64, 4, 5),
-        "o_proj": (64, 64, 1, 7),
-        "down": (64, 64, 1, 7),
-        "gate_up": (64, 64, 1, 7),
-    },
-    48: {
-        "conv_coef": (64, 64, 4, 5),
-        "qkv": (64, 64, 4, 5),
-        "o_proj": (64, 64, 1, 7),
-        "down": (64, 64, 1, 7),
-        "gate_up": (64, 64, 1, 7),
-    },
-    56: {
-        "conv_coef": (64, 64, 4, 5),
-        "qkv": (64, 64, 4, 5),
-        "o_proj": (64, 64, 1, 7),
-        "down": (64, 64, 1, 7),
-        "gate_up": (64, 64, 1, 7),
-    },
-    64: {
-        "conv_coef": (64, 64, 4, 5),
-        "qkv": (64, 64, 4, 5),
-        "o_proj": (64, 64, 1, 7),
-        "down": (64, 64, 1, 7),
-        "gate_up": (64, 64, 1, 7),
-    },
-}
-SM107_TP8_DRAFTER_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
-    (_rows, *_TP8_DRAFTER_WIDE_SHAPES[_site]): _tactic
-    for _rows, _sites in _TP8_DRAFTER_WIDE_TILES.items()
-    for _site, _tactic in _sites.items()
-}
-#: ``tep8_fc_wide`` (``configure``; ``spec_worker``'s TP8 fc shard above 8 rows) adds the DFlash
-#: fc's TP8 column shard ``[rows, 40960] @ [1024, 40960].T`` at 16..32 rows, and with
-#: ``tep8_wide64`` (the split-K kernel's M <= 64) 40..64 rows; other row counts run ``F.linear`` on
-#: the shard. Each keeps the 8-row cell's split_k (4): a row's bits are its one-request bits, and
-#: at 24 and 32 rows they are also the replicated cuBLAS GEMM's (its nvjet 160x64 kernel splits K
-#: the same 4 ways; elsewhere 99.4-99.6 % of elements equal, the rest one BF16 ulp). Widths: the
-#: fastest behind a plain predecessor (the side chain's torch kernels), 16 rows per tile up to 32
-#: rows, 32 above.
-SM107_TP8_FC_WIDE_TACTICS: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
-    (_rows, 40960, 1024): (64, 16, 4, 10) if _rows <= 32 else (64, 32, 4, 8)
-    for _rows in (16, 24, 32, 40, 48, 56, 64)
-}
-#: The settings ``configure`` sets (all off: the one-request sm107 TP8 table above as measured).
-TEP8_WIDE64 = False
-TEP8_DRAFTER_WIDE = False
-TEP8_FC_WIDE = False
-TEP8_DRAFTER_WIDE64 = False
-#: ``SM107_SPLITK_TACTICS`` as measured, before ``configure`` adds the wide entries.
-_SM107_SPLITK_TACTICS_BASE = dict(SM107_SPLITK_TACTICS)
 
 #: The same for a tep4 drafter (one tray) on sm103: every TP-sharded projection is
 #: twice the tep8 one along its sharded dimension; the replicated convolution
@@ -189,88 +82,17 @@ SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
     (32, 8192, 14336): (128, 32, 1, 5),
 }
 
-#: The tep4 drafter shapes on sm107 (212 SMs), each the fastest split-K tactic there in
-#: the same chains; every one beats cuBLAS at its shape. Besides the one-request block
-#: (8 rows) the table lists the blocks of 2..4 requests (16, 24 and 32 rows), each the
-#: fastest split-K tactic at that row count over cold weights with PDL on.
-SM107_SPLITK_TACTICS_TP4: dict[tuple[int, int, int], tuple[int, int, int, int]] = {
-    (8, 8192, 2048): (64, 8, 4, 10),
-    (8, 8192, 2560): (64, 8, 4, 12),
-    (8, 2048, 8192): (128, 16, 2, 6),
-    (8, 7168, 8192): (64, 8, 2, 10),
-    (8, 8192, 14336): (64, 8, 2, 11),
-    (16, 8192, 2048): (64, 16, 4, 10),
-    (16, 8192, 2560): (64, 16, 4, 10),
-    (16, 2048, 8192): (64, 16, 1, 11),
-    (16, 7168, 8192): (64, 32, 1, 8),
-    (16, 8192, 14336): (128, 16, 1, 6),
-    (24, 8192, 2048): (64, 32, 4, 8),
-    (24, 8192, 2560): (64, 32, 4, 8),
-    (24, 2048, 8192): (64, 32, 1, 9),
-    (24, 7168, 8192): (64, 32, 1, 9),
-    (24, 8192, 14336): (128, 32, 1, 5),
-    (32, 8192, 2048): (64, 32, 4, 8),
-    (32, 8192, 2560): (64, 32, 4, 8),
-    (32, 2048, 8192): (64, 32, 1, 9),
-    (32, 7168, 8192): (64, 32, 2, 9),
-    (32, 8192, 14336): (64, 32, 2, 8),
-}
-
 #: The measured table of each ``(compute capability, drafter TP size)``.
 SPLITK_TACTICS_BY_SM_TP: dict[
     tuple[tuple[int, int], int], dict[tuple[int, int, int], tuple[int, int, int, int]]
 ] = {
     ((10, 3), 8): SPLITK_TACTICS,
     ((10, 3), 4): SPLITK_TACTICS_TP4,
-    ((10, 7), 8): SM107_SPLITK_TACTICS,
-    ((10, 7), 4): SM107_SPLITK_TACTICS_TP4,
 }
 
-#: The kernel's row limit (the dispatcher's ``_MAX_M``): 64 with the TP8 drafter's or fc shard's
-#: 40..64-row entries (``tep8_wide64``, which needs the split-K kernel's 64-wide tiles), as
-#: ``configure`` sets it. Shapes no table lists still run the built-in GEMM.
+#: The kernel's row limit (the dispatcher's ``_MAX_M``).
+#: Shapes no table lists still run the built-in GEMM.
 MAX_M = 32
-
-
-def configure(
-    *, tep8_wide64: bool = False, tep8_drafter_wide: bool = False, tep8_fc_wide: bool = False
-) -> None:
-    """Set the wide entries of the sm107 TP8 tactic table and the kernel's row limit.
-
-    ``lever_settings.apply`` sets them from the model's plan before any install (the drafter
-    installs read the table then). The table is updated in place: ``SPLITK_TACTICS_BY_SM_TP``
-    holds it.
-
-    Args:
-        tep8_wide64: also the 40..64-row entries of the two below, and ``MAX_M`` 64 with either
-            (needs the split-K kernel's ``wide64``).
-        tep8_drafter_wide: the TP8 drafter's 16..32-row blocks (``SM107_TP8_DRAFTER_WIDE_TACTICS``).
-        tep8_fc_wide: the DFlash fc shard's 16..32-row calls (``SM107_TP8_FC_WIDE_TACTICS``).
-    """
-    global TEP8_WIDE64, TEP8_DRAFTER_WIDE, TEP8_FC_WIDE, TEP8_DRAFTER_WIDE64, MAX_M
-    TEP8_WIDE64 = bool(tep8_wide64)
-    TEP8_DRAFTER_WIDE = bool(tep8_drafter_wide)
-    TEP8_FC_WIDE = bool(tep8_fc_wide)
-    TEP8_DRAFTER_WIDE64 = TEP8_DRAFTER_WIDE and TEP8_WIDE64
-    SM107_SPLITK_TACTICS.clear()
-    SM107_SPLITK_TACTICS.update(_SM107_SPLITK_TACTICS_BASE)
-    if TEP8_DRAFTER_WIDE:
-        SM107_SPLITK_TACTICS.update(
-            {
-                key: tactic
-                for key, tactic in SM107_TP8_DRAFTER_WIDE_TACTICS.items()
-                if key[0] <= 32 or TEP8_WIDE64
-            }
-        )
-    if TEP8_FC_WIDE:
-        SM107_SPLITK_TACTICS.update(
-            {
-                key: tactic
-                for key, tactic in SM107_TP8_FC_WIDE_TACTICS.items()
-                if key[0] <= 32 or TEP8_WIDE64
-            }
-        )
-    MAX_M = 64 if TEP8_WIDE64 and (TEP8_DRAFTER_WIDE or TEP8_FC_WIDE) else 32
 
 
 _DEVICE_CAPABILITY: tuple[int, int] | None = None

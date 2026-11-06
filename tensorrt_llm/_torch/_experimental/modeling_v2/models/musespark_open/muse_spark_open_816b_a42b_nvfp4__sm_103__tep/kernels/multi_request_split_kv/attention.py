@@ -26,7 +26,7 @@ metadata (per-capture constants under a CUDA graph). A step of one sequence -- t
 decode graph of a single request -- returns to the class behind this mixin before anything else
 is read, so its kernels and what the 8-row fast paths do are unchanged. Prefill and mixed steps are never
 intercepted. ``install``'s ``min_requests`` raises the floor where another path owns the smallest
-multi-request steps (``wide_full_attention`` takes 2..4 sequences on sm107 TEP4): steps below it
+multi-request steps: steps below it
 are the class behind this mixin.
 
 Any call that is not the plain case -- positional arguments, other keywords, sinks, a scaled
@@ -369,7 +369,7 @@ def install(model: torch.nn.Module, sliding: bool, min_requests: int = 2) -> int
 
     Raises:
         ValueError: if ``intercepting`` would not reach the built-in decode FMHA, the device is
-            not sm_103 or sm_107, or a chosen layer's attention is not a tep4 rank's (32 query
+            not sm_103, or a chosen layer's attention is not a tep4 rank's (32 query
             / 4 KV heads) or a tep8 rank's (16 / 2) heads of width 64 with the plain softmax
             scale and the trtllm-gen FMHA library, or a sliding-window layer's window is not
             2048, or the layers differ in rank shape.
@@ -379,12 +379,9 @@ def install(model: torch.nn.Module, sliding: bool, min_requests: int = 2) -> int
         raise ValueError(
             f"[musespark_open] multi_request_split_kv cannot replace the decode FMHA: {reason}"
         )
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
-        (10, 3),
-        (10, 7),
-    ):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
         raise ValueError(
-            "[musespark_open] the multi_request_split_kv kernel is built for sm_103 and sm_107 only"
+            "[musespark_open] the multi_request_split_kv kernel is built for sm_103 only"
         )
     chosen = [
         layer.self_attn for layer in model.layers if sliding or not layer.self_attn.is_sliding

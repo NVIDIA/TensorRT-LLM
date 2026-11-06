@@ -28,9 +28,7 @@ and weights instead of the router logits (``moe.shard_routing``), and the attent
 residual join writes the router's FP32 input next to the pre-FFN norm output
 (``router_input``); both are bitwise. There the attention input of steps of at least
 ``ce_gather.MIN_ROWS`` rows is gathered by the copy engines and the QKV projection runs
-in row blocks behind per-peer flags (``ce_gather``); also bitwise. On sm107 the router
-logits and the attention input are all-gathered, unless ``configure`` adds sm103's parts
-there.
+in row blocks behind per-peer flags (``ce_gather``); also bitwise.
 
 DFlash taps the residual stream after its capture layers, and that stream is
 sharded here. For the forward the step's capture buffer
@@ -55,8 +53,8 @@ rows. So the path takes:
   up to the next captured bucket, so with buckets ``..., 768, 1024, ...`` every step of
   769 rows or more replays a sequence-parallel graph, generation rows beside the
   context rows included;
-* an eager step of at least the device's eager threshold (``EAGER_MIN_ROWS_BY_SM``,
-  ``EAGER_MIN_ROWS`` on sm103), where the GPU work saved exceeds the host time added.
+* an eager step of at least the eager threshold (``EAGER_MIN_ROWS``),
+  where the GPU work saved exceeds the host time added.
 
 Eager steps below that threshold (including the breakable graph's eager warmups of
 its buckets, and every step when no prefill graph is configured), and every decode step,
@@ -85,7 +83,6 @@ from tensorrt_llm._torch.models.modeling_musespark_open import (
 )
 from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_cuda_graph
 from tensorrt_llm._torch.speculative.dflash import DFlashSpecMetadata
-from tensorrt_llm.logger import logger
 
 #: The fewest rows a step captured into the breakable prefill CUDA graph needs to run
 #: sequence-parallel: below it the two collectives' fixed cost per all-reduce replaced
@@ -100,12 +97,6 @@ MIN_ROWS = 1024
 #: and this the replicated forward is faster; above it the sequence-parallel GPU time is
 #: the shorter. Measured on sm103 with its Grace host.
 EAGER_MIN_ROWS = 4608
-
-#: ``EAGER_MIN_ROWS`` per SM version (``dispatch.sm_of``). On sm107 with its Vera host the
-#: eager sequence-parallel forward is already the faster one at 3584 rows, the smallest
-#: eager step above the default prefill graph buckets (3072 rows), so every eager step of
-#: the largest bucket's rows or more takes the path there. Any other SM takes sm103's.
-EAGER_MIN_ROWS_BY_SM = {103: EAGER_MIN_ROWS, 107: 3072}
 
 #: The ranks the rows are split over: one tray's TP4 group, experts parallel over it.
 TP_SIZE = 4
@@ -154,47 +145,14 @@ SHARD_PARTS_BY_SM = {
     # sm103: the MoE re-class with routing on the shard, the router's FP32 input from the
     # attention-side join, and the copy-engine gather of the attention input.
     103: ("moe", "shard_routing", "router_input", "ce_gather"),
-    # sm107: the MoE re-class only; the router logits are gathered and every row of the
-    # step is routed, as the built-in arm does, and the attention input is all-gathered.
-    # ``configure``'s ``sm107_extra_parts`` (the ``context_sp_extra_parts`` lever) adds
-    # sm103's parts.
-    107: ("moe",),
 }
-
-
-def configure(*, sm107_extra_parts: Tuple[str, ...] = ()) -> None:
-    """Set the parts ``install`` wires on sm107 beside the MoE re-class (``SHARD_PARTS_BY_SM``).
-
-    ``lever_settings.apply`` sets them from the model's plan before any install. With the default
-    sm107 runs the MoE re-class only.
-
-    Args:
-        sm107_extra_parts: sm103's parts to add on sm107 (``shard_routing``, ``router_input``,
-            ``ce_gather``), in any order; they are wired in sm103's order.
-
-    Raises:
-        ValueError: if a name is not one of sm103's parts.
-    """
-    extra = tuple(str(part).strip() for part in sm107_extra_parts if str(part).strip())
-    choices = SHARD_PARTS_BY_SM[103][1:]
-    unknown = sorted(set(extra) - set(choices))
-    if unknown:
-        raise ValueError(
-            f"[musespark_open] context_sequence_parallel: not an sm103 part: {unknown}"
-        )
-    SHARD_PARTS_BY_SM[107] = ("moe",) + tuple(part for part in choices if part in extra)
-    if extra:
-        logger.info(
-            f"[musespark_open] context_sequence_parallel: sm107 parts {SHARD_PARTS_BY_SM[107]}"
-        )
 
 
 def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequenceParallel":
     """The path's forward for ``model``, with every layer's MoE re-classed (``moe.install``).
 
     ``sm`` is the SM version the model's composition was built for
-    (``dispatch.sm_of``), required: the parts differ per SM, so none is assumed. It
-    picks the eager threshold (``EAGER_MIN_ROWS_BY_SM``) and the parts installed
+    (``dispatch.sm_of``), required: it picks the parts installed
     beside the MoE re-class (``SHARD_PARTS_BY_SM``).
 
     The MNNVL all-reduce workspaces are grown on the first prefill step
@@ -203,7 +161,7 @@ def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequencePar
     Raises:
         ValueError: when ``refusal`` names a reason, a layer's MoE is not the built-in one,
             a layer's fused finalize all-reduce serves ``MIN_ROWS`` rows, or ``sm`` is
-            neither 103 nor 107 (None included).
+            not 103 (None included).
     """
     from . import moe as _moe
 
@@ -211,7 +169,7 @@ def install(model: MuseSparkOpenModel, sm: Optional[int]) -> "ContextSequencePar
     if parts is None:
         got = "no SM version" if sm is None else f"sm{sm}"
         raise ValueError(
-            f"[musespark_open] context_sequence_parallel is written for sm103 and sm107, got {got}"
+            f"[musespark_open] context_sequence_parallel is written for sm103, got {got}"
         )
     path = ContextSequenceParallel(model, sm)
     _moe.install(model, min_rows=MIN_ROWS, shard_routing="shard_routing" in parts)
@@ -304,7 +262,7 @@ class ContextSequenceParallel:
         # the router's FP32 input (``router_input``).
         self.step = SequenceParallelStep()
         #: The fewest rows of an eager step that runs sequence-parallel on this SM.
-        self.eager_min_rows = EAGER_MIN_ROWS_BY_SM.get(sm, EAGER_MIN_ROWS)
+        self.eager_min_rows = EAGER_MIN_ROWS
 
     def reserve(self, model: MuseSparkOpenModel) -> None:
         """Grow ``model``'s MNNVL all-reduce workspaces once, on the first prefill step.

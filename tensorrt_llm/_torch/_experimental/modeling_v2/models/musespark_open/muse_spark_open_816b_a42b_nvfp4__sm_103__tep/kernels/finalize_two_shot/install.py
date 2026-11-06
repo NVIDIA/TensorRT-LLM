@@ -48,9 +48,8 @@ MAX_TOKENS_ATTRIBUTE = "_finalize_ar_max_tokens"
 #: The fewest rows this fast path arms, per SM (``10 * major + minor``): below them the built-in
 #: fused finalize + one-shot all-reduce is as fast or faster behind its FC2 producer. On sm103
 #: that holds at 64 rows, so the band starts one request (8 rows at K = 7) above the kernel's
-#: smallest call (``_two.MIN_ROWS``); on sm107 the one-shot stays ahead up to 80 rows and the
-#: two-shot leads from 96 (12 requests).
-MIN_ROWS_BY_SM = {103: 72, 107: 96}
+#: smallest call (``_two.MIN_ROWS``).
+MIN_ROWS_BY_SM = {103: 72}
 MIN_ROWS = MIN_ROWS_BY_SM[103]
 MAX_ROWS = _two.MAX_ROWS
 
@@ -87,11 +86,8 @@ class FinalizeTwoShotSwitch:
 
 def refusal(model: MuseSparkOpenModel) -> Optional[str]:
     """Why ``install`` cannot take this model's MoE finalize, or None. Changes nothing."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
-        (10, 3),
-        (10, 7),
-    ):
-        return "it is written for sm_103 and sm_107"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        return "it is written for sm_103"
     mapping = model.layers[0].mapping
     if mapping.tp_size not in _two.RANK_COUNTS or mapping.is_multi_node():
         return f"it serves TP4 on one node, got TP{mapping.tp_size}"

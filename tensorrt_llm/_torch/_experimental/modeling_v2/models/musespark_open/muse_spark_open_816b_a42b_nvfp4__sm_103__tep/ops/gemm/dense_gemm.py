@@ -14,7 +14,7 @@ kernel per shape runs it on every rank:
 
 * ``"splitk:<mma_m>,<mma_n>,<split_k>,<stages>"`` -- the CuTe-DSL cluster split-K
   kernel of ``ops/gemm/splitk_gemm.py`` (flashinfer's ``dense_bf16_gemm_sm100_splitk``,
-  moved into this target with the changes ``splitk_gemm.configure`` sets). It swaps A
+  moved into this target). It swaps A
   and B (the weight's rows are the MMA's M), each CTA of a cluster accumulates one K
   slice in FP32 in TMEM, the peers send
   their partials to the cluster's first CTA through DSMEM, which adds them in
@@ -34,7 +34,7 @@ kernel per shape runs it on every rank:
 
 The direct kernel holds every row in one CTA and serves at most ``MAX_ROWS``; the split-K
 kernel and cuBLAS also serve the 9..``WIDE_MAX_ROWS``-row steps of a tep4 rank
-(``wide_dense_gemms``, ``wide_projection_gathers``).
+(``wide_projection_gathers``).
 
 All accumulate in FP32 and round once; they differ from each other, and the
 split-K kernel's tactics with different ``split_k`` differ among themselves, only

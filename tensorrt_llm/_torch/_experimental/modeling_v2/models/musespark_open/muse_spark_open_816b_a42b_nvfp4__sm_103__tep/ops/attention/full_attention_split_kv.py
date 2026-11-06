@@ -361,7 +361,7 @@ def build_options(key: tuple) -> dict:
 
 def _ring_stages() -> int:
     """The TMA ring depth split-KV kernels are built with now
-    (``full_attention_split_kv_kernel.configure``), which each op passes to ``_compiled_kernel``."""
+    (``full_attention_split_kv_kernel._FA_STAGES``), which each op passes to ``_compiled_kernel``."""
     from . import full_attention_split_kv_kernel as fk
 
     return fk._FA_STAGES
@@ -391,7 +391,7 @@ class FullAttnSplitKv(OpWrapper):
     E4M3 pool ``[blocks, G, 32, 64]`` with G 2 or 4; an int32 ``[2, pages]`` block table with
     a unit last stride and at most ``cta_pages(G)`` (256 at tep8, 512 at tep4) pages per split;
     int32 ``seq_lens``; an fp32 scale; ``1 <= num_splits <= 512``; partial buffers of the
-    shapes above; every tensor 16-byte aligned on one sm_103 or sm_107 device. The first call
+    shapes above; every tensor 16-byte aligned on one sm_103 device. The first call
     per device and build compiles the kernel, which must not happen inside a CUDA-graph capture.
 
     Not certified: more than one sequence per call, other head counts or widths, other page
@@ -479,10 +479,10 @@ class FullAttnSplitKv(OpWrapper):
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
-            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
+            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
         ):
             raise ValueError(
-                "full_attention_split_kv takes, on one sm_103 or sm_107 device and 16-byte aligned: a "
+                "full_attention_split_kv takes, on one sm_103 device and 16-byte aligned: a "
                 "contiguous FP8 E4M3 pool [blocks, G, "
                 f"{PAGE}, {HEAD_DIM}] with G KV heads in {sorted(RANK_KV_HEADS.values())}, BF16 "
                 f"qkv [1..{MAX_ROWS}, (8 G + 2 G) * {HEAD_DIM}] (unit last stride, rows a multiple "
@@ -658,7 +658,7 @@ class FullAttnSplitKvMulti(OpWrapper):
     Metadata consumed: seq_lens[0..R-1] (device, read by the kernel before its dependency wait,
     like the one-sequence call's seq_lens[0]), the sequences' K and V page ids, the layer's pool
     view, the FP8 KV scale. Call site: the target's 16 full-attention layers on tep4 decode
-    steps of 2..4 sequences (fast path wide_full_attention), right after the multi-sequence
+    steps of 2..4 sequences, right after the multi-sequence
     folded prep (preattn_prep_append with an [R, 2, pages] table); combine_norm_gate with
     requests consumes the partials.
 
@@ -729,10 +729,10 @@ class FullAttnSplitKvMulti(OpWrapper):
             or not part_lse.is_contiguous()
             or any(t.device != qkv.device or t.data_ptr() % 16 for t in tensors)
             or qkv.device.type != "cuda"
-            or torch.cuda.get_device_capability(qkv.device) not in ((10, 3), (10, 7))
+            or torch.cuda.get_device_capability(qkv.device) != (10, 3)
         ):
             raise ValueError(
-                "full_attention_split_kv_multi takes, on one sm_103 or sm_107 device and 16-byte "
+                "full_attention_split_kv_multi takes, on one sm_103 device and 16-byte "
                 f"aligned: the one-sequence call's pool, BF16 qkv [R x 1..{MAX_ROWS}, (8 G + 2 G) "
                 f"* {HEAD_DIM}], an int32 [R, 2, pages] table (K and V rows adjacent, at most "
                 f"{stages} pages per split in the worst case), int32 seq_lens of at least R, an "

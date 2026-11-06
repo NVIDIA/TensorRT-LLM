@@ -72,6 +72,9 @@ profiling forwards are the first forwards when the estimation is skipped): there
 the first layer's expert call additionally runs the ``64 + R`` window once in the
 tuning context, so that window's tactics are profiled like the 64-expert window's, and
 then gives each of its profiles the 64-expert window's tactic where that is valid.
+
+Layers left on the built-in path (0 and 61: their experts are quantized at load, which
+the census does not cover) run the autotuner's tactic on the owner-only window.
 """
 
 from __future__ import annotations
@@ -618,8 +621,10 @@ def _owner_window_tactics(window: int) -> Tuple[int, int]:
     return aligned, profiled
 
 
-def install(text_model, mapping: Mapping) -> Optional[HotReplicas]:
+def install(text_model, mapping: Mapping, pin_l061: bool = False) -> Optional[HotReplicas]:
     """Hook every eligible NVFP4 MoE layer of ``text_model``; returns the switch (or None).
+
+    ``pin_l061`` is ignored.
 
     Allocates nothing (``HotReplicas.decide`` does, on the first forward). Must run after
     the owner-window install (``ring_buddy.install(windows=1)``), whose expert and routing

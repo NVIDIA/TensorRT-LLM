@@ -30,19 +30,6 @@ Sample (``SampleStoreWriter``, the model's sampler store writer): the sampler
 store's four ``index_copy_`` and the three device-to-host snapshots become one
 launch that writes the store rows and the pinned host snapshots directly.
 
-Two levers of the plan (``make_runtime_hooks`` reads ``model._plan``) change where and
-how much of this runs:
-
-* ``step_loop_on_execution_stream`` declares
-  ``RuntimeHooks.step_loop_on_execution_stream``: the executor's overlap loop
-  then issues the sample launch and the next prepare launch on the execution
-  stream, right behind the decode graph, instead of on its thread's stream
-  behind two cross-stream waits per step.
-* ``incremental_block_offsets`` makes the prepare launch copy
-  only the block-table columns whose host page index changed since its last
-  copy of that row (``_BlockOffsetsMemo``, which states when the memo is
-  trusted); the readable columns hold the same words as with the full copy.
-
 Steps that do not qualify -- prefill or mixed batches, eager steps, graph
 capture, dummies, any configuration outside the one ``StepInputStaging.ineligible``
 accepts -- run the built-in code untouched. Within a qualifying step, a write
@@ -83,112 +70,9 @@ _INT32_BYTES = 4
 
 _INT_DTYPES = (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8)
 
-#: Changed-column runs per block-table row recorded as separate descriptors; a row with
-#: more runs is re-copied as one span from its first to its last changed column.
-_MAX_BLOCK_RUNS = 4
-
-#: The reasons ``StepInputStaging.ineligible`` gives for every step of a configuration, not
-#: for one step: under ``incremental_block_offsets`` each is reported as a decline of it.
-CONFIG_DECLINES = frozenset(
-    {
-        "attention metadata type",
-        "draft KV cache manager",
-        "guided decoding",
-        "mrope",
-        "attention DP",
-        "overlap scheduler off",
-        "beam search",
-        "helix",
-        "pipeline parallelism",
-    }
-)
-#: The block-offset copy's own declines that hold for a configuration, reported likewise.
-BLOCK_DECLINES = frozenset({"block offsets: layout or manager mode", "block offsets: cross KV"})
-
 
 def _addr(t: torch.Tensor, element_offset: int = 0) -> int:
     return t.data_ptr() + element_offset * t.element_size()
-
-
-class _BlockOffsetsMemo:
-    """The host page indices the staged block-offset copies last wrote, per device row.
-
-    A ``BLOCKS`` descriptor writes ``K[i] = f(page[i])`` and ``V[i] = f(page[i]) +
-    kv_offset`` into the device block table from the host page-index row, a pure
-    function of the page index, the pool's scale and its offset. So when a device
-    row ``(pool, seq)`` last received ``f`` of the host row ``row`` over columns
-    ``[0, n)`` with the same scale and offset, and nothing else has written the
-    device table since, re-copying a column whose page index is unchanged writes
-    the word already there; ``changed_runs`` lists the others.
-
-    Ownership. The device table ``dst`` has two writers: this stager's launches
-    and the KV cache manager's own copy, which ``TrtllmAttentionMetadata.prepare``
-    issues when no window records the write. The decoder runner opens a window
-    (``StepInputStaging.begin_if_eligible``) right before its only
-    ``_prepare_inputs`` call, so every native copy happens in a step the
-    stager saw: one it found ineligible, or a window that declined the copy or
-    was discarded. Each of those calls ``forget``. The memo is also reset when
-    the manager, the attention metadata object or the table's storage (pointer
-    and shape) is not the one of its last recording. The host row is read by
-    the launch from pinned memory after the host recorded it; the executor waits
-    for the step's prepare event before it changes the host page table again
-    (``_wait_for_decoder_input_copy``), so the values compared here are the
-    values the launch reads.
-    """
-
-    def __init__(self):
-        self._scope: Optional[tuple] = None
-        #: (pool, seq) -> (host row, scale, kv_offset, page indices of columns [0, n)).
-        self._rows: dict[tuple[int, int], tuple[int, int, int, np.ndarray]] = {}
-
-    def forget(self) -> None:
-        """Drop everything: the next recording copies every readable column."""
-        self._scope = None
-        self._rows.clear()
-
-    def open(self, manager: Any, dst: torch.Tensor, attn_metadata: Any) -> None:
-        """Start a recording for ``dst``; resets the memo unless it last recorded this very table."""
-        scope = (manager, attn_metadata, dst.data_ptr(), tuple(dst.shape))
-        last = self._scope
-        if (
-            last is None
-            or last[0] is not manager
-            or last[1] is not attn_metadata
-            or last[2:] != scope[2:]
-        ):
-            self._rows.clear()
-        self._scope = scope
-
-    def changed_runs(
-        self, pool: int, seq: int, row: int, scale: int, kv_offset: int, pages: np.ndarray
-    ) -> list[tuple[int, int]]:
-        """Column runs ``[lo, hi)`` of ``pages`` (this step's first ``n`` page indices) to copy.
-
-        Remembers ``pages`` as what the device row holds once the recorded copies have run.
-        """
-        n = pages.shape[0]
-        entry = self._rows.get((pool, seq))
-        if entry is None or entry[:3] != (row, scale, kv_offset):
-            runs = [(0, n)] if n else []
-        else:
-            old = entry[3]
-            m = min(old.shape[0], n)
-            diff = np.flatnonzero(pages[:m] != old[:m])
-            runs = []
-            if diff.size:
-                cuts = np.flatnonzero(np.diff(diff) > 1)
-                starts = np.concatenate(([diff[0]], diff[cuts + 1]))
-                ends = np.concatenate((diff[cuts], [diff[-1]])) + 1
-                runs = [(int(a), int(b)) for a, b in zip(starts, ends)]
-            if n > m:
-                if runs and runs[-1][1] == m:
-                    runs[-1] = (runs[-1][0], n)
-                else:
-                    runs.append((m, n))
-            if len(runs) > _MAX_BLOCK_RUNS:
-                runs = [(runs[0][0], runs[-1][1])]
-        self._rows[(pool, seq)] = (row, scale, kv_offset, pages.copy())
-        return runs
 
 
 class _PrepareStager:
@@ -209,15 +93,9 @@ class _PrepareStager:
         runner: Any,
         attn_metadata: Any,
         spec_metadata: Any,
-        blocks_memo: Optional[_BlockOffsetsMemo] = None,
-        plan: Any = None,
     ):
         self.staging = staging
         self.counts = counts
-        #: When set, ``block_offsets`` re-copies only the changed columns (``_BlockOffsetsMemo``).
-        self.blocks_memo = blocks_memo
-        #: The plan the configuration-level block-copy declines are reported to, or None.
-        self.plan = plan
         self.runner = runner
         self.attn_metadata = attn_metadata
         self.declined: list[str] = []
@@ -445,7 +323,6 @@ class _PrepareStager:
             copies), which it is after an earlier decline.
         """
         if self._after_decline():
-            self._forget_blocks()
             return False
         host = getattr(manager, "host_kv_cache_block_offsets", None)
         if (
@@ -488,29 +365,12 @@ class _PrepareStager:
         scales = [int(s) for s in manager._index_scale_ints]
         kv_offsets = [int(o) for o in manager.kv_offset.tolist()]
         host_rows, dst_rows = host.shape[1], dst.shape[1]
-        # (pool, seq, host row, column runs): one full-width run per row without a memo.
-        memo = self.blocks_memo
-        if memo is None:
-            plan = [
-                (pool, seq, row, [(0, cols)])
-                for pool in range(host.shape[0])
-                for seq, row in enumerate(rows)
-            ]
-        else:
-            memo.open(manager, dst, self.attn_metadata)
-            pages = host.numpy()
-            plan = [
-                (
-                    pool,
-                    seq,
-                    row,
-                    memo.changed_runs(
-                        pool, seq, row, scales[pool], kv_offsets[pool], pages[pool, row, 0, :cols]
-                    ),
-                )
-                for pool in range(host.shape[0])
-                for seq, row in enumerate(rows)
-            ]
+        # (pool, seq, host row, column runs): one full-width run per row.
+        plan = [
+            (pool, seq, row, [(0, cols)])
+            for pool in range(host.shape[0])
+            for seq, row in enumerate(rows)
+        ]
         if not self.staging.room(sum(len(runs) for *_, runs in plan)):
             return self._decline_blocks("staging block full")
         st = self.staging
@@ -529,22 +389,12 @@ class _PrepareStager:
                     kv_offsets[pool],
                 )
                 copied += hi - lo
-        if memo is not None:
-            self.counts["block columns copied"] += copied
-            self.counts["block columns kept"] += cols * len(plan) - copied
         self.block_cols = cols
         self.block_seqs = num_seqs
         return True
 
-    def _forget_blocks(self) -> None:
-        if self.blocks_memo is not None:
-            self.blocks_memo.forget()
-
     def _decline_blocks(self, reason: str) -> bool:
-        """Decline the block-offset copy: the caller's native copy rewrites the table, so the memo resets."""
-        self._forget_blocks()
-        if self.blocks_memo is not None and self.plan is not None and reason in BLOCK_DECLINES:
-            self.plan.declined("incremental_block_offsets", reason)
+        """Decline the block-offset copy: the caller's native copy rewrites the table."""
         return self._decline(reason)
 
     def end(self, inputs: dict) -> None:
@@ -574,7 +424,6 @@ class _PrepareStager:
         dropped (``StepInputStager.discard``)."""
         self._close()
         self._static = None
-        self._forget_blocks()
         self.counts["prepare aborted"] += 1
 
     def static_inputs(self) -> Optional[tuple]:
@@ -651,25 +500,22 @@ class _PrepareStager:
 class StepInputStaging:
     """The model's ``StepInputStagerSource``: one ``_PrepareStager`` window per eligible step."""
 
-    def __init__(self, pp_size: int = 1, incremental_blocks: bool = False, plan: Any = None):
+    def __init__(
+        self,
+        pp_size: int = 1,
+        plan: Any = None,
+    ):
         """Allocate the pinned staging block.
 
         Args:
             pp_size: the model's pipeline-parallel size; any value above 1 is ineligible.
-            incremental_blocks: re-copy only the changed block-table columns
-                (``_BlockOffsetsMemo``, the ``incremental_block_offsets`` lever); otherwise
-                every readable column, every step.
             plan: the model's plan (``dispatch.Plan``): ``begin_if_eligible`` counts its
-                steps (``Plan.step``) and reports the steps ``incremental_block_offsets``
-                declined (``Plan.declined``); None reports nothing.
+                steps (``Plan.step``); None counts nothing.
         """
         self.pp_size = pp_size
         self.plan = plan
         self.staging = _sc.StepStaging()
         self.counts: Counter = Counter()
-        self.blocks_memo: Optional[_BlockOffsetsMemo] = (
-            _BlockOffsetsMemo() if incremental_blocks else None
-        )
 
     def ineligible(
         self,
@@ -767,11 +613,6 @@ class StepInputStaging:
         if self.plan is not None:
             self.plan.step()
         if reason is not None:
-            # The native prepare of this step rewrites the block table.
-            if self.blocks_memo is not None:
-                self.blocks_memo.forget()
-                if reason in CONFIG_DECLINES and self.plan is not None:
-                    self.plan.declined("incremental_block_offsets", f"step input staging: {reason}")
             key = f"prepare declined: {reason}"
             if not self.counts[key]:
                 # Once per reason, so that a configuration change that declines every
@@ -793,8 +634,6 @@ class StepInputStaging:
             runner,
             attn_metadata,
             spec_metadata,
-            self.blocks_memo,
-            self.plan,
         )
 
 
@@ -810,7 +649,10 @@ class SampleStoreWriter:
                 (``isend_object``), which the snapshot ring does not fence.
         """
         self.pp_size = pp_size
-        self._staging = [_sc.StepStaging(), _sc.StepStaging()]
+        self._staging = [
+            _sc.StepStaging(),
+            _sc.StepStaging(),
+        ]
         self._turn = 0
         self._host_ring: list[Optional[tuple[torch.Tensor, ...]]] = [None] * _HOST_RING
         self._host_events: list[Optional[torch.cuda.Event]] = [None] * _HOST_RING
@@ -1068,9 +910,8 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
 
     Args:
         model: the shell; both parts get its ``_mapping.pp_size`` (1 without one). Its plan
-            (``_plan``) selects the parts (``deferred_input_prep``, ``sampler_store``) and the
-            levers ``step_loop_on_execution_stream`` and ``incremental_block_offsets``; a
-            model without one gets both parts and neither lever.
+            (``_plan``) selects the parts (``deferred_input_prep``, ``sampler_store``); a
+            model without one gets both parts.
 
     Returns:
         ``RuntimeHooks`` declaring the step-input stager (``StepInputStaging``) and the
@@ -1080,17 +921,13 @@ def make_runtime_hooks(model: Any) -> RuntimeHooks:
     plan = getattr(model, "_plan", None)
     stager = plan is None or plan.enabled("deferred_input_prep")
     writer = plan is None or plan.enabled("sampler_store")
-    one_stream = plan is not None and plan.enabled("step_loop_on_execution_stream")
-    incremental_blocks = plan is not None and plan.enabled("incremental_block_offsets")
     hooks = RuntimeHooks(
-        step_input_stager=StepInputStaging(pp_size, incremental_blocks, plan) if stager else None,
-        sampler_store_writer=SampleStoreWriter(pp_size) if writer else None,
-        step_loop_on_execution_stream=one_stream,
+        step_input_stager=(StepInputStaging(pp_size, plan) if stager else None),
+        sampler_store_writer=(SampleStoreWriter(pp_size) if writer else None),
     )
     _sc.warm_up()
     logger.info(
         f"[musespark_open] executor hooks: step input staging {'on' if stager else 'off'}, "
-        f"sampler store writer {'on' if writer else 'off'}, pp_size={pp_size}, step loop on "
-        f"the execution stream={one_stream}, incremental block offsets={incremental_blocks}"
+        f"sampler store writer {'on' if writer else 'off'}, pp_size={pp_size}"
     )
     return hooks

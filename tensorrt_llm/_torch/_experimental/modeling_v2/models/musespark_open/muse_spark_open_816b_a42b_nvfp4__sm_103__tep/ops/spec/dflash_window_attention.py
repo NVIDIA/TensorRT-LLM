@@ -171,12 +171,13 @@ def _window_attention_split_kernel(
     DIRECT: tl.constexpr,
     LAUNCH_WITH_PDL: tl.constexpr,
     PAGE: tl.constexpr,
+    PRE_WAIT: tl.constexpr = False,
 ):
     split = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // HKV
     kvh = bh % HKV
-    if LAUNCH_WITH_PDL:
+    if LAUNCH_WITH_PDL and not PRE_WAIT:
         # Before any global read: q and the block's K/V are the previous
         # kernels' outputs. The merge kernel may launch now; it waits for this
         # whole grid (griddepcontrol.wait) before it reads a partial.
@@ -185,9 +186,15 @@ def _window_attention_split_kernel(
     seqlen = tl.load(seqlens_ptr + b)
     lo = tl.maximum(seqlen - M - WINDOW_LEFT, 0)
     start = lo + split * (TILES * BLOCK_N)
+    if PRE_WAIT:
+        # Issued beside the length's load rather than behind the exit test.
+        slot_pre = tl.load(batch_idx_ptr + b)
     if start >= seqlen:
         return
-    slot = tl.load(batch_idx_ptr + b).to(tl.int64)
+    if PRE_WAIT:
+        slot = slot_pre.to(tl.int64)
+    else:
+        slot = tl.load(batch_idx_ptr + b).to(tl.int64)
     dims = tl.arange(0, D)
     # A paged call's slot names the request's page-table row; its slot strides are 0.
     table = page_table_ptr + slot * stride_pt
@@ -195,6 +202,26 @@ def _window_attention_split_kernel(
     v_base = v_ptr + slot * stride_vs + kvh * stride_vh
     block_start = seqlen - M
     new_row0 = b.to(tl.int64) * M
+    if PRE_WAIT:
+        # split_pre_wait (with APPEND and PDL): the lengths, the slots and the
+        # context columns below the block are final once this grid is released
+        # (window_attention_launch), so the context part of the first key tile
+        # is loaded before the wait; q and the block's K/V only after it.
+        cols_pre = start + tl.arange(0, BLOCK_N)
+        arena_pre = (cols_pre < seqlen) & (cols_pre < block_start)
+        cols_pre64 = cols_pre.to(tl.int64)
+        k_pre = tl.load(
+            k_base + cols_pre64[:, None] * stride_kn + dims[None, :],
+            mask=arena_pre[:, None],
+            other=0.0,
+        )
+        v_pre = tl.load(
+            v_base + cols_pre64[:, None] * stride_vn + dims[None, :],
+            mask=arena_pre[:, None],
+            other=0.0,
+        )
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     if APPEND:
         if split == 0:
             # The append: the block's K/V into the arena at [L - M, L). Nothing
@@ -251,11 +278,16 @@ def _window_attention_split_kernel(
             from_new = cols >= block_start
             in_arena = col_ok & (cols < block_start)
             new_rows = new_row0 + (cols - block_start)
-            k = tl.load(
-                k_base + kv_rows[:, None] * stride_kn + dims[None, :],
-                mask=in_arena[:, None],
-                other=0.0,
-            )
+            if PRE_WAIT and t == 0:
+                # Loaded before the wait over a dense arena (PRE_WAIT excludes PAGE), whose rows
+                # are the columns ``kv_rows`` names.
+                k = k_pre
+            else:
+                k = tl.load(
+                    k_base + kv_rows[:, None] * stride_kn + dims[None, :],
+                    mask=in_arena[:, None],
+                    other=0.0,
+                )
             k = tl.where(
                 from_new[:, None],
                 tl.load(
@@ -265,11 +297,14 @@ def _window_attention_split_kernel(
                 ),
                 k,
             )
-            v = tl.load(
-                v_base + kv_rows[:, None] * stride_vn + dims[None, :],
-                mask=in_arena[:, None],
-                other=0.0,
-            )
+            if PRE_WAIT and t == 0:
+                v = v_pre
+            else:
+                v = tl.load(
+                    v_base + kv_rows[:, None] * stride_vn + dims[None, :],
+                    mask=in_arena[:, None],
+                    other=0.0,
+                )
             v = tl.where(
                 from_new[:, None],
                 tl.load(
@@ -412,12 +447,15 @@ def window_attention_launch(
     merge_warps: int,
     merge_entry_trigger: bool = False,
     page_table: torch.Tensor | None = None,
+    split_pre_wait: bool = False,
 ) -> torch.Tensor:
     """Launch the split and merge kernels with an explicit split geometry.
 
     ``merge_entry_trigger`` (with ``enable_pdl``): the merge kernel releases its
     dependent before its own wait instead of at its exit (the PDL chain's ``pdl_merge``).
     ``page_table``: the caches are pools of pages (see the module docstring).
+    ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``, over a dense arena): see
+    ``DflashWindowAttention``.
 
     Raises:
         ValueError: if the geometry cuts the window into more than ``MAX_SPLITS`` splits.
@@ -502,6 +540,7 @@ def window_attention_launch(
         DIRECT=direct,
         LAUNCH_WITH_PDL=enable_pdl,
         PAGE=page,
+        PRE_WAIT=enable_pdl and append and split_pre_wait and not page,
         num_warps=num_warps,
         launch_pdl=enable_pdl,
     )
@@ -569,7 +608,14 @@ class DflashWindowAttention(OpWrapper):
     * ``page_table`` ``[rows, max_pages]`` int32, unit last stride: the caches
       are pools ``[pages, page_size, Hkv, D]`` whose page stride is the same
       whole number of rows for both, and ``cache_batch_idx`` names table rows
-      (see the module docstring).
+      (see the module docstring);
+    * ``split_pre_wait`` (with ``enable_pdl`` and ``k_new``, over a dense arena:
+      a paged call ignores it; the attention PDL copy): the split
+      kernel loads the lengths, the slots and the context part (columns below
+      ``L - M``) of its first key tile before its ``griddepcontrol.wait``, and
+      ``q`` and the block's K/V after it. The caller guarantees those
+      tensors were final before the split's predecessor released it (its
+      predecessor triggers only after its own wait, in every CTA). The same values;
 
     Returns ``[B, M, Hq, D]`` in ``q``'s dtype, contiguous.
 
@@ -601,6 +647,7 @@ class DflashWindowAttention(OpWrapper):
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
         page_table: torch.Tensor | None = None,
+        split_pre_wait: bool = False,
     ) -> None:
         reason = unsupported_reason(
             q,
@@ -630,6 +677,7 @@ class DflashWindowAttention(OpWrapper):
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
         page_table: torch.Tensor | None = None,
+        split_pre_wait: bool = False,
     ) -> torch.Tensor:
         m, num_q_heads = q.shape[1], q.shape[2]
         group = num_q_heads // k_cache.shape[2]
@@ -648,6 +696,7 @@ class DflashWindowAttention(OpWrapper):
             **config,
             merge_entry_trigger=merge_entry_trigger,
             page_table=page_table,
+            split_pre_wait=split_pre_wait,
         )
 
     def reference(
@@ -663,13 +712,14 @@ class DflashWindowAttention(OpWrapper):
         k_new: torch.Tensor | None = None,
         v_new: torch.Tensor | None = None,
         merge_entry_trigger: bool = False,
+        split_pre_wait: bool = False,
     ) -> torch.Tensor:
         """Dense masked softmax attention in fp32, one rounding at the end.
 
         The block's keys and values come from ``k_new`` / ``v_new`` when given;
-        the reference does not write the arena. ``enable_pdl`` and
-        ``merge_entry_trigger`` change how the op launches, not what it
-        computes; ignored.
+        the reference does not write the arena. ``enable_pdl``,
+        ``merge_entry_trigger`` and ``split_pre_wait`` change how the op
+        launches, not what it computes; ignored.
         """
         return attention_reference(
             q,

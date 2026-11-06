@@ -11,13 +11,13 @@ runs in plain TF32 (every weight rounded to 11 bits).
 
 This entry runs the CuTe BF16x3 router GEMM ``ops/moe/bf16x3_router_gemm.Sm100BF16x3RouterGemm``
 (the kernel behind the built-in ``MUSESPARK_OPEN_BF16X3_ROUTER`` option,
-``cute_dsl_kernels/blackwell/bf16x3_router_gemm``, moved into this target with its
-pre-wait build) and sums its split-K partials with the multiplier folded in. The GEMM
+``cute_dsl_kernels/blackwell/bf16x3_router_gemm``, moved into this target)
+and sums its split-K partials with the multiplier folded in. The GEMM
 computes ``W X^T`` on tcgen05: the 256 experts are the MMA's M dimension (two tiles of 128),
 the call's rows its N dimension (one tile of the next power of two of up to 128 rows, then
 128-row tiles), so the weight is streamed once per 128 rows. A call of ``t`` row tiles on a
 device of ``S`` SMs runs ``splits(rows) = S // (2 * t)`` K splits -- 76, 38, 25, 19
-on GB300's 152 SMs, 106, 53, 35, 26 on R200's 212 -- so that its ``2 * t * splits``
+on GB300's 152 SMs -- so that its ``2 * t * splits``
 CTAs fill the GPU's SMs in one wave; each CTA owns every ``splits``-th K tile of 64.
 It splits each FP32 weight it loads into three BF16 terms, ``w = w0 + w1 + w2`` --
 exact for every FP32 value of normal magnitude --
@@ -65,6 +65,32 @@ EXPERT_TILES = EXPERTS // 128
 ROW_TILE = 128
 #: Partials per program of the sum kernel (splits, padded to a power of two, x logits).
 SUM_TILE = 4096
+#: The staged GEMM's epilogues: one bulk copy per row, or 16-byte vector stores.
+STAGED_MODES = ("bulk", "v4")
+#: The epilogue every call's GEMM runs: None for the tree's kernel, else a ``STAGED_MODES``
+#: entry (``set_staged_epilogue``).
+_staged_epilogue: Optional[str] = None
+
+
+def set_staged_epilogue(mode: Optional[str]) -> None:
+    """Run every later call's GEMM with the staged epilogue ``mode`` (None: the tree's kernel).
+
+    Same partials bit for bit either way. Set by the ``router_gemm`` install, before any call.
+
+    Raises:
+        ValueError: for a mode outside ``STAGED_MODES``.
+    """
+    global _staged_epilogue
+    if mode is not None and mode not in STAGED_MODES:
+        raise ValueError(
+            f"[musespark_open] router GEMM epilogue {mode!r}: expected one of {STAGED_MODES}"
+        )
+    _staged_epilogue = mode
+
+
+def staged_epilogue() -> Optional[str]:
+    """The staged epilogue ``set_staged_epilogue`` selected, or None."""
+    return _staged_epilogue
 
 
 def row_tile(rows: int) -> int:
@@ -85,14 +111,13 @@ def device_sms() -> int:
 def splits(rows: int, sms: Optional[int] = None) -> int:
     """The K splits of a call of ``rows`` rows on a device of ``sms`` SMs (default: the
     current device's): one CTA per SM over the call's ``2 * t`` output tiles -- 76, 38,
-    25, 19 for 1, 2, 3, 4 row tiles on 152 SMs, 106, 53, 35, 26 on 212."""
+    25, 19 for 1, 2, 3, 4 row tiles on 152 SMs."""
     sms = device_sms() if sms is None else sms
     return sms // (EXPERT_TILES * triton.cdiv(rows, ROW_TILE))
 
 
 def _gemm(tile: int):
-    # Imported at the first compile, as before the move; ``compile`` builds with the module's
-    # configured pre-wait setting (``bf16x3_router_gemm.configure``).
+    # Imported at the first compile, as before the move.
     from .bf16x3_router_gemm import Sm100BF16x3RouterGemm
 
     return Sm100BF16x3RouterGemm.compile(tile, HIDDEN)
@@ -132,7 +157,7 @@ class RouterGemm(OpWrapper):
         ``[M, 256]`` FP32 logits, newly allocated.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Budgeted, not bitwise: the test gates every cell against the float64 product

@@ -51,7 +51,7 @@ INTER = 4096
 TOP_K = 8
 #: Rows one launch serves: the MMA's N (all token columns of a decode step).
 MAX_ROWS = 8
-#: Rows the wide build serves (``wide_persistent_experts``, windows of at most 64 experts):
+#: Rows the wide build serves (windows of at most 64 experts):
 #: a TP4 decode step of two requests at K = 7, on an MMA N of 16.
 WIDE_MAX_ROWS = 16
 #: What the wide build changes in the device's ``OPTIONS``: its B operand and compact scale
@@ -87,11 +87,9 @@ OPTIONS: Dict[str, int] = {
     "fastroute": 0,
 }
 
-#: What each supported device compute capability changes in ``OPTIONS``: sm107 (212 SMs)
-#: runs eight weight stages, which shortens a call there (six on sm103).
+#: What each supported device compute capability changes in ``OPTIONS``.
 OPTIONS_BY_SM: Dict[Tuple[int, int], Dict[str, int]] = {
     (10, 3): {},
-    (10, 7): {"num_stages": 8},
 }
 
 _LOCK = threading.Lock()

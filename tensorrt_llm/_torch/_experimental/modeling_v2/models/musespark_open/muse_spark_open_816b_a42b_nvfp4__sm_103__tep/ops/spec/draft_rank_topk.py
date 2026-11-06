@@ -93,7 +93,7 @@ class DraftRankTopK(OpWrapper):
     Integer selection: exact.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         Cell(
             "five requests at TP8 (35 rows, the fewest wide_draft_topk takes)",
