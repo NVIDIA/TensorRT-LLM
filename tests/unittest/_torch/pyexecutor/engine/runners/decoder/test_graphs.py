@@ -509,6 +509,41 @@ def test_kv_regime_resolver_resolves_only_for_the_fp4_mla_4x_decode() -> None:
 
 
 @pytest.mark.cpu_only
+def test_kv_regime_resolver_resolves_each_graph_shape_once() -> None:
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_dispatch
+    from tensorrt_llm._torch.attention.mla import MLA
+
+    mla_layer = Mock(spec=MLA)
+    mla_layer.num_heads_tp = 128
+    model = Mock()
+    model.modules.return_value = [mla_layer]
+    runner = decoder_graphs(decoder_config(), model=model)
+    fp4_kv_cache_manager = Mock(spec=["max_blocks_per_seq", "get_fp4_mla_page_table_spec"])
+    fp4_kv_cache_manager.max_blocks_per_seq = 235
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = fp4_kv_cache_manager
+    config_module = "tensorrt_llm._torch.attention.backends.fp4_mla.config"
+
+    with (
+        patch(f"{config_module}._fp4_mla_cutedsl_4x_enabled", return_value=True),
+        patch(f"{config_module}._fp4_mla_packed_q_enabled", return_value=True),
+        patch.object(runner, "_decode_sm_count", return_value=212),
+        patch.object(
+            fp4_mla_dispatch, "kv_regimes_for_batch", return_value=(12345, 30080)
+        ) as regimes,
+    ):
+        resolver = runner._kv_regime_resolver(resource_manager)
+        # the graph runner resolves every decode step; each shape is computed once
+        for _ in range(3):
+            assert resolver(64, 3) == (12345, 30080)
+        assert resolver(32, 3) == (12345, 30080)
+        assert regimes.call_count == 2
+    # replay keeps the ceilings its graphs were captured for, whatever the dispatcher says later
+    assert resolver(64, 3) == (12345, 30080)
+    assert regimes.call_count == 2
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("schedule", [{4: 4, 8: 2, 16: 1}, {4: 2}, {16: 4}, {4: 0}])
 def test_dynamic_warmup_graphs_match_replay_schedule(schedule: dict[int, int]) -> None:
     from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.graphs import (

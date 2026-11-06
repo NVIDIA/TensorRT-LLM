@@ -803,9 +803,10 @@ class KvRegimeGraphKeyTestCase(unittest.TestCase):
         spec_a.py_draft_tokens = spec_b.py_draft_tokens = [0, 0, 0]
         self.assertEqual(runner.get_graph_key(self._batch(spec_a, spec_b)).kv_regime, 16384)
         self.assertEqual(shapes, [(1, 0), (2, 3)])
-        # a shape with a single regime always keys it
+        # a shape with a single regime always keys it, without measuring the step's KV
         runner.set_kv_regime_resolver(lambda batch_size, draft_len: (30080,))
-        self.assertEqual(runner.get_graph_key(self._batch(single)).kv_regime, 30080)
+        with patch.object(runner, "_max_total_seq_len", side_effect=AssertionError("measured")):
+            self.assertEqual(runner.get_graph_key(self._batch(single)).kv_regime, 30080)
 
     def test_missing_regime_rounds_up_to_a_captured_graph(self) -> None:
         runner = self._runner()

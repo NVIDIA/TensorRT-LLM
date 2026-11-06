@@ -730,6 +730,9 @@ class CUDAGraphRunner:
                          for request in batch.generation_requests),
                         default=0)
         ceilings = resolver(batch.batch_size, draft_len)
+        if len(ceilings) == 1:
+            # Most shapes have one regime; the step's KV cannot change it.
+            return int(ceilings[0])
         # One-engine speculation reads max_draft_len - 1 KV tokens beyond the
         # row's sequence length (the sparse short/long split counts them too).
         # Imported here: only an FP4 MLA decode registers a resolver.
