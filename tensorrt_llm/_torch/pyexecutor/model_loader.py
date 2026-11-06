@@ -5,6 +5,7 @@ import copy
 import inspect
 import os
 import sys
+import threading
 import traceback
 import warnings
 from contextlib import AbstractContextManager, contextmanager
@@ -84,6 +85,7 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
+_WEIGHT_LOAD_THREADS_ENV = "TLLM_WEIGHT_LOAD_THREADS"
 
 # Dense models do not consume the MoE backend or MoE mapping dimensions. Their
 # runtime topology remains bounded by the general and attention dimensions.
@@ -690,6 +692,52 @@ def _timed_checkpoint_weight_session(
     else:
         with timing_metric(checkpoint_finalization_metric_name, metrics):
             session.__exit__(None, None, None)
+
+
+def _weight_load_num_threads() -> Optional[int]:
+    """Threads ``TLLM_WEIGHT_LOAD_THREADS`` asks for, capped at usable CPUs."""
+    value = os.environ.get(_WEIGHT_LOAD_THREADS_ENV)
+    if value is None or not value.strip():
+        return None
+    try:
+        requested = int(value)
+    except ValueError as error:
+        raise ValueError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                         f"integer, got {value!r}") from error
+    if requested <= 0:
+        raise ValueError(f"{_WEIGHT_LOAD_THREADS_ENV} must be a positive "
+                         f"integer, got {value!r}")
+    try:
+        available = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        available = os.cpu_count() or 1
+    return min(requested, available)
+
+
+@contextmanager
+def _weight_load_threads() -> Iterator[None]:
+    """Run this thread's load on ``TLLM_WEIGHT_LOAD_THREADS`` torch threads.
+
+    Unset keeps the process's count. Only raises; restores on exit and on error.
+    """
+    requested = _weight_load_num_threads()
+    previous = torch.get_num_threads()
+    if requested is None or requested <= previous:
+        yield
+        return
+    logger.info(f"Weight loading uses {requested} torch threads (was "
+                f"{previous}), as {_WEIGHT_LOAD_THREADS_ENV} asks")
+    try:
+        torch.set_num_threads(requested)
+        # New threads start from torch's process-wide count; set it back from
+        # another thread so this one keeps the raise and loader pools do not.
+        setter = threading.Thread(target=torch.set_num_threads,
+                                  args=(previous, ))
+        setter.start()
+        setter.join()
+        yield
+    finally:
+        torch.set_num_threads(previous)
 
 
 def _inspect_shadow_weight_load_plan(
@@ -1375,13 +1423,14 @@ class ModelLoader:
 
                 weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
-                weights_preloaded = self._materialize_checkpoint_weights(
-                    checkpoint_loader, weights_checkpoint_dir, model, config,
-                    load_weights_kwargs)
+                with _weight_load_threads():
+                    weights_preloaded = self._materialize_checkpoint_weights(
+                        checkpoint_loader, weights_checkpoint_dir, model,
+                        config, load_weights_kwargs)
 
-                if loads_draft_weights:
-                    self._materialize_draft_checkpoint_weights(
-                        checkpoint_loader, model)
+                    if loads_draft_weights:
+                        self._materialize_draft_checkpoint_weights(
+                            checkpoint_loader, model)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a
