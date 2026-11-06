@@ -93,6 +93,41 @@ class TestSuffixAutomatonManager:
         draft_list = draft_tokens[0, :max_draft_len].cpu().tolist()
         assert draft_list == [0, 0, 0, 0], f"Expected zeroed draft, got {draft_list}"
 
+    @pytest.mark.parametrize("method", ["extend", "extend_ngram", "extend_global"])
+    def test_extend_after_draft_len_shrinks(self, make_manager, method):
+        """Drafts stay per-request when the draft length drops below the workspace width.
+
+        Under a draft_len_schedule the workspace is allocated at the largest
+        draft length and later steps run with a smaller one. Every request in
+        the batch must still get its own draft, not request 0's layout.
+        """
+        config = SAConfig(max_seq_len=1024, max_slots=16, enable_global_pool=True)
+        manager = make_manager(config, max_num_requests=16)
+
+        patterns = [list(range(100, 112)), list(range(200, 212))]
+        request_ids = [0, 1]
+        for request_id, pattern in zip(request_ids, patterns):
+            # The pattern, then its first 6 tokens again: the next token continues the repeat.
+            manager.add_request(request_id, pattern + pattern[:6])
+
+        manager.prepare(request_ids, 6)  # workspace allocated at width 6
+        max_draft_len = 4
+        manager.prepare(request_ids, max_draft_len)
+
+        accepted_tokens = torch.zeros(
+            (len(request_ids), max_draft_len + 1), dtype=torch.int32, device="cuda"
+        )
+        accepted_tokens[:, 0] = torch.tensor([p[6] for p in patterns], dtype=torch.int32)
+        num_accepted_tokens = torch.ones(len(request_ids), dtype=torch.int32, device="cuda")
+
+        _, draft_tokens = getattr(manager, method)(
+            request_ids, accepted_tokens, num_accepted_tokens, max_draft_len
+        )
+
+        assert draft_tokens.shape == (len(request_ids), max_draft_len)
+        expected = [p[7 : 7 + max_draft_len] for p in patterns]
+        assert draft_tokens.cpu().tolist() == expected
+
     def test_global_pool_size_below_max_requests_rejected(self, make_manager):
         """global_pool_size smaller than max_num_requests must be rejected."""
         config = SAConfig(
