@@ -501,15 +501,21 @@ def test_agent_gate_metadata_loads_after_drain_timeout() -> None:
 
 
 def test_submit_transfer_releases_status_inside_agent_gate() -> None:
-    """The status destructor (NIXL request release) runs before the transfer leaves the gate."""
+    """The status destructor (NIXL request release) runs before the transfer leaves the gate.
+
+    Covers a completed, a failed and a raising wait; the traceback of the raising one must not
+    keep the status alive past the gate.
+    """
     gate = transfer_mod._AgentOperationGate()
     seen: list[tuple[int, bool]] = []
 
     class _Status:
-        def __init__(self, completed: bool) -> None:
+        def __init__(self, completed: bool | None) -> None:
             self._completed = completed
 
         def wait(self) -> bool:
+            if self._completed is None:
+                raise RuntimeError("wait failed")
             return self._completed
 
         def last_status_str(self) -> str:
@@ -522,7 +528,7 @@ def test_submit_transfer_releases_status_inside_agent_gate() -> None:
     sender._shutdown = True  # No worker threads or transport were created by this fixture.
     sender._enforce_physical_ownership = False
     sender._agent_operation_gate = gate
-    outcomes = [True, False]
+    outcomes: list[bool | None] = [True, False, None]
     # Build each status on demand: a list of prebuilt ones would keep them alive past the call.
     sender._agent = Mock(
         submit_transfer_requests=Mock(side_effect=lambda _req: _Status(outcomes.pop(0))),
@@ -535,7 +541,9 @@ def test_submit_transfer_releases_status_inside_agent_gate() -> None:
 
     assert sender._submit_transfer(task, 3, request()) == (True, None)
     assert sender._submit_transfer(task, 3, request()) == (False, "ERROR")
-    assert seen == [(1, False), (1, False)]
+    with pytest.raises(RuntimeError, match="wait failed"):
+        sender._submit_transfer(task, 3, request())
+    assert seen == [(1, False)] * 3
     assert gate._active_transfers == 0
 
 

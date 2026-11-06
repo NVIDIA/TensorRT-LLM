@@ -2252,13 +2252,17 @@ def test_sender_registration_does_not_wait_for_active_transfer(
     monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock(return_value=0))
     monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
     monkeypatch.setattr(transfer_mod.RankInfo, "from_bytes", Mock(return_value=peer))
+    gate = sender._agent_operation_gate = transfer_mod._AgentOperationGate()
     thread_results: queue.Queue[Exception | None] = queue.Queue()
-    registration = _start_checked_thread(
-        lambda: sender._register_peer_rank(b"", [b"", b"rank"]),
-        thread_results,
-    )
-    registration.join(timeout=10)
-    assert not registration.is_alive()
+    # A transfer without ownership is inside the gate; the owned load must not wait for it.
+    with gate.transfer():
+        registration = _start_checked_thread(
+            lambda: sender._register_peer_rank(b"", [b"", b"rank"]),
+            thread_results,
+        )
+        registration.join(timeout=10)
+        assert not registration.is_alive()
+        assert gate._metadata_waiters == 0 and not gate._metadata_active
     _raise_thread_errors(thread_results, expected=1)
 
     sender._registrar.register.assert_called_once_with("gen", 2, peer)

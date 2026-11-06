@@ -21,6 +21,7 @@ import queue
 import struct
 import threading
 import time
+import traceback
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -1014,6 +1015,12 @@ class Sender(SenderBase):
                     detail = (
                         None if completed else getattr(status, "last_status_str", lambda: None)()
                     )
+                except Exception as error:
+                    # The traceback keeps the status alive through the frames
+                    # of the call that raised; clear them so that the release
+                    # below is the last reference.
+                    traceback.clear_frames(error.__traceback__)
+                    raise
                 finally:
                     # The status destructor releases the NIXL request; it must
                     # run inside the gate, before a metadata load can start.
