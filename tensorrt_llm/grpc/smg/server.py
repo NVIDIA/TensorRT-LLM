@@ -75,8 +75,10 @@ def launch_smg_server(
         logger.info("Model loaded successfully")
 
         server = None
+        request_manager = None
         try:
             request_manager = GrpcRequestManager(llm)
+            request_manager.start_load_feed()
             servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
 
             server = grpc.aio.server(
@@ -122,6 +124,8 @@ def launch_smg_server(
                 if server is not None:
                     await server.stop(grace=5.0)
                     logger.info("gRPC server stopped")
+                if request_manager is not None:
+                    request_manager.stop_load_feed()
             finally:
                 if hasattr(llm, "shutdown"):
                     llm.shutdown()
