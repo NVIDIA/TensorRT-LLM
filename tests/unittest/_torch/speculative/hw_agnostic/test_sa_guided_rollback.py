@@ -87,9 +87,9 @@ def _json_request(**overrides) -> GuidedRequest:
 def _target_step(decoder: CapturableGuidedDecoder, request: GuidedRequest, new_tokens=None):
     """One target verification for a hand-built request.
 
-    Mirrors ``CapturableGuidedDecoder.add_batch`` (requests snapshot, new-token
-    column, queue hand-off) and then runs ``execute`` on zero logits, so the
-    applied mask is readable as ``-inf`` entries.
+    Mirrors ``CapturableGuidedDecoder.add_batch`` (requests snapshot, active
+    flag, new-token column, queue hand-off) and then runs ``execute`` on zero
+    logits, so the applied mask is readable as ``-inf`` entries.
     """
     requests = GuidedRequests(
         [request],
@@ -98,6 +98,7 @@ def _target_step(decoder: CapturableGuidedDecoder, request: GuidedRequest, new_t
         max_num_draft_tokens=K,
     )
     decoder.requests = requests
+    decoder.active = True
     if new_tokens is not None:
         decoder.new_tokens[:, request.seq_slot].copy_(torch.tensor(new_tokens, dtype=torch.int32))
     decoder.queue.put((requests, new_tokens is not None))

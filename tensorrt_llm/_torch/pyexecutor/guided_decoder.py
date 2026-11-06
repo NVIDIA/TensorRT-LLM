@@ -14,7 +14,7 @@ from ..._utils import nvtx_range, prefer_pinned
 from ...bindings.executor import GuidedDecodingParams
 from ...bindings.internal.batch_manager import LlmRequestType
 from ...logger import logger
-from ..hostfunc import hostfunc
+from ..hostfunc import drain_captured_hostfuncs, hostfunc
 from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
                               XGrammarMatcherFactory)
 from .llm_request import LlmRequest
@@ -510,6 +510,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
+        # Whether the current forward runs guided decoding; set by add_batch.
+        self.active = False
 
         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
                                       self.max_num_sequences,
@@ -546,17 +548,41 @@ class CapturableGuidedDecoder(GuidedDecoder):
         if not torch.cuda.is_current_stream_capturing():
             self.bitmask_event.synchronize()
 
+    def _skip_inactive(self) -> bool:
+        """Return True if the current forward has no guided work.
+
+        An inactive forward still waits for the host functions of a previously
+        replayed graph, so the caller does not enter a GIL-holding call while
+        they are pending. Capturing an inactive forward raises an error, since
+        the graph would replay without guided decoding.
+        """
+        if self.active:
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Cannot capture a CUDA graph while guided decoding is "
+                "inactive; pass is_cuda_graph=True to add_batch.")
+        drain_captured_hostfuncs()
+        return True
+
     @nvtx_range("GuidedDecoder.add_batch")
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
                   new_tokens: Optional[torch.Tensor] = None,
-                  runtime_draft_len: Optional[int] = None) -> None:
+                  runtime_draft_len: Optional[int] = None,
+                  is_cuda_graph: bool = False) -> None:
         # See GuidedDecoder.add_batch: the layout must follow the runtime draft
         # length so the captured graph's bitmask matches the target logits.
         num_draft_tokens = (self.max_num_draft_tokens
                             if runtime_draft_len is None else runtime_draft_len)
         self.requests = GuidedRequests.from_scheduled_requests(
             scheduled_requests, num_draft_tokens)
+        # A CUDA graph replays its captured guided work for every batch, so
+        # graph forwards stay active. An eager forward skips guided decoding
+        # when no request is constrained.
+        self.active = is_cuda_graph or any(self.requests.valid_requests())
+        if not self.active:
+            return
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
@@ -586,6 +612,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute(self,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+        if self._skip_inactive():
+            return []
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
@@ -617,6 +645,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
                         draft_step: int = 0) -> None:
+        if self._skip_inactive():
+            return
         batch_size = len(self.requests)
         assert new_tokens.size(0) == batch_size
         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
@@ -695,6 +725,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
             num_accepted_tokens: Int32 tensor of shape [batch_size], including
                 the bonus token in each verification count.
         """
+        if self._skip_inactive():
+            return
         self.add_accepted_batch(num_accepted_tokens)
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
@@ -709,6 +741,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
                             draft_step: int = 0) -> List[Tuple[int, str]]:
+        if self._skip_inactive():
+            return []
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)

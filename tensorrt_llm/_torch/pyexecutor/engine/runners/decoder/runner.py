@@ -18,6 +18,8 @@ from tensorrt_llm._torch.attention.backends.interface import (
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.hostfunc import drain_captured_hostfuncs
+from tensorrt_llm._torch.models.modeling_multimodal_utils import needs_multimodal_encoder
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
@@ -807,6 +809,10 @@ class DecoderRunner(ScheduledModelRunner):
 
             graph_key = key if can_run_graph else None
             captures_model_body = self._graphs.captures_model_body(graph_key)
+            # The encoder can hold the GIL while it waits on the device, so the host functions of
+            # the previous graph replay must run first.
+            if needs_multimodal_encoder(inputs.get("multimodal_params")):
+                drain_captured_hostfuncs()
             outputs = self._graphs.run(
                 graph_key,
                 inputs,
