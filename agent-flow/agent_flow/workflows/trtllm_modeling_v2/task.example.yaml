@@ -146,6 +146,8 @@ environment:
   #   - name: a
   #     spool: /path/to/scratch/spool          # the gate spool above; absolute, one per session
   #     role: gates                            # gates | work | any (the default)
+  #     # Gates run on environment.spool and every `gates` or `any` session; a `work` session
+  #     # gets only what a worker submits to it.
   #     nodes: 1                               # default 1
   #     gpus_per_node: 4
   #     time_limit: "24:00:00"
@@ -347,6 +349,23 @@ accuracy:
 #     - name: batch
 #       workload: {isl: 8192, osl: 1024, concurrency: [128]}
 #       llm_api_options: {enable_chunked_prefill: true}   # over the derived serving config
+#     - name: agent                # `client: agentx` replays InferenceX's AgentX traces (multi-turn
+#       workload:                  # agent sessions sharing long prefixes) with its aiperf client
+#         client: agentx           # (agentx-harness 1.0.12 in a per-job uv venv, from PyPI);
+#         isl: 8192                # isl/osl only describe the requests
+#         osl: 1024
+#         concurrency: [1]
+#         duration_s: 900                      # default 900; per point
+#         dataset: semianalysis_cc_traces_weka_062126_256k   # the default corpus
+#         # warmup_per_lane: 3, max_context_length: 262144, extra_args: [...]: aiperf's own flags
+#         # hf_home: <corpus cache>            # default <workspace>/tune/agentx-cache/hf
+#       llm_api_options: {enable_chunked_prefill: true, kv_cache_config: {enable_block_reuse: true}}
+#       constraint: {kv_hit_pct_min: 95}       # prompt tokens served from the KV cache, percent
+#       # Its points rank as InferenceX ranks AgentX: tok_s_user = 1 / P90 full-response ITL,
+#       # throughputs over the profiling window (total_tok_s_gpu counts cached input too). MTP
+#       # results comparable with the published ones force its golden acceptance length in
+#       # env_script (TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS = AL - 1); without it the
+#       # campaign measures the acceptance the traces reach.
 #   goal: {ratio_to_baseline: 1.1}   # stop once every headline is 1.1x the baseline; or/and
 #                                    # pct_of_sol: 0.7, 70% of each headline's SOL ceiling
 #   sol:                           # public roofline turns; input schema: tune/sol.py
@@ -360,6 +379,9 @@ accuracy:
 #   env_script: <sourced by every perf job>   # default <workspace>/tune/env.sh
 #   wall: 2h                       # default; one perf job's wall limit
 #   model: /path/to/checkpoint     # default checkpoint_path (and `target`: the run's target)
+#   source_workspace: <onboarding workspace>   # a standalone tune beside an onboarding of the
+#                                  # same checkout imports the commits the core's verdicts there
+#                                  # validate; default the tune's own workspace
 #   campaign:                      # every value shown is the default but max_hours (none)
 #     enabled: true                # false: the baseline only
 #     min_gain: 0.01               # an e2e win = max(min_gain, noise_factor x spread)
@@ -378,6 +400,9 @@ accuracy:
 #     max_roadmaps: 2              # a spent roadmap with budget left is refreshed on the best tree
 #     max_hours: 24                # the campaign's wall budget
 #     idle_settle_s: 120           # a measurement starts on a node idle this long
+#     retry_wait_s: 600            # a transient no-verdict (a job to finish, a session to come
+#     max_retries: 24              # back) is waited out in process this long, this many times;
+#                                  # past them the process ends and the next one resumes
 #     gate_tests: true             # the target's and the contract's tests, at each checkpoint
 #     kernel_ledger: require       # or off: no kernel ledger asked of a roadmap
 #     kernel_coverage_pct: 80      # the GPU time a roadmap's kernel ledger must cover

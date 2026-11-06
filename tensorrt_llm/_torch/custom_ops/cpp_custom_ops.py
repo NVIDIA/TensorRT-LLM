@@ -450,7 +450,13 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::dwdp_fabric_gather")
-    def _(dst_ptrs, src_ptrs, lines, row_starts, blocks_per_row, threads):
+    def _(dst_ptrs,
+          src_ptrs,
+          lines,
+          row_starts,
+          blocks_per_row,
+          threads,
+          use_tma=False):
         # Copies through raw device pointers; no return value.
         pass
 
