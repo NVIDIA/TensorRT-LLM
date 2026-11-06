@@ -476,6 +476,27 @@ def test_runner_captures_break_graphs_only_in_capture_break_graphs():
     assert runner.num_break_graphs == 0 and runner._break_graph_pool is None
 
 
+def test_runner_capture_promotes_window_releases_before_warmup(monkeypatch):
+    # Windows released on another stream must be reusable from the capture stream on every
+    # rank before warmup requests any, else best-fit diverges across ranks and deadlocks.
+    runner = BreakableCUDAGraphRunner(_Body().cuda())
+    events = []
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.breakable_cuda_graph_runner."
+        "promote_synchronized_nccl_window_releases",
+        lambda: events.append("promote"),
+    )
+    monkeypatch.setattr(runner, "warmup", lambda *_args: events.append("warmup"))
+
+    def engine_forward():
+        raise RuntimeError("stop after warmup")
+
+    with pytest.raises(RuntimeError, match="stop after warmup"):
+        runner.capture(4, engine_forward)
+
+    assert events == ["promote", "warmup"]
+
+
 def test_runner_clear_releases_memory_pool_after_graph_reset(monkeypatch):
     runner = BreakableCUDAGraphRunner(_Body().cuda())
     pool = (12345, 67890)
