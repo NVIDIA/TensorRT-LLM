@@ -59,6 +59,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import OutOfPagesError
 from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import \
     host_profiler_context
 
+from ..disaggregation import diagnostics as disagg_diagnostics
 from ..disaggregation.base.transfer import get_unique_rid
 from ..disaggregation.kv_cache_transceiver import KvCacheTransceiver
 from ..disaggregation.orchestration.admission import \
@@ -75,6 +76,7 @@ from ..models.modeling_multimodal_mixin import \
     maybe_prefetch_mm_encoder_for_next_iter
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
+from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..moe.expert_statistic import ExpertStatistic
 from ..speculative.drafter import Drafter
 from ..speculative.spec_sampler_base import SpecSampler
@@ -122,7 +124,7 @@ from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
 from .resource_manager import (NoFreeSlotsError, ResourceManager,
                                ResourceManagerType, is_context_only_kv_cache,
                                request_context)
-from .runtime_hooks import ExecutorEvents, runtime_hooks_of
+from .runtime_hooks import ExecutorEvents, RuntimeHooks, runtime_hooks_of
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
                       SampleStateTensors)
 from .scheduler import (RequestScheduler, ScheduledRequests,
@@ -234,6 +236,19 @@ def _validate_dspark_exact_bucket(*, exact_shape, bucket) -> None:
         raise RuntimeError(
             "DSpark exact policy did not publish its selected captured "
             f"verifier bucket V={expected_bucket}; got {bucket}")
+
+
+def _dspark_tp_shared_ragged_lens(dist, ragged_lens: List[int]) -> List[int]:
+    """Use TP rank 0's verify rows on every rank.
+
+    Without attention DP every TP rank runs one token layout, but each rank
+    ranks rows from its own confidence snapshot, so rank-local choices can
+    differ and the next collective stalls. Every rank holds the same batch,
+    so the vectors have one length.
+    """
+    return [
+        int(value) for value in dist.tp_cp_broadcast_int64(ragged_lens, root=0)
+    ]
 
 
 def _classify_dspark_exact_generation_rows(
@@ -556,6 +571,21 @@ class PendingEncoderStep:
     result: Optional[EncoderStepResult] = None
 
 
+def _arm_runtime_opt_ins(hooks: RuntimeHooks) -> bool:
+    """Arm the process-wide features ``hooks`` opt into; return whether to arm
+    the late-compile detector after warmup.
+
+    Both are off for a model that declares neither: the SM107 MXFP8 GEMM
+    tactic table (the GEMM runner does not know the model, so it is armed
+    here) and the late-compile detector.
+    """
+    if hooks.mxfp8_pinned_tactics:
+        # Imported on use: only an opted-in model needs the table.
+        from tensorrt_llm._torch.custom_ops import mxfp8_cute_pinned_tactics
+        mxfp8_cute_pinned_tactics.arm()
+    return hooks.late_compile_detect
+
+
 def _request_flag(request, name: str) -> bool:
     """Read a request state predicate that is a nanobind read-only property on
     the C++ ``LlmRequest`` (``is_generation_only_request`` etc.) but a plain
@@ -607,6 +637,7 @@ class PyExecutorResources:
     virtual_memory_pools: Optional[dict]
     kv_connector_manager: Optional[KvCacheConnectorManager]
     dwdp_manager: Optional[DwdpManager]
+    dense_dwdp_manager: Optional[DenseDwdpManager]
     max_seq_len: Optional[int]
     max_num_sequences: int
     waiting_queue_policy: WaitingQueuePolicy
@@ -679,6 +710,7 @@ class PyExecutor:
         waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
         adp_router: Optional[ADPRouter] = None,
         dwdp_manager: Optional[DwdpManager] = None,
+        dense_dwdp_manager: Optional[DenseDwdpManager] = None,
         enable_kv_pool_rebalance: bool = False,
         kv_pool_rebalance_check_interval: int = KV_POOL_REBALANCE_CHECK_INTERVAL,
         enable_adp_dummy_fixes: bool = False,
@@ -793,6 +825,7 @@ class PyExecutor:
                 virtual_memory_pools=virtual_memory_pools,
                 kv_connector_manager=kv_connector_manager,
                 dwdp_manager=dwdp_manager,
+                dense_dwdp_manager=dense_dwdp_manager,
                 max_seq_len=max_seq_len,
                 max_num_sequences=max_num_sequences,
                 waiting_queue_policy=waiting_queue_policy,
@@ -814,6 +847,7 @@ class PyExecutor:
         virtual_memory_pools = resources.virtual_memory_pools
         kv_connector_manager = resources.kv_connector_manager
         dwdp_manager = resources.dwdp_manager
+        dense_dwdp_manager = resources.dense_dwdp_manager
         max_seq_len = resources.max_seq_len
         max_num_sequences = resources.max_num_sequences
         waiting_queue_policy = resources.waiting_queue_policy
@@ -829,6 +863,10 @@ class PyExecutor:
         hang_detection_timeout = self._execution_config.hang_detection_timeout
         enable_kv_pool_rebalance = self._execution_config.enable_kv_pool_rebalance
         transfer_budget_is_explicit = self._execution_config.transfer_budget_is_explicit
+        # Before anything is bound or warmed up, so that a combination this
+        # executor cannot drive fails before the warmup forwards.
+        self._validate_dwdp_managers(dwdp_manager, dense_dwdp_manager,
+                                     disable_overlap_scheduler)
         self.peft_cache_config = peft_cache_config
         self.iter_counter = 0
         # profile config
@@ -847,6 +885,7 @@ class PyExecutor:
         self.resource_manager = resource_manager
         self.kv_connector_manager = kv_connector_manager
         self.dwdp_manager = dwdp_manager
+        self.dense_dwdp_manager = dense_dwdp_manager
         # Compatibility checks and MultimodalScheduler wrapping live in
         # `create_py_executor_instance`; the executor only keeps the flag
         # its loop paths branch on.
@@ -911,6 +950,20 @@ class PyExecutor:
         self._pending_num_new_active_requests = 0
         self._pending_num_completed_requests = 0
         self.stream_interval = self.llm_args.stream_interval
+        # Streaming: also emit on decoding iterations 2..N when the model's
+        # runtime hooks ask for it (RuntimeHooks.first_content_emit_iters; 1,
+        # the default, keeps the stock schedule).
+        model_hooks = runtime_hooks_of(model_engine.model)
+        self.first_content_emit_iters = max(
+            1, model_hooks.first_content_emit_iters)
+        if self.stream_interval > 1 and self.first_content_emit_iters > 1:
+            logger.info(
+                f"first-content emission engaged: emit on decoding iters "
+                f"<= {self.first_content_emit_iters} (stream_interval "
+                f"{self.stream_interval}), rank {self.dist.rank}")
+        self._late_compile_detect = False
+        if model_hooks.mxfp8_pinned_tactics or model_hooks.late_compile_detect:
+            self._late_compile_detect = _arm_runtime_opt_ins(model_hooks)
         self.perf_manager = PerfMetricsManager(
             enabled=getattr(self.llm_args, 'return_perf_metrics', False))
         self.attention_dp_enable_balance = (
@@ -1287,6 +1340,10 @@ class PyExecutor:
                     self.encoder_launch_executor.submit(
                         self._warmup_encoder_cuda_graphs_enc_dec).result()
 
+        if self._late_compile_detect:
+            from tensorrt_llm._torch.late_compile import mark_server_ready
+            mark_server_ready()
+
         # Snapshot some cumulative KV cache counters so that stats reported to
         # users exclude blocks reused and missed during warmup dummy requests.
         if hasattr(self.kv_cache_manager, 'snapshot_warmup_baseline'):
@@ -1497,11 +1554,6 @@ class PyExecutor:
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
 
-        if dwdp_manager is not None and not self.disable_overlap_scheduler:
-            raise ValueError(
-                "DWDP requires disable_overlap_scheduler=True. "
-                "Overlap scheduler is not yet supported with DWDP.")
-
         if self.drafter is not None:
             if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
@@ -1560,6 +1612,11 @@ class PyExecutor:
             raise
 
     @property
+    def is_generation_model(self) -> bool:
+        """Whether requests generate tokens, rather than finish after one forward."""
+        return self.sampler.is_generation_model()
+
+    @property
     def metrics(self) -> dict[str, float | dict[str, float]]:
         """Return executor construction and model-engine startup metrics."""
         return self._metrics
@@ -1576,6 +1633,32 @@ class PyExecutor:
         """
         connector = getattr(self, "kv_connector_manager", None)
         return connector is not None and not connector.capacity_only
+
+    @staticmethod
+    def _validate_dwdp_managers(dwdp_manager: Optional[DwdpManager],
+                                dense_dwdp_manager: Optional[DenseDwdpManager],
+                                disable_overlap_scheduler: bool) -> None:
+        """Reject DWDP managers this executor cannot drive.
+
+        Expert DWDP (``dwdp_manager``) runs only with the overlap scheduler
+        off. A standalone dense DWDP manager runs with either loop: the
+        non-overlap loop primes it before each forward, and in the overlap loop
+        the model's forward entry (H0) primes it. With expert DWDP,
+        ``DwdpManager`` drives dense DWDP itself, so only one of the two
+        managers may be given.
+
+        Raises:
+            ValueError: ``dwdp_manager`` with the overlap scheduler on, or both
+                managers given.
+        """
+        if dwdp_manager is not None and not disable_overlap_scheduler:
+            raise ValueError(
+                "DWDP requires disable_overlap_scheduler=True. "
+                "Overlap scheduler is not yet supported with DWDP.")
+        if dwdp_manager is not None and dense_dwdp_manager is not None:
+            raise ValueError(
+                "pass dense_dwdp_manager only without DWDP: with dwdp_manager, "
+                "DwdpManager drives dense DWDP")
 
     def _maybe_init_kv_connector_manager(self) -> None:
         if self.kv_connector_manager is not None:
@@ -2556,6 +2639,9 @@ class PyExecutor:
         if self.dwdp_manager is not None:
             self.dwdp_manager.__exit__(None, None, None)
             self.dwdp_manager = None
+        if self.dense_dwdp_manager is not None:
+            self.dense_dwdp_manager.__exit__(None, None, None)
+            self.dense_dwdp_manager = None
         # Released in full: the next release, after a rebind or of resources a
         # failed rebind bound, starts over.
         self._shutdown_runtime_complete = False
@@ -4765,6 +4851,10 @@ class PyExecutor:
                                 graph_batch_size=common_graph_batch_size,
                                 verifier_budget=selected_verifier_budget,
                             ))
+                        if (is_distributed
+                                and not self.dist.mapping.enable_attention_dp):
+                            ragged_lens = _dspark_tp_shared_ragged_lens(
+                                self.dist, ragged_lens)
                         if exact_local.num_requests == 0:
                             if not exact_zero_real_adp_dummy:
                                 raise RuntimeError(
@@ -5119,6 +5209,17 @@ class PyExecutor:
         if spec_resource_manager is not None:
             spec_resource_manager.free_resources(dummy_request)
         self.kv_cache_manager.free_resources(dummy_request)
+        # The V2 scheduler also admits the draft pool's mirror while it
+        # schedules the dummy (KVCacheV2Scheduler._admit_unpaired_draft), so
+        # that pool holds an empty cache under the dummy ID too. Left behind,
+        # it outlives this dummy, and the deferred previous batch -- which
+        # still holds the earlier, finished dummy with the same ID -- resizes
+        # it to that dummy's history in update_resources ("History length
+        # cannot exceed capacity").
+        draft_kv_cache_manager = getattr(self, "draft_kv_cache_manager", None)
+        if (getattr(self, "_is_kv_manager_v2", False)
+                and draft_kv_cache_manager is not None):
+            draft_kv_cache_manager.free_resources(dummy_request)
         self.active_requests.remove(dummy_request)
 
     def _revert_ctx_alloc(self, dropped_context_requests):
@@ -6071,6 +6172,24 @@ class PyExecutor:
         return torch.profiler.record_function(
             self._build_step_scope_label(scheduled_batch, phase))
 
+    def _prime_dwdp(self) -> None:
+        """Start DWDP for the next forward of the non-overlap loop.
+
+        Expert DWDP starts its prefetch (``DwdpManager.start_forward``): the
+        first MoE layers, unless the previous forward already prefetched them,
+        each after the layer's dense weights when dense DWDP is attached. A
+        standalone dense DWDP manager enqueues the dense weights of the first
+        two layers. Dense DWDP skips what is primed already and leaves the
+        recovery after an aborted forward to the model's forward entry (H0).
+        The overlap and pipeline-parallel loops do not call this: expert DWDP
+        refuses the overlap scheduler, and a standalone dense DWDP manager is
+        primed by H0 in every forward there.
+        """
+        if self.dwdp_manager is not None:
+            self.dwdp_manager.start_forward()
+        elif self.dense_dwdp_manager is not None:
+            self.dense_dwdp_manager.prefetch_first_layers()
+
     def _executor_loop(self) -> None:
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -6240,8 +6359,7 @@ class PyExecutor:
                         with self.perf_manager.record_perf_events(
                                 gpu_forward_start,
                                 gpu_forward_end) as fwd_timing:
-                            if self.dwdp_manager is not None:
-                                self.dwdp_manager.start_forward()
+                            self._prime_dwdp()
                             batch_outputs = self._forward_step(scheduled_batch)
 
                         # None: _forward_step hit an exception and
@@ -8168,6 +8286,7 @@ class PyExecutor:
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue, total_num_live_requests)
+        self._cancel_queued_context_requests(waiting_queue)
 
         # 3. Pop requests from waiting queue
         new_requests, placement = self._pop_from_waiting_queue(
@@ -8213,6 +8332,77 @@ class PyExecutor:
                               exclude_last_generation_logits=self.
                               _should_exclude_last_generation_logits(),
                               is_disagg=self.kv_cache_transceiver is not None)
+
+    def _cancel_queued_context_requests(self,
+                                        waiting_queue: WaitingQueue) -> None:
+        """Finish cancelled CTX work before admission or rank placement.
+
+        The executor loop serializes removal with activation. Entries already
+        activated remain on the existing active-request cancellation path.
+        No model, KV, or transfer resources have been acquired for these raw
+        entries, so only a terminal response is emitted, not resource teardown.
+
+        Args:
+            waiting_queue: Replicated queue of accepted, unactivated requests.
+        """
+        if not self.canceled_req_ids or self.kv_connector_manager is not None:
+            return
+        cancelled_ids = set(self.canceled_req_ids)
+        cancelled_items = [
+            item for item in waiting_queue
+            if item.id in cancelled_ids and item.request is not None and
+            item.request.request_type == RequestType.REQUEST_TYPE_CONTEXT_ONLY
+        ]
+        if not cancelled_items:
+            return
+        handled_ids = {item.id for item in cancelled_items}
+        waiting_queue.remove_by_ids(handled_ids)
+        self.canceled_req_ids[:] = [
+            req_id for req_id in self.canceled_req_ids
+            if req_id not in handled_ids
+        ]
+        if self.dist.rank == 0:
+            # Discard parent/child timing records without counting admission.
+            self.executor_request_queue.calculate_queue_latency(
+                cancelled_items, time.time())
+
+        # Before ADP placement every rank owns the same raw queue. Contribute
+        # one copy to the existing response gather, including empty peer lists.
+        emit_response = self.dist.rank == 0 or (self.gather_all_responses and
+                                                not self.enable_attention_dp)
+        responses = []
+        for item in cancelled_items if emit_response else ():
+            raw = item.request
+            # Reuse native beam/sequence completion and result serialization,
+            # without activation or copying multimodal/LoRA execution inputs.
+            request = LlmRequest(
+                request_id=item.id,
+                max_new_tokens=raw.max_tokens,
+                input_tokens=raw.get_input_token_ids_array(),
+                sampling_config=raw.sampling_config,
+                is_streaming=raw.streaming,
+                draft_tokens=None,
+                exclude_input_from_output=raw.output_config.
+                exclude_input_from_output,
+                client_id=raw.client_id
+                if raw.client_id is not None else item.id,
+                llm_request_type=LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY,
+                return_perf_metrics=raw.output_config.return_perf_metrics,
+            )
+            for child_id in item.child_req_ids or ():
+                request.create_child_request(child_id)
+            for sequence in (request, *request.child_requests):
+                sequence.finish_by_reason(FinishReason.CANCELLED)
+                response = sequence.create_response()
+                if response is not None:
+                    responses.append((item.id, response))
+        # This replicated pre-admission boundary also runs on idle PP passes;
+        # do not wait for a model batch or flush unrelated resource teardown.
+        self._enqueue_responses(responses)
+        if self.dist.rank == 0 or self.gather_all_responses:
+            with self.response_cv:
+                for req_id in handled_ids:
+                    self.result_wait_queues.pop(req_id, None)
 
     def _handle_special_queue_items(
             self,
@@ -8301,6 +8491,23 @@ class PyExecutor:
         ]
 
         self.active_requests.extend(validated_requests)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                for request in validated_requests:
+                    if not request.is_disagg_generation_init_state:
+                        continue
+                    prompt_tokens = getattr(request, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = request.prompt_len
+                    disagg_diagnostics.emit_request_event(
+                        "gen_ingress",
+                        request,
+                        side="gen",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        prompt_tokens=prompt_tokens,
+                        state=request.state.name,
+                    )
         return validated_requests
 
     def _add_kv_cache_events(self):
@@ -9557,6 +9764,19 @@ class PyExecutor:
                     prepare(req)
 
             self._maybe_prepend_logprobs_and_logits(req, beam_width)
+            if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+                with disagg_diagnostics.suppress_diagnostic_errors():
+                    prompt_tokens = getattr(req, "total_input_len_cp", None)
+                    if prompt_tokens is None:
+                        prompt_tokens = req.prompt_len
+                    disagg_diagnostics.emit_request_event(
+                        "gen_decode_ready",
+                        req,
+                        side="gen",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        prompt_tokens=prompt_tokens,
+                    )
 
     def _update_sampler_state_for_disagg_gen_request(self, req, beam_width,
                                                      first_gen_tokens) -> bool:
@@ -10036,7 +10256,8 @@ class PyExecutor:
     @nvtx_range("_update_request_states")
     def _update_request_states(self, scheduled_requests: ScheduledRequests):
         cp_config = self.dist.cp_config
-        if 'cp_type' in cp_config:
+        # A cp_type takes effect only with context parallelism on.
+        if 'cp_type' in cp_config and self.dist.cp_size > 1:
             cp_type = cp_config['cp_type']
             if cp_type == CpType.HELIX:
                 # Take the usual route with _update_request_states_tp().
@@ -10484,6 +10705,19 @@ class PyExecutor:
             )
         self.sampler.release_request(request)
         self.resource_manager.free_resources(request)
+        if disagg_diagnostics.DISAGG_TRANSFER_DIAGNOSTICS_ENABLED:
+            with disagg_diagnostics.suppress_diagnostic_errors():
+                if request.is_context_only_request:
+                    disagg_diagnostics.emit_request_event(
+                        "ctx_source_kv_released",
+                        request,
+                        side="ctx",
+                        rank=self.global_rank,
+                        dist=self.dist,
+                        prompt_tokens=request.prompt_len,
+                        state=request.state.name,
+                        source_kv_request_owned=False,
+                    )
         self._prefetched_request_ids.discard(request.py_request_id)
         self.disagg.forget_request(request.py_request_id)
         for engine in (self.model_engine, self.draft_model_engine):
@@ -10911,6 +11145,28 @@ class PyExecutor:
 
         self._enqueue_responses(new_responses)
 
+    def _should_emit_response(self,
+                              request: LlmRequest,
+                              emit_first_iter: bool = True,
+                              first_gen_emit: bool = False) -> bool:
+        """Whether ``_handle_responses`` emits a response for ``request`` now.
+
+        Emits on decoding iteration 1, on finish, every ``stream_interval``
+        iterations, on the first generation-only content, and on iterations
+        ``2..first_content_emit_iters``.
+        """
+        decoding_iter = request.py_decoding_iter
+        if request.is_finished:
+            return True
+        if decoding_iter == 1:
+            # The early-emit prototype issues the (non-terminal) iter-1
+            # response from `_emit_first_token_responses`; suppress it here.
+            return emit_first_iter
+        if (self.first_content_emit_iters > 1
+                and 1 < decoding_iter <= self.first_content_emit_iters):
+            return True
+        return first_gen_emit or decoding_iter % self.stream_interval == 0
+
     @nvtx_range("_handle_responses")
     def _handle_responses(self, emit_first_iter: bool = True):
         new_responses = []
@@ -11004,20 +11260,12 @@ class PyExecutor:
                                         "route_capture", None)
                 if route_capture is not None:
                     route_capture.attach_routes(request)  # R3: append routes
-            # A generation-only request skipped its iteration-1 response (the
-            # CTX returned the first token); without this its first streamed
-            # content waits for decoding iteration stream_interval.
+            # A generation-only request's first streamed content must not wait
+            # for stream_interval after the context-side first token.
             first_gen_emit = (request.is_generation_only_request
                               and not request.py_gen_first_emitted)
-            should_emit = (request.py_decoding_iter == 1 or request.is_finished
-                           or first_gen_emit or
-                           request.py_decoding_iter % self.stream_interval == 0)
-            # The early-emit prototype issues the (non-terminal) iter-1
-            # response from `_emit_first_token_responses`; suppress it here.
-            if (not emit_first_iter and request.py_decoding_iter == 1
-                    and not request.is_finished):
-                should_emit = False
-            if should_emit:
+            if self._should_emit_response(request, emit_first_iter,
+                                          first_gen_emit):
                 if request.return_perf_metrics:
                     # Response creation may finalize and copy scalar ctx GPU totals.
                     self.perf_manager.compute_batch_gpu_times(

@@ -492,6 +492,7 @@ def _context_resize_mgr(is_disagg: bool, resizes: list) -> SimpleNamespace:
         is_disagg=is_disagg,
         kv_cache_map={7: kv},
         num_extra_kv_tokens=0,
+        _kv_alloc_extra_tokens=0,
         _connector_reservations_enabled=lambda: False,
         _fill_fresh_kv_pages=lambda req_id: None,
         _log_window_crossing=lambda *args: None,
