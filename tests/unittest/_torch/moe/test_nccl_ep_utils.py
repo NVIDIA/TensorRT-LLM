@@ -18,9 +18,8 @@
 under the Ray orchestrator (``mpi_disabled()``) and from an ``MPI_COMM_WORLD``
 split keyed by pipeline stage otherwise. These tests stub the ``nccl`` namespace
 package, ``mpi4py`` and the CUDA allocations, so they run in the CPU-only stage
-next to ``test_communication_factory.py`` and catch a regression that selects the
-wrong bootstrap, passes the wrong EP group, or tears the resources down in the
-wrong order.
+and catch a regression that selects the wrong bootstrap, passes the wrong EP
+group, or tears the resources down in the wrong order.
 """
 
 from __future__ import annotations
@@ -35,6 +34,9 @@ import torch
 
 from tensorrt_llm import _utils as trtllm_utils
 from tensorrt_llm._torch.moe.fused_moe import nccl_ep_utils
+
+# The CPU stage runs -m cpu_only and collects only files that carry this marker.
+pytestmark = pytest.mark.cpu_only
 
 _NUM_EXPERTS = 8
 _MAX_TOKENS_PER_RANK = 4
