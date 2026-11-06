@@ -4,8 +4,10 @@
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
+from tensorrt_llm._torch._experimental.modeling_v2._native import load_family_ops
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell, OpWrapper
+
+native_ops = load_family_ops(__name__)
 
 
 class AttnResRmsnormFwd(OpWrapper):
@@ -17,7 +19,7 @@ class AttnResRmsnormFwd(OpWrapper):
     it writes the output, so a dependent PDL kernel must wait on the grid dependency before reading it.
     """
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = (
         *(
             Cell(
@@ -77,9 +79,11 @@ class AttnResRmsnormFwd(OpWrapper):
     before reading output or overwriting these inputs. Non-PDL kernels use
     normal stream ordering; disabling PDL changes scheduling, not arithmetic.
     Shape-only launches capture after warm-up and replay eager bits.
-    Kimi K3 calls this before attention, snapshot-appending MLPs and model
-    output up to KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (default 1, topology mode 32),
-    unless the persistent topology handles it. Drafter-captured mixtures use
+    The Kimi K3 targets call this before attention, snapshot-appending MLPs and
+    model output up to KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS (their default 1,
+    topology mode 32), unless the persistent topology handles it. The built-in
+    model (default ceiling 64) runs the CuTe DSL decode kernel there and this
+    op where that kernel is unavailable on the device. Drafter-captured mixtures use
     the unfused entry. The fake op returns empty_like(layer_residual).
     """
 
@@ -93,7 +97,7 @@ class AttnResRmsnormFwd(OpWrapper):
         rms_eps: float,
         output_rms_eps: float,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.k3_attn_res_rmsnorm_fwd(
+        return native_ops.k3_attn_res_rmsnorm_fwd(
             layer_residual,
             block_residual,
             res_weight,

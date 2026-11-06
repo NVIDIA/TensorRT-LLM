@@ -37,7 +37,7 @@ class K3SandwichTail(OpWrapper):
     (``updated`` with ``tap_updated``). ``updated_out``: store ``updated`` there; it is then the returned ``updated``.
     Advances ``workspace`` by one call: every rank of the group makes the same calls on it in the same order."""
 
-    ARCHS = frozenset({Arch.SM_100})
+    ARCHS = frozenset({Arch.SM_100, Arch.SM_103})
     CELLS: tuple[Cell, ...] = tuple(
         Cell(
             why=f"{tokens} decode tokens, {snapshots} snapshots, prefix={prefix}: latent slice shift {shift}",

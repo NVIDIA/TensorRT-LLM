@@ -105,7 +105,9 @@ def test_create_client_does_not_register_with_server_metrics_collector(bounded_r
     server._req_timeout_secs = 30
     server._collect_perf_metrics = True
     server._config = SimpleNamespace(
-        internal_request_auth_key="key", bounded_replay_on_generation=bounded_replay
+        internal_request_auth_key="key",
+        bounded_replay_on_generation=bounded_replay,
+        ctx_frontend_affinity=None,
     )
     server._perf_metrics_collector = SimpleNamespace()
 

@@ -60,6 +60,7 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "CUTLASS"}}, True),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend_typo": "CUTLASS"}}, False),
         (generator.SERVE_SCHEMA, {"moe_config": {"backend": "not-a-backend"}}, False),
+        (generator.SERVE_SCHEMA, {"moe_config": {"load_balancer": "eplb.yaml"}}, True),
         (generator.SERVE_SCHEMA, {"backend": "pytorch"}, True),
         (generator.SERVE_SCHEMA, {"backend": "_autodeploy"}, False),
         (
@@ -81,6 +82,31 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"env_overrides": {"FLAG": 1, "OTHER": True}}, True),
         (generator.SERVE_SCHEMA, {"telemetry_config": {"disabled": True}}, True),
         (generator.SERVE_SCHEMA, {"multimodal_config": None}, True),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": True}},
+            True,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": False}},
+            True,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": "invalid"}},
+            False,
+        ),
+        (
+            generator.SERVE_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": 1}},
+            False,
+        ),
+        (
+            generator.DISAGG_SCHEMA,
+            {"multimodal_config": {"vision_gpu_normalize": None}},
+            False,
+        ),
         (
             generator.SERVE_SCHEMA,
             {"multimodal_config": {"encoder_cuda_graph": {"vision": {"max_batch_size": 8}}}},
@@ -145,6 +171,8 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.SERVE_SCHEMA, {"kv_cache_config": {"enable_mix_precision": "nvfp4"}}, False),
         (generator.SERVE_SCHEMA, {"checkpoint_loader": {}}, False),
         (generator.SERVE_SCHEMA, {"tokenizer": 42}, False),
+        (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "rank_striped_read_ahead"}, True),
+        (generator.SERVE_SCHEMA, {"checkpoint_io_policy": "unknown"}, False),
         (generator.DISAGG_SCHEMA, {"backend": "pytorch"}, True),
         (generator.DISAGG_SCHEMA, {"backend": "_autodeploy"}, False),
         (generator.DISAGG_SCHEMA, {"context_servers": {"urls": ["ctx:8001"]}}, True),
@@ -163,6 +191,8 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         ),
         (generator.DISAGG_SCHEMA, {"schedule_style": "invalid"}, False),
         (generator.DISAGG_SCHEMA, {"num_workers": 2, "server_keep_alive_timeout": 20}, True),
+        (generator.DISAGG_SCHEMA, {"checkpoint_io_policy": "native"}, True),
+        (generator.DISAGG_SCHEMA, {"context_servers": {"checkpoint_io_policy": "unknown"}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 1}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_szie": 1}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"cfg_size": 0}}, False),
@@ -170,6 +200,58 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 2}}, True),
         (generator.VISUAL_GEN_SCHEMA, {"parallel_config": {"text_encoder_tp_size": 0}}, False),
         (generator.VISUAL_GEN_SCHEMA, {"attention_config": {"backend": "not-a-backend"}}, False),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "native",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "morton",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "hilbert",
+                    }
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "attention_config": {
+                    "sparse_attention_config": {
+                        "algorithm": "sol_attn",
+                        "tau": 1.0,
+                        "token_order": "peano",
+                    }
+                }
+            },
+            False,
+        ),
     ],
 )
 def test_config_validation(
@@ -201,6 +283,40 @@ def test_branch_snapshot_field_types(
     config = {"kv_cache_config": {section: {"enable_branch_snapshot": value}}}
     errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
     assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize(
+    ("load_balancer", "valid"),
+    [
+        ({"num_slots": 288}, True),
+        ({"mode": "standard", "num_slots": 288, "layer_updates_per_iter": 1}, True),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 4}, True),
+        (
+            {"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "shared_banks"},
+            True,
+        ),
+        # A mapping without mode is standard EPLB, which has no auxiliary_sms.
+        ({"num_slots": 320, "auxiliary_sms": 4}, False),
+        ({"mode": "per_layer_dynamic"}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "layer_updates_per_iter": 1}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "auxiliary_sms": 9}, False),
+        ({"mode": "per_layer_dynamic", "num_slots": 320, "helper_slot_mode": "private"}, False),
+        ({"mode": "dynamic", "num_slots": 320}, False),
+    ],
+)
+def test_load_balancer_schema_matches_runtime(
+    schemas: dict[str, dict], load_balancer: dict, valid: bool
+) -> None:
+    from tensorrt_llm.llmapi.llm_args import MoeConfig
+
+    config = {"moe_config": {"load_balancer": load_balancer}}
+    errors = list(Draft202012Validator(schemas[generator.SERVE_SCHEMA]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+    if valid:
+        MoeConfig(load_balancer=load_balancer)
+    else:
+        with pytest.raises(ValueError):
+            MoeConfig(load_balancer=load_balancer)
 
 
 def _assert_serving_fields_in_schema(source: str, function_name: str, properties: dict) -> None:
@@ -721,12 +837,12 @@ def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> 
         str(schema_dir),
     ]
     before_sync = {path.name: path.read_bytes() for path in schema_dir.iterdir()}
-    result = subprocess.run(command + ["--check"], capture_output=True, text=True)
+    result = subprocess.run(command + ["--check"], capture_output=True, text=True, timeout=60)
     assert result.returncode != 0
     assert "Missing or stale configuration schemas" in result.stderr
     assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_sync
 
-    subprocess.run(command, check=True, capture_output=True, text=True)
+    subprocess.run(command, check=True, capture_output=True, text=True, timeout=60)
     version = generator._source_version()
     before_check = {}
     for filename, expected_command in generator._SCHEMA_COMMANDS.items():
@@ -738,7 +854,7 @@ def test_version_metadata_sync_needs_no_project_dependencies(tmp_path: Path) -> 
         assert schema["sentinel"] == {"preserved": True}
         before_check[filename] = path.read_bytes()
 
-    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True)
+    subprocess.run(command + ["--check"], check=True, capture_output=True, text=True, timeout=60)
     assert {path.name: path.read_bytes() for path in schema_dir.iterdir()} == before_check
 
 

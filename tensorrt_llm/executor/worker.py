@@ -15,6 +15,7 @@
 
 import gc
 import os
+import pickle  # nosec B403
 import sys
 import threading
 import time
@@ -28,6 +29,9 @@ import zmq
 from tensorrt_llm.logger import logger
 
 from .._utils import mpi_comm, mpi_rank, print_all_stacks
+from ..llmapi._load_balance_env import (LAUNCH_QUEUES_ENV,
+                                        configure_moe_launch_queues,
+                                        uses_collective_shutdown)
 from ..llmapi.llm_args import BaseLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tokenizer import TokenizerBase
@@ -153,8 +157,139 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
         if self.doing_shutdown:
             return
-        else:
-            self.doing_shutdown = True
+        if not uses_collective_shutdown(getattr(self, "llm_args", None)):
+            self._shutdown_rank_local()
+            return
+        self.doing_shutdown = True
+        shutdown_succeeded = False
+
+        try:
+            logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
+
+            shutdown_error = None
+            # The server references this worker; a long-lived worker process would
+            # otherwise keep one server, its threads and sockets per LLM it hosted.
+            if self.rpc_server is not None:
+                try:
+                    self.rpc_server.shutdown()
+                    self.rpc_server = None
+                except BaseException as error:
+                    shutdown_error = error
+            if self.engine is not None:
+                engine = self.engine
+                local_safe = bool(
+                    getattr(self, "_engine_shutdown_completed", False))
+                if not local_safe:
+                    try:
+                        if engine.can_enqueue_requests():
+                            if self.await_response_thread.is_alive():
+                                self.await_response_thread.stop()
+                                self.await_response_thread.join()
+
+                        engine.shutdown()
+                        self._engine_shutdown_completed = True
+                        local_safe = True
+                    except BaseException as error:
+                        shutdown_error = error
+                try:
+                    terminal_cleanup = getattr(engine, "terminal_cleanup", None)
+                    if terminal_cleanup is not None:
+                        if getattr(engine, "shutdown_all_ranks", False):
+                            terminal_cleanup(local_safe=local_safe)
+                        elif local_safe:
+                            terminal_cleanup()
+                except BaseException as error:
+                    if shutdown_error is None:
+                        shutdown_error = error
+
+                if (self.llm_args.backend == "pytorch"
+                        and hasattr(self, "checkpoint_loader")
+                        and self.checkpoint_loader is not None
+                        and shutdown_error is None):
+                    try:
+                        self.checkpoint_loader.cleanup()
+                    except BaseException as error:
+                        shutdown_error = error
+                    else:
+                        self.checkpoint_loader = None
+
+            # Keep every rank aligned before entering the next collective phase.
+            # A rank-local engine or checkpoint failure must prevent peers from
+            # advancing to symmetric-buffer release and process-group teardown.
+            shutdown_failures = mpi_comm().allgather(
+                None if shutdown_error is
+                None else f"{type(shutdown_error).__name__}: {shutdown_error}")
+            shutdown_failures = [
+                f"rank {rank}: {failure}"
+                for rank, failure in enumerate(shutdown_failures)
+                if failure is not None
+            ]
+            if shutdown_failures:
+                if shutdown_error is not None:
+                    raise shutdown_error
+                raise RuntimeError("Worker shutdown failed: " +
+                                   "; ".join(shutdown_failures))
+
+            # MegaMoE's NVLink symmetric-memory activation workspaces are
+            # rendezvoused over the EP group, so they must go before the
+            # destroy_process_group() below.
+            mega_moe = sys.modules.get(_MEGA_MOE_DEEPGEMM_MODULE)
+            symm_release_error = None
+            if mega_moe is not None:
+                try:
+                    mega_moe.release_symm_buffer_cache()
+                except BaseException as error:
+                    symm_release_error = error
+            # No rank may destroy its process group while a peer still needs that
+            # group to retry symmetric-buffer destruction.
+            symm_release_failures = mpi_comm().allgather(
+                None if symm_release_error is None else
+                f"{type(symm_release_error).__name__}: {symm_release_error}")
+            symm_release_failures = [
+                f"rank {rank}: {failure}"
+                for rank, failure in enumerate(symm_release_failures)
+                if failure is not None
+            ]
+            if symm_release_failures:
+                if symm_release_error is not None:
+                    raise symm_release_error
+                raise RuntimeError("MegaMoE symm-buffer release failed: " +
+                                   "; ".join(symm_release_failures))
+
+            # Destroy torch distributed process groups so that NCCL communicators
+            # are torn down cleanly before MPI session shutdown and process exit.
+            # This is done here (not in PyExecutor.shutdown()) because the MPI
+            # worker owns the process group. In the Ray path the process group
+            # belongs to RayWorkerWrapper and must not be destroyed by the engine.
+            import torch.distributed
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+
+            # Return this rank's GPU memory to the driver. Under an external MPI
+            # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
+            # shared across successive LLM instances: a new GenerationExecutorWorker
+            # is built for each LLM, but the OS process -- and with it the CUDA
+            # context and PyTorch caching allocator -- persists.
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            self.engine = None
+            self._engine_shutdown_completed = False
+            shutdown_succeeded = True
+            logger_debug(f"Worker {mpi_rank()} shutdown done.\n", "yellow")
+
+            # Raise background-thread errors only after the commit above, which
+            # every rank has reached, so a retry cannot re-enter collectives.
+            self._handle_background_error()
+        finally:
+            # A failed collective shutdown can be retried only explicitly.
+            self._collective_shutdown_failed = not shutdown_succeeded
+            if not shutdown_succeeded:
+                self.doing_shutdown = False
+
+    def _shutdown_rank_local(self):
+        """Best-effort teardown for configurations without collective EP resources."""
+        self.doing_shutdown = True
 
         logger_debug(f'Worker {mpi_rank()} shutdown...\n', "yellow")
 
@@ -171,6 +306,9 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                     self.await_response_thread.join()
 
             self.engine.shutdown()
+            local_cleanup = getattr(self.engine, "local_cleanup", None)
+            if local_cleanup is not None:
+                local_cleanup()
             self.engine = None
 
             if (self.llm_args.backend == "pytorch"
@@ -196,7 +334,7 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
         # Destroy torch distributed process groups so that NCCL communicators
         # are torn down cleanly before MPI session shutdown and process exit.
         # This is done here (not in PyExecutor.shutdown()) because the MPI
-        # worker owns the process group.  In the Ray path the process group
+        # worker owns the process group. In the Ray path the process group
         # belongs to RayWorkerWrapper and must not be destroyed by the engine.
         import torch.distributed
         if torch.distributed.is_initialized():
@@ -204,15 +342,8 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
 
         # Return this rank's GPU memory to the driver. Under an external MPI
         # launch (mpirun/srun, e.g. CI), the worker process is long-lived and
-        # shared across successive LLM instances: a new GenerationExecutorWorker
-        # is built for each LLM, but the OS process -- and with it the CUDA
-        # context and PyTorch caching allocator -- persists. Setting
-        # `self.engine = None` above is not enough to free the GPU: reference
-        # cycles keep the model tensors alive until a later GC, and the allocator
-        # holds freed blocks as "reserved" instead of returning them. Without
-        # this, the previous model's ~weights-sized reservation carries into the
-        # next LLM built in this process and can OOM its load (e.g. back-to-back
-        # tests in one CI shard).
+        # shared across successive LLM instances, so the previous model's
+        # reservation would otherwise carry into the next LLM in this process.
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -226,6 +357,21 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
             from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
             if isinstance(self.engine, PyExecutor):
                 self.engine.wait_shutdown()
+
+
+def _incoming_requests(request_queue: IpcQueue):
+    """Yield the proxy's requests until its shutdown sentinel arrives.
+
+    With TRTLLM_PROXY_BATCH_REQUESTS=1 the proxy sends a burst of requests as
+    one list of pickled requests. ``request_queue.get()`` has already
+    authenticated that message, and with it every payload inside.
+    """
+    while (msg := request_queue.get()) is not None:
+        if isinstance(msg, list):
+            for payload in msg:
+                yield pickle.loads(payload)  # nosec B301
+        else:
+            yield msg
 
 
 @print_traceback_on_error
@@ -247,6 +393,21 @@ def worker_main(
     hmac_key: bytes = b"",
 ) -> None:
 
+    launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
+    if llm_args is not None and llm_args.env_overrides:
+        # MPI may have cached the parent's environment before this worker was
+        # spawned, so replay overrides before any rebalance state is inspected.
+        os.environ.update(llm_args.env_overrides)
+
+    # Configure per-layer dynamic EPLB before MPI or CUDA state is created.
+    if llm_args is not None and llm_args.backend == "pytorch":
+        queue_overrides = configure_moe_launch_queues(
+            getattr(llm_args, "moe_config", None),
+            llm_args.env_overrides,
+            initial_setting=launch_queues)
+        if queue_overrides is not llm_args.env_overrides:
+            llm_args.env_overrides = queue_overrides
+
     def _print_stacks():
         counter = 0
         while True:
@@ -263,14 +424,6 @@ def worker_main(
         print_stacks_thread.start()
 
     mpi_comm().barrier()
-
-    if llm_args is not None and llm_args.env_overrides:
-        # this is needed because MPI_Init seems to cache the env at import time.
-        # The cached env snapshot is used to spawn workers.
-        # Any env overrides to the main process after tensorrt_llm import
-        # may not get reflected in the spawned worker process, no matter how early,
-        # unless we update it explicitly here.
-        os.environ.update(llm_args.env_overrides)
 
     if llm_args is not None and llm_args.trust_remote_code:
         _init_hf_modules()
@@ -395,6 +548,10 @@ def worker_main(
                               [worker_queues.result_queue_addr])
 
         assert result_queues is not None
+        # A reused worker process may still hold cyclic garbage from the LLM it
+        # hosted before, including CUDA objects. Collect it here: a forked
+        # postprocess worker that finalizes them aborts on CUDA.
+        gc.collect()
         postproc_worker_pool = ProcessPoolExecutor(
             max_workers=postproc_worker_config.num_postprocess_workers)
         for i in range(postproc_worker_config.num_postprocess_workers):
@@ -493,7 +650,7 @@ def worker_main(
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
 
-                while (req := request_queue.get()) is not None:
+                for req in _incoming_requests(request_queue):
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
                     elif isinstance(req, StartProfileRequest):
