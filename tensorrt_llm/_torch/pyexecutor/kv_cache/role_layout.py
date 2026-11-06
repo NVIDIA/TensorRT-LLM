@@ -592,7 +592,8 @@ def check_pieces(layout: RoleLayoutV2, size: int, ranks: int, rank: int) -> None
 
 @dataclass(frozen=True)
 class RankTopology:
-    """This rank's parallel sizes and ranks, as native RankInfo carries them.
+    """This rank's parallel sizes and ranks, as native RankInfo carries them; a RankInfo gives
+    its own (``RankInfo.topology``).
 
     Attributes:
         tp_size: Positive tensor-parallel group size.
