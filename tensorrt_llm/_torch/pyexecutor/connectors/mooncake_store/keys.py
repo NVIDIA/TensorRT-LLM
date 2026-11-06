@@ -25,7 +25,9 @@ them, the layer group inside that shard, the tokens each page holds and how many
 bytes a page is. A change to any of those reads as a miss rather than as garbage.
 """
 
+import functools
 import hashlib
+import struct
 from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
@@ -123,14 +125,21 @@ class BlockHashChain:
                 f"token list shrank from {len(self._hashes)} to {num_full_blocks} "
                 "full blocks; a hash chain belongs to exactly one request"
             )
-        for ordinal in range(len(self._hashes), num_full_blocks):
-            start = ordinal * self._tokens_per_block
-            block = tokens[start : start + self._tokens_per_block]
-            parent = self._hashes[-1] if self._hashes else self._seed
-            # Fixed-width little-endian token ids: a delimiter-free encoding
-            # would let two different token sequences serialize identically.
-            payload = b"".join(int(token).to_bytes(8, "little", signed=True) for token in block)
-            self._hashes.append(_digest(parent, payload))
+        first = len(self._hashes)
+        if first == num_full_blocks:
+            return self._hashes
+        # Fixed-width little-endian token ids: a delimiter-free encoding would
+        # let two different token sequences serialize identically. The new
+        # blocks are packed in one call and sliced per block, which gives the
+        # same payloads as packing each token, at a fraction of the cost on the
+        # scheduler's path.
+        start, end = first * self._tokens_per_block, num_full_blocks * self._tokens_per_block
+        packed = struct.pack(f"<{end - start}q", *tokens[start:end])
+        step = 8 * self._tokens_per_block
+        parent = self._hashes[-1] if self._hashes else self._seed
+        for offset in range(0, len(packed), step):
+            parent = _digest(parent, packed[offset : offset + step])
+            self._hashes.append(parent)
         return self._hashes
 
 
@@ -149,9 +158,9 @@ class KeyNamespace:
     tokens_per_block: int
     bytes_per_page: int
 
-    @property
+    @functools.cached_property
     def prefix(self) -> str:
-        """The literal string every key in this namespace starts with."""
+        """The literal string every key in this namespace starts with (computed once: a lookup builds thousands)."""
         return (
             f"{self.namespace}/{self.model_key}"
             f"/w{self.world_size}r{self.rank}"

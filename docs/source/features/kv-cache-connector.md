@@ -193,13 +193,14 @@ following configuration limits at bring-up.
 
 | Configuration | Mechanism |
 |---|---|
-| Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. |
+| Speculative decoding | Rejected draft tokens shrink a request's page list, and the freed slot goes to whichever request allocates next. The connector is never told the tail block moved. `mooncake-store` is exempt: under a drafter it saves only prompt blocks, which are filled before the first draft. |
 | A capacity scheduler policy other than `GUARANTEED_NO_EVICT` with KV cache manager V1 | V1 does not reset the connector block delta when a request is destroyed and replayed. V2 resets that state and permits replay; an active connector load retains its allocation until completion. |
 | A host or disk cache tier | Tier eviction reassigns the GPU slot. See [KV cache tiers are GPU-only under a connector](#kv-cache-tiers-are-gpu-only-under-a-connector). |
 
 The exact set the runtime refuses depends on your cache configuration; the bring-up error is
 authoritative. Speculative decoding is unsupported with a connector wherever it is not refused —
-the same page-list shrink happens there.
+the same page-list shrink happens there — except with `mooncake-store`, which saves only prompt
+blocks while drafts are on.
 
 ##### `RequestData` fields that may not be populated
 
@@ -487,12 +488,38 @@ settings. A `capacity` server keeps both as configured.
 Checked at startup, before any request is admitted, because each one's failure mode is KV replayed
 without all of the state it was computed with — a wrong answer rather than a slow one.
 
-Beyond beam search, attention data parallelism, speculative decoding and Mamba/hybrid models, which
-are rejected for [every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector),
-this one also rejects KV cache manager V1, context parallelism, pipeline parallelism,
-sliding-window attention, and `sparse_attention_config` with an index-V cache unless
-`sparse_disable_index_value=True`; it bypasses individual requests that carry a LoRA adapter or
-multimodal content without hashes, leaving the rest of the deployment served.
+Beyond beam search, attention data parallelism and Mamba/hybrid models, which are rejected for
+[every connector](#a-page-slot-must-not-be-reassigned-underneath-the-connector), this one also
+rejects KV cache manager V1, context parallelism, pipeline parallelism, and
+`sparse_attention_config` with an index-V cache unless `sparse_disable_index_value=True`; it
+bypasses individual requests that carry a LoRA adapter or multimodal content without hashes,
+leaving the rest of the deployment served. Speculative decoding is accepted: only prompt blocks
+are saved while drafts are on.
+
+With sliding-window layers it also rejects `kv_cache_config.enable_swa_scratch_reuse`, a nonzero
+`speculative_config.context_recompute_tail`, and `scheduler_config.enable_prefix_aware_scheduling=False`.
+Each would let it save or load a window page it never verified.
+
+### Sliding-window layers
+
+A sliding-window group keeps only the blocks its window still reads, so the connector saves its
+pages once per prompt, in the prompt's last chunk: the window's sinks and tail at the prompt end.
+That is where the next turn of a conversation resumes. A lookup takes the longest full-attention
+hit, then walks back up to `block_reuse_config.swa_endpoint_rewind_tokens` for a prompt end whose
+window is complete in the pool. With none found, it looks further back for the latest earlier end
+that has one. A stored prefix is loaded through a prefix reservation: the request waits outside
+the batch while loader threads move its pages, and the server keeps computing the others.
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TRTLLM_MOONCAKE_STORE_LOAD_THREADS` | `2` | Loader threads per loading rank. Each pins its own staging pool, which the node memory check counts. |
+| `TRTLLM_MOONCAKE_STORE_SYNC_LOAD` | `0` | `1` loads reserved prefixes synchronously in the executor's step and starts no loader threads. |
+| `TRTLLM_MOONCAKE_STORE_PROBE_CHUNK` | `4096` | Keys per existence-probe call; longer probes go out as concurrent chunks. `0` sends one call. |
+| `TRTLLM_MOONCAKE_STORE_WINDOW_FALLBACK` | `1` | `0` reports a miss when no window is stored within the rewind, instead of looking further back. |
+| `TRTLLM_MOONCAKE_STORE_WINDOW_FIRST` | `1` | `0` queues a prompt's full-attention blocks for saving before its window pages. |
+| `TRTLLM_MOONCAKE_STORE_RESAVE_MIN_TOKENS` | `0` | A prompt that computed at least this many tokens lists its full-attention blocks again at its last chunk. This refreshes the chain's head in the pool and rewrites blocks evicted during a long prefill. `0` turns it off. |
 
 ### How pages reach the pool
 

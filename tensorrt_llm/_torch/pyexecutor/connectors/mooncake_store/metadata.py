@@ -23,7 +23,7 @@ each worker prefixes its own rank namespace, so one broadcast serves all shards.
 from dataclasses import dataclass, field
 from typing import List
 
-__all__ = ["MooncakeStoreMetadata", "PageTransfer", "RequestTransfers"]
+__all__ = ["MooncakeStoreMetadata", "PageTransfer", "PrefixLoadTransfers", "RequestTransfers"]
 
 
 @dataclass
@@ -51,12 +51,27 @@ class RequestTransfers:
 
 
 @dataclass
+class PrefixLoadTransfers:
+    """The pages of one confirmed prefix reservation.
+
+    Reported back through `get_finished_prefix_loads` once they are on the
+    device. An asynchronous one is moved off the executor thread while its
+    request waits outside the batch.
+    """
+
+    reservation_id: int
+    is_async: bool
+    transfers: RequestTransfers
+
+
+@dataclass
 class MooncakeStoreMetadata:
     """Loads to perform before the next forward pass, saves to start after it."""
 
     loads: List[RequestTransfers] = field(default_factory=list)
     saves: List[RequestTransfers] = field(default_factory=list)
+    prefix_loads: List[PrefixLoadTransfers] = field(default_factory=list)
 
     def __bool__(self) -> bool:
         """Whether there is any work at all this iteration."""
-        return bool(self.loads or self.saves)
+        return bool(self.loads or self.saves or self.prefix_loads)

@@ -165,6 +165,10 @@ class KvCacheLayerGroupLayout:
     #: Attention window for this group, or None for full attention.
     window_size: Optional[int]
     regions: Tuple[KvCacheRegion, ...]
+    #: Leading tokens a sliding window keeps however far it has moved, or None.
+    #: With ``window_size`` it fixes which blocks the group still reads: the
+    #: same ``AttnLifeCycle`` the cache masks stale pages with.
+    num_sink_tokens: Optional[int] = None
 
     @property
     def bytes_per_page(self) -> int:
@@ -254,6 +258,11 @@ def _window_size(init_config, local_layer_id: int) -> Optional[int]:
     return None if window is None else int(window)
 
 
+def _num_sink_tokens(init_config, local_layer_id: int) -> Optional[int]:
+    sinks = getattr(init_config.layers[local_layer_id], "num_sink_tokens", None)
+    return None if sinks is None else int(sinks)
+
+
 def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
     """Describe the cache's page regions for a KV connector.
 
@@ -318,6 +327,7 @@ def build_kv_cache_layout_v2(manager: "KVCacheManagerV2") -> KvCacheLayout:
                 layer_ids=tuple(global_by_local[lid] for lid in local_layer_ids),
                 window_size=_window_size(init_config, local_layer_ids[0]),
                 regions=tuple(regions),
+                num_sink_tokens=_num_sink_tokens(init_config, local_layer_ids[0]),
             )
         )
 
