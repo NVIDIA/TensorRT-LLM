@@ -10900,7 +10900,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         f"{self.__class__.kernel_class.__name__} supports "
                         f"tile_size 128 and 256 only, but got {self.tile_size}")
 
-            def unique_id(self):
+            def unique_id(self) -> Tuple[int, int, int, int, int, float]:
                 return (
                     self.num_experts,
                     self.top_k,
@@ -10927,7 +10927,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
 
             @staticmethod
-            def _normalize_tactic(tactic) -> Tuple:
+            def _normalize_tactic(tactic: Tuple) -> Tuple:
                 (mma_tiler, mma_inst_shape, cluster_shape_mn, scheduler,
                  stream_weights, fc1_prefetch, fc2_prefetch,
                  sparse_gather) = tactic
@@ -11141,23 +11141,23 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 fc2_scheduler_counter = workspace[ready_words + 32:ready_words +
                                                   33]
 
-                def _e4m3_ptr(t):
+                def _e4m3_ptr(t: torch.Tensor) -> cute.Pointer:
                     return _bw_make_ptr(cutlass.Float8E4M3FN,
                                         t.data_ptr(),
                                         cute.AddressSpace.gmem,
                                         assumed_align=16)
 
-                def _ue8m0_ptr(t):
+                def _ue8m0_ptr(t: torch.Tensor) -> cute.Pointer:
                     return _bw_make_ptr(cutlass.Float8E8M0FNU,
                                         t.data_ptr(),
                                         cute.AddressSpace.gmem,
                                         assumed_align=16)
 
-                def _f32_ptr(t):
+                def _f32_ptr(t: torch.Tensor) -> cute.Pointer:
                     return _bw_make_ptr(cutlass.Float32, t.data_ptr(),
                                         cute.AddressSpace.gmem)
 
-                def _i32_ptr(t):
+                def _i32_ptr(t: torch.Tensor) -> cute.Pointer:
                     return _bw_make_ptr(cutlass.Int32, t.data_ptr(),
                                         cute.AddressSpace.gmem)
 
@@ -11449,6 +11449,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
             tuner_key: str,
             zero_output: bool = False,
         ) -> None:
+            _validate_mxfp8_fused_fc12_op_inputs(
+                {
+                    "input": input,
+                    "input_scale": input_scale,
+                    "fc1_weight": fc1_weight,
+                    "fc1_weight_scale": fc1_weight_scale,
+                    "fc2_weight": fc2_weight,
+                    "fc2_weight_scale": fc2_weight_scale,
+                    "output": output,
+                },
+                {
+                    "fc1_alpha": fc1_alpha,
+                    "fc2_alpha": fc2_alpha,
+                    "fc1_norm_const": fc1_norm_const,
+                    "tile_idx_to_group_idx": tile_idx_to_group_idx,
+                    "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+                    "permuted_idx_to_expanded_idx":
+                    permuted_idx_to_expanded_idx,
+                    "num_non_exiting_tiles": num_non_exiting_tiles,
+                    "token_final_scales": token_final_scales,
+                },
+                input,
+                fc1_weight,
+                output,
+                token_final_scales,
+                top_k,
+                Sm100Mxfp8FusedFc12MoeRunner.fc1_k_alignment,
+            )
             # The Blackwell kernel's workspace reset neither clears the
             # output nor quantizes the input (both are fused on Rubin), so
             # honour the shared op contract with separate launches here.
@@ -11538,6 +11566,36 @@ if IS_CUTLASS_DSL_AVAILABLE:
             shape and is never read or modified. Unlike Rubin, both happen
             in separate launches ahead of the fused kernel. A negative
             ``swiglu_limit`` disables the SwiGLU clamp.
+
+            With ``M`` input rows, ``T`` output tokens, ``K`` the hidden size
+            (a multiple of 512), ``N`` the per-expert intermediate size,
+            ``L`` local experts and ``P`` permuted rows (a multiple of
+            ``tile_size``), every tensor is contiguous and row-major:
+
+            - ``input``: ``[M, K]`` float8_e4m3fn, or bfloat16/float16 to be
+              quantized; 16-byte aligned.
+            - ``input_scale``: ``[M, K // 32]`` uint8 (UE8M0), linear layout.
+            - ``fc1_weight``: ``[L, 2N, K]`` float8_e4m3fn, gate/up
+              interleaved at granularity 64.
+            - ``fc1_weight_scale``: ``[L, 2N, K // 32]`` uint8 (UE8M0), 128x4
+              swizzled.
+            - ``fc1_alpha``, ``fc2_alpha``: ``[L]`` float32.
+            - ``tile_idx_to_group_idx``, ``tile_idx_to_mn_limit``:
+              ``[P // tile_size]`` int32, from ``moe_sort``.
+            - ``permuted_idx_to_expanded_idx``: ``[P]`` int32.
+            - ``num_non_exiting_tiles``: ``[1]`` int32.
+            - ``fc1_norm_const``: ``[1]`` float32.
+            - ``fc2_weight``: ``[L, K, N]`` float8_e4m3fn.
+            - ``fc2_weight_scale``: ``[L, K, N // 32]`` uint8 (UE8M0), 128x4
+              swizzled.
+            - ``output``: ``[T, K]`` bfloat16, 16-byte aligned; written in
+              place.
+            - ``token_final_scales``: ``[T, top_k]`` float32.
+
+            Raises:
+                ValueError: if a tensor is not contiguous, an FP8, scale or
+                    output tensor is not 16-byte aligned, or the input, FC1
+                    weight, output or routing-scale shapes disagree.
             """
             _run_mxfp8_fused_fc12_moe_blackwell(
                 input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,

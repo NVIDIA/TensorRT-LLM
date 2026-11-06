@@ -15,6 +15,7 @@
 
 from contextlib import contextmanager
 from types import SimpleNamespace
+from typing import Callable
 
 import pytest
 import torch
@@ -5823,8 +5824,12 @@ _MXFP8_FUSED_FC12_CASES = [
 
 
 @pytest.mark.skipif(
-    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
-    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+    not (
+        (get_sm_version() == 107 and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE)
+        or (get_sm_version() in (100, 103) and IS_CUTLASS_DSL_MXFP8_FUSED_FC12_BLACKWELL_AVAILABLE)
+    ),
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) or data-center Blackwell (SM100/SM103) "
+    "with a CuTe DSL build that supports the fused FC12 kernel",
 )
 def test_moe_module_mxfp8_chunked_forward_with_aux_stream():
     """A layer whose ``moe_max_num_tokens`` is below the batch gets an aux
@@ -6007,8 +6012,8 @@ def test_mxfp8_fused_fc12_moe_blackwell(
 
 
 def _run_mxfp8_fused_fc12_moe_case(
-    fused_op,
-    runner_cls,
+    fused_op: Callable[..., None],
+    runner_cls: type,
     num_tokens: int,
     top_k: int,
     ep_size: int,
@@ -6017,7 +6022,7 @@ def _run_mxfp8_fused_fc12_moe_case(
     num_experts: int,
     tile_size: int,
     swiglu_limit: float,
-):
+) -> None:
     """End-to-end check of a fused MXFP8 FC1+FC2 MoE op against a float oracle.
 
     Exercises the full adapter contract: linear per-token activation scales,

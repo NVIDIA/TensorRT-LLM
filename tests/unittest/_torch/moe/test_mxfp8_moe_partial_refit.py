@@ -423,3 +423,41 @@ def test_mxfp8_cutedsl_interleave_pending_slots_drained_after_finalize():
     torch.cuda.synchronize()
     assert not backend._cute_dsl_mxfp8_w3_w1_interleave_pending
     assert not backend._mxfp8_w3_w1_sf_pending_slots
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "rebuilt, cleared",
+    [
+        ({"w3_w1_weight"}, {"pending", "weight"}),
+        ({"w3_w1_weight_scale"}, {"scale"}),
+        ({"w3_w1_weight", "w3_w1_weight_scale"}, {"pending", "weight", "scale"}),
+        ({"w2_weight"}, set()),
+    ],
+    ids=["fc1_weight", "fc1_scale", "both", "fc2_only"],
+)
+def test_mxfp8_cutedsl_pre_reload_resets_interleave_state_of_rebuilt_fc1(
+    rebuilt: set, cleared: set, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recreated FC1 parameter holds no slot in the CuTe DSL interleaved
+    layout, so ``pre_reload_weights`` must forget its interleave state, and
+    only its own: a parameter left in place keeps its slots' layout for a
+    partial refit to build on."""
+    monkeypatch.setattr(
+        MXFP8CuteDslFusedMoEMethod.__mro__[1], "pre_reload_weights", lambda self, module: None
+    )
+    module = torch.nn.Module()
+    module.rebuild_tensor_metadata = {name: None for name in rebuilt}
+    module._cute_dsl_mxfp8_w3_w1_interleave_pending = {0, 1}
+    module._cute_dsl_mxfp8_w3_w1_weight_interleaved = {0, 1, 2}
+    module._cute_dsl_mxfp8_w3_w1_scale_interleaved = {0, 1, 2}
+
+    MXFP8CuteDslFusedMoEMethod.__new__(MXFP8CuteDslFusedMoEMethod).pre_reload_weights(module)
+
+    sets = {
+        "pending": module._cute_dsl_mxfp8_w3_w1_interleave_pending,
+        "weight": module._cute_dsl_mxfp8_w3_w1_weight_interleaved,
+        "scale": module._cute_dsl_mxfp8_w3_w1_scale_interleaved,
+    }
+    for name, slots in sets.items():
+        assert (not slots) is (name in cleared), f"{name}: {slots}"
