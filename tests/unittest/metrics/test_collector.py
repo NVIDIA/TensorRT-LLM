@@ -309,6 +309,7 @@ class TestAttentionDpIterationMetrics:
     def test_rank0_owned_fields_are_not_overwritten_or_counted_twice(
         self, collector: MetricsCollector
     ) -> None:
+        """Keep shared gauges and counters unchanged by copied rank-1 statistics."""
         collector.log_iteration_stats({**SAMPLE_ITERATION_STATS, "attentionDpRank": 0})
         collector.log_iteration_stats(
             {
@@ -434,6 +435,7 @@ class TestSpecDecodingStats:
     """Test speculative decoding stats are correctly exposed."""
 
     def test_verification_rounds_support_aggregate_acceptance_length(self, collector):
+        """Accumulate rounds to compute a round-weighted acceptance length."""
         assert (
             REGISTRY.get_sample_value("trtllm_spec_decode_num_drafts_total", collector.labels) == 0
         )
@@ -455,6 +457,7 @@ class TestSpecDecodingStats:
         assert 1 + accepted / rounds == pytest.approx(1 + 11 / 6)
 
     def test_rejected_drafts_expose_zero_acceptance(self, collector):
+        """Expose zero accepted tokens so all-rejected rounds have length one."""
         for metric_name in (
             "trtllm_spec_decode_num_draft_tokens_total",
             "trtllm_spec_decode_num_accepted_tokens_total",

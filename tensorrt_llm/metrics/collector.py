@@ -169,6 +169,31 @@ class MetricsCollector:
         registry: "Optional[CollectorRegistry]" = None,
         gauge_multiprocess_mode: str = "all",
     ) -> None:
+        """Register request and iteration metrics for one serving label set.
+
+        Args:
+            labels: Metadata attached to every metric produced by this collector.
+            e2e_request_latency_buckets: End-to-end latency upper bounds in seconds.
+                None selects the default buckets.
+            time_to_first_token_buckets: First-token latency upper bounds in seconds.
+                None selects the default buckets.
+            time_per_output_token_buckets: Per-token latency upper bounds in seconds.
+                None selects the default buckets.
+            request_queue_time_buckets: Queue-time upper bounds in seconds.
+                None selects the default buckets.
+            request_prefill_time_buckets: Prefill-time upper bounds in seconds.
+                None selects the default buckets.
+            request_decode_time_buckets: Decode-time upper bounds in seconds.
+                None selects the default buckets.
+            request_inference_time_buckets: Inference-time upper bounds in seconds.
+                None selects the default buckets.
+            registry: Destination registry, or None for the default registry.
+            gauge_multiprocess_mode: Prometheus multiprocess aggregation mode
+                applied to gauges.
+
+        Raises:
+            ValueError: A supplied bucket list is empty or not strictly increasing.
+        """
         from prometheus_client import REGISTRY, Counter, Gauge, Histogram
         self._registry = REGISTRY if registry is None else registry
         self._gauge_multiprocess_mode = gauge_multiprocess_mode
