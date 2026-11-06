@@ -19,6 +19,7 @@ These tests exercise the pure-async coalescing logic with an injected, synchrono
 
 import pytest
 
+from tensorrt_llm.executor.utils import is_context_length_exceeded_message
 from tensorrt_llm.serve.encode_batcher import EncodeBatcher
 
 pytestmark = pytest.mark.asyncio
@@ -325,8 +326,9 @@ async def test_submit_rejects_single_input_over_token_budget():
     await batcher.start()
     try:
         # 5 tokens > max_num_tokens=4, even alone.
-        with pytest.raises(InputTooLongError):
+        with pytest.raises(InputTooLongError) as raised:
             batcher.validate_input([1, 2, 3, 4, 5])
+        assert is_context_length_exceeded_message(str(raised.value))
         with pytest.raises(InputTooLongError):
             await batcher.submit([1, 2, 3, 4, 5])
         # A within-budget request still succeeds.

@@ -154,6 +154,15 @@ def context_length_exceeded_message(max_context_length: int,
         "Please reduce the length of the messages.")
 
 
+def check_prompt_capacity(num_prompt_tokens: int, max_prompt_len: int) -> None:
+    """Raise ValueError with the context-length message for a prompt longer than max_prompt_len."""
+    if num_prompt_tokens > max_prompt_len:
+        raise ValueError(
+            context_length_exceeded_message(
+                max_context_length=max_prompt_len,
+                num_prompt_tokens=num_prompt_tokens))
+
+
 _CONTEXT_LENGTH_EXCEEDED_RE = re.compile(
     r"This model's maximum context length is \d+ tokens\. "
     r"However, your messages resulted in \d+ tokens\.")

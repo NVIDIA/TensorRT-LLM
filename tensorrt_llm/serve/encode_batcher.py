@@ -17,12 +17,14 @@ Coalesces independent concurrent requests into a single batched `encode_fn` call
 mirroring NVIDIA Triton Inference Server's dynamic batcher: a configurable hold
 window (`max_queue_delay`) and a maximum batch size, with a token budget and queue
 backpressure. The actual model forward is injected as `encode_fn` so this module
-carries no TensorRT-LLM / torch dependencies and is unit-testable on CPU.
+is unit-testable on CPU.
 """
 
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional
+
+from tensorrt_llm.executor.utils import check_prompt_capacity
 
 # encode_fn maps a batch (list of token-id lists) to a list of per-item results,
 # in the same order as the input.
@@ -76,6 +78,10 @@ class EncodeBatcher:
         self._max_queue_delay = max_queue_delay
         self._max_num_tokens = max_num_tokens
         self._max_seq_len = max_seq_len
+        # The longest single input; None when neither limit is set.
+        self._max_input_len = min(
+            (limit for limit in (max_seq_len, max_num_tokens) if limit is not None), default=None
+        )
         self._queue: "asyncio.Queue[_QueuedRequest]" = asyncio.Queue(maxsize=max_queue_size)
         self._worker: Optional[asyncio.Task] = None
 
@@ -100,14 +106,12 @@ class EncodeBatcher:
         `encode_fn` reject the formed batch. Callers may invoke this before
         submitting a group of inputs so an oversize item fails fast.
         """
-        if self._max_seq_len is not None and len(token_ids) > self._max_seq_len:
-            raise InputTooLongError(
-                f"Input length ({len(token_ids)}) exceeds max_seq_len ({self._max_seq_len})."
-            )
-        if self._max_num_tokens is not None and len(token_ids) > self._max_num_tokens:
-            raise InputTooLongError(
-                f"Input length ({len(token_ids)}) exceeds max_num_tokens ({self._max_num_tokens})."
-            )
+        if self._max_input_len is None:
+            return
+        try:
+            check_prompt_capacity(len(token_ids), self._max_input_len)
+        except ValueError as error:
+            raise InputTooLongError(str(error)) from error
 
     async def submit(self, token_ids: List[int]) -> Any:
         """Enqueue one input and await its encoded result.
