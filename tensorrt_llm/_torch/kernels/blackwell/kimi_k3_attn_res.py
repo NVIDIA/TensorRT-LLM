@@ -722,8 +722,14 @@ class KimiK3AttnResKernel:
         if cutlass.const_expr(not self.early_poll and not self.snapshots_after_wait):
             wait_and_release()
 
+        # The prefix sum is older than the previous grid: its load is issued before the slot
+        # polls and lands while they spin (before the grid wait only with early_poll).
+        prefix = []
+        if cutlass.const_expr(self.add_mode != ADD_NONE):
+            prefix = load(layer_addr + row + col, False)
         state = None
         finished = []
+        arrivals = Int32(0)
         if cutlass.const_expr(self.finish_world > 0):
             # This kernel finishes the pushed call: the state is this call's (its producer read it
             # after its own wait), the previous call's buffer is re-armed while the rows travel.
@@ -758,8 +764,14 @@ class KimiK3AttnResKernel:
                 )
                 finished = pushed_ar.round_sum_v4(acc, self.finish_sanitize)
             finished = [_selp_b32(valid, w, Int32(0)) for w in finished]
+            # Every thread of this CTA has read the state (its polls used it): count the CTA
+            # now with a relaxed atomic whose result thread 0 reads only after its stores, so the
+            # round trip overlaps the mix; the last CTA advances the state after the grid wait.
+            cute.arch.barrier()
+            if tidx == 0:
+                arrivals = pushed_ar.arrive_count(add2_addr)
         if cutlass.const_expr(self.add_mode == ADD_PREFIX):
-            pre = unpack(load(layer_addr + row + col, False))
+            pre = unpack(prefix)
             if cutlass.const_expr(self.finish_world > 0):
                 addend = unpack(finished)
             elif cutlass.const_expr(self.in_place_addend):
@@ -771,7 +783,7 @@ class KimiK3AttnResKernel:
                 addend = unpack(load(add_addr + row + col, False))
             x = [_round_bf16(_add_ftz(pre[e], addend[e])) for e in range(8)]
         elif cutlass.const_expr(self.add_mode == ADD_MOE):
-            pre = unpack(load(layer_addr + row + col, False))
+            pre = unpack(prefix)
             if cutlass.const_expr(self.finish_all_gather):
                 # routed: this token's all-gather row; shared: the finished slot sum.
                 routed_words = pushed_ar.poll_v4(
@@ -865,12 +877,12 @@ class KimiK3AttnResKernel:
             sf_off = sf_off + Int64((token & 31) * 16 + ((token & 127) >> 5) * 4) + (group & 3)
             _stg_u8_if(valid & Int32((tidx & 3) == 0), xs_addr + sf_off, e_a)
         if cutlass.const_expr(self.finish_world > 0):
-            # Every thread has read the state and the producer has completed (the wait above):
-            # the last CTA to count advances the workspace.
-            cute.arch.barrier()
+            # The producer has completed (the wait above): the last CTA to count advances the
+            # workspace.
             if tidx == 0:
-                pushed_ar.arrive_finish(
+                pushed_ar.arrive_rotate(
                     add2_addr,
+                    arrivals,
                     m * c,
                     state[0],
                     state[2],

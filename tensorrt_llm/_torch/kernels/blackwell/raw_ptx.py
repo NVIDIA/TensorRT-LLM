@@ -372,6 +372,16 @@ def atom_add_acq_rel_u32(addr, value, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def atom_add_relaxed_u32(addr, value, *, loc=None, ip=None):
+    """Relaxed GPU-scope ``atomicAdd``; returns the old value (the thread stalls only where it
+    reads it)."""
+    return Int32(
+        asm(T.i32(), [lv(addr, loc=loc, ip=ip), iv(value, loc=loc, ip=ip)],
+            "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;", "=r,l,r", loc=loc, ip=ip)
+    )  # fmt: skip
+
+
+@dsl_user_op
 def red_release_add(addr, value, *, loc=None, ip=None):
     """Release GPU-scope reduction add (no return value)."""
     asm(None, [lv(addr, loc=loc, ip=ip), iv(value, loc=loc, ip=ip)],

@@ -1061,7 +1061,7 @@ class MnnvlPendingResult(MnnvlWorkspaceResult):
     * a consumer kernel that finishes the call (``kimi_k3_attn_res`` with an
       ``AllReduceFinish`` from ``finish_args``; the device side is
       ``mnnvl_pushed_allreduce.reduce_slots_v4`` / ``finish_two_shot_v4`` /
-      ``clear_dirty_stages`` / ``arrive_finish``), or
+      ``clear_dirty_stages`` / ``arrive_count`` + ``arrive_rotate``), or
     * ``materialize``, the finish kernel into a tensor.
 
     Either reads the rotation state before waiting for the producer, which releases its

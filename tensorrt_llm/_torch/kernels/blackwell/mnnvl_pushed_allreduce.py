@@ -44,8 +44,9 @@ A consumer kernel may also finish a call itself (its finish is then left pending
 rotation state, sums the slots of its rows with :func:`reduce_slots_v4` (one-shot) or
 :func:`finish_two_shot_v4` (two-shot: the owner reduces and multicasts its rows, the others poll
 them), re-arms the previous call's buffer with :func:`clear_dirty_stages` and counts its CTAs with
-:func:`arrive_finish`, whose last arrival advances the state. The sums and the state are the
-finish kernel's, so the consumer reads the bits the finish kernel would have stored.
+:func:`arrive_finish` (or :func:`arrive_count` once its polls are done and :func:`arrive_rotate`
+after its grid wait), whose last arrival advances the state. The sums and the state are the finish
+kernel's, so the consumer reads the bits the finish kernel would have stored.
 :class:`PushedAllReduceCopyKernel` pushes a tensor for a producer without a push epilogue.
 
 An all-gather call (one-shot) carries, after its ``W`` slots per row, one all-gather row per token
@@ -83,6 +84,7 @@ from .raw_ptx import acc_bf16x2 as _acc_bf16x2
 from .raw_ptx import add_f32 as _add_f32
 from .raw_ptx import asm as _asm
 from .raw_ptx import atom_add_acq_rel_u32 as _atom_add_acq_rel_u32
+from .raw_ptx import atom_add_relaxed_u32 as _atom_add_relaxed_u32
 from .raw_ptx import iv as _iv
 from .raw_ptx import ld_acquire_u32 as _ld_acquire_u32
 from .raw_ptx import ld_nc_u64 as _ld_nc_u64
@@ -391,11 +393,37 @@ def arrive_finish(
     thread per CTA, once every thread of the CTA has read the state and the call's producer has
     completed); the last CTA writes the next call's state and resets the counter, as
     :class:`PushedAllReduceFinishKernel`'s updater does."""
-    arrivals = flags + Int64(FLAG_ARRIVALS * 4)
-    old = _atom_add_acq_rel_u32(arrivals, Int32(1))
+    old = _atom_add_acq_rel_u32(flags + Int64(FLAG_ARRIVALS * 4), Int32(1))
+    arrive_rotate(flags, old, total, cur, nbytes, m, world, hidden, one_shot, all_gather)
+
+
+@cute.jit
+def arrive_count(flags: Int64):
+    """The counting half of :func:`arrive_finish` for a consumer that counts its CTA before its
+    grid wait (one thread per CTA, once every thread of the CTA has read the state): a relaxed
+    atomic whose result only :func:`arrive_rotate` reads, so the thread does not stall on it."""
+    return _atom_add_relaxed_u32(flags + Int64(FLAG_ARRIVALS * 4), Int32(1))
+
+
+@cute.jit
+def arrive_rotate(
+    flags: Int64,
+    old: Int32,
+    total: Int32,
+    cur: Int32,
+    nbytes: Int32,
+    m: Int32,
+    world: int,
+    hidden: int,
+    one_shot: bool,
+    all_gather: bool = False,
+):
+    """The rotation half of :func:`arrive_finish`: the CTA whose count ``old`` was the last of
+    ``total`` writes the next call's state and resets the counter. Only after the call's
+    producer has completed (the caller has passed ``griddepcontrol.wait``)."""
     if old == total - 1:
         _write_next_state(flags, cur, nbytes, m, world, hidden, one_shot, all_gather)
-        _st_u32(arrivals, Int32(0))
+        _st_u32(flags + Int64(FLAG_ARRIVALS * 4), Int32(0))
 
 
 @cute.jit
@@ -913,7 +941,9 @@ __all__ = [
     "add_bf16x8",
     "all_gather_call_bytes",
     "all_gather_row",
+    "arrive_count",
     "arrive_finish",
+    "arrive_rotate",
     "arrived_v4",
     "check_transport",
     "clear_dirty_stages",

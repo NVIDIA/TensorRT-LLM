@@ -895,7 +895,7 @@ def test_one_shot_finish_sums_rank_chunks(world):
 
 
 @skip_pre_blackwell
-@pytest.mark.parametrize("world, m", [(4, 3), (16, 2)])
+@pytest.mark.parametrize("world, m", [(4, 3), (16, 2), (16, 8)])
 @pytest.mark.parametrize("cpp_one_shot", [True, False])
 def test_all_gather_call_finish_on_one_gpu(world, m, cpp_one_shot):
     """An all-gather call finished by the finish kernel (``bf16(y + bf16(sum))``) and by the
@@ -991,7 +991,7 @@ def test_all_gather_call_finish_on_one_gpu(world, m, cpp_one_shot):
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("early_poll", [False, True])
-@pytest.mark.parametrize("world, m", [(2, 1), (8, 5), (16, 3), (64, 1)])
+@pytest.mark.parametrize("world, m", [(2, 1), (8, 5), (16, 3), (16, 8), (64, 1)])
 def test_attn_res_finishes_one_shot_call(world, m, early_poll):
     """The decode attention-residual mix finishing a pushed one-shot call (sums in the C++ order,
     chunks of eight ranks above eight) against the mix of the finished all-reduce, on one GPU:
@@ -1009,7 +1009,9 @@ def test_attn_res_finishes_one_shot_call(world, m, early_poll):
     if not attn_res.is_supported_device(torch.cuda.current_device()):
         pytest.skip("the decode attention-residual kernel does not run on this GPU")
     h, k = 7168, 3
-    one_shot, nbytes = mnnvl_allreduce_transport(m, h, world, torch.bfloat16)
+    # One-shot up to 2 MiB (TLLM_MNNVL_ONESHOT_THRESHOLD_BYTES of the min-latency deployments):
+    # 8 rows over 16 ranks, one decode step of one request with 7 draft tokens.
+    one_shot, nbytes = mnnvl_allreduce_transport(m, h, world, torch.bfloat16, 2 << 20)
     assert one_shot
     nbytes = max(nbytes, 1 << 16)
     workspace = torch.zeros(pushed.NUM_BUFFERS * nbytes, dtype=torch.uint8, device="cuda")
