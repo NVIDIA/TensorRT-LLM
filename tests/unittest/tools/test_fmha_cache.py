@@ -59,15 +59,17 @@ _FMHA = _load_fmha_module()
 
 @pytest.mark.parametrize("ccache_available", [False, True])
 @pytest.mark.parametrize("inherited_value", [None, "0", "1"])
+@pytest.mark.parametrize("sm_version", [80, 90])
 def test_fmha_selects_ccache_without_overriding_user_setting(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     ccache_available: bool,
     inherited_value: str | None,
+    sm_version: int,
 ) -> None:
     """Pass the selected ccache setting to every FMHA build invocation."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(_FMHA, "get_sm_version", lambda: 90)
+    monkeypatch.setattr(_FMHA, "get_sm_version", lambda: sm_version)
     monkeypatch.setattr(
         _FMHA,
         "which",
@@ -88,14 +90,15 @@ def test_fmha_selects_ccache_without_overriding_user_setting(
     ) -> None:
         assert shell
         assert check
-        if command != "rm -rf generated temp obj .pytest_cache __pycache__ bin cubin":
-            assert env is not None
-            build_environments.append(env)
+        if env is not None:
+            build_environments.append(env.copy())
 
     monkeypatch.setattr(_FMHA, "run", run)
     _FMHA.test_fmha()
 
     expected = inherited_value or ("1" if ccache_available else None)
-    assert len(build_environments) == 3
+    assert len(build_environments) == (7 if sm_version == 80 else 3)
+    expected_architectures = {80, 100, 120} if sm_version == 80 else {90}
+    assert {int(env["FMHA_FILTER_ARCH"]) for env in build_environments} == expected_architectures
     for env in build_environments:
         assert env.get("USE_CCACHE") == expected
