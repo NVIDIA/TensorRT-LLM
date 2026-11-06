@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 338" width="1000" height="338" role="img" aria-label="HBM of one context GPU with and without dense DWDP">
+<defs><marker id="ah" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#4f5d75"/></marker><marker id="ahg" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,1 L8,5 L0,9 Z" fill="#3f6600"/></marker></defs>
+<rect width="1000" height="338" fill="#f5f5f5"/>
+<rect x="300.0" y="17.0" width="14.0" height="14.0" rx="2" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="320.0" y="29.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#4f5d75" text-anchor="start">Weights, prefetch buffers and activations</text>
+<rect x="630.0" y="17.0" width="14.0" height="14.0" rx="2" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="650.0" y="29.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#4f5d75" text-anchor="start">KV cache</text>
+<rect x="750.0" y="17.0" width="14.0" height="14.0" rx="2" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="770.0" y="29.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="400" fill="#4f5d75" text-anchor="start">Headroom</text>
+<text x="24.0" y="68.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#4f5d75" text-anchor="start">At the recipe's max_num_tokens</text>
+<text x="288.0" y="102.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="14" font-weight="500" fill="#2d3142" text-anchor="end">Dense DWDP off · 16K tokens</text>
+<rect x="300.0" y="80.0" width="475.5" height="34.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="537.8" y="102.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">198.5</text>
+<rect x="777.5" y="80.0" width="132.7" height="34.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="843.9" y="102.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#1d2b00" text-anchor="middle">KV 56.0</text>
+<rect x="912.3" y="80.0" width="55.7" height="34.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="940.1" y="102.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#4f5d75" text-anchor="middle">24.0</text>
+<text x="288.0" y="148.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="14" font-weight="500" fill="#2d3142" text-anchor="end">Dense DWDP on · 16K tokens</text>
+<rect x="300.0" y="126.0" width="348.8" height="34.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="474.4" y="148.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">145.8</text>
+<rect x="650.8" y="126.0" width="221.7" height="34.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="761.6" y="148.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#1d2b00" text-anchor="middle">KV 93.0</text>
+<rect x="874.5" y="126.0" width="93.7" height="34.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="921.4" y="148.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#4f5d75" text-anchor="middle">39.8</text>
+<text x="24.0" y="176.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#4f5d75" text-anchor="start">At the largest max_num_tokens that fits</text>
+<text x="288.0" y="210.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="14" font-weight="500" fill="#2d3142" text-anchor="end">Dense DWDP off · 24K tokens</text>
+<rect x="300.0" y="188.0" width="489.5" height="34.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="544.7" y="210.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">204.3</text>
+<rect x="791.5" y="188.0" width="114.0" height="34.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="848.5" y="210.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#1d2b00" text-anchor="middle">KV 48.2</text>
+<rect x="907.5" y="188.0" width="60.5" height="34.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="937.7" y="210.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#4f5d75" text-anchor="middle">26.0</text>
+<text x="288.0" y="256.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="14" font-weight="500" fill="#2d3142" text-anchor="end">Dense DWDP on · 32K tokens</text>
+<rect x="300.0" y="234.0" width="376.9" height="34.0" rx="0" fill="#8d99ae" stroke="none" stroke-width="1"/>
+<text x="488.5" y="256.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#ffffff" text-anchor="middle">157.5</text>
+<rect x="678.9" y="234.0" width="202.0" height="34.0" rx="0" fill="#76b900" stroke="none" stroke-width="1"/>
+<text x="779.9" y="256.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#1d2b00" text-anchor="middle">KV 84.8</text>
+<rect x="882.9" y="234.0" width="85.3" height="34.0" rx="0" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="925.6" y="256.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="13" font-weight="600" fill="#4f5d75" text-anchor="middle">36.3</text>
+<line x1="300.0" y1="286.0" x2="970.0" y2="286.0" stroke="#bfc0c0" stroke-width="1"/>
+<line x1="300.0" y1="286.0" x2="300.0" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="300.0" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">0</text>
+<line x1="420.3" y1="286.0" x2="420.3" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="420.3" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">50</text>
+<line x1="540.6" y1="286.0" x2="540.6" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="540.6" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">100</text>
+<line x1="660.9" y1="286.0" x2="660.9" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="660.9" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">150</text>
+<line x1="781.1" y1="286.0" x2="781.1" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="781.1" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">200</text>
+<line x1="901.4" y1="286.0" x2="901.4" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="901.4" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">250</text>
+<line x1="970.0" y1="286.0" x2="970.0" y2="291.0" stroke="#bfc0c0" stroke-width="1"/>
+<text x="970.0" y="306.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">278.5</text>
+<text x="635.0" y="326.0" font-family="Inter, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', sans-serif" font-size="12" font-weight="400" fill="#4f5d75" text-anchor="middle">GiB per GPU (median over 16 ranks)</text>
+</svg>
