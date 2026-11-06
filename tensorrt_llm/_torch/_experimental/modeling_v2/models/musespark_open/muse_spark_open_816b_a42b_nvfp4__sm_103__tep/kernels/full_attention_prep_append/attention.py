@@ -83,7 +83,7 @@ from tensorrt_llm.quantization.mode import QuantMode
 from ... import attention as _target_attention
 from ...attention_forward import PREPROCESS_ARGS, eliding, preprocess_reachable
 from ...dispatch import LAUNCH_PDL
-from ...ops.attention.preattn_prep_append import MAX_REQUESTS, MAX_ROWS, preattn_prep_append
+from ...ops.attention.preattn_prep_append import MAX_ROWS, preattn_prep_append
 
 #: ``PositionEmbeddingType.learned_absolute``: what a layer without RoPE passes; the
 #: append kernel then applies no rotation.
@@ -146,7 +146,7 @@ class FoldedPreprocess:
     quant_mode: int
     bmm1_host: float
     rotary_dim: int
-    #: The step's sequences (``wide_full_attention``: 2..4 of ``rows / requests`` rows each).
+    #: The step's sequences.
     requests: int = 1
     consumed: bool = field(default=False)
     #: Why a preprocess call in this layer's window ran the real op, if one did.
@@ -415,9 +415,6 @@ class FullAppendAttention:
     _prep_append_metadata: Optional[object]
     _prep_append_folded: Optional[FoldedPreprocess]
     _prep_append_census: Optional[FoldCensus] = None
-    #: ``wide_full_attention`` (``install_multi``): fold decode steps of 2..``MAX_REQUESTS``
-    #: generation sequences of equal row count too.
-    _prep_append_multi: bool = False
 
     def forward(self, position_ids, hidden_states, attn_metadata, *args, **kwargs):
         census = self._prep_append_census
@@ -483,26 +480,8 @@ class FullAppendAttention:
         return result
 
     def _prep_append_requests(self, md) -> int:
-        """The sequences of this step the fold takes in one call: 1, or under
-        ``_prep_append_multi`` the 2..``MAX_REQUESTS`` generation sequences of a step whose host
-        ``seq_lens`` are all ``rows / sequences`` (at most ``MAX_ROWS``). Host-side reads only."""
-        if not self._prep_append_multi:
-            return 1
-        n = md.num_seqs
-        rows = md.num_tokens
-        seq_lens = getattr(md, "seq_lens", None)
-        if (
-            not 2 <= n <= MAX_REQUESTS
-            or md.num_generations != n
-            or rows % n
-            or rows // n > MAX_ROWS
-            or seq_lens is None
-            or seq_lens.is_cuda
-            or seq_lens.numel() < n
-            or bool((seq_lens[:n] != rows // n).any())
-        ):
-            return 1
-        return n
+        """The sequences of this step the fold takes in one call: 1."""
+        return 1
 
     def _prep_append_fmha_lib(self):
         """The flashinfer trtllm-gen FMHA library of this layer's FMHA manager, or None."""
@@ -706,31 +685,6 @@ def install(model: torch.nn.Module) -> int:
         f"[musespark_open] full_attention_prep_append: the KV append and FP8 query of {len(full)} "
         "full-attention layers run in the preattn_prep prep on decode steps of one sequence and at most "
         f"{MAX_ROWS} rows; their trtllm-gen generation preprocess launch is skipped"
-    )
-    return len(full)
-
-
-def install_multi(model: torch.nn.Module) -> int:
-    """``wide_full_attention``: the fold also takes decode steps of 2..``MAX_REQUESTS`` sequences.
-
-    Run after ``install``. Sets ``_prep_append_multi`` on every full-attention layer; returns
-    how many.
-
-    Raises:
-        ValueError: if a full-attention layer does not carry the fold (``install``).
-    """
-    full = [layer.self_attn for layer in model.layers if not layer.self_attn.is_sliding]
-    refused = [a.layer_idx for a in full if not isinstance(a, FullAppendAttention)]
-    if refused:
-        raise ValueError(
-            "[musespark_open] wide_full_attention extends full_attention_prep_append, which "
-            f"full-attention layers {refused} do not carry"
-        )
-    for attention in full:
-        attention._prep_append_multi = True
-    logger.info(
-        f"[musespark_open] wide_full_attention: the folded prep of {len(full)} full-attention "
-        f"layers also takes decode steps of 2..{MAX_REQUESTS} sequences of up to {MAX_ROWS} rows"
     )
     return len(full)
 

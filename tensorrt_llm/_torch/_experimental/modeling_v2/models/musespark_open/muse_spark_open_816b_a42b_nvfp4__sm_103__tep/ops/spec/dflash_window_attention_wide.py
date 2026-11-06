@@ -300,27 +300,8 @@ WIDE_GEOMETRY = (
     (64, 64, 2, 4, 3),
 )
 
-
-#: The same sweep on R200 (212 SMs, TP4 rank shape, cold L2, confirm pass in reverse
-#: order): eight-warp programs win at almost every request count; the split count steps
-#: down as the split grid (requests x KV heads x splits) passes about one, then two
-#: waves of the larger device.
-WIDE_GEOMETRY_212_SMS = (
-    (1, 64, 11, 8, 3),
-    (10, 64, 7, 8, 3),
-    (16, 64, 6, 8, 3),
-    (20, 64, 5, 8, 3),
-    (24, 64, 7, 8, 3),
-    (28, 64, 7, 4, 3),
-    (32, 64, 6, 4, 3),
-    (40, 64, 5, 8, 3),
-    (48, 64, 4, 8, 3),
-    (64, 64, 3, 8, 3),
-    (96, 64, 2, 8, 3),
-    (128, 64, 3, 8, 3),
-)
 #: The geometry table per device SM count; a device of another count takes ``WIDE_GEOMETRY``.
-WIDE_GEOMETRY_BY_SMS = {152: WIDE_GEOMETRY, 212: WIDE_GEOMETRY_212_SMS}
+WIDE_GEOMETRY_BY_SMS = {152: WIDE_GEOMETRY}
 
 
 @functools.lru_cache(maxsize=None)
@@ -518,7 +499,7 @@ class DflashWindowAttentionWide(OpWrapper):
     append when ``k_new`` is None.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = (
         "Not bitwise dflash_window_attention or flash_attn_with_kvcache: different split "

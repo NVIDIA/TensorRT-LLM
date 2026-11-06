@@ -115,22 +115,19 @@ class DirectPublish:
     later ``arm`` raises.
 
     ``rows`` are the row counts this publication serves, each on the same workspace: by
-    default ``ROWS``; the wide direct publication (``wide_oproj_publish``) serves
-    ``WIDE_PUBLISH_ROWS`` on the 32-row direct transport. A step of any of them arms every
+    default ``ROWS``. A step of any of them arms every
     layer with that row count's slots, so the parity sequence above holds across steps of
     different row counts too.
     """
 
     #: The one row count the 8-row publication serves: the K = 7 verify step. Other row
-    #: counts keep the post-attention hop, on its own workspace, unless the wide
-    #: publication serves them.
+    #: counts keep the post-attention hop, on its own workspace.
     ROWS = 8
     #: The o_proj kernel families that store straight into the slot, per device compute
     #: capability: the families of that arch's ``post_attn_hop.VALIDATED_PRODUCERS``. The
     #: dense GEMM plan's o_proj kernel at ``ROWS`` must be one of them.
     PRODUCER_FAMILIES = {
         (10, 3): frozenset({"cublas"}),
-        (10, 7): frozenset({"splitk", "direct"}),
     }
 
     def __init__(
@@ -261,10 +258,6 @@ class PostAttnHopCall:
     """What ``DecodeTarget`` holds under ``post_attention_hop``: the op, its workspace and the joins it arms.
 
     With ``attention_output_into_hop``, also the ``DirectPublish`` that steps of its row count arm.
-    With ``wide_post_attention_hop``, also the wide transport (``wide``) that steps of
-    ``MAX_ROWS + 1 .. WIDE_MAX_ROWS`` rows run on. With both and ``wide_oproj_publish``,
-    also the wide ``DirectPublish`` (``wide_direct``) that steps of
-    ``WIDE_PUBLISH_ROWS`` rows arm instead of the wide transport.
     """
 
     def __init__(
@@ -272,23 +265,16 @@ class PostAttnHopCall:
         workspace: "_hop.PostAttnHopWorkspace",
         joins: "tuple[MuseSparkOpenTepPostAttnJoin, ...]" = (),
         direct: Optional[DirectPublish] = None,
-        wide: "Optional[_hop.PostAttnHopWorkspace]" = None,
-        wide_direct: Optional[DirectPublish] = None,
     ) -> None:
         self.op = _hop.post_attn_hop
         self.workspace = workspace
         self.joins = tuple(joins)
         self.direct = direct
-        self.wide = wide
-        self.wide_direct = wide_direct
 
     def publication_for(self, rows: Optional[int]) -> Optional[DirectPublish]:
         """The direct publication a decode step of ``rows`` rows arms, or ``None`` (the hop)."""
         if self.direct is not None and rows == DirectPublish.ROWS:
             return self.direct
-        wide_direct = getattr(self, "wide_direct", None)
-        if wide_direct is not None and wide_direct.serves(rows):
-            return wide_direct
         return None
 
     def takes_call(
@@ -301,8 +287,8 @@ class PostAttnHopCall:
     ) -> bool:
         """Whether the armed hop computes one join call (``post_attn_hop.hop_takes``).
 
-        On the transport of the call's row count (``workspace_for``): the 8-row one, or
-        the wide one above it; a row count with no transport is not taken.
+        On the transport of the call's row count (``workspace_for``): the 8-row one; a
+        row count with no transport is not taken.
         """
         rows = partial.shape[0] if partial.ndim == 2 else 0
         workspace = self.workspace_for(rows)
@@ -315,13 +301,11 @@ class PostAttnHopCall:
 
         Every rank of the group sees the same rows, so every rank arms or none does.
         """
-        if 1 <= rows <= _hop.MAX_ROWS:
-            return True
-        return self.wide is not None and rows <= self.wide.max_rows
+        return 1 <= rows <= _hop.MAX_ROWS
 
     def workspace_for(self, rows: int) -> "_hop.PostAttnHopWorkspace":
-        """The transport a ``rows``-row call runs on: the 8-row one, or the wide one above it."""
-        return self.workspace if rows <= _hop.MAX_ROWS else self.wide
+        """The transport a ``rows``-row call runs on: the 8-row one, or None above it."""
+        return self.workspace if rows <= _hop.MAX_ROWS else None
 
     def join_workspace(self, rows: int) -> "_hop.PostAttnHopWorkspace":
         """The transport an armed join's call of ``rows`` rows (``takes_call`` took it) runs on."""
@@ -332,8 +316,7 @@ class PostAttnHopCall:
         """Arm every join for the duration of one decode forward; disarm on any exit.
 
         A step of ``DirectPublish.ROWS`` rows (``attention_output_into_hop``) also arms the
-        direct publication, and a step of ``WIDE_PUBLISH_ROWS`` rows the wide one when it is
-        built (``publication_for``),
+        direct publication (``publication_for``),
         after ``DirectPublish.check_step`` on the step's input ``residual`` (when given);
         an exception after that hands the transport to ``DirectPublish.recover`` before it
         propagates.
@@ -394,8 +377,7 @@ class WideHopCall:
     each graph), and it builds the larger workspace first.
 
     ``min_rows`` is the fewest rows a step it takes has: the row after the last one the
-    8-row hop's call takes, its wide TP4 transport (``wide_post_attention_hop``) included,
-    so a step arms one hop or the other, never both.
+    8-row hop's call takes, so a step arms one hop or the other, never both.
     """
 
     def __init__(
@@ -414,9 +396,6 @@ class WideHopCall:
         self.min_rows = max(int(min_rows), _wide.MIN_ROWS)
         #: The joins read ``direct`` off any armed call; the wide op has no direct publication.
         self.direct = None
-        #: ``tep8_direct_hop``: the direct publication of the steps it takes
-        #: (``_build_wide_direct``), or None.
-        self.direct_publication = None
 
     @staticmethod
     def takes_call(*tensors: torch.Tensor) -> bool:
@@ -462,31 +441,13 @@ class WideHopCall:
 
     @contextlib.contextmanager
     def armed(self, rows: Optional[int] = None, residual: Optional[torch.Tensor] = None):
-        """Arm every join with this call for the duration of one decode forward; disarm on any exit.
-
-        A step the direct publication (``tep8_direct_hop``) takes also arms it: o_proj then stores
-        into the owners' scatter slots and the joins run the direct consumer; an exception after
-        that resets its transport.
-        """
-        publication = self.direct_publication
-        if publication is not None and (rows is None or not publication.takes(rows)):
-            publication = None
+        """Arm every join with this call for the duration of one decode forward; disarm on any exit."""
         self.workspace = self.served if rows is None else self.workspace_for(rows)
         for join in self.joins:
             join._armed = self
-        published = False
         try:
-            if publication is not None:
-                publication.arm(rows)
-                published = True
             yield
-        except Exception as error:
-            if published:
-                publication.recover(error)
-            raise
         finally:
-            if publication is not None:
-                publication.disarm()
             for join in self.joins:
                 join._armed = None
             self.workspace = self.served
@@ -525,8 +486,6 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
     _armed: Optional[PostAttnHopCall]
     _o_proj_all_reduce: object
     _direct: Optional[tuple] = None
-    #: ``tep8_direct_hop``: the layer's parity while a wide direct publication is armed, else None.
-    _wide_direct: Optional[int] = None
 
     @classmethod
     def adopt(
@@ -555,8 +514,6 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
             return super()._add_after_rmsnorm_and_norm(residual, branch, eps, next_norm, gain)
         if self._direct is not None:
             return self._consume_published(call, residual, branch, eps, next_norm, gain)
-        if self._wide_direct is not None:
-            return self._consume_wide_direct(call, residual, branch, eps, next_norm, gain)
         alpha, beta = self.coefficients()
         weight = next_norm.weight
         if (
@@ -584,40 +541,6 @@ class MuseSparkOpenTepPostAttnJoin(MuseSparkOpenGatedResidual):
         # A call the hop does not take: the built-in all-reduce, then the built-in join.
         return super()._add_after_rmsnorm_and_norm(
             residual, self._o_proj_all_reduce(branch), eps, next_norm, gain
-        )
-
-    def _consume_wide_direct(self, call, residual, branch, eps, next_norm, gain):
-        """``tep8_direct_hop``: the direct consumer on the slots o_proj scattered into (every peer
-        polls them, so a call it does not take cannot fall back)."""
-        publication = call.direct_publication
-        alpha, beta = self.coefficients()
-        weight = next_norm.weight
-        rows = branch.shape[0] if branch.ndim == 2 else 0
-        if not (
-            publication is not None
-            and gain is None
-            and self._fused_enabled
-            and next_norm.use_gemma
-            and not torch.compiler.is_compiling()
-            and rows == publication.rows
-            and _wide.wide_takes(branch, residual, alpha, beta, weight)
-        ):
-            raise RuntimeError(
-                "[musespark_open] tep8_direct_hop: an armed step reached a join the direct consumer does not "
-                f"take (branch {tuple(branch.shape)}, gain={gain is not None}); every rank polls this call, so it "
-                "cannot fall back"
-            )
-        residual, alpha, beta, weight = _hop.readable(residual, alpha, beta, weight)
-        return publication.consume(
-            self._wide_direct,
-            branch,
-            residual,
-            alpha,
-            beta,
-            weight,
-            eps,
-            next_norm.variance_epsilon,
-            self._preqkv_norm_fp32,
         )
 
     def _consume_published(self, call, residual, branch, eps, next_norm, gain):
@@ -723,7 +646,6 @@ def _build_post_attn_hop(
     model: MuseSparkOpenModel,
     early_trigger: bool = False,
     stale_poll: bool = False,
-    wide: bool = False,
 ) -> PostAttnHopCall:
     """Take the group's one workspace (collective), then re-class every layer's ``add_attn``.
 
@@ -762,16 +684,6 @@ def _build_post_attn_hop(
         early_trigger=early_trigger,
         stale_poll=stale_poll,
     )
-    wide_workspace = None
-    if wide:
-        # wide_post_attention_hop: a second, 32-row transport (TP4) for steps of 9..32 rows.
-        wide_workspace = _hop.shared_workspace(
-            model.layers[0].mapping,
-            variants=variants,
-            early_trigger=early_trigger,
-            stale_poll=stale_poll,
-            max_rows=_hop.WIDE_MAX_ROWS,
-        )
     joins = tuple(
         MuseSparkOpenTepPostAttnJoin.adopt(layer.add_attn, layer.self_attn.o_proj.all_reduce)
         for layer in model.layers
@@ -781,12 +693,14 @@ def _build_post_attn_hop(
         workspace.multicast,
         early_trigger,
         stale_poll,
-        wide_workspace.max_rows if wide_workspace is not None else None,
     )
-    return PostAttnHopCall(workspace, joins, wide=wide_workspace)
+    return PostAttnHopCall(workspace, joins)
 
 
-def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHopCall:
+def _build_wide_hop(
+    model: MuseSparkOpenModel,
+    call: PostAttnHopCall,
+) -> WideHopCall:
     """``multi_request_post_attention_hop``: take the group's wide-hop workspace (collective) for ``call``'s joins.
 
     The joins are ``post_attention_hop``'s, whose refusals already read every layer; the
@@ -820,8 +734,8 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         variants=variants,
         early_launch=_wide.SERVED_EARLY_LAUNCH and tep8,
     )
-    # The 8-row hop's call keeps every row count it takes (its wide TP4 transport's too).
-    min_rows = (call.wide.max_rows if call.wide is not None else _hop.MAX_ROWS) + 1
+    # The 8-row hop's call keeps every row count it takes.
+    min_rows = _hop.MAX_ROWS + 1
     _wide.log_once_enabled(
         len(model.layers),
         workspace.multicast,
@@ -863,81 +777,7 @@ def _build_wide_hop(model: MuseSparkOpenModel, call: PostAttnHopCall) -> WideHop
         )
         return built
 
-    wide_call = WideHopCall(workspace, call.joins, wide_factory, min_rows=min_rows)
-    if _wide.SERVED_DIRECT and tep8:
-        wide_call.direct_publication = _build_wide_direct(model, call, variants)
-    return wide_call
-
-
-def _build_wide_direct(
-    model: MuseSparkOpenModel, call: PostAttnHopCall, variants
-) -> "_wide.DirectPublication":
-    """``tep8_direct_hop``: the direct publication of the wide hop's two-shot (collective).
-
-    Checked on every layer and agreed over the TP group first: an even layer count, eight
-    ranks, and every o_proj on the dense GEMM dispatcher's wide64 split-K (whose kernel has
-    the scatter epilogue).
-
-    Raises:
-        ValueError: on every rank alike, naming what is missing; nothing has been built then.
-    """
-    from .kernels.dense_gemms import dispatcher as dense_gemms
-
-    layers = list(model.layers)
-    mapping = layers[0].mapping
-    reasons = []
-    if len(layers) % 2:
-        reasons.append(f"{len(layers)} layers: the per-layer parity needs an even count")
-    if mapping.tp_size != 8:
-        reasons.append(f"tp_size {mapping.tp_size}: the direct wide hop serves 8 ranks")
-    if not getattr(_wide, "HAS_SCATTER_GEMM", False):
-        reasons.append("no scatter producer (flashinfer's split-K kernel is unavailable)")
-    if "o_proj" not in getattr(dense_gemms, "TEP8_WIDE64_SITES", ()):
-        reasons.append("o_proj is not on the TEP8 wide64 split-K (tep8_wide64_splitk)")
-    if len(call.joins) != len(layers):
-        reasons.append(f"{len(call.joins)} post-attention joins for {len(layers)} layers")
-    dispatchers = []
-    for layer in layers:
-        o_proj = layer.self_attn.o_proj
-        if not isinstance(o_proj, dense_gemms.MuseSparkOpenTepDenseLinear):
-            reasons.append(f"layer {layer.layer_idx}: o_proj is not on the dense GEMM dispatcher")
-            continue
-        dispatcher = o_proj._low_m_gemm_dispatcher
-        if dispatcher.site.role != "o_proj":
-            reasons.append(
-                f"layer {layer.layer_idx}: the dispatcher's role is {dispatcher.site.role}"
-            )
-            continue
-        dispatchers.append(dispatcher)
-    refusal = _tp_agreement.agreed_refusal(
-        mapping,
-        "[musespark_open] tep8_direct_hop: " + " | ".join(reasons) if reasons else None,
-    )
-    if refusal is not None:
-        raise ValueError(refusal)
-    workspace = _wide.WideDirectWorkspace(
-        mapping,
-        multicast=True,
-        variants=variants,
-        early_launch=True,
-        max_rows=64,
-        wide_min_rows=_wide.SERVED_DIRECT_WIDE_MIN_ROWS,
-        smem_pad=_wide.SERVED_DIRECT_PAD,
-        pad_rows=(0, 1024),
-        wait_first=True,
-        fb_layout=True,
-    )
-    publication = _wide.DirectPublication(workspace, dispatchers, call.joins)
-    _wide._DIRECT_PUBLICATION = publication
-    logger.info(
-        "[musespark_open] tep8_direct_hop: o_proj of decode steps of "
-        f"{_wide.SERVED_DIRECT_ROWS[0]}..{_wide.SERVED_DIRECT_ROWS[1]} rows scatters its partial into the "
-        f"owners' slots on all {len(layers)} layers (window stride {workspace.peer_stride} B, feature-block "
-        f"slots, +{workspace.workspace_bytes / 2**20:.1f} MiB fabric per rank); consumer: early, multicast "
-        f"gather, two rows per 512-thread CTA from {_wide.SERVED_DIRECT_WIDE_MIN_ROWS} rows, "
-        f"SMEM pad {_wide.SERVED_DIRECT_PAD} B"
-    )
-    return publication
+    return WideHopCall(workspace, call.joins, wide_factory, min_rows=min_rows)
 
 
 def _build_direct_publish(
@@ -950,8 +790,8 @@ def _build_direct_publish(
     layer count (the per-layer parity), the post-attention hop's multicast transport, and
     every o_proj on the dense GEMM dispatcher with a kernel of the device's
     ``DirectPublish.PRODUCER_FAMILIES`` for ``DirectPublish.ROWS`` rows -- the kernels whose
-    epilogue stores are known to publish through the multicast address (cuBLAS on sm103,
-    flashinfer's split-K and direct kernels on sm107; the device is the dense GEMM plan's).
+    epilogue stores are known to publish through the multicast address (cuBLAS on sm103;
+    the device is the dense GEMM plan's).
     ``early_trigger`` gives the consumer hop the hop's early trigger placement. Every o_proj site
     then lists ``DirectPublish.ROWS`` in its ``skip_prefetch_rows``. The kernel the published
     o_proj actually runs (cuBLAS picks its own) is checked once the weights are loaded
@@ -1031,123 +871,6 @@ def _build_direct_publish(
     return DirectPublish(workspace, tuple(dispatchers), call.joins)
 
 
-#: The row counts the wide direct publication serves: two to four requests' K = 7 verify steps.
-WIDE_PUBLISH_ROWS = (16, 24, 32)
-#: Whether the published wide row counts fork the o_proj -> pool-weight prefetch: as at 8 rows,
-#: the consumer hop ends before the prefetch would, so none is forked.
-WIDE_PUBLISH_DROPS_PREFETCH = True
-
-
-def _build_wide_direct_publish(
-    model: MuseSparkOpenModel, call: PostAttnHopCall, early_trigger: bool = False
-) -> Tuple[Optional[DirectPublish], Optional[str]]:
-    """``attention_output_into_hop`` on the wide TP4 steps (``wide_oproj_publish``).
-
-    On a decode step of ``WIDE_PUBLISH_ROWS`` rows layer ``l``'s o_proj (the ``wide_dense_gemms``
-    split-K tactic of the step's rows) stores straight into this rank's ``[rows, 8192]`` slot of
-    a 32-row direct transport (``PostAttnDirectWorkspace(max_rows=WIDE_MAX_ROWS)``, buffer
-    ``l mod 2``), and the join runs the consumer hop there instead of the wide hop
-    (``wide_post_attention_hop``), which would load the partial and publish it itself. Same
-    bits: the same tactic writes the same partial; the consumer's rank-order sum and 4-CTA
-    boundary are the wide hop's statements (a published ``-0`` adds what the hop's cleared
-    ``+0`` adds).
-
-    Collective: every rank of the TP group calls it when the plan carries the lever. Builds
-    on the 8-row publication (``call.direct``: its o_proj dispatchers and their producer
-    policy) and the wide hop (``call.wide``: the joins take 9..32-row calls); checked first
-    and agreed over the group before the workspace's collective construction: TP4, and an
-    o_proj kernel of the policy's families at every served row count on every layer. A
-    refusal leaves every rank on the wide hop. Returns ``(the wide publication, None)`` or
-    ``(None, the agreed refusal)``.
-    """
-    from .ops.gemm.dense_gemm import parse_kernel
-
-    layers = list(model.layers)
-    mapping = layers[0].mapping
-    direct = call.direct
-    reasons = []
-    if direct is None:
-        reasons.append("o_proj does not publish its 8-row steps (attention_output_into_hop)")
-    if call.wide is None:
-        reasons.append("no wide post-attention hop transport (wide_post_attention_hop)")
-    tp_size = getattr(mapping, "tp_size", None)
-    if tp_size != 4:
-        reasons.append(f"the wide direct transport is TP4 only, got TP{tp_size}")
-    kernels = {}
-    if direct is not None:
-        for dispatcher in direct.dispatchers:
-            policy = dispatcher.publish_policy
-            plan = dispatcher.site.plan
-            for rows in WIDE_PUBLISH_ROWS:
-                kernel = plan.kernel_for(dispatcher.site.role, rows)
-                family = None if kernel is None else parse_kernel(kernel)[0]
-                if policy is None or family not in policy.direct:
-                    reasons.append(
-                        f"layer {dispatcher.site.layer_idx}: o_proj runs {kernel} at {rows} rows, "
-                        "not a kernel family that publishes directly "
-                        f"({sorted(policy.direct) if policy is not None else []})"
-                    )
-                kernels[rows] = kernel
-            if reasons:
-                break
-    refusal = _tp_agreement.agreed_refusal(mapping, " | ".join(reasons) if reasons else None)
-    if refusal is not None:
-        return None, f"{refusal}; the wide steps keep wide_post_attention_hop"
-    variants = sorted(
-        {
-            (
-                float(layer.post_attn_norm.variance_epsilon),
-                float(layer.pre_ffn_norm.variance_epsilon),
-                bool(layer.add_attn._preqkv_norm_fp32),
-            )
-            for layer in layers
-        }
-    )
-    workspace = _hop.shared_direct_workspace(
-        mapping, variants=variants, early_trigger=early_trigger, max_rows=_hop.WIDE_MAX_ROWS
-    )
-    dropped = 0
-    if WIDE_PUBLISH_DROPS_PREFETCH:
-        for dispatcher in direct.dispatchers:
-            site = dispatcher.site
-            site.skip_prefetch_rows = frozenset(site.skip_prefetch_rows | set(WIDE_PUBLISH_ROWS))
-            dropped += int(bool(site.plan.prefetch) and site.next_weight is not None)
-    described = ", ".join(f"{kernels[rows]}@{rows}" for rows in WIDE_PUBLISH_ROWS)
-    _hop.log_once_wide_direct(len(layers), WIDE_PUBLISH_ROWS, described, dropped)
-    return DirectPublish(workspace, direct.dispatchers, call.joins, rows=WIDE_PUBLISH_ROWS), None
-
-
-def _check_wide_publication(direct: DirectPublish, o_proj, rows: int) -> str:
-    """Layer 0's real dispatcher publishes a ``rows``-row product into the wide transport's
-    slot 0 inside a capture that is never replayed; the workspace checks the captured kernel
-    (``check_producer``, collective). Returns its name."""
-    dispatcher = direct.dispatchers[0]
-    slot = direct.slots_by_rows[rows][0]
-    weight = o_proj.weight
-    x = torch.zeros(rows, int(weight.shape[1]), dtype=weight.dtype, device=weight.device)
-    site = dispatcher.site
-
-    def publish() -> None:
-        dispatcher.publish = slot
-        # The capture holds the producer only: no prefetch fork at the checked row count.
-        skipped = site.skip_prefetch_rows
-        site.skip_prefetch_rows = frozenset(skipped | {rows})
-        try:
-            with torch.inference_mode():
-                dispatcher.apply(o_proj, x, weight, None)
-        finally:
-            dispatcher.publish = None
-            site.skip_prefetch_rows = skipped
-
-    def warm() -> None:
-        # The same kernel, disarmed, into a fresh output: library state and a flashinfer
-        # kernel's compilation happen outside the capture.
-        with torch.inference_mode():
-            dispatcher.apply(o_proj, x, weight, None)
-
-    return direct.workspace.check_producer(publish, warm)
-
-
 def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
     """``attention_output_into_hop``, once the weights are final: the kernel the published o_proj runs.
 
@@ -1192,13 +915,7 @@ def verify_direct_publish(text_model: MuseSparkOpenModel) -> str:
         with torch.inference_mode():
             dispatcher.apply(o_proj, x, weight, None)
 
-    name = direct.workspace.check_producer(publish, warm)
-    wide = getattr(call, "wide_direct", None)
-    if wide is not None:
-        # The wide publication's tactics (one per served row count), the same check.
-        for rows in wide.rows:
-            _check_wide_publication(wide, o_proj, rows)
-    return name
+    return direct.workspace.check_producer(publish, warm)
 
 
 def _raise_refusal(reason: Optional[str], path: str) -> None:
@@ -1269,7 +986,6 @@ def adopt_model(
         dense_gemm_plan = dense_gemms.install(
             model,
             prefetch=plan.enabled("dense_gemm_prefetch"),
-            wide=plan.enabled("wide_dense_gemms"),
         )
     norm_gate_trigger = None
     early_release_on = plan.enabled("boundary_early_release")
@@ -1349,9 +1065,6 @@ def adopt_model(
         _tp_agreement.agreed_install(
             model.layers[0].mapping, lambda: prep_fold_attention.install(model)
         )
-    if plan.enabled("wide_full_attention"):
-        # After the prep append and split-KV: their mixins take steps of 2..4 sequences too.
-        full_attention.install_multi(model)
     decode_kv_splits = None
     if plan.enabled("decode_kv_splits"):
         # DecodeTarget arms it around a decode forward of 72..512 rows; the mixed-step
@@ -1365,17 +1078,13 @@ def adopt_model(
     if plan.enabled("multi_request_split_kv"):
         # After every other attention re-class but multi_request_prep_append's: its mixin
         # goes in front of them and acts only on decode steps of two or more sequences, where
-        # it swaps the decode FMHA launch (``intercepting``). Agreed like split-KV's. With
-        # wide_full_attention the fold owns steps of 2..MAX_REQUESTS sequences, so this
-        # path takes the steps above them.
+        # it swaps the decode FMHA launch (``intercepting``). Agreed like split-KV's.
         from .kernels.multi_request_split_kv import attention as multi_request_attention
-        from .ops.attention.preattn_prep_append import MAX_REQUESTS as _WIDE_MAX_REQUESTS
 
-        min_requests = _WIDE_MAX_REQUESTS + 1 if plan.enabled("wide_full_attention") else 2
         _tp_agreement.agreed_install(
             model.layers[0].mapping,
             lambda: multi_request_attention.install(
-                model, sliding=multi_request_attention.SLIDING_LAYERS, min_requests=min_requests
+                model, sliding=multi_request_attention.SLIDING_LAYERS
             ),
         )
     if plan.enabled("multi_request_prep_append"):
@@ -1386,22 +1095,9 @@ def adopt_model(
         from .kernels.multi_request_prep_append import attention as multi_request_append
 
         min_seqs = multi_request_append.MIN_SEQS
-        if plan.enabled("wide_full_attention") or plan.enabled("wide_swa_block"):
-            # Those paths fold the append of steps of two to MULTI_MAX_REQUESTS
-            # sequences in their own calls; the prep append takes the larger steps.
-            from .ops.attention.full_attention_split_kv import MULTI_MAX_REQUESTS as _full_multi_max
-            from .ops.attention.swa_block import MULTI_MAX_REQUESTS as _swa_multi_max
-
-            min_seqs = 1 + max(_full_multi_max, _swa_multi_max)
-        # packed_prep_append: calls of its MIN_ROWS rows or more on the packed kernel.
-        packed_min_rows = (
-            plan.param("packed_prep_append", "MIN_ROWS")
-            if plan.enabled("packed_prep_append")
-            else None
-        )
         _tp_agreement.agreed_install(
             model.layers[0].mapping,
-            lambda: multi_request_append.install(model, min_seqs, packed_min_rows),
+            lambda: multi_request_append.install(model, min_seqs),
         )
     if decode_kv_splits is not None:
         # After every other attention re-class: the mixed-step mixin goes in front of all of
@@ -1423,17 +1119,6 @@ def adopt_model(
         )
     if swa_block is not None:
         swa_attention_block.log_installed(model.layers, swa_block)
-        if plan.enabled("wide_swa_block"):
-            swa_attention_block.install_multi(model)
-    if plan.enabled("mixed_step_gen_rows"):
-        # After every other attention re-class and after select_decode_fmha: the mixin goes
-        # in front of all of them and acts only on mixed steps, which none of the others
-        # intercept. Agreed like multi_request_split_kv's.
-        from .kernels.mixed_step_gen_rows import attention as mixed_step_gen_rows
-
-        _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: mixed_step_gen_rows.install(model)
-        )
     layer_kwargs = {}
     if plan.enabled("projection_gathers"):
         # Imported only when planned: with no fast path the target imports
@@ -1454,17 +1139,6 @@ def adopt_model(
         # The router fork: its refusals (PDL off, a stream not created) are agreed over
         # the TP group.
         moe_prologue.install_router_fork(model)
-    # After the router fork (whose side stream its router shard runs on): wide_prologue hands
-    # every prologue MoE and post-FFN join its wide inbox. Its refusal is agreed over the TP
-    # group before the inboxes' collective construction.
-    if plan.enabled("wide_prologue"):
-        from .kernels.wide_prologue import prologue as wide_prologue
-
-        wide_prologue.install(
-            model,
-            router_rows=plan.enabled("wide_router_per_row"),
-            direct=plan.enabled("wide_direct_transports"),
-        )
     router_gemm = None
     if plan.enabled("router_gemm"):
         # After moe_prologue and the router fork, which check the MoE class they re-class:
@@ -1473,14 +1147,8 @@ def adopt_model(
         # early_expert_ids) take a subclass of it. Agreed like the attention installs.
         from .kernels.router_gemm import router as _router_gemm
 
-        # Where wide_prologue serves the 16..32-row steps' router, the op starts above them.
-        min_rows = (
-            _router_gemm.WIDE_PROLOGUE_MIN_ROWS
-            if plan.enabled("wide_prologue")
-            else _router_gemm.MIN_ROWS
-        )
         router_gemm = _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: _router_gemm.install(model, min_rows)
+            model.layers[0].mapping, lambda: _router_gemm.install(model)
         )
     # The capture layers whose boundary writes the DFlash capture (capture_fold): no
     # plain capture copy follows their boundary, so boundary_early_release converts
@@ -1502,7 +1170,6 @@ def adopt_model(
             model,
             early_trigger=True,
             stale_poll=True,
-            wide=plan.enabled("wide_post_attention_hop"),
         )
         if plan.enabled("post_attention_hop")
         else None
@@ -1533,7 +1200,8 @@ def adopt_model(
         from .kernels.next_qkv_prefetch import prefetch as _qkv_prefetch
 
         qkv_prefetch = _tp_agreement.agreed_install(
-            model.layers[0].mapping, lambda: _qkv_prefetch.install(model, dense_gemm_plan)
+            model.layers[0].mapping,
+            lambda: _qkv_prefetch.install(model, dense_gemm_plan),
         )
     unpool_direct = None
     if plan.enabled("unpool_into_boundary"):
@@ -1555,22 +1223,6 @@ def adopt_model(
         from .kernels.pool_into_route import route as _pool_direct
 
         pool_direct = _pool_direct.install(model, dense_gemm_plan, mapping=model.layers[0].mapping)
-    if plan.enabled("wide_direct_transports"):
-        # Both transports' wide layouts follow construction-time state wide_prologue.install
-        # agreed over the TP group, so every rank reports the same.
-        unbuilt = [
-            name
-            for name, built in (
-                ("pool_into_route", pool_direct),
-                ("unpool_into_boundary", unpool_direct),
-            )
-            if built is None or built.wide_workspace is None
-        ]
-        plan.installed(
-            "wide_direct_transports",
-            not unbuilt,
-            "no wide direct transport on " + ", ".join(unbuilt),
-        )
     # finalize_transport replaces only the object every MoE layer calls its fused
     # finalize on, whatever class the MoE has.
     finalize_transport = None
@@ -1579,9 +1231,7 @@ def adopt_model(
         # and runs nothing beyond the built-in modules.
         from .kernels.finalize_transport import transport as _finalize_transport
 
-        finalize_transport = _finalize_transport.install(
-            model, wide=plan.enabled("wide_finalize_transport")
-        )
+        finalize_transport = _finalize_transport.install(model)
     wide_moe_allreduce = None
     if plan.enabled("wide_moe_allreduce"):
         # Replaces only the module every MoE layer reduces its unfused output with;
@@ -1610,16 +1260,13 @@ def adopt_model(
     if plan.enabled("attention_output_into_hop"):
         # After dense_gemms (its o_proj dispatchers) and post_attention_hop (its joins).
         post_attn_hop.direct = _build_direct_publish(model, post_attn_hop, early_trigger=True)
-        if plan.enabled("wide_oproj_publish"):
-            # The wide steps' publication (a collective agreement on every rank).
-            post_attn_hop.wide_direct, refusal = _build_wide_direct_publish(
-                model, post_attn_hop, early_trigger=True
-            )
-            plan.installed("wide_oproj_publish", refusal is None, refusal or "")
     wide_hop = None
     if plan.enabled("multi_request_post_attention_hop"):
         # After post_attention_hop, whose joins it arms on 9..1024-row decode steps.
-        wide_hop = _build_wide_hop(model, post_attn_hop)
+        wide_hop = _build_wide_hop(
+            model,
+            post_attn_hop,
+        )
     wide_projections = None
     if plan.enabled("wide_projection_gathers"):
         # After projection_gathers (whose MoE and join classes read its inboxes) and

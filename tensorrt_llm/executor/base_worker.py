@@ -16,6 +16,7 @@ import datetime
 import enum
 import gc
 import json
+import os
 import time
 import traceback
 import uuid
@@ -148,13 +149,23 @@ class BaseWorker(GenerationExecutor):
 
     def _get_comm_ranks_device_id(self):
         device_id = self.global_rank % torch.cuda.device_count()
+        # set_device creates the device's CUDA context. With
+        # TLLM_WORKER_AFFINITY_BEFORE_CUDA_CONTEXT=1 the worker is bound to
+        # its GPU's NUMA node first, so the context is created from a CPU of
+        # that node and the driver's host-side memory for it (where the GPU
+        # writes and polls event semaphores) is on the GPU's own socket.
+        affinity_first = os.environ.get(
+            "TLLM_WORKER_AFFINITY_BEFORE_CUDA_CONTEXT") == "1"
+        if affinity_first:
+            configure_cpu_affinity(device_id)
         torch.cuda.set_device(device_id)
         # Make sure C++ executor would use same devices/ranks as py_executor
         global_rank = global_mpi_rank()
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
-        configure_cpu_affinity(device_id)
+        if not affinity_first:
+            configure_cpu_affinity(device_id)
 
         return comm_ranks, device_ids
 

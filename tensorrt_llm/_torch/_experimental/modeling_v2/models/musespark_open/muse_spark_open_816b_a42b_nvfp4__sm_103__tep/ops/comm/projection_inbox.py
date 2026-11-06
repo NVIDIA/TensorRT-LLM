@@ -102,7 +102,7 @@ class ProjectionInbox:
     Construction is collective over the TP group.
 
     ``max_rows`` is the most rows one call may carry: ``MAX_ROWS`` (8), or
-    ``WIDE_MAX_ROWS`` (32) at TP4 for the wide sites of ``wide_prologue`` and
+    ``WIDE_MAX_ROWS`` (32) at TP4 for the wide sites and
     ``wide_projection_gathers``, and at TP8 for ``projection_gathers``' 9..32-row sites.
 
     Attributes read by the fused ops: ``base`` (address of rank 0's segment

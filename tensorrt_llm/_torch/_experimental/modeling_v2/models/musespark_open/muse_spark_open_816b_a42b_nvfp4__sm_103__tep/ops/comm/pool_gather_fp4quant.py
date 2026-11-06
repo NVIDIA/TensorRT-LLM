@@ -154,8 +154,7 @@ if _AVAILABLE:
                 scale_format="e4m3",
             )
             # The configuration the inbox addressing below is written for; it is
-            # what flashinfer selects for H=4096 BF16 on sm_103 and sm_107 (the
-            # same opt-in shared memory per block).
+            # what flashinfer selects for H=4096 BF16 on sm_103.
             if not (
                 self.cluster_n == 1
                 and self.threads_per_row == 64

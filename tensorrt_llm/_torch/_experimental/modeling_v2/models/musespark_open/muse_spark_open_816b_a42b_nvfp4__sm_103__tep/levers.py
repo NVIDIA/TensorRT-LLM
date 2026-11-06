@@ -39,8 +39,7 @@ Semantics, in the order a lever is resolved:
 ``on`` for a lever the composition does not serve, that a structural rule excludes, whose
 dependency or requirement is off, or that conflicts with another lever that is on, raises.
 So does every grammar error and every retired switch (``RETIRED``); ``UCX_RNDV_THRESH`` on
-a server with a cache transceiver (a ``ctx`` or ``gen`` role, or an unhinted one); and
-``context_fp8_dense`` on where a decode step can reach its ``MIN_ROWS``. The resolver
+a server with a cache transceiver (a ``ctx`` or ``gen`` role, or an unhinted one). The resolver
 reads no device and no module of this target: everything it needs is an argument, so it
 runs on any host.
 """
@@ -59,12 +58,6 @@ from typing import Callable, Dict, FrozenSet, Iterable, List, Mapping, Optional,
 DRAFT_LEN = 7
 #: Decode rows one request brings to a step: its last accepted token and its drafts.
 ROWS_PER_REQUEST = DRAFT_LEN + 1
-#: The fewest decode rows of a step of two requests, where the wide TP4 paths start.
-WIDE_MIN_ROWS = 2 * ROWS_PER_REQUEST
-#: Aggregated sm107 TEP4 servers of at least this max_batch_size run the high-concurrency
-#: selection: no wide decode paths or cooperative head fold, the graph-start QKV prefetch,
-#: and the parallel windowed context commit from one request.
-HC_MIN_BATCH = 48
 
 #: The prefix of every lever knob.
 PREFIX = "MUSESPARK_OPEN_LEVER_"
@@ -89,107 +82,9 @@ DEFAULT_VALUES = (AUTO, BASELINE)
 SOURCES = ("structural", "dependency", "knob", "baseline", "auto", "gate")
 
 #: Retired switches and what replaced them. Setting one, to any value, raises.
-RETIRED: Mapping[str, str] = types.MappingProxyType(
-    {
-        "MUSESPARK_OPEN_PREP_PACKED_ROWS": PREFIX + "PACKED_PREP_APPEND",
-        "MUSESPARK_OPEN_CTX_COMMIT_TUNED": PREFIX + "WINDOWED_COMMIT_PARALLEL",
-        "MUSESPARK_OPEN_CONTEXT_FP8_DENSE": PREFIX + "CONTEXT_FP8_DENSE",
-        "MUSESPARK_OPEN_CONTEXT_FP8_DENSE_MIN_ROWS": PREFIX + "CONTEXT_FP8_DENSE__MIN_ROWS",
-        "MUSESPARK_OPEN_CONTEXT_FP8_DENSE_PROJECTIONS": PREFIX + "CONTEXT_FP8_DENSE__PROJECTIONS",
-        "MUSESPARK_OPEN_CONTEXT_FP8_DENSE_GATHER": PREFIX + "CONTEXT_FP8_ATTN_GATHER",
-        "TRTLLM_MUSESPARK_TEP_WIDE_DIRECT": PREFIX + "WIDE_DIRECT_TRANSPORTS",
-        "TRTLLM_MUSESPARK_TEP_WIDE_ROUTER_ROWS": PREFIX + "WIDE_ROUTER_PER_ROW",
-        "TRTLLM_MUSESPARK_TEP_WIDE_OPROJ_PUBLISH": PREFIX + "WIDE_OPROJ_PUBLISH",
-        "MUSESPARK_OPEN_STEP_LOOP_ONE_STREAM": PREFIX + "STEP_LOOP_ON_EXECUTION_STREAM",
-        "MUSESPARK_OPEN_INCREMENTAL_BLOCK_OFFSETS": PREFIX + "INCREMENTAL_BLOCK_OFFSETS",
-        "MUSESPARK_OPEN_PS_SIDE_CHAIN": PREFIX + "DRAFTER_KV_SIDE_CHAIN",
-        "MUSESPARK_OPEN_PS_EARLY_FC": PREFIX + "DRAFTER_FC_EARLY_FORK",
-        "MUSESPARK_OPEN_PS_DRAFTER_PREAMBLE": PREFIX + "DRAFTER_PREAMBLE_FROM_COMMIT",
-        "MUSESPARK_OPEN_PS_COOP_FOLD": PREFIX + "HEAD_SAMPLER_COOP_FOLD",
-        "MUSESPARK_OPEN_PS_SYMM_GATHER": PREFIX + "HEAD_MULTIMEM_GATHER",
-        "MUSESPARK_OPEN_PS_NO_START_PREFETCH": PREFIX + "GRAPH_START_QKV_PREFETCH=off",
-        "MUSESPARK_OPEN_PS_NO_LM_HEAD_INBOX": PREFIX + "LM_HEAD_INBOX=off",
-        "MUSESPARK_OPEN_PS_LAYER0_INPUT": "nothing: model_boundary builds layer 0's attention input",
-        "MUSESPARK_OPEN_PS_STEP_COMMIT_PDL": "nothing: the step commit launch has no PDL variant",
-        "MUSESPARK_OPEN_HEAD_INBOX_POLL_SCOPE": "nothing: the inbox polls are system-scope",
-        "MUSESPARK_OPEN_HEAD_INBOX_RESET_SCOPE": "nothing: the inbox resets are system-scope",
-        "TRTLLM_MUSESPARK_SWA_BLOCKS_PER_PROGRAM": "nothing: this build has no such switch",
-        "TRTLLM_MUSESPARK_TEP_WIDE_FULL_FOLD": "nothing: this build has no such switch",
-        "TRTLLM_MUSESPARK_TEP_WIDE_QKV_PREFETCH": "nothing: this build has no such switch",
-        "TRTLLM_MUSESPARK_TEP_WIDE_CAPTURE_FOLD": "nothing: this build has no such switch",
-        "MUSESPARK_OPEN_SPLITK_MAILBOX_V4": "nothing: the sm107 compositions build the split-K mailbox",
-        "MUSESPARK_OPEN_SPLITK_OVERSIZED_SMEM": (
-            "nothing: the sm107 compositions build split-K in oversized shared memory"
-        ),
-        "MUSESPARK_OPEN_SPLITK_RS": PREFIX + "SPLITK_POOL_SPLIT8",
-        "MUSESPARK_OPEN_SPLITK_RS_ONLY": PREFIX + "SPLITK_POOL_SPLIT8",
-        "MUSESPARK_OPEN_POOL_SPLITK8": PREFIX + "SPLITK_POOL_SPLIT8",
-        "MUSESPARK_OPEN_TEP4_WIDE_GEMMS": PREFIX + "SPLITK_FRONTIER_TABLES",
-        "MUSESPARK_OPEN_TEP4_NARROW_GEMMS": PREFIX + "SPLITK_FRONTIER_TABLES",
-        "MUSESPARK_OPEN_TEP8_WIDE64_SPLITK": PREFIX + "TEP8_WIDE64_SPLITK",
-        "MUSESPARK_OPEN_TEP8_WIDE64_KERNELS": PREFIX + "TEP8_WIDE64_SPLITK",
-        "MUSESPARK_OPEN_TEP8_PUBLISH_SPLITK": PREFIX + "TEP8_PUBLISH_SPLITK",
-        "MUSESPARK_OPEN_TEP8_DRAFTER_WIDE_GEMMS": PREFIX + "TEP8_DRAFTER_WIDE_GEMMS",
-        "MUSESPARK_OPEN_TEP8_FC_SHARD_WIDE": PREFIX + "TEP8_FC_SHARD_WIDE",
-        "MUSESPARK_OPEN_TEP8_FC_GATHER_PROGRAMS": PREFIX + "TEP8_FC_SHARD_WIDE",
-        "MUSESPARK_OPEN_PREFETCH_JOIN": PREFIX + "WEIGHT_PREFETCH_AFTER_JOIN",
-        "MUSESPARK_OPEN_DROP_WEIGHT_PREFETCH": PREFIX + "WEIGHT_PREFETCH_AFTER_JOIN",
-        "MUSESPARK_OPEN_NEXT_QKV_PREFETCH_SKIP_ROWS": PREFIX + "NEXT_QKV_PREFETCH_SKIP",
-        "MUSESPARK_OPEN_SWA_CL8": PREFIX + "SWA_ONE_CLUSTER_BLOCK",
-        "MUSESPARK_OPEN_TEP8_SWA_CL8": PREFIX + "SWA_ONE_CLUSTER_BLOCK",
-        "MUSESPARK_OPEN_SWA_PREP_SPLIT": PREFIX + "SWA_PREP_SPLIT",
-        "MUSESPARK_OPEN_SWA_ONE2": PREFIX + "SWA_EIGHT_REQUESTS",
-        "MUSESPARK_OPEN_FA_PREP_FOLD_MULTI": PREFIX + "FULL_ATTENTION_FOLD_MULTI",
-        "MUSESPARK_OPEN_FA_STAGES": PREFIX + "SPLIT_KV_DEEP_RINGS",
-        "MUSESPARK_OPEN_MR_STAGES": PREFIX + "SPLIT_KV_DEEP_RINGS",
-        "MUSESPARK_OPEN_BF16_HALF_WINDOW": PREFIX + "BF16_HALF_WINDOW",
-        "MUSESPARK_OPEN_PREROUTED_META": PREFIX + "PREROUTED_EXPERTS",
-        "MUSESPARK_OPEN_TEP8_PREROUTED": PREFIX + "PREROUTED_EXPERTS",
-        "MUSESPARK_OPEN_PREROUTED_SO": "nothing: the experts run trtllm::fp4_block_scale_moe_prerouted",
-        "MUSESPARK_OPEN_ROUTER_ROWS_TILING": "nothing: the sm107 compositions tile the per-row router shard",
-        "MUSESPARK_OPEN_TEP8_RING_BUDDY_MAX_ROWS": PREFIX + "TEP8_RING_BUDDY_WIDE",
-        "MUSESPARK_OPEN_TEP8_RB_PDL": PREFIX + "TEP8_RING_BUDDY_PDL",
-        "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT": PREFIX + "TEP8_TILE_PLACEMENT",
-        "MUSESPARK_OPEN_TEP8_TILE_PLACEMENT_MIN_ROWS": PREFIX + "TEP8_TILE_PLACEMENT",
-        "MUSESPARK_OPEN_TEP8_ROUTER_PUSH": PREFIX + "TEP8_ROUTER_PUSH",
-        "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_MIN_ROWS": PREFIX + "TEP8_ROUTER_PUSH",
-        "MUSESPARK_OPEN_TEP8_ROUTER_PUSH_ROUTE": PREFIX + "TEP8_ROUTER_PUSH",
-        "MUSESPARK_OPEN_TEP8_ROUTER_PREWAIT": PREFIX + "TEP8_ROUTER_PREWAIT",
-        "MUSESPARK_OPEN_TEP8_POOL_PROGRAMMATIC_FORK": PREFIX + "TEP8_POOL_PROGRAMMATIC_FORK",
-        "MUSESPARK_OPEN_TEP8_WIDE_POOL_GATHER": PREFIX + "TEP8_WIDE_PROJECTION_GATHERS",
-        "MUSESPARK_OPEN_TEP8_WIDE_UNPOOL_GATHER": PREFIX + "TEP8_WIDE_PROJECTION_GATHERS",
-        "MUSESPARK_OPEN_FINALIZE_TRIGGER": PREFIX + "FINALIZE_ENTRY_TRIGGER",
-        "MUSESPARK_OPEN_TEP8_FINALIZE_TRANSPORT_TOKENS": PREFIX + "TEP8_FINALIZE_TRANSPORT_64",
-        "MUSESPARK_OPEN_HOP_ENTRY_TRIGGER": PREFIX + "HOP_ENTRY_TRIGGER",
-        "MUSESPARK_OPEN_TEP8_HOP_DIRECT": PREFIX + "TEP8_DIRECT_HOP",
-        "MUSESPARK_OPEN_TEP8_HOP_EARLY": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
-        "MUSESPARK_OPEN_TEP8_HOP_MULTICAST": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
-        "MUSESPARK_OPEN_TEP8_HOP_PAD_ROWS": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
-        "MUSESPARK_OPEN_TEP8_HOP_R2": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
-        "MUSESPARK_OPEN_TEP8_HOP_R2_MIN_ROWS": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
-        "MUSESPARK_OPEN_TEP8_HOP_SMEM_PAD": PREFIX + "TEP8_EARLY_MULTICAST_HOP",
-        "MUSESPARK_OPEN_TEP8_JOIN_PDL": PREFIX + "TEP8_PUBLISH_JOIN",
-        "MUSESPARK_OPEN_PUBLISH_JOIN_CLUSTER": PREFIX + "TEP8_PUBLISH_JOIN",
-        "MUSESPARK_OPEN_NORM_GATE_PDL_MAX_ROWS": PREFIX + "WIDE_NORM_GATE_PDL",
-        "MUSESPARK_OPEN_STEP_COMMIT_V2": PREFIX + "STEP_COMMIT_V2",
-        "MUSESPARK_OPEN_CTX_KV_GLUE": PREFIX + "DRAFTER_KV_GLUE",
-        "MUSESPARK_OPEN_CTX_KV_FORK_EARLY": PREFIX + "DRAFTER_KV_FORK_BEFORE_HEAD",
-        "MUSESPARK_OPEN_VP_MIN_ROWS": PREFIX + "VOCAB_PARALLEL_HEAD__MIN_ROWS",
-        "MUSESPARK_OPEN_SM107_VOCAB_PARALLEL_HEAD": PREFIX + "VOCAB_PARALLEL_HEAD",
-        "MUSESPARK_OPEN_TEP8_EXTRA_PATHS": "nothing: the sm107 tep8 composition serves those paths",
-        "MUSESPARK_OPEN_DROP_PATHS": "the " + PREFIX + "<PATH>=off knobs",
-        "MUSESPARK_OPEN_FC_SHARD_PREWARM": "nothing: the sm107 compositions prewarm the drafter fc",
-        "MUSESPARK_OPEN_SP_SM107_PARTS": PREFIX + "CONTEXT_SP_EXTRA_PARTS__PARTS",
-    }
-)
+RETIRED: Mapping[str, str] = types.MappingProxyType({})
 #: Name prefixes only retired switches carry; any other name under them raises too.
-RETIRED_PREFIXES: Mapping[str, str] = types.MappingProxyType(
-    {
-        "MUSESPARK_OPEN_PS_": "the " + PREFIX + "* knobs",
-        "TRTLLM_MUSESPARK_TEP_WIDE_": "the " + PREFIX + "WIDE_* knobs",
-        "MUSESPARK_OPEN_HEAD_INBOX_": "nothing: the inbox scopes are system-scope",
-    }
-)
+RETIRED_PREFIXES: Mapping[str, str] = types.MappingProxyType({})
 
 
 def retired_replacement(name: str) -> Optional[str]:
@@ -286,7 +181,7 @@ class Deployment:
         )
 
     def as_dict(self) -> dict:
-        return {
+        out = {
             "sm": self.sm,
             "tp": self.tp,
             "max_batch_size": self.max_batch_size,
@@ -295,6 +190,7 @@ class Deployment:
             "role_source": self.role_source,
             "arena": self.arena.value,
         }
+        return out
 
 
 def _count(value: Optional[int]) -> str:
@@ -305,8 +201,10 @@ def _count(value: Optional[int]) -> str:
 class Param:
     """A heuristic threshold a lever declares, overridable by ``<LEVER>__<KEY>``.
 
-    An integer in ``low..high``, or, with ``choices``, a non-empty subset of ``choices``
-    (comma-separated, kept in ``choices`` order). A lossy lever's range is a subset of
+    An integer in ``low..high``; with ``choices``, a non-empty subset of ``choices``
+    (comma-separated, kept in ``choices`` order); with ``ranges``, a non-empty list of
+    inclusive integer ranges in ``low..high`` (``"lo-hi,lo-hi,n"``, as sorted
+    ``(lo, hi)`` pairs). A lossy lever's range is a subset of
     the values its accuracy gate covered. ``default_for``, when set, gives the default
     per deployment; the knob still wins over it.
     """
@@ -317,6 +215,7 @@ class Param:
     high: int = 1 << 30
     choices: Tuple[str, ...] = ()
     default_for: Optional[Callable[["Deployment"], object]] = None
+    ranges: bool = False
 
     def default_of(self, deployment: "Deployment") -> object:
         return self.default if self.default_for is None else self.default_for(deployment)
@@ -337,6 +236,8 @@ class Param:
                     f"{raw!r}"
                 )
             return tuple(choice for choice in self.choices if choice in names)
+        if self.ranges:
+            return self._parse_ranges(raw, text)
         try:
             value = int(text, 10)
         except ValueError:
@@ -346,6 +247,25 @@ class Param:
         if not self.low <= value <= self.high:
             raise ValueError(f"expected an integer in {self.low}..{self.high}, got {value}")
         return value
+
+    def _parse_ranges(self, raw: str, text: str) -> Tuple[Tuple[int, int], ...]:
+        pairs = []
+        for item in (part.strip() for part in text.split(",")):
+            if not item:
+                continue
+            lo_text, _, hi_text = item.partition("-")
+            try:
+                lo, hi = int(lo_text, 10), int(hi_text or lo_text, 10)
+            except ValueError:
+                raise ValueError(
+                    f"expected ranges lo-hi,... in {self.low}..{self.high}, got {raw!r}"
+                ) from None
+            if not self.low <= lo <= hi <= self.high:
+                raise ValueError(f"range {item!r} is outside {self.low}..{self.high} or descending")
+            pairs.append((lo, hi))
+        if not pairs:
+            raise ValueError(f"expected ranges lo-hi,... in {self.low}..{self.high}, got {raw!r}")
+        return tuple(sorted(pairs))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,62 +359,6 @@ class Resolving:
 # The deployment rules
 # --------------------------------------------------------------------------
 _NO_DECODE = "the server runs no decode step"
-_HC = f"aggregated sm107 tep4 servers of max_batch_size {HC_MIN_BATCH} or more"
-
-
-def _hc_selection(d: Deployment) -> bool:
-    """Whether ``d`` runs the high-concurrency selection (``HC_MIN_BATCH``)."""
-    return (
-        d.sm == 107
-        and d.tp == 4
-        and d.role is Role.AGG
-        and d.max_batch_size is not None
-        and d.max_batch_size >= HC_MIN_BATCH
-    )
-
-
-def _off_at_hc(rule: "RuleFn") -> "RuleFn":
-    """``rule``, except off on the high-concurrency selection."""
-
-    def wrapped(d: Deployment, t: "Resolving", p: Mapping[str, object]) -> Tuple[bool, str]:
-        if _hc_selection(d):
-            return False, f"{_HC} run without it"
-        return rule(d, t, p)
-
-    return wrapped
-
-
-def _reaching(rows: int, what: str) -> RuleFn:
-    """A rule on while the server decodes and some decode step reaches ``rows`` rows."""
-
-    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-        if not d.decodes():
-            return False, _NO_DECODE
-        if d.reaches(rows):
-            return True, f"{what} are reachable at max_batch_size {_count(d.max_batch_size)}"
-        return False, f"max_batch_size {_count(d.max_batch_size)} never reaches {rows} decode rows"
-
-    return rule
-
-
-def _packed_prep_append(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    rows = int(p["MIN_ROWS"])
-    return _reaching(rows, f"prep-append calls of {rows} or more rows")(d, t, p)
-
-
-def _windowed_commit_parallel(
-    d: Deployment, t: Resolving, p: Mapping[str, object]
-) -> Tuple[bool, str]:
-    requests = int(p["MIN_REQUESTS"])
-    return _reaching(
-        d.rows_per_request * requests, f"context commits of {requests} or more requests"
-    )(d, t, p)
-
-
-def _wide_steps(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    return _reaching(
-        WIDE_MIN_ROWS, f"decode steps of {WIDE_MIN_ROWS}..{4 * ROWS_PER_REQUEST} rows"
-    )(d, t, p)
 
 
 def _at_most(key: str, requires_decode: bool = True) -> RuleFn:
@@ -513,45 +377,11 @@ def _at_most(key: str, requires_decode: bool = True) -> RuleFn:
     return rule
 
 
-def _lossy(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    return False, "lossy: on only by its knob"
-
-
-def _flagged(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    return False, "flagged: on only by its knob, once its open safety check has passed"
-
-
 def _always(why: str) -> RuleFn:
     def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
         return True, why
 
     return rule
-
-
-def _not_on_sm107(why_off: str, why_on: str) -> RuleFn:
-    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-        if d.sm == 107:
-            return False, why_off
-        return True, why_on
-
-    return rule
-
-
-def _graph_start_prefetch(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    if d.sm != 107:
-        return True, "graph starts of split-K row counts"
-    if _hc_selection(d):
-        return True, f"graph starts of split-K row counts on {_HC}"
-    return False, (
-        "on sm107 a captured decode graph starts without a fork, and layer 0's QKV weight is "
-        "not prefetched"
-    )
-
-
-def _coop_fold(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    if not d.decodes():
-        return False, _NO_DECODE
-    return True, f"head calls of at most {p['MAX_ROWS']} rows"
 
 
 def _hot_replicas(requires_decode: bool) -> RuleFn:
@@ -565,88 +395,16 @@ def _hot_replicas(requires_decode: bool) -> RuleFn:
     return rule
 
 
-def _attn_gather_excluded(d: Deployment, t: Resolving) -> Optional[str]:
-    if "qkv" not in t.param("context_fp8_dense", "PROJECTIONS"):
-        return "its gathered rows feed the QKV projection, which context_fp8_dense__PROJECTIONS leaves out"
-    return None
-
-
-def _router_gate(role: Role, scope: str) -> Gate:
-    def holds(d: Deployment) -> bool:
-        return (
-            d.role is role
-            and d.tp == 4
-            and d.max_batch_size is not None
-            and 2 <= d.max_batch_size <= 4
-        )
-
-    return Gate(holds, scope)
-
-
-#: The most requests the Vera Rubin low-latency levers (origin ``LL``, sm107 compositions)
-#: were measured on: TEP4 and TEP8 decode of one to eight requests.
 LL_MAX_BATCH = 8
 
 
-def _ll_params() -> Tuple[Param, ...]:
-    return (Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),)
-
-
-def _ll_gate() -> Gate:
-    """Where the numeric low-latency levers passed their accuracy gates."""
-
-    def holds(d: Deployment) -> bool:
-        return (
-            d.sm == 107
-            and d.tp in (4, 8)
-            and d.role in (Role.GEN, Role.AGG)
-            and d.max_batch_size is not None
-            and d.max_batch_size <= LL_MAX_BATCH
-        )
-
-    return Gate(
-        holds,
-        f"sm107 tep4 and tep8 servers of max_batch_size up to {LL_MAX_BATCH}: greedy drift, "
-        "GSM8K and SPEED-Bench acceptance",
-    )
-
-
-def _ll(kind: Kind) -> Rule:
-    """A low-latency lever of decode steps: on while ``max_batch_size`` is at most MAX_BATCH."""
-    gates = (_ll_gate(),) if kind is Kind.NUMERIC else ()
-    return Rule("LL", kind, _at_most("MAX_BATCH"), params=_ll_params(), gates=gates)
-
-
-def _context_workers(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    """On context servers; on aggregated ones only while ``max_batch_size`` is at most MAX_BATCH."""
-    if d.role is Role.GEN:
-        return False, "the server runs no context step"
-    if d.role is Role.AGG:
-        return _at_most("MAX_BATCH", requires_decode=False)(d, t, p)
-    return True, "large context steps of a context server"
-
-
-def _not_on_sm107_tep8(why_off: str, why_on: str) -> RuleFn:
-    def rule(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-        if (d.sm, d.tp) == (107, 8):
-            return False, why_off
-        return True, why_on
-
-    return rule
-
-
-#: The TP4 paths the sm107 TEP8 composition serves too (``modeling._SM107_TEP8_PATHS``):
-#: on wherever served under ``auto``; under ``baseline`` the upstream sm107 TEP8 composition,
-#: which did not serve them, leaves them out.
-SM107_TEP8_TEP4_PATHS = (
+#: The TP4 paths: on wherever served under ``auto``.
+TEP4_PATHS = (
     "multi_request_prep_append",
-    "wide_swa_block",
-    "wide_full_attention",
     "multi_request_split_kv",
     "multi_request_post_attention_hop",
     "wide_drafter_hops",
     "router_gemm",
-    "wide_dense_gemms",
     "projection_publish",
 )
 
@@ -656,118 +414,26 @@ def _tep4_path_rule() -> Rule:
         "upstream",
         Kind.COMPOSITION,
         _always("its rows, wherever served"),
-        baseline=_not_on_sm107_tep8(
-            "the upstream sm107 tep8 composition does not serve it", "its rows, wherever served"
-        ),
     )
 
 
-def _drafter_kv_glue(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    if t.on("drafter_kv_side_chain"):
-        return False, "yields to drafter_kv_side_chain, which fuses the same store"
-    return _at_most("MAX_BATCH")(d, t, p)
-
-
 def _vocab_parallel_head(d: Deployment, t: Resolving, p: Mapping[str, object]) -> Tuple[bool, str]:
-    if d.sm != 107:
-        return True, "verify heads of 16..1024 rows"
-    # sm107: 151 MiB of fabric buffers per TP4 rank for steps of up to 1024 rows; an engine
-    # that admits more requests (a context worker among them) samples on the built-in head.
-    return _at_most("MAX_BATCH")(d, t, p)
+    return True, "verify heads of 16..1024 rows"
 
 
 #: Every lever whose rule is not the default; every other served lever is on under ``auto``
 #: and ``baseline``.
 RULES: Mapping[str, Rule] = types.MappingProxyType(
     {
-        "packed_prep_append": Rule(
-            "HC",
-            Kind.BITWISE,
-            _packed_prep_append,
-            params=(Param("MIN_ROWS", 33, 8, 1024),),
-        ),
-        "windowed_commit_parallel": Rule(
-            "HC",
-            Kind.BITWISE,
-            _windowed_commit_parallel,
-            params=(
-                Param("MIN_REQUESTS", 5, 1, 64, default_for=lambda d: 1 if _hc_selection(d) else 5),
-            ),
-        ),
-        "context_fp8_dense": Rule(
-            "HC",
-            Kind.LOSSY,
-            _lossy,
-            params=(
-                Param("MIN_ROWS", 1024, 1024, 32768),
-                Param(
-                    "PROJECTIONS",
-                    ("qkv", "o_proj", "pool", "unpool"),
-                    choices=("qkv", "o_proj", "pool", "unpool"),
-                ),
-            ),
-        ),
-        "context_fp8_attn_gather": Rule(
-            "HC", Kind.LOSSY, _lossy, after=("context_fp8_dense",), excluded=_attn_gather_excluded
-        ),
-        "wide_direct_transports": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
-        "wide_router_per_row": Rule(
-            "midc",
-            Kind.NUMERIC,
-            _wide_steps,
-            gates=(_router_gate(Role.GEN, "generation servers at tep4 with max_batch_size 2..4"),),
-        ),
-        "wide_oproj_publish": Rule("midc", Kind.BITWISE, _off_at_hc(_wide_steps)),
-        "wide_finalize_transport": Rule(
-            "midc",
-            Kind.BITWISE,
-            _off_at_hc(_always("17..32-token finalize calls on a 32-token transport")),
-        ),
         "lm_head_inbox": Rule(
             "upstream",
             Kind.COMPOSITION,
-            _not_on_sm107(
-                "the sm107 compositions gather the 8-row head without the inbox", "8-row heads"
-            ),
-            baseline=_always("8-row heads"),
+            _always("8-row heads"),
         ),
         "graph_start_qkv_prefetch": Rule(
             "upstream",
             Kind.COMPOSITION,
-            _graph_start_prefetch,
-            baseline=_always("graph starts of split-K row counts"),
-        ),
-        "step_loop_on_execution_stream": Rule(
-            "LL",
-            Kind.BITWISE,
-            _at_most("MAX_BATCH"),
-            params=(Param("MAX_BATCH", 4, 1, 64),),
-        ),
-        "incremental_block_offsets": Rule(
-            "LL",
-            Kind.BITWISE,
-            _at_most("MAX_BATCH"),
-            params=(Param("MAX_BATCH", 8, 1, 64),),
-        ),
-        "drafter_kv_side_chain": Rule(
-            "LL", Kind.BITWISE, _always("decode steps of 1..64 requests over a dense arena")
-        ),
-        "drafter_fc_early_fork": Rule("LL", Kind.BITWISE, _always("forked side-chain steps")),
-        "drafter_preamble_from_commit": Rule(
-            "LL", Kind.BITWISE, _always("folded steps over a dense arena")
-        ),
-        "head_sampler_coop_fold": Rule(
-            "LL",
-            Kind.BITWISE,
-            _off_at_hc(_coop_fold),
-            params=(Param("MAX_ROWS", 16, 1, 128),),
-        ),
-        "head_multimem_gather": Rule(
-            "LL",
-            Kind.FLAGGED,
-            _flagged,
-            requires=("step_loop_on_execution_stream",),
-            conflicts=("lm_head_inbox",),
+            _always("graph starts of split-K row counts"),
         ),
         "half_window_experts": Rule(
             "upstream",
@@ -784,76 +450,16 @@ RULES: Mapping[str, Rule] = types.MappingProxyType(
             after=("half_window_experts",),
             conflicts=("half_window_experts",),
         ),
-        "prefill_cutedsl_experts": Rule(
-            "upstream", Kind.COMPOSITION, _always("expert calls of 4096..8192 rows")
-        ),
         "vocab_parallel_head": Rule(
             "upstream",
             Kind.COMPOSITION,
             _vocab_parallel_head,
-            baseline=_not_on_sm107(
-                "the upstream sm107 compositions sample on the split sampler",
-                "verify heads of 16..1024 rows",
-            ),
             params=(
                 Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
-                Param("MIN_ROWS", 16, 8, 16, default_for=lambda d: 8 if d.sm == 107 else 16),
+                Param("MIN_ROWS", 16, 8, 16),
             ),
         ),
-        **{name: _tep4_path_rule() for name in SM107_TEP8_TEP4_PATHS},
-        # The Vera Rubin low-latency levers.
-        "splitk_pool_split8": _ll(Kind.NUMERIC),
-        "splitk_frontier_tables": _ll(Kind.NUMERIC),
-        "tep8_wide64_splitk": _ll(Kind.NUMERIC),
-        "tep8_publish_splitk": _ll(Kind.NUMERIC),
-        "tep8_drafter_wide_gemms": _ll(Kind.NUMERIC),
-        "tep8_fc_shard_wide": _ll(Kind.NUMERIC),
-        "weight_prefetch_after_join": _ll(Kind.BITWISE),
-        "next_qkv_prefetch_skip": _ll(Kind.BITWISE),
-        "swa_one_cluster_block": _ll(Kind.NUMERIC),
-        "swa_prep_split": _ll(Kind.BITWISE),
-        "swa_eight_requests": _ll(Kind.NUMERIC),
-        "full_attention_fold_multi": _ll(Kind.BITWISE),
-        "split_kv_deep_rings": _ll(Kind.BITWISE),
-        "bf16_half_window": _ll(Kind.NUMERIC),
-        "prerouted_experts": _ll(Kind.BITWISE),
-        "tep8_ring_buddy_wide": _ll(Kind.NUMERIC),
-        "tep8_ring_buddy_pdl": _ll(Kind.BITWISE),
-        "tep8_tile_placement": _ll(Kind.NUMERIC),
-        "tep8_router_push": _ll(Kind.NUMERIC),
-        "tep8_router_prewait": _ll(Kind.BITWISE),
-        "finalize_entry_trigger": _ll(Kind.BITWISE),
-        "tep8_finalize_transport_64": _ll(Kind.BITWISE),
-        "hop_entry_trigger": _ll(Kind.BITWISE),
-        "tep8_early_multicast_hop": _ll(Kind.BITWISE),
-        "tep8_direct_hop": _ll(Kind.BITWISE),
-        "tep8_publish_join": _ll(Kind.BITWISE),
-        "tep8_pool_programmatic_fork": _ll(Kind.BITWISE),
-        "tep8_wide_projection_gathers": _ll(Kind.NUMERIC),
-        "step_commit_v2": _ll(Kind.BITWISE),
-        "wide_norm_gate_pdl": _ll(Kind.BITWISE),
-        "drafter_kv_glue": Rule(
-            "LL",
-            Kind.BITWISE,
-            _drafter_kv_glue,
-            params=_ll_params(),
-            after=("drafter_kv_side_chain",),
-            conflicts=("drafter_kv_side_chain",),
-        ),
-        "drafter_kv_fork_before_head": _ll(Kind.BITWISE),
-        "context_sp_extra_parts": Rule(
-            "LL",
-            Kind.BITWISE,
-            _context_workers,
-            params=(
-                Param("MAX_BATCH", LL_MAX_BATCH, 1, 64),
-                Param(
-                    "PARTS",
-                    ("router_input", "ce_gather"),
-                    choices=("shard_routing", "router_input", "ce_gather"),
-                ),
-            ),
-        ),
+        **{name: _tep4_path_rule() for name in TEP4_PATHS},
     }
 )
 
@@ -1088,7 +694,11 @@ def role_of(snapshot: Mapping[str, str], disaggregated: Optional[bool]) -> Tuple
 
 
 def deployment_of(
-    model_config, compute_capability, arena: Arena, engine_facts, snapshot: Mapping[str, str]
+    model_config,
+    compute_capability,
+    arena: Arena,
+    engine_facts,
+    snapshot: Mapping[str, str],
 ) -> Deployment:
     """The ``Deployment`` of a model: its config's mapping, the device, the arena and the engine.
 
@@ -1312,15 +922,6 @@ def resolve(
                     f"{name} ({decision.source}) and {other} ({decisions[other].source}) cannot "
                     f"both be on; set {knob_name(other)}=off or {knob_name(name)}=off"
                 )
-    # The MXFP8 copy takes any call of MIN_ROWS rows or more, context rows or not.
-    fp8 = decisions.get("context_fp8_dense")
-    if fp8 is not None and fp8.on and d.decodes() and d.reaches(int(fp8.params["MIN_ROWS"])):
-        errors.append(
-            f"{knob_name('context_fp8_dense')}=on, but decode steps of {fp8.params['MIN_ROWS']} "
-            f"rows or more are reachable at max_batch_size {_count(d.max_batch_size)}, and the "
-            f"MXFP8 copy would take them too; set {knob_name('context_fp8_dense', 'MIN_ROWS')} "
-            f"above max_batch_size * {d.rows_per_request}"
-        )
     for name, mode in knobs.modes.items():
         if name in served:
             continue

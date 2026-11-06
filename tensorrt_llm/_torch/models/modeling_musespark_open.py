@@ -47,7 +47,8 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
 - ``MUSESPARK_OPEN_FUSED_PREATTN`` (default OFF, opt-in): fused pre-attention.
 - ``MUSESPARK_OPEN_ALLREDUCE`` (default NCCL): all-reduce strategy name.
 - ``MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL`` (default off): shard replicated
-  prefill work across single-node BF16 TP4/EP4 ranks.
+  prefill work across single-node BF16 TP4/EP4 ranks;
+  ``MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS`` (default 4096) sets the smallest step split.
 - ``MUSESPARK_OPEN_BF16X3_ROUTER`` (default off): BF16x3 projection for large routers.
 - ``MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES`` (default off): fuse large-batch routing;
   ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
@@ -93,11 +94,13 @@ from ..attention.backends.interface import (
 )
 from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce, AllReduceParams, allgather, reducescatter
+from ..distributed.ops import MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant_available
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.logit_soft_cap import soft_capped_logits
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
@@ -1636,8 +1639,7 @@ class MuseSparkOpenLogitsProcessor(LogitsProcessor):
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         logits = super().forward(hidden_states, lm_head, attn_metadata, return_context_logits)
-        logits = logits.float() * self.logit_multiplier
-        return self.soft_cap * torch.tanh(logits / self.soft_cap)
+        return soft_capped_logits(logits, self.logit_multiplier, self.soft_cap)
 
 
 def _attention_allreduce_strategy() -> AllReduceStrategy:
@@ -1960,6 +1962,78 @@ def _pad_sequence_parallel_tokens(tensor: torch.Tensor, tp_size: int) -> torch.T
     if padding == 0:
         return tensor
     return torch.cat((tensor, tensor.new_zeros((padding, *tensor.shape[1:]))), dim=0)
+
+
+#: Smallest step, in tokens, that prefill sequence parallelism shards by default.
+_PREFILL_SP_MIN_TOKENS = 4096
+#: Lowest accepted override. The sharded step keeps the full-row MoE finalize and
+#: the per-shard unpooler, so it must stay above the fused finalize + all-reduce
+#: (at most 512 tokens) and give every shard more rows than the sharded small-batch
+#: projections take (8), or those paths would reduce or gather across ranks that
+#: hold different tokens.
+_PREFILL_SP_MIN_TOKENS_FLOOR = 1024
+
+
+def _prefill_sp_min_tokens() -> int:
+    """Smallest step that MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL shards.
+
+    MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS overrides the default; values below
+    ``_PREFILL_SP_MIN_TOKENS_FLOOR`` are refused. Steps at or below the largest
+    prefill CUDA graph bucket are captured with the split when they reach the
+    threshold, so the choice is fixed for the engine's lifetime.
+    """
+    value = os.environ.get("MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS", "").strip()
+    if not value:
+        return _PREFILL_SP_MIN_TOKENS
+    try:
+        tokens = int(value)
+    except ValueError:
+        tokens = 0
+    if tokens < _PREFILL_SP_MIN_TOKENS_FLOOR:
+        logger.warning(
+            f"MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS={value!r} is not a token count of at least "
+            f"{_PREFILL_SP_MIN_TOKENS_FLOOR}; keeping {_PREFILL_SP_MIN_TOKENS}"
+        )
+        return _PREFILL_SP_MIN_TOKENS
+    return tokens
+
+
+def _reserve_mnnvl_all_reduce_workspace(layers: nn.ModuleList, max_num_tokens: int) -> None:
+    """Size every MNNVL all-reduce workspace the layers use for a full replicated step.
+
+    An MNNVL workspace is shared per mapping and grows to the largest message
+    seen; growing it releases the old buffer, while CUDA graphs captured earlier
+    keep its address. Without sequence parallelism the max-shape warmups reach
+    the largest message before any capture. With it, those warmups are sharded
+    and send no all-reduce, so the first large replicated message would be a
+    prefill graph capture, which comes after the decode graphs.
+
+    The workspace is looked up by the reducer's own mapping and dtype. The
+    attention output projection builds its own mapping, which differs from the
+    model mapping (it carries no expert parallelism), so reserving under the
+    model mapping would leave the attention workspace at its initial size.
+    """
+    required: Dict[Tuple[Mapping, torch.dtype], int] = {}
+    for layer in layers:
+        o_proj = layer.self_attn.o_proj
+        candidates = (
+            (getattr(o_proj, "all_reduce", None), o_proj.out_features),
+            (
+                getattr(layer.feed_forward, "all_reduce", None),
+                layer.feed_forward.expert_hidden_size,
+            ),
+        )
+        for reducer, width in candidates:
+            mnnvl = getattr(reducer, "mnnvl_allreduce", None)
+            if mnnvl is None:
+                continue
+            key = (mnnvl.mapping, mnnvl.dtype)
+            size = MNNVLAllReduce.get_required_workspace_size(
+                max_num_tokens, width, mnnvl.mapping.tp_size, mnnvl.dtype
+            )
+            required[key] = max(required.get(key, 0), size)
+    for (mapping, dtype), size in required.items():
+        get_or_scale_allreduce_mnnvl_workspace(mapping, dtype, buffer_size_bytes=size)
 
 
 class MuseSparkOpenMoE(nn.Module):
@@ -2779,6 +2853,12 @@ def _build_finalize_ar_workspace(
 
 
 class MuseSparkOpenModel(DecoderModel):
+    #: Smallest step the prefill sequence-parallel split shards; set per instance.
+    _prefill_sp_min_tokens: int = _PREFILL_SP_MIN_TOKENS
+    #: Rows the MNNVL all-reduce workspaces are sized for at the first eager forward
+    #: under prefill sequence parallelism; None once reserved, or with the split off.
+    _mnnvl_reserve_tokens: Optional[int] = None
+
     def __init__(self, model_config: ModelConfig[MuseSparkOpenConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
@@ -2810,6 +2890,8 @@ class MuseSparkOpenModel(DecoderModel):
         self._sp_mapping = mapping
         self._prefill_sp_enabled = os.getenv("MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL", "0") == "1"
         if self._prefill_sp_enabled:
+            # The threshold and the workspace reservation exist only with the split on.
+            self._prefill_sp_min_tokens = _prefill_sp_min_tokens()
             if not (
                 mapping.tp_size == 4
                 and mapping.moe_ep_size == 4
@@ -2825,7 +2907,11 @@ class MuseSparkOpenModel(DecoderModel):
                 )
             ):
                 raise ValueError("Prefill sequence parallelism requires single-node BF16 TP4/EP4")
-            logger.info("MuseSparkOpen prefill sequence parallelism enabled for >=4096 tokens")
+            logger.info(
+                "MuseSparkOpen prefill sequence parallelism enabled for "
+                f">={self._prefill_sp_min_tokens} tokens"
+            )
+            self._mnnvl_reserve_tokens = model_config.max_num_tokens
         local_finalize_tp4 = (
             mapping.tp_size == 4
             and len({rank // mapping.gpus_per_node for rank in mapping.tp_group}) == 1
@@ -2904,6 +2990,21 @@ class MuseSparkOpenModel(DecoderModel):
         )
         self.dtype = config.torch_dtype
 
+    def _reserve_mnnvl_workspaces_once(self) -> None:
+        """Reserve the MNNVL all-reduce workspaces before the first CUDA graph capture.
+
+        Runs at the first forward that is not captured, an eager warmup (or
+        memory-profiling) step. That is where the replicated max-shape step would
+        have grown the workspaces, so the reservation takes the same memory at the
+        same point relative to KV cache sizing, and it comes before any graph holds
+        a workspace address. All TP ranks run that forward together, as the
+        workspace exchange requires.
+        """
+        if self._mnnvl_reserve_tokens is None or torch.cuda.is_current_stream_capturing():
+            return
+        _reserve_mnnvl_all_reduce_workspace(self.layers, self._mnnvl_reserve_tokens)
+        self._mnnvl_reserve_tokens = None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2914,6 +3015,8 @@ class MuseSparkOpenModel(DecoderModel):
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
+        if self._mnnvl_reserve_tokens is not None:
+            self._reserve_mnnvl_workspaces_once()
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         embeds = self.embed_norm(inputs_embeds.to(self.dtype))
@@ -2924,7 +3027,7 @@ class MuseSparkOpenModel(DecoderModel):
             self._prefill_sp_enabled
             and not torch.compiler.is_compiling()
             and attn_metadata.num_contexts > 0
-            and embeds.shape[0] >= 4096
+            and embeds.shape[0] >= self._prefill_sp_min_tokens
             and kwargs.get("spec_metadata") is None
             and kwargs.get("lora_params") is None
             and kwargs.get("all_reduce_params") is None

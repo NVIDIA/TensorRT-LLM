@@ -100,7 +100,6 @@ calls of ``SpecDecOneEngineForCausalLM.forward``.
 
 from __future__ import annotations
 
-import socket
 import time
 from typing import Optional
 
@@ -109,6 +108,7 @@ import torch
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenLogitsProcessor
 from tensorrt_llm._torch.modules import low_m_gemm as _low_m
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.logit_soft_cap import soft_capped_logits
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
@@ -197,118 +197,6 @@ def context_kv_head_fork(lm_head) -> tuple:
     return True, vars(lm_head).get("_context_kv_fork")
 
 
-# ---- The logits all-gather over MULTIMEM (``head_multimem_gather``) ----
-#: With ``head_multimem_gather`` (and no ``lm_head_inbox``), ``TargetHead`` gathers the LM
-#: head's shards of a ``MULTIMEM_GATHER_ROWS``-row call with
-#: ``torch.ops.symm_mem.multimem_all_gather_out`` (one kernel, NVSwitch multicast stores, a
-#: barrier before and after) into a symmetric-memory buffer instead of the NCCL ring, then
-#: joins the shards with the built-in gather's own ``cat`` statement. A copy of the same bytes:
-#: the logits are the built-in ones bit for bit.
-MULTIMEM_GATHER_ROWS = GATHER_ROWS
-
-
-def _torch_dist_world(mapping) -> None:
-    """A ``torch.distributed`` WORLD group over the MPI ranks, created once if none exists.
-
-    Collective over the TP group (the host all-gather of rank 0's rendezvous address). Only
-    a group whose TP group is the whole MPI world is supported (``MultimemGather.reason``).
-    """
-    import torch.distributed as dist
-
-    from ... import dispatch as _dispatch
-
-    if dist.is_initialized():
-        return
-    # Rank 0's host and a port free on it right now (an inherited MASTER_PORT may be taken).
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        port = int(sock.getsockname()[1])
-    try:
-        addr = socket.gethostbyname(socket.gethostname())
-    except OSError:
-        addr = "127.0.0.1"
-    everyone = _dispatch.Distributed.get(mapping).tp_allgather((addr, port), small_payload=True)
-    addr, port = everyone[0]
-    dist.init_process_group(
-        backend="cuda:nccl,cpu:gloo",
-        init_method=f"tcp://{addr}:{port}",
-        rank=mapping.tp_rank,
-        world_size=mapping.tp_size,
-        device_id=torch.device("cuda", torch.cuda.current_device()),
-    )
-
-
-class MultimemGather:
-    """This rank's MULTIMEM gather of the LM head's ``[MULTIMEM_GATHER_ROWS, shard]`` BF16 shard."""
-
-    @staticmethod
-    def reason(mapping, lm_head) -> Optional[str]:
-        """Why the MULTIMEM gather cannot stand in for the head's all-gather here, or None (rank-local)."""
-        try:
-            import torch.distributed._symmetric_memory  # noqa: F401
-        except ImportError as e:
-            return f"no torch symmetric memory ({e})"
-        if not hasattr(torch.ops.symm_mem, "multimem_all_gather_out"):
-            return "torch has no symm_mem.multimem_all_gather_out"
-        from tensorrt_llm._utils import mpi_world_size
-
-        if mpi_world_size() != mapping.tp_size or list(mapping.tp_group) != list(
-            range(mapping.tp_size)
-        ):
-            return "the TP group is not the whole MPI world"
-        if lm_head.lora is not None:
-            return "the LM head has LoRA"
-        if (int(lm_head.weight.shape[0]) * 2) % 4:
-            return "a shard row is not a whole number of 4-byte words"
-        return None
-
-    def __init__(self, mapping, shard: int, device: torch.device) -> None:
-        """Collective over the TP group: the process group, the buffer and its rendezvous."""
-        import torch.distributed as dist
-        import torch.distributed._symmetric_memory as symm_mem
-
-        _torch_dist_world(mapping)
-        self.world = int(mapping.tp_size)
-        self.shard = int(shard)
-        self.group_name = str(dist.group.WORLD.group_name)
-        try:
-            symm_mem.enable_symm_mem_for_group(self.group_name)
-        except (AttributeError, RuntimeError):
-            pass  # torch builds that enable it implicitly
-        self.buffer = symm_mem.empty(
-            (self.world * MULTIMEM_GATHER_ROWS, self.shard), dtype=torch.bfloat16, device=device
-        )
-        handle = symm_mem.rendezvous(self.buffer, self.group_name)
-        self.multicast = bool(handle.multicast_ptr)
-
-    def takes(self, hidden_states: torch.Tensor, lm_head) -> bool:
-        return (
-            self.multicast
-            and hidden_states.shape[0] == MULTIMEM_GATHER_ROWS
-            and int(lm_head.weight.shape[0]) == self.shard
-        )
-
-    def __call__(self, lm_head: Linear, hidden_states: torch.Tensor) -> torch.Tensor:
-        """``Linear.forward`` of the column-parallel gathered head, with the MULTIMEM gather.
-
-        ``apply_linear`` as the built-in forward calls it (so a fork point bound on the
-        instance fires), then ``_allgather``'s statements with the transport swapped:
-        ``view(-1, numel_base)``, the gather into ``[world * rows, shard]``, ``chunk`` and
-        ``cat`` along the last dim.
-        """
-        from tensorrt_llm._torch.distributed.ops import get_output_info
-
-        local = lm_head.apply_linear(hidden_states, lm_head.bias, None, None)
-        info = get_output_info(local, -1)
-        flat = local.contiguous().view(-1, info["numel_base"])
-        # The NCCL op gathers ``flat`` along its dim 0: the ranks' blocks back to back.
-        out = self.buffer.view(-1)[: self.world * flat.numel()].view(
-            self.world * flat.shape[0], flat.shape[1]
-        )
-        torch.ops.symm_mem.multimem_all_gather_out(flat, self.group_name, out)
-        return torch.cat([x.reshape(info["output_shape"]) for x in out.chunk(self.world)], dim=-1)
-
-
 class TargetHead:
     """The state the re-classed processor and worker share: the step's pending BF16 row."""
 
@@ -316,14 +204,6 @@ class TargetHead:
     vp: Optional[_hs.VocabParallelWorkspace] = None
     #: This rank's ``[rows, shard]`` LM-head output while a vocab-parallel row is pending.
     pending_local: Optional[torch.Tensor] = None
-
-    #: ``head_multimem_gather``'s MULTIMEM gather, when every rank built it.
-    multimem: Optional["MultimemGather"] = None
-    #: Why ``head_multimem_gather`` asked for the gather and has none (agreed), or None.
-    multimem_refusal: Optional[str] = None
-    #: ``head_sampler_coop_fold``'s MAX_ROWS: head calls of at most this many rows run kernel A
-    #: with the soft cap computed by the whole CTA (0: never).
-    coop_max_rows: int = 0
 
     def __init__(
         self,
@@ -333,8 +213,6 @@ class TargetHead:
         mapping,
         gather: bool,
         vocab_parallel: bool = False,
-        multimem_gather: bool = False,
-        coop_max_rows: int = 0,
     ) -> None:
         self.multiplier = float(processor.logit_multiplier)
         self.soft_cap = float(processor.soft_cap)
@@ -342,7 +220,6 @@ class TargetHead:
         self.gather = gather
         self.pdl = LAUNCH_PDL
         self.device = lm_head.weight.device
-        self.coop_max_rows = int(coop_max_rows)
         start = time.perf_counter()
         # Both loads are collective: every rank loads the library, then the group agrees,
         # so a rank whose load fails cannot leave the others waiting.
@@ -366,31 +243,6 @@ class TargetHead:
             self.vp = _hs.VocabParallelWorkspace(
                 mapping, int(lm_head.weight.shape[0]), self.max_rows
             )
-        # head_multimem_gather: the MULTIMEM logits gather of MULTIMEM_GATHER_ROWS-row steps,
-        # when every rank can build it (collective). Its row band (8) is below
-        # vocab_parallel_head's (VP_MIN_ROWS..max_rows), so the two never take the same step
-        # (``produce``); the inbox gathers the same steps, so the plan never carries both.
-        self.multimem = None
-        self.multimem_refusal = None
-        if multimem_gather:
-            if gather:
-                raise ValueError(
-                    "[musespark_open] head_multimem_gather: lm_head_inbox gathers the same steps"
-                )
-            if self.vp is not None and MULTIMEM_GATHER_ROWS >= _hs.VP_MIN_ROWS:
-                raise ValueError(
-                    "[musespark_open] head_multimem_gather: its row band overlaps "
-                    "vocab_parallel_head's"
-                )
-            refusal = _tp_agreement.agreed_refusal(mapping, MultimemGather.reason(mapping, lm_head))
-            if refusal is None:
-                self.multimem = MultimemGather(mapping, int(lm_head.weight.shape[0]), self.device)
-                refusal = _tp_agreement.agreed_refusal(
-                    mapping, None if self.multimem.multicast else "no multicast pointer"
-                )
-                if refusal is not None:
-                    self.multimem = None
-            self.multimem_refusal = refusal
         self.load_seconds = time.perf_counter() - start
         self.pending: Optional[torch.Tensor] = None
         self.pending_inbox = False
@@ -497,9 +349,6 @@ class TargetHead:
                 fork.fire("head")
             logits = self.workspace.gathered[:rows]
             self.pending_inbox = True
-        elif self.multimem is not None and self.multimem.takes(hidden_states, lm_head):
-            logits = self.multimem(lm_head, hidden_states)
-            self.pending_inbox = False
         else:
             logits = lm_head(hidden_states)
             self.pending_inbox = False
@@ -586,7 +435,6 @@ class TargetHead:
             self.soft_cap,
             self.states if logits.shape[0] <= _hs.MAX_ROWS else self.wide_states,
             self.pdl,
-            coop_max_rows=self.coop_max_rows,
         )
 
     def vocab_parallel(self, logits) -> bool:
@@ -640,13 +488,13 @@ class TargetHead:
     def materialize(self, logits: torch.Tensor) -> torch.Tensor:
         """The built-in processor's FP32 capped logits for the pending row; consumes it."""
         gathered = self._gather_now(logits)
-        return _hs.reference_capped(
+        return soft_capped_logits(
             logits if gathered is None else gathered, self.multiplier, self.soft_cap
         )
 
     def drain(self) -> None:
-        """Consume a pending row nothing sampled (resets its inbox words; a vocab-parallel row
-        has none, and is dropped without a gather)."""
+        """Consume a pending row nothing sampled (resets its inbox words; a vocab-parallel row has
+        none, and is dropped without a gather)."""
         if self.pending_local is not None:
             self.pending = None
             self.pending_local = None
@@ -896,18 +744,12 @@ def install(
     mapping,
     gather: bool,
     vocab_parallel: bool = False,
-    multimem_gather: bool = False,
-    coop_max_rows: int = 0,
 ) -> "TargetHead":
     """Install the split sampler on the target's processor and DFlash worker; returns the head.
 
     Idempotent. With ``gather`` (``lm_head_inbox``) the LM-head GEMM also writes into the
     multicast inbox the sampler gathers; without it (``split_sampler``) the sampler takes
-    the built-in all-gather's logits, or, with ``multimem_gather``
-    (``head_multimem_gather``), the 8-row steps' logits gathered over MULTIMEM (the head's
-    ``multimem``, or its ``multimem_refusal``). ``coop_max_rows``
-    (``head_sampler_coop_fold``'s MAX_ROWS, 0 for off) is the largest head call whose
-    kernel A computes the soft cap with the whole CTA.
+    the built-in all-gather's logits.
 
     Call after the drafter fast paths (``draft_head`` re-classes only the built-in worker
     class; ``fused_accept`` composes with a class derived from it). A fast path that
@@ -937,8 +779,6 @@ def install(
         mapping,
         gather,
         vocab_parallel,
-        multimem_gather=multimem_gather,
-        coop_max_rows=coop_max_rows,
     )
     processor.__class__ = SplitSamplerLogitsProcessor
     processor._split_head = head
@@ -949,18 +789,6 @@ def install(
             ", LM-head GEMM into a multicast inbox gathered by the sampler "
             f"(poll timeout {_hs.POLL_TIMEOUT_S} s)"
             if gather
-            else ""
-        )
-        + (
-            f"; head_multimem_gather: the {MULTIMEM_GATHER_ROWS}-row steps' logits all-gathered "
-            "over MULTIMEM"
-            if head.multimem is not None
-            else ""
-        )
-        + (
-            f"; head_sampler_coop_fold: kernel A's soft cap by the whole CTA up to "
-            f"{head.coop_max_rows} rows"
-            if head.coop_max_rows
             else ""
         )
         + (

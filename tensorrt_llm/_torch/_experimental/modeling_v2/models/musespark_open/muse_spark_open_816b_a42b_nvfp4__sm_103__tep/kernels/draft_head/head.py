@@ -111,6 +111,8 @@ TRANSFORM_METHOD = "apply_draft_logit_transform"
 STALE_TABLES = "the drafter's logit_multiplier or logit_softcap differs from the install's"
 #: Why a step takes the built-in path: its bf16 logits are not the shard the transform deferred.
 NOT_DEFERRED = "the draft logits are not the shard the deferring transform handed back"
+#: Why the sharded selector does not take a step: its drafts are sampled (rejection sampling).
+SAMPLED_DRAFTS = "sampled drafts"
 
 #: Largest shard the 16-bit column field of a shard key holds.
 MAX_SHARD = 65536
@@ -436,7 +438,7 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         ):
             return "draft logits outside the [B, K, shard] layout"
         if spec_metadata.wants_advanced_draft_sampling:
-            return "sampled drafts"
+            return SAMPLED_DRAFTS
         if self._d2t is not None:
             return "a d2t draft vocab map"
         return None
@@ -574,7 +576,8 @@ class ShardedDraftHeadDFlashWorker(DFlashWorker):
         tokens = getattr(logits, TOKENS_ATTR, None)
         if tokens is not None:
             return tokens
-        return super().sample_draft_tokens(logits, spec_metadata, batch_size, **kwargs)
+        tokens = super().sample_draft_tokens(logits, spec_metadata, batch_size, **kwargs)
+        return tokens
 
 
 def unsupported_reason(worker, draft_model) -> str | None:

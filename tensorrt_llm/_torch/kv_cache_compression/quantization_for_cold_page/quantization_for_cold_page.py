@@ -22,6 +22,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
+        lossless_layers: frozenset[int] = frozenset(),
     ) -> object:
         """Create one native codec with state isolated to this KVCM."""
 
@@ -34,6 +35,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
             num_kv_heads_per_layer=num_kv_heads_per_layer,
             head_dim_per_layer=head_dim_per_layer,
             is_draft=is_draft,
+            lossless_layers=lossless_layers,
         )
         return native.create_python_cold_page_codec(self, codec_state)
 
@@ -62,6 +64,7 @@ class ColdPageQuantizationCompression(KVCacheCompressionManager):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
+        lossless_layers: frozenset[int] = frozenset(),
     ) -> object:
         """Build the format-specific state owned by one native codec."""
         raise NotImplementedError

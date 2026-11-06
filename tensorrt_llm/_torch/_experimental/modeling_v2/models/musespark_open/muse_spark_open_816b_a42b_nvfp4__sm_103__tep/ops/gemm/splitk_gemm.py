@@ -9,15 +9,13 @@ to rank 0 through DSMEM; rank 0 reduces, casts, and stores once. The public
 use kernel coordinates: kernel-M carries public N and kernel-N carries public M.
 
 This target's copy of flashinfer's ``flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py``
-with four optional changes merged in. Each is a setting of ``configure``, off by default; with
+with three optional changes merged in, each a module setting off by default; with
 all of them off this is flashinfer's kernel:
 
 * ``mailbox_v4``: the conflict-free mailbox layout, same bits.
 * ``rs_split_k``: the reduce-scatter epilogue at the listed split-K sizes, same bits; with it on,
   split_k 8 is served too.
 * ``wide64``: 64-wide kernel-N tiles and up to 64 public rows.
-* ``oversized_smem``: the device's oversized shared memory, where the driver reports it, for
-  deeper pipelines.
 
 CuTe DSL names a kernel after its class's module path and name, so this module's kernel is
 ``...__sm_103__tepopsgemmsplitk_gemmSplitKDenseGemmKernel...`` where flashinfer's was
@@ -29,7 +27,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import hashlib
 import sys
 from typing import Tuple
 
@@ -48,116 +45,13 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
-#: ``oversized_smem`` (``configure``) lets a tactic use the device's oversized shared memory.
-#: The capacity is the device's CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK, read at
-#: run time, served once the function's CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE is
-#: ALLOW_OVERSIZED_SHARED_MEMORY; it is never below the per-block opt-in above. Deeper pipelines
-#: stage more of the weight before the dependency wait; the stage count changes no arithmetic, so
-#: a tactic's bits depend only on its split_k as before. A tactic that fits the opt-in launches
-#: exactly as with the setting off (the opt-in request and its carveout); only a deeper one
-#: requests the oversized capacity, through
-#: ``_install_oversized_mode``'s CuTe DSL hook. Without the device attribute or the driver's
-#: shared-memory mode the capacity stays at the opt-in. ``configure`` sets
-#: ``_SMEM_CAPACITY_BYTES`` and the stage cap ``_MAX_AB_STAGES`` from it; off they are the opt-in
-#: and 12.
 _OPTIN_SMEM_BYTES = _SMEM_CAPACITY_BYTES
 
-#: The settings ``configure`` sets; all off is flashinfer's kernel. Each is described where it
-#: is read: ``_mailbox_v4_enabled``, ``_rs_for``, ``_wide64_enabled``, and the oversized capacity
-#: above.
+#: The settings; all off is flashinfer's kernel. Each is described where it
+#: is read: ``_mailbox_v4_enabled``, ``_rs_for``, ``_wide64_enabled``.
 _MAILBOX_V4 = False
-_OVERSIZED_SMEM = False
 _RS_SPLIT_K: Tuple[int, ...] = ()
 _WIDE64 = False
-
-
-def _oversized_capacity() -> int:
-    try:
-        _cuda.cuInit(0)
-        err, dev = _cuda.cuDeviceGet(0)
-        if int(err) != 0:
-            return _OPTIN_SMEM_BYTES
-        attr = _cuda.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK
-        _ = _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE
-        _ = _cuda.CUsharedMemoryMode.CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY
-        err, value = _cuda.cuDeviceGetAttribute(attr, dev)
-        return max(_OPTIN_SMEM_BYTES, int(value)) if int(err) == 0 else _OPTIN_SMEM_BYTES
-    except Exception:  # noqa: BLE001 - an older driver or bindings keep the opt-in
-        return _OPTIN_SMEM_BYTES
-
-
-def _install_oversized_mode() -> None:
-    """CuTe DSL sets a kernel's CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES from its launch request through
-    ``base_dsl.runtime.cuda.set_kernel_attribute``; that attribute refuses values above the opt-in even in the
-    oversized mode, so a request above the opt-in sets CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE = ALLOW_OVERSIZED instead.
-    Requests within the opt-in pass through unchanged (any kernel, any module)."""
-    from cutlass.base_dsl.runtime import cuda as _dsl_cuda
-
-    if getattr(_dsl_cuda.set_kernel_attribute, "_musespark_splitk_oversized", False):
-        return
-    original = _dsl_cuda.set_kernel_attribute
-    mode = int(_cuda.CUsharedMemoryMode.CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY)
-    mode_attr = _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE
-
-    def set_kernel_attribute(kernel, attribute, value, device=None):
-        if (
-            attribute == _cuda.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
-            and int(value) > _OPTIN_SMEM_BYTES
-        ):
-            if device is None:
-                result = _cuda.cuFuncSetAttribute(kernel, mode_attr, mode)
-            else:
-                result = _cuda.cuKernelSetAttribute(mode_attr, mode, kernel, device)
-            err = result[0] if isinstance(result, tuple) else result
-            if int(err) != 0:
-                raise RuntimeError(
-                    f"split-K oversized shared memory: CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE failed ({err})"
-                )
-            return None
-        return original(kernel, attribute, value, device)
-
-    set_kernel_attribute._musespark_splitk_oversized = True
-    _dsl_cuda.set_kernel_attribute = set_kernel_attribute
-
-
-def configure(
-    *,
-    mailbox_v4: bool = False,
-    oversized_smem: bool = False,
-    rs_split_k: Tuple[int, ...] = (),
-    wide64: bool = False,
-) -> None:
-    """Set the kernel's optional changes; with all of them off this is flashinfer's kernel.
-
-    ``lever_settings.apply`` sets them from the model's plan before any install, so before any
-    split-K tactic is validated, compiled or launched.
-
-    Args:
-        mailbox_v4: the conflict-free split-K mailbox layout (bitwise the same output).
-        oversized_smem: tactics may use the device's oversized shared memory per CTA (deeper
-            pipelines, the same bits); a tactic above the opt-in launches in the oversized mode.
-        rs_split_k: the split-K sizes whose calls take the reduce-scatter epilogue (bitwise the
-            same output); any size also lets split_k 8 validate. Empty: the epilogue is off.
-        wide64: tactics with 64-wide kernel-N tiles and calls of up to 64 public rows.
-    """
-    global _MAILBOX_V4, _OVERSIZED_SMEM, _RS_SPLIT_K, _WIDE64, _SMEM_CAPACITY_BYTES, _MAX_AB_STAGES
-    _MAILBOX_V4 = bool(mailbox_v4)
-    _RS_SPLIT_K = tuple(int(split_k) for split_k in rs_split_k)
-    _WIDE64 = bool(wide64)
-    _OVERSIZED_SMEM = bool(oversized_smem)
-    _SMEM_CAPACITY_BYTES = _OPTIN_SMEM_BYTES
-    if _OVERSIZED_SMEM:
-        _SMEM_CAPACITY_BYTES = _oversized_capacity()
-        if _SMEM_CAPACITY_BYTES > _OPTIN_SMEM_BYTES:
-            _install_oversized_mode()
-        print(
-            "[musespark_open] splitk_gemm: oversized_smem: split-K tactics may use "
-            f"{_SMEM_CAPACITY_BYTES} B of shared memory per CTA (opt-in {_OPTIN_SMEM_BYTES} B); "
-            "deeper tactics launch in the oversized shared-memory mode",
-            flush=True,
-        )
-    _MAX_AB_STAGES = 20 if _SMEM_CAPACITY_BYTES > _OPTIN_SMEM_BYTES else 12
-    _RS_ANNOUNCED.clear()
 
 
 #: K extent of one CTA tile.
@@ -403,16 +297,12 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
 __all__ = [
     "SplitKTactic",
     "autotune_tactics",
-    "configure",
     "default_tactic",
-    "producer_key",
     "run_splitk_dense",
     "serve_flashinfer_path",
 ]
 
 
-# ---- device code begin: the kernel and its compilation. ``producer_key`` fingerprints the code lines between this
-# ---- marker and the end marker (comment and blank lines excluded); an edit there needs a new producer census.
 @dsl_user_op
 def _map_shared_rank(
     smem_ptr: "cute.Pointer",
@@ -490,7 +380,7 @@ class SplitKDenseGemmKernel:
         # ``mailbox_v4`` lays the split-K mailbox out as
         # [peer][value group of 4][epilogue thread][4] instead of [peer][epilogue thread][value].
         self.mailbox_v4 = mailbox_v4
-        # ``rs``: the reduce-scatter epilogue (``configure``'s ``rs_split_k``).
+        # ``rs``: the reduce-scatter epilogue (``rs_split_k``).
         self.rs = rs and tactic.split_k > 1
         self.acc_dtype = cutlass.Float32
         self.cta_m = tactic.mma_m
@@ -1190,9 +1080,6 @@ def _get_compiled_splitk_kernel(
     return compiled
 
 
-# ---- device code end
-
-
 def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
     tensors = (a, b, out) + ((bias,) if bias is not None else ())
     if any(not isinstance(tensor, _torch.Tensor) for tensor in tensors):
@@ -1223,7 +1110,7 @@ def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
     return m, n, k
 
 
-#: ``mailbox_v4`` (``configure``) compiles the split-K kernels with the conflict-free mailbox
+#: ``mailbox_v4`` compiles the split-K kernels with the conflict-free mailbox
 #: layout. The original layout strides the 128 epilogue threads by ``values_per_thread`` FP32
 #: words, a ``values_per_thread``-way shared-memory bank conflict for the peers' ``st.async`` and
 #: the owner's reads (16-way for a 64x32 tile: ~1.06 us of a 5-6 us launch); grouped by 4 values
@@ -1235,7 +1122,7 @@ def _mailbox_v4_enabled() -> bool:
     return _MAILBOX_V4
 
 
-#: ``rs_split_k`` (``configure``) compiles the split-K calls of the listed split-K sizes (> 1)
+#: ``rs_split_k`` compiles the split-K calls of the listed split-K sizes (> 1)
 #: with a reduce-scatter epilogue: each cluster rank reduces and stores one group of epilogue
 #: threads' values instead of rank 0 reducing the whole tile, so a CTA takes (split_k - 1) /
 #: split_k of a tile in partials instead of split_k - 1 tiles. Every output element is still rank
@@ -1270,7 +1157,7 @@ def _rs_for(split_k: int) -> bool:
     return split_k in _RS_SPLIT_K
 
 
-#: ``wide64`` (``configure``) lets a caller name tactics with 64-wide kernel-N tiles (``mma_n``
+#: ``wide64`` lets a caller name tactics with 64-wide kernel-N tiles (``mma_n``
 #: 64) and serve up to 64 public rows (33..64-row TP8 decode steps, 5..8 requests at K = 7), as
 #: the dense dispatcher's ``tep8_wide64`` does for QKV and o_proj. Only validation widens:
 #: ``autotune_tactics`` and ``default_tactic`` keep the stock lists, so the built-in low-M
@@ -1289,7 +1176,7 @@ def _launch_options(rows: int, split_k: int) -> dict:
     """The epilogue options a call of ``rows`` public rows at ``split_k`` compiles with: the
     reduce-scatter epilogue (at the ``rs_split_k`` sizes), else the conflict-free mailbox
     (``mailbox_v4``, or ``wide64``'s calls above 32 rows), else flashinfer's kernel.
-    ``run_splitk_dense`` launches with them and ``producer_key`` keys on them."""
+    ``run_splitk_dense`` launches with them."""
     if _rs_for(split_k):
         return {"mailbox_v4": _mailbox_v4_enabled(), "rs": True}
     if _mailbox_v4_enabled() or (_wide64_enabled() and rows > _MAX_M):
@@ -1323,48 +1210,6 @@ def run_splitk_dense(
     else:
         compiled(*cute_tensors[:3], stream)
     return out
-
-
-@functools.lru_cache(maxsize=None)
-def _device_code_md5() -> str | None:
-    """md5 of the code lines between the device-code markers of this file (comment and blank lines excluded)."""
-    try:
-        with open(__file__, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-        begin = next(
-            i for i, line in enumerate(lines) if line.startswith("# ---- device code begin")
-        )
-        end = next(i for i, line in enumerate(lines) if line.startswith("# ---- device code end"))
-    except (OSError, StopIteration):
-        return None
-    code = [line.rstrip() for line in lines[begin + 1 : end]]
-    code = [line for line in code if line and not line.lstrip().startswith("#")]
-    # A fingerprint of the kernel source, not a security hash.
-    return hashlib.md5("\n".join(code).encode(), usedforsecurity=False).hexdigest()
-
-
-def producer_key(rows: int, tactic: SplitKTactic, use_pdl: bool = True) -> tuple:
-    """What a bias-free call of ``rows`` public rows at ``tactic`` compiles and launches, as a census key.
-
-    ``(device-code md5, tactic, epilogue, mailbox layout, shared-memory request, PDL)``: the device
-    code is the region between the markers above (``_device_code_md5``), the rest is what
-    ``run_splitk_dense`` compiles this call with under this module's settings (``configure``,
-    ``_launch_options``; the request from the kernel's own ``launch_smem``). A producer census
-    (``projection_publish.CERTIFIED_SPLITK_PRODUCERS_TP8``) certified on this key holds through
-    host-side edits elsewhere in this file (settings accessors, tactic tables, comments); a change
-    to the kernel's code or to what a call compiles with is a new key.
-    """
-    kernel = SplitKDenseGemmKernel(
-        tactic=tactic, use_pdl=use_pdl, has_bias=False, **_launch_options(rows, tactic.split_k)
-    )
-    return (
-        _device_code_md5(),
-        dataclasses.astuple(tactic),
-        "reduce-scatter" if kernel.rs else "owner",
-        "v4" if kernel.mailbox_v4 else "flat",
-        "opt-in" if kernel.launch_smem == _OPTIN_SMEM_BYTES else int(kernel.launch_smem),
-        bool(kernel.use_pdl),
-    )
 
 
 #: flashinfer-python's module path of this kernel (0.6.18 ships the stock copy there).

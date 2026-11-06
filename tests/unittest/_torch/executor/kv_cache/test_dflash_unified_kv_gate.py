@@ -419,3 +419,51 @@ def test_rank_pins_auto_to_unify_like_trtllm(tmp_path, monkeypatch, is_disagg):
     assert creator._unified_drafter_attention_backend() == "TRTLLM"
     creator._check_shared_draft_kv_request()  # TRTLLM_DISAGG_SHARED_DRAFT_KV=1 (autouse)
     assert creator._should_unify_dflash_kv_cache()
+
+
+def _cold_page_creator(
+    *, is_disagg=False, backend="TRTLLM", algorithm="quantization_for_cold_page"
+):
+    target = _model_config(kv_heads=8, head_dim=128, kv_quant_algo=QuantAlgo.FP8)
+    draft = _model_config(kv_heads=8, head_dim=128)
+    creator = _creator(is_disagg=is_disagg, target=target, draft=draft)
+    creator._llm_args.kv_cache_compression_config = SimpleNamespace(algorithm=algorithm)
+    creator._sparse_attention_config = None
+    spec = creator._speculative_config
+    spec.attention_backend = backend
+    spec._use_shared_kv_cache = False
+    spec.spec_dec_mode.use_one_engine = lambda: True
+    spec.spec_dec_mode.is_sa = lambda: False
+    return creator
+
+
+def test_cold_page_compression_keeps_the_drafter_in_the_targets_manager():
+    creator = _cold_page_creator()
+
+    assert creator._should_unify_dflash_kv_cache()
+    creator._check_dflash_cold_page_sharing(object())
+
+
+def test_other_compression_keeps_the_drafter_out_of_the_targets_manager():
+    creator = _cold_page_creator(algorithm="triattention")
+
+    assert creator._dflash_unify_blocker() == "KV cache compression 'triattention' is enabled"
+
+
+@pytest.mark.parametrize("backend", ["VANILLA", "FA4"])
+def test_cold_page_compression_admits_a_drafter_without_a_draft_manager(backend):
+    creator = _cold_page_creator(backend=backend)
+
+    assert not creator._should_create_separate_draft_kv_cache()
+    creator._check_dflash_cold_page_sharing(object())
+
+
+def test_cold_page_compression_refuses_a_separate_draft_manager(monkeypatch):
+    monkeypatch.setenv(_SHARED_DRAFT_KV_ENV, "0")
+    creator = _cold_page_creator(is_disagg=True)
+
+    assert creator._should_create_separate_draft_kv_cache()
+    with pytest.raises(ValueError, match="TRTLLM_DISAGG_SHARED_DRAFT_KV"):
+        creator._check_dflash_cold_page_sharing(object())
+    # Without a codec (no compression, or the estimation pass) there is nothing to check.
+    creator._check_dflash_cold_page_sharing(None)

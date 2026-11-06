@@ -89,18 +89,11 @@ def wide_kernel_steps(
     as ``dense_gemms.device_capability`` reads a host without CUDA).
 
     Raises:
-        ValueError: on sm107, whose TEP4 composition serves its 9..32-row projections on
-            ``wide_dense_gemms``' R200 table instead (``dense_gemms`` ``SM107_TP4_WIDE_KERNELS``),
-            and on any other device.
+        ValueError: on any other device.
     """
     capability = (10, 3) if capability is None else tuple(capability)
     if capability == (10, 3):
         return TP4_WIDE_KERNELS
-    elif capability == (10, 7):
-        raise ValueError(
-            "[musespark_open] wide_projection_gathers has no sm107 table: sm107 TEP4 runs its "
-            "9..32-row projections on wide_dense_gemms"
-        )
     else:
         raise ValueError(
             f"[musespark_open] wide_projection_gathers has no table for SM {capability} "

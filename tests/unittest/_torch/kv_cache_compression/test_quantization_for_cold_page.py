@@ -1192,6 +1192,54 @@ def test_lossless_layout_uses_resolved_hot_buffer_bytes() -> None:
     assert metadata.cold_page_bytes == 48
 
 
+def test_lossless_layers_keep_a_shared_drafters_bytes_under_an_fp8_codec() -> None:
+    """A drafter's BF16 layer in the target's FP8 manager is copied whole.
+
+    Layer 0 is the target's (FP8, 1 head x 5 tokens x 32 dims = 160 bytes per
+    buffer) and becomes NVFP4; layer 1 is the drafter's (BF16, 2 heads x 5
+    tokens x 64 dims x 2 bytes = 1280 bytes per buffer) and keeps its bytes.
+    """
+    native, _ = _native()
+    cache_config = SimpleNamespace(
+        tokens_per_block=5,
+        layers=(
+            AttentionLayerConfig(
+                layer_id=0,
+                buffers=[BufferConfig(role="key", size=160), BufferConfig(role="value", size=160)],
+            ),
+            AttentionLayerConfig(
+                layer_id=1,
+                buffers=[
+                    BufferConfig(role="key", size=1280),
+                    BufferConfig(role="value", size=1280),
+                ],
+            ),
+        ),
+    )
+
+    with patch("tensorrt_llm.bindings.internal.kv_cache_compression", new=native):
+        _manager().create_cold_page_codec(
+            cache_config,
+            runtime_dtype=DataType.FP8,
+            pp_layers=(0, 1),
+            num_kv_heads_per_layer=(1, 2),
+            head_dim_per_layer=(32, 64),
+            lossless_layers=frozenset({1}),
+        )
+
+    state = _codec_state(native)
+    assert state.runtime_type == 2
+    assert all(buffer.scales is not None for buffer in state.layer_layouts[0].buffers)
+    assert all(buffer.scales is None for buffer in state.layer_layouts[1].buffers)
+    metadata = _configure_lifecycle(
+        native, {0: {"key": 160, "value": 160}, 1: {"key": 1280, "value": 1280}}
+    )
+    assert metadata.integers[:4, 1].tolist() == [0, 0, 1, 1]
+    # The target's layer packs into 192 bytes; the drafter's follows it whole.
+    assert metadata.wide[2:4, 3].tolist() == [192, 1472]
+    assert metadata.cold_page_bytes == 192 + 2 * 1280
+
+
 @pytest.mark.parametrize(
     ("owns_index", "expected_layers", "expected_buffers", "expected_bytes"),
     [
@@ -1318,16 +1366,20 @@ def test_admitted_dflash_builds_no_draft_kv_cache_and_adds_no_target_layers(
         _speculative_config=spec_config,
         _mapping=SimpleNamespace(enable_attention_dp=enable_attention_dp, pp_size=1),
         _sparse_attention_config=None,
+        _should_unify_dflash_kv_cache=lambda: False,
     )
     assert not util_mod.KvCacheCreator._should_create_separate_draft_kv_cache(creator)
     assert util_mod.get_num_spec_layers(spec_config) == 0
 
 
-def test_speculative_admission_rejects_dflash_with_draft_kv_cache() -> None:
+def test_speculative_admission_accepts_a_trtllm_dflash_drafter() -> None:
+    """Admitted here; the KV cache creator then requires its layers in the target's manager.
+
+    See test_dflash_unified_kv_gate.py.
+    """
     spec_config = DFlashDecodingConfig(max_draft_len=7, attention_backend="TRTLLM")
     assert util_mod.should_use_separate_draft_kv_cache(spec_config)
-    with pytest.raises(ValueError, match="DFlash without a separate draft KV cache"):
-        _validate_compression(spec_config=spec_config)
+    _validate_compression(spec_config=spec_config)
 
 
 def test_qwen35_mtp3_resolves_to_supported_one_model_mode() -> None:
@@ -1369,6 +1421,7 @@ def test_cold_manager_is_disabled_for_estimation_and_active_nvfp4(monkeypatch) -
         )
         creator._model_engine = _factory_model_engine(active_kv_quant=active_kv_quant)
         creator._draft_model_engine = None
+        creator._speculative_config = None
         creator._kv_connector_manager = None
         creator._fp8_ctx_mla_kv_len_cap = None
         creator._is_encoder_decoder = MagicMock(return_value=False)
@@ -1980,6 +2033,43 @@ def test_uniform_windows_count_as_full_attention() -> None:
     assert state.layer_ids == (0, 1)
     _, state = _create_with_types(["full_attention"], (None, None))
     assert state.layer_ids == ()
+
+
+@pytest.mark.parametrize(
+    ("uncompressed_layer_types", "expected_layer_ids", "codec_lossless"),
+    (([], (0, 1, 2, 3, 4), (4,)), (["sliding_window"], (1, 3), ())),
+)
+def test_lossless_layers_follow_the_lifecycle_of_their_window(
+    uncompressed_layer_types, expected_layer_ids, codec_lossless
+) -> None:
+    """A shared manager's draft layer (4) has the target's sliding window, so it shares
+    that lifecycle: the codec copies it whole when the sliding layers are encoded, and
+    leaves it to the lossless default with them, since a lifecycle cannot mix the two."""
+    native, _ = _native()
+    manager = Nvfp4ColdPageQuantizationCompression(
+        ColdPageQuantizationCompressionConfig(uncompressed_layer_types=uncompressed_layer_types),
+        pretrained_config=SimpleNamespace(model_type="muse_spark"),
+    )
+    windows = (2048, None, 2048, None, 2048)
+    _create(
+        manager,
+        _hybrid_window_cache_config(windows),
+        native,
+        pp_layers=tuple(range(len(windows))),
+        num_kv_heads_per_layer=(4,) * len(windows),
+        head_dim_per_layer=(64,) * len(windows),
+        lossless_layers=frozenset({4}),
+    )
+    state = _codec_state(native)
+    assert state.layer_ids == expected_layer_ids
+    assert (
+        tuple(
+            layer_id
+            for layer_id, layout in state.layer_layouts.items()
+            if all(buffer.scales is None for buffer in layout.buffers)
+        )
+        == codec_lossless
+    )
 
 
 def test_uncompressed_layer_types_default_and_validation() -> None:

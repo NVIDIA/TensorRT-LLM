@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import copy
 import gc
 import math
 import os
@@ -300,6 +301,92 @@ def assert_kv_cache_reuse_for_llm(
     assert len(cold_output.token_ids) == output_length
     assert len(warm_output.token_ids) == output_length
     assert warm_output.token_ids == cold_output.token_ids
+
+
+def gsm8k_fewshot_prompts(num_prompts: int, num_shots: int = 5) -> List[str]:
+    """Completion prompts of ``num_shots`` GSM8K train examples and one test question.
+
+    Several hundred tokens each, so a repeated prompt spans many KV-cache
+    blocks. Deterministic: the first ``num_shots`` train examples and the
+    first ``num_prompts`` test questions.
+    """
+    from datasets import load_dataset
+
+    data_dir = f"{llm_models_root()}/datasets/openai/gsm8k/main"
+    dataset = load_dataset("parquet",
+                           data_files={
+                               "train":
+                               f"{data_dir}/train-00000-of-00001.parquet",
+                               "test": f"{data_dir}/test-00000-of-00001.parquet"
+                           })
+    shots = "".join(f"Question: {row['question']}\nAnswer: {row['answer']}\n\n"
+                    for row in dataset["train"].select(range(num_shots)))
+    return [
+        f"{shots}Question: {row['question']}\nAnswer:"
+        for row in dataset["test"].select(range(num_prompts))
+    ]
+
+
+def acceptance_length_cold_and_warm(
+        llm: PyTorchLLM, prompts: List[str],
+        sampling_params: SamplingParams) -> tuple[float, float]:
+    """Acceptance length of ``prompts`` run cold, then again over their cached prefix.
+
+    Each prompt gets its own ``cache_salt``, so the cold pass reuses nothing
+    (not even a prefix the prompts share) and the warm pass reuses each
+    prompt's own blocks; the warm pass is checked to have hit the cache. The
+    target's output is the same on both passes, so a drop in the warm
+    acceptance length can only come from a drafter that lost the reused
+    prefix's context. Requires ``enable_iter_perf_stats=True`` and block reuse.
+
+    Returns:
+        ``(cold, warm)`` mean acceptance lengths.
+    """
+    sampling_params = copy.copy(sampling_params)
+    sampling_params.return_perf_metrics = True
+    salts = [f"acceptance-under-reuse-{i}" for i in range(len(prompts))]
+    # Drop whatever iterations an earlier workload left in the stats queue.
+    llm.get_stats(timeout=2)
+    cold = llm.generate(prompts,
+                        sampling_params=sampling_params,
+                        cache_salt=salts,
+                        use_tqdm=False)
+    cold_al = compute_acceptance_length(llm)
+    warm = llm.generate(prompts,
+                        sampling_params=sampling_params,
+                        cache_salt=salts,
+                        use_tqdm=False)
+    warm_al = compute_acceptance_length(llm)
+
+    def reused_blocks(outputs):
+        return sum(output.outputs[0].request_perf_metrics.kv_cache_metrics.
+                   num_reused_blocks for output in outputs)
+
+    assert reused_blocks(cold) == 0, "the cold pass reused KV-cache blocks"
+    assert reused_blocks(warm) > 0, "the warm pass did not reuse KV cache"
+    print(f"[AL] cold {cold_al:.4f}, warm {warm_al:.4f} "
+          f"({100 * (warm_al / cold_al - 1):+.2f}%)")
+    return cold_al, warm_al
+
+
+def assert_acceptance_length_survives_prefix_reuse(
+        llm: PyTorchLLM,
+        prompts: List[str],
+        sampling_params: SamplingParams,
+        *,
+        min_ratio: float = 0.95) -> tuple[float, float]:
+    """Assert a prefix-cache hit keeps the drafter's acceptance length.
+
+    See ``acceptance_length_cold_and_warm``; the warm acceptance length must
+    be at least ``min_ratio`` of the cold one.
+    """
+    cold_al, warm_al = acceptance_length_cold_and_warm(llm, prompts,
+                                                       sampling_params)
+    assert warm_al >= min_ratio * cold_al, (
+        f"[AL] Prefix-cache reuse cost acceptance length: warm {warm_al:.3f} "
+        f"< {min_ratio} x cold {cold_al:.3f}. The drafter drafts a reused "
+        "prefix without its context.")
+    return cold_al, warm_al
 
 
 class AccuracyTask:

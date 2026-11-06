@@ -128,8 +128,7 @@ its arithmetic at 17..32 tokens too; at TP8 the built-in switches to one CTA
 per token above 16 tokens, which the cluster-8 order is not, so the wide
 layout is TP4-only. A TP8 workspace instead takes its calls of
 17..``TP8_MAX_TOKENS`` itself, on its own layout of that many tokens and the
-flat build (``TP8_MAX_TOKENS`` is ``configure``'s ``tep8_max_tokens``: 16, 32
-or 64, 16 by default; no TP4 workspace uses it).
+flat build (``TP8_MAX_TOKENS``; no TP4 workspace uses it).
 """
 
 from __future__ import annotations
@@ -158,8 +157,7 @@ WIDE_MAX_TOKENS = 32
 LAYOUT_RANK_COUNTS = {MAX_TOKENS: (4, 8), WIDE_MAX_TOKENS: (4,)}
 #: The built-in TP8 kernel's cluster-8 range; above it the built-in runs one CTA per token.
 CLUSTER8_TOKENS = 16
-#: The layout of a TP8 workspace (``configure``'s ``tep8_max_tokens``: 16, 32 or 64; the
-#: ``tep8_finalize_transport_64`` lever sets 64), whose calls of 17..TP8_MAX_TOKENS tokens add their
+#: The layout of a TP8 workspace, whose calls of 17..TP8_MAX_TOKENS tokens add their
 #: slot sums flat, in the built-in one-CTA-per-token order (``flat_sum``, as at TP4; the built-in
 #: runs one CTA per token up to 128). TP4 workspaces ignore it (their 17..32-token calls are
 #: ``serve_wide_calls``'). Kept out of ``LAYOUT_RANK_COUNTS`` (``has_layout``), so a 32-token TP8
@@ -259,39 +257,10 @@ class Transport:
         return f"{self.publish}/{self.arrival}/{self.reduction}/{self.trigger}"
 
 
-#: The transport ``finalize_transport`` installs. ``configure``'s ``trigger`` ``entry`` (the
-#: ``finalize_entry_trigger`` lever) moves its dependent-launch trigger to right after this kernel's
-#: own ``griddepcontrol.wait`` (module docstring), so the unpool's split-K GEMM launches and stages
-#: its weight while this kernel waits for its peers; ``late``, the default, is the built-in's place.
-#: Every value is the same either way: only where the dependents may launch moves.
+#: The transport ``finalize_transport`` installs.
 DEFAULT = Transport()
 #: The same transport with the trigger at kernel entry.
 ENTRY_TRIGGER = Transport(trigger="entry")
-
-
-def configure(*, tep8_max_tokens: int = 16, trigger: str = "late") -> None:
-    """Set the TP8 workspace layout and the trigger of the transport ``finalize_transport`` builds.
-
-    ``lever_settings.apply`` sets them from the model's plan before any install; a workspace
-    built afterwards takes them (``FinalizeTransportWorkspace``'s defaults).
-
-    Args:
-        tep8_max_tokens: the token layout of a TP8 workspace (``TP8_MAX_TOKENS``): 16, 32 or 64.
-            Above 16 its calls of 17..``tep8_max_tokens`` tokens run the flat build.
-        trigger: the dependent-launch trigger of ``DEFAULT``: ``"late"`` or ``"entry"``
-            (an empty value is ``"late"``).
-
-    Raises:
-        ValueError: if ``tep8_max_tokens`` is not 16, 32 or 64, or ``trigger`` is not a
-            ``Transport`` trigger.
-    """
-    global TP8_MAX_TOKENS, DEFAULT
-    tokens = int(tep8_max_tokens)
-    if tokens not in (16, 32, 64):
-        raise ValueError(f"finalize transport token cap {tokens}: 16, 32 or 64")
-    transport = Transport(trigger=str(trigger).strip() or "late")
-    TP8_MAX_TOKENS = tokens
-    DEFAULT = transport
 
 
 try:
@@ -1070,8 +1039,8 @@ class FinalizeTransportWorkspace:
                         f"the built-in TP{self.ranks} kernel does not split a {tokens}-token "
                         "call the way this kernel's order assumes"
                     )
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the finalize transport runs on SM103 or SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the finalize transport runs on SM103 only")
             size = workspace_bytes(self.ranks, self.max_tokens)
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, size, mapping, mapping.is_multi_node()
@@ -1292,7 +1261,7 @@ class FinalizeAllReduceTransport(OpWrapper):
     site: the built-in MoE's ``workspace.finalize`` once per layer per step,
     unchanged; the feature puts a ``FinalizeTransportWorkspace`` in that
     attribute, which runs this kernel for 1..16 tokens (and, with
-    ``wide_finalize_transport`` at TP4, the same kernel on a 32-token layout
+    at TP4, the same kernel on a 32-token layout
     for 17..32 tokens; at TP8 with ``TP8_MAX_TOKENS`` above 16, its flat build
     for 17..``TP8_MAX_TOKENS`` tokens) and the built-in kernel otherwise.
 

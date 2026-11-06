@@ -71,17 +71,9 @@ from tensorrt_llm.logger import logger
 
 from ...attention import MuseSparkOpenTepAttention, MuseSparkOpenTepDecodeAttention
 from ...dispatch import LAUNCH_PDL
-from ...ops.attention import swa_block as _swa_ops
 from ...ops.attention.paged_decode_attention import window_splits
 from ...ops.attention.preattn_prep import HEAD_DIM, preattn_prep
-from ...ops.attention.swa_block import (
-    _ONE2_MAX_REQUESTS,
-    MAX_ROWS,
-    MULTI_MAX_REQUESTS,
-    max_blocks,
-    swa_block_attention,
-    swa_block_multi_attention,
-)
+from ...ops.attention.swa_block import max_blocks, swa_block_attention
 
 
 @dataclasses.dataclass(frozen=True)
@@ -105,14 +97,8 @@ class _SwaBlock:
     ``DecodeTarget`` passes it) on a sliding-window layer runs the block
     through ``ops/attention/swa_block``; every other call is the base class's.
     The per-call attributes are set by ``forward`` and cleared when it returns.
-
-    With ``_swa_multi`` (set by the ``wide_swa_block`` fast path) a decode step of
-    2..``MULTI_MAX_REQUESTS`` generation sequences of equal row count runs the block too,
-    through ``swa_block_multi_attention``: each sequence's rows, cache bytes and output are
-    the one-sequence block's.
     """
 
-    _swa_multi: bool = False
     _swa_block: Optional[SwaBlockPlan]
     _swa_raw: bool
     _swa_gate: Optional[torch.Tensor]
@@ -282,7 +268,13 @@ class _SwaBlock:
             key="musespark_open.swa_block.installed",
         )
         out = self._swa_block_call(
-            q, attn_metadata, attention_window_size, decode.q_fp8, raw, gate, requests
+            q,
+            attn_metadata,
+            attention_window_size,
+            decode.q_fp8,
+            raw,
+            gate,
+            requests,
         )
         self._swa_gated = gate is not None
         return out, None
@@ -305,35 +297,19 @@ class _SwaBlock:
         )
 
     def _step_requests(self, md) -> int:
-        """The sequences of this step the block takes in one call: 1, or under ``_swa_multi`` the
-        2..``MULTI_MAX_REQUESTS`` generation sequences of a step whose host ``seq_lens`` are all
-        ``rows / sequences`` (at most ``MAX_ROWS``). Host-side reads only."""
-        if not self._swa_multi:
-            return 1
-        n = md.num_seqs
-        rows = md.num_tokens
-        seq_lens = getattr(md, "seq_lens", None)
-        # swa_block's ``one2`` (swa_eight_requests), read per call: TEP8 layers (2 KV heads) take
-        # up to 8 sequences.
-        cap = (
-            _ONE2_MAX_REQUESTS
-            if _swa_ops._SWA_ONE2 and self.num_key_value_heads == 2
-            else MULTI_MAX_REQUESTS
-        )
-        if (
-            not 2 <= n <= cap
-            or md.num_generations != n
-            or rows % n
-            or rows // n > MAX_ROWS
-            or seq_lens is None
-            or seq_lens.is_cuda
-            or seq_lens.numel() < n
-            or bool((seq_lens[:n] != rows // n).any())
-        ):
-            return 1
-        return n
+        """The sequences of this step the block takes in one call: 1."""
+        return 1
 
-    def _swa_block_call(self, q, md, window: int, q_fp8: bool, raw: bool, gate, requests: int = 1):
+    def _swa_block_call(
+        self,
+        q,
+        md,
+        window: int,
+        q_fp8: bool,
+        raw: bool,
+        gate,
+        requests: int = 1,
+    ):
         attn = self.attn
         rows = md.num_tokens
         local_layer_idx = attn.get_local_layer_idx(md)
@@ -353,12 +329,10 @@ class _SwaBlock:
             torch.bfloat16,
         )
         rope = raw and not self.skip_rope
-        multi = requests > 1
-        op = swa_block_multi_attention if multi else swa_block_attention
-        return op(
+        return swa_block_attention(
             q[:rows],
             kv_pool,
-            block_tables if multi else block_tables[0],
+            block_tables[0],
             md.kv_lens_cuda_runtime[:requests],
             attn.kv_scale_orig_quant,
             self.num_heads,
@@ -453,51 +427,4 @@ def log_installed(layers, plan: SwaBlockPlan) -> None:
     )
 
 
-def install_multi(model) -> int:
-    """``wide_swa_block``: let every sliding-window layer's ``swa_block`` take 2..4-request steps.
-
-    Called after the attention re-class. Sets ``_swa_multi`` on each sliding-window layer
-    whose attention carries ``swa_block``; returns how many.
-
-    Raises:
-        ValueError: if a sliding-window layer does not carry ``swa_block``.
-    """
-    count = 0
-    one2 = 0
-    for layer in model.layers:
-        attention = layer.self_attn
-        if not attention.is_sliding:
-            continue
-        if not isinstance(attention, _SwaBlock):
-            raise ValueError(
-                "[musespark_open] wide_swa_block extends swa_block; layer "
-                f"{layer.layer_idx} carries {type(attention).__name__}"
-            )
-        attention._swa_multi = True
-        if (
-            _swa_ops._SWA_ONE2
-            and attention.num_key_value_heads == 2
-            and hasattr(attention, "_mr_append_min_seqs")
-        ):
-            # swa_block's ``one2``: the one-launch block of 5..8 sequences does its own prep and K/V
-            # append on these layers, so multi_request_prep_append (installed before this) folds
-            # only larger steps here.
-            attention._mr_append_min_seqs = max(
-                attention._mr_append_min_seqs, _ONE2_MAX_REQUESTS + 1
-            )
-            one2 += 1
-        count += 1
-    logger.info(
-        f"[musespark_open] wide_swa_block: swa_block on decode steps of 2..{MULTI_MAX_REQUESTS} "
-        f"requests of up to {MAX_ROWS} rows each on {count} sliding-window layers"
-        + (
-            f"; swa_eight_requests: also 5..{_ONE2_MAX_REQUESTS} requests on {one2} TEP8 layers "
-            "(one launch; multi_request_prep_append stands down for them)"
-            if one2
-            else ""
-        )
-    )
-    return count
-
-
-__all__ = ["SwaBlockPlan", "attention_class", "install_multi", "log_installed"]
+__all__ = ["SwaBlockPlan", "attention_class", "log_installed"]

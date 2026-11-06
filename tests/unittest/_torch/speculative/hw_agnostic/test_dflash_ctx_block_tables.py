@@ -123,3 +123,33 @@ def test_block_count_is_the_allocation_extent_past_a_sliding_window():
     # A count of valid entries would cap row 0 at its two live pages.
     assert worker._ctx_block_counts[:3].tolist() == [5, 2, 0]
     assert worker._ctx_block_tables[0].tolist() == [0, 0, 0, 4, 5, 0]
+
+
+def _alloc_worker(manager, block_counts=None):
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_kv_manager = manager
+    worker._ctx_page_size = 32
+    worker._ctx_block_counts = block_counts
+    return worker
+
+
+def test_context_allocation_comes_from_the_managers_host_capacity():
+    # No device counts at all: reading them back would be a D2H sync per
+    # context iteration, so the bound must come from the host capacity.
+    manager = SimpleNamespace(
+        kv_cache_map={7: SimpleNamespace(capacity=33), 9: SimpleNamespace(capacity=64)}
+    )
+    worker = _alloc_worker(manager)
+
+    assert worker._ctx_alloc_tokens([7, 9]) == [64, 64]
+
+
+@pytest.mark.parametrize(
+    "manager",
+    [SimpleNamespace(), SimpleNamespace(kv_cache_map={7: SimpleNamespace(capacity=33)})],
+    ids=["no-host-map", "request-missing"],
+)
+def test_context_allocation_falls_back_to_the_block_table_extent(manager):
+    worker = _alloc_worker(manager, block_counts=torch.tensor([5, 2, 0], dtype=torch.long))
+
+    assert worker._ctx_alloc_tokens([7, 9]) == [160, 64]

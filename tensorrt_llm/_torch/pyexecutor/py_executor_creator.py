@@ -5,6 +5,7 @@ import copy
 import functools
 import gc
 import importlib
+import json
 import os
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -229,6 +230,63 @@ def _pin_dflash_auto_attention_backend(spec_config) -> None:
     if (spec_config is not None and spec_config.spec_dec_mode.is_dflash()
             and spec_config.attention_backend == "AUTO"):
         spec_config.resolve_from_checkpoint()
+
+
+# Muse Spark checkpoints: the open-format export and the flat in-tree config.
+_MUSESPARK_MODEL_TYPES = frozenset({"muse_spark", "musespark_open_omni"})
+
+
+def _is_musespark_checkpoint(checkpoint_dir: Optional[str]) -> bool:
+    """Whether ``checkpoint_dir`` holds a Muse Spark checkpoint, by its config.json model_type."""
+    if checkpoint_dir is None:
+        return False
+    config_path = os.path.join(str(checkpoint_dir), "config.json")
+    if not os.path.isfile(config_path):
+        return False
+    with open(config_path) as f:
+        return json.load(f).get("model_type") in _MUSESPARK_MODEL_TYPES
+
+
+def _reject_musespark_vanilla_attention(attn_backend: str, spec_config,
+                                        checkpoint_dir: Optional[str],
+                                        requested_drafter_backend) -> None:
+    """Refuse VANILLA attention, target or DFlash drafter, on a Muse Spark checkpoint.
+
+    A VANILLA DFlash drafter keeps its context K/V in a private arena that
+    neither a prefix-cache hit nor a disaggregated context transfer reaches,
+    so it drafts those requests without their context. Muse Spark runs its
+    target and its drafter on TRTLLM attention.
+
+    Args:
+        attn_backend: The target's ``attn_backend``.
+        spec_config: The speculative config, the drafter backend already
+            resolved from AUTO.
+        checkpoint_dir: The target checkpoint directory.
+        requested_drafter_backend: The drafter backend before AUTO was
+            resolved, to say why AUTO did not land on TRTLLM.
+    """
+    if not _is_musespark_checkpoint(checkpoint_dir):
+        return
+    if attn_backend == "VANILLA":
+        raise ValueError(
+            "Muse Spark does not run on VANILLA target attention; use "
+            "attn_backend='TRTLLM'.")
+    if (spec_config is None or not spec_config.spec_dec_mode.is_dflash()
+            or spec_config.attention_backend != "VANILLA"):
+        return
+    if requested_drafter_backend == "AUTO":
+        from ..speculative.dflash_attention import \
+            dflash_trtllm_gen_unavailability_reason
+        reason = dflash_trtllm_gen_unavailability_reason()
+        raise ValueError(
+            "Muse Spark needs TRTLLM DFlash drafter attention, but "
+            "attention_backend AUTO resolved to VANILLA"
+            f"{f' (TRTLLM is unavailable: {reason})' if reason else ''}.")
+    raise ValueError(
+        "Muse Spark does not run a VANILLA DFlash drafter: its private context "
+        "arena is unreachable from prefix-cache hits and disaggregated context "
+        "transfer, so those requests draft without their context. Use "
+        "speculative_config.attention_backend='TRTLLM' or leave it at AUTO.")
 
 
 def _flashinfer_one_engine_spec_supported(attn_backend: str,
@@ -620,7 +678,11 @@ def _create_py_executor(
     if spec_config is not None and spec_config.decoding_type == "AUTO":
         from tensorrt_llm._torch.speculative import suggest_spec_config
         spec_config = suggest_spec_config(max_batch_size)
+    requested_drafter_backend = getattr(spec_config, "attention_backend", None)
     _pin_dflash_auto_attention_backend(spec_config)
+    _reject_musespark_vanilla_attention(llm_args.attn_backend, spec_config,
+                                        checkpoint_dir,
+                                        requested_drafter_backend)
 
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
         if not spec_config.spec_dec_mode.support_overlap_scheduler():

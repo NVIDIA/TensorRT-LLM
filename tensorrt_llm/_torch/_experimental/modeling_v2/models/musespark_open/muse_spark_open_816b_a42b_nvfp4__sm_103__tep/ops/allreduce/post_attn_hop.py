@@ -116,30 +116,6 @@ from tensorrt_llm.mapping import Mapping
 #: The kernels launch with programmatic dependent launch: ``TRTLLM_ENABLE_PDL`` on is a
 #: precondition of every composition that builds them.
 _LAUNCH_PDL = True
-#: Where both kernels of this module (the hop and its direct consumer, at every transport size)
-#: trigger their dependents (``hop_entry_trigger``, set by ``configure``). Off, the
-#: programmatic-dependent-launch trigger follows the last transport access (``early_trigger``)
-#: or the stores. On, it follows the kernel's own ``griddepcontrol.wait`` (the entry of the
-#: exchange), so the pool GEMM that follows can stage its weight during the exchange: at one
-#: request per step the pool GEMM was resident only ~1.0 us before the hop ended and ran 3.58 us
-#: past it, against a 1.20 us floor. A dependent still waits on this grid with its own
-#: griddepcontrol.wait: bitwise.
-_ENTRY_TRIGGER = False
-
-
-def configure(*, entry_trigger: bool = False) -> None:
-    """Set where this module's kernels trigger their dependents (``hop_entry_trigger``).
-
-    ``lever_settings.apply`` calls it from the model's plan before any install. The kernels
-    read the setting when they are traced and no compile cache is keyed on it, so it must be
-    set before this module builds its first kernel.
-
-    Args:
-        entry_trigger: trigger right after the kernel's own ``griddepcontrol.wait`` instead of
-            after its last transport access (``early_trigger``) or its stores.
-    """
-    global _ENTRY_TRIGGER
-    _ENTRY_TRIGGER = bool(entry_trigger)
 
 
 #: Residual width the kernel's thread map is written for.
@@ -592,8 +568,6 @@ if HAS_CUTE_DSL:
                 # after this wait.
                 if cutlass.const_expr(self.pdl):
                     cute.arch.griddepcontrol_wait()
-                    if cutlass.const_expr(_ENTRY_TRIGGER):
-                        cute.arch.griddepcontrol_launch_dependents()
 
                 # The arrival counter holds 64 per completed call plus less than
                 # 64 of this one (this CTA arrives only after all its threads
@@ -708,7 +682,7 @@ if HAS_CUTE_DSL:
                 # Early trigger: past the last transport access. A dependent may
                 # start its prologue now; its griddepcontrol.wait still returns
                 # only once this grid has completed and its stores are visible.
-                if cutlass.const_expr(self.pdl and self.early_trigger and not _ENTRY_TRIGGER):
+                if cutlass.const_expr(self.pdl and self.early_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
 
                 # The built-in one-shot sum: FP32 from +0, ranks in order, one RN round.
@@ -788,7 +762,7 @@ if HAS_CUTE_DSL:
                         amount = Uint32(self.grid_step + 1 - blocks)
                     _arrive(control_address + 4, amount)
                 # Late trigger: after every store, the boundary kernel's own placement.
-                if cutlass.const_expr(self.pdl and not self.early_trigger and not _ENTRY_TRIGGER):
+                if cutlass.const_expr(self.pdl and not self.early_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
 
     _POINTER_DTYPES = (
@@ -924,8 +898,8 @@ class PostAttnHopWorkspace:
         try:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the fused hop runs on SM103 or SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the fused hop runs on SM103 only")
             use_fabric = mapping.is_multi_node()
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, workspace_bytes(self.max_rows), mapping, use_fabric
@@ -1198,20 +1172,8 @@ DIRECT_WATCHDOG_S = 10.0
 #: store the sentinel half). A captured kernel matches an entry its name contains.
 #:
 #: * ``(10, 3)``: cuBLAS's choice for the 8-row o_proj, ``[8, 1024] x [1024, 8192]`` BF16.
-#: * ``(10, 7)``: the split-K kernel (``ops/gemm/splitk_gemm``, flashinfer's moved into this target; flashinfer's
-#:   own copy too) and flashinfer's direct kernel, the o_proj kernels the dense GEMM plan names there (the split-K
-#:   tactics of 9..32 rows on the wide direct transport included, ``wide_dense_gemms``); cuBLAS's choice on this
-#:   arch is not one.
 VALIDATED_PRODUCERS: Dict[Tuple[int, int], FrozenSet[str]] = {
     (10, 3): frozenset({"nvjet_sm103_tst_64x8_64x16_4x1_v_bz_TNT"}),
-    (10, 7): frozenset(
-        {
-            "tensorrt_llm_torch_experimentalmodeling_v2modelsmusespark_openmuse_spark_open_816b_a42b_nvfp4__sm_103__tep"
-            "opsgemmsplitk_gemmSplitKDenseGemmKernel",
-            "flashinfergemmkernelsdense_bf16_gemm_sm100_splitkSplitKDenseGemmKernel",
-            "flashinfergemmkernelsdense_bf16_gemm_directDirectDenseGemmKernel",
-        }
-    ),
 }
 
 
@@ -1480,8 +1442,6 @@ if HAS_CUTE_DSL:
                 # Nothing above touches global memory.
                 if cutlass.const_expr(self.pdl):
                     cute.arch.griddepcontrol_wait()
-                    if cutlass.const_expr(_ENTRY_TRIGGER):
-                        cute.arch.griddepcontrol_launch_dependents()
 
                 buffer = Int64(parity)
                 slot = (Int64(row) * HIDDEN + Int64(offset)) * 2
@@ -1552,7 +1512,7 @@ if HAS_CUTE_DSL:
                         receive_address + (buffer * MAX_RANKS + p) * self.slab_bytes + slot
                     )
                 # Early trigger: past the last transport access (the hop's early-trigger placement).
-                if cutlass.const_expr(self.pdl and self.early_trigger and not _ENTRY_TRIGGER):
+                if cutlass.const_expr(self.pdl and self.early_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
 
                 # The built-in one-shot sum: FP32 from +0, ranks in order, one RN round.
@@ -1620,7 +1580,7 @@ if HAS_CUTE_DSL:
                     cute.make_tensor((next_output + row * 8192 + offset).align(16), layout),
                 )
                 # Late trigger: after every store, the boundary kernel's own placement.
-                if cutlass.const_expr(self.pdl and not self.early_trigger and not _ENTRY_TRIGGER):
+                if cutlass.const_expr(self.pdl and not self.early_trigger):
                     cute.arch.griddepcontrol_launch_dependents()
 
     _CONSUMER_POINTER_DTYPES = (
@@ -1765,8 +1725,8 @@ class PostAttnDirectWorkspace:
             if not HAS_CUTE_DSL:
                 raise RuntimeError("CuTe DSL is unavailable")
             self.capability = tuple(torch.cuda.get_device_capability(self.device))
-            if self.capability not in ((10, 3), (10, 7)):
-                raise RuntimeError("the direct hop runs on SM103 or SM107 only")
+            if self.capability != (10, 3):
+                raise RuntimeError("the direct hop runs on SM103 only")
             use_fabric = mapping.is_multi_node()
             nbytes = workspace_bytes(self.max_rows)
             self._handle = _make_mnnvl_mcast_buffer(self._comm, nbytes, mapping, use_fabric)
@@ -2095,10 +2055,9 @@ class PostAttnConsumerHop(OpWrapper):
 
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step of
-    the row counts the target serves directly (8 at K = 7; with
-    ``wide_oproj_publish`` also 16, 24 and 32 on the wide direct
-    transport at TP4), from the target's attention-side residual join, after the layer's
-    o_proj GEMM wrote its output into ``published``; layer ``l`` uses parity ``l mod 2``.
+    the row counts the target serves directly (8 at K = 7), from the target's
+    attention-side residual join, after the layer's o_proj GEMM wrote its output
+    into ``published``; layer ``l`` uses parity ``l mod 2``.
 
     Bit-identical to ``post_attn_hop`` on the same partials (on the wide direct
     transport: to ``post_attn_hop`` on its wide transport), gated by its own
@@ -2198,18 +2157,6 @@ def log_once_direct(
     )
 
 
-def log_once_wide_direct(
-    layers: int, rows: Sequence[int], kernels: str, prefetch_dropped: int = 0
-) -> None:
-    logger.info(
-        "[musespark_open] attention_output_into_hop: o_proj also publishes into the "
-        f"post-attention hop's {WIDE_MAX_ROWS}-row direct transport on the decode steps of "
-        f"{'/'.join(str(r) for r in rows)} rows, all {layers} layers (o_proj {kernels}; the "
-        "wide hop's own publication gone; the o_proj -> pool-weight prefetch dropped at those "
-        f"rows on {prefetch_dropped} layers)"
-    )
-
-
 def log_once_producer(name: str) -> None:
     logger.info(
         f"[musespark_open] attention_output_into_hop: the published o_proj captures {name}, a validated producer"
@@ -2264,9 +2211,7 @@ class PostAttnHop(OpWrapper):
     note = """
     Metadata consumed: none. Call site: once per decoder layer per decode step
     of at most 8 rows, from the target's attention-side residual join, in place
-    of the built-in MNNVL one-shot all-reduce and cluster boundary; with the wide
-    transport (wide_post_attention_hop, TP4) also steps of 9..32 rows, where the
-    built-in boundary runs its 4-CTA split.
+    of the built-in MNNVL one-shot all-reduce and cluster boundary.
 
     Bit-identical to that pair, gated by its own multi-GPU test (both outputs,
     every cell, both transport variants, graph replay with changing inputs and
@@ -2356,7 +2301,6 @@ def log_once_enabled(
     multicast: bool,
     early_trigger: bool = False,
     stale_poll: bool = False,
-    wide_rows: Optional[int] = None,
 ) -> None:
     logger.info(
         "[musespark_open] post_attention_hop: fused post-attention hop (one-shot AR + residual join + pre-FFN norm) "
@@ -2366,9 +2310,3 @@ def log_once_enabled(
         f"{'early' if early_trigger else 'late'} dependent-launch trigger"
         f"{', stale-only polling from %d rows' % STALE_POLL_MIN_ROWS if stale_poll else ''})"
     )
-    if wide_rows is not None:
-        logger.info(
-            f"[musespark_open] wide_post_attention_hop: the fused post-attention hop on a "
-            f"{wide_rows}-row transport for decode steps of {MAX_ROWS + 1}..{wide_rows} rows "
-            "(the boundary's 4-CTA split)"
-        )

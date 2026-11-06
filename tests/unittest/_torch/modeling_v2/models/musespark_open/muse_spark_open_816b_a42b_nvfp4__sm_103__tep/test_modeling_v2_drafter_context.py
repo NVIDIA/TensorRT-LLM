@@ -6,7 +6,7 @@
   geometry) over pages are bitwise their dense calls, the appended block included.
 * ``context_kv_fork``'s commit empties the dummy slot, as the worker's own commit does.
 * The block decode over a unified target/draft ``KVCacheManagerV2`` is bitwise the dense one.
-* Over pages the only sm103 TEP4 fast path ``compose`` leaves out for a structural rule is
+* Over pages the only TEP4 fast path ``compose`` leaves out for a structural rule is
   the window compaction.
 """
 
@@ -102,10 +102,10 @@ def test_the_window_ops_over_pages_are_their_dense_calls(sms, append, monkeypatc
     assert torch.equal(k_pages[rows], k_arena) and torch.equal(v_pages[rows], v_arena)
 
 
-@pytest.mark.parametrize("windowed", [False, True], ids=["dense", "sm107_windowed_commit"])
+@pytest.mark.parametrize("windowed", [False, True], ids=["dense", "windowed_commit"])
 def test_the_fork_commit_empties_the_dummy_slot(windowed):
     """The dummy slot, which CUDA-graph padding rows share, is empty after the commit, the DFlash
-    worker's rule: over the dense arena, and after the sm107 windowed commit's own launch."""
+    worker's rule: over the dense arena, and after the windowed commit's own launch."""
     worker = object.__new__(DFlashWorker)
     worker._ctx_k_buf = torch.zeros(4, 5, 64, 1, 128, dtype=torch.bfloat16, device="cuda")
     worker._ctx_v_buf = torch.zeros_like(worker._ctx_k_buf)
@@ -236,7 +236,7 @@ def test_the_block_decode_over_a_unified_kv_cache_is_the_dense_arena_one(wide):
 
 
 def test_a_paged_context_plans_every_fast_path_but_the_window_compaction(monkeypatch):
-    """sm103 TEP4 with a TRTLLM drafter, TRTLLM_DFLASH_WINDOWED_CTX_ARENA set: a paged context is
+    """TEP4 with a TRTLLM drafter, TRTLLM_DFLASH_WINDOWED_CTX_ARENA set: a paged context is
     never windowed, so the window compaction is the one served path a structural rule leaves
     out; every other path off is off by its lever rule at ``max_batch_size`` 64."""
     monkeypatch.setattr(dispatch, "missing_preconditions", lambda *args: [])

@@ -19,6 +19,7 @@ try:
     from ..custom_ops import flashinfer_apply_rope_with_cos_sin_cache_inplace as _flashinfer_rope
 except ImportError:
     _flashinfer_rope = None
+from ..modules.logit_soft_cap import soft_capped_logits
 from ..pyexecutor.config_utils import _is_sliding_attention_layer, get_layer_attention_window
 from ..speculative.dflash_attention import (
     dflash_trtllm_gen_unavailability_reason,
@@ -859,12 +860,14 @@ class DFlashForCausalLM(nn.Module):
         """
         if self.logit_multiplier == 1.0 and self.logit_softcap is None:
             return logits
-        logits = logits.float()
-        if self.logit_multiplier != 1.0:
-            logits.mul_(self.logit_multiplier)
-        if self.logit_softcap is not None:
-            logits.div_(self.logit_softcap).tanh_().mul_(self.logit_softcap)
-        return logits
+        if self.logit_softcap is None:
+            return logits.float().mul_(self.logit_multiplier)
+        # One pass instead of the widening and four elementwise kernels, bit for
+        # bit (``x * 1.0`` is ``x``). An FP32 ``logits`` is transformed in place.
+        in_place = logits.dtype == torch.float32 and logits.is_contiguous()
+        return soft_capped_logits(
+            logits, self.logit_multiplier, self.logit_softcap, out=logits if in_place else None
+        )
 
     def select_candidate_path(
         self,

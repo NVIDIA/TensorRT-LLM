@@ -47,9 +47,7 @@ successors (``entry_rows``); a width without one runs the base launches. ``pdl_s
 and ``pdl_merge`` act on the widths their device's table lists among those
 (``SILU_ENTRY_ROWS_BY_SM`` / ``MERGE_ENTRY_ROWS_BY_SM``), each measured in the in-model
 drafter chain on that GPU. On GB300 all three triggers together are the fastest chain at
-1..4 requests. On Rubin an entry-released ``o_proj`` competes with the multi-request merge
-it follows (the chain is slower with the merge trigger at 2..4 requests), and the silu
-trigger on top of the conv trigger gains nothing at two requests and loses at three.
+1..4 requests.
 ``pdl_head`` acts on a one-request step whose K slots are one contiguous row
 range (any K); its successor is the low-M dispatcher's runner for the LM
 head (cuBLAS through ``torch.mm``, which has no programmatic attribute, or
@@ -115,17 +113,15 @@ ROWS = 8
 ENTRY_ROW_CANDIDATES = (8, 16, 24, 32)
 
 #: The block widths of the merge trigger per compute capability (``trigger_rows``), among
-#: those of ``entry_rows``. sm103: one to four requests. sm107: the one-request block only.
+#: those of ``entry_rows``. sm103: one to four requests.
 MERGE_ENTRY_ROWS_BY_SM: dict[tuple[int, int], frozenset] = {
     (10, 3): frozenset(ENTRY_ROW_CANDIDATES),
-    (10, 7): frozenset({ROWS}),
 }
 
 #: The block widths of the silu trigger per compute capability (``trigger_rows``), among
-#: those of ``entry_rows``. sm103: one to four requests. sm107: one and four requests.
+#: those of ``entry_rows``. sm103: one to four requests.
 SILU_ENTRY_ROWS_BY_SM: dict[tuple[int, int], frozenset] = {
     (10, 3): frozenset(ENTRY_ROW_CANDIDATES),
-    (10, 7): frozenset({ROWS, 4 * ROWS}),
 }
 
 

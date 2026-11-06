@@ -68,8 +68,10 @@ The current implementation requires the PyTorch backend, native C++
 KVCacheManagerV2, and an SM100, SM103, or SM107 GPU. Hot Attention KV can use FP16,
 BF16, or FP8. Host and Disk cold tiers share the same compact representation,
 and KV-cache block reuse remains supported because Page and token identity are
-unchanged. One-model MTP-EAGLE and EAGLE3 are supported; HELIX context
-parallelism is not currently supported.
+unchanged. One-model MTP-EAGLE, EAGLE3 and DFlash are supported; a TRTLLM
+DFlash drafter must keep its KV layers in the target's KV cache manager
+rather than a separate draft one. HELIX context parallelism is not currently
+supported.
 
 Set `kv_cache_config.use_kv_cache_manager_v2: true` explicitly. A nonzero Host
 or Disk cache is also required for Pages to cross a compression boundary.
@@ -317,6 +319,7 @@ and compression ratio that fits your workload and requirements.
 MTP draft KV is not excluded from cold-page compression. Its effect on draft
 acceptance rate has not been evaluated; validate this opt-in experimental
 feature on your workload.
+A TRTLLM DFlash drafter's KV layers are excluded: their cold pages are copied unchanged.
 
 The indexer cache is always copied as it
 is, and the sliding-window, HCA, and compressor caches of the model are preserved
