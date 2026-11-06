@@ -21,6 +21,7 @@ are created in ``communication/nccl_ep.py``. ``use_internal_fp8_dispatch`` gates
 the persistent FP8 scales receive buffer.
 """
 
+from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -63,9 +64,7 @@ def is_nccl_ep_installed() -> bool:
     return _nccl_ep_installed
 
 
-_device_api_support_cache: dict = {}
-
-
+@lru_cache(maxsize=None)
 def nccl_ep_device_api_supported(mapping: Mapping) -> bool:
     """Return True iff NCCL reports Device API support for this EP group.
 
@@ -77,13 +76,11 @@ def nccl_ep_device_api_supported(mapping: Mapping) -> bool:
 
     Collective over the EP group: every EP rank reaches MoE communication
     selection together. The result is the minimum across ranks, so all ranks
-    pick the same strategy, and is cached per EP group. Any probe failure is
+    pick the same strategy. Memoized on ``mapping`` because ``NcclEP`` is built once per
+    MoE layer while the answer only depends on the platform and EP group; clear it with
+    ``nccl_ep_device_api_supported.cache_clear()``. Any probe failure is
     treated as "unsupported".
     """
-    key = (mapping.pp_rank, mapping.moe_ep_size, mapping.moe_ep_rank)
-    if key in _device_api_support_cache:
-        return _device_api_support_cache[key]
-
     import nccl.core as nccl_core
 
     from tensorrt_llm._utils import mpi_comm, mpi_disabled
@@ -122,7 +119,6 @@ def nccl_ep_device_api_supported(mapping: Mapping) -> bool:
             ep_mpi_comm.Free()
 
     logger.info(f"NCCL EP Device API supported: {supported}")
-    _device_api_support_cache[key] = supported
     return supported
 
 
@@ -576,3 +572,4 @@ def destroy_all_nccl_ep_contexts():
             logger.warning(f"Error destroying NCCL EP context: {e}")
     _ep_group_cache.clear()
     _ep_group_refcounts.clear()
+    nccl_ep_device_api_supported.cache_clear()

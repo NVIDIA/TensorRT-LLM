@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import sys
+from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -69,8 +70,8 @@ _REAL_DEVICE_API_PROBE = nccl_ep_utils.nccl_ep_device_api_supported
 @pytest.fixture(autouse=True)
 def _nccl_ep_device_api_supported(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default to a platform with NCCL Device API; tests override for the unsupported case."""
+    _REAL_DEVICE_API_PROBE.cache_clear()
     monkeypatch.setattr(nccl_ep_utils, "nccl_ep_device_api_supported", lambda _mapping: True)
-    monkeypatch.setattr(nccl_ep_utils, "_device_api_support_cache", {})
 
 
 def _strategy_unavailable(*args, **kwargs):
@@ -716,6 +717,10 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         strategy._setup_handle(ctx, object(), 0)
 
 
+# ``nccl_ep_device_api_supported`` is memoized on the mapping, which must be hashable.
+_HashableMapping = namedtuple("_HashableMapping", ["pp_rank", "moe_ep_size", "moe_ep_rank"])
+
+
 class _FakeMpiComm:
     def __init__(self):
         self.freed = False
@@ -760,7 +765,7 @@ def _install_fake_nccl_comm(monkeypatch: pytest.MonkeyPatch, device_api_support:
 @pytest.mark.parametrize("device_api_support", [True, False])
 def test_nccl_ep_device_api_probe(monkeypatch: pytest.MonkeyPatch, device_api_support: bool):
     comm, mpi = _install_fake_nccl_comm(monkeypatch, device_api_support)
-    mapping = SimpleNamespace(pp_rank=0, moe_ep_size=2, moe_ep_rank=0)
+    mapping = _HashableMapping(pp_rank=0, moe_ep_size=2, moe_ep_rank=0)
 
     assert _REAL_DEVICE_API_PROBE(mapping) is device_api_support
     # Probe communicator and MPI sub-communicator are released, and the result is cached.
@@ -772,7 +777,7 @@ def test_nccl_ep_device_api_probe(monkeypatch: pytest.MonkeyPatch, device_api_su
 def test_nccl_ep_device_api_probe_failure_is_unsupported(monkeypatch: pytest.MonkeyPatch):
     comm, _mpi = _install_fake_nccl_comm(monkeypatch, True)
     sys.modules["nccl.core"].Communicator.init = Mock(side_effect=RuntimeError("init failed"))
-    mapping = SimpleNamespace(pp_rank=0, moe_ep_size=2, moe_ep_rank=0)
+    mapping = _HashableMapping(pp_rank=0, moe_ep_size=2, moe_ep_rank=0)
 
     assert _REAL_DEVICE_API_PROBE(mapping) is False
 
