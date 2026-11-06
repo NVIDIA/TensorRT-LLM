@@ -91,7 +91,14 @@ def test_ready_timeout_dumps_log_tail(tmp_path, dead_url: str):
     assert "clean init so far" in msg
 
 
-def test_endpoint_down_wait_retries_a_read_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("timeout", "minimum_polls"),
+    [(0.02, 1), (2.5, 2)],
+    ids=["short-budget", "multiple-polls"],
+)
+def test_endpoint_down_wait_retries_a_read_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout: float, minimum_polls: int
+) -> None:
     calls = []
     clock = SimpleNamespace(now=0.0)
 
@@ -111,10 +118,11 @@ def test_endpoint_down_wait_retries_a_read_timeout(monkeypatch: pytest.MonkeyPat
         SimpleNamespace(monotonic=monotonic, sleep=sleep),
     )
     with pytest.raises(RuntimeError, match="did not become down"):
-        wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=0.02)
+        wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=timeout)
 
-    assert len(calls) == 1
-    assert all(0 < timeout <= 0.02 for timeout in calls)
+    assert len(calls) >= minimum_polls
+    assert clock.now >= timeout
+    assert all(0 < poll_timeout <= timeout for poll_timeout in calls)
 
 
 def test_endpoint_down_wait_makes_one_request_per_poll(monkeypatch: pytest.MonkeyPatch) -> None:
