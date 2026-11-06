@@ -33,6 +33,7 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import PIL.Image
 import pytest
 import torch
+from cosmos3_fixtures import bare_resolver
 from utils.llm_data import get_checkpoint
 
 import tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 as pipe_mod
@@ -41,15 +42,15 @@ from tensorrt_llm._torch.visual_gen.models.cosmos3.defaults import (
     COSMOS3_ACTION_PARAMS,
     COSMOS3_DEFAULT_CONDITION_VIDEO_KEEP,
     COSMOS3_DEFAULT_CONDITION_VIDEO_LATENT_INDEXES,
+    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
+    COSMOS3_DEFAULT_SYSTEM_PROMPT,
+    COSMOS3_DURATION_TEMPLATE,
     COSMOS3_EXTRA_SPECS,
+    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     COSMOS3_T2I_PARAMS,
     _normalize_condition_video_keep,
 )
 from tensorrt_llm._torch.visual_gen.models.cosmos3.pipeline_cosmos3 import (
-    COSMOS3_DEFAULT_RESOLUTION_TEMPLATE,
-    COSMOS3_DEFAULT_SYSTEM_PROMPT,
-    COSMOS3_DURATION_TEMPLATE,
-    COSMOS3_IMAGE_RESOLUTION_TEMPLATE,
     Cosmos3OmniMoTPipeline,
     _condition_pixel_frame_count,
     _load_reference_image,
@@ -866,7 +867,7 @@ class TestCosmos3V2V:
         assert result.frame_rate == FRAME_RATE
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=10.0,
+            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
             use_karras_sigmas=False,
         )
 
@@ -896,7 +897,7 @@ class TestCosmos3V2V:
         )
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=10.0,
+            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
             use_karras_sigmas=False,
         )
 
@@ -908,6 +909,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         calls = []
         token_calls = []
 
@@ -927,9 +929,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 calls.append((target, use_karras_sigmas))
@@ -978,6 +977,7 @@ class TestCosmos3V2V:
         # Bypassing __init__ means the generation-default family has to be set
         # here; forward() reads its per-mode table through it.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=1.0)
         rebuilt = []
 
         class StopAfterTokenize(Exception):
@@ -989,9 +989,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 rebuilt.append((scheduler.name, target, use_karras_sigmas))
@@ -1026,7 +1023,8 @@ class TestCosmos3V2V:
                 enable_audio=True,
             )
 
-        assert rebuilt == [("video", 10.0, False), ("audio", 10.0, False)]
+        # Video-to-video keeps the checkpoint shift and forces the uniform sigma grid.
+        assert rebuilt == [("video", 1.0, False), ("audio", 1.0, False)]
 
     def test_action_video_is_not_classified_as_v2v(self):
         """An action reference arrives as the same `video` bytes V2V uses, but
@@ -1040,7 +1038,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.family = QWEN3_RECIPE.name
         token_calls = []
 
@@ -1053,9 +1051,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 return scheduler
@@ -1098,7 +1093,7 @@ class TestCosmos3V2V:
         )
         pipeline.audio_gen = False
         pipeline.action_gen = True
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name, flow_shift=7.0)
         pipeline.family = QWEN3_RECIPE.name
         calls = []
 
@@ -1111,9 +1106,6 @@ class TestCosmos3V2V:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
             def set_flow_shift(self, scheduler, target, *, use_karras_sigmas=None):
                 calls.append((scheduler.name, target, use_karras_sigmas))
@@ -1154,6 +1146,7 @@ class TestCosmos3V2V:
         from that stream's own base."""
         pipeline = Cosmos3OmniMoTPipeline.__new__(Cosmos3OmniMoTPipeline)
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         rebuilt = []
 
         class FakeSampling:
@@ -1210,6 +1203,7 @@ class TestCosmos3TransferRouting:
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.audio_gen = False
 
         class FakeSampling:
@@ -1218,9 +1212,6 @@ class TestCosmos3TransferRouting:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
         pipeline.sampling = FakeSampling()
         pipeline._forward_transfer = lambda **kwargs: None
@@ -1265,6 +1256,7 @@ class TestCosmos3TransferRouting:
         pipeline.action_gen = False
         # __new__ skips __init__, where the real pipeline resolves this.
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         pipeline.audio_gen = False
 
         class FakeSampling:
@@ -1273,9 +1265,6 @@ class TestCosmos3TransferRouting:
 
             def validate_request(self, num_inference_steps, guidance_scale):
                 return None
-
-            def generation_default_overrides(self):
-                return {}
 
         pipeline.sampling = FakeSampling()
         captured = {}
@@ -1326,11 +1315,8 @@ class TestCosmos3T2I:
         )
         assert result.video is None
         _assert_valid_image(result.image, height=T2I_HEIGHT, width=T2I_WIDTH)
-        _assert_scheduler_config(
-            cosmos3_pipeline,
-            flow_shift=COSMOS3_T2I_PARAMS["flow_shift"],
-            use_karras_sigmas=_base_use_karras_sigmas(cosmos3_pipeline),
-        )
+        # Image mode runs at the checkpoint scheduler's shift like every other mode.
+        _assert_default_video_scheduler_config(cosmos3_pipeline)
 
 
 @pytest.mark.integration
@@ -1358,7 +1344,7 @@ class TestCosmos3Audio:
         _assert_valid_audio(result.audio, result.audio_sample_rate)
         _assert_scheduler_config(
             cosmos3_pipeline,
-            flow_shift=10.0,
+            flow_shift=cosmos3_pipeline.sampling.checkpoint_flow_shift,
             use_karras_sigmas=False,
         )
 
@@ -1651,9 +1637,10 @@ class TestCosmos3TextGuardrailBlocked:
         pipeline.audio_gen = False
         pipeline.audio_scheduler = None
         pipeline.family = QWEN3_RECIPE.name
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         # All-None policy is the documented pre-load placeholder.
         pipeline.sampling = Cosmos3SamplingPolicy()
-        pipeline.default_use_system_prompt = False
+        pipeline.resolver = bare_resolver(QWEN3_RECIPE.name)
         # ``rank`` is a read-only property that resolves to 0 with no
         # distributed init. The guardrail model is not under test, so a
         # checker that reports "unsafe" for any input drives the path

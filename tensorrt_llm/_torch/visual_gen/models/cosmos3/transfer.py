@@ -22,33 +22,6 @@ from tensorrt_llm._torch.visual_gen.triton_kernels import (
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.media.decoding import decode_video_reference_window
 
-from .defaults import VIDEO_RES_SIZE_INFO
-
-
-def find_closest_target_size(h: int, w: int, resolution: str | int) -> tuple[int, int]:
-    """Pick the ``resolution`` bucket whose aspect ratio best matches ``h/w``.
-
-    Returns ``(target_w, target_h)`` so a source frame maps onto a supported
-    output size without distorting its aspect ratio.
-    """
-    key = str(resolution)
-    if key not in VIDEO_RES_SIZE_INFO:
-        raise ValueError(
-            f"Unknown Cosmos3 transfer resolution={resolution!r}; "
-            f"expected one of {sorted(VIDEO_RES_SIZE_INFO)}."
-        )
-    input_ratio = h / w
-    best_size = None
-    best_diff = float("inf")
-    for cand_w, cand_h in VIDEO_RES_SIZE_INFO[key].values():
-        diff = abs(input_ratio - cand_h / cand_w)
-        if diff < best_diff:
-            best_diff = diff
-            best_size = (cand_w, cand_h)
-    assert best_size is not None
-    return best_size
-
-
 # ---------------------------------------------------------------------------
 # Transfer sampling + per-control-hint defaults, ported from vllm-omni's
 # Cosmos3 transfer implementation; the guidance and edge/blur presets are
