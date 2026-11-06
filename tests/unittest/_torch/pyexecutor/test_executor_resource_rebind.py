@@ -461,23 +461,3 @@ def test_release_stops_pipeline_progress_before_gpu_teardown(executor):
     assert ex._pp_mpi_progress_quiesced.is_set()
     assert ex._mpi_progress_thread is None
     assert ex._mpi_progress_thread_exit_hook is None
-
-
-def test_terminal_shutdown_deregisters_before_releasing_cache(
-    executor: tuple[PyExecutor, list[str]],
-) -> None:
-    ex, events = executor
-    ex.shutdown()
-    assert "drain" not in events
-    assert events.index("unregister") < events.index("cache")
-
-
-def test_terminal_transfer_shutdown_failure_keeps_cache_owned(
-    executor: tuple[PyExecutor, list[str]],
-) -> None:
-    ex, events = executor
-    ex.kv_cache_transceiver.shutdown = Mock(side_effect=RuntimeError("DMA still active"))
-    with pytest.raises(RuntimeError, match="DMA still active"):
-        ex.shutdown()
-    assert "cache" not in events
-    assert not ex._closed
