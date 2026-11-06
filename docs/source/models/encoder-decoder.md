@@ -248,7 +248,7 @@ Every Whisper request produces 1500 encoder positions (the checkpoint's
 `max_source_positions`) regardless of clip length, and the cross-KV pool is sized
 to hold them; `max_input_len` does not affect it. Leave `max_seq_len` unset, or
 set it to at least 1500, because the engine-level limit also covers the encoder
-pass.
+pass; a smaller value is rejected at startup.
 
 Whisper automatically disables block reuse for both the decoder self-attention
 and cross-attention KV caches, even when `KvCacheConfig.enable_block_reuse=True`.

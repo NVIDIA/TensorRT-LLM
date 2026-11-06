@@ -3136,12 +3136,28 @@ class KvCacheCreator:
             head_dim = encoder_hidden_size // encoder_num_heads
 
         max_seq_len = fallback_max_seq_len or self._max_seq_len
+        input_processor = self._model_engine.input_processor
         # max_input_len bounds the prompt, which is the encoder input only for
         # token encoders (BART/T5). A feature encoder (e.g. Whisper) takes the
         # prompt as the decoder prefix and emits a model-defined number of
         # positions, so max_input_len must not cap its cross pool.
-        if not getattr(self._model_engine.input_processor,
-                       "requires_encoder_features", False):
+        if getattr(input_processor, "requires_encoder_features", False):
+            # The input processor stamps this length on every request, and the
+            # cross pool allocates blocks from it.
+            encoder_output_len = getattr(input_processor, "encoder_output_len",
+                                         None)
+            if encoder_output_len is not None:
+                encoder_output_len = int(encoder_output_len)
+                if max_seq_len < encoder_output_len:
+                    raise ValueError(
+                        f"max_seq_len ({max_seq_len}) is smaller than the "
+                        f"{encoder_output_len} encoder positions every request "
+                        "of this model produces, so the encoder pass and the "
+                        "cross-attention KV cache cannot hold them. Leave "
+                        "max_seq_len unset or set it to at least "
+                        f"{encoder_output_len}.")
+                return num_layers, num_kv_heads, head_dim, encoder_output_len
+        else:
             max_input_len = getattr(self._llm_args, "max_input_len", None)
             if isinstance(max_input_len, int) and max_input_len > 0:
                 max_seq_len = max_input_len
@@ -3149,8 +3165,8 @@ class KvCacheCreator:
             config,
             ("max_encoder_input_len", "encoder_max_input_length",
              "max_encoder_position_embeddings",
-             "encoder_max_position_embeddings", "max_source_positions",
-             "max_position_embeddings", "n_positions"),
+             "encoder_max_position_embeddings", "max_position_embeddings",
+             "n_positions"),
         )
         if encoder_limit is not None:
             max_seq_len = min(max_seq_len, encoder_limit)
