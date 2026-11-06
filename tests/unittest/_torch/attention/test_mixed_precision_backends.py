@@ -958,24 +958,27 @@ def test_draft_forward_hides_mixed_precision_high_rows(backend):
 
 
 @pytest.mark.cpu_only
-def test_high_rows_property_is_sparse_only_and_dense_reports_the_redirect():
-    """With a high page table, the sparse metadata reports high rows and the dense metadata reports
-    the block-offset redirect, never both: the MLA write path must not run the sparse row store for
-    dense MLA models."""
+def test_high_rows_is_sparse_only_and_dense_reports_the_redirect():
+    """The dense metadata has no high-rows property and reports the block-offset redirect; the sparse
+    metadata reports high rows and no redirect. The MLA write path keys the sparse row store on the
+    former, so it never runs for dense MLA models."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
     )
 
     table = torch.full((2, 4), -1, dtype=torch.int32)
-    for cls, high_rows in ((TrtllmAttentionMetadata, False), (DSAtrtllmAttentionMetadata, True)):
-        metadata = Mock(spec=cls)
-        metadata.mixed_precision_block_offsets_redirect = cls.mixed_precision_block_offsets_redirect
-        metadata.mixed_precision_high_block_table = table
-        assert cls.has_mixed_precision_high_rows.fget(metadata) is high_rows
-        assert cls.redirects_mixed_precision_block_offsets.fget(metadata) is not high_rows
-        metadata.mixed_precision_high_block_table = None
-        assert cls.has_mixed_precision_high_rows.fget(metadata) is False
-        assert cls.redirects_mixed_precision_block_offsets.fget(metadata) is False
+    assert not hasattr(TrtllmAttentionMetadata, "has_mixed_precision_high_rows")
+    dense = Mock(spec=TrtllmAttentionMetadata)
+    dense.mixed_precision_block_offsets_redirect = True
+    dense.mixed_precision_high_block_table = table
+    assert TrtllmAttentionMetadata.redirects_mixed_precision_block_offsets.fget(dense) is True
+    sparse = Mock(spec=DSAtrtllmAttentionMetadata)
+    sparse.mixed_precision_block_offsets_redirect = False
+    sparse.mixed_precision_high_block_table = table
+    assert DSAtrtllmAttentionMetadata.has_mixed_precision_high_rows.fget(sparse) is True
+    assert DSAtrtllmAttentionMetadata.redirects_mixed_precision_block_offsets.fget(sparse) is False
+    sparse.mixed_precision_high_block_table = None
+    assert DSAtrtllmAttentionMetadata.has_mixed_precision_high_rows.fget(sparse) is False
 
 
 @pytest.mark.cpu_only
@@ -1155,7 +1158,7 @@ def test_cold_page_window_redirects_dense_block_offsets(layout):
     dense MLA one latent block per page."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12):
         pytest.skip("Mixed-precision KV requires Blackwell")
-    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+    from tensorrt_llm._torch.attention.backends.mixed_precision_rows import (
         store_mixed_precision_low_rows,
     )
 
