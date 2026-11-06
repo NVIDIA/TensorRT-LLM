@@ -512,6 +512,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         num_kv_heads_per_layer: Sequence[int],
         head_dim_per_layer: Sequence[int],
         is_draft: bool = False,
+        lossless_layers: frozenset[int] = frozenset(),
     ) -> _Nvfp4ColdPageCodecState:
         from tensorrt_llm.runtime.kv_cache_manager_v2 import AttentionLayerConfig
 
@@ -523,13 +524,35 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
         attention_layers = [
             layer for layer in cache_config.layers if isinstance(layer, AttentionLayerConfig)
         ]
+        # A lifecycle is owned by the codec or left to the lossless default as a
+        # whole, and a lossless layer shares its lifecycle with the other layers
+        # of its window, so it is classified with them.
+        uncompressed_layers = self._uncompressed_layer_ids(attention_layers)
+        # The codec copies its lossless layers byte for byte, whatever their
+        # dtype; the runtime dtype describes the layers that become NVFP4.
+        lossless_layouts = [
+            _Nvfp4LayerLayout(
+                layer_id=int(layer.layer_id),
+                num_kv_heads=int(num_kv_heads_per_layer[int(layer.layer_id)]),
+                tokens_per_page=int(cache_config.tokens_per_block),
+                raw_row_stride_elements=int(head_dim_per_layer[int(layer.layer_id)]),
+                buffers=tuple(
+                    _Nvfp4BufferLayout(role=str(buffer.role)) for buffer in layer.buffers
+                ),
+            )
+            for layer in attention_layers
+            if int(layer.layer_id) in lossless_layers
+            and int(layer.layer_id) not in uncompressed_layers
+        ]
+        attention_layers = [
+            layer for layer in attention_layers if int(layer.layer_id) not in lossless_layers
+        ]
         if attention_layers and runtime_type is None:
             raise RuntimeError(
                 "NVFP4 cold-page compression supports FP16, BF16, or FP8 "
                 f"Attention KV, not {runtime_dtype}"
             )
         default_scale = self._default_scale(runtime_dtype, is_draft=is_draft)
-        uncompressed_layers = self._uncompressed_layer_ids(attention_layers)
 
         # The codec holds only the target model's config, so it cannot locate RoPE
         # in a draft model's K vectors: draft KVCMs always quantize whole vectors.
@@ -552,7 +575,7 @@ class Nvfp4ColdPageQuantizationCompression(ColdPageQuantizationCompression):
                 default_scale=default_scale,
             )
 
-        layer_layouts = []
+        layer_layouts = lossless_layouts
         for layer in attention_layers:
             layer_id = int(layer.layer_id)
             if layer_id in uncompressed_layers:

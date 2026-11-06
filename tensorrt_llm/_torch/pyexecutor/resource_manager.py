@@ -2964,16 +2964,22 @@ class KVCacheCompressionManager(BaseResourceManager):
         return self.draft_kv_cache_manager is not None
 
     def create_cold_page_codec(
-        self,
-        cache_config: object,
-        *,
-        runtime_dtype: DataType,
-        pp_layers: Sequence[int],
-        num_kv_heads_per_layer: Sequence[int],
-        head_dim_per_layer: Sequence[int],
-        is_draft: bool = False,
+            self,
+            cache_config: object,
+            *,
+            runtime_dtype: DataType,
+            pp_layers: Sequence[int],
+            num_kv_heads_per_layer: Sequence[int],
+            head_dim_per_layer: Sequence[int],
+            is_draft: bool = False,
+            lossless_layers: frozenset[int] = frozenset(),
     ) -> Optional[object]:
-        """Create a native cold-page codec when the algorithm provides one."""
+        """Create a native cold-page codec when the algorithm provides one.
+
+        ``lossless_layers`` are local layer ids whose cold pages keep their
+        bytes unchanged, such as a drafter's layers in a manager it shares
+        with the target.
+        """
         return None
 
     def encode_cold_pages(

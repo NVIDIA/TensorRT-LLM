@@ -1994,20 +1994,36 @@ class KVCacheManagerV2(BaseResourceManager):
         def create_cold_page_codec(cache_config: object) -> Optional[object]:
             if cold_page_codec_provider is None:
                 return None
-            if (
-                self.layer_specs is not None
-                and len({layer.dtype for layer in self.layer_specs}) > 1
-            ):
+            # A drafter's layers in a manager it shares with the target keep
+            # their cold pages lossless; only the target's layers are encoded,
+            # so only their dtypes have to agree.
+            layer_specs = self.layer_specs or ()
+            lossless_layers = frozenset(
+                local_id
+                for local_id, layer in enumerate(layer_specs)
+                if layer.owner is KVCacheLayerOwner.DRAFT
+            )
+            encoded_dtypes = {
+                layer.dtype
+                for local_id, layer in enumerate(layer_specs)
+                if local_id not in lossless_layers
+            }
+            if len(encoded_dtypes) > 1:
                 raise NotImplementedError(
                     "cold-page compression does not yet support mixed-dtype KV-cache layer specs"
                 )
+            if encoded_dtypes:
+                runtime_dtype = next(iter(encoded_dtypes))
+            else:
+                runtime_dtype = layer_specs[0].dtype if layer_specs else self.dtype
             return cold_page_codec_provider.create_cold_page_codec(
                 cache_config,
-                runtime_dtype=self.layer_specs[0].dtype if self.layer_specs else self.dtype,
+                runtime_dtype=runtime_dtype,
                 pp_layers=self.pp_layers,
                 num_kv_heads_per_layer=self.num_kv_heads_per_layer,
                 head_dim_per_layer=self.head_dim_per_layer,
                 is_draft=self.is_draft,
+                lossless_layers=lossless_layers,
             )
 
         mappings_before_host_tier = (
