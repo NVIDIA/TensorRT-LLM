@@ -261,6 +261,16 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cosmos3_sigma_grid.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
   - unittest/_torch/visual_gen/test_seacache.py
+  - unittest/_torch/visual_gen/test_quant_ignore.py
+  - unittest/_torch/visual_gen/test_quant_ignore_runtime.py
+  - unittest/_torch/visual_gen/test_attention_qkv_share.py::test_linear_quant_ignore_bypasses_shared_qkv_quantization
+  - unittest/_torch/visual_gen/test_flux_attention.py::test_flux_attention_quant_ignore_bypasses_explicit_qkv_quantization
+  - unittest/_torch/visual_gen/test_flux_attention.py::test_flux2_linear_quant_ignore_bypasses_fp4_mlp_fusion
+  - unittest/_torch/visual_gen/test_flux_attention.py::test_flux_attention_ignore_matches_real_module_path
+  - unittest/_torch/visual_gen/test_flux_transformer.py::test_linear_ignored_steps_disable_shared_nvfp4_quantization
+  - unittest/_torch/visual_gen/test_wan_transformer.py::test_linear_ignored_steps_keep_fused_norm_output_bf16
+  - unittest/_torch/visual_gen/test_ltx2_attention.py::test_linear_ignored_steps_keep_norm_output_bf16
+  - unittest/_torch/visual_gen/test_ltx2_attention.py::test_linear_ignored_steps_bypass_async_qkv_quantization
   - unittest/_torch/visual_gen/test_sleep.py
   - unittest/_torch/visual_gen/test_teacache.py
   - unittest/_torch/visual_gen/test_tensor_payload.py

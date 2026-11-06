@@ -406,6 +406,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         force_dynamic_quant: bool = False,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         super().__init__()
         self.config = config
@@ -425,7 +426,7 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             config=config,
             layer_idx=layer_idx,
-            module_name=f"single_transformer_blocks.{layer_idx}.attn",
+            module_name=module_name or f"single_transformer_blocks.{layer_idx}.attn",
         )
 
     def forward(
@@ -668,6 +669,7 @@ class Flux2Transformer2DModel(BaseDiffusionModel):
                     force_dynamic_quant=force_dynamic_quant,
                     config=model_config,
                     layer_idx=num_layers + i,  # Continue numbering from dual-stream blocks
+                    module_name=f"single_transformer_blocks.{i}.attn",
                 )
                 for i in range(num_single_layers)
             ]

@@ -338,6 +338,144 @@
       "title": "CudaGraphConfig",
       "type": "object"
     },
+    "DiffusionQuantConfig": {
+      "additionalProperties": false,
+      "description": "Linear quantization configuration with per-step quantization exclusions.",
+      "properties": {
+        "clamp_val": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "number"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Clamp values used in FP8 rowwise quantization.",
+          "title": "Clamp Val"
+        },
+        "exclude_modules": {
+          "anyOf": [
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Module name patterns that are skipped in quantization.",
+          "title": "Exclude Modules"
+        },
+        "group_size": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 128,
+          "description": "Group size for group-wise quantization.",
+          "title": "Group Size"
+        },
+        "has_zero_point": {
+          "default": false,
+          "description": "Whether to use zero point for quantization.",
+          "title": "Has Zero Point",
+          "type": "boolean"
+        },
+        "ignored_steps": {
+          "description": "Zero-based denoising iterations that run Linear layers with the original BF16 weights instead of quantization. Requires a high-precision checkpoint and load-time weight quantization; retaining BF16 weights increases memory use. Cannot be combined with nonempty Linear or attention ignore lists.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": "prototype",
+          "title": "Ignored Steps",
+          "type": "array"
+        },
+        "kv_cache_quant_algo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuantAlgo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "KV cache quantization algorithm."
+        },
+        "mamba_ssm_cache_dtype": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Data type for mamba SSM cache.",
+          "title": "Mamba Ssm Cache Dtype"
+        },
+        "mamba_ssm_philox_rounds": {
+          "default": 10,
+          "description": "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness.",
+          "minimum": 1,
+          "title": "Mamba Ssm Philox Rounds",
+          "type": "integer"
+        },
+        "mamba_ssm_stochastic_rounding": {
+          "default": false,
+          "description": "Enable stochastic rounding for Mamba SSM state updates. Requires fp16 cache.",
+          "title": "Mamba Ssm Stochastic Rounding",
+          "type": "boolean"
+        },
+        "pre_quant_scale": {
+          "default": false,
+          "description": "Whether to use pre-quant scale for quantization.",
+          "title": "Pre Quant Scale",
+          "type": "boolean"
+        },
+        "quant_algo": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuantAlgo"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Quantization algorithm.",
+          "telemetry": true
+        },
+        "smoothquant_val": {
+          "default": 0.5,
+          "description": "Smoothing parameter alpha used in smooth quant.",
+          "title": "Smoothquant Val",
+          "type": "number"
+        },
+        "use_meta_recipe": {
+          "default": false,
+          "description": "Whether to use Meta's recipe for FP8 rowwise quantization.",
+          "title": "Use Meta Recipe",
+          "type": "boolean"
+        }
+      },
+      "title": "DiffusionQuantConfig",
+      "type": "object"
+    },
     "ParallelConfig": {
       "additionalProperties": false,
       "description": "Configuration for distributed parallelism across DiT-shaped models.\n\nThe sequence axis can be sharded via Attention2D (a 2D mesh) or Ring\nAttention (a 1D mesh); these two are mutually exclusive. Either can be\ncombined with Ulysses head-sharding to form an outer \u00d7 inner sequence\nparallel mesh. See ``mapping.py`` for the underlying DeviceMesh layout.",
@@ -491,6 +629,25 @@
       "additionalProperties": false,
       "description": "Attention quantization recipe (TRTLLM / CUDNN / FLASHINFER / CUTEDSL backends).\n\nSpecifies Q/K and V quantization formats and their optional block sizes.\n\nBare QuantAttentionConfig() uses the Qk16Pv8 defaults. Recipe validity is\nbackend-specific; FLASHINFER supports block-scaled MXFP8 or NVFP4 Q/K with FP8 V\non SM100/SM103, or NVFP4 Q/K/V on SM120/SM121. Unsupported recipes are rejected\nby AttentionConfig's validator with a ValueError.",
       "properties": {
+        "ignore": {
+          "description": "Attention module paths excluded from attention quantization at every step. Uses the same glob and re: patterns as Linear exclude_modules; paths may be relative to a transformer or qualified by its component name. Cannot be combined with nonempty Linear or attention ignored_steps lists.",
+          "items": {
+            "type": "string"
+          },
+          "status": "prototype",
+          "title": "Ignore",
+          "type": "array"
+        },
+        "ignored_steps": {
+          "description": "Zero-based denoising iterations that use the selected backend's native BF16/FP16 attention instead of this quantization recipe. Independent of Linear ignored_steps; cannot be combined with nonempty Linear or attention ignore lists.",
+          "items": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": "prototype",
+          "title": "Ignored Steps",
+          "type": "array"
+        },
         "k_block_size": {
           "default": 0,
           "description": "Number of K tokens per SageAttention quantization block; 0 otherwise.",
@@ -1074,6 +1231,127 @@
   "$id": "https://nvidia.github.io/TensorRT-LLM/1.4.0rc4/_static/schemas/trtllm-serve-visual-gen-config.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          {
+            "properties": {
+              "quant_config": {
+                "properties": {
+                  "ignored_steps": {
+                    "minItems": 1,
+                    "type": "array"
+                  }
+                },
+                "required": [
+                  "ignored_steps"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "quant_config"
+            ]
+          },
+          {
+            "properties": {
+              "attention_config": {
+                "properties": {
+                  "quant_attention_config": {
+                    "properties": {
+                      "ignored_steps": {
+                        "minItems": 1,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "ignored_steps"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "quant_attention_config"
+                ]
+              }
+            },
+            "required": [
+              "attention_config"
+            ]
+          }
+        ]
+      },
+      "then": {
+        "properties": {
+          "attention_config": {
+            "properties": {
+              "quant_attention_config": {
+                "properties": {
+                  "ignore": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            }
+          },
+          "cache_config": {
+            "type": "null"
+          },
+          "quant_config": {
+            "properties": {
+              "exclude_modules": {
+                "maxItems": 0
+              },
+              "ignore": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "quant_config": {
+            "properties": {
+              "ignored_steps": {
+                "minItems": 1,
+                "type": "array"
+              }
+            },
+            "required": [
+              "ignored_steps"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "quant_config"
+        ]
+      },
+      "then": {
+        "properties": {
+          "quant_config": {
+            "properties": {
+              "quant_algo": {
+                "not": {
+                  "type": "null"
+                }
+              }
+            },
+            "required": [
+              "quant_algo"
+            ]
+          },
+          "runtime_lora_config": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
   "description": "Static YAML checks only; runtime validation remains authoritative.",
   "properties": {
     "attention_config": {
@@ -1160,10 +1438,22 @@
     "quant_config": {
       "anyOf": [
         {
+          "$ref": "#/$defs/DiffusionQuantConfig"
+        },
+        {
           "$ref": "#/$defs/QuantConfig"
         },
         {
           "additionalProperties": true,
+          "properties": {
+            "ignored_steps": {
+              "items": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            }
+          },
           "type": "object"
         }
       ],

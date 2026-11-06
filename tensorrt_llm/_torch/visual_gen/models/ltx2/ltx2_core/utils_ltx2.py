@@ -23,6 +23,8 @@ def get_nvfp4_input_scale(linear) -> Optional[torch.Tensor]:
     Used by call sites to dispatch the fused-quant variant of the AdaLN wrappers
     when the downstream Linear can consume a pre-quantized Fp4QuantizedTensor.
     """
+    if getattr(getattr(linear, "quant_config", None), "ignored_steps", []):
+        return None
     if not isinstance(getattr(linear, "quant_method", None), NVFP4LinearMethod):
         return None
     input_scale = getattr(linear, "input_scale", None)

@@ -794,3 +794,29 @@ class TestFluxHuggingFaceComparison(unittest.TestCase):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.cpu_only
+def test_linear_ignored_steps_disable_shared_nvfp4_quantization() -> None:
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
+        FluxSingleTransformerBlock,
+    )
+
+    config = SimpleNamespace(ignored_steps=[0])
+
+    def projection():
+        return SimpleNamespace(
+            has_nvfp4_activation_quantization=True,
+            quant_config=config,
+            input_scale=torch.ones(()),
+            pre_quant_scale=None,
+            force_dynamic_quantization=False,
+            scaling_vector_size=16,
+        )
+
+    block = SimpleNamespace(
+        attn=SimpleNamespace(fuse_qk_norm_rope=True, qkv_proj=projection()), proj_mlp=projection()
+    )
+    assert not FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)
+    config.ignored_steps = []
+    assert FluxSingleTransformerBlock.configure_shared_nvfp4_quantize(block)

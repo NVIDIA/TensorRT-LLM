@@ -360,7 +360,71 @@ def generate_visual_gen_schema() -> dict:
     """Describe the separate VisualGen engine-args YAML file."""
     from tensorrt_llm.visual_gen.args import VisualGenArgs
 
-    return _schema_for(VisualGenArgs)
+    schema = _schema_for(VisualGenArgs)
+    # ModelOpt dictionaries remain extensible, but their diffusion step selector
+    # has the same constraint as the typed DiffusionQuantConfig branch.
+    quant_config = schema["properties"]["quant_config"]
+    for branch in quant_config.get("anyOf", []):
+        if branch.get("type") == "object" and branch.get("additionalProperties") is True:
+            branch.setdefault("properties", {})["ignored_steps"] = {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 0},
+            }
+    nonempty_steps = {
+        "type": "object",
+        "required": ["ignored_steps"],
+        "properties": {"ignored_steps": {"type": "array", "minItems": 1}},
+    }
+    linear_steps = {
+        "required": ["quant_config"],
+        "properties": {"quant_config": nonempty_steps},
+    }
+    attention_steps = {
+        "required": ["attention_config"],
+        "properties": {
+            "attention_config": {
+                "required": ["quant_attention_config"],
+                "properties": {"quant_attention_config": nonempty_steps},
+            }
+        },
+    }
+    # Keep cross-field constraints aligned with the runtime model validator.
+    schema.setdefault("allOf", []).append(
+        {
+            "if": {"anyOf": [linear_steps, attention_steps]},
+            "then": {
+                "properties": {
+                    "cache_config": {"type": "null"},
+                    "quant_config": {
+                        "properties": {
+                            "ignore": {"maxItems": 0},
+                            "exclude_modules": {"maxItems": 0},
+                        },
+                    },
+                    "attention_config": {
+                        "properties": {
+                            "quant_attention_config": {"properties": {"ignore": {"maxItems": 0}}}
+                        }
+                    },
+                }
+            },
+        }
+    )
+    schema["allOf"].append(
+        {
+            "if": linear_steps,
+            "then": {
+                "properties": {
+                    "runtime_lora_config": {"type": "null"},
+                    "quant_config": {
+                        "required": ["quant_algo"],
+                        "properties": {"quant_algo": {"not": {"type": "null"}}},
+                    },
+                }
+            },
+        }
+    )
+    return schema
 
 
 def _source_version() -> str:

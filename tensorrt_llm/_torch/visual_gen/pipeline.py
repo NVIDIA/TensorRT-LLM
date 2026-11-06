@@ -214,6 +214,33 @@ class BasePipeline(nn.Module):
             state = getattr(model_config, "attention_metadata_state", None)
             if state is not None:
                 state["denoise_step"] = denoise_step
+                step = None if denoise_step is None else denoise_step[0]
+                state["linear_quant_ignored"] = step in getattr(
+                    getattr(model_config, "quant_config", None), "ignored_steps", []
+                )
+                recipe = getattr(
+                    getattr(model_config, "attention", None), "quant_attention_config", None
+                )
+                state["attention_quant_ignored"] = step in getattr(recipe, "ignored_steps", [])
+
+    def _setup_linear_quant_dispatcher(self) -> None:
+        """Install Linear dispatch after quantized weights have been finalized."""
+        from .quantization.quant_dispatcher import install_linear_quant_dispatcher
+
+        for name in self.transformer_components:
+            model = getattr(self, name, None)
+            if model is None:
+                continue
+            config = model.model_config
+            if not getattr(config.quant_config, "ignored_steps", []):
+                continue
+            if self.pipeline_config.runtime_lora is not None:
+                raise ValueError(
+                    "Linear ignored_steps cannot be combined with runtime LoRA fusion."
+                )
+            if config.attention_metadata_state is None:
+                raise ValueError("Linear ignored_steps requires per-component attention state.")
+            install_linear_quant_dispatcher(model, config.attention_metadata_state)
 
     def _get_or_create_cuda_graph_shared_pool(self) -> SharedGraphPool:
         """Return the pipeline-owned pool shared by non-concurrent graph runners."""
