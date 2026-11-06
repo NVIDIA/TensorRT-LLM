@@ -3086,6 +3086,375 @@ class TestDeepSeekV31Parser(BaseToolParserTestClass):
             undefined_tool=undefined_tool_text,
         )
 
+    def test_parse_streaming_increment_streams_arguments_as_they_arrive(
+            self, sample_tools, parser):
+        """A call still being generated sends its name, then its arguments.
+
+        Unfinished arguments go out as they arrive, a final ``<`` included.
+        """
+        increments = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>search_web<｜tool▁sep｜>"
+            '{"query":',
+            ' "a <',
+            'b> tag"}',
+            "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ]
+
+        streamed = [[(call.tool_index, call.name, call.parameters)
+                     for call in parser.parse_streaming_increment(
+                         increment, sample_tools).calls]
+                    for increment in increments]
+
+        assert streamed == [
+            [(0, "search_web", "")],
+            [(0, None, '{"query": "a <')],
+            [(0, None, 'b> tag"}')],
+            [],
+        ]
+
+    def test_parse_streaming_increment_end_marker_split_across_increments(
+            self, sample_tools, parser):
+        """A split end marker is neither arguments nor text."""
+        increments = [
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>"
+            '{"location": "San',
+            ' Francisco, CA"} <｜tool▁call',
+            "▁end｜><｜tool▁calls▁end｜>",
+        ]
+
+        results = [
+            parser.parse_streaming_increment(increment, sample_tools)
+            for increment in increments
+        ]
+
+        assert [result.normal_text for result in results] == ["", "", ""]
+        assert [(call.tool_index, call.name, call.parameters)
+                for result in results for call in result.calls] == [
+                    (0, "get_weather", ""),
+                    (0, None, '{"location": "San Francisco, CA"}'),
+                ]
+
+
+_DEEPSEEK_WEATHER_ARGUMENTS = {
+    "location": "San Francisco, CA",
+    "unit": "celsius"
+}
+_DEEPSEEK_SEARCH_ARGUMENTS = {"query": 'SF "weather" {today} <b>'}
+
+
+def _deepseek_v3_call(name: str, arguments: dict) -> str:
+    return ("<｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+            f"{name}\n```json\n{json.dumps(arguments)}\n```<｜tool▁call▁end｜>")
+
+
+def _deepseek_v31_call(name: str, arguments: dict) -> str:
+    return (f"<｜tool▁call▁begin｜>{name}<｜tool▁sep｜>"
+            f"{json.dumps(arguments)}<｜tool▁call▁end｜>")
+
+
+# Parser name: (parser class, markup of one call, text between two calls).
+_DEEPSEEK_V3_FORMATS = {
+    "deepseek_v3": (DeepSeekV3Parser, _deepseek_v3_call, "\n"),
+    "deepseek_v31": (DeepSeekV31Parser, _deepseek_v31_call, ""),
+}
+
+
+class TestDeepSeekV3StreamingMatchesWholeTextParse:
+    """Streamed DeepSeek V3 and V3.1 calls end equal to the whole-text parse.
+
+    Whatever the increments, a client assembling the streamed calls by index
+    must end with the calls ``detect_and_parse`` finds in the whole text,
+    including when a call arrives in the last increment, after which nothing
+    can release it. The streamed text is the same for every split too, and
+    carries no markup, also when the stream ends inside a marker.
+    """
+
+    @staticmethod
+    def _outputs(parser_name):
+        _, call, between = _DEEPSEEK_V3_FORMATS[parser_name]
+        weather = call("get_weather", _DEEPSEEK_WEATHER_ARGUMENTS)
+        search = call("search_web", _DEEPSEEK_SEARCH_ARGUMENTS)
+        two_calls = ("<｜tool▁calls▁begin｜>" + weather + between + search +
+                     "<｜tool▁calls▁end｜>")
+        text_around_calls = "Let me check both.\n" + two_calls + "\nDone."
+        two_sections = ("<｜tool▁calls▁begin｜>" + weather +
+                        "<｜tool▁calls▁end｜><｜tool▁calls▁begin｜>" + search +
+                        "<｜tool▁calls▁end｜>")
+        text_around_two_sections = ("Let me check both.\n" + two_sections +
+                                    "\nDone.")
+        return {
+            "one_call": "<｜tool▁calls▁begin｜>" + weather + "<｜tool▁calls▁end｜>",
+            "two_calls": two_calls,
+            "text_around_calls": text_around_calls,
+            "stream_ends_inside_a_marker": text_around_calls + "<｜tool▁call",
+            "text_around_two_sections": text_around_two_sections,
+        }
+
+    @staticmethod
+    def _texts(parser_name):
+        """Per output, the normal text of the whole-text parse and of a stream.
+
+        The whole-text parse keeps the text before the calls, stripped.
+        Streaming sends that text as it is, then the text between and after
+        the calls, but nothing of a marker the stream ends inside.
+        """
+        between = _DEEPSEEK_V3_FORMATS[parser_name][2]
+        text_around_calls = ("Let me check both.",
+                             "Let me check both.\n" + between + "\nDone.")
+        text_around_two_sections = ("Let me check both.",
+                                    "Let me check both.\n\nDone.")
+        return {
+            "one_call": ("", ""),
+            "two_calls": ("", between),
+            "text_around_calls": text_around_calls,
+            "stream_ends_inside_a_marker": text_around_calls,
+            "text_around_two_sections": text_around_two_sections,
+        }
+
+    @staticmethod
+    def _chunkings(text):
+        yield "whole", [text]
+        yield "per_char", list(text)
+        for size in (2, 3, 5, 8, 13):
+            yield f"size_{size}", [
+                text[i:i + size] for i in range(0, len(text), size)
+            ]
+        for cut in range(1, len(text)):
+            yield f"split_{cut}", [text[:cut], text[cut:]]
+
+    @staticmethod
+    def _decoded(parameters):
+        """Decode streamed arguments; text that is not JSON stays visible."""
+        try:
+            return json.loads(parameters)
+        except json.JSONDecodeError:
+            return f"<not JSON: {parameters!r}>"
+
+    @classmethod
+    def _whole_text_calls(cls, parser_name, text, tools):
+        parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+        return [(index, call.name, cls._decoded(call.parameters))
+                for index, call in enumerate(
+                    parser.detect_and_parse(text, tools).calls)]
+
+    @classmethod
+    def _streamed(cls, parser_name, chunks, tools):
+        """Stream the chunks and finish, as the serving layer does.
+
+        Returns the streamed normal text and the calls assembled by tool
+        index, as a streaming client does.
+        """
+        parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        text = ""
+        calls = {}
+        for result in results:
+            text += result.normal_text
+            indices = [call.tool_index for call in result.calls]
+            assert len(indices) == len(set(indices)), (
+                f"one increment repeats a tool index: {indices}")
+            for call in result.calls:
+                name, arguments = calls.get(call.tool_index, (None, ""))
+                calls[call.tool_index] = (name or call.name,
+                                          arguments + call.parameters)
+        return text, [(index, name, cls._decoded(arguments))
+                      for index, (name, arguments) in sorted(calls.items())]
+
+    @pytest.mark.parametrize("output", [
+        "one_call", "two_calls", "text_around_calls",
+        "stream_ends_inside_a_marker", "text_around_two_sections"
+    ])
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_streamed_calls_match_whole_text_parse(self, sample_tools,
+                                                   parser_name, output):
+        """Whole output, one character, fixed sizes, every two-way split."""
+        text = self._outputs(parser_name)[output]
+        whole_text, streamed_text = self._texts(parser_name)[output]
+        expected = self._whole_text_calls(parser_name, text, sample_tools)
+        assert expected and all(
+            isinstance(arguments, dict) for _, _, arguments in expected)
+        parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+        assert parser.detect_and_parse(text,
+                                       sample_tools).normal_text == whole_text
+
+        chunkings = list(self._chunkings(text))
+        differing = [
+            label for label, chunks in chunkings
+            if self._streamed(parser_name, chunks, sample_tools) != (
+                streamed_text, expected)
+        ]
+
+        assert not differing, (
+            f"{len(differing)} of {len(chunkings)} chunkings end with other "
+            f"text or calls than expected, e.g. {differing[:8]}")
+
+    @pytest.mark.parametrize("marker",
+                             ["<｜tool▁call▁end｜>", "<｜tool▁calls▁end｜>"],
+                             ids=["call_end", "calls_end"])
+    @pytest.mark.parametrize("stream_ends_in_marker", [False, True],
+                             ids=["marker_arrives", "stream_ends_in_marker"])
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_end_marker_split_after_complete_arguments(self, sample_tools,
+                                                       parser_name,
+                                                       stream_ends_in_marker,
+                                                       marker):
+        """No part of an end marker cut in two is streamed as text.
+
+        One increment ends where the first call's arguments start, the next
+        with complete arguments, and the first end marker after them is cut
+        at every position. Each call it ends carries its arguments, whether
+        the rest arrives or the stream ends inside the marker.
+        """
+        text = self._outputs(parser_name)["two_calls"]
+        _, streamed_text = self._texts(parser_name)["two_calls"]
+        calls = [(0, "get_weather", _DEEPSEEK_WEATHER_ARGUMENTS),
+                 (1, "search_web", _DEEPSEEK_SEARCH_ARGUMENTS)]
+        if stream_ends_in_marker and marker == "<｜tool▁call▁end｜>":
+            expected = ("", calls[:1])
+        else:
+            expected = (streamed_text, calls)
+        arguments_start = text.index("{")
+        marker_start = text.index(marker)
+        for cut in range(marker_start + 1, marker_start + len(marker)):
+            chunks = [
+                text[:arguments_start], text[arguments_start:marker_start],
+                text[marker_start:cut]
+            ]
+            if not stream_ends_in_marker:
+                chunks.append(text[cut:])
+
+            streamed = self._streamed(parser_name, chunks, sample_tools)
+
+            assert streamed == expected, chunks
+
+    @pytest.mark.parametrize(
+        "marker", [
+            "<｜tool▁calls▁begin｜>", "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>"
+        ],
+        ids=["calls_begin", "call_begin", "call_end", "calls_end"])
+    @pytest.mark.parametrize("stream_ends_in_marker", [False, True],
+                             ids=["marker_arrives", "stream_ends_in_marker"])
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_text_before_a_split_marker_is_sent_with_its_increment(
+            self, sample_tools, parser_name, stream_ends_in_marker, marker):
+        """The text before part of a marker goes out with its increment.
+
+        Only the part of the marker waits, and none of it is streamed as text,
+        whether the rest arrives or the stream ends inside the marker. The
+        marker is cut at every position.
+        """
+        text = "Done: a < b."
+        for cut in range(1, len(marker)):
+            chunks = [text + marker[:cut]]
+            if not stream_ends_in_marker:
+                chunks.append(marker[cut:])
+            parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+
+            results = [
+                parser.parse_streaming_increment(chunk, sample_tools)
+                for chunk in chunks
+            ]
+            results.append(parser.finish(sample_tools))
+            streamed = [(result.normal_text, result.calls)
+                        for result in results]
+
+            assert streamed == [(text, [])] + [("", [])] * len(chunks), chunks
+
+    @pytest.mark.parametrize(
+        "split",
+        ["whole_call_in_last_increment", "last_increment_has_the_rest"])
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_last_increment_sends_the_arguments_with_the_name(
+            self, sample_tools, parser_name, split):
+        """A call first named by the last increment comes with its arguments."""
+        text = self._outputs(parser_name)["one_call"]
+        if split == "whole_call_in_last_increment":
+            chunks = ["Let me check.\n", text]
+        else:
+            cut = text.index("get_weather") + len("get_wea")
+            chunks = [text[:cut], text[cut:]]
+        parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+        for chunk in chunks[:-1]:
+            assert parser.parse_streaming_increment(chunk,
+                                                    sample_tools).calls == []
+
+        last = parser.parse_streaming_increment(chunks[-1], sample_tools)
+
+        assert [(call.tool_index, call.name, self._decoded(call.parameters))
+                for call in last.calls] == [(0, "get_weather",
+                                             _DEEPSEEK_WEATHER_ARGUMENTS)]
+        assert parser.finish(sample_tools).calls == []
+
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_two_calls_in_last_increment_are_both_sent(self, sample_tools,
+                                                       parser_name):
+        """Both whole calls of one increment are sent, one item each."""
+        parser = _DEEPSEEK_V3_FORMATS[parser_name][0]()
+
+        last = parser.parse_streaming_increment(
+            self._outputs(parser_name)["two_calls"], sample_tools)
+
+        assert [(call.tool_index, call.name, self._decoded(call.parameters))
+                for call in last.calls] == [
+                    (0, "get_weather", _DEEPSEEK_WEATHER_ARGUMENTS),
+                    (1, "search_web", _DEEPSEEK_SEARCH_ARGUMENTS),
+                ]
+        assert parser.finish(sample_tools).calls == []
+
+    @pytest.mark.parametrize("split", [
+        "whole_output_in_one_step", "calls_in_last_step",
+        "last_step_has_the_rest", "last_step_from_the_first_end_marker"
+    ])
+    @pytest.mark.parametrize("parser_name", sorted(_DEEPSEEK_V3_FORMATS))
+    def test_chat_stream_carries_the_arguments_to_the_end(
+            self, sample_tools, parser_name, split):
+        """The chat stream assembles to the whole-text calls in each case.
+
+        The text around the calls reaches the client too, without markup.
+        """
+        _, streamed_text = self._texts(parser_name)["text_around_calls"]
+        text = self._outputs(parser_name)["text_around_calls"]
+        cut = {
+            "whole_output_in_one_step": None,
+            "calls_in_last_step": len("Let me check both.\n"),
+            "last_step_has_the_rest": text.index("search_web") + len("sea"),
+            "last_step_from_the_first_end_marker":
+            text.index("<｜tool▁call▁end｜>"),
+        }[split]
+        chunks = [text] if cut is None else [text[:cut], text[cut:]]
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser=parser_name, stream=True)
+
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            args, chunks)
+
+        calls = {}
+        content = ""
+        for payload in payloads:
+            for choice in payload["choices"]:
+                content += choice["delta"].get("content") or ""
+                tool_calls = choice["delta"].get("tool_calls") or []
+                indices = [tool_call["index"] for tool_call in tool_calls]
+                assert len(indices) == len(set(indices)), (
+                    f"one chunk repeats a tool index: {indices}")
+                for tool_call in tool_calls:
+                    function = tool_call["function"]
+                    name, arguments = calls.get(tool_call["index"], (None, ""))
+                    calls[tool_call["index"]] = (
+                        name or function.get("name"),
+                        arguments + (function.get("arguments") or ""))
+        streamed = [(index, name, self._decoded(arguments))
+                    for index, (name, arguments) in sorted(calls.items())]
+
+        assert streamed == self._whole_text_calls(parser_name, text,
+                                                  sample_tools)
+        assert payloads[-1]["choices"][0]["finish_reason"] == "tool_calls"
+        assert content == streamed_text
+
 
 # ============================================================================
 # DeepSeekV32Parser Tests
