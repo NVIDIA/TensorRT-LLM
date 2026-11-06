@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Adding Kernels for KV-Cache Features
+# Adding Kernels for KV Cache Compression Methods and KV Cache Manager V2 Features
 
 This guide covers kernels for compression methods, cold-page codecs,
 mixed-precision KV cache conversion, and KV cache manager V2 data movement.

@@ -1,16 +1,18 @@
 ---
 name: trtllm-kv-cache-compression
 description: >-
-  Design, implement, review, or debug KV cache compression methods in the
+  Entry point for KV cache compression framework development in the
   TensorRT-LLM PyTorch backend: KvCacheCompressionConfig subclasses,
   create_kv_cache_compression_manager and its admission checks, the
-  KVCacheCompressionManager base and its five lifecycle hooks
-  (iteration-driven methods such as TriAttention eviction with physical
-  compaction), storage-bound methods that provide cold-page codecs to KV cache
-  manager V2, and method kernels. Use for any new KV cache compression
-  method, any change to the KV cache compression manager base, hooks,
-  factory, admission, or compaction, and any review of a KV cache compression
-  PR. For cold-page codecs also load trtllm-kv-cache-cold-page
+  KVCacheCompressionManager base and its five lifecycle hooks,
+  iteration-driven methods such as TriAttention eviction with physical
+  compaction, storage-bound methods that provide cold-page codecs to KV cache
+  manager V2, and method kernels. Read it first for any new KV cache
+  compression method, any change to the KV cache compression manager base,
+  hooks, factory, admission, or compaction, and any review of a KV cache
+  compression PR. Builds on KV cache manager V2 (trtllm-kv-cache-manager-v2,
+  ../trtllm-kv-cache-manager-v2/SKILL.md), whose engineering rules it shares.
+  For cold-page codecs also read trtllm-kv-cache-cold-page
   (../trtllm-kv-cache-cold-page/SKILL.md).
 license: Apache-2.0
 metadata:
@@ -27,20 +29,73 @@ the KV cache compression framework:
 - the steps for adding a method;
 - the order of validation.
 
-This skill is the workflow on top of it: what to read, which owner boundaries
-a change must respect, the contracts the guide leaves implicit, the rules
-only a reviewer enforces, and the design-gate and review templates. Load
-`trtllm-kv-cache-develop` (`../trtllm-kv-cache-develop/SKILL.md`) first.
+This skill is the entry point for KV cache compression framework
+development and the workflow on top of that guide: what to read, which owner
+boundaries a change must respect, the contracts the guide leaves implicit,
+the rules only a reviewer enforces, and the design-gate and review
+templates.
 
 The KV cache compression framework sits on KV cache manager V2 only. Do not
 build compression on the deprecated KV cache manager V1, and do not model a
 new method on sparse-attention algorithms that still depend on KV cache
 manager V1. RocketKV is a sparse-attention method, not a compression method.
+For the KV cache manager V2 contracts a method relies on (lengths,
+publication, resize, reuse), the current and deprecated paths, and the owner
+map, read `trtllm-kv-cache-manager-v2`
+(`../trtllm-kv-cache-manager-v2/SKILL.md`). The design workflow, engineering
+rules, agent working rules, and PR hygiene that both entry skills share are
+in `../trtllm-kv-cache-manager-v2/references/engineering-rules.md`.
+
+## Hard Rules
+
+Follow all of these in every task on the KV cache compression framework.
+`../trtllm-kv-cache-manager-v2/references/engineering-rules.md` and
+`../trtllm-kv-cache-manager-v2/references/design-principles.md` explain each
+one.
+
+1. Read the required context below before designing or editing.
+2. Reuse an existing mechanism before building a new one: configuration,
+   then an existing extension point, then the method's own package. Native
+   code comes last, with a written reason.
+3. Build only on current paths (KV cache manager V2, the Python cache
+   transceiver, `tensorrt_llm/_torch/attention/`), never on deprecated ones.
+4. With the method off, outputs, memory, speed, errors, and API stay
+   identical to main.
+5. Reject unsupported combinations at configuration time. Never fall back
+   silently.
+6. Decide and test every compatibility axis, including block reuse, CUDA
+   graphs, the overlap scheduler, disaggregated serving, speculative
+   decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`).
+7. Measure performance end to end in the production configuration before
+   calling a change done (`../perf-kv-cache-tuning/SKILL.md`).
+8. Never remove a feature, mode, or optimization to make code smaller, and
+   never change an experiment's settings to make a result pass.
+9. Give each concept one full name and use it everywhere: identifiers, test
+   names, comments, docs, PR text, and replies to people. Write
+   "mixed-precision high window", never "window"; "FP8 KV cache", never
+   "FP8" or "KV". Abbreviate only with common knowledge (LLM, GPU, CUDA,
+   `attn`) or after writing "full name (ABBR)" at first use.
+10. Say "done", "passed", or "pushed" only with evidence you can show.
+
+## Route the Task
+
+Paths are relative to this file.
+
+| Task | Read next |
+|---|---|
+| Cold-page compression: cold-page codecs, the NVFP4 cold-page format, rotary position embedding (RoPE) precision | `../trtllm-kv-cache-cold-page/SKILL.md` |
+| An iteration-driven method (eviction, compaction): lengths, protected tokens, cadence, CUDA graphs, speculative decoding, parallelism | `references/iteration-driven-methods.md` |
+| Method kernels | `references/adding-kernels.md` |
+| A change to KV cache manager V2 itself, or a KV cache manager V2 contract a method relies on | `../trtllm-kv-cache-manager-v2/SKILL.md` |
+| Whether a method works with reuse, CUDA graphs, the overlap scheduler, disaggregated serving, speculative decoding, or parallelism; test design | `../trtllm-kv-cache-compat-testing/SKILL.md` |
+| Throughput, latency, memory, profiling, tuning | `../perf-kv-cache-tuning/SKILL.md` |
+| Accuracy of a lossy method | `../trtllm-kv-cache-accuracy-eval/SKILL.md` |
 
 ## Required Context
 
 1. The development guide above, in full. Its GitHub line anchors can be
-   stale; locate symbols by name.
+   stale; locate symbols by name. Also `CODING_GUIDELINES.md` and the root
+   `AGENTS.md`.
 2. `docs/source/features/kv-cache-compression.md` and the recipes in
    `examples/kv_cache_compression/`.
 3. `docs/source/developer-guide/kv-cache-cold-page-codec.md`, for
@@ -113,7 +168,7 @@ A round is a fixed sequence of stages. Keep each stage in its place:
 | `on_request_finish` | Host | Release request-local state; never free blocks |
 
 Kernels for the score and select stages follow
-`../trtllm-kv-cache-develop/references/adding-kernels.md`.
+`references/adding-kernels.md`.
 
 ## How a Method Is Wired on Main
 
@@ -291,8 +346,8 @@ A change to `KVCacheCompressionManager`, its hooks, the factory, admission, or
 
 ## Design Gate
 
-Extend the general gate from `trtllm-kv-cache-develop`
-(`../trtllm-kv-cache-develop/SKILL.md`) with:
+Extend the general design gate in
+`../trtllm-kv-cache-manager-v2/references/engineering-rules.md` with:
 
 ```markdown
 ## Compression Design Gate
@@ -350,3 +405,17 @@ Extend the general gate from `trtllm-kv-cache-develop`
 - `references/iteration-driven-methods.md`: protected tails, overlap-scheduler
   and CUDA-graph safety, compaction, speculative decoding, parallelism,
   kernels, and TriAttention as a worked example.
+- `references/adding-kernels.md`: choosing, writing, wiring, and testing
+  kernels for compression methods, cold-page codecs, mixed-precision KV cache
+  conversion, and KV cache manager V2 data movement (Triton, CuTe DSL, CUDA
+  C++ with torch custom ops or nanobind).
+- Shared with `trtllm-kv-cache-manager-v2`, under
+  `../trtllm-kv-cache-manager-v2/references/`:
+  - `engineering-rules.md`: the design workflow and design gate,
+    engineering rules, what machines check, agent working rules, PR
+    hygiene, and the review output format;
+  - `design-principles.md`: the review bar, with rationale;
+  - `lessons-learned.md`: recurring review findings and the rules they
+    produced, by category;
+  - `kv-cache-architecture.md`: a map of the stack around KV cache manager
+    V2, with the invariants changes most often break.

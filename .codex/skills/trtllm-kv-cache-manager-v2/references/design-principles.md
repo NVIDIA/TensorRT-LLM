@@ -3,10 +3,11 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Design Principles for KV-Cache Features
+# Design Principles for KV Cache Manager V2 and KV Cache Compression Work
 
-These principles are the review bar for KV-cache work. Each one comes from a
-change that was reworked in review. The incidents are summarized in
+These principles are the review bar for work on KV cache manager V2 and on
+the KV cache compression framework. Each one comes from a change that was
+reworked in review. The incidents are summarized in
 `lessons-learned.md`.
 
 ## 1. Start From the Behavior Contract

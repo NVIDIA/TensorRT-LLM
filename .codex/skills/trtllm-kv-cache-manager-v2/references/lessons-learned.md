@@ -3,10 +3,11 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# Lessons Learned in KV-Cache Development
+# Lessons Learned in KV Cache Manager V2 and KV Cache Compression Work
 
 These rules summarize findings that came up again and again in reviews of
-AI-assisted KV-cache work in this repository. The areas covered are:
+AI-assisted work on KV cache manager V2 and the KV cache compression
+framework in this repository. The areas covered are:
 - the KV cache compression framework;
 - token eviction and physical compaction;
 - cold-page compression;

@@ -38,10 +38,12 @@ The contracts live in:
   cold-page codec application binary interface (ABI), the memory contract,
   the migration transaction, and the initialization order.
 
-This skill is the workflow and the pitfalls on top of them. Load
-`trtllm-kv-cache-develop` (`../trtllm-kv-cache-develop/SKILL.md`) and
+This skill is the workflow and the pitfalls on top of them. Cold-page
+compression is a KV cache compression method: read
 `trtllm-kv-cache-compression` (`../trtllm-kv-cache-compression/SKILL.md`)
-first.
+first. The KV cache manager V2 side of the cold-page codec interface is
+covered by `trtllm-kv-cache-manager-v2`
+(`../trtllm-kv-cache-manager-v2/SKILL.md`).
 
 ## Required Context
 
@@ -112,7 +114,7 @@ The compression provider's encode and decode receive host page-index pairs
 and the migration stream, and launch the cold-page format kernels. The NVFP4
 launcher splits a batch into fixed-size chunks of pages. Kernels for a new
 cold-page format follow
-`../trtllm-kv-cache-develop/references/adding-kernels.md`.
+`../trtllm-kv-cache-compression/references/adding-kernels.md`.
 
 ## Layers and Ownership
 

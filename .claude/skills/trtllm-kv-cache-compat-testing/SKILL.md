@@ -23,8 +23,11 @@ metadata:
 KV-cache features rarely fail on their own. They fail when they meet reuse,
 CUDA graphs, the overlap scheduler, disaggregated serving, or speculative
 decoding. Decide each combination up front, test what you claim, and reject
-the rest before execution. Load `trtllm-kv-cache-develop`
-(`../trtllm-kv-cache-develop/SKILL.md`) first.
+the rest before execution. Read the entry skill for the area first:
+`trtllm-kv-cache-manager-v2` (`../trtllm-kv-cache-manager-v2/SKILL.md`) for
+KV cache manager V2 changes, or `trtllm-kv-cache-compression`
+(`../trtllm-kv-cache-compression/SKILL.md`) for KV cache compression
+methods.
 
 ## Step 1: Decide the Compatibility Table Up Front
 

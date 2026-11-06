@@ -139,7 +139,7 @@ The low-precision format is chosen by the dtype name `mixed_<low>_<high>`.
    - `convert_mixed_precision_kv()` compiles one kernel per key: dtypes,
      shapes, and strides. Warm up every key the deployment uses before CUDA
      graph capture.
-   - Follow `../../trtllm-kv-cache-develop/references/adding-kernels.md`.
+   - Follow `../../trtllm-kv-cache-compression/references/adding-kernels.md`.
 4. **Own-pool backends (high-row overlay path).** A backend whose native pool
    already uses the low-precision format needs only the high-row store and
    overlay, not the low-precision codec.

@@ -1,21 +1,24 @@
 ---
 name: trtllm-kv-cache-manager-v2
 description: >-
-  Change, extend, review, or debug TensorRT-LLM KV cache manager V2
-  itself: the executor-side KVCacheManagerV2 wrapper and its model- and
-  backend-specific subclasses, layer groups and life cycles, per-life-cycle
-  reuse policies and commit timing, retention priorities, extra buffers, pool
-  sizing, Host and Disk tiers, events and statistics, the nanobind surface, and
-  its native core. Use before adding a buffer, life cycle, reuse or retention
-  rule, or tier behavior; before changing capacity, history, commit, or
-  release; when a feature needs something KV cache manager V2 does not yet
-  provide; and when reviewing such a change.
+  Entry point for KV cache manager V2 development in TensorRT-LLM: the
+  executor-side KVCacheManagerV2 wrapper and its model- and backend-specific
+  subclasses, layer groups and life cycles, per-life-cycle reuse policies and
+  commit timing, retention priorities, extra buffers, pool sizing, host and
+  disk tiers, events and statistics, the nanobind surface, and the native
+  core, plus features built directly on them such as the mixed-precision KV
+  cache. Read it first before designing, implementing, debugging, or
+  reviewing such a change. Gives the hard rules, required reading, current
+  and deprecated paths, owner map, where a change belongs, contracts, and
+  tests. Also hosts the engineering rules, design principles, and review
+  lessons that the KV cache compression framework skill
+  (trtllm-kv-cache-compression) uses as well.
 license: Apache-2.0
 metadata:
   author: NVIDIA Corporation
 ---
 
-# Changing KV Cache Manager V2
+# KV Cache Manager V2 Development
 
 KV cache manager V2 has four layers:
 - the native core, in C++ (`cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`);
@@ -26,23 +29,153 @@ KV cache manager V2 has four layers:
   `kv_cache/mamba_cache_manager/`, and the backend managers under
   `tensorrt_llm/_torch/attention/backends/`).
 
+This skill is the entry point for work on KV cache manager V2 and on
+features built directly on it, such as the mixed-precision KV cache. Work on
+the KV cache compression framework, meaning compression methods such as
+TriAttention eviction and cold-page compression, starts from
+`trtllm-kv-cache-compression` (`../trtllm-kv-cache-compression/SKILL.md`),
+which builds on the contracts described here.
+
 The two `AGENTS.md` files of the native core and of the Python surface are the
 source of truth for architecture, concurrency, invariants, and commands. This
 skill decides where a change belongs, which extension points to use, and how
-to test and review it. Load `trtllm-kv-cache-develop`
-(`../trtllm-kv-cache-develop/SKILL.md`) first.
+to test and review it. The design workflow, engineering rules, agent working
+rules, and PR hygiene that both entry skills share are in
+`references/engineering-rules.md`.
+
+## Hard Rules
+
+Follow all of these in every task on KV cache manager V2.
+`references/engineering-rules.md` and `references/design-principles.md`
+explain each one.
+
+1. Read the required context below before designing or editing.
+2. Reuse an existing mechanism before building a new one: configuration,
+   then an existing extension point, then the feature's own package. Native
+   code comes last, with a written reason.
+3. Build only on current paths (KV cache manager V2, the Python cache
+   transceiver, `tensorrt_llm/_torch/attention/`), never on deprecated ones.
+4. With the feature off, outputs, memory, speed, errors, and API stay
+   identical to main.
+5. Reject unsupported combinations at configuration time. Never fall back
+   silently.
+6. Decide and test every compatibility axis, including block reuse, CUDA
+   graphs, the overlap scheduler, disaggregated serving, speculative
+   decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`).
+7. Measure performance end to end in the production configuration before
+   calling a change done (`../perf-kv-cache-tuning/SKILL.md`).
+8. Never remove a feature, mode, or optimization to make code smaller, and
+   never change an experiment's settings to make a result pass.
+9. Give each concept one full name and use it everywhere: identifiers, test
+   names, comments, docs, PR text, and replies to people. Write
+   "mixed-precision high window", never "window"; "FP8 KV cache", never
+   "FP8" or "KV". Abbreviate only with common knowledge (LLM, GPU, CUDA,
+   `attn`) or after writing "full name (ABBR)" at first use.
+10. Say "done", "passed", or "pushed" only with evidence you can show.
+
+## Route the Task
+
+Paths are relative to this file.
+
+| Task | Read next |
+|---|---|
+| The mixed-precision KV cache (`mixed_nvfp4_*` dtypes, first/last N tokens) | `../trtllm-kv-cache-mixed-precision/SKILL.md` |
+| A KV cache compression method, or the KV cache compression framework itself (iteration-driven or storage-bound, including cold-page compression) | `../trtllm-kv-cache-compression/SKILL.md` |
+| Whether a change works with reuse, CUDA graphs, the overlap scheduler, disaggregated serving, speculative decoding, or parallelism; test design | `../trtllm-kv-cache-compat-testing/SKILL.md` |
+| Throughput, latency, memory, profiling, tuning | `../perf-kv-cache-tuning/SKILL.md` |
+| Accuracy of a lossy or state-changing feature | `../trtllm-kv-cache-accuracy-eval/SKILL.md` |
+| Kernels for KV cache manager V2 data movement or for a feature built on it | `../trtllm-kv-cache-compression/references/adding-kernels.md` |
+| A sparse attention algorithm that selects or skips KV cache entries inside attention (`SparseAttentionConfig`) | `docs/source/developer-guide/sparse-attention-development-guide.md` in the repository, then the compatibility, performance, and accuracy skills above |
 
 ## Required Context
 
-1. `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md` (the KV
-   cache manager V2 C++ guide), in full. When you touch the batch, the sparse
-   cache, or index conversion, also read `SPARSE_ATTENTION_DESIGN.md` and
-   `INDEX_CONVERSION_DESIGN.md` next to it.
-2. `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md`: test commands, the
+Read before proposing a design or editing code:
+
+1. `CODING_GUIDELINES.md` and the root `AGENTS.md`.
+2. `docs/source/features/kvcache.md`: manager selection, reuse, partial
+   reuse, retention, mixed precision, offloading.
+3. `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md` (the KV
+   cache manager V2 C++ guide), in full: ownership, invariants, the
+   concurrency model, and high-risk areas. When you touch the batch, the
+   sparse cache, or index conversion, also read `SPARSE_ATTENTION_DESIGN.md`
+   and `INDEX_CONVERSION_DESIGN.md` next to it.
+4. `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md`: test commands, the
    rebuild steps after a C++ change, and the gotchas (string salts,
    dataclass-field grafts, the cross-language block-key format).
-3. The wrapper (`kv_cache_manager_v2.py`) and the subclass you touch.
-4. `docs/source/features/kvcache.md`, for user-facing behavior.
+5. The wrapper (`kv_cache_manager_v2.py`) and the subclass you touch.
+6. `tensorrt_llm/_torch/attention/ATTENTION_DEVELOPER_GUIDE.md`, at least
+   "KV-cache and decode-time semantics", "Evaluating New Attention", and
+   "Anti-Patterns".
+7. `docs/source/features/feature-combination-matrix.md`.
+8. The docs of the area you touch:
+   - disaggregated serving: `docs/source/features/disagg-serving.md` and
+     `docs/source/developer-guide/kv-transfer.md`;
+   - sparse attention: `docs/source/features/sparse-attention.md` and
+     `docs/source/developer-guide/sparse-attention-development-guide.md`;
+   - the cold-page codec interface:
+     `docs/source/developer-guide/kv-cache-cold-page-codec.md`;
+   - KV cache compression methods: start from
+     `../trtllm-kv-cache-compression/SKILL.md` instead.
+9. The target code, its tests, and its recent history (`git log -- <files>`):
+   who changed it, and why.
+
+When docs and code disagree, the code and its tests win. Say so in the change,
+and either fix the doc in the same PR or report it as a follow-up. Known
+stale spots to read past:
+- some docs still mention a pure-Python KV cache manager V2 backend, or ask
+  for tests on "both backends". There is one backend: the C++ native core;
+- the sparse-attention development guide still offers KV cache manager V1
+  for auxiliary pools. Put side buffers on KV cache manager V2 through
+  `_extra_buffers_per_layer` instead;
+- the root `AGENTS.md` lists NIXL, UCX, or MPI for KV cache exchange, and
+  `kv-transfer.md` says a V1 context worker can talk to a V2 generation
+  worker. Both predate the deprecation: the current transceiver uses NIXL,
+  with KV cache manager V2 on both sides;
+- the opening sections of `kvcache.md` ("The Basics", "Reuse Across
+  Requests") describe KV cache manager V1 pools. KV cache manager V2 sizes
+  one pool per layer group, from `pool_ratio` or `avg_seq_len`;
+- the "Multi-backend Support" overview in `disagg-serving.md` describes the
+  deprecated C++ transceiver. Use its transceiver configuration section
+  instead;
+- the cold-page codec design's section on the KV cache manager refactoring
+  it requires (titled "Required KVCM Refactoring") is already implemented.
+  Read it as invariants, not as open work;
+- the note in `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md` that
+  streaming KV cache events have no implementation predates the native
+  streaming path. The "KV Cache Events" section of `kvcache.md` is current;
+- line anchors in GitHub links can drift. Locate symbols by name.
+
+## Build on Current Paths Only
+
+| Build on | Do not build on (deprecated, removed, or legacy) |
+|---|---|
+| KV cache manager V2 (`use_kv_cache_manager_v2: true`, the default) | KV cache manager V1. It is deprecated and scheduled for removal, together with its V1-based subclasses, such as the hybrid managers in `kv_cache/mamba_cache_manager/legacy.py`. A few features still depend on V1 while they gain V2 support; new features target V2 and do not reuse V1-specific code paths |
+| The Python cache transceiver (`transceiver_runtime: PYTHON`) on the NIXL backend, with KV cache manager V2 on both workers | The deprecated C++ cache transceiver, which is selected by `transceiver_runtime: CPP`, by an explicit null, or by `auto` when it falls back. Also the `UCX`, `MPI`, and `MOONCAKE` transceiver backends, `backend: DEFAULT`, and the `TRTLLM_USE_*_KVCACHE` backend selectors. New features target the Python transceiver |
+| Explicit settings in recipes and tests (`use_kv_cache_manager_v2: true`, `transceiver_runtime: PYTHON`) | `auto` values that can resolve to a deprecated path, and example or curated configurations that pin `use_kv_cache_manager_v2: false` |
+| Current speculative-decoding configurations: multi-token prediction (MTP), EAGLE3, and the other one-model modes | The deprecated `NGramDecodingConfig` and `UserProvidedDecodingConfig` |
+| The KV cache manager V2 native core (C++), driven through `tensorrt_llm/_torch/pyexecutor/kv_cache/` | A pure-Python KV cache manager V2 core. Main has none, and no code reads the `TLLM_KV_CACHE_MANAGER_V2_BACKEND` variable that some docs and tests still mention |
+| `tensorrt_llm/_torch/attention/` (`backends/`, `attention.py`, `ATTENTION_DEVELOPER_GUIDE.md`) | The deprecated compatibility modules `tensorrt_llm._torch.attention_backend` and `tensorrt_llm._torch.modules.attention`, which only re-export the new location |
+| `tensorrt_llm/_torch/pyexecutor/kv_cache/` and `tensorrt_llm/_torch/disaggregation/` | Flat module paths from before the KV cache managers and the transceiver were regrouped |
+| The KV cache compression framework (`KvCacheCompressionConfig`) for work between steps or at tier boundaries | Sparse-attention hooks for KV cache reduction that does not change the attention computation |
+| Current field names: `cold_tier_offload_min_priority`, `block_reuse_config.policy`, `block_reuse_config.enable_branch_snapshot`, `mamba_state_config.periodic_snapshot_interval` | Old names: `secondary_offload_min_priority` (alias of `cold_tier_offload_min_priority`); `block_reuse_config.block_reuse_policy` (rejected; renamed to `policy`); `mamba_state_config.enable_branch_snapshot` (alias of `block_reuse_config.enable_branch_snapshot`); `mamba_state_cache_interval` (alias of `mamba_state_config.periodic_snapshot_interval`); `sink_token_length` (ignored on the PyTorch backend) |
+| `tests/unittest/_torch/pyexecutor/` for executor tests, `tests/unittest/_torch/pyexecutor/kv_cache/` for the KV cache manager V2 wrapper, `tests/unittest/kv_cache_manager_v2_tests/` for KV cache manager V2 core behavior | `tests/unittest/_torch/executor/`, the name from before the executor tests were renamed |
+
+Before relying on any path, confirm it on the current main. Search open pull
+requests for planned removals or renames of the files you will touch.
+
+## Owner Map
+
+| Layer | Location | Owns | Must not |
+|---|---|---|---|
+| User configuration | `tensorrt_llm/llmapi/llm_args.py` (`KvCacheConfig`, `KvCacheCompressionConfig` subclasses, `SparseAttentionConfig`) | Settings, defaults, validation, rejection of unsupported combinations | Hold runtime state; switch features off silently |
+| Executor construction | `tensorrt_llm/_torch/pyexecutor/_util.py`, `py_executor_creator.py` | Building managers in the right order, compatibility admission, KV cache memory budget estimation | Contain method-specific runtime logic |
+| Executor loop and resource managers | `tensorrt_llm/_torch/pyexecutor/py_executor.py`, `resource_manager.py` | Request lifecycle, scheduling, the order of resource callbacks | Know a KV layout or a method's name |
+| KV cache manager V2, executor side | `tensorrt_llm/_torch/pyexecutor/kv_cache/` (`kv_cache_manager_v2.py`, `mixed_precision_staging.py`, `mamba_cache_manager/mamba_cache_manager_v2.py` for hybrid models), plus model- and backend-specific subclasses under `tensorrt_llm/_torch/attention/backends/` that declare side buffers through `_extra_buffers_per_layer` | Mapping layers to layer groups, pools, life cycles, priorities and reuse policies; extra buffers; the page tables that the mixed-precision staging copy reads (the mixed-precision staging copy itself belongs to the attention metadata) | Make algorithm decisions; branch on one method |
+| KV cache manager V2 native core | `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/`, surfaced by `tensorrt_llm/runtime/kv_cache_manager_v2/` | Pages, slots, pools, the radix tree, eviction, migration, events, publication, release | Know models or methods |
+| Compression methods | `tensorrt_llm/_torch/kv_cache_compression/`, plus the KV cache compression manager base class (`KVCacheCompressionManager`) in `resource_manager.py` | Cadence, request-local state, selection, transforms, method kernels | Allocate or publish pages; release capacity except through the KV cache manager V2 API after publishing completion |
+| Attention | `tensorrt_llm/_torch/attention/` (backends, metadata) | Consuming the published active representation; per-step metadata; declaring backend side buffers through the KV cache manager V2 hooks | Own storage policy beyond those declarations; grow per-feature kernel branches |
+| Disaggregated transfer | `tensorrt_llm/_torch/disaggregation/` (Python transceiver, NIXL backend) | Moving published state between context and generation workers; resolving layout and transfer ids on both sides | Assume layouts the sender did not publish; target the deprecated C++ transceiver |
+
 
 ## How It Is Used
 
@@ -201,3 +334,16 @@ most often:
 - Tests: fast mode + production import, targeted suites, C++ gtests, debug fills, pressure run: <...>
 - Docs: KV cache manager V2 C++ guide, Python surface guide, kvcache.md updated where behavior changed: <...>
 ```
+
+## References
+
+- `references/engineering-rules.md`: the design workflow and design gate,
+  engineering rules, what machines check, agent working rules, PR hygiene,
+  and the review output format. Shared with `trtllm-kv-cache-compression`.
+- `references/design-principles.md`: the review bar, with rationale.
+- `references/lessons-learned.md`: recurring review findings and the rules
+  they produced, by category.
+- `references/kv-cache-architecture.md`: a map of the stack, with the
+  invariants changes most often break.
+- `../trtllm-kv-cache-compression/references/adding-kernels.md`: choosing,
+  writing, wiring, and testing kernels.

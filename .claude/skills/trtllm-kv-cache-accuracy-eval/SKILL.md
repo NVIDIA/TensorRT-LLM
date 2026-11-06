@@ -26,8 +26,11 @@ workflow with a written protocol, not as one number.
 
 Functional tests, accuracy evaluation, and performance measurement are
 separate tasks. Do the one that was asked, and label the evidence honestly.
-Load `trtllm-kv-cache-develop` (`../trtllm-kv-cache-develop/SKILL.md`) first
-for the general rules.
+Read the entry skill for the area first:
+`trtllm-kv-cache-manager-v2` (`../trtllm-kv-cache-manager-v2/SKILL.md`) for
+KV cache manager V2 changes, or `trtllm-kv-cache-compression`
+(`../trtllm-kv-cache-compression/SKILL.md`) for KV cache compression
+methods.
 
 ## Step 1: Fix the Protocol Before Running
 
@@ -197,7 +200,7 @@ benchmark's own requests, not filler traffic.
 
 - `../perf-kv-cache-tuning/SKILL.md`: engine-per-GPU rules and measurement
   hygiene shared with performance runs.
-- `../trtllm-kv-cache-develop/references/lessons-learned.md`: evaluation
+- `../trtllm-kv-cache-manager-v2/references/lessons-learned.md`: evaluation
   incidents behind these rules.
 - `docs/source/developer-guide/kv-cache-compression-development.md`
   ("Validation"): the required order of accuracy, functional, and

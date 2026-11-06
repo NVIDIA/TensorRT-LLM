@@ -28,8 +28,10 @@ high-precision dtype.
 
 The user-facing contract is in `docs/source/features/kvcache.md`, section
 "Mixed-Precision KV Cache (Prototype)". This skill covers the design, the
-invariants, the extension steps, and the pitfalls. Load
-`trtllm-kv-cache-develop` (`../trtllm-kv-cache-develop/SKILL.md`) first. The
+invariants, the extension steps, and the pitfalls. The mixed-precision KV
+cache is built on KV cache manager V2, not on the KV cache compression
+framework: read `trtllm-kv-cache-manager-v2`
+(`../trtllm-kv-cache-manager-v2/SKILL.md`) first. The
 data flow and extension recipes are in `references/design-and-extension.md`.
 
 ## Required Context
@@ -301,8 +303,8 @@ KV cache, and a KV cache in the model dtype:
 
 ## Design Gate
 
-Extend the general gate from `trtllm-kv-cache-develop`
-(`../trtllm-kv-cache-develop/SKILL.md`) with:
+Extend the general design gate in
+`../trtllm-kv-cache-manager-v2/references/engineering-rules.md` with:
 
 ```markdown
 ## Mixed-Precision KV Cache Design Gate

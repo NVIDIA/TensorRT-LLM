@@ -28,8 +28,11 @@ the repository skills `perf-nsight-systems`, `perf-host-analysis`,
 `perf-host-optimization`, `perf-torch-sync-free`, `perf-torch-cuda-graphs`, and
 `perf-regression-cookbook` cover profiling and host-overhead work in depth.
 This skill decides what to measure, against which baseline, and how to read
-the result for KV-cache features. Load `trtllm-kv-cache-develop`
-(`../trtllm-kv-cache-develop/SKILL.md`) first for the general rules.
+the result for KV-cache features. Read the entry skill for the area first:
+`trtllm-kv-cache-manager-v2` (`../trtllm-kv-cache-manager-v2/SKILL.md`) for
+KV cache manager V2 changes, or `trtllm-kv-cache-compression`
+(`../trtllm-kv-cache-compression/SKILL.md`) for KV cache compression
+methods.
 
 ## Non-Negotiable Rules
 

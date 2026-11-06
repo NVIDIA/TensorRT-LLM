@@ -3,10 +3,12 @@ SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All 
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# KV-Cache Stack Map
+# Stack Map Around KV Cache Manager V2
 
-This file is a map of the PyTorch-backend KV-cache stack and of the invariants
-changes most often break. The authoritative details live in:
+This file is a map of the PyTorch-backend stack around KV cache manager V2:
+the executor, attention metadata, the KV cache compression framework, and
+disaggregated transfer. It also lists the invariants changes most often
+break. The authoritative details live in:
 - the KV cache manager V2 C++ guide,
   `cpp/tensorrt_llm/batch_manager/kv_cache_manager_v2/AGENTS.md`;
 - `tensorrt_llm/runtime/kv_cache_manager_v2/AGENTS.md`;
