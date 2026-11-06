@@ -2336,7 +2336,13 @@ class KvCacheCreator:
         is "1" or "auto". Unset, it is "auto" for a manager that hosts explicit
         draft layers, whose separate draft pool is not transferred.
         """
-        if self._dflash_unify_blocker() is not None:
+        blocker = self._dflash_unify_blocker()
+        if blocker is not None:
+            if self._kv_cache_manager_hosts_draft_layers():
+                logger.info_once(
+                    f"{self._unified_drafter_name()}: keeping a separate draft "
+                    f"KV cache: {blocker}.",
+                    key="dflash_hosting_manager_blocker")
             return False
         default = "auto" if self._kv_cache_manager_hosts_draft_layers(
         ) else None
