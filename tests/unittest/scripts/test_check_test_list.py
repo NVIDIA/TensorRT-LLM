@@ -401,6 +401,50 @@ def test_verify_qa_test_lists_clears_stale_file(mod, tmp_path, monkeypatch):
     assert result == ["accuracy/test_new.py::test_current[a]"]
 
 
+def test_verify_qa_yaml_membership_and_waives(mod, tmp_path, monkeypatch):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    case = "accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_fp8_tp16_mtp3_trtllm"
+    (qa_dir / "multinode.yml").write_text(
+        f"defaults:\n  launch:\n    mode: mpi\n    world_size: 16\ntests:\n  - case: '{case}'\n",
+        encoding="utf-8",
+    )
+    (qa_dir / "other.yml").write_text("other: []\n", encoding="utf-8")
+    (qa_dir.parent / "waives.txt").write_text(f"{case} SKIP reason\n", encoding="utf-8")
+    collected = []
+
+    def collect(llm_src, path):
+        collected.extend(Path(path).read_text().splitlines())
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_run_collection_pytest", collect)
+    mod.verify_qa_test_lists(str(tmp_path))
+    assert collected == [case]
+    assert (tmp_path / "qa_test.txt").read_text().splitlines() == [case]
+    assert mod.load_collectable_entries(str(tmp_path)) == {mod.parse_test_entry(case)}
+    mod.verify_waive_list(str(tmp_path), mod.argparse.Namespace(l0=False, qa=True))
+    assert not (tmp_path / "nonexits_cases.json").exists()
+
+
+def test_multinode_compatibility_list_matches_yaml(mod):
+    qa_dir = REPO_ROOT / "tests" / "integration" / "test_lists" / "qa"
+    yaml_entries, malformed = mod.collect_entries(str(qa_dir))
+    assert not malformed
+    yaml_path = str(qa_dir / "llm_function_multinode.yml")
+    cases = {
+        entry
+        for entry, refs in yaml_entries.items()
+        if any(ref.startswith(yaml_path + ":") for ref in refs)
+    }
+    text_cases = [
+        mod.parse_test_entry(line)
+        for line in (qa_dir / "llm_function_multinode.txt").read_text().splitlines()
+    ]
+    text_cases = [entry for entry in text_cases if entry is not None]
+    assert len(text_cases) == len(set(text_cases))
+    assert set(text_cases) == cases
+
+
 # --------------------------------------------------------------------------
 # module-const soundness against in-place mutation / rebinding
 # --------------------------------------------------------------------------
