@@ -21,6 +21,7 @@ import os
 import pickle
 import re
 import statistics
+import subprocess
 import sys
 import tempfile
 from typing import Any, List
@@ -32,6 +33,7 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm._torch.autotuner as autotuner
+from tensorrt_llm import _deep_gemm_jit_share as jit_share
 from tensorrt_llm._torch.autotuner import (AutoTuner, DistributedTuningStrategy,
                                            DynamicDim, DynamicTensorSpec,
                                            FakeTensor, OptimizationProfile,
@@ -2298,3 +2300,136 @@ def test_parallel_deal_start_is_stable_and_spread():
         assert len(per_rank) == 1, (m, per_rank)
         starts.append(per_rank.pop())
     assert set(starts) == set(range(group_size)), sorted(set(starts))
+
+
+def test_share_jit_builds_sets_aside_profiles_built_elsewhere(
+        monkeypatch, tmp_path):
+    """With DeepGEMM's builds shared across ranks, a rank runs the profiles it
+    claims first. One whose kernel another rank is building is set aside rather
+    than failed and runs after the others; a profile another rank claimed runs
+    last, once that rank has run it."""
+    calls: List[int] = []
+
+    class SharedBuildRunner(TunableRunner):
+
+        def unique_id(self):
+            return ()
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = -1,
+                    **kwargs) -> torch.Tensor:
+            m = inputs[0].shape[0]
+            calls.append(m)
+            if m in (2, 4) and calls.count(m) == 1:
+                raise RuntimeError(
+                    f"command failed with exit code 75:\n{jit_share.BUSY_MARK} 0"
+                )
+            return inputs[0]
+
+    monkeypatch.setattr(jit_share, "enabled", lambda: True)
+    monkeypatch.setattr(jit_share, "start_fraction", lambda: 0.0)
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    op = "autotuner_test::share_jit_builds"
+    config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, (1, 2, 4, 8)), ),
+                          share_jit_builds=True)
+    real_claim = jit_share.SharedSweep.claim
+    # Another rank holds the claim on the last profile (M = 8) and has run it.
+    monkeypatch.setattr(jit_share.SharedSweep, "claim",
+                        lambda self, i: i != 3 and real_claim(self, i))
+    monkeypatch.setattr(jit_share.SharedSweep, "wait_done",
+                        lambda self, i: calls.append(-i))
+    with autotune():
+        tuner.choose_one(op, [SharedBuildRunner()], config,
+                         [torch.zeros(8, 64, device="cuda")])
+    assert calls == [1, 2, 4, 2, 4, -3, 8], calls
+    assert not tuner.stats.failed_profiling_count[op]
+    assert len(tuner.profiling_cache.get_specific_custom_op(op)) == 4
+    assert jit_share._DEFER_ENV not in os.environ
+
+
+def test_deep_gemm_jit_share_builds_each_kernel_once(tmp_path):
+    """DeepGEMM's compiler wrapper builds a kernel in the process that claims
+    it. Others copy the published cubin, report busy while it is being built if
+    asked to defer, and build it themselves when the claimant never publishes
+    or its claim is stale."""
+    calls = tmp_path / "calls"
+    compiler = tmp_path / "fake_nvcc"
+    compiler.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "args = sys.argv[1:]\n"
+        f"open({str(calls)!r}, 'a').write(' '.join(args) + '\\n')\n"
+        "if args == ['--version']:\n"
+        "    print('Cuda compilation tools, release 13.0')\n"
+        "    sys.exit(0)\n"
+        "out = args[args.index('--output-file') + 1]\n"
+        "open(out, 'wb').write(open(args[0], 'rb').read()[::-1])\n")
+    compiler.chmod(0o755)
+    kernels = tmp_path / "share" / "kernels"
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("TLLM_DEEP_GEMM_JIT_SHARE_",
+                             jit_share.SHARE_DIR_ENV))
+    }
+    env.update({
+        jit_share.SHARE_DIR_ENV: str(tmp_path / "share"),
+        jit_share._REAL_COMPILER_ENV: str(compiler),
+    })
+
+    def kernel(name: str, source: str) -> List[str]:
+        work = tmp_path / name
+        work.mkdir()
+        (work / "kernel.cu").write_text(source)
+        return [
+            str(work / "kernel.cu"), "--cubin", "--output-file",
+            str(work / "kernel.cubin"), "-O3"
+        ]
+
+    def run(argv: List[str], **extra_env) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, "-I", "-S", jit_share.__file__] +
+                              argv,
+                              env=dict(env, **extra_env),
+                              capture_output=True,
+                              text=True)
+
+    def builds() -> int:
+        return calls.read_text().count("--cubin") if calls.exists() else 0
+
+    def claim(argv: List[str], age_s: float = 0.0) -> None:
+        kernels.mkdir(parents=True, exist_ok=True)
+        path = kernels / f"{jit_share._kernel_key(argv[0], argv)}.claim"
+        path.write_text("another process\n")
+        os.utime(path, (path.stat().st_mtime - age_s, ) * 2)
+
+    assert "release 13.0" in run(["--version"]).stdout
+
+    for name in ("a", "b"):  # built once, then copied
+        argv = kernel(name, "kernel one")
+        assert run(argv).returncode == 0
+        assert (tmp_path / name / "kernel.cubin").read_text() == "eno lenrek"
+    assert builds() == 1
+
+    argv = kernel("c", "kernel two")
+    claim(argv)
+    busy = run(argv, **{jit_share._DEFER_ENV: "1"})
+    assert busy.returncode == jit_share.BUSY_EXIT_CODE
+    assert jit_share.BUSY_MARK in busy.stdout and builds() == 1
+    assert run(argv, **{jit_share._WAIT_ENV: "0.2"}).returncode == 0
+    assert builds() == 2
+
+    argv = kernel("d", "kernel three")
+    claim(argv, age_s=3600)
+    assert run(argv, **{jit_share._DEFER_ENV: "1"}).returncode == 0
+    assert builds() == 3
