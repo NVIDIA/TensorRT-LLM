@@ -18,6 +18,7 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
+  - unittest/_torch/multi_gpu/test_mpi_checkpoint_lifecycle.py
   # Two-rank cases include uneven/empty attention-DP batches and bounded CSA2 replay.
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_engram[world2-row-sharded]
   - unittest/_torch/multi_gpu/test_deepseek_v41_attention_dp.py::test_attention_dp_decoder_bounded_replay[world2]

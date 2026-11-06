@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from tensorrt_llm.bindings import MpiProgressThread
 
     from ..moe.fused_moe.communication.base import CheckpointableCommunication
+    from .checkpoint import NativeCheckpoint
 
 _UNBOUNDED_STATS_MAX_LEN = -1
 
@@ -1581,6 +1582,8 @@ class PyExecutor:
         # this, two concurrent RPC calls could both pass control_request_barrier
         # and race on the shared communicator, consuming the wrong ACKs.
         self._sleep_wakeup_lock = threading.Lock()
+        self._control_action_lock = threading.Lock()
+        self.checkpoint = None
 
         self._maybe_init_kv_connector_manager()
 
@@ -2051,6 +2054,8 @@ class PyExecutor:
     def start_worker(self):
         with self.worker_lock:
             if not self.worker_started:
+                if self.checkpoint is not None:
+                    self.checkpoint.start()
                 # Model/KV-cache/transceiver construction can create threads
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
@@ -2506,6 +2511,9 @@ class PyExecutor:
             node_server.close()
             self._openengine_node_server = None
         if self.worker_started:
+            checkpoint = getattr(self, "checkpoint", None)
+            if checkpoint is not None:
+                checkpoint.close()
             self.executor_request_queue.enqueue_shutdown_request()
             self.shutdown_event.wait()
         if (self.enable_attention_dp and self.kv_connector_manager is not None
@@ -7085,10 +7093,13 @@ class PyExecutor:
             runner.release_padding_dummy(self.resource_manager, draft_len)
 
     @contextmanager
-    def control_action(self,
-                       *,
-                       drain: bool = True,
-                       control_id: Optional[str] = None):
+    def control_action(
+            self,
+            *,
+            drain: bool = True,
+            control_id: Optional[str] = None,
+            checkpoint_owner: Optional["NativeCheckpoint"] = None,
+            timeout: Optional[float] = None) -> Iterator["PyExecutor"]:
         """Run an action at a scheduler step boundary.
 
         drain=True  (default): block until ``active_requests`` and
@@ -7097,19 +7108,59 @@ class PyExecutor:
                      In-flight requests keep their KV caches across the
                      action; same-batch requests fetched after the sentinel
                      are parked until the ``with`` block exits.
+
+        Args:
+            drain: Whether all requests must retire before the action starts.
+            control_id: Identity used to reject a late, cancelled sentinel.
+            checkpoint_owner: Native checkpoint authority, if it owns the gate.
+            timeout: Optional total budget for control ownership and scheduler drain.
+
+        Yields:
+            The protected executor. The admission gate is not released on exit.
+
+        Raises:
+            RuntimeError: If checkpoint ownership excludes this caller.
+            TimeoutError: If ownership or scheduler acknowledgement exceeds the budget.
         """
 
-        if self.dist.rank == 0:
-            self.executor_request_queue.enqueue_control_request(
-                drain=drain, control_id=control_id)
-
-        self.control_request_barrier.wait()
-
+        owner = checkpoint_owner is not None and checkpoint_owner is self.checkpoint
+        if self.executor_request_queue.checkpoint_admission_closed(
+        ) and not owner:
+            raise RuntimeError(
+                "Checkpoint owns the scheduler control boundary.")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        if not self._control_action_lock.acquire(
+                timeout=-1 if timeout is None else timeout):
+            raise TimeoutError(
+                "Timed out waiting for scheduler control ownership.")
         try:
-            yield self
+            if self.executor_request_queue.checkpoint_admission_closed(
+            ) and not owner:
+                raise RuntimeError(
+                    "Checkpoint owns the scheduler control boundary.")
+            if self.dist.rank == 0:
+                self.executor_request_queue.enqueue_control_request(
+                    drain=drain,
+                    control_id=control_id,
+                    checkpoint_session=self.checkpoint.session_id
+                    if owner else None)
+            remaining = None if deadline is None else max(
+                0, deadline - time.monotonic())
+            if not self.control_request_barrier.wait(timeout=remaining):
+                if control_id is not None:
+                    self._record_sleep_wakeup_abort(
+                        control_id, "Scheduler drain timed out.")
+                self.executor_request_queue.fail_sleep_wakeup_transition()
+                self.control_action_done.set()
+                raise TimeoutError(
+                    "Timed out draining the scheduler for checkpoint.")
+            try:
+                yield self
+            finally:
+                self.control_request_barrier.clear()
+                self.control_action_done.set()
         finally:
-            self.control_action_done.set()
-            self.control_request_barrier.clear()
+            self._control_action_lock.release()
 
     def _wait_for_model_engine_input_copy(self):
         self.model_engine.wait_for_input_copy()

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 """Tests for ExecutorRequestQueue class.
 
 This module tests the ExecutorRequestQueue class functionality including:
@@ -69,6 +71,60 @@ def test_executor_queue_init(executor_queue, mock_dist):
     assert executor_queue.get_admission_state() is RequestAdmissionState.RUNNING
     assert isinstance(executor_queue.request_queue, queue.Queue)
     assert isinstance(executor_queue.enqueue_lock, type(threading.Lock()))
+
+
+def test_checkpoint_rejects_public_requests_and_competing_controls(
+        executor_queue):
+    """Protect the checkpoint independently of memory sleep and control sentinels."""
+    executor_queue.close_checkpoint_admission("source")
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match="Checkpoint"):
+        executor_queue.enqueue_request(Mock())
+    with pytest.raises(RuntimeError, match="Checkpoint"):
+        executor_queue.begin_sleep_transition(["kv_cache"])
+    with pytest.raises(RuntimeError, match="Checkpoint"):
+        executor_queue.enqueue_control_request()
+    with pytest.raises(RuntimeError, match="Profiling"):
+        executor_queue.enqueue_profile_start_request({})
+    executor_queue.enqueue_control_request(checkpoint_session="source")
+    assert executor_queue.request_queue.get_nowait().is_control_request
+
+
+def test_checkpoint_private_permit_is_single_use(executor_queue):
+    """One internal token admits one request, never an arbitrary batch or replay."""
+    executor_queue.close_checkpoint_admission("source")
+    executor_queue.bind_checkpoint_restore("source", "restore")
+    executor_queue.set_checkpoint_validation("restore", "private")
+    request = Mock(py_checkpoint_validation_token="private")
+    with pytest.raises(RuntimeError):
+        executor_queue.enqueue_requests([request, request])
+    with patch.object(executor_queue, "_generate_child_request_ids"):
+        executor_queue.enqueue_request(request)
+    with pytest.raises(RuntimeError):
+        executor_queue.enqueue_request(request)
+    assert not executor_queue.can_enqueue_request()
+    executor_queue.open_checkpoint_admission("restore")
+    assert executor_queue.can_enqueue_request()
+
+
+def test_memory_completion_cannot_clear_checkpoint_gate(executor_queue):
+    """A memory-ready update is not checkpoint serving authorization."""
+    executor_queue.close_checkpoint_admission("source")
+    executor_queue.admission_state = RequestAdmissionState.WAKING
+    executor_queue.complete_wakeup_transition()
+    assert executor_queue.get_admission_state() == RequestAdmissionState.RUNNING
+    assert not executor_queue.can_enqueue_request()
+    with pytest.raises(RuntimeError, match="Stale"):
+        executor_queue.open_checkpoint_admission("other")
+
+
+def test_checkpoint_failure_cannot_be_activated(executor_queue):
+    """A failed native transition requires host cleanup, not an activation retry."""
+    executor_queue.close_checkpoint_admission("source")
+    executor_queue.fail_sleep_wakeup_transition()
+    with pytest.raises(RuntimeError):
+        executor_queue.open_checkpoint_admission("source")
+    assert not executor_queue.can_enqueue_request()
 
 
 def test_enqueue_requests(executor_queue):
