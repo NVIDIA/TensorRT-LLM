@@ -63,8 +63,8 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import prepare_sparse_runtime_params
-from .sparse.mixed_precision_high_rows import store_mixed_precision_low_rows
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
 from .utils import log_attention_failure_context
@@ -1245,15 +1245,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))
         self._fill_mixed_precision_high_block_tables()
-
-    @property
-    def has_mixed_precision_high_rows(self) -> bool:
-        """Sparse backends only: the selected rows a mixed-precision high layer holds are read
-        from and written to its rows through the high page table. Dense attention with the
-        cold-page first/last-N mixed precision reaches the high blocks through its redirected
-        block offsets instead (redirects_mixed_precision_block_offsets)."""
-        return (self.mixed_precision_high_block_table is not None
-                and not self.mixed_precision_block_offsets_redirect)
 
     @property
     def redirects_mixed_precision_block_offsets(self) -> bool:

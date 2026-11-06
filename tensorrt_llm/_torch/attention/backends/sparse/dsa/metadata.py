@@ -186,6 +186,13 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     runtime_tokens_per_gen_step: int = 0
 
     @property
+    def has_mixed_precision_high_rows(self) -> bool:
+        """Whether this batch reads and writes the selected rows of a mixed-precision high layer
+        through the high page table (the sparse backends' way; dense attention redirects block
+        offsets instead)."""
+        return self.mixed_precision_high_block_table is not None
+
+    @property
     def is_ragged_verify(self) -> bool:
         return self.ragged_verify_lens is not None
 
