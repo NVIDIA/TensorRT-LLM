@@ -26,7 +26,6 @@ DWDP ([Tech Blog 19](blog19_DWDP_Distributed_Weight_Data_Parallelism_for_High_Pe
 - [Evaluation](#evaluation)
   - [Experimental Setup](#experimental-setup)
   - [No Overhead at the Same Settings](#no-overhead-at-the-same-settings)
-  - [Context-Only Evaluation](#context-only-evaluation)
   - [End-to-End Evaluation](#end-to-end-evaluation)
   - [Trading Throughput for Time to First Token](#trading-throughput-for-time-to-first-token)
   - [Accuracy](#accuracy)
@@ -265,28 +264,13 @@ Dense DWDP should cost nothing when its memory is not used. Table 5 compares run
 | End to end, 32 GPUs, concurrency 383: output tokens/s/GPU | 362.2 | 363.3 | +0.3% |
 | End to end, 32 GPUs, concurrency 383: total tokens/s/GPU | 47,771 | 47,783 | +0.0% |
 
-*Table 5. Same configuration with and without dense DWDP. Total tokens include the prompt tokens served from the prefix cache.*
+*Table 5. Same configuration with and without dense DWDP. The context-only row runs one DWDP16 context tier (16 GPUs) on its own, with a generation side that only receives the KV cache. Total tokens include the prompt tokens served from the prefix cache.*
 
 The dense gathers hide behind compute, so all of the gain comes from spending the freed memory.
 
-### Context-Only Evaluation
-
-The context-only study runs one DWDP16 context server (16 GPUs) at concurrency 128, with a generation side that only receives the KV cache. Table 6 compares today's recipe, the best configuration we found without dense DWDP (24K-token chunks; 32K ran out of memory), and dense DWDP with 32K-token chunks. All runs ran in the same time window.
-
-| Configuration | KV cache (GiB/GPU) | Requests/s | Computed prompt tokens/s/GPU | TTFT p50 (s) | TTFT p90 (s) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Dense DWDP off, 16K (recipe) | 56.1 | 13.30 | 6,702 | 10.96 | 36.46 |
-| Dense DWDP off, 24K, run 1 | 48.2 | 13.71 | 6,972 | 10.69 | 35.19 |
-| Dense DWDP off, 24K, run 2 | 48.2 | 13.62 | 6,889 | 10.87 | 33.23 |
-| Dense DWDP on, 32K | 84.8 | 14.02 | 7,150 | 10.59 | 32.97 |
-
-*Table 6. Context-only results. Computed prompt tokens exclude prefix cache hits. The 24K runs give the KV cache 65% of the free memory, the others 70%.*
-
-Dense DWDP at 32K tokens serves 2.6% more requests per second than the best configuration without it (mean of the two 24K runs), computes 3.2% more prompt tokens per GPU and cuts TTFT p90 by 3.6%. Against today's recipe the gains are 5.4%, 6.7% and 9.6%. Three runs of the dense configuration served 14.02 to 14.24 requests per second, so the run-to-run noise is about 1.5%.
-
 ### End-to-End Evaluation
 
-The end-to-end study takes eight points of a Kimi-K3 Pareto curve, from concurrency 24 to 623. At each point, the base runs the recipe's context tier: 16 GPUs as a DWDP16 group with 16K-token chunks, or 24 GPUs as a DWDP24 group at concurrency 623. The dense DWDP arm keeps the generation servers and the client unchanged and replaces the context tier with a smaller one: 8 GPUs (DWDP8, 16K-token chunks), 12 GPUs (DWDP12, 32K) or 16 GPUs (DWDP16, 32K). With fewer context GPUs, each GPU serves more conversations, so at concurrency 24 to 240 the dense arm gives the KDA states 45% of the KV cache pool instead of the recipe's 14%, which keeps prefix reuse at the base's level (Table 7). The recipes at concurrency 330 to 623 use 45% in both arms.
+The end-to-end study takes eight points of a Kimi-K3 Pareto curve, from concurrency 24 to 623. At each point, the base runs the recipe's context tier: 16 GPUs as a DWDP16 group with 16K-token chunks, or 24 GPUs as a DWDP24 group at concurrency 623. The dense DWDP arm keeps the generation servers and the client unchanged and replaces the context tier with a smaller one: 8 GPUs (DWDP8, 16K-token chunks), 12 GPUs (DWDP12, 32K) or 16 GPUs (DWDP16, 32K). With fewer context GPUs, each GPU serves more conversations, so at concurrency 24 to 240 the dense arm gives the KDA states 45% of the KV cache pool instead of the recipe's 14%, which keeps prefix reuse at the base's level (Table 6). The recipes at concurrency 330 to 623 use 45% in both arms.
 
 <div align="center">
 <figure>
@@ -306,13 +290,15 @@ The end-to-end study takes eight points of a Kimi-K3 Pareto curve, from concurre
 | 383 | 1 × DEP16, batch 8 | 32 (16) → 28 (12) | 91.4 → 91.7 | 362.45 → 406.65 | +12.2% | 95.3% → 95.1% |
 | 623 | 1 × DEP16, batch 16 | 40 (24) → 32 (16) | 72.9 → 74.4 | 440.52 → 524.79 | +19.1% | 95.3% → 94.9% |
 
-*Table 7. End-to-end results, base → dense DWDP. Gain is the change of output tokens per second per GPU.*
+*Table 6. End-to-end results, base → dense DWDP. Gain is the change of output tokens per second per GPU.*
 
-Dense DWDP raises the output throughput per GPU at every point, by 6.1% to 19.1% with a median of 12.5%, while tokens per second per user stay within 2.1%. The gain comes from serving the same load with fewer GPUs: at seven of the eight points the total output throughput of the deployment stays within -1.8% to +2.3% of the base, so the gain follows the share of GPUs that the smaller context tier saves. Removing 8 of 64 GPUs gives +13% to +17%, 4 of 64 or 56 gives +6% to +8%, 4 of 32 gives +12% and 8 of 40 gives +19%. The three low-concurrency points run their context tier on DWDP8 groups, which only dense DWDP makes fit ([Committing Dense Weights Before the Expert Prefetch Ring](#committing-dense-weights-before-the-expert-prefetch-ring)).
+Dense DWDP raises the output throughput per GPU at every point, by 6.1% to 19.1% with a median of 12.5%, while tokens per second per user stay within 2.1%. The gain comes from serving the same load with fewer GPUs, not from faster ones: at seven of the eight points the total output throughput of the deployment stays within -1.8% to +2.3% of the base, so the gain follows the share of GPUs that the smaller context tier saves. Removing 8 of 64 GPUs gives +13% to +17%, 4 of 64 or 56 gives +6% to +8%, 4 of 32 gives +12% and 8 of 40 gives +19%.
+
+A smaller context tier keeps up because, at most points, compute does not set its size. At concurrency 24 to 240 the base tier serves 0.7 to 7.7 requests per second, while a saturated 16-GPU DWDP16 tier sustains about 13 (measured with the context tier on its own at concurrency 128). Memory sets the floor instead. A DWDP8 group fits only with dense DWDP ([Committing Dense Weights Before the Expert Prefetch Ring](#committing-dense-weights-before-the-expert-prefetch-ring)), and with fewer context GPUs each GPU holds the KV pages and KDA states of more conversations, which the freed memory pays for. Only close to saturation, at concurrency 383 and 623, does a smaller tier lengthen the TTFT tail.
 
 ### Trading Throughput for Time to First Token
 
-A smaller context tier carries more load per GPU, which shows first in the TTFT tail. TTFT p90 stays within 2 s of the base at six of the eight points, and rises at concurrency 383 (14.6 to 18.0 s) and 623 (15.9 to 23.0 s). Table 8 shows the choices at concurrency 623, the throughput end of the curve, where we ran three context tiers with dense DWDP.
+A smaller context tier carries more load per GPU, which shows first in the TTFT tail. TTFT p90 stays within 2 s of the base at six of the eight points, and rises at concurrency 383 (14.6 to 18.0 s) and 623 (15.9 to 23.0 s). Table 7 shows the choices at concurrency 623, the throughput end of the curve, where we ran three context tiers with dense DWDP.
 
 | Context tier | GPUs | Output tokens/s/GPU | Total tokens/s/GPU | TTFT p50 / p90 / p99 (s) |
 | --- | ---: | ---: | ---: | --- |
@@ -321,7 +307,7 @@ A smaller context tier carries more load per GPU, which shows first in the TTFT 
 | Dense DWDP: 20 GPUs, 32K | 36 | 490.2 (+11.3%) | 65,689 (+10.8%) | 6.8 / 14.3 / 71.6 |
 | Dense DWDP: 16 GPUs, 32K | 32 | 524.8 (+19.1%) | 70,156 (+18.4%) | 6.8 / 23.0 / 107.3 |
 
-*Table 8. Context tiers at concurrency 623; the generation server (DEP16, batch 16) is the same in all four.*
+*Table 7. Context tiers at concurrency 623; the generation server (DEP16, batch 16) is the same in all four.*
 
 Dense DWDP moves the whole trade-off between throughput and latency:
 
