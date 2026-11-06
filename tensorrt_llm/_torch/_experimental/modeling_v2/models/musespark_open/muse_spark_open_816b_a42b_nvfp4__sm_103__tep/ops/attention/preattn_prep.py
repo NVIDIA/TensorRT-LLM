@@ -500,6 +500,7 @@ class PreattnPrep(OpWrapper):
         qkv_permuted: bool,
         enable_pdl: bool = False,
         trigger_at_entry: bool = False,
+        row_vec: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         rows, width = qkv.shape
         if (
@@ -587,6 +588,7 @@ class PreattnPrep(OpWrapper):
         qkv_permuted: bool,
         enable_pdl: bool = False,
         trigger_at_entry: bool = False,
+        row_vec: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """float64 at every stage, rounded to BF16 at the three points the op rounds.
 
@@ -594,8 +596,8 @@ class PreattnPrep(OpWrapper):
         downstream sees BF16 after the norm, after the query scale and after
         RoPE), so the reference keeps them; between them it is exact to
         float64. The query scale is the fp32 value of ``q_scale``, as the op
-        and the built-in multiply receive it. ``enable_pdl`` and ``trigger_at_entry``
-        change how the op is launched, not what it computes, and are ignored here.
+        and the built-in multiply receive it. ``enable_pdl``, ``trigger_at_entry`` and
+        ``row_vec`` change how the op is launched, not what it computes, and are ignored here.
         """
         rows = qkv.shape[0]
         q, gate, k, v = _split_projection(qkv, num_q_heads, num_kv_heads, qkv_permuted)
@@ -636,6 +638,7 @@ class PreattnPrep(OpWrapper):
         qkv_permuted: bool,
         enable_pdl: bool = False,
         trigger_at_entry: bool = False,
+        row_vec: bool = False,
     ) -> None:
         """A position outside the table is read from outside it, with no error."""
         if cos_sin is not None and position_ids is not None and position_ids.numel():

@@ -317,7 +317,7 @@ class ContextKvCommitWindowed(OpWrapper):
     * ``num_ctx_out[g] = ctx_len[slots[g]] - ctx_base[slots[g]]``.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Metadata consumed: none. Two Triton launches. The commit is one program
@@ -328,7 +328,7 @@ class ContextKvCommitWindowed(OpWrapper):
     tiles of ``COMPACT_COLUMNS`` in increasing order, loading a tile, a CTA
     barrier, then storing it; it reads its request's shift from the commit's
     output, so its launch follows the commit on the stream. With
-    ``parallel_min_requests`` (``windowed_commit_parallel``'s MIN_REQUESTS) a call of
+    ``parallel_min_requests`` a call of
     at least that many requests runs the commit as a parallel zeroing launch plus a
     vectorized length launch, and the compaction at ``COMPACT_TUNED``; the same bytes.
 

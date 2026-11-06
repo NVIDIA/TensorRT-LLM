@@ -17,11 +17,7 @@ compilation on every rank) and puts it in every layer's attribute. Its
 ``finalize`` has the built-in signature: calls of 1..16 tokens (at TP8,
 1..``TP8_MAX_TOKENS`` of that module) run
 ``ops/moe/finalize_allreduce_transport``, bit for bit the built-in kernel's
-result; larger calls run the built-in kernel. With ``wide_finalize_transport``
-(``install(model, wide=True)``, TP4 only) the workspace also builds a second
-one laid out for 32 tokens, so the calls of 17..32 tokens (decode steps of
-three or four requests at K = 7) run the same kernel there, bit for bit the
-built-in TP4 kernel too, and only larger calls run the built-in kernel. No
+result; larger calls run the built-in kernel. No
 module is re-classed, so the fast paths that re-class the MoE
 (``projection_gathers``) or patch its experts (``replicated_experts``)
 compose with it in any order.
@@ -41,10 +37,7 @@ ATTRIBUTE = "_finalize_ar_workspace"
 
 
 def refusal(model: MuseSparkOpenModel, wide: bool = False) -> Optional[str]:
-    """Why ``install`` cannot replace this model's fused finalize, or None. Changes nothing.
-
-    ``wide`` asks for the 17..32-token calls as well, which only a TP4 group has.
-    """
+    """Why ``install`` cannot replace this model's fused finalize, or None. Changes nothing."""
     legacy = getattr(model, ATTRIBUTE, None)
     if legacy is None:
         return (
@@ -61,10 +54,6 @@ def refusal(model: MuseSparkOpenModel, wide: bool = False) -> Optional[str]:
         return f"layers {others} do not call the model's fused finalize workspace"
     if not _fin.HAS_CUTE_DSL:
         return "the CuTe DSL or the built-in finalize module is unavailable"
-    if wide:
-        tp_size = getattr(model.layers[0].mapping, "tp_size", None)
-        if tp_size not in _fin.LAYOUT_RANK_COUNTS[_fin.WIDE_MAX_TOKENS]:
-            return f"the {_fin.WIDE_MAX_TOKENS}-token layout serves TP4, got TP{tp_size}"
     return None
 
 
@@ -91,9 +80,6 @@ def agreed_refusal(model: MuseSparkOpenModel, wide: bool = False) -> Optional[st
 def install(model: MuseSparkOpenModel, wide: bool = False):
     """Put a ``FinalizeTransportWorkspace`` in every layer's finalize attribute (collective).
 
-    With ``wide`` the workspace also serves the calls of 17..32 tokens on its
-    second, 32-token workspace (``FinalizeTransportWorkspace.serve_wide_calls``).
-
     Raises:
         ValueError: if ``refusal`` names a reason on some rank (on every rank
             alike, from ``agreed_refusal``, before the workspace is built).
@@ -104,11 +90,8 @@ def install(model: MuseSparkOpenModel, wide: bool = False):
     if reason is not None:
         raise ValueError(reason)
     legacy = getattr(model, ATTRIBUTE)
-    # The transport it builds: read here, after ``finalize_allreduce_transport.configure``.
     transport = _fin.DEFAULT
     workspace = _fin.FinalizeTransportWorkspace(legacy, legacy._mapping, transport)
-    if wide:
-        workspace.serve_wide_calls(legacy._mapping)
     for layer in model.layers:
         setattr(layer.feed_forward, ATTRIBUTE, workspace)
     # The installed layout's token range (TP8_MAX_TOKENS on a TP8 workspace).

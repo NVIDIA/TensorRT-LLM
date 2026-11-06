@@ -637,8 +637,8 @@ class FinalizeTwoShotWorkspace:
                 raise RuntimeError("the CuTe DSL or the built-in finalize module is unavailable")
             if mapping.is_multi_node():
                 raise RuntimeError("the two-shot finalize serves one tray")
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the two-shot finalize runs on SM103 and SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the two-shot finalize runs on SM103 only")
             self.sms = torch.cuda.get_device_properties(self.device).multi_processor_count
             self._handle = _make_mnnvl_mcast_buffer(
                 self._comm, self.workspace_bytes, mapping, False
@@ -846,7 +846,7 @@ class FinalizeTwoShot(OpWrapper):
     FP32 in rank order and rounded to BF16.
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Metadata consumed: ``indices`` (the expert op's ``[tokens, 8]`` row map, under the

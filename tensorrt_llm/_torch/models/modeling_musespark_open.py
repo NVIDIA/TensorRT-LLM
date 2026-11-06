@@ -47,8 +47,11 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
 - ``MUSESPARK_OPEN_FUSED_PREATTN`` (default OFF, opt-in): fused pre-attention.
 - ``MUSESPARK_OPEN_ALLREDUCE`` (default NCCL): all-reduce strategy name.
 - ``MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL`` (default off): shard replicated
-  prefill work across single-node BF16 TP4/EP4 ranks.
+  prefill work across single-node BF16 TP4/EP4 ranks;
+  ``MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS`` (default 4096) sets the smallest step split.
 - ``MUSESPARK_OPEN_BF16X3_ROUTER`` (default off): BF16x3 projection for large routers.
+- ``MUSESPARK_OPEN_FINALIZE_BF16_OUT`` (default off): the model's own unfused expert
+  finalize stores BF16 instead of FP32, bitwise the following cast.
 - ``MUSESPARK_OPEN_FULL_ROUTING_ALL_BATCHES`` (default off): fuse large-batch routing;
   ``MUSESPARK_OPEN_FULL_ROUTING_TORCH_ORDER`` preserves Torch's large-batch order.
 - ``MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS`` (default off): use four warps for large
@@ -63,6 +66,11 @@ lever can be A/B'd on one image; see the ``_*_enabled`` helpers for rationale):
   chunks with reduce-scatter in eager sequence-parallel prefills of >=8192 tokens.
 - ``MUSESPARK_OPEN_PAD_SP_PROJECTION`` (default off): pad narrower projection inputs
   instead of outputs in eager sequence-parallel prefills; overlap takes precedence.
+- ``MUSESPARK_OPEN_FP8_PROJECTIONS`` (default off; context workers only): serve the
+  qkv, o, pool and unpool projections as block-FP8 DeepGEMM Linears, quantized once
+  at load to 128x128 power-of-two (UE8M0) scales. ``all`` (or ``1``) names all four;
+  a ``+``-joined subset such as ``qkv+pool`` names just those. Refused on the
+  modeling_v2 (generation) path.
 
 Default-on switches read as disabled for the values ``0``/``false``/``no``/
 ``off``.
@@ -71,7 +79,7 @@ Default-on switches read as disabled for the values ``0``/``false``/``no``/
 import contextlib
 import copy
 import os
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -79,7 +87,7 @@ import triton.language as tl
 from torch import nn
 
 from tensorrt_llm._torch.configs.musespark_open import SLIDING_ATTENTION, MuseSparkOpenConfig
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, nvtx_range
 from tensorrt_llm.functional import AllReduceStrategy, PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -93,6 +101,7 @@ from ..attention.backends.interface import (
 )
 from ..attention.qk_norm_attention import QKNormRoPEAttention
 from ..distributed import AllReduce, AllReduceParams, allgather, reducescatter
+from ..distributed.ops import MNNVLAllReduce, get_or_scale_allreduce_mnnvl_workspace
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -222,7 +231,7 @@ def post_expert_norm_rows(
 
 @triton.jit
 def _post_expert_norm_combine_kernel(
-    out_ptr,  # [num_tokens, HIDDEN] fp32
+    out_ptr,  # [num_tokens, HIDDEN] fp32, or bf16/fp16 (rounded once at the store)
     gemm2_ptr,  # [num_permuted, >= HIDDEN], any float dtype
     index_ptr,  # [num_tokens * TOP_K] integer, -1 for a non-local slot
     weights_ptr,  # [num_tokens * TOP_K] any float dtype
@@ -289,7 +298,10 @@ def _post_expert_norm_combine_kernel(
     # zeros even if ``eps`` were ever zero, where ``rsqrt(0)`` would otherwise
     # turn the zeroed row into a NaN.
     acc = tl.sum(tl.where(local[:, None], normed * weights[:, None], 0.0), axis=0)
-    tl.store(out_ptr + token * HIDDEN + hoff, acc, mask=in_row)
+    # FP32 accumulation either way. A narrower output is rounded here, once, to
+    # nearest-even -- the same single rounding the caller's ``.to()`` applies to
+    # an FP32 output -- and a same-dtype ``.to`` emits nothing.
+    tl.store(out_ptr + token * HIDDEN + hoff, acc.to(out_ptr.dtype.element_ty), mask=in_row)
 
 
 # Threads per program. Measured, not reasoned: at the checkpoint's width eight
@@ -340,8 +352,9 @@ def _fused_post_expert_norm_combine(
     top_k: int,
     hidden_size: int,
     num_warps: int = _FINALIZE_NUM_WARPS,
+    out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    out = torch.empty((num_tokens, hidden_size), dtype=torch.float32, device=gemm2_output.device)
+    out = torch.empty((num_tokens, hidden_size), dtype=out_dtype, device=gemm2_output.device)
     _post_expert_norm_combine_kernel[(num_tokens,)](
         out,
         gemm2_output,
@@ -362,7 +375,7 @@ def _fused_post_expert_norm_combine(
 
 @triton.jit
 def _post_expert_norm_combine_sparse_kernel(
-    out_ptr,  # [num_tokens, HIDDEN] fp32
+    out_ptr,  # [num_tokens, HIDDEN] fp32, or bf16/fp16 (rounded once at the store)
     gemm2_ptr,  # [num_permuted, >= HIDDEN], any float dtype
     index_ptr,  # [num_tokens * TOP_K] integer, -1 for a non-local slot
     weights_ptr,  # [num_tokens * TOP_K] any float dtype
@@ -407,7 +420,9 @@ def _post_expert_norm_combine_sparse_kernel(
             normed = scaled * tl.rsqrt(variance + eps)
             weight = tl.load(weights_ptr + token * TOP_K + slot).to(tl.float32)
             acc += normed * weight
-    tl.store(out_ptr + token * HIDDEN + hoff, acc, mask=in_row)
+    # As in the tile kernel: one round-to-nearest-even at the store when the
+    # output is narrower than FP32, nothing when it is FP32.
+    tl.store(out_ptr + token * HIDDEN + hoff, acc.to(out_ptr.dtype.element_ty), mask=in_row)
 
 
 _SPARSE_FINALIZE_NUM_WARPS = 4
@@ -430,8 +445,9 @@ def _sparse_post_expert_norm_combine(
     num_tokens: int,
     top_k: int,
     hidden_size: int,
+    out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    out = torch.empty((num_tokens, hidden_size), dtype=torch.float32, device=gemm2_output.device)
+    out = torch.empty((num_tokens, hidden_size), dtype=out_dtype, device=gemm2_output.device)
     _post_expert_norm_combine_sparse_kernel[(num_tokens,)](
         out,
         gemm2_output,
@@ -461,6 +477,7 @@ def post_expert_norm_combine(
     hidden_size: int,
     num_warps: int = _FINALIZE_NUM_WARPS,
     sparse_slots: bool = False,
+    out_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Weight-first RMSNorm each selected expert output, then combine, in FP32.
 
@@ -480,7 +497,23 @@ def post_expert_norm_combine(
     reads only the local slots of each token instead of the whole top-k tile.
     ``num_warps`` sets the tile kernel's width only; the sparse kernel always
     runs ``_SPARSE_FINALIZE_NUM_WARPS`` warps.
+
+    ``out_dtype`` is the dtype of the returned tensor; the accumulation is FP32
+    either way. FP32 (the default) is the unchanged function. BF16 or FP16 is
+    the FP32 result rounded once to nearest-even -- in the kernel's store, or by
+    ``.to`` on the reference composition -- so it is bitwise
+    ``post_expert_norm_combine(...).to(out_dtype)`` without the FP32 tensor's
+    write, read and second launch. ``MuseSparkOpenMoE.forward`` asks for BF16
+    only under ``MUSESPARK_OPEN_FINALIZE_BF16_OUT``; every other caller,
+    including the attention-DP combine hook, keeps FP32.
     """
+    if out_dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise ValueError(f"post_expert_norm_combine cannot return {out_dtype}")
+    # Passed on to the launch wrappers only when it is not the default, so the
+    # FP32 call is exactly today's: modeling_v2's context-SP path swaps
+    # ``_sparse_post_expert_norm_combine`` for a launch of the same pre-out_dtype
+    # signature (``context_sequence_parallel/moe.py: _SparseFinalizeTo``).
+    narrow_out = {} if out_dtype == torch.float32 else {"out_dtype": out_dtype}
     # ``num_tokens == 0`` happens on the zero-token DP pad and would launch an
     # empty grid; a row-major ``gemm2_output`` is what the kernel's single row
     # stride assumes. Both fall back rather than assert, because both are
@@ -505,6 +538,7 @@ def post_expert_norm_combine(
             num_tokens=num_tokens,
             top_k=top_k,
             hidden_size=hidden_size,
+            **narrow_out,
         )
     if on_cuda and num_tokens > 0 and row_major:
         return _fused_post_expert_norm_combine(
@@ -517,6 +551,7 @@ def post_expert_norm_combine(
             top_k=top_k,
             hidden_size=hidden_size,
             num_warps=num_warps,
+            **narrow_out,
         )
     normed, _ = post_expert_norm_rows(
         gemm2_output,
@@ -528,7 +563,8 @@ def post_expert_norm_combine(
         hidden_size=hidden_size,
     )
     weights = routing_weights.reshape(num_tokens, top_k, 1).to(torch.float32)
-    return (normed * weights).sum(dim=1)
+    # ``.to`` of an FP32 tensor to FP32 returns it unchanged.
+    return (normed * weights).sum(dim=1).to(out_dtype)
 
 
 def _version_or_none(tensor: torch.Tensor) -> Optional[int]:
@@ -821,6 +857,123 @@ def _large_finalize_sparse_enabled() -> bool:
         "yes",
         "on",
     )
+
+
+def _finalize_bf16_out_enabled() -> bool:
+    """Whether ``MuseSparkOpenMoE.forward``'s own finalize stores BF16 instead of FP32.
+
+    Off unless MUSESPARK_OPEN_FINALIZE_BF16_OUT names a truthy value. The
+    finalize's FP32 output is cast to the BF16 activation dtype on the very next
+    line of ``forward``, so the kernel can round at its store instead: the same
+    single round-to-nearest-even, so BITWISE the same tensor, with half the
+    finalize write and no separate cast kernel. Only that call site asks for it;
+    the attention-DP ``unfinalized_combine_fn`` hook keeps FP32. Resolved at
+    module construction, before warmup and any graph capture.
+    """
+    return os.environ.get("MUSESPARK_OPEN_FINALIZE_BF16_OUT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+#: The projections MUSESPARK_OPEN_FP8_PROJECTIONS can name, in the order the boot line lists them.
+FP8_PROJECTION_NAMES = ("qkv", "o", "pool", "unpool")
+_FP8_PROJECTIONS_OFF = ("", "0", "off", "false", "no")
+_FP8_PROJECTIONS_ALL = ("1", "all", "on", "true", "yes")
+#: The largest step the DeepGEMM warmup compiles every layout for:
+#: ``deep_gemm_jit_warmup_buckets`` clamps its walk at 8192 rows, so a larger
+#: qkv/o step would compile mid-serve (nvcc under the GIL stalls every rank).
+_FP8_PROJECTIONS_MAX_NUM_TOKENS = 8192
+
+
+def _resolve_fp8_projections() -> Tuple[str, ...]:
+    """The projections MUSESPARK_OPEN_FP8_PROJECTIONS serves as block-FP8 Linears.
+
+    Empty (off) when unset or ``0``/``off``/``false``/``no``. ``all`` (or
+    ``1``/``on``/``true``/``yes``) names all four of ``FP8_PROJECTION_NAMES``;
+    anything else must be a ``+``-joined subset of them, e.g. ``qkv+pool``.
+    Returned in ``FP8_PROJECTION_NAMES`` order whatever order was written.
+
+    Raises ``ValueError`` for an unknown or empty token. Rank 0 logs the
+    resolved set and layer count (``_log_fp8_projections``). Resolved once,
+    before any layer is built.
+    """
+    raw = os.environ.get("MUSESPARK_OPEN_FP8_PROJECTIONS", "").strip().lower()
+    if raw in _FP8_PROJECTIONS_OFF:
+        return ()
+    if raw in _FP8_PROJECTIONS_ALL:
+        return FP8_PROJECTION_NAMES
+    tokens = [token.strip() for token in raw.split("+")]
+    unknown = [token for token in tokens if token not in FP8_PROJECTION_NAMES]
+    if unknown:
+        raise ValueError(
+            f"MUSESPARK_OPEN_FP8_PROJECTIONS={raw!r}: unknown projection(s) {unknown}; expected "
+            f"'all' or a '+'-joined subset of {'/'.join(FP8_PROJECTION_NAMES)}"
+        )
+    return tuple(name for name in FP8_PROJECTION_NAMES if name in tokens)
+
+
+def _check_fp8_projections_supported(
+    model_config: ModelConfig, names: Sequence[str], sm_version: Optional[int] = None
+) -> None:
+    """Refuse, at boot, every configuration the block-FP8 projections are not built for.
+
+    Raises ``ValueError``. ``sm_version`` defaults to this device's.
+
+    - The modeling_v2 path (``modeling_v2_target``): the generation worker's
+      dense GEMMs and projection gathers read these weights as BF16. Its class
+      subclasses the omni wrapper and so builds this decoder too; refusing here
+      turns a leaked env into a failed boot instead of a wrong one.
+    - Anything outside the SM100 family, and non-BF16 activations: the path is
+      DeepGEMM ``fp8_swap_ab_gemm``, which takes BF16 input.
+    - ``MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT=1`` with qkv: its
+      ``prepare_weight_layout`` already refuses any non-BF16, quantized QKV at
+      load; this fails the same combination before 62 layers are built, with
+      the reason.
+    - ``use_cute_dsl_blockscaling_mm``: it consumes FP32 scales, not the UE8M0
+      layout loaded here.
+    - LoRA: the adapters assume the unquantized projection.
+    - ``max_num_tokens`` above ``_FP8_PROJECTIONS_MAX_NUM_TOKENS``.
+    """
+    pretrained_config = model_config.pretrained_config
+    target = getattr(model_config, "modeling_v2_target", None)
+    if target is not None:
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS is a context-worker switch: the modeling_v2 path "
+            f"({getattr(target, '__name__', target)}) reads these projections as BF16"
+        )
+    if sm_version is None:
+        sm_version = get_sm_version()
+    if not is_sm_100f(sm_version):
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS needs DeepGEMM on an SM100-family GPU, got "
+            f"SM{sm_version}"
+        )
+    if getattr(pretrained_config, "torch_dtype", None) != torch.bfloat16:
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS needs BF16 activations, got "
+            f"{getattr(pretrained_config, 'torch_dtype', None)}"
+        )
+    if "qkv" in names and os.getenv("MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT", "0") == "1":
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS with qkv cannot combine with "
+            "MUSESPARK_OPEN_LL_QKV_WEIGHT_LAYOUT=1, whose row layout takes a plain BF16 QKV weight"
+        )
+    if getattr(model_config, "use_cute_dsl_blockscaling_mm", False):
+        raise ValueError(
+            "MUSESPARK_OPEN_FP8_PROJECTIONS serves DeepGEMM with UE8M0 scales; "
+            "use_cute_dsl_blockscaling_mm selects a different block-FP8 GEMM"
+        )
+    if getattr(model_config, "lora_config", None) is not None:
+        raise ValueError("MUSESPARK_OPEN_FP8_PROJECTIONS does not support LoRA")
+    if model_config.max_num_tokens > _FP8_PROJECTIONS_MAX_NUM_TOKENS:
+        raise ValueError(
+            f"MUSESPARK_OPEN_FP8_PROJECTIONS needs max_num_tokens <= "
+            f"{_FP8_PROJECTIONS_MAX_NUM_TOKENS} (got {model_config.max_num_tokens}): the DeepGEMM "
+            "warmup walk stops there, so larger steps would compile kernels mid-serve"
+        )
 
 
 #: The largest batch whose router and pool projection run on two streams:
@@ -1962,6 +2115,78 @@ def _pad_sequence_parallel_tokens(tensor: torch.Tensor, tp_size: int) -> torch.T
     return torch.cat((tensor, tensor.new_zeros((padding, *tensor.shape[1:]))), dim=0)
 
 
+#: Smallest step, in tokens, that prefill sequence parallelism shards by default.
+_PREFILL_SP_MIN_TOKENS = 4096
+#: Lowest accepted override. The sharded step keeps the full-row MoE finalize and
+#: the per-shard unpooler, so it must stay above the fused finalize + all-reduce
+#: (at most 512 tokens) and give every shard more rows than the sharded small-batch
+#: projections take (8), or those paths would reduce or gather across ranks that
+#: hold different tokens.
+_PREFILL_SP_MIN_TOKENS_FLOOR = 1024
+
+
+def _prefill_sp_min_tokens() -> int:
+    """Smallest step that MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL shards.
+
+    MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS overrides the default; values below
+    ``_PREFILL_SP_MIN_TOKENS_FLOOR`` are refused. Steps at or below the largest
+    prefill CUDA graph bucket are captured with the split when they reach the
+    threshold, so the choice is fixed for the engine's lifetime.
+    """
+    value = os.environ.get("MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS", "").strip()
+    if not value:
+        return _PREFILL_SP_MIN_TOKENS
+    try:
+        tokens = int(value)
+    except ValueError:
+        tokens = 0
+    if tokens < _PREFILL_SP_MIN_TOKENS_FLOOR:
+        logger.warning(
+            f"MUSESPARK_OPEN_PREFILL_SP_MIN_TOKENS={value!r} is not a token count of at least "
+            f"{_PREFILL_SP_MIN_TOKENS_FLOOR}; keeping {_PREFILL_SP_MIN_TOKENS}"
+        )
+        return _PREFILL_SP_MIN_TOKENS
+    return tokens
+
+
+def _reserve_mnnvl_all_reduce_workspace(layers: nn.ModuleList, max_num_tokens: int) -> None:
+    """Size every MNNVL all-reduce workspace the layers use for a full replicated step.
+
+    An MNNVL workspace is shared per mapping and grows to the largest message
+    seen; growing it releases the old buffer, while CUDA graphs captured earlier
+    keep its address. Without sequence parallelism the max-shape warmups reach
+    the largest message before any capture. With it, those warmups are sharded
+    and send no all-reduce, so the first large replicated message would be a
+    prefill graph capture, which comes after the decode graphs.
+
+    The workspace is looked up by the reducer's own mapping and dtype. The
+    attention output projection builds its own mapping, which differs from the
+    model mapping (it carries no expert parallelism), so reserving under the
+    model mapping would leave the attention workspace at its initial size.
+    """
+    required: Dict[Tuple[Mapping, torch.dtype], int] = {}
+    for layer in layers:
+        o_proj = layer.self_attn.o_proj
+        candidates = (
+            (getattr(o_proj, "all_reduce", None), o_proj.out_features),
+            (
+                getattr(layer.feed_forward, "all_reduce", None),
+                layer.feed_forward.expert_hidden_size,
+            ),
+        )
+        for reducer, width in candidates:
+            mnnvl = getattr(reducer, "mnnvl_allreduce", None)
+            if mnnvl is None:
+                continue
+            key = (mnnvl.mapping, mnnvl.dtype)
+            size = MNNVLAllReduce.get_required_workspace_size(
+                max_num_tokens, width, mnnvl.mapping.tp_size, mnnvl.dtype
+            )
+            required[key] = max(required.get(key, 0), size)
+    for (mapping, dtype), size in required.items():
+        get_or_scale_allreduce_mnnvl_workspace(mapping, dtype, buffer_size_bytes=size)
+
+
 class MuseSparkOpenMoE(nn.Module):
     """Router + pooled experts + per-expert post-norm combine + unpooler.
 
@@ -1992,6 +2217,7 @@ class MuseSparkOpenMoE(nn.Module):
         self.mapping = model_config.mapping
         self._large_finalize_4warps = os.getenv("MUSESPARK_OPEN_LARGE_FINALIZE_4WARPS", "0") == "1"
         self._large_finalize_sparse = _large_finalize_sparse_enabled()
+        self._finalize_bf16_out = _finalize_bf16_out_enabled()
         self._finalize_ar_max_tokens = (
             _FINALIZE_AR_CHUNKED_MAX_TOKENS if _fused_finalize_ar_chunked_enabled() else 128
         )
@@ -2166,7 +2392,11 @@ class MuseSparkOpenMoE(nn.Module):
         """Shard small BF16 ``[tokens, hidden]`` projections, then gather columns.
 
         The workspace is shared across layers in CUDA execution order. Larger
-        batches and compiled execution retain the original replicated Linear.
+        batches and compiled execution retain the original replicated Linear,
+        and so does a module whose weight is not BF16
+        (MUSESPARK_OPEN_FP8_PROJECTIONS): the sharded branch slices
+        ``module.weight`` straight into a BF16 GEMM, which an E4M3 weight and
+        its separate block scales cannot feed.
         """
         if (
             workspace is None
@@ -2175,6 +2405,7 @@ class MuseSparkOpenMoE(nn.Module):
             or hidden_states.ndim != 2
             or not 0 < hidden_states.shape[0] <= 8
             or not hidden_states.is_contiguous()
+            or module.weight.dtype != torch.bfloat16
         ):
             return module(hidden_states)
         from ..modules.low_m_gemm import apply_low_m_gemm
@@ -2366,10 +2597,15 @@ class MuseSparkOpenMoE(nn.Module):
         routing_weights: torch.Tensor,
         num_tokens: int,
         token_selected_slots: Optional[torch.Tensor] = None,
+        *,
+        out_dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
         # ``token_selected_slots`` is part of the ``unfinalized_combine_fn``
         # contract for per-expert transforms; the post-expert norm is the same
         # for every expert, so this finalize does not consult it.
+        # ``out_dtype`` is NOT part of that contract: the scheduler never passes
+        # it, so the attention-DP combine reduces FP32 partials as before. Only
+        # ``forward``'s own call asks for BF16 (MUSESPARK_OPEN_FINALIZE_BF16_OUT).
         del token_selected_slots
         if self.mapping.moe_tp_size > 1:
             # Backend row permutations are rank-local. Reduce in canonical
@@ -2407,6 +2643,8 @@ class MuseSparkOpenMoE(nn.Module):
                 getattr(self, "_large_finalize_sparse", False)
                 and num_tokens >= _SPARSE_FINALIZE_MIN_TOKENS
             ),
+            # Only when narrowed, so the default call is exactly today's.
+            **({} if out_dtype == torch.float32 else {"out_dtype": out_dtype}),
         )
 
     def forward(
@@ -2529,6 +2767,20 @@ class MuseSparkOpenMoE(nn.Module):
                         num_tokens,
                     )
                     finalize_ar_used = True
+                elif (
+                    getattr(self, "_finalize_bf16_out", False)
+                    and hidden_states.dtype == torch.bfloat16
+                ):
+                    # MUSESPARK_OPEN_FINALIZE_BF16_OUT: the kernel rounds at its
+                    # store, so the cast below is a no-op and the result is
+                    # bitwise what that cast produced from the FP32 output.
+                    combined = self.finalize(
+                        gemm2_output,
+                        expanded_idx_to_permuted_idx,
+                        token_final_scales,
+                        num_tokens,
+                        out_dtype=torch.bfloat16,
+                    )
                 else:
                     combined = self.finalize(
                         gemm2_output, expanded_idx_to_permuted_idx, token_final_scales, num_tokens
@@ -2549,6 +2801,8 @@ class MuseSparkOpenMoE(nn.Module):
         # anyway -- but it is a real numerics change and the parity gates
         # decide it, not this argument. For pure MoE TP, finalize has already
         # reduced each expert before normalization; only the cast remains.
+        # Under MUSESPARK_OPEN_FINALIZE_BF16_OUT the finalize above already
+        # rounded to BF16 at its store and this returns ``combined`` itself.
         combined = combined.to(hidden_states.dtype)
         # ``has_tp()`` is only ``tp_size > 1``; it knows nothing about attention
         # DP. Under attention DP the ranks of the TP group hold DIFFERENT
@@ -2779,6 +3033,12 @@ def _build_finalize_ar_workspace(
 
 
 class MuseSparkOpenModel(DecoderModel):
+    #: Smallest step the prefill sequence-parallel split shards; set per instance.
+    _prefill_sp_min_tokens: int = _PREFILL_SP_MIN_TOKENS
+    #: Rows the MNNVL all-reduce workspaces are sized for at the first eager forward
+    #: under prefill sequence parallelism; None once reserved, or with the split off.
+    _mnnvl_reserve_tokens: Optional[int] = None
+
     def __init__(self, model_config: ModelConfig[MuseSparkOpenConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
@@ -2810,6 +3070,8 @@ class MuseSparkOpenModel(DecoderModel):
         self._sp_mapping = mapping
         self._prefill_sp_enabled = os.getenv("MUSESPARK_OPEN_PREFILL_SEQUENCE_PARALLEL", "0") == "1"
         if self._prefill_sp_enabled:
+            # The threshold and the workspace reservation exist only with the split on.
+            self._prefill_sp_min_tokens = _prefill_sp_min_tokens()
             if not (
                 mapping.tp_size == 4
                 and mapping.moe_ep_size == 4
@@ -2825,7 +3087,11 @@ class MuseSparkOpenModel(DecoderModel):
                 )
             ):
                 raise ValueError("Prefill sequence parallelism requires single-node BF16 TP4/EP4")
-            logger.info("MuseSparkOpen prefill sequence parallelism enabled for >=4096 tokens")
+            logger.info(
+                "MuseSparkOpen prefill sequence parallelism enabled for "
+                f">={self._prefill_sp_min_tokens} tokens"
+            )
+            self._mnnvl_reserve_tokens = model_config.max_num_tokens
         local_finalize_tp4 = (
             mapping.tp_size == 4
             and len({rank // mapping.gpus_per_node for rank in mapping.tp_group}) == 1
@@ -2904,6 +3170,21 @@ class MuseSparkOpenModel(DecoderModel):
         )
         self.dtype = config.torch_dtype
 
+    def _reserve_mnnvl_workspaces_once(self) -> None:
+        """Reserve the MNNVL all-reduce workspaces before the first CUDA graph capture.
+
+        Runs at the first forward that is not captured, an eager warmup (or
+        memory-profiling) step. That is where the replicated max-shape step would
+        have grown the workspaces, so the reservation takes the same memory at the
+        same point relative to KV cache sizing, and it comes before any graph holds
+        a workspace address. All TP ranks run that forward together, as the
+        workspace exchange requires.
+        """
+        if self._mnnvl_reserve_tokens is None or torch.cuda.is_current_stream_capturing():
+            return
+        _reserve_mnnvl_all_reduce_workspace(self.layers, self._mnnvl_reserve_tokens)
+        self._mnnvl_reserve_tokens = None
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -2914,6 +3195,8 @@ class MuseSparkOpenModel(DecoderModel):
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("Specify exactly one of input_ids and inputs_embeds")
+        if self._mnnvl_reserve_tokens is not None:
+            self._reserve_mnnvl_workspaces_once()
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         embeds = self.embed_norm(inputs_embeds.to(self.dtype))
@@ -2924,7 +3207,7 @@ class MuseSparkOpenModel(DecoderModel):
             self._prefill_sp_enabled
             and not torch.compiler.is_compiling()
             and attn_metadata.num_contexts > 0
-            and embeds.shape[0] >= 4096
+            and embeds.shape[0] >= self._prefill_sp_min_tokens
             and kwargs.get("spec_metadata") is None
             and kwargs.get("lora_params") is None
             and kwargs.get("all_reduce_params") is None
@@ -2983,6 +3266,92 @@ def assert_supported_spec_config(spec_config: Any) -> None:
     )
 
 
+#: Block edge of the FP8 weight scales (128x128), and so every shard boundary's alignment.
+_FP8_BLOCK = 128
+
+
+def fp8_projection_linears(layer: "MuseSparkOpenDecoderLayer") -> Dict[str, Linear]:
+    """One decoder layer's four MUSESPARK_OPEN_FP8_PROJECTIONS candidates, by switch name."""
+    return {
+        "qkv": layer.self_attn.qkv_proj,
+        "o": layer.self_attn.o_proj,
+        "pool": layer.feed_forward.pooler,
+        "unpool": layer.feed_forward.unpooler,
+    }
+
+
+def _check_fp8_projection_linear(layer_idx: int, name: str, linear: Linear) -> None:
+    """Refuse a projection the block-FP8 load cannot shard or that is already quantized."""
+    where = f"MUSESPARK_OPEN_FP8_PROJECTIONS: layer {layer_idx} {name}"
+    quant_config = linear.quant_config
+    if quant_config is not None and quant_config.layer_quant_mode.has_any_quant(
+        exclude_kv_cache=True
+    ):
+        raise ValueError(
+            f"{where} is already quantized by the checkpoint ({quant_config.quant_algo}); "
+            "the switch only converts BF16 projections"
+        )
+    if linear.use_cute_dsl_blockscaling_mm or linear.disable_deep_gemm:
+        raise ValueError(f"{where} opts out of DeepGEMM, which the UE8M0 weight layout needs")
+    # Every TP shard boundary must fall on a 128 block: the loader quantizes the
+    # full tensor and load_shard then slices weight and scales in step.
+    bounds = [(0, linear.in_features), (0, linear.out_features)]
+    if isinstance(linear.tp_sharding, tuple):
+        bounds.append(linear.tp_sharding)
+    elif isinstance(linear.tp_sharding, dict):
+        bounds.extend(linear.tp_sharding.values())
+    for offset, size in (linear.fused_weight_shard_indices_mapping or {}).values():
+        bounds.append((offset, offset + size))
+    misaligned = [bound for bound in bounds if bound[0] % _FP8_BLOCK or bound[1] % _FP8_BLOCK]
+    if misaligned:
+        raise ValueError(f"{where} has shard bounds {misaligned} off the {_FP8_BLOCK}-row blocks")
+
+
+def convert_fp8_projections(
+    layers: Sequence["MuseSparkOpenDecoderLayer"], names: Sequence[str]
+) -> int:
+    """Give the named projections of every layer a block-FP8 quant config.
+
+    Layer ``i`` of ``layers`` is decoder layer ``i``. Each converted Linear gets
+    ``QuantConfig(FP8_BLOCK_SCALES)``, keeping the KV-cache algorithm it carried,
+    and ``_weights_created = False``, the same mechanism the checkpoint
+    exclusion pass uses: ``__post_init__`` then calls ``create_weights`` on every
+    module, which re-derives the quant method (``FP8BlockScalesLinearMethod``)
+    and allocates E4M3 weights plus FP32 scales, so no BF16 copy of a converted
+    projection is ever loaded. ``Attention.create_weights`` reaches ``o_proj``
+    through ``o_proj.create_weights()``, which recreates only the weights: the
+    MNNVL ``o_proj.all_reduce`` pinned in ``MuseSparkOpenAttention.__init__``
+    survives. The attention module's own quant config (FP8 KV only) is not
+    touched, so ``_use_quantize_output`` stays False and the attention output
+    stays BF16. Returns the number of converted layers.
+    """
+    converted = 0
+    for layer_idx, layer in enumerate(layers):
+        linears = fp8_projection_linears(layer)
+        for name in names:
+            linear = linears[name]
+            _check_fp8_projection_linear(layer_idx, name, linear)
+            linear.quant_config = QuantConfig(
+                quant_algo=QuantAlgo.FP8_BLOCK_SCALES,
+                kv_cache_quant_algo=getattr(linear.quant_config, "kv_cache_quant_algo", None),
+            )
+            linear._weights_created = False
+        converted += 1
+    return converted
+
+
+def _log_fp8_projections(names: Sequence[str], converted: int, num_layers: int) -> None:
+    """Rank 0's boot line naming the block-FP8 projections and how many layers carry them.
+
+    For example ``MuseSparkOpen FP8 projections: qkv+o+pool+unpool layers=62/62
+    (MUSESPARK_OPEN_FP8_PROJECTIONS)``.
+    """
+    logger.info(
+        f"MuseSparkOpen FP8 projections: {'+'.join(names)} layers={converted}/{num_layers} "
+        "(MUSESPARK_OPEN_FP8_PROJECTIONS)"
+    )
+
+
 # No @register_auto_model here on purpose. The checkpoint's only architecture
 # string is "MuseSparkOpenOmniForCausalLM", and it now names
 # MuseSparkOpenOmniForConditionalGeneration in modeling_musespark_open_omni, which
@@ -3018,6 +3387,11 @@ class MuseSparkOpenForCausalLM(
             "MuseSparkOpen does not support pipeline parallelism"
         )
         assert_supported_spec_config(getattr(model_config, "spec_config", None))
+        # Resolved and refused before any layer is built; applied by
+        # apply_quant_config_exclude_modules, which __post_init__ runs.
+        fp8_projections = _resolve_fp8_projections()
+        if fp8_projections:
+            _check_fp8_projections_supported(model_config, fp8_projections)
         super().__init__(
             MuseSparkOpenModel(model_config),
             model_config,
@@ -3027,6 +3401,36 @@ class MuseSparkOpenForCausalLM(
         self.logits_processor = MuseSparkOpenLogitsProcessor(
             logit_multiplier=config.metap_multiplier, soft_cap=config.output_soft_cap_temp
         )
+        self._fp8_projections = fp8_projections
+
+    def apply_quant_config_exclude_modules(self):
+        """The checkpoint's exclusion pass, then MUSESPARK_OPEN_FP8_PROJECTIONS.
+
+        The only hook where the switch can take effect. ``__post_init__`` runs
+        this pass and then ``create_weights`` on every module, and the base
+        pass resets qkv/o to a KV-only config because the checkpoint excludes
+        ``self_attn`` (pool/unpool are built with no quant config at all), so a
+        conversion made any earlier would be undone and one made later would
+        find BF16 weights already created. The omni wrapper is a plain
+        ``PreTrainedModel`` and runs no second pass. Only the first
+        ``num_hidden_layers`` entries of ``self.model.layers``, the target
+        decoder layers, convert; no drafter layer does.
+        """
+        super().apply_quant_config_exclude_modules()
+        names = getattr(self, "_fp8_projections", ())
+        if not names:
+            return
+        num_layers = self.config.num_hidden_layers
+        converted = convert_fp8_projections(self.model.layers[:num_layers], names)
+        # Pin the 1x128 activation quantization to the CUDA kernel. Unpinned, the
+        # AutoTuner picks between two separate implementations independently on
+        # every rank and only at the tuned M values, so numerics could differ by
+        # rank and by boot; the CUDA kernel is the one every untuned M runs.
+        from ..custom_ops.torch_custom_ops import pin_fp8_1x128_quant_tactic
+
+        pin_fp8_1x128_quant_tactic("cuda")
+        if self.model_config.mapping.rank == 0:
+            _log_fp8_projections(names, converted, num_layers)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(cls, pretrained_config: Any = None) -> Literal["V2"]:

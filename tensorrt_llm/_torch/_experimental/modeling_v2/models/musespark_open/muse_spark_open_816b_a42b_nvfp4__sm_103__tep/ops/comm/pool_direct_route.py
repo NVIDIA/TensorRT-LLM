@@ -62,7 +62,7 @@ Ownership and reuse (cuFlow):
   ``guard_ns`` sets a guard word in host memory (and keeps polling).
 
 Wide transport (TP4, ``max_rows=WIDE_MAX_ROWS``): the decode steps of two to four
-requests (16..32 rows, ``wide_prologue``) run the wide tagged kernel's statements, in
+requests (16..32 rows) run the wide tagged kernel's statements, in
 which each CTA routes only its own two rows (no placement, no early ids). A record is
 then the source rank's ``[32, C]`` pool slot followed by one ``[32, L]`` FP32 logit
 block, the router's output as it is (``router_shard_rows`` with the block as its
@@ -80,6 +80,15 @@ before the CTA's own wait).
 Calls on one workspace must be issued in the same order on every rank, with the
 same row counts and buffers, serialized on one stream (graph replay included).
 The workspace is this op's alone.
+
+BF16 norm (``bf16_norm=``, a separately compiled variant; the default kernels do not include it):
+for the BF16-expert layers (0 and 61), whose expert input is the pre-expert gemma RMSNorm in
+BF16 (``moe_prologue.PF_BF16_FRONT`` mode 2), phase 3 writes that norm instead of the NVFP4
+payload, with ``pool_gather_route``'s ``bf16_norm`` statements: the same sum of squares and
+``rstd`` of phase 2, the weight loaded with flashinfer ``RMSNormKernel``'s row-broadcast tiled
+copy over the same thread-value layout, ``y = x * rstd * (w + 1)`` in FP32, one rounding to
+BF16. The norm weight is a parameter, so these warps load it before their dependency wait.
+No block scale is written and the early-id publication is not available in this variant.
 """
 
 from __future__ import annotations
@@ -131,40 +140,8 @@ CHUNKS = _route.CHUNKS
 CENSUS_WORDS = 2 * CHUNKS
 CENSUS_ARRIVED = CHUNKS
 CENSUS_READ = CHUNKS + 1
-#: The ``prerouted_experts`` lever at TP4 (``configure(prerouted_meta=True)``): the wide
-#: half-window kernel also builds the TRTLLM-gen routing metadata of the expert op -- one token
-#: count per expert next to the census (its atomic's old value is the slot's position within its
-#: expert), the tile-8 prefix over the 96-expert window, the expanded->permuted and
-#: permuted->token maps and the CTA tables -- and issues no dependent trigger, so the expert GEMMs
-#: launch on it directly (``ops/moe/prerouted_experts``, no routing kernel). Off: the kernel and
-#: workspace without metadata.
-_META = False
-#: The expert op's window (``HALF_SPAN``) and token tile the metadata is laid out for.
-META_WINDOW = 96
-META_TILE = 8
-#: Census words per buffer: the presence, arrival and read words, then (meta) one count per expert.
-#: Derived from ``_META`` (``configure``).
-CENSUS_STRIDE = CENSUS_WORDS + (EXPERTS if _META else 0)
-
-
-def configure(*, prerouted_meta: bool = False) -> None:
-    """Set whether the wide half-window kernel writes the expert op's routing metadata.
-
-    ``lever_settings.apply`` sets it from the model's plan before any install; the default is
-    the kernel without metadata. It must precede every ``PoolDirectWorkspace``: a workspace
-    sizes its census buffers from ``CENSUS_STRIDE``, which follows the setting.
-
-    Args:
-        prerouted_meta: the ``prerouted_experts`` lever (``_META``); the metadata is written
-            only where ``ops/moe/prerouted_experts`` finds TRT-LLM's prerouted op.
-    """
-    global _META, CENSUS_STRIDE
-    stride = CENSUS_WORDS + (EXPERTS if prerouted_meta else 0)
-    if _AVAILABLE and stride != CENSUS_STRIDE:
-        # A kernel compiled before reads the census at the previous stride.
-        _compile.cache_clear()
-    _META = bool(prerouted_meta)
-    CENSUS_STRIDE = stride
+#: Census words per buffer: the presence, arrival and read words.
+CENSUS_STRIDE = CENSUS_WORDS
 
 
 def pool_row_words(world: int) -> int:
@@ -317,36 +294,6 @@ if _AVAILABLE:
         )
 
     @dsl_user_op
-    def _atom_relaxed_gpu_add(address, value, *, loc=None, ip=None):
-        """A relaxed GPU-scope add returning the old value (the routing metadata: a slot's
-        position in its expert)."""
-        return Uint32(
-            _asm(
-                T.i32(),
-                [_i64(address, loc, ip), _u32(value, loc, ip)],
-                "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;",
-                "=r,l,r",
-                loc,
-                ip,
-            )
-        )
-
-    @dsl_user_op
-    def _shfl_up_b32(value, delta, *, loc=None, ip=None):
-        """``shfl.sync.up`` over the full warp (the routing metadata's tile prefix); lanes below
-        ``delta`` get their own value."""
-        return Uint32(
-            _asm(
-                T.i32(),
-                [_u32(value, loc, ip), _u32(delta, loc, ip)],
-                "shfl.sync.up.b32 $0, $1, $2, 0, -1;",
-                "=r,r,r",
-                loc,
-                ip,
-            )
-        )
-
-    @dsl_user_op
     def _ld_acquire_gpu_b32(address, *, loc=None, ip=None):
         return Uint32(
             _asm(
@@ -412,7 +359,7 @@ if _AVAILABLE:
             world: int = WORLD,
             max_rows: int = MAX_ROWS,
             census: int = 0,
-            meta: bool = False,
+            bf16_norm: bool = False,
         ):
             check_layout(world, max_rows)
             wide = max_rows > MAX_ROWS
@@ -438,23 +385,16 @@ if _AVAILABLE:
                 stamps,
                 world,
                 max_rows,
+                bf16_norm,
             )
             self.place = place
             self.census = int(census)
-            # The expert op's routing metadata (prerouted_meta; wide half window only).
-            self.meta = bool(meta) and wide and place == PLACE_HALF
             self.guard_ns = int(guard_ns)
             self.guard_break = bool(guard_break)
             self.pool_row_words = pool_row_words(world)
             self.pool_slot_words = pool_slot_words(world, max_rows)
             self.box_words = box_words(world)
             self.record_words = record_words(world, max_rows)
-
-        def _route_smem_bytes(self) -> int:
-            # The routing metadata: + the per-expert counts [256], the window's counts and CTA
-            # offsets [96 each] and four flag words, with alignment slack.
-            extra = (EXPERTS + 2 * META_WINDOW + 4) * 4 + 4 * 16 if self.meta else 0
-            return super()._route_smem_bytes() + extra
 
         @cute.jit
         def __call__(
@@ -477,12 +417,6 @@ if _AVAILABLE:
             local_ids: Int64,
             weights_bf16: Int64,
             stats: Int64,
-            m_e2p: Int64,
-            m_p2t: Int64,
-            m_c2b: Int64,
-            m_c2m: Int64,
-            m_nnc: Int64,
-            m_tnp: Int64,
             dry: Int32,
             enable_pdl: cutlass.Constexpr[bool],
             store_gathered: cutlass.Constexpr[bool],
@@ -515,12 +449,6 @@ if _AVAILABLE:
                 local_ids,
                 weights_bf16,
                 stats,
-                m_e2p,
-                m_p2t,
-                m_c2b,
-                m_c2m,
-                m_nnc,
-                m_tnp,
                 dry,
                 enable_pdl,
                 store_gathered,
@@ -555,12 +483,6 @@ if _AVAILABLE:
             local_ids: Int64,
             weights_bf16: Int64,
             stats: Int64,
-            m_e2p: Int64,
-            m_p2t: Int64,
-            m_c2b: Int64,
-            m_c2m: Int64,
-            m_nnc: Int64,
-            m_tnp: Int64,
             dry: Int32,
             enable_pdl: cutlass.Constexpr[bool],
             store_gathered: cutlass.Constexpr[bool],
@@ -600,17 +522,6 @@ if _AVAILABLE:
                 Uint32, cute.make_layout((MAX_ROWS * TOP_K,)), byte_alignment=16
             )
             sCensus = smem.allocate_tensor(Uint32, cute.make_layout((CHUNKS,)), byte_alignment=16)
-            if cutlass.const_expr(self.meta):
-                sCounts = smem.allocate_tensor(
-                    Uint32, cute.make_layout((EXPERTS,)), byte_alignment=16
-                )
-                sLocal = smem.allocate_tensor(
-                    Uint32, cute.make_layout((META_WINDOW,)), byte_alignment=16
-                )
-                sCtaOff = smem.allocate_tensor(
-                    Uint32, cute.make_layout((META_WINDOW,)), byte_alignment=16
-                )
-                sMisc = smem.allocate_tensor(Uint32, cute.make_layout((4,)), byte_alignment=16)
             world = self.world
             local_count = self.local_experts
             record_bytes = self.record_words * 4
@@ -624,25 +535,63 @@ if _AVAILABLE:
                     # Warps 0-3: pool_gather_fp4quant statement for
                     # statement, the pool slices polled from the transport.
                     # ======================================================
-                    if enable_pdl:
-                        cute.arch.griddepcontrol_wait()
-                    lane_in_row = tidx % threads_per_row
-                    row_in_block = tidx // threads_per_row
-                    fp4_max_rcp = _fp4.rcp_approx_ftz(Float32(_fp4.FLOAT4_E2M1_MAX))
+                    if cutlass.const_expr(self.bf16_norm):
+                        # BF16 norm variant: the tile layouts first (address arithmetic only),
+                        # then the norm weight (a parameter) into registers, then the wait.
+                        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
+                        copy_atom_load_async = cute.make_copy_atom(
+                            cute.nvgpu.cpasync.CopyG2SOp(),
+                            mX.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        tiled_copy_load = cute.make_tiled_copy(
+                            copy_atom_load_async, tv_layout, tiler_mn
+                        )
+                        thr_copy_X = tiled_copy_load.get_slice(tidx)
+                        tXgX = thr_copy_X.partition_S(gX)
+                        tXsX = thr_copy_X.partition_D(sX)
+                        tXrX = cute.make_fragment_like(tXgX)
+                        mW_2d = cute.make_tensor(
+                            mW.iterator,
+                            cute.prepend(mW.layout, cute.make_layout((tiler_mn[0],), stride=(0,))),
+                        )
+                        gW = cute.local_tile(mW_2d, tiler_mn, (0, 0))
+                        copy_atom_w = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            mW.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        thr_copy_W = cute.make_tiled_copy(
+                            copy_atom_w, tv_layout, tiler_mn
+                        ).get_slice(tidx)
+                        tWgW = thr_copy_W.partition_S(gW)
+                        tWrW = cute.make_fragment_like(tWgW)
+                        tXrW = thr_copy_X.retile(tWrW)
+                        cute.copy(copy_atom_w, tWgW, tWrW)
+                        if enable_pdl:
+                            cute.arch.griddepcontrol_wait()
+                        lane_in_row = tidx % threads_per_row
+                        row_in_block = tidx // threads_per_row
+                    else:
+                        if enable_pdl:
+                            cute.arch.griddepcontrol_wait()
+                        lane_in_row = tidx % threads_per_row
+                        row_in_block = tidx // threads_per_row
+                        fp4_max_rcp = _fp4.rcp_approx_ftz(Float32(_fp4.FLOAT4_E2M1_MAX))
 
-                    gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
-                    copy_atom_load_async = cute.make_copy_atom(
-                        cute.nvgpu.cpasync.CopyG2SOp(),
-                        mX.element_type,
-                        num_bits_per_copy=_fp4.COPY_BITS,
-                    )
-                    tiled_copy_load = cute.make_tiled_copy(
-                        copy_atom_load_async, tv_layout, tiler_mn
-                    )
-                    thr_copy_X = tiled_copy_load.get_slice(tidx)
-                    tXgX = thr_copy_X.partition_S(gX)
-                    tXsX = thr_copy_X.partition_D(sX)
-                    tXrX = cute.make_fragment_like(tXgX)
+                        gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
+                        copy_atom_load_async = cute.make_copy_atom(
+                            cute.nvgpu.cpasync.CopyG2SOp(),
+                            mX.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        tiled_copy_load = cute.make_tiled_copy(
+                            copy_atom_load_async, tv_layout, tiler_mn
+                        )
+                        thr_copy_X = tiled_copy_load.get_slice(tidx)
+                        tXgX = thr_copy_X.partition_S(gX)
+                        tXsX = thr_copy_X.partition_D(sX)
+                        tXrX = cute.make_fragment_like(tXgX)
 
                     # Phase 1: the pool gather, from the senders' slots: vector v of a
                     # thread lies in sender owner(v)'s slot at word offset(v) + 4 * lane.
@@ -705,64 +654,94 @@ if _AVAILABLE:
                     sum_sq = _row_sum(x_sq, reduction_buffer)
                     mean_sq = sum_sq / H
                     rstd = cute.math.rsqrt(mean_sq + eps, fastmath=True)
-                    global_scale_val = mGlobalScale[0]
+                    if cutlass.const_expr(not self.bf16_norm):
+                        global_scale_val = mGlobalScale[0]
                     _bar_sync(QUANT_BARRIER, QUANT_THREADS)
 
+                    if cutlass.const_expr(self.bf16_norm):
+                        # Phase 3 (BF16 norm variant): pool_gather_route's bf16_norm phase 3 --
+                        # flashinfer RMSNormKernel's pass 2 at this width (gemma, weight_bias 1).
+                        gY = cute.local_tile(mY, tiler_mn, (bidx, 0))
+                        copy_atom_y = cute.make_copy_atom(
+                            cute.nvgpu.CopyUniversalOp(),
+                            mY.element_type,
+                            num_bits_per_copy=_fp4.COPY_BITS,
+                        )
+                        thr_copy_O = cute.make_tiled_copy(
+                            copy_atom_y, tv_layout, tiler_mn
+                        ).get_slice(tidx)
+                        tXgO = thr_copy_O.partition_D(gY)
+                        tXrO = cute.make_fragment_like(tXgO)
+                        cute.autovec_copy(tXsX, tXrX)
+                        xn = tXrX.load().to(Float32)
+                        w = tXrW.load().to(Float32)
+                        y = xn * rstd * (w + Float32(1.0))
+                        tXrO.store(y.to(mY.element_type))
+                        if actual_row_idx < M:
+                            cute.copy(copy_atom_y, tXrO, tXgO)
                     # Phase 3: RMSNorm + quantize (flashinfer's).
-                    if actual_row_idx < M:
-                        num_sf_per_thread = (
-                            num_sf_blocks_per_row + threads_per_row - 1
-                        ) // threads_per_row
-                        for sf_iter in range(num_sf_per_thread):
-                            sf_idx = lane_in_row + sf_iter * threads_per_row
-                            if sf_idx < num_sf_blocks_per_row:
-                                block_start = sf_idx * block_size
+                    if cutlass.const_expr(not self.bf16_norm):
+                        if actual_row_idx < M:
+                            num_sf_per_thread = (
+                                num_sf_blocks_per_row + threads_per_row - 1
+                            ) // threads_per_row
+                            for sf_iter in range(num_sf_per_thread):
+                                sf_idx = lane_in_row + sf_iter * threads_per_row
+                                if sf_idx < num_sf_blocks_per_row:
+                                    block_start = sf_idx * block_size
 
-                                x_h2 = cute.make_rmem_tensor((8,), Uint32)
-                                w_h2 = cute.make_rmem_tensor((8,), Uint32)
-                                x_tile = sX.iterator + row_in_block * H + block_start
-                                x_h2[0], x_h2[1], x_h2[2], x_h2[3] = _load_shared_words(x_tile)
-                                x_h2[4], x_h2[5], x_h2[6], x_h2[7] = _load_shared_words(x_tile + 8)
-                                w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)
-                                w_ptr1 = _fp4.get_ptr_as_int64(mW, block_start + Int32(8))
-                                w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(w_ptr0)
-                                w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(w_ptr1)
+                                    x_h2 = cute.make_rmem_tensor((8,), Uint32)
+                                    w_h2 = cute.make_rmem_tensor((8,), Uint32)
+                                    x_tile = sX.iterator + row_in_block * H + block_start
+                                    x_h2[0], x_h2[1], x_h2[2], x_h2[3] = _load_shared_words(x_tile)
+                                    x_h2[4], x_h2[5], x_h2[6], x_h2[7] = _load_shared_words(
+                                        x_tile + 8
+                                    )
+                                    w_ptr0 = _fp4.get_ptr_as_int64(mW, block_start)
+                                    w_ptr1 = _fp4.get_ptr_as_int64(mW, block_start + Int32(8))
+                                    w_h2[0], w_h2[1], w_h2[2], w_h2[3] = _fp4.ld_global_v4_u32(
+                                        w_ptr0
+                                    )
+                                    w_h2[4], w_h2[5], w_h2[6], w_h2[7] = _fp4.ld_global_v4_u32(
+                                        w_ptr1
+                                    )
 
-                                xw_h2 = _fp4.bfloat2_mul_8(x_h2, w_h2)
-                                max_xw_h2 = _fp4.bfloat2_max_abs_8(xw_h2)
-                                max_xw = _fp4.bfloat2_hmax_to_f32(max_xw_h2)
-                                y_f32 = _fp4.bfloat2_to_float16(xw_h2, rstd)
+                                    xw_h2 = _fp4.bfloat2_mul_8(x_h2, w_h2)
+                                    max_xw_h2 = _fp4.bfloat2_max_abs_8(xw_h2)
+                                    max_xw = _fp4.bfloat2_hmax_to_f32(max_xw_h2)
+                                    y_f32 = _fp4.bfloat2_to_float16(xw_h2, rstd)
 
-                                max_abs = max_xw * rstd
+                                    max_abs = max_xw * rstd
 
-                                scale_float = global_scale_val * max_abs * fp4_max_rcp
-                                scale_float = _fp4.fmin_f32(
-                                    scale_float, Float32(_fp4.FLOAT8_E4M3_MAX)
-                                )
+                                    scale_float = global_scale_val * max_abs * fp4_max_rcp
+                                    scale_float = _fp4.fmin_f32(
+                                        scale_float, Float32(_fp4.FLOAT8_E4M3_MAX)
+                                    )
 
-                                scale_fp8_u32 = _fp4.cvt_f32_to_e4m3(scale_float)
-                                scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
+                                    scale_fp8_u32 = _fp4.cvt_f32_to_e4m3(scale_float)
+                                    scale_fp8 = Uint8(scale_fp8_u32 & cutlass.Uint32(0xFF))
 
-                                inv_scale = (
-                                    _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32) * global_scale_val
-                                )
+                                    inv_scale = (
+                                        _fp4.fp8_e4m3_to_f32_and_rcp(scale_fp8_u32)
+                                        * global_scale_val
+                                    )
 
-                                mS[actual_row_idx, sf_idx] = scale_fp8
+                                    mS[actual_row_idx, sf_idx] = scale_fp8
 
-                                packed64 = _fp4.quantize_and_pack_16(y_f32, inv_scale)
+                                    packed64 = _fp4.quantize_and_pack_16(y_f32, inv_scale)
 
-                                out_offset = block_start // 2
-                                out_ptr = _fp4.get_ptr_as_int64(
-                                    mY, actual_row_idx * (H // 2) + out_offset
-                                )
-                                _fp4.st_global_u64(out_ptr, packed64)
+                                    out_offset = block_start // 2
+                                    out_ptr = _fp4.get_ptr_as_int64(
+                                        mY, actual_row_idx * (H // 2) + out_offset
+                                    )
+                                    _fp4.st_global_u64(out_ptr, packed64)
                     if cutlass.const_expr(self.stamps != 0):
                         if tidx == 0:
                             _stamp_timer(Int64(self.stamps) + Int64(bidx * 64 + 32))
                     # Early ids with an early trigger: the routing warps' trigger (after the
                     # logit poll) is the CTA's only one, since the first trigger in a
                     # CTA counts and these warps can finish first.
-                    if cutlass.const_expr(self.trigger == 0 and not self.meta):
+                    if cutlass.const_expr(self.trigger == 0):
                         if enable_pdl:
                             cute.arch.griddepcontrol_launch_dependents()
                 else:
@@ -795,12 +774,6 @@ if _AVAILABLE:
                     if cutlass.const_expr(self.place != PLACE_NONE):
                         if rt < CHUNKS:
                             _st_shared_b32(sCensus.iterator + rt, Uint32(0))
-                    rank_e = Uint32(0)
-                    census_meta = Int64(0)
-                    if cutlass.const_expr(self.meta):
-                        census_meta = Int64(self.census) + Int64(buffer) * Int64(CENSUS_STRIDE * 4)
-                        if rt == 0:
-                            _st_shared_b32(sMisc.iterator + 1, Uint32(0))
                     if cutlass.const_expr(self.wide):
                         # The CTA's own rows of each sender's block: words 4 rt of its
                         # [rows_per_block, L] rows (fewer when its last row is past M).
@@ -940,14 +913,6 @@ if _AVAILABLE:
                                         sSelected.iterator + row * TOP_K + lane, expert_id
                                     )
                                     _st_shared_b32(sWeights.iterator + row * TOP_K + lane, weight)
-                                    if cutlass.const_expr(self.meta):
-                                        # Routing metadata: this slot's position within its expert.
-                                        rank_e = _atom_relaxed_gpu_add(
-                                            census_meta
-                                            + Int64(CENSUS_WORDS * 4)
-                                            + Int64(expert_id) * 4,
-                                            Uint32(1),
-                                        )
                                 out = Int64(global_row * TOP_K + lane) * 4
                                 _st_global_b32(selected + out, expert_id)
                                 _st_global_b32(weights + out, weight)
@@ -1001,16 +966,6 @@ if _AVAILABLE:
                                     sCensus.iterator + rt,
                                     _ld_relaxed_gpu_b32(census + Int64(rt * 4)),
                                 )
-                            if cutlass.const_expr(self.meta):
-                                for j in cutlass.range_constexpr(EXPERTS // ROUTE_THREADS):
-                                    _st_shared_b32(
-                                        sCounts.iterator + rt + j * ROUTE_THREADS,
-                                        _ld_relaxed_gpu_b32(
-                                            census
-                                            + Int64((CENSUS_WORDS + j * ROUTE_THREADS) * 4)
-                                            + Int64(rt * 4)
-                                        ),
-                                    )
                             _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
                             if rt == 0:
                                 read = _atom_acq_rel_gpu_add(
@@ -1019,20 +974,6 @@ if _AVAILABLE:
                                 if _eq(read + Uint32(1), ctas) != Uint32(0):
                                     for word in cutlass.range_constexpr(CENSUS_WORDS):
                                         _st_relaxed_gpu_b32(census + Int64(word * 4), Uint32(0))
-                                    if cutlass.const_expr(self.meta):
-                                        _st_shared_b32(sMisc.iterator + 1, Uint32(1))
-                            if cutlass.const_expr(self.meta):
-                                # The last reader's CTA also clears the counts, every routing thread
-                                # its share (every CTA copied them before its read arrival).
-                                _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
-                                if _ld_shared_b32(sMisc.iterator + 1) != Uint32(0):
-                                    for j in cutlass.range_constexpr(EXPERTS // ROUTE_THREADS):
-                                        _st_relaxed_gpu_b32(
-                                            census
-                                            + Int64((CENSUS_WORDS + j * ROUTE_THREADS) * 4)
-                                            + Int64(rt * 4),
-                                            Uint32(0),
-                                        )
                         w0, w1, w2, w3 = _load_shared_words(sCensus.iterator)
                         w4, w5, w6, w7 = _load_shared_words(sCensus.iterator + 4)
                         words = [w0, w1, w2, w3, w4, w5, w6, w7]
@@ -1147,71 +1088,6 @@ if _AVAILABLE:
                         else:
                             xs = [Uint32(0) for _ in range(world)]
                             moved_r = Uint32(0)
-                        if cutlass.const_expr(self.meta):
-                            # Routing metadata: the 96-expert window's token counts, their tile-8
-                            # prefix and (CTA 0) the CTA tables, as the expert op's routing kernel
-                            # builds them.
-                            if rt < META_WINDOW:
-                                _st_shared_b32(sLocal.iterator + rt, Uint32(0))
-                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
-                            for j in cutlass.range_constexpr(EXPERTS // ROUTE_THREADS):
-                                cnt_g = _ld_shared_b32(sCounts.iterator + rt + j * ROUTE_THREADS)
-                                if cnt_g != Uint32(0):
-                                    placed_g = _placed_expert(
-                                        Uint32(rt + j * ROUTE_THREADS),
-                                        words,
-                                        xs,
-                                        self.peer_rank,
-                                        x2s,
-                                        world,
-                                        True,
-                                    )
-                                    if _lt_u(placed_g, Uint32(META_WINDOW)) != Uint32(0):
-                                        _st_shared_b32(sLocal.iterator + placed_g, cnt_g)
-                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
-                            if rwarp == 0:
-                                per_lane = META_WINDOW // 32
-                                cnts = [
-                                    _ld_shared_b32(sLocal.iterator + per_lane * lane + i)
-                                    for i in range(per_lane)
-                                ]
-                                tiles = [(c + Uint32(META_TILE - 1)) >> 3 for c in cnts]
-                                own = tiles[0]
-                                for i in cutlass.range_constexpr(1, per_lane):
-                                    own = own + tiles[i]
-                                incl = own
-                                for d in cutlass.range_constexpr(5):
-                                    up = _shfl_up_b32(incl, Uint32(1 << d))
-                                    incl = incl + _sel(
-                                        _lt_u(Uint32(lane), Uint32(1 << d)), Uint32(0), up
-                                    )
-                                base = incl - own
-                                offs = []
-                                for i in cutlass.range_constexpr(per_lane):
-                                    offs.append(base)
-                                    _st_shared_b32(sCtaOff.iterator + per_lane * lane + i, base)
-                                    base = base + tiles[i]
-                                total = _shfl_idx_b32(incl, Uint32(31))
-                                if bidx == 0:
-                                    for i in cutlass.range_constexpr(per_lane):
-                                        for c in cutlass.range_constexpr(4):
-                                            if _lt_u(Uint32(c), tiles[i]) != Uint32(0):
-                                                cta = offs[i] + Uint32(c)
-                                                _st_global_b32(
-                                                    m_c2b + Int64(cta) * 4,
-                                                    Uint32(per_lane * lane + i),
-                                                )
-                                                _st_global_b32(
-                                                    m_c2m + Int64(cta) * 4,
-                                                    _min_u32(
-                                                        (cta + Uint32(1)) * Uint32(META_TILE),
-                                                        offs[i] * Uint32(META_TILE) + cnts[i],
-                                                    ),
-                                                )
-                                    if lane == 0:
-                                        _st_global_b32(m_nnc, total)
-                                        _st_global_b32(m_tnp, total * Uint32(META_TILE))
-                            _bar_sync(ROUTE_BARRIER, ROUTE_THREADS)
                         from_prev = _shfl_idx_b32(
                             moved_r, (lane_r + Uint32(world - 1)) & Uint32(world - 1)
                         )
@@ -1259,21 +1135,6 @@ if _AVAILABLE:
                             _st_global_b32(local_ids + Int64(slot_index) * 4, placed)
                             w_bits = _ld_shared_b32(sWeights.iterator + shared_index)
                             _st_global_b16(weights_bf16 + Int64(slot_index) * 2, _bf16_bits(w_bits))
-                            if cutlass.const_expr(self.meta):
-                                is_local = _lt_u(placed, Uint32(META_WINDOW))
-                                perm = (
-                                    _ld_shared_b32(
-                                        sCtaOff.iterator + _sel(is_local, placed, Uint32(0))
-                                    )
-                                    * Uint32(META_TILE)
-                                    + rank_e
-                                )
-                                _st_global_b32(
-                                    m_e2p + Int64(slot_index) * 4,
-                                    _sel(is_local, perm, Uint32(0xFFFFFFFF)),
-                                )
-                                if is_local != Uint32(0):
-                                    _st_global_b32(m_p2t + Int64(perm) * 4, Uint32(own_row))
                         held_load = loads[0]
                         for b in cutlass.range_constexpr(1, world):
                             held_load = _sel(_eq(lane_r, Uint32(b)), loads[b], held_load)
@@ -1290,9 +1151,8 @@ if _AVAILABLE:
                     if cutlass.const_expr(self.stamps != 0):
                         if rt == 0:
                             _stamp_timer(Int64(self.stamps) + Int64(bidx * 64 + 24))
-                    if cutlass.const_expr(not self.meta):
-                        if enable_pdl:
-                            cute.arch.griddepcontrol_launch_dependents()
+                    if enable_pdl:
+                        cute.arch.griddepcontrol_launch_dependents()
 
     @functools.lru_cache(maxsize=64)
     def _compile(
@@ -1311,7 +1171,7 @@ if _AVAILABLE:
         world: int = WORLD,
         max_rows: int = MAX_ROWS,
         census: int = 0,
-        meta: bool = False,
+        bf16_norm: bool = False,
     ):
         kernel = _PoolDirectRouteKernel(
             peer_rank,
@@ -1326,16 +1186,22 @@ if _AVAILABLE:
             world,
             max_rows,
             census,
-            meta,
+            bf16_norm,
         )
         rows = cute.sym_int()
         fake = cute.runtime.make_fake_compact_tensor
+        # The BF16 norm variant's output is the [M, 4096] BF16 normalized row.
+        out_fake = (
+            fake(cutlass.BFloat16, (rows, HIDDEN), stride_order=(1, 0), assumed_align=128)
+            if bf16_norm
+            else fake(cutlass.Uint8, (rows, HIDDEN // 2), stride_order=(1, 0), assumed_align=128)
+        )
         with torch.cuda.device(device_index):
             return cute.compile(
                 kernel,
                 fake(cutlass.BFloat16, (rows, HIDDEN), stride_order=(1, 0), assumed_align=128),
                 fake(cutlass.BFloat16, (HIDDEN,), assumed_align=128),
-                fake(cutlass.Uint8, (rows, HIDDEN // 2), stride_order=(1, 0), assumed_align=128),
+                out_fake,
                 fake(
                     cutlass.Uint8, (rows, HIDDEN // BLOCK), stride_order=(1, 0), assumed_align=128
                 ),
@@ -1353,12 +1219,6 @@ if _AVAILABLE:
                 Int64(0),
                 Int64(0),
                 Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
-                Int64(0),
                 Int32(1),
                 enable_pdl,
                 store_gathered,
@@ -1368,8 +1228,9 @@ if _AVAILABLE:
 
 
 #: What selects a compiled kernel: ``(place, static_from, enable_pdl, store_gathered,
-#: publish, epoch_word, trigger, stamps)`` (the early-id settings are the last four; 0 = off).
-Variant = Tuple[int, int, bool, bool, int, int, int, int]
+#: publish, epoch_word, trigger, stamps, bf16_norm)`` (the early-id settings are publish ..
+#: stamps, 0 = off; ``bf16_norm`` the BF16 norm variant).
+Variant = Tuple[int, int, bool, bool, int, int, int, int, bool]
 
 
 def variant(
@@ -1379,14 +1240,18 @@ def variant(
     store_gathered: bool = True,
     early=None,
     stamps: int = 0,
+    bf16_norm: bool = False,
 ) -> Variant:
     """The workspace's key of the kernel a call with these settings launches.
 
     ``early``: the ``EarlyExpertIds`` when this call publishes (the host decides
-    per call, ``EarlyExpertIds.may_publish``), else None.
+    per call, ``EarlyExpertIds.may_publish``), else None. ``bf16_norm``: the BF16 norm
+    variant (phase 3 writes the gemma RMSNorm in BF16; no early ids).
     """
     if place not in (PLACE_NONE,) + tuple(_route.EARLY_PLACES):
         raise ValueError(f"unknown placement kind {place}")
+    if bf16_norm and early is not None:
+        raise ValueError("the BF16 norm variant has no early-id publication")
     publish = epoch = trigger = 0
     if early is not None:
         if place not in _route.EARLY_PLACES or not enable_pdl:
@@ -1404,6 +1269,7 @@ def variant(
         int(epoch),
         int(trigger),
         int(stamps),
+        bool(bf16_norm),
     )
 
 
@@ -1465,8 +1331,8 @@ class PoolDirectWorkspace:
             refusal = (
                 "CuTe DSL, flashinfer's RMSNormFP4QuantKernel or the direct poll is unavailable"
             )
-        elif torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-            refusal = "the direct routed pool kernel runs on SM103 or SM107 only"
+        elif torch.cuda.get_device_capability(self.device) != (10, 3):
+            refusal = "the direct routed pool kernel runs on SM103 only"
         elif not prefer_pinned():
             refusal = "the guard words need pinned host memory, which this platform does not pin"
         if not _mnnvl_workspace_all_succeeded(self._comm, refusal is None):
@@ -1491,32 +1357,6 @@ class PoolDirectWorkspace:
                     if self.wide
                     else None
                 )
-                # prerouted_meta: the expert op's routing metadata, written by the wide
-                # half-window kernel (one set: a layer's expert GEMMs read it before the next
-                # layer's kernel can pass its dependency wait).
-                # Only where the prerouted backend is registered (ops/moe/prerouted_experts:
-                # TRT-LLM's fp4_block_scale_moe_prerouted op): without it the workspace writes no
-                # metadata and builds the kernel without it, and every expert call is the stock
-                # call.
-                from ..moe import prerouted_experts as _prerouted
-
-                self.meta = (
-                    _meta_buffers(self.max_rows, self.device)
-                    if self.wide and _META and _prerouted.available()
-                    else None
-                )
-                if self.meta is not None:
-                    logger.info(
-                        "[musespark_open] pool_direct_route prerouted_meta: the wide "
-                        "half-window kernel writes the expert op's routing metadata (96-expert window, "
-                        f"8-token tiles, {self.max_rows} rows) and triggers no dependent"
-                    )
-                elif self.wide and _META:
-                    logger.warning(
-                        "[musespark_open] pool_direct_route prerouted_meta off: no "
-                        f"prerouted backend (this build registers no trtllm::{_prerouted.OP_NAME}); "
-                        "the wide kernel writes no metadata"
-                    )
                 self.control = torch.zeros(
                     CONTROL_WORDS, dtype=torch.int32, pin_memory=prefer_pinned()
                 )
@@ -1676,7 +1516,17 @@ class PoolDirectWorkspace:
                 f"[musespark_open] pool_into_route: direct routed pool kernel variant {key} was not built before "
                 "graph capture"
             )
-        place, static_from, enable_pdl, store_gathered, publish, epoch, trigger, stamps = key
+        (
+            place,
+            static_from,
+            enable_pdl,
+            store_gathered,
+            publish,
+            epoch,
+            trigger,
+            stamps,
+            bf16_norm,
+        ) = key
         compiled = _compile(
             self.device.index,
             self.rank,
@@ -1693,12 +1543,13 @@ class PoolDirectWorkspace:
             self.world,
             self.max_rows,
             self._census.data_ptr() if self.wide and place != PLACE_NONE else 0,
-            # The metadata build exactly where the workspace holds the metadata (``self.meta``).
-            bool(getattr(self, "meta", None) is not None and place == PLACE_HALF),
+            bf16_norm,
         )
         # A dry launch loads the module now, not inside a capture.
         with torch.cuda.device(self.device):
-            outputs = _outputs(1, self.device, place != PLACE_NONE, store_gathered, self.world)
+            outputs = _outputs(
+                1, self.device, place != PLACE_NONE, store_gathered, self.world, bf16_norm
+            )
             gain = torch.zeros(HIDDEN, dtype=torch.bfloat16, device=self.device)
             scale = torch.zeros(1, dtype=torch.float32, device=self.device)
             _launch(compiled, outputs, gain, scale, 1, 1e-6, 1e-20, 0, 0, 0, 0, dry=1)
@@ -1708,10 +1559,21 @@ class PoolDirectWorkspace:
 
 
 def _outputs(
-    rows: int, device, placed: bool, store_gathered: bool, world: int = WORLD
+    rows: int,
+    device,
+    placed: bool,
+    store_gathered: bool,
+    world: int = WORLD,
+    bf16_norm: bool = False,
 ) -> _route.RouteOutputs:
+    """A call's outputs; the BF16 norm variant writes ``normed`` in place of ``fp4``."""
     return _route.RouteOutputs(
-        fp4=torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device),
+        fp4=None
+        if bf16_norm
+        else torch.empty((rows, HIDDEN // 2), dtype=torch.uint8, device=device),
+        normed=torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device)
+        if bf16_norm
+        else None,
         scale=torch.empty((rows, HIDDEN // BLOCK), dtype=torch.uint8, device=device),
         gathered=torch.empty((rows, HIDDEN), dtype=torch.bfloat16, device=device),
         logits=torch.empty((rows, EXPERTS), dtype=torch.float32, device=device),
@@ -1738,15 +1600,12 @@ def _launch(
     buffer: int,
     bias: int,
     dry: int = 0,
-    meta=None,
 ) -> None:
     placed = out.local_ids is not None
-    # The routing-metadata pointers (0: the kernel was compiled without metadata).
-    mp = [0] * 6 if meta is None else [meta[name].data_ptr() for name in META_FIELDS]
     compiled(
         out.gathered,
         gain,
-        out.fp4,
+        out.fp4 if out.fp4 is not None else out.normed,
         out.scale,
         global_scale,
         rows,
@@ -1762,44 +1621,8 @@ def _launch(
         out.local_ids.data_ptr() if placed else 0,
         out.weights_bf16.data_ptr() if placed else 0,
         out.stats.data_ptr() if placed else 0,
-        mp[0],
-        mp[1],
-        mp[2],
-        mp[3],
-        mp[4],
-        mp[5],
         dry,
     )
-
-
-#: The routing-metadata tensors, in the kernel's argument order.
-META_FIELDS = ("e2p", "p2t", "c2b", "c2m", "nnc", "tnp")
-
-
-def meta_sizes(max_rows: int) -> dict:
-    """Element counts of the expert op's routing metadata at ``max_rows`` rows on the 96-expert
-    window with 8-token tiles (TRT-LLM's ``getMaxNumCgasInBatchDim`` /
-    ``getMaxPermutedPaddedCount`` / ``getRouteMapAllocCount``)."""
-    slots = max_rows * TOP_K
-    filled = min(META_WINDOW, slots)
-    ctas = filled + (slots - filled) // META_TILE
-    return dict(e2p=slots, p2t=ctas * META_TILE + 1, c2b=ctas, c2m=ctas, nnc=1, tnp=1)
-
-
-def meta_view(meta: dict, rows: int) -> dict:
-    """The routing metadata an expert call of ``rows`` rows reads (its expanded->permuted map
-    as ``[rows, 8]``)."""
-    view = dict(meta)
-    view["e2p"] = meta["e2p"][: rows * TOP_K].view(rows, TOP_K)
-    view["rows"] = rows
-    return view
-
-
-def _meta_buffers(max_rows: int, device) -> dict:
-    return {
-        name: torch.zeros(count, dtype=torch.int32, device=device)
-        for name, count in meta_sizes(max_rows).items()
-    }
 
 
 _SHARED: dict = {}
@@ -1920,9 +1743,15 @@ class PoolDirectRoute(OpWrapper):
         return_gathered: bool = True,
         early=None,
         stamps: Optional[torch.Tensor] = None,
+        bf16_norm: Optional[torch.Tensor] = None,
     ) -> _route.RouteOutputs:
         placed = place != PLACE_NONE
-        publish = early is not None and placed and bool(enable_pdl) and early.may_publish()
+        # ``bf16_norm`` (the gemma norm's raw [4096] BF16 weight): the kernel writes the
+        # normalized BF16 row into ``normed`` and no NVFP4 payload or scale.
+        norm = bf16_norm is not None
+        publish = (
+            early is not None and not norm and placed and bool(enable_pdl) and early.may_publish()
+        )
         key = variant(
             int(place),
             int(static_from),
@@ -1930,13 +1759,14 @@ class PoolDirectRoute(OpWrapper):
             bool(return_gathered),
             early if publish else None,
             0 if stamps is None else stamps.data_ptr(),
+            norm,
         )
         compiled = workspace.kernel(key)
-        out = _outputs(rows, gain.device, placed, True, workspace.world)
+        out = _outputs(rows, gain.device, placed, True, workspace.world, norm)
         _launch(
             compiled,
             out,
-            gain,
+            gain if not norm else bf16_norm,
             global_scale,
             rows,
             eps,
@@ -1945,14 +1775,13 @@ class PoolDirectRoute(OpWrapper):
             workspace.control_ptr(),
             int(buffer),
             bias.data_ptr(),
-            meta=getattr(workspace, "meta", None)
-            if place == PLACE_HALF and workspace.wide
-            else None,
         )
         if publish:
             early.arm(out.local_ids)
         if not return_gathered:
             out.gathered = None
+        if norm:
+            out.scale = None
         return out
 
     def reference(
@@ -2012,6 +1841,7 @@ class PoolDirectRoute(OpWrapper):
         return_gathered: bool = True,
         early=None,
         stamps: Optional[torch.Tensor] = None,
+        bf16_norm: Optional[torch.Tensor] = None,
     ) -> None:
         """Raw vector accesses at fixed strides on the operands' device; the transport's
         buffer and row count must be the ones the producers published into. The wide
@@ -2027,11 +1857,14 @@ class PoolDirectRoute(OpWrapper):
             raise ValueError(f"buffer must be in 0..{BUFFERS - 1}, got {buffer}")
         if not enable_pdl and early is not None:
             raise ValueError("the early-id publication needs programmatic dependent launch")
-        for tensor, shape, dtype in (
+        checked = [
             (gain, (HIDDEN,), torch.bfloat16),
             (global_scale, (1,), torch.float32),
             (bias, (EXPERTS,), torch.float32),
-        ):
+        ]
+        if bf16_norm is not None:
+            checked.append((bf16_norm, (HIDDEN,), torch.bfloat16))
+        for tensor, shape, dtype in checked:
             if (
                 tuple(tensor.shape) != shape
                 or tensor.dtype != dtype

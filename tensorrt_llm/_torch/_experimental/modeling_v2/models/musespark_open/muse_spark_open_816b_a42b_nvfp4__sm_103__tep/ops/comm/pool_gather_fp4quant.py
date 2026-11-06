@@ -154,8 +154,7 @@ if _AVAILABLE:
                 scale_format="e4m3",
             )
             # The configuration the inbox addressing below is written for; it is
-            # what flashinfer selects for H=4096 BF16 on sm_103 and sm_107 (the
-            # same opt-in shared memory per block).
+            # what flashinfer selects for H=4096 BF16 on sm_103.
             if not (
                 self.cluster_n == 1
                 and self.threads_per_row == 64
@@ -555,7 +554,8 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
 
     A collective over the TP group (TP4 or TP8, ``inbox.world``): every rank
     calls it with the same row count, in the same order relative to its other
-    calls on ``inbox``. Rows 1 to ``inbox.max_rows`` (8, or 32 on a wide inbox at TP4).
+    calls on ``inbox``. Rows 1 to ``inbox.max_rows`` (8, or 32 on a wide inbox, at TP4 or
+    TP8).
     """
 
     ARCHS = frozenset({Arch.SM_103})
@@ -567,8 +567,9 @@ class PoolGatherRmsnormFp4Quant(OpWrapper):
     inputs, row-count changes, tag wrap, a delayed rank; and in the
     integration's test, a two-stream 62-layer chain with back-to-back replays),
     and against `reference` within a band. Rows 1..8 on an 8-row inbox; rows
-    9..32 on a wide inbox at TP4 (the built-in shards only 1..8; there it is
-    certified against the built-in gather workspace + flashinfer's kernel).
+    9..32 on a wide inbox at TP4 and at TP8 (the built-in shards only 1..8; there
+    it is certified against the built-in gather workspace + flashinfer's kernel,
+    the TP8 rows over eight ranks on two trays).
     """
 
     def __call__(

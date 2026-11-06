@@ -97,36 +97,10 @@ NQ = 2
 #: as, per SM version (``ring_stages``). At deep contexts the split kernel streams the cache and
 #: the ring depth sets its rate. sm103: each build takes the deepest ring one CTA's shared memory
 #: holds next to its Q buffers, 20 pages with a one-term Q (the served E4M3 Q) and 16 with a
-#: two-term Q (24 and 20 do not launch). sm107: 16 pages for either Q.
-RING_STAGES_BY_SM = {103: {1: 20, 2: 16}, 107: {1: 16, 2: 16}}
-#: sm107's depths in the table above, which ``configure`` starts from.
-_SM107_RING_STAGES = dict(RING_STAGES_BY_SM[107])
+#: two-term Q (24 and 20 do not launch).
+RING_STAGES_BY_SM = {103: {1: 20, 2: 16}}
 #: sm103's ring depths.
 RING_STAGES = RING_STAGES_BY_SM[103]
-
-
-def configure(*, sm107_stages: Optional[int] = None) -> None:
-    """Set sm107's ring depth for the served one-term (E4M3) Q build (``split_kv_deep_rings``).
-
-    ``lever_settings.apply`` sets it from the model's plan before any install. ``None`` keeps
-    the table's depths; ``n`` sets the one-term build's ring to ``n`` pages (the two-term build
-    keeps 16: on sm103 its 20-page ring does not launch). 20 launches on sm107 and is bitwise to
-    16 (outputs and partials at 5-8 requests x 256k / 512k / 1M contexts); per layer at 8 / 5
-    requests: 512k -4.8 / -2.7 %, 1M -6.9 / -4.8 %, 256k ~0. Each compiled build is keyed on the
-    depth it takes (``_compile``), so a build compiled at another depth is never reused.
-
-    Raises:
-        ValueError: for a depth that is not a positive multiple of 4 (pages per 128-key tile).
-    """
-    table = dict(_SM107_RING_STAGES)
-    if sm107_stages is not None:
-        if sm107_stages <= 0 or sm107_stages % 4:
-            raise ValueError(
-                f"multi_request_split_kv: the ring depth is a positive multiple of 4, got "
-                f"{sm107_stages}"
-            )
-        table[1] = int(sm107_stages)
-    RING_STAGES_BY_SM[107] = table
 
 
 def ring_stages(device_index: int, q_terms: int) -> int:
@@ -293,7 +267,7 @@ def compiled_key(
 
 
 def _compile(key: tuple):
-    # The ring depth (``ring_stages``, which ``configure`` sets on sm107) is passed explicitly so
+    # The ring depth (``ring_stages``) is passed explicitly so
     # that it is part of the compiled build's cache key.
     return _compiled_kernel(*key[:4], nq=key[4], rescale_cols=key[5], q_fp8=key[6],
                             device_scale=key[7], stages=ring_stages(key[0], key[4]),
@@ -462,12 +436,12 @@ class MultiRequestSplitKv(OpWrapper):
     ``G`` in ``RANK_KV_HEADS``; an int32 ``[B, 2, pages]`` table with a unit last stride;
     contiguous int32 ``seq_lens [B]``; a BF16 ``out`` of Q's shape with a unit last stride;
     partial buffers of at least ``num_work + B`` slots; ``1 <= num_work <= min(SMs,
-    COMBINE_MAX_SLOTS)``; one sm_103 / sm_107 device. The first
+    COMBINE_MAX_SLOTS)``; one sm_103 device. The first
     call per device and build compiles the kernel, which must not happen inside a CUDA-graph
     capture (``precompile``).
     """
 
-    ARCHS = frozenset({Arch.SM_103, Arch.SM_107})
+    ARCHS = frozenset({Arch.SM_103})
 
     note = """
     Metadata consumed: seq_lens (device; read by both kernels, never on the host), the batch's
@@ -562,10 +536,10 @@ class MultiRequestSplitKv(OpWrapper):
             or nq not in (1, 2)
             or any(t.device != q.device or t.data_ptr() % 16 for t in tensors)
             or q.device.type != "cuda"
-            or torch.cuda.get_device_capability(q.device) not in ((10, 3), (10, 7))
+            or torch.cuda.get_device_capability(q.device) != (10, 3)
         ):
             raise ValueError(
-                "multi_request_split_kv takes, on one sm_103 or sm_107 device and 16-byte "
+                "multi_request_split_kv takes, on one sm_103 device and 16-byte "
                 f"aligned: BF16 or E4M3 q [B M, 8 G * {HEAD_DIM}] (1 <= M <= {MAX_ROWS}, 1 <= B <= "
                 f"{MAX_REQUESTS}), a contiguous FP8 E4M3 pool [blocks, G, {PAGE}, {HEAD_DIM}], "
                 "an int32 [B, 2, pages] table, contiguous int32 seq_lens [B], a BF16 out of q's "

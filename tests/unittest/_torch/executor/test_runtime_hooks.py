@@ -29,6 +29,7 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import (
     DEFAULT_RUNTIME_HOOKS,
+    OverlapOffsetsApplier,
     RuntimeHooks,
     SamplerStoreWriter,
     StepInputStager,
@@ -132,6 +133,7 @@ def test_the_protocols_state_the_call_site_methods():
         "static_inputs",
     }
     assert methods(SamplerStoreWriter) == {"store_and_copy_out"}
+    assert methods(OverlapOffsetsApplier) == {"apply"}
 
 
 def test_engine_classes_declare_the_hooks_off():
@@ -1021,3 +1023,109 @@ def test_the_runner_reads_the_hooks_of_its_model(declared):
     with pytest.raises(_Stop):
         DecoderRunner.__init__(runner, model, _StopConfig(), **others)
     assert runner.runtime_hooks is (hooks if declared else DEFAULT_RUNTIME_HOOKS)
+
+
+# -- the overlap offsets of _preprocess_inputs ---------------------------------------------------
+
+
+class _Metadata:
+    """The attention metadata fields ``_preprocess_inputs`` reads, with a real ``kv_lens_cuda``."""
+
+    def __init__(self, kv_lens, num_contexts=0, num_chunked=0, with_kv_lens=True):
+        self.kv_cache_manager = object()
+        self.num_seqs = kv_lens.numel()
+        self.num_contexts = num_contexts
+        self.num_generations = kv_lens.numel() - num_contexts
+        self.num_ctx_tokens = 0
+        self.num_chunked_ctx_requests = num_chunked
+        if with_kv_lens:
+            self.kv_lens_cuda = kv_lens
+        self.updates = 0
+
+    def on_update_kv_lens(self):
+        self.updates += 1
+
+
+class _Applier:
+    def __init__(self, accept: bool) -> None:
+        self.accept = accept
+        self.calls = []
+
+    def apply(self, *views):
+        self.calls.append(views)
+        return self.accept
+
+
+def _preprocess(applier, *, positions_3d=False, num_contexts=0, num_chunked=0, with_kv_lens=True):
+    from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.runner import DecoderRunner
+
+    tokens, gens = 8, 1
+    pos = torch.arange(100, 100 + tokens, dtype=torch.int32).reshape(1, tokens)
+    if positions_3d:
+        pos = pos.reshape(1, 1, tokens).repeat(3, 1, 1)
+    kv = torch.tensor([450_000] * (gens + num_contexts), dtype=torch.int32)
+    md = _Metadata(
+        kv, num_contexts=num_contexts, num_chunked=num_chunked, with_kv_lens=with_kv_lens
+    )
+    runner = types.SimpleNamespace(
+        _config=types.SimpleNamespace(disable_overlap_scheduler=False),
+        previous_pos_id_offsets_cuda=torch.full((64,), 4, dtype=torch.int32),
+        previous_kv_lens_offsets_cuda=torch.full((16,), -3, dtype=torch.int32),
+        runtime_hooks=RuntimeHooks(overlap_offsets_applier=applier),
+        mapping=types.SimpleNamespace(has_cp_helix=lambda: False),
+        guided_decoder=None,
+        get_runtime_tokens_per_gen_step=lambda draft_len: draft_len + 1,
+    )
+    inputs = {
+        "attn_metadata": md,
+        "input_ids": torch.zeros(tokens, dtype=torch.int32),
+        "position_ids": pos,
+    }
+    before = (pos.clone(), kv.clone())
+    out = DecoderRunner._preprocess_inputs(
+        runner, inputs, enable_spec_decode=True, runtime_draft_len=7
+    )
+    assert out is inputs
+    return runner, md, pos, kv, before
+
+
+def test_the_overlap_offsets_are_two_adds_with_the_hook_off():
+    runner, md, pos, kv, (pos0, kv0) = _preprocess(None)
+    assert torch.equal(pos, pos0 + 4)
+    assert torch.equal(kv, kv0 - 3)
+    # Once on entry, once after the KV-length add.
+    assert md.updates == 2
+
+
+def test_the_overlap_offsets_are_handed_to_an_accepting_applier():
+    applier = _Applier(accept=True)
+    runner, md, pos, kv, (pos0, kv0) = _preprocess(applier)
+    ((p, po, k, ko),) = applier.calls
+    # The very views the two original statements write and read.
+    assert p.data_ptr() == pos[0, 0:].data_ptr() and p.shape == pos[0, 0:].shape
+    assert po.data_ptr() == runner.previous_pos_id_offsets_cuda.data_ptr() and po.numel() == 8
+    assert k.data_ptr() == kv.data_ptr() and k.numel() == 1
+    assert ko.data_ptr() == runner.previous_kv_lens_offsets_cuda.data_ptr() and ko.numel() == 1
+    # The call site added nothing itself; the applier's work is followed by the metadata update.
+    assert torch.equal(pos, pos0) and torch.equal(kv, kv0)
+    assert md.updates == 2
+
+
+def test_the_overlap_offsets_are_two_adds_after_an_applier_declines():
+    applier = _Applier(accept=False)
+    _, md, pos, kv, (pos0, kv0) = _preprocess(applier)
+    assert len(applier.calls) == 1
+    assert torch.equal(pos, pos0 + 4)
+    assert torch.equal(kv, kv0 - 3)
+    assert md.updates == 2
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(positions_3d=True), dict(num_contexts=1, num_chunked=1), dict(with_kv_lens=False)],
+    ids=["mrope", "chunked", "no_kv_lens"],
+)
+def test_the_overlap_offsets_applier_is_not_asked_outside_its_shape(kwargs):
+    applier = _Applier(accept=True)
+    _preprocess(applier, **kwargs)
+    assert applier.calls == []

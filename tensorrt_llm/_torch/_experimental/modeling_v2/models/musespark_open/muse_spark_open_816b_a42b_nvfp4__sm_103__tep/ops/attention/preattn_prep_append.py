@@ -259,9 +259,8 @@ class PreattnPrepAppend(OpWrapper):
     sequence's K and V page ids, the layer's pool view, the two FP8 KV scales,
     the FMHA's host bmm1 scale and the output scale (1.0 for a BF16 output).
     Call site: the target's 16 full-attention layers on decode steps of one
-    sequence and at most 8 rows (fast path full_attention_prep_append), and at tep4 on
-    decode steps of two to four sequences of equal row count (fast path
-    wide_full_attention), whose trtllm-gen generation preprocess launch the target then
+    sequence and at most 8 rows (fast path full_attention_prep_append),
+    whose trtllm-gen generation preprocess launch the target then
     skips; a caller may launch it with trigger_at_entry to release its dependents at
     entry. Grid (rows, H + G), one warp per program.
 

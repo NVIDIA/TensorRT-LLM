@@ -435,8 +435,10 @@ __global__ void __launch_bounds__(THREADS) splitFoldCoopKernel(SplitFoldParams p
 //! around the target, every claimant walks, as in the shipped kernel). Any other row
 //! runs the shipped body itself.
 //!
-//! PDL: waits on kernel A before reading anything.
-template <int VB, int WALK>
+//! PDL: waits on kernel A before reading anything. With `kTrigger` (``TargetHead.verify_pdl``)
+//! every CTA releases its dependent right after that wait; the dependent waits for this grid
+//! before it reads the tokens.
+template <int VB, int WALK, bool kTrigger>
 __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
     splitDrawKernel(FusedSamplingParams params, OnlineSoftmax const* states, SplitCap cap)
 {
@@ -453,6 +455,10 @@ __global__ void __launch_bounds__(VB, VB == kSplitNarrowBlock ? 2 : 1)
     }
     __syncthreads();
     gridDependencyWait();
+    if constexpr (kTrigger)
+    {
+        gridDependencyTrigger();
+    }
     int const vocabSize = params.vocabSize;
     RowParams const rp = loadRowParams(params, row);
     if (rp.needTopK || rp.needTopP || rp.needMinP)
@@ -1510,7 +1516,7 @@ void foldGather(at::Tensor const& inbox, at::Tensor const& gathered, at::Tensor 
 at::Tensor draw(at::Tensor const& logits, at::Tensor const& temperatures, at::Tensor const& topKs,
     at::Tensor const& topPs, at::Tensor const& minPs, std::optional<at::Tensor> const& seed,
     std::optional<at::Tensor> const& offset, at::Tensor const& states, double multiplier, double invCap, double cap,
-    bool pdl)
+    bool pdl, bool earlyTrigger)
 {
     TORCH_CHECK(logits.scalar_type() == at::kBFloat16, "logits must be BF16");
     at::cuda::CUDAGuard guard(logits.device());
@@ -1524,12 +1530,25 @@ at::Tensor draw(at::Tensor const& logits, at::Tensor const& temperatures, at::Te
     auto const* threadStates = reinterpret_cast<fs::OnlineSoftmax const*>(states.data_ptr());
     if (fs::splitVirtualBlock(params.numRows) == fs::kSplitBlock)
     {
-        launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors>, dim3(params.numRows), dim3(fs::kSplitBlock),
-            pdl, params, threadStates, softCap(multiplier, invCap, cap));
+        if (earlyTrigger)
+        {
+            launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors, true>, dim3(params.numRows),
+                dim3(fs::kSplitBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+        }
+        else
+        {
+            launch(fs::splitDrawKernel<fs::kSplitBlock, fs::kSplitWalkVectors, false>, dim3(params.numRows),
+                dim3(fs::kSplitBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
+        }
+    }
+    else if (earlyTrigger)
+    {
+        launch(fs::splitDrawKernel<fs::kSplitNarrowBlock, fs::kSplitNarrowWalkVectors, true>, dim3(params.numRows),
+            dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
     }
     else
     {
-        launch(fs::splitDrawKernel<fs::kSplitNarrowBlock, fs::kSplitNarrowWalkVectors>, dim3(params.numRows),
+        launch(fs::splitDrawKernel<fs::kSplitNarrowBlock, fs::kSplitNarrowWalkVectors, false>, dim3(params.numRows),
             dim3(fs::kSplitNarrowBlock), pdl, params, threadStates, softCap(multiplier, invCap, cap));
     }
     return tokens;
@@ -1785,7 +1804,8 @@ TORCH_LIBRARY(musespark_open_head_sampler, m)
         "int timeout_s, bool fold, int threads, bool pdl) -> ()");
     m.def(
         "draw(Tensor logits, Tensor temperatures, Tensor top_ks, Tensor top_ps, Tensor min_ps, Tensor? seed, "
-        "Tensor? offset, Tensor states, float multiplier, float inv_cap, float cap, bool pdl) -> Tensor");
+        "Tensor? offset, Tensor states, float multiplier, float inv_cap, float cap, bool pdl, "
+        "bool early_trigger=False) -> Tensor");
     m.def(
         "fold_plain_coop(Tensor logits, Tensor temperatures, Tensor(a!) states, float multiplier, float inv_cap, "
         "float cap, int vts, int threads, bool early_trigger, bool pdl) -> ()");

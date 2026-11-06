@@ -50,25 +50,15 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             fc_shard,
             fused_accept,
             fixed_gemms,
-            # Passed only when selected, as the load-phase installers' keywords are.
-            **({"fc_inbox": True} if plan.enabled("drafter_fc_inbox") else {}),
         )
     if plan.enabled("context_kv_fork"):
         # Derives from the class draft_head / fused_accept left the worker with;
         # verify_fold then composes on top of it.
         from .kernels.context_kv_fork import fork as _context_kv_fork
 
-        parallel = plan.enabled("windowed_commit_parallel")
         _context_kv_fork.install(
             shell.llm,
             shell.llm.model,
-            side_chain=plan.enabled("drafter_kv_side_chain"),
-            early_fc=plan.enabled("drafter_fc_early_fork"),
-            glue=plan.enabled("drafter_kv_glue"),
-            fork_before_head=plan.enabled("drafter_kv_fork_before_head"),
-            parallel_min_requests=(
-                plan.param("windowed_commit_parallel", "MIN_REQUESTS") if parallel else None
-            ),
             declined=plan.declined,
         )
     verify_fold = plan.enabled("verify_fold")
@@ -80,7 +70,6 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             getattr(shell.llm, "spec_worker", None),
             verify_fold,
             path_walk_tail,
-            preamble=plan.enabled("drafter_preamble_from_commit"),
             declined=plan.declined,
         )
     if plan.enabled("drafter_hops"):
@@ -100,21 +89,12 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
     if plan.enabled("split_sampler"):
         from .kernels.split_sampler import target_head as _target_head
 
-        multimem = plan.enabled("head_multimem_gather")
-        coop = plan.enabled("head_sampler_coop_fold")
-        head = _target_head.install(
+        _target_head.install(
             shell.llm,
             shell._mapping,
             plan.enabled("lm_head_inbox"),
             plan.enabled("vocab_parallel_head"),
-            multimem_gather=multimem,
-            coop_max_rows=plan.param("head_sampler_coop_fold", "MAX_ROWS") if coop else 0,
         )
-        if multimem:
-            # The gather's refusal is agreed over the TP group, so every rank reports alike.
-            plan.installed(
-                "head_multimem_gather", head.multimem is not None, str(head.multimem_refusal)
-            )
         if plan.enabled("wide_split_sampler"):
             _target_head.widen(shell.llm)
     # Last: the arena compaction derives its worker class from whatever class every

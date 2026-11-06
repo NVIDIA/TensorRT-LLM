@@ -43,8 +43,7 @@ shipped library's arithmetic -- as one extension per device architecture
 and source version (``library_name``: ``LIBRARY_NAME``, the arch target and
 ``source_digest``) under torch's extension build root; ``load_library``
 builds it there on first use (torch serializes concurrent builds) and loads
-it. The per-arch name keeps an sm_103a and an sm_107a build apart when both
-share one build root. The digest of the sources and flags keeps builds of
+it. The digest of the sources and flags keeps builds of
 different sources apart: torch rebuilds an extension of an unchanged name only
 when ninja finds a source newer than its object, so two source versions
 mounted at the same path under one build root (a cache seeded from another
@@ -103,8 +102,12 @@ INBOX_ROWS = 8
 FOLD_THREADS = 128
 #: (virtual threads, threads) per CTA of the cooperative kernel A (``fold_plain_coop``,
 #: early trigger) that ``SplitSample`` runs on calls of at most ``coop_max_rows`` rows
-#: (``head_sampler_coop_fold``): every thread of the CTA computes the soft cap, and the
+#: every thread of the CTA computes the soft cap, and the
 #: states are ``fold_plain``'s bit for bit on the 1024-thread virtual block.
+#: With ``verify_pdl=True`` kernel B releases its
+#: dependent right after its wait (``early_trigger``), so the verify fold (``dflash_verify_fold``
+#: with ``pre_wait``) launches under it; the noise gather after the fold launches with PDL too.
+#: Same tokens.
 COOP_FOLD_SHAPE = (32, 512)
 #: A poll waiting longer than this traps: a peer that never published. The trap ends the
 #: CUDA context (where the built-in NCCL all-gather would keep waiting), so any skew between
@@ -119,14 +122,12 @@ _LOADED: Optional[str] = None
 
 
 def arch_target() -> str:
-    """The arch-specific target of the current device: ``103a`` or ``107a``."""
+    """The arch-specific target of the current device: ``103a``."""
     capability = torch.cuda.get_device_capability()
     if capability == (10, 3):
         return "103a"
-    elif capability == (10, 7):
-        return "107a"
     raise RuntimeError(
-        f"the head sampler is built for sm_103a / sm_107a, not sm_{capability[0]}{capability[1]}"
+        f"the head sampler is built for sm_103a, not sm_{capability[0]}{capability[1]}"
     )
 
 
@@ -302,6 +303,7 @@ class SplitSample(OpWrapper):
         states: torch.Tensor,
         pdl: bool = False,
         coop_max_rows: int = 0,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         m, inv, cap = cap_constants(multiplier, soft_cap)
         if logits.shape[0] <= min(coop_max_rows, MAX_ROWS):
@@ -315,7 +317,19 @@ class SplitSample(OpWrapper):
                 logits, temperatures, states, m, inv, cap, FOLD_THREADS, pdl
             )
         return torch.ops.musespark_open_head_sampler.draw(
-            logits, temperatures, top_ks, top_ps, min_ps, seed, offset, states, m, inv, cap, pdl
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            states,
+            m,
+            inv,
+            cap,
+            pdl,
+            verify_pdl and pdl,
         )
 
     def reference(
@@ -332,10 +346,11 @@ class SplitSample(OpWrapper):
         states: torch.Tensor,
         pdl: bool = False,
         coop_max_rows: int = 0,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         """The built-in head: the processor's soft cap, then the shipped fused sampler.
 
-        ``states``, ``pdl`` and ``coop_max_rows`` are ignored.
+        ``states``, ``pdl``, ``coop_max_rows`` and ``verify_pdl`` are ignored.
         """
         capped = reference_capped(logits, multiplier, soft_cap)
         return torch.ops.trtllm.fused_sample_from_logits(
@@ -356,6 +371,7 @@ class SplitSample(OpWrapper):
         states: torch.Tensor,
         pdl: bool = False,
         coop_max_rows: int = 0,
+        verify_pdl: bool = False,
     ) -> None:
         if logits.dtype != torch.bfloat16 or logits.dim() != 2:
             raise ValueError("logits must be BF16 [rows, vocab]")
@@ -418,6 +434,7 @@ class GatherSplitSample(OpWrapper):
         slot_rows: int,
         sample: bool = True,
         pdl: bool = False,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         m, inv, cap = cap_constants(multiplier, soft_cap)
         torch.ops.musespark_open_head_sampler.fold_gather(
@@ -439,7 +456,19 @@ class GatherSplitSample(OpWrapper):
         if not sample:
             return gathered
         return torch.ops.musespark_open_head_sampler.draw(
-            gathered, temperatures, top_ks, top_ps, min_ps, seed, offset, states, m, inv, cap, pdl
+            gathered,
+            temperatures,
+            top_ks,
+            top_ps,
+            min_ps,
+            seed,
+            offset,
+            states,
+            m,
+            inv,
+            cap,
+            pdl,
+            verify_pdl and pdl,
         )
 
     def reference(
@@ -460,11 +489,12 @@ class GatherSplitSample(OpWrapper):
         slot_rows: int,
         sample: bool = True,
         pdl: bool = False,
+        verify_pdl: bool = False,
     ) -> torch.Tensor:
         """The built-in: concatenate the shards in rank order, cap, sample (no inbox side effects).
 
         ``inbox`` must hold the published words (read, not reset); ``gathered``,
-        ``states``, ``status`` and ``pdl`` are ignored.
+        ``states``, ``status``, ``pdl`` and ``verify_pdl`` are ignored.
         """
         rows = gathered.shape[0]
         ranks = gathered.shape[1] // shard
@@ -495,6 +525,7 @@ class GatherSplitSample(OpWrapper):
         slot_rows: int,
         sample: bool = True,
         pdl: bool = False,
+        verify_pdl: bool = False,
     ) -> None:
         if gathered.dtype != torch.bfloat16 or gathered.dim() != 2:
             raise ValueError("gathered must be BF16 [rows, vocab]")
@@ -563,8 +594,8 @@ class HeadGatherWorkspace:
         try:
             if self.shard % 4:
                 raise RuntimeError(f"shard {self.shard} is not a whole number of 4-element vectors")
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the head gather runs on SM103 or SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the head gather runs on SM103 only")
             self.library = load_library()
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
             error = exc
@@ -626,21 +657,6 @@ def shared_gather_workspace(mapping: Mapping, shard: int) -> HeadGatherWorkspace
 #: Fewest rows the vocabulary-parallel head takes (two K=7 verify blocks); 8-row steps keep
 #: the ``lm_head_inbox`` gather.
 VP_MIN_ROWS = 16
-
-
-def configure(*, vp_min_rows: int = 16) -> None:
-    """Set the vocabulary-parallel head's row floor (``vocab_parallel_head``'s MIN_ROWS).
-
-    ``lever_settings.apply`` calls it from the model's plan before any install; 8 takes one
-    K=7 verify block (for a composition that serves no ``lm_head_inbox``), 16 two.
-
-    Raises:
-        ValueError: for a floor other than 8 or 16.
-    """
-    global VP_MIN_ROWS
-    if vp_min_rows not in (8, 16):
-        raise ValueError(f"the vocabulary-parallel head's row floor is 8 or 16, got {vp_min_rows}")
-    VP_MIN_ROWS = vp_min_rows
 
 
 #: Claimants of a row whose crossings the ranks exchange (``kVpClaimants``).
@@ -1036,8 +1052,8 @@ class VocabParallelWorkspace:
         error: Optional[BaseException] = None
         try:
             self.layout = VocabParallelLayout(self.ranks, shard, max_rows)
-            if torch.cuda.get_device_capability(self.device) not in ((10, 3), (10, 7)):
-                raise RuntimeError("the vocabulary-parallel head runs on SM103 or SM107 only")
+            if torch.cuda.get_device_capability(self.device) != (10, 3):
+                raise RuntimeError("the vocabulary-parallel head runs on SM103 only")
             self.library = load_library()
         except Exception as exc:  # noqa: BLE001 - every failure must reach the agreement
             error = exc

@@ -2135,6 +2135,38 @@ class Fp8QuantKernelRunner(TunableRunner):
         return a
 
 
+_FP8_1X128_QUANT_TACTICS = {
+    "cuda": Fp8QuantKernelRunner.TACTIC_CUDA,
+    "triton": Fp8QuantKernelRunner.TACTIC_TRITON,
+}
+# The pinned activation-quant tactic of fp8_swap_ab_gemm; None lets the
+# AutoTuner choose. Set through pin_fp8_1x128_quant_tactic, before warmup.
+_fp8_1x128_quant_tactic_pin: Optional[int] = None
+
+
+def pin_fp8_1x128_quant_tactic(kernel: Optional[str]) -> None:
+    """Pin the activation-quant kernel of every later ``fp8_swap_ab_gemm``.
+
+    ``"cuda"`` (``fp8_quantize_1x128_packed_ue8m0``, the fallback for every M
+    the AutoTuner did not tune) or ``"triton"`` (``triton_fp8_quantize_1x128``);
+    ``None`` restores the AutoTuner's choice. Unpinned, the choice is profiled
+    independently on every rank and only at the tuned M values, and the two
+    kernels are separate implementations of the UE8M0 1x128 quantization that
+    no test here holds bitwise equal, so a pin is what keeps the numerics of a
+    tensor-parallel group the same on every rank and every boot. Process-wide:
+    set it once, before warmup and any graph capture.
+    """
+    global _fp8_1x128_quant_tactic_pin
+    if kernel is None:
+        _fp8_1x128_quant_tactic_pin = None
+        return
+    if kernel not in _FP8_1X128_QUANT_TACTICS:
+        raise ValueError(
+            f"Unknown FP8 1x128 activation-quant kernel {kernel!r}; expected "
+            f"one of {sorted(_FP8_1X128_QUANT_TACTICS)} or None")
+    _fp8_1x128_quant_tactic_pin = _FP8_1X128_QUANT_TACTICS[kernel]
+
+
 class fp8SwapABGemmRunner(TunableRunner):
     """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
@@ -2305,14 +2337,17 @@ def fp8_swap_ab_gemm(
     tuner = AutoTuner.get()
 
     # Step 1: Select best quantization kernel (CUDA vs Triton).
-    # Profiles only _quantize (no GEMM), with empty M-buckets.
-    quant_runner = Fp8QuantKernelRunner()
-    _, quant_tactic = tuner.choose_one(
-        "trtllm::fp8_quant_1x128_tactic",
-        [quant_runner],
-        Fp8QuantKernelRunner.tuning_config,
-        [input],
-    )
+    # Profiles only _quantize (no GEMM), with empty M-buckets. A pinned
+    # kernel (pin_fp8_1x128_quant_tactic) skips the choice at every M.
+    quant_tactic = _fp8_1x128_quant_tactic_pin
+    if quant_tactic is None:
+        quant_runner = Fp8QuantKernelRunner()
+        _, quant_tactic = tuner.choose_one(
+            "trtllm::fp8_quant_1x128_tactic",
+            [quant_runner],
+            Fp8QuantKernelRunner.tuning_config,
+            [input],
+        )
 
     # Step 2: Run quantize + GEMM. Single tactic triggers DeepGemm JIT
     # warmup across M-buckets without re-profiling the quant kernel.

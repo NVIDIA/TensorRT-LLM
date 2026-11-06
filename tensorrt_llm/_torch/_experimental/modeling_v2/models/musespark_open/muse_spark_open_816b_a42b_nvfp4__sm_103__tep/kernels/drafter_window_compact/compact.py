@@ -45,29 +45,41 @@ class WindowCompactDFlashWorker(DFlashWorker):
     """
 
     def _compact_ctx_window(self, slots) -> None:
-        reason = unsupported_reason(
-            self._ctx_k_buf, self._ctx_v_buf, self._ctx_len, self._ctx_base, slots, self._ctx_keep
-        )
-        if reason is not None:
-            logger.warning_once(
-                f"[musespark_open] drafter_window_compact: the arena compaction runs the built-in "
-                f"method ({reason})",
-                key=f"musespark_open.window_compact.builtin_{reason}",
-            )
-            return super()._compact_ctx_window(slots)
-        ctx_window_compact(
-            self._ctx_k_buf,
-            self._ctx_v_buf,
-            self._ctx_len,
-            self._ctx_base,
-            slots,
-            int(self._ctx_keep),
-            LAUNCH_PDL,
-        )
+        if not _compact_in_place(self, slots, "drafter_window_compact"):
+            super()._compact_ctx_window(slots)
 
 
-#: ``WindowCompactDFlashWorker`` combined with another feature's worker class, by that class.
-_COMPOSED_WORKERS: dict[type, type] = {}
+def _compact_in_place(worker, slots, label: str) -> bool:
+    """Run ``ctx_window_compact`` on the worker's arena; False when it does not take the operands."""
+    reason = unsupported_reason(
+        worker._ctx_k_buf,
+        worker._ctx_v_buf,
+        worker._ctx_len,
+        worker._ctx_base,
+        slots,
+        worker._ctx_keep,
+    )
+    if reason is not None:
+        logger.warning_once(
+            f"[musespark_open] {label}: the arena compaction runs the built-in method ({reason})",
+            key=f"musespark_open.{label}.builtin_{reason}",
+        )
+        return False
+    ctx_window_compact(
+        worker._ctx_k_buf,
+        worker._ctx_v_buf,
+        worker._ctx_len,
+        worker._ctx_base,
+        slots,
+        int(worker._ctx_keep),
+        LAUNCH_PDL,
+    )
+    return True
+
+
+#: A compaction class combined with another feature's worker class, by (compaction class,
+#: that class).
+_COMPOSED_WORKERS: dict[tuple, type] = {}
 
 
 def unsupported_worker_reason(spec_worker) -> Optional[str]:
@@ -83,6 +95,37 @@ def unsupported_worker_reason(spec_worker) -> Optional[str]:
     return None
 
 
+def _recompose(spec_worker, compaction: type, label: str, prefix: str) -> bool:
+    """Re-class the worker to run ``compaction``'s ``_compact_ctx_window``; whether it changed.
+
+    Raises:
+        ValueError: when the worker cannot take it (``unsupported_worker_reason``).
+    """
+    if isinstance(spec_worker, compaction):
+        return False
+    reason = unsupported_worker_reason(spec_worker)
+    if reason is not None:
+        raise ValueError(f"[musespark_open] {label} cannot run here: {reason}")
+    cls = type(spec_worker)
+    if cls is DFlashWorker:
+        spec_worker.__class__ = compaction
+    else:
+        composed = _COMPOSED_WORKERS.get((compaction, cls))
+        if composed is None:
+            composed = type(
+                f"{prefix}{cls.__name__}",
+                (compaction, cls),
+                {
+                    "__module__": __name__,
+                    "__doc__": f"``{cls.__qualname__}`` with ``{compaction.__name__}``'s "
+                    "arena compaction.",
+                },
+            )
+            _COMPOSED_WORKERS[(compaction, cls)] = composed
+        spec_worker.__class__ = composed
+    return True
+
+
 def install(spec_worker) -> bool:
     """Re-class the DFlash worker to run ``WindowCompactDFlashWorker``'s compaction.
 
@@ -91,28 +134,10 @@ def install(spec_worker) -> bool:
     Raises:
         ValueError: when the worker cannot take it (``unsupported_worker_reason``).
     """
-    if isinstance(spec_worker, WindowCompactDFlashWorker):
+    if not _recompose(
+        spec_worker, WindowCompactDFlashWorker, "drafter_window_compact", "WindowCompact"
+    ):
         return False
-    reason = unsupported_worker_reason(spec_worker)
-    if reason is not None:
-        raise ValueError(f"[musespark_open] drafter_window_compact cannot run here: {reason}")
-    cls = type(spec_worker)
-    if cls is DFlashWorker:
-        spec_worker.__class__ = WindowCompactDFlashWorker
-    else:
-        composed = _COMPOSED_WORKERS.get(cls)
-        if composed is None:
-            composed = type(
-                f"WindowCompact{cls.__name__}",
-                (WindowCompactDFlashWorker, cls),
-                {
-                    "__module__": __name__,
-                    "__doc__": f"``{cls.__qualname__}`` with ``WindowCompactDFlashWorker``'s "
-                    "arena compaction.",
-                },
-            )
-            _COMPOSED_WORKERS[cls] = composed
-        spec_worker.__class__ = composed
     logger.info(
         "[musespark_open] drafter_window_compact: the windowed drafter arena's per-step compaction "
         f"runs in place in two launches (worker class {type(spec_worker).__name__})"

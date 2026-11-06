@@ -14,7 +14,7 @@ from tensorrt_llm._torch.modules.linear import Linear, UnquantizedLinearMethod
 
 _PACKAGE = (
     "tensorrt_llm._torch._experimental.modeling_v2.models.musespark_open."
-    "muse_spark_open_816b_a42b_nvfp4__sm_103__tep.kernels.context_fp8_dense"
+    "muse_spark_open_816b_a42b_nvfp4__sm_107__tep.kernels.context_fp8_dense"
 )
 
 _ON_RUBIN = (

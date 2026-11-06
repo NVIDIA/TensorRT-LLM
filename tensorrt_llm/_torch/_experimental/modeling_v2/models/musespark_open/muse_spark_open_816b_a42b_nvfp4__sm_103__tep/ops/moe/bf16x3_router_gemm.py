@@ -23,8 +23,7 @@ three BF16 residual terms inside the kernel, then accumulating the three BF16
 MMA results into FP32 TMEM output.
 
 This is the built-in ``cute_dsl_kernels/blackwell/bf16x3_router_gemm.Sm100BF16x3RouterGemm``
-(its source statement for statement), moved into the target together with its pre-wait build
-(``PREWAIT``, the ``tep8_router_prewait`` lever). The built-in module stays as it is for the
+(its source statement for statement), moved into the target. The built-in module stays as it is for the
 built-in ``MUSESPARK_OPEN_BF16X3_ROUTER`` option and its own test; this target's router logits
 (``ops/moe/router_gemm``) compile only this copy. CuTe DSL names a kernel after its module, so
 the compiled kernel's name now carries this module's path; the class name, which the
@@ -35,7 +34,6 @@ helpers moved: the target sums the split-K partials with its own kernel
 """
 
 from functools import cache
-from typing import Optional
 
 import cutlass
 from cuda.bindings.driver import CUstream
@@ -47,43 +45,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell import router_tcgen05 as _tcgen05
 from tensorrt_llm._torch.cute_dsl_kernels.blackwell.cute_ptx_utils import simple_tma_copy
 
-__all__ = ["PREWAIT", "Sm100BF16x3RouterGemm", "configure"]
-
-#: The ``tep8_router_prewait`` lever (``configure(prewait=True)``; the TEP8 router GEMM): builds
-#: the GEMM so that the FP32 router weight -- a parameter, which no kernel of the step writes --
-#: is loaded and split into its three BF16 terms in TMEM before ``griddepcontrol.wait``: the TMA
-#: warp issues the W tile of every stage it can fill before its wait and the activation tiles only
-#: after it (W and X then complete on separate barriers), the prep warps never wait (they read
-#: only shared memory and write TMEM), TMEM is allocated before the warps meet, and the epilogue
-#: waits before its stores. The same tiles, the same decomposition and the same MMA order: the
-#: partials are bit for bit the built-in build's. Read at every ``compile`` (part of its cache
-#: key); off: the vendored kernel unchanged.
-PREWAIT = False
-
-
-def configure(*, prewait: bool = False) -> None:
-    """Set the build ``Sm100BF16x3RouterGemm.compile`` makes by default (``PREWAIT``).
-
-    ``lever_settings.apply`` sets it from the model's plan before any install; the default is
-    the vendored kernel. ``compile`` resolves it before its cache, so a build after this call
-    follows it.
-
-    Args:
-        prewait: the ``tep8_router_prewait`` lever: load and split the FP32 weight before
-            ``griddepcontrol.wait``.
-    """
-    global PREWAIT
-    PREWAIT = bool(prewait)
-    if PREWAIT:
-        try:
-            from tensorrt_llm.logger import logger as _logger
-
-            _logger.info(
-                "[musespark_open] bf16x3_router_gemm: tep8_router_prewait: the router GEMM loads "
-                "and splits its FP32 weight before griddepcontrol.wait"
-            )
-        except Exception:  # noqa: BLE001 - logging only
-            pass
+__all__ = ["Sm100BF16x3RouterGemm"]
 
 
 @dsl_user_op
@@ -138,12 +100,10 @@ def _decompose_fp32x2_to_3xbf16x2(
 
 
 class Sm100BF16x3RouterGemm:
-    def __init__(self, BN: int = 128, prewait: bool = False) -> None:
+    def __init__(self, BN: int = 128) -> None:
         self.cta_tile = (BN, 128, 64)
         self.num_stages = 2
         self.num_warps = 10
-        # The pre-wait weight build (``PREWAIT``, ``configure``).
-        self.prewait = bool(prewait)
 
     @cute.jit
     def _make_tma(self, tensor: cute.Tensor, BM: int, BK: int):
@@ -215,9 +175,6 @@ class Sm100BF16x3RouterGemm:
         w_full_mbar = smem.allocate_array(Int64, num_stages)
         mma_mbar = smem.allocate_array(Int64, 1)
         taddr = smem.allocate(Int32, 4)
-        if cutlass.const_expr(self.prewait):
-            # The pre-wait build: ``tma_full`` completes on the W tile alone, ``x_full`` on the X tile.
-            x_full_mbar = smem.allocate_array(Int64, num_stages)
 
         BAR_TMEM_ALLOC = 1
         BAR_PREP = 2
@@ -236,167 +193,15 @@ class Sm100BF16x3RouterGemm:
                     cute.arch.mbarrier_init(tma_full_mbar + i, 1)
                     cute.arch.mbarrier_init(tma_empty_mbar + i, 1)
                     cute.arch.mbarrier_init(w_full_mbar + i, 128)
-                    if cutlass.const_expr(self.prewait):
-                        cute.arch.mbarrier_init(x_full_mbar + i, 1)
                 cute.arch.mbarrier_init(mma_mbar, 1)
                 cute.arch.mbarrier_init_fence()
-            if cutlass.const_expr(self.prewait):
-                # TMEM before the warps meet (warp 0, which also frees it): the prep warps store W's terms into it
-                # before the wait.
-                _tcgen05.alloc(taddr)
         elif warp_id == 1:
             cpasync.prefetch_descriptor(X_tma.atom)
             cpasync.prefetch_descriptor(W_tma.atom)
         cute.arch.sync_threads()
-        if cutlass.const_expr(not self.prewait):
-            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_wait()
 
-        if cutlass.const_expr(self.prewait):
-            if warp_id == 9:
-                # TMA warp, pre-wait build: W of the first stages before the wait, every X after it.
-                gW_tiles = cute.local_tile(W_tma.tma_tensor, (BM, BK), (bid_m, None))
-                gX_tiles = cute.local_tile(X_tma.tma_tensor, (BN, BK), (bid_n, None))
-                n_tiles = (k_tiles - bid_k + split_k - 1) // split_k
-                n_pre = cutlass.min(n_tiles, num_stages)
-                for i in cutlass.range(n_pre, unroll=1):
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(tma_full_mbar + i, BM * BK * 4)
-                    simple_tma_copy(
-                        W_tma.atom,
-                        gW_tiles[None, None, bid_k + i * split_k],
-                        sW[None, None, i],
-                        tma_full_mbar + i,
-                    )
-                cute.arch.griddepcontrol_wait()
-                for i in cutlass.range(n_tiles, unroll=1):
-                    stage_id = i % num_stages
-                    tile_k = bid_k + i * split_k
-                    if i >= num_stages:
-                        cute.arch.mbarrier_wait(
-                            tma_empty_mbar + stage_id, ((i // num_stages) + 1) % 2
-                        )
-                        with cute.arch.elect_one():
-                            cute.arch.mbarrier_arrive_and_expect_tx(
-                                tma_full_mbar + stage_id, BM * BK * 4
-                            )
-                        simple_tma_copy(
-                            W_tma.atom,
-                            gW_tiles[None, None, tile_k],
-                            sW[None, None, stage_id],
-                            tma_full_mbar + stage_id,
-                        )
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(x_full_mbar + stage_id, BN * BK * 2)
-                    simple_tma_copy(
-                        X_tma.atom,
-                        gX_tiles[None, None, tile_k],
-                        sX[None, None, stage_id],
-                        x_full_mbar + stage_id,
-                    )
-            elif warp_id == 8:
-                # MMA warp, pre-wait build: X and W's terms of each stage, then the built-in MMAs.
-                stage_id = 0
-                parity = 0
-
-                idesc = _tcgen05.make_bf16_idesc(BM, BN)
-                sdesc = _tcgen05.make_sdesc_128B_swizzle(0)
-
-                for tile_k in cutlass.range(bid_k, k_tiles, split_k, unroll=1):
-                    cute.arch.mbarrier_wait(x_full_mbar + stage_id, parity)
-                    cute.arch.mbarrier_wait(w_full_mbar + stage_id, parity)
-                    _tcgen05.fence_after_thread_sync()
-
-                    w_tmem = w_tmem_base + stage_id * (BK // 2 * 3)
-                    x_desc = sdesc | (sX[None, None, stage_id].iterator.toint() >> 4)
-
-                    for k in cutlass.range_constexpr(BK // 16):
-                        enable_d = (tile_k > bid_k) or (k > 0)
-                        _tcgen05.mma_ts_f16(acc_main, w_tmem + k * 8, x_desc, idesc, enable_d)
-                        _tcgen05.mma_ts_f16(acc_res, w_tmem + 32 + k * 8, x_desc, idesc, enable_d)
-                        _tcgen05.mma_ts_f16(acc_res, w_tmem + 64 + k * 8, x_desc, idesc, True)
-                        x_desc += 32 >> 4
-
-                    _tcgen05.commit(tma_empty_mbar + stage_id)
-
-                    stage_id = (stage_id + 1) % self.num_stages
-                    if stage_id == 0:
-                        parity ^= 1
-
-                _tcgen05.commit(mma_mbar)
-            elif warp_id >= 4:
-                # prep warps, pre-wait build: as below (W only; no dependency wait).
-                warp_id_ = warp_id % 4
-
-                stage_id = 0
-                parity = 0
-
-                op = cute.nvgpu.CopyUniversalOp()
-                cp_atom = cute.make_copy_atom(op, Float32, num_bits_per_copy=128)
-
-                row = warp_id_ * 32 + lane_id
-                sW_view = cute.zipped_divide(sW[row, None, None], (4, 1))
-
-                for _ in cutlass.range(bid_k, k_tiles, split_k, unroll=1):
-                    if warp_id_ == 0:
-                        cute.arch.mbarrier_wait(tma_full_mbar + stage_id, parity)
-                    cute.arch.barrier(barrier_id=BAR_PREP, number_of_threads=128)
-
-                    row = warp_id_ * 32 + lane_id
-                    w_tmem = w_tmem_base + stage_id * (BK // 2 * 3)
-                    for kblock in cutlass.range_constexpr(BK // 4):
-                        w0 = cute.make_rmem_tensor(2, Uint32)
-                        w1 = cute.make_rmem_tensor(2, Uint32)
-                        w2 = cute.make_rmem_tensor(2, Uint32)
-
-                        w_tmp = cute.make_rmem_tensor(4, Float32)
-                        cute.copy(cp_atom, sW_view[None, (kblock, stage_id)], w_tmp)
-                        w0[0], w1[0], w2[0] = _decompose_fp32x2_to_3xbf16x2(w_tmp[0], w_tmp[1])
-                        w0[1], w1[1], w2[1] = _decompose_fp32x2_to_3xbf16x2(w_tmp[2], w_tmp[3])
-
-                        tcol = kblock * 2
-                        _tcgen05.st(warp_id_ * 32, w_tmem + 0 + tcol, "32x32b", 2, w0)
-                        _tcgen05.st(warp_id_ * 32, w_tmem + 32 + tcol, "32x32b", 2, w1)
-                        _tcgen05.st(warp_id_ * 32, w_tmem + 64 + tcol, "32x32b", 2, w2)
-
-                    _tcgen05.wait_st()
-                    _tcgen05.fence_before_thread_sync()
-                    cute.arch.mbarrier_arrive(w_full_mbar + stage_id)
-
-                    stage_id = (stage_id + 1) % self.num_stages
-                    if stage_id == 0:
-                        parity ^= 1
-            else:
-                # epilogue warps, pre-wait build: TMEM is allocated; wait for the predecessor before the stores.
-                cute.arch.griddepcontrol_wait()
-                if warp_id == 0:
-                    cute.arch.mbarrier_wait(mma_mbar, 0)
-                cute.arch.barrier(barrier_id=BAR_EPI, number_of_threads=128)
-                _tcgen05.fence_after_thread_sync()
-
-                cute.arch.griddepcontrol_launch_dependents()
-
-                WIDTH = 8
-                for i in cutlass.range_constexpr(BN // WIDTH):
-                    tcol = i * WIDTH
-                    main_regs = cute.make_rmem_tensor(WIDTH, Float32)
-                    res_regs = cute.make_rmem_tensor(WIDTH, Float32)
-                    main_regs.store(_tcgen05.ld(warp_id * 32, tcol, "32x32b", WIDTH))
-                    res_regs.store(_tcgen05.ld(warp_id * 32, BN + tcol, "32x32b", WIDTH))
-                    _tcgen05.wait_ld()
-
-                    for j in cutlass.range(WIDTH, vectorize=True):
-                        main_regs[j] += res_regs[j]
-
-                    w_row_idx = bid_m * BM + tid
-                    for j in cutlass.range_constexpr(WIDTH):
-                        x_row_idx = bid_n * BN + i * WIDTH + j
-                        if x_row_idx < N and w_row_idx < M:
-                            out[bid_k, x_row_idx, w_row_idx] = main_regs[j]
-
-                cute.arch.barrier(barrier_id=BAR_EPI, number_of_threads=128)
-                if warp_id == 0:
-                    _tcgen05.dealloc()
-        elif warp_id == 9:
+        if warp_id == 9:
             # TMA warp
             stage_id = 0
             parity = 1
@@ -541,16 +346,13 @@ class Sm100BF16x3RouterGemm:
                 _tcgen05.dealloc()
 
     @staticmethod
-    def compile(BN: int = 128, K: int = 6144, prewait: Optional[bool] = None):
-        """The compiled GEMM for ``BN``-row tiles over ``K``; ``prewait`` None: ``PREWAIT``.
-
-        The setting is resolved here, before the cache, so the cached build follows it.
-        """
-        return Sm100BF16x3RouterGemm._compile(BN, K, PREWAIT if prewait is None else bool(prewait))
+    def compile(BN: int = 128, K: int = 6144):
+        """The compiled GEMM for ``BN``-row tiles over ``K``."""
+        return Sm100BF16x3RouterGemm._compile(BN, K)
 
     @cache
     @staticmethod
-    def _compile(BN: int, K: int, prewait: bool):
+    def _compile(BN: int, K: int):
         N = cute.sym_int()
         M = cute.sym_int()
         SPLIT_K = cute.sym_int()
@@ -564,5 +366,5 @@ class Sm100BF16x3RouterGemm:
             Float32, (SPLIT_K, N, M), stride_order=(2, 1, 0), assumed_align=4
         )
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        kernel = Sm100BF16x3RouterGemm(BN, prewait)
+        kernel = Sm100BF16x3RouterGemm(BN)
         return cute.compile(kernel, X, W, out, Int32(1), stream, options="--enable-tvm-ffi")

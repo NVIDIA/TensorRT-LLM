@@ -109,6 +109,35 @@ def test_enqueue_request_wraps_lora_load_error():
         worker._enqueue_request(request)
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("env, affinity_first", [(None, False), ("0", False),
+                                                 ("1", True)])
+def test_cpu_affinity_order_around_set_device(monkeypatch, env, affinity_first):
+    import tensorrt_llm.executor.base_worker as base_worker_module
+
+    calls = []
+    if env is None:
+        monkeypatch.delenv("TLLM_WORKER_AFFINITY_BEFORE_CUDA_CONTEXT",
+                           raising=False)
+    else:
+        monkeypatch.setenv("TLLM_WORKER_AFFINITY_BEFORE_CUDA_CONTEXT", env)
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 4)
+    monkeypatch.setattr(torch.cuda, "set_device", lambda d: calls.append(
+        ("set_device", d)))
+    monkeypatch.setattr(base_worker_module, "configure_cpu_affinity",
+                        lambda d: calls.append(("affinity", d)))
+    monkeypatch.setattr(base_worker_module, "global_mpi_rank", lambda: 6)
+    monkeypatch.setattr(base_worker_module, "mpi_comm",
+                        lambda: SimpleNamespace(allgather=lambda v: [v]))
+    worker = object.__new__(BaseWorker)
+    worker.doing_shutdown = False
+    worker.global_rank = 6
+
+    assert worker._get_comm_ranks_device_id() == ([6], [2])
+    expected = [("set_device", 2), ("affinity", 2)]
+    assert calls == (expected[::-1] if affinity_first else expected)
+
+
 def test_lora_request_does_not_probe_filesystem_on_init(tmp_path):
     missing_path = str(tmp_path / "private-lora-path")
 

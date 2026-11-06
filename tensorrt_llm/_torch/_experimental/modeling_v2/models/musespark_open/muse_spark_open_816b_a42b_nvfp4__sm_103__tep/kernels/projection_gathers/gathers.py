@@ -88,34 +88,6 @@ from ...ops.comm import pool_gather_fp4quant as _pool
 from ...ops.comm import unpool_gather_boundary as _unpool
 from ...ops.comm.projection_inbox import MAX_ROWS, WIDE_ROWS, ProjectionInbox
 
-#: ``tep8_wide_pool_gather`` (``configure``): at TP8, decode steps of 9..32 rows hand the pool slice
-#: on ungathered too and gather it inside the pre-expert quantization on a 32-row inbox
-#: (``install``).
-TEP8_WIDE_POOL_GATHER = False
-#: ``tep8_wide_unpool_gather`` (``configure``): at TP8, decode steps of 9..32 rows hand the unpool
-#: slice on ungathered too and gather it inside the post-FFN boundary on a 32-row inbox
-#: (``install``).
-TEP8_WIDE_UNPOOL_GATHER = False
-
-
-def configure(
-    *, tep8_wide_pool_gather: bool = False, tep8_wide_unpool_gather: bool = False
-) -> None:
-    """Set the TP8 9..32-row gathers ``install`` builds (``tep8_wide_projection_gathers``).
-
-    ``lever_settings.apply`` sets them from the model's plan before any install. With the defaults
-    a TP8 decode step of 9..32 rows keeps the built-in replicated projections.
-
-    Args:
-        tep8_wide_pool_gather: the TP8 pool site also defers 9..32-row slices to the pre-expert
-            quantization's gather (``TEP8_WIDE_POOL_GATHER``).
-        tep8_wide_unpool_gather: the TP8 unpool site also defers 9..32-row slices to the post-FFN
-            boundary's gather (``TEP8_WIDE_UNPOOL_GATHER``).
-    """
-    global TEP8_WIDE_POOL_GATHER, TEP8_WIDE_UNPOOL_GATHER
-    TEP8_WIDE_POOL_GATHER = bool(tep8_wide_pool_gather)
-    TEP8_WIDE_UNPOOL_GATHER = bool(tep8_wide_unpool_gather)
-
 
 def fused_rows(owner) -> int:
     """The most rows a call of ``owner`` (a re-classed MoE or post-FFN join) may fuse: 32 while
@@ -143,21 +115,12 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
     """The built-in MoE, whose pool and unpool may hand their slices on ungathered.
 
     ``_defer_max_rows``: the most rows whose slices are handed on ungathered;
-    ``MAX_ROWS``, or ``WIDE_MAX_ROWS`` once ``wide_prologue`` gave the layer's consumers
-    wide inboxes (``kernels/wide_prologue``).
     """
 
     _defer_unpool: bool
     _defer_pool: bool
     _pool_inbox: Optional[ProjectionInbox]
     _defer_max_rows: int = MAX_ROWS
-    #: The pool's own bound where it exceeds ``_defer_max_rows`` (``TEP8_WIDE_POOL_GATHER``: TP8
-    #: defers the pool slices of 9..32-row calls, whatever the unpool's bound); None:
-    #: ``_defer_max_rows``.
-    _defer_max_rows_pool: Optional[int] = None
-    #: The unpool's own bound (``TEP8_WIDE_UNPOOL_GATHER``: TP8 9..32-row slices joined by the
-    #: boundary's gather on a 32-row inbox); None: ``_defer_max_rows``.
-    _defer_max_rows_unpool: Optional[int] = None
     #: ``wide_projection_gathers``: its arming (``WideProjections``) and the pool site's
     #: 32-row inbox; None without the path.
     _wide = None
@@ -187,11 +150,7 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
             or not 0
             < hidden_states.shape[0]
             <= max(
-                self._defer_max_rows_pool
-                if (module is self.pooler and self._defer_max_rows_pool is not None)
-                else self._defer_max_rows_unpool
-                if (module is self.unpooler and self._defer_max_rows_unpool is not None)
-                else self._defer_max_rows,
+                self._defer_max_rows,
                 fused_rows(self),
             )
             or not hidden_states.is_contiguous()
@@ -248,8 +207,8 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
     def _pool_quant_args(self, pooled: torch.Tensor, max_rows: Optional[int] = None):
         """(gain, global scale) exactly when the built-in would quantize the gathered row
         with flashinfer's fused ``rmsnorm_fp4quant``, on a call of at most ``max_rows`` rows
-        (the inbox the caller's fused op uses: ``moe_prologue``'s 8-row or ``wide_prologue``'s
-        wide one); ``None`` otherwise. Without ``max_rows``, on this class's own inboxes: the
+        (the inbox the caller's fused op uses: ``moe_prologue``'s 8-row one); ``None`` otherwise.
+        Without ``max_rows``, on this class's own inboxes: the
         8-row one up to 8 rows, ``wide_projection_gathers``' 32-row one above while it is
         armed (``fused_rows``).
 
@@ -266,7 +225,7 @@ class MuseSparkOpenTepGatherMoE(MuseSparkOpenMoE):
         rows = pooled.shape[0]
         if max_rows is None:
             inbox = self._pool_inbox if rows <= MAX_ROWS else self._wide_pool_inbox
-            max_rows = max(fused_rows(self), self._defer_max_rows_pool or 0)
+            max_rows = fused_rows(self)
         else:
             inbox = self._pool_inbox
         if (
@@ -310,12 +269,9 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
     ``_capture_fold`` (set by ``capture_fold`` for one call) is a
     DFlash capture view the fused kernel also writes ``updated.to(bfloat16)``
     into; ``_capture_stored`` records that it did. Unset, the join is the plain fused gather join.
-    ``_gather_inbox_wide`` (``wide_prologue``) is the TP4 wide inbox the join takes for
-    9..32-row calls; ``None`` leaves those to the built-in gather.
     """
 
     _gather_inbox: Optional[ProjectionInbox]
-    _gather_inbox_wide: Optional[ProjectionInbox] = None
     _gather: Optional[object]
     #: ``wide_projection_gathers``: its arming and the unpool site's 32-row inbox; None
     #: without the path.
@@ -406,13 +362,10 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
 
     def _inbox_for(self, residual: torch.Tensor) -> Optional[ProjectionInbox]:
         """The inbox a call of ``residual``'s row count takes: the 8-row one up to 8 rows,
-        the wide one above (``wide_prologue``'s when installed, else
-        ``wide_projection_gathers``'). Reads only the shape."""
+        the wide one above (``wide_projection_gathers``'). Reads only the shape."""
         rows = residual.shape[0] if residual.dim() == 2 else 0
         if rows <= MAX_ROWS:
             return self._gather_inbox
-        if self._gather_inbox_wide is not None:
-            return self._gather_inbox_wide
         return self._wide_gather_inbox
 
     def _fits_fused(self, residual, branch, next_norm, gain, alpha, beta, inbox=None) -> bool:
@@ -432,11 +385,9 @@ class MuseSparkOpenTepGatedResidual(MuseSparkOpenGatedResidual):
         rows = residual.shape[0] if residual.dim() == 2 else 0
         if inbox is None:
             inbox = self._inbox_for(residual)
-        # wide_prologue's inbox bounds its own calls; otherwise wide_projection_gathers'
-        # arming bounds them too (``fused_rows``).
+        # wide_projection_gathers' arming bounds the calls too (``fused_rows``).
         most = _unpool.max_rows(inbox) if inbox is not None else 0
-        if self._gather_inbox_wide is None:
-            most = min(fused_rows(self), most)
+        most = min(fused_rows(self), most)
         if not (
             inbox is not None
             and self._fused_enabled
@@ -551,8 +502,7 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
         if moe._pool_gather_workspace is None or moe._unpool_gather_workspace is None:
             raise ValueError(
                 "[musespark_open] projection_gathers fuses the sharded projections' gathers; it needs "
-                "MUSESPARK_OPEN_SHARDED_PROJECTIONS=1 (TP8/EP8 or single-node TP4/EP4; on "
-                "sm107 with MUSESPARK_OPEN_SM107_FUSED_KERNELS=1)"
+                "MUSESPARK_OPEN_SHARDED_PROJECTIONS=1 (TP8/EP8 or single-node TP4/EP4)"
             )
         for module, classes in (
             (layer, (MuseSparkOpenDecoderLayer,)),
@@ -578,22 +528,6 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
     pool_inbox = (
         ProjectionInbox(mapping, row_words=_pool.local_columns(world) // 2) if pool else None
     )
-    # TEP8_WIDE_POOL_GATHER: at TP8, decode steps of 9..32 rows hand the pool slice on ungathered
-    # too and gather it inside the pre-expert quantization on a 32-row inbox (the kernel takes TP8
-    # and 32-row slots).
-    wide_pool_inbox = (
-        ProjectionInbox(mapping, row_words=_pool.local_columns(world) // 2, max_rows=WIDE_ROWS)
-        if pool and world == 8 and TEP8_WIDE_POOL_GATHER
-        else None
-    )
-    # TEP8_WIDE_UNPOOL_GATHER: the unpool site on 9..32-row steps too, its slice gathered inside the
-    # post-FFN boundary on a 32-row inbox (the boundary's four CTAs a row each span two TP8 slices,
-    # which ops/comm/unpool_gather_boundary takes).
-    wide_unpool_inbox = (
-        ProjectionInbox(mapping, row_words=_unpool.local_columns(world) // 2, max_rows=WIDE_ROWS)
-        if unpool and world == 8 and TEP8_WIDE_UNPOOL_GATHER
-        else None
-    )
     for layer in layers:
         layer.__class__ = MuseSparkOpenTepDecoderLayer
         moe = layer.feed_forward
@@ -601,15 +535,9 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
         moe._defer_unpool = False
         moe._defer_pool = False
         moe._pool_inbox = pool_inbox
-        if wide_pool_inbox is not None:
-            moe._wide_pool_inbox = wide_pool_inbox
-            moe._defer_max_rows_pool = WIDE_ROWS
         layer.add_ffn.__class__ = MuseSparkOpenTepGatedResidual
         layer.add_ffn._gather_inbox = unpool_inbox
         layer.add_ffn._gather = moe._unpool_gather_workspace
-        if wide_unpool_inbox is not None:
-            layer.add_ffn._gather_inbox_wide = wide_unpool_inbox
-            moe._defer_max_rows_unpool = WIDE_ROWS
     sites = [
         name
         for name, on in (
@@ -621,16 +549,6 @@ def install(model: MuseSparkOpenModel, *, unpool: bool, pool: bool) -> dict:
     logger.info(
         f"[musespark_open] projection_gathers: TP{world} sharded-projection gathers fused on the "
         f"decode path ({'; '.join(sites)}), steps of at most {MAX_ROWS} rows"
-        + (
-            f"; the pool site also on 9..{WIDE_ROWS}-row steps (32-row inbox)"
-            if wide_pool_inbox is not None
-            else ""
-        )
-        + (
-            f"; the unpool site also on 9..{WIDE_ROWS}-row steps (32-row inbox)"
-            if wide_unpool_inbox is not None
-            else ""
-        )
     )
     layer_kwargs = {}
     if unpool:

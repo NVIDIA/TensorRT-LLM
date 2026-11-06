@@ -13,9 +13,7 @@ the built-in ``router_logits`` runs the TF32x3 ``_router_tensorcore_kernel`` at
 ``install`` re-classes every layer's MoE with ``RouterGemmMoE`` in front of the
 class it has (whatever the other MoE fast paths made it) and returns one
 ``RouterGemmCall`` that the model keeps. ``DecodeTarget`` arms it for the forward
-of a decode step of ``min_rows..MAX_ROWS`` rows (``min_rows`` is ``MIN_ROWS``, or
-``WIDE_PROLOGUE_MIN_ROWS`` where ``wide_prologue`` serves the 16..32-row steps'
-router as its own shard, bit for bit the built-in tensor-core router's); while it is armed, a
+of a decode step of ``min_rows..MAX_ROWS`` rows (``min_rows`` is ``MIN_ROWS``); while it is armed, a
 ``router_logits`` call of contiguous BF16 rows over the FP32 ``[256, 8192]``
 weight runs ``ops/moe/router_gemm``. Every other call -- unarmed (steps with
 context rows, which ``PrefillTarget`` runs, and decode steps of at most 8 or more
@@ -41,51 +39,11 @@ from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenMoE
 from tensorrt_llm.logger import logger
 
 from ...ops.moe import router_gemm as _op
-from ...ops.moe import router_shard as _shard
 
-#: The router push (``ops/moe/router_push``, the ``tep8_router_push`` lever), imported on the
-#: first served call (``_router_push_module``), never at import. Importing it at module level
-#: changed a TP4 context engine's first tokens (6/256 near-ties, deterministic) although no TP4
-#: call reaches it; here the import sits behind the served call, so a process whose router GEMM
-#: never serves a call (every TP4 context worker, TEP4 decode below 33 rows) never imports it.
-_router_push = None
-#: Step A: the routing memo's version guard, as the routing method reads it (imported on the
-#: routed branch's first call).
-_version_or_none = None
-
-
-def _router_push_module():
-    """The router push module, imported on the first call; its own ``armed()`` decides whether it runs."""
-    global _router_push
-    if _router_push is None:
-        from ...ops.moe import router_push as _push
-
-        _router_push = _push
-    return _router_push
-
-
-def _routing_version_guard():
-    """``modeling_musespark_open._version_or_none``, imported on first use."""
-    global _version_or_none
-    if _version_or_none is None:
-        try:
-            from tensorrt_llm._torch.models.modeling_musespark_open import _version_or_none as _v
-        except ImportError:  # pragma: no cover
-            return None
-        _version_or_none = _v
-    return _version_or_none
-
-
-#: The device capabilities the op and this path are validated on: GB300 (sm_103) and
-#: R200 (sm_107).
-VALIDATED_CAPABILITIES = frozenset({(10, 3), (10, 7)})
+#: The device capabilities the op and this path are validated on: GB300 (sm_103).
+VALIDATED_CAPABILITIES = frozenset({(10, 3)})
 #: The fewest rows the path takes by default: the op's.
 MIN_ROWS = _op.MIN_ROWS
-#: The fewest rows the path takes where ``wide_prologue`` serves 16..32-row decode steps:
-#: there each rank computes its own router columns with the built-in tensor-core router's
-#: bits (``ops/moe/router_shard.router_shard_wide``) and never calls ``router_logits``, so
-#: the op starts at five requests (33 rows at K=7).
-WIDE_PROLOGUE_MIN_ROWS = _shard.WIDE_MAX_ROWS + 1
 
 
 class RouterGemmCall:
@@ -165,47 +123,6 @@ class RouterGemmMoE:
             served = takes(hidden_states, weight)
             call.report(hidden_states, served)
             if served:
-                if _router_push_module() is not None and _router_push.armed():
-                    # This rank's router columns and their multicast all-gather in one kernel
-                    # (ops/moe/router_push.py, TP8 under the tep8_router_push lever); None -> the
-                    # op below.
-                    route_armed = getattr(_router_push, "route_armed", None)
-                    if (
-                        route_armed is not None
-                        and route_armed()
-                        and _routing_version_guard() is not None
-                    ):
-                        # Step A: the push also writes the routing method's selection and weights
-                        # (_full_routing_kernel's bits); the memo then serves this layer's
-                        # routing_method.apply calls, as the 8-row prologue's
-                        # _prologue_record_routing does. (out, None, None): apply computes.
-                        routing = getattr(getattr(self, "experts", None), "routing_method", None)
-                        res = _router_push.logits_routed(
-                            getattr(self, "mapping", None),
-                            hidden_states,
-                            weight,
-                            self.metap_multiplier,
-                            routing,
-                        )
-                        if res is not None:
-                            out, selected, weights = res
-                            if selected is not None:
-                                routing._routing_memo = (
-                                    out,
-                                    _version_or_none(out),
-                                    selected,
-                                    weights,
-                                )
-                            return out
-                    else:
-                        out = _router_push.logits(
-                            getattr(self, "mapping", None),
-                            hidden_states,
-                            weight,
-                            self.metap_multiplier,
-                        )
-                        if out is not None:
-                            return out
                 return _op.router_gemm(hidden_states, weight, self.metap_multiplier)
         return super().router_logits(hidden_states)
 
@@ -216,9 +133,11 @@ def _router_gemm_class(base: type) -> type:
     return type(f"{base.__name__}RouterGemm", (RouterGemmMoE, base), {})
 
 
-def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmCall:
+def install(
+    model: torch.nn.Module, min_rows: int = _op.MIN_ROWS, staged_epilogue: Optional[str] = None
+) -> RouterGemmCall:
     """Re-class every layer's MoE with ``RouterGemmMoE`` in front; returns the call to arm
-    on decode steps of ``min_rows..MAX_ROWS`` rows.
+    on decode steps of ``min_rows..MAX_ROWS`` rows. ``staged_epilogue`` is ignored.
 
     Every layer is checked before any is re-classed; a layer already carrying the
     mixin is re-pointed at the returned call.
@@ -231,9 +150,7 @@ def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmC
         not torch.cuda.is_available()
         or tuple(torch.cuda.get_device_capability()) not in VALIDATED_CAPABILITIES
     ):
-        raise ValueError(
-            "[musespark_open] the router_gemm kernel is validated on sm_103 and sm_107 only"
-        )
+        raise ValueError("[musespark_open] the router_gemm kernel is validated on sm_103 only")
     layers = list(model.layers)
     wrong = [
         layer.layer_idx for layer in layers if not isinstance(layer.feed_forward, MuseSparkOpenMoE)
@@ -251,7 +168,7 @@ def install(model: torch.nn.Module, min_rows: int = _op.MIN_ROWS) -> RouterGemmC
     logger.info(
         f"[musespark_open] router_gemm: router logits of decode steps of {min_rows}.."
         f"{_op.MAX_ROWS} rows on the BF16x3 split-K GEMM (one CTA per SM, K splits = SMs // "
-        f"(2 x 128-row tiles)) in {len(layers)} MoE layers; other steps keep the built-in "
-        "router"
+        f"(2 x 128-row tiles)"
+        + f") in {len(layers)} MoE layers; other steps keep the built-in router"
     )
     return call
