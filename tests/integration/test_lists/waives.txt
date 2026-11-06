@@ -56,7 +56,6 @@ examples/visual_gen/test_visual_gen_cosmos3.py::test_cosmos3_t2i_4step_example S
 examples/visual_gen/test_visual_gen_flux.py::test_flux_accuracy_against_golden[flux2-nvfp4] SKIP (https://nvbugs/6572800)
 examples/visual_gen/test_visual_gen_hunyuan.py::test_hunyuan_t2v_lpips_against_golden SKIP (https://nvbugs/7028056)
 examples/visual_gen/test_visual_gen_ltx2.py::test_ltx2_feature_accuracy_against_golden[nvfp4] SKIP (https://nvbugs/6572800)
-examples/visual_gen/test_visual_gen_multi_gpu.py::test_minimax_h3_ulysses_parallel_vae_lpips[2-2-VANILLA] SKIP (https://nvbugs/6907083)
 examples/visual_gen/test_visual_gen_wan.py::test_fastwan_lpips_against_golden SKIP (https://nvbugs/6572800)
 full:A10/unittest/scripts SKIP (https://nvbugs/6929768)
 full:A100/accuracy/test_llm_api_pytorch_multimodal.py::TestExaone4_5_33B::test_auto_dtype[forced_chunked_prefill] SKIP (https://nvbugs/6597570)
