@@ -7,7 +7,7 @@ import itertools
 import math
 import os
 from dataclasses import replace
-from typing import ClassVar, List, Optional, Tuple, Type
+from typing import ClassVar, Dict, List, Optional, Tuple, Type
 
 import torch
 
@@ -183,6 +183,58 @@ def _validate_16_byte_aligned_dense_tensor(tensor: torch.Tensor,
                 "16-byte alignment, got "
                 f"shape={tuple(tensor.shape)} and stride={tuple(tensor.stride())}."
             )
+
+
+def _validate_mxfp8_fused_fc12_op_inputs(
+    aligned: Dict[str, torch.Tensor],
+    dense: Dict[str, torch.Tensor],
+    input: torch.Tensor,
+    fc1_weight: torch.Tensor,
+    output: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    top_k: int,
+    hidden_alignment: int,
+) -> None:
+    """Reject what an MXFP8 fused FC12 kernel would silently misread.
+
+    The kernel wrappers build dense row-major layouts from each tensor's
+    ``data_ptr()`` and assume 16-byte alignment for the FP8, scale-factor and
+    output operands, so a strided view or a misaligned slice would scatter
+    into the wrong rows or fault instead of failing. ``aligned`` maps argument
+    names to those operands, ``dense`` to the other tensors handed to the
+    kernel. Only the base pointer must be aligned: the weight scales are a
+    128x4-swizzled buffer whose ``[L, N, K/32]`` view can have rows of any
+    byte width.
+    """
+    for name, tensor in {**aligned, **dense}.items():
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous, got strides "
+                             f"{tuple(tensor.stride())}")
+    for name, tensor in aligned.items():
+        if tensor.data_ptr() % 16 != 0:
+            raise ValueError(
+                f"{name} data pointer must be 16-byte aligned, got "
+                f"data_ptr={tensor.data_ptr()}.")
+    if input.dim() != 2 or output.dim() != 2:
+        raise ValueError("input and output must be 2-D [tokens, hidden], got "
+                         f"{tuple(input.shape)} and {tuple(output.shape)}")
+    hidden = input.size(1)
+    if hidden % hidden_alignment != 0:
+        raise ValueError(f"hidden size {hidden} must be a multiple of "
+                         f"{hidden_alignment}")
+    if fc1_weight.dim() != 3 or fc1_weight.size(2) != hidden:
+        raise ValueError(
+            f"fc1_weight must be [experts, 2 * intermediate, {hidden}], got "
+            f"{tuple(fc1_weight.shape)}")
+    if output.dtype != torch.bfloat16 or output.size(1) != hidden:
+        raise ValueError(f"output must be bfloat16 [tokens, {hidden}], got "
+                         f"{output.dtype} {tuple(output.shape)}")
+    if (token_final_scales.dtype != torch.float32
+            or token_final_scales.shape != (output.size(0), top_k)):
+        raise ValueError("token_final_scales must be float32 "
+                         f"[{output.size(0)}, {top_k}], got "
+                         f"{token_final_scales.dtype} "
+                         f"{tuple(token_final_scales.shape)}")
 
 
 def _canonicalize_swiglu_limit_scalar(swiglu_limit_scalar: float) -> float:
@@ -19304,6 +19356,34 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 tuner_key: str,
                 zero_output: bool = False,
             ) -> None:
+                _validate_mxfp8_fused_fc12_op_inputs(
+                    {
+                        "input": input,
+                        "input_scale": input_scale,
+                        "fc1_weight": fc1_weight,
+                        "fc1_weight_scale": fc1_weight_scale,
+                        "fc2_weight": fc2_weight,
+                        "fc2_weight_scale": fc2_weight_scale,
+                        "output": output,
+                    },
+                    {
+                        "fc1_alpha": fc1_alpha,
+                        "fc2_alpha": fc2_alpha,
+                        "fc1_norm_const": fc1_norm_const,
+                        "tile_idx_to_group_idx": tile_idx_to_group_idx,
+                        "tile_idx_to_mn_limit": tile_idx_to_mn_limit,
+                        "permuted_idx_to_expanded_idx":
+                        permuted_idx_to_expanded_idx,
+                        "num_non_exiting_tiles": num_non_exiting_tiles,
+                        "token_final_scales": token_final_scales,
+                    },
+                    input,
+                    fc1_weight,
+                    output,
+                    token_final_scales,
+                    top_k,
+                    Sm107Mxfp8FusedFc12MoeRunner.fc1_k_alignment,
+                )
                 tuner = AutoTuner.get()
                 runner = Sm107Mxfp8FusedFc12MoeRunner(
                     num_experts,
@@ -19385,6 +19465,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 expected [orig_m, K/32] shape and is never read or modified.
                 E4M3 input requires populated linear UE8M0 scales.
                 A negative ``swiglu_limit`` disables the SwiGLU clamp.
+
+                Raises:
+                    ValueError: if a tensor is not contiguous, an FP8, scale
+                        or output tensor is not 16-byte aligned, or the input,
+                        FC1 weight, output or routing-scale shapes disagree.
                 """
                 _run_mxfp8_fused_fc12_moe_rubin(
                     input, fc1_weight, input_scale, fc1_weight_scale, fc1_alpha,
