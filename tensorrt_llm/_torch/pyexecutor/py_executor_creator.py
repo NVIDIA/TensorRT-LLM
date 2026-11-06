@@ -43,6 +43,8 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 if TYPE_CHECKING:
     from tensorrt_llm.executor.ipc import IpcQueue
 
+    from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
+
 from ..attention.backends.interface import AttentionRuntimeFeatures
 from ..attention.backends.utils import get_attention_backend
 from ..distributed import Distributed
@@ -67,6 +69,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .scheduled_encoder_executor import ScheduledEncoderExecutor
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -453,6 +456,50 @@ def _check_no_kv_execution(llm_args: TorchLlmArgs, mapping: Mapping,
             "max_num_tokens are rejected.")
 
 
+def _check_scheduled_encoder_support(llm_args: TorchLlmArgs,
+                                     mapping: Mapping) -> None:
+    """Reject the settings ScheduledEncoderExecutor cannot serve a non-generation model with."""
+    _check_no_kv_execution(llm_args, mapping, is_generation=False)
+    if mapping.cp_size > 1:
+        raise ValueError(
+            "Context parallelism is not supported for non-generation models; "
+            "set context_parallel_size=1.")
+    checks = (
+        ("lora_config", llm_args.lora_config is not None),
+        ("speculative_config", llm_args.speculative_config is not None),
+        ("cache_transceiver_config",
+         is_disagg_enabled(llm_args.cache_transceiver_config)),
+        ("kv_connector_config", llm_args.kv_connector_config is not None),
+        ("dwdp_config", llm_args.dwdp_config is not None),
+        ("moe_config.load_balancer", llm_args.moe_config.load_balancer
+         is not None),
+        ("enable_resource_governor", llm_args.enable_resource_governor),
+        ("sleep_config", llm_args.sleep_config is not None),
+        ("orchestrator_type='ray'", llm_args.orchestrator_type == "ray"),
+    )
+    settings = [name for name, used in checks if used]
+    if settings:
+        raise ValueError(
+            f"Non-generation models do not support {', '.join(settings)}; "
+            "remove these settings.")
+
+
+def _create_scheduled_encoder_executor(
+        llm_args: TorchLlmArgs, checkpoint_dir: Optional[str],
+        checkpoint_loader: "BaseCheckpointLoader") -> ScheduledEncoderExecutor:
+    mapping = _get_mapping(llm_args.parallel_config.to_mapping())
+    _check_scheduled_encoder_support(llm_args, mapping)
+    executor = ScheduledEncoderExecutor.create(
+        llm_args,
+        model_path=checkpoint_dir,
+        checkpoint_loader=checkpoint_loader,
+        mapping=mapping,
+        dist=Distributed.get(mapping),
+    )
+    executor.start_worker()
+    return executor
+
+
 def _get_mapping(_mapping: Mapping) -> Mapping:
     if _mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
@@ -520,9 +567,9 @@ def _load_config_and_create_checkpoint_loader(
         load_format=llm_args.load_format,
         partial_model_loading=llm_args.is_partial_model_loading,
     )
-    llm_args = ModelLoader.load_config_and_apply_defaults(
+    llm_args, config = ModelLoader.load_config_with_defaults(
         checkpoint_dir, llm_args, checkpoint_loader)
-    return llm_args, checkpoint_loader
+    return llm_args, checkpoint_loader, config.is_generation
 
 
 def create_encoder_executor(
@@ -545,7 +592,7 @@ def create_encoder_executor(
     """
     from .encoder_executor import EncoderExecutor
 
-    llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+    llm_args, checkpoint_loader, _ = _load_config_and_create_checkpoint_loader(
         llm_args, checkpoint_dir)
 
     mapping = _get_mapping(llm_args.parallel_config.to_mapping())
@@ -589,7 +636,7 @@ def _create_py_executor_impl(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue: "Optional[IpcQueue]" = None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor instance from the given LLM arguments.
 
     Loads model configuration, applies model-specific defaults, constructs the
@@ -633,15 +680,19 @@ def _create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create and initialize a PyExecutor while recording scoped metrics."""
     initial_model_engine_metrics: dict[str, float | dict[str, float]] = {}
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     with timing_metric("config_and_checkpoint_loader_initialization_seconds",
                        creation_metrics):
-        llm_args, checkpoint_loader = _load_config_and_create_checkpoint_loader(
+        llm_args, checkpoint_loader, is_generation = _load_config_and_create_checkpoint_loader(
             llm_args, checkpoint_dir)
+
+    if not llm_args.mm_encoder_only and not is_generation:
+        return _create_scheduled_encoder_executor(llm_args, checkpoint_dir,
+                                                  checkpoint_loader)
 
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
@@ -1512,7 +1563,7 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
     resource_governor_queue=None,
-) -> PyExecutor:
+) -> PyExecutor | ScheduledEncoderExecutor:
     """Create a PyExecutor and roll back a partially initialized DWDP runtime.
 
     On an error, a DWDP manager and a dense DWDP manager registered during the

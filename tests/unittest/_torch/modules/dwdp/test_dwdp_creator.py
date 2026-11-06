@@ -277,7 +277,7 @@ def _create(
         create_py_executor_instance=create_py_executor_instance,
         create_py_executor_resources=create_py_executor_resources,
         ModelEngine=model_engine,
-        _load_config_and_create_checkpoint_loader=lambda llm_args, _dir: (llm_args, None),
+        _load_config_and_create_checkpoint_loader=lambda llm_args, _dir: (llm_args, None, True),
         _get_mapping=lambda _: Mapping(),
         dwdp_global_rank=lambda: 0,
         get_calibrator=_DummyCalibrator,
