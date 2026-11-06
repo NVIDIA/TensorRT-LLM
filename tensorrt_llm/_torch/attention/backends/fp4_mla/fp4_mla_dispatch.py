@@ -47,10 +47,10 @@ small-batch rules, Helix / softmax-stats / packed-V requirements, split-mode bou
 may run, and the two-stream planner (``fp4_mla_twostream``) decides whether handing the last requests to the 2x
 kernel on a concurrent stream drops a whole 4x wave.
 
-KV length used for the decision: ``live_max_kv`` when the caller knows the step's real longest KV (eager mode
-narrows the page-table capacity to it; a graph runner that keys its graphs by KV regime can pass the regime
-ceiling through ``Fp4MlaState.kv_regime_max_kv``), otherwise the page-table capacity.  The kernels themselves are
-always compiled and planned for the capacity.
+KV length used for the decision: ``live_max_kv``, the ceiling of the KV regime a CUDA graph runner keys its decode
+graphs by (``set_decode_kv_regime`` on the graph's attention metadata stores it in ``Fp4MlaState.kv_regime_max_kv``),
+an upper bound of the step's longest live KV; without one, eager steps included, the page-table capacity.  The
+kernels themselves are always compiled and planned for the capacity.
 
 Environment:
 ``TRTLLM_FP4_MLA_CUTEDSL_4X``       master switch (default off): 0 -> always ``2x``.
@@ -96,7 +96,7 @@ class DecodeStrategy(NamedTuple):
     r2: int  # requests on the 2x arm when path == twostream, else 0
     reason: str
     kv_len_decision: int  # KV length the decision was taken on
-    kv_source: str  # "live" | "capacity" | "forced"
+    kv_source: str  # "live" (live_max_kv, a KV regime ceiling) | "capacity" | "forced"
     plan: Optional[TwoStreamPlan]
 
     @property
@@ -296,7 +296,9 @@ def choose_decode_strategy(
 
     ``envelope_reason`` is ``fp4_mla_cutedsl_4x_host.envelope_reason_static`` (injected so this module stays
     importable without the kernel host); it is always evaluated on the page-table capacity, the geometry the
-    kernels are compiled for.
+    kernels are compiled for.  ``live_max_kv`` is an upper bound of the call's longest KV (the KV regime ceiling of
+    a regime-keyed CUDA graph) that the floor and the two-stream plan are taken on instead of the capacity; None
+    keeps the capacity.
     """
     forced = _env_path()
     kv_source = "capacity"
