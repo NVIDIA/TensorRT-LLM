@@ -70,10 +70,17 @@ section below exists to prevent one of them:
    2. real end-to-end activation on every claimed model family, and the
       claimed compatibility combinations;
    3. end-to-end performance;
-   4. automated regression tests.
+   4. automated regression tests: small functional pytest checks (the path
+      runs, bookkeeping matches exactly, unsupported combinations are
+      rejected, the feature activated, exact operations are byte-exact,
+      layout invariants hold) and a few integration smoke tests that only
+      prove activation.
 
-   Unit tests protect what these stages established; they do not replace
-   them. Each stage is its own deliverable, with its own evidence.
+   Stages 1 to 3 are local real runs, and so are the encode/decode
+   round-trip accuracy and the end-to-end accuracy and performance checks
+   that the guide lists under stage 4. Write their commands and results in
+   the PR description, not in pytest. Each stage is its own deliverable,
+   with its own evidence.
 8. **User-facing surface.** Docs, an example, manifest and schema
    regeneration for config changes, API-stability references.
 
@@ -91,8 +98,9 @@ Write the gate before editing:
 - Owner placement: <responsibility -> owner-map row>
 - Compatibility table: <axis -> supported / rejected (where) / n/a>
 - Per-step cost and expected benefit: <...>; baselines: <...>
-- Validation plan: <accuracy contract / end-to-end activation and
-  compatibility / end-to-end performance / regression tests>
+- Validation plan: <local real runs, reported in the PR description:
+  accuracy contract / end-to-end activation and compatibility / end-to-end
+  performance; regression tests: functional pytest / activation smoke tests>
 - Names: <the full name of each new concept, used unchanged in code,
   tests, docs, and the PR>
 - Docs and config artifacts to update: <...>
@@ -315,6 +323,8 @@ behind them are in `lessons-learned.md`.
   - the flow;
   - a short module table;
   - one quantified result;
+  - the commands and results of the local lossy-numeric, accuracy,
+    end-to-end, and performance runs;
   - explicit scope limits.
 
   Keep claims conservative and precise; unvalidated paths are called

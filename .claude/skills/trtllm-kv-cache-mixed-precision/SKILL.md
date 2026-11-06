@@ -266,7 +266,11 @@ KV cache, and a KV cache in the model dtype:
   window, disaggregated export, drafters, DSA page table. Requires Blackwell.
 - `tests/unittest/_torch/attention/test_mixed_precision_backends.py`:
   conversion, the mixed-precision staging copy, CUDA-graph lengths, drafters,
-  public options, validation.
+  public options, validation. Its conversion test compares bytes only
+  (layout, addressing, exact decoding). After changing the conversion
+  kernels, check the NVFP4 encode/decode round trip for every high-precision
+  dtype locally on real KV cache data, and write the commands and results in
+  the PR description.
 - The mixed-precision cases in
   `tests/unittest/_torch/pyexecutor/kv_cache/test_mamba_cache_manager.py`,
   `test_kvcm2_integration.py`, and `test_dflash_unified_kv_gate.py`, and
@@ -314,5 +318,6 @@ Extend the general design gate in
 - Reuse impact: <effect on reusable depth; reuse policy of the mixed-precision high layer group unchanged? why>
 - CUDA graphs and the overlap scheduler: <static buffers, lengths re-synced, fast paths>
 - Per-step cost and memory: <...>
-- Tests: <files and stages; Blackwell availability>
+- Tests: <pytest files and stages; Blackwell availability>
+- Local runs (round trip, accuracy, end to end): <commands and results, for the PR description>
 ```

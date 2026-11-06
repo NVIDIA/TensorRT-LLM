@@ -283,11 +283,14 @@ read the category you are working in before starting.
 
 ## 5. Testing
 
-- **Unit tests are functional.** Pytest checks three things:
+- **Unit tests are functional.** Pytest checks five things:
   - configurations start and run;
   - bookkeeping matches exactly (pages, lengths, layer ids, which layers take
     the feature);
-  - unsupported configurations are rejected.
+  - unsupported configurations are rejected;
+  - outputs are byte-exact where the operation is meant to be exact;
+  - layouts and invariants hold (spans, scale groups, byte-exact lossless
+    parts, identical re-encode where the format promises it).
 
   Kernel-numeric references with tolerances, accuracy thresholds, and
   model-quality checks stay out of unit tests, and GPU tests stay few. Check
@@ -394,6 +397,8 @@ read the category you are working in before starting.
   - Use the title format.
   - Give the purpose and the benefit, one quantified result, and the scope
     limits.
+  - Write the commands and results of the local lossy-numeric, accuracy,
+    end-to-end, and performance runs.
   - Leave out stale status notes and internal links.
   - Integrate new text into the existing description instead of appending an
     "Updates" section.

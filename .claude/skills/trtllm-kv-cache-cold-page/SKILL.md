@@ -33,7 +33,8 @@ and staging buffer.
 The contracts live in:
 - `docs/source/developer-guide/kv-cache-compression-development.md`, sections
   "Storage-bound methods", "Which numbers of a K or V vector become NVFP4",
-  and "Validation";
+  and "Validation" (check its encode/decode round-trip accuracy item
+  locally on real KV cache data, not in pytest or gtests);
 - `docs/source/developer-guide/kv-cache-cold-page-codec.md`: the native
   cold-page codec application binary interface (ABI), the memory contract,
   the migration transaction, and the initialization order.
@@ -229,6 +230,12 @@ adapter:
      unit-test fixture so CI builds and runs it.
    - Add Python tests for cold-page codec state, layouts, admission, and
      activation.
+   - In both, test lossy kernels through the layout contract in "Numerics
+     Pitfalls Seen Before", never with a tolerance against a hand-written
+     numeric reference. Measure the encode/decode round-trip accuracy for
+     every supported runtime dtype, and any drift over repeated round trips,
+     locally on real KV cache data, and write the commands and results in
+     the PR description.
 
 ## Enabling a Model for RoPE-Preserving Cold Pages
 
@@ -318,12 +325,14 @@ and quantize whole vectors. To add a model:
     drifts on every round trip.
   - Design it so that re-encoding a decoded page reproduces the same codes,
     or measure and document the drift.
-  - Test several round trips, not one, locally on real KV cache data, and
-    write the results in the PR description.
+  - Test several round trips, not one. Where the cold-page format promises
+    it, check in pytest or the kernel gtest that re-encoding a decoded page
+    reproduces the same codes. Measure any drift locally on real KV cache
+    data, and write the commands and results in the PR description.
 - **Hand-written reference implementations can be wrong**, for example by
   grouping dimensions in a different order than the kernel. Test the layout
-  contract instead: spans, scale groups, byte-exact lossless parts,
-  round-trip stability.
+  contract instead: spans, scale groups, byte-exact lossless parts, and the
+  same codes on re-encode where the cold-page format promises it.
 - **Global scales.** Identity by default. With `scale_checkpoint_path`,
   per-layer K/V scales come from an NVFP4 ModelOpt checkpoint, and are loaded
   and validated at initialization.
@@ -368,7 +377,8 @@ and quantize whole vectors. To add a model:
 - Layout verified on the real cache layout for each enabled model: <models>
 - Unsupported layouts and combinations rejected with actionable errors: <where>
 - Lossy cold-page codec declared without adding a method name to KV cache manager V2: <how / not applicable>
-- Repeated round-trip stability tested: <test>
+- Same codes on re-encode tested, where the cold-page format promises it: <test / not promised>
+- Encode/decode round-trip accuracy for every supported runtime dtype, and drift over repeated round trips, measured locally on real KV cache data: <commands and results in the PR description>
 - Reuse of onboarded pages covered in accuracy evaluation: <yes/no>
 - Host and Disk paths, failure rollback, non-default streams tested: <tests>
 - Activation shown for compressed life cycles, not only byte counters: <how>

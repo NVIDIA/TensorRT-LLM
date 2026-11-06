@@ -109,8 +109,11 @@ prepared batch, a request whose protected tail spans a page boundary.
 - **Stable addresses.** CUDA-graph-captured attention metadata reads the
   published cached-token counts. Update those counts through the existing
   preparation path; do not add new captured tensors.
-- **Overlap scheduler.** Run every test with the overlap scheduler on and
-  off. When output diverges only with the overlap scheduler on, check both
+- **Overlap scheduler.** Compare outputs end to end with the overlap
+  scheduler on and off, locally on real runs, and write the commands and
+  results in the PR description. In pytest, the section 2 boundary test for
+  a request in the prepared batch covers the overlap-scheduler ordering.
+  When output diverges only with the overlap scheduler on, check both
   kinds of ordering. A missing dependency between GPU streams disappears
   under a full device synchronization; fix it with an event that the
   consumer stream waits on, as TriAttention makes the KV cache manager V2

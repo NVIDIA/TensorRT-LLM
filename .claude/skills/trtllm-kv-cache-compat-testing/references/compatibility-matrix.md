@@ -21,6 +21,14 @@ catches it, and the evidence a reviewer should ask for. Check the general
 combination table in `docs/source/features/feature-combination-matrix.md`
 first; it may already constrain the feature.
 
+Keep pytest small, with few GPU tests. The smallest tests below that compare
+model outputs end to end (feature on vs off, CUDA graphs, the overlap
+scheduler, parallelism, disaggregated serving, speculative decoding, model
+families, GPU architectures) are checked locally on real runs; write their
+commands and results in the PR description. Bookkeeping, rejection,
+activation, byte-exact, and layout checks stay in pytest; see "What Belongs
+in pytest" in `../SKILL.md`.
+
 ## Reuse Axes
 
 ### Block reuse (full-block prefix reuse)
@@ -38,7 +46,10 @@ first; it may already constrain the feature.
   1. The reused-token count is what the design predicts. Check it; a hit rate
      that silently drops to zero passes every output check.
   2. The output matches the run without reuse. Compare token for token for
-     lossless features; for lossy features, use the documented contract.
+     lossless features; for lossy features, use the documented accuracy
+     contract, measured with `trtllm-kv-cache-accuracy-eval`
+     (`../../trtllm-kv-cache-accuracy-eval/SKILL.md`). Check this locally on
+     real runs and write the commands and results in the PR description.
   3. Reusing a prefix that was itself compressed, restored, or partly evicted
      behaves as designed.
 - **Evidence**: per-request reuse counters for both arms (the configurations
@@ -328,14 +339,16 @@ first; it may already constrain the feature.
   - a kernel built or tuned for one architecture family fails, is skipped,
     or produces different numerics on another;
   - shared-memory limits and supported data types differ between families;
-  - a test registered on one GPU stage leaves the other families untested.
+  - a feature validated on only one GPU family is untested on the others.
 - **Smallest test**: run the end-to-end path on each architecture the
   feature claims: Hopper (SM90: H100, H200), datacenter Blackwell (SM100:
   B200, GB200; SM103: B300, GB300), and workstation Blackwell (SM120) where
   supported. Reject the others at configuration time.
-- **Evidence**: tests registered in the test list of each claimed GPU, such
-  as `l0_h100.yml`, `l0_b200.yml`, `l0_b300.yml`, `l0_gb200_multi_gpus.yml`,
-  and `l0_gb300.yml`, and an end-to-end run per architecture.
+- **Evidence**: a local end-to-end run on each claimed architecture, with the
+  commands and results in the PR description. CI does not need a copy per
+  architecture: register the feature's few GPU tests on a stage that has the
+  right GPU, such as `l0_h100.yml`, `l0_b200.yml`, `l0_b300.yml`,
+  `l0_gb200_multi_gpus.yml`, or `l0_gb300.yml`.
 
 ## Feature-Off Invariance
 

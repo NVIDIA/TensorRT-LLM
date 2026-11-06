@@ -80,8 +80,8 @@ one.
 7. Write few, strong tests: each one runs the real path and fails if the
    method breaks. Never edit, skip, or loosen a test to make it pass; fix
    the code, or stop and report the conflict. Keep pytest small, with few
-   GPU tests; check lossy numerics and end-to-end behavior locally, and write
-   the commands and results in the PR description.
+   GPU tests; check lossy numerics and end-to-end behavior locally on real
+   runs, and write the commands and results in the PR description.
 8. Decide and test every compatibility axis, including block reuse, CUDA
    graphs, the overlap scheduler, disaggregated serving, speculative
    decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`),
@@ -135,6 +135,12 @@ Paths are relative to this file.
 
 When the guide and the code disagree, the code and tests win. Name the
 mismatch, and fix the guide in the same change or report it.
+
+One deliberate difference: the guide's "Turn validated behavior into
+regression gates" lists "encode/decode round-trip accuracy for every
+supported runtime dtype" and "aligned end-to-end accuracy and performance
+checks" as automated tests. Under hard rule 7, check both locally on real
+runs instead, and write the commands and results in the PR description.
 
 ## How to Use It
 
@@ -376,7 +382,8 @@ Extend the general design gate in
 - Protected tokens (prompt, sinks, tails, next prepared batch): <...>
 - changes_physical_kv_length: <value; accepted costs: no generation-block reuse,
   no steady fast paths, no RoPE fusion>
-- Capabilities: block reuse <T/F + test>; speculative modes <list + test>
+- Capabilities: block reuse <T/F>; speculative modes <list>; evidence for each:
+  <pytest check | local run in the PR description>
 - Explicit rejections added: <combination -> check>
 - Reused KV cache compression framework parts: <compaction, lifecycle hooks, cold-page codec adapter>
 - Estimation-pass behavior: <built | skipped; why; test>

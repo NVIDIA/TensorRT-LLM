@@ -62,9 +62,12 @@ Run the TensorRT-LLM arms through the repository's evaluation entry point
 instead of writing a new harness: `trtllm-eval` (`tensorrt_llm/evaluate/`),
 with every arm using the same configuration file apart from the feature's own
 keys. The accuracy test infrastructure and reference scores live under
-`tests/integration/defs/accuracy/`. When a benchmark's official protocol needs
-its own harness, run that harness against a TensorRT-LLM server, and keep the
-harness identical across arms.
+`tests/integration/defs/accuracy/`. Do not add an accuracy test or a
+reference score for the feature there or anywhere else in pytest: run the
+arms locally on real runs, and write the commands and results in the PR
+description. When a benchmark's official protocol needs its own harness, run
+that harness against a TensorRT-LLM server, and keep the harness identical
+across arms.
 
 Align in stages, each run through the TensorRT-LLM path (not another
 library):

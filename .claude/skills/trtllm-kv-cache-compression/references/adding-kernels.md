@@ -103,18 +103,22 @@ compilation cost.
 
 ## 5. Test It
 
-1. **Standalone, during development.** Compare against a CPU reference
-   implementation. Use byte-exact comparisons where the operation is exact,
-   and invariants where it is lossy: spans, scale groups, lossless parts,
-   round-trip stability. Cover non-contiguous, partial, and large batches,
-   and non-default streams. Keep only small, fast checks of this kind in
-   pytest; run the lossy numeric checks locally and write their results in
-   the PR description.
+1. **Standalone, during development.** Compare exact operations byte for
+   byte with a CPU reference implementation. Test lossy operations through
+   invariants, not a numeric reference: spans, scale groups, byte-exact
+   lossless parts, and identical re-encode where the format promises it.
+   Cover non-contiguous, partial, and large batches, and non-default
+   streams. Keep only small, fast checks of this kind in pytest. Check lossy
+   kernel numerics, such as the encode/decode round-trip accuracy for every
+   supported runtime dtype, locally on real runs, and write the commands and
+   results in the PR description.
 2. **C++ gtest.** For C++ kernels, register it with `add_tllm_gtest(<name>
    OWNER ... SOURCES ... LINK_LIBRARIES ... LABELS "unit;kernels;...;gpu")` in
    `cpp/tests/unit_tests/kernels/CMakeLists.txt`. Make sure a CI stage runs
    the binary: some integration fixtures build and run only named binaries,
-   and must be extended.
+   and must be extended. Limit the gtest to the checks item 1 keeps in
+   pytest; never compare lossy outputs against a hand-written numeric
+   reference with a tolerance.
 3. **Python tests.** Add them under the feature's test directory, and register
    new files in the test-db. Keep them small, with few GPU tests.
 4. **In the pipeline.** Run under CUDA graphs and the overlap scheduler, with
@@ -136,4 +140,6 @@ compilation cost.
   supported sizes. Keep a large-size regression test.
 - New C++ tests existed but no CI stage ran them.
 - A reference implementation in a test was wrong, while the kernel was
-  bit-correct. Prefer invariants over tolerance-based references.
+  bit-correct. Keep tolerance-based comparisons against hand-written
+  references out of pytest and gtests: test invariants there, and check
+  lossy kernel numerics locally on real runs.

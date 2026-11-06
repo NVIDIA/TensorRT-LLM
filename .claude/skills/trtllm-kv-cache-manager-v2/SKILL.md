@@ -75,8 +75,8 @@ the result correct and reviewable. `references/engineering-rules.md` and
 7. Write few, strong tests: each one runs the real path and fails if the
    feature breaks. Never edit, skip, or loosen a test to make it pass; fix
    the code, or stop and report the conflict. Keep pytest small, with few
-   GPU tests; check lossy numerics and end-to-end behavior locally, and write
-   the commands and results in the PR description.
+   GPU tests; check lossy numerics and end-to-end behavior locally on real
+   runs, and write the commands and results in the PR description.
 8. Decide and test every compatibility axis, including block reuse, CUDA
    graphs, the overlap scheduler, disaggregated serving, speculative
    decoding, and parallelism (`../trtllm-kv-cache-compat-testing/SKILL.md`),
@@ -336,9 +336,11 @@ most often:
   `TRTLLM_KV_FRESH_PAGE_FILL=nan` and `TRTLLM_KV_GUARD_PAGE` to catch reads of
   pages that were never written.
 - **Pressure.** After any change to capacity, history, resize, suspend, or
-  resume, run a high-pressure serving test with the overlap scheduler on, in
-  which requests are suspended as eviction victims. Assert that no tail page
-  entry is `-1`.
+  resume, run a high-pressure serving workload locally with the overlap
+  scheduler on, in which requests are suspended as eviction victims. Check
+  that no tail page entry is `-1`, and write the command and result in the
+  PR description. In pytest, cover the same invariant with a small
+  manager-level test of resize, suspend, and resume at a page boundary.
 - Then run the feature-level gates in `trtllm-kv-cache-compat-testing`
   (`../trtllm-kv-cache-compat-testing/SKILL.md`).
 

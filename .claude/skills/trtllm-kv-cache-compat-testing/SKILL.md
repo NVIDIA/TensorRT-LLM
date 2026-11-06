@@ -94,8 +94,8 @@ Rules for the decision:
 |---|---|---|
 | CPU configuration and admission | Parsing, defaults, serialization, rejection of unsupported combinations with the right error | `tests/unittest/llmapi/`, the feature's CPU tests |
 | KV cache manager and bookkeeping | Pools, page counts, lengths, reuse counts, hook cadence, state release, item by item | `tests/unittest/_torch/pyexecutor/kv_cache/`, `tests/unittest/kv_cache_manager_v2_tests/` |
-| Kernels and data movement | Byte-exact movement and compaction; layout of cold-page codecs and conversions (spans, scale groups, lossless parts); non-contiguous, partial and large batches. Lossy numerics are checked locally and reported in the PR description | `tests/unittest/_torch/kv_cache_compression/`, C++ unit tests |
-| Small end-to-end smoke | The production executor runs with the feature, activation is proven, and the claimed combinations run | The feature's integration tests |
+| Kernels and data movement | Byte-exact movement and compaction; layout of cold-page codecs and mixed-precision KV cache conversions (spans, scale groups, lossless parts); non-contiguous, partial and large batches. Lossy kernel numerics are checked locally and reported in the PR description | `tests/unittest/_torch/kv_cache_compression/`, C++ unit tests |
+| Small end-to-end smoke | The production executor runs with the feature and activation is proven. Claimed combinations are checked locally on real runs (the end-to-end gate in Step 3), with the commands and results in the PR description | A few integration tests |
 | Accuracy | Model-quality contract | Separate evaluation with `trtllm-kv-cache-accuracy-eval` (`../trtllm-kv-cache-accuracy-eval/SKILL.md`), not pytest |
 | Performance | Throughput and latency contract | Separate measurement with `perf-kv-cache-tuning` (`../perf-kv-cache-tuning/SKILL.md`), not pytest |
 
@@ -118,16 +118,17 @@ Rules for the decision:
   grouping quantization dimensions in a different order. Such a test fails on
   some hardware while the kernel is bit-correct. Test lossy paths through
   invariants instead:
-  - the round trip is stable;
   - lossless spans are byte-exact;
   - scale geometry is right;
-  - repeated encode/decode is idempotent where the format promises it.
+  - the round trip is stable: re-encoding a decoded page reproduces the same
+    bytes where the format promises it.
 
-  Keep pytest small and cheap, with few GPU tests. Check lossy kernel
-  numerics, such as the encode/decode round trip for every supported runtime
-  dtype that the compression development guide asks for, and end-to-end
-  behavior locally on real runs. Write the commands and results in the PR
-  description.
+  Keep pytest small, with few GPU tests; check lossy kernel numerics, such as
+  the encode/decode round-trip accuracy for every supported runtime dtype,
+  and end-to-end behavior locally on real runs, and write the commands and
+  results in the PR description. The KV cache compression development guide
+  lists that round-trip accuracy check among its automated tests; run it
+  locally instead.
 - **Mocks**: a bare `MagicMock` attribute is truthy, so gates like
   `if getattr(cfg, "feature", None):` pass on mocks and hide the real branch.
   Use real configuration objects or `spec`'d mocks.
@@ -199,7 +200,7 @@ owner decide. Do not fold it into the feature.
 ## Compatibility review
 - Compatibility table present and complete: <yes/no>
 - Unsupported combinations rejected in the validator with clear errors: <list>
-- Claimed combinations each have a test: <axis -> test>
+- Claimed combinations each have evidence: <axis -> test | local run>
 - Activation asserted (not just config parsed): <how>
 - New tests registered in test-db: <stage/file>
 - Neighbor suites run: <list>; skipped: <list + reason>
@@ -214,4 +215,8 @@ owner decide. Do not fold it into the feature.
 - `docs/source/features/feature-combination-matrix.md`: the user-facing
   combination table.
 - `docs/source/developer-guide/kv-cache-compression-development.md`
-  ("Validation"): the test lists for compression methods.
+  ("Validation"): the KV cache compression development guide's validation
+  stages and test lists for compression methods. Two of its test-list items
+  run locally, not in pytest, with the commands and results in the PR
+  description: "encode/decode round-trip accuracy for every supported runtime
+  dtype" and "aligned end-to-end accuracy and performance checks".

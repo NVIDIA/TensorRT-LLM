@@ -145,9 +145,12 @@ The low-precision format is chosen by the dtype name `mixed_<low>_<high>`.
    overlay, not the low-precision codec.
 5. **Tests.** Round-trip invariants of the low-precision codec, paged
    conversion with non-contiguous pages, CUDA-graph replay with changing
-   lengths, and the manager's pool-size checks. Then evaluate accuracy
-   against the FP8 KV cache and against a KV cache entirely in the
-   low-precision format.
+   lengths, and the manager's pool-size checks. Then, locally, check the
+   codec's encode/decode round-trip error for every supported
+   high-precision dtype on real KV cache data, and evaluate accuracy on real
+   runs against the FP8 KV cache and against a KV cache entirely in the
+   low-precision format. Write the commands and results in the PR
+   description; pytest keeps only the checks above.
 
 ## Recipe: A New KV Cache Manager or Model Family
 
@@ -177,14 +180,16 @@ recomputation is the other option. The steps are:
 3. Fill unselected mixed-precision high pages before attention reads them:
    decode them from the mixed-precision low pool, or recompute them. Show
    that this is correct on the TRTLLM, FlashInfer, and sparse attention
-   backends, under CUDA graphs and the overlap scheduler.
+   backends, under CUDA graphs and the overlap scheduler, in local real runs.
 4. Check that disaggregated transfer reads `reuse_status` correctly.
 5. Test match length and selection behavior in
-   `tests/unittest/kv_cache_manager_v2_tests/`, and the end-to-end reused
-   depth in the mixed-precision tests.
-6. Measure accuracy with forced reuse, and the per-request reused depth,
-   against the `REQUIRED` baseline. Keep the baseline configuration
-   unchanged.
+   `tests/unittest/kv_cache_manager_v2_tests/`, and the reused depth at
+   manager level in
+   `tests/unittest/_torch/pyexecutor/kv_cache/test_mixed_precision_kv_cache.py`.
+6. Measure accuracy with forced reuse, and the per-request reused depth end
+   to end, against the `REQUIRED` baseline, in local real runs. Keep the
+   baseline configuration unchanged. Write the commands and results of
+   steps 3 and 6 in the PR description.
 
 A **new** C++ reuse policy is a change to the KV cache manager V2 native
 core. Follow the high-risk rules of the KV cache manager V2 C++ guide
