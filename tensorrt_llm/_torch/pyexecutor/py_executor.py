@@ -658,6 +658,25 @@ class _ExecutorExecutionConfig:
     transfer_budget_is_explicit: bool = False
 
 
+def _register_batched_logits_processor(llm_args, model_engine) -> None:
+    """Hand LLM(batched_logits_processor=...) to the model engine.
+
+    The engine's logits post-processor walk calls it once per step, for the
+    requests that opted in with SamplingParams.apply_batched_logits_processor.
+    Raises at construction when the engine has no such walk, rather than serve
+    requests that asked for processing nothing would run.
+    """
+    batched_logits_processor = llm_args.batched_logits_processor
+    if batched_logits_processor is None:
+        return
+    if not hasattr(model_engine, "register_batched_logits_processor"):
+        raise ValueError(
+            "LLM(batched_logits_processor=...) is not supported by "
+            f"{type(model_engine).__name__}: it has no logits "
+            "post-processor walk to call it from.")
+    model_engine.register_batched_logits_processor(batched_logits_processor)
+
+
 class PyExecutor:
     # True while the overlap loop runs with the execution stream current
     # (_overlap_loop_stream_scope).
@@ -928,6 +947,7 @@ class PyExecutor:
                                   if model_engine.is_spec_decode else 0)
         self.llm_args = self.model_engine.llm_args
         self._kv_connector_config = self.llm_args.kv_connector_config
+        _register_batched_logits_processor(self.llm_args, model_engine)
         self.max_stats_len = self.llm_args.max_stats_len
         self.max_num_tokens = self.llm_args.max_num_tokens
         self.print_log = self.llm_args.print_iter_log
