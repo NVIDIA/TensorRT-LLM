@@ -43,7 +43,7 @@ from ..infra.compute.scheduler import (
 )
 from ..infra.git import git_checked
 from .harness import index_writer
-from .harness.bench import resolve_config
+from .harness.bench import AGENTX_SCORE, resolve_config
 from .records import PARTS_FILE, Measurement, PerfLedger
 
 
@@ -82,6 +82,9 @@ def validate_measurement(
             config,
         ):
             raise ValueError("serving measurement workload/config does not match")
+        recorded = client_identity(meta.get("client"), meta.get("agentx"), meta.get("agentx_score"))
+        if recorded != bench.client(name):
+            raise ValueError("serving measurement was taken with another client or AgentX setting")
         if not meta.get("hostname") or set(part.points) != set(concurrencies):
             raise ValueError("serving measurement lacks host or concurrency coverage")
         for row in part.points.values():
@@ -109,15 +112,55 @@ def evidence_key(bench: "BenchSpec", configs: Sequence[Path]) -> str:
         "workloads": workloads,
         "constraints": {p.name: dict(p.constraint) for p in bench.parts},
     }
+    clients = {p.name: bench.client(p.name) for p in bench.parts if p.client != "random"}
+    if clients:
+        # Only then: the inputs of a campaign that replays no traces keep their identity.
+        payload["clients"] = clients
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()[
         :16
     ]
+
+
+def part_keys(bench: "BenchSpec", configs: Sequence[Path]) -> dict[str, str]:
+    """:func:`evidence_key` per perf config: what that config's runs of a measurement measured.
+
+    Keyed by the config's name (``""`` for a campaign of one workload).
+    """
+    keys = {}
+    for name, (isl, osl, con, paths) in bench.workloads(configs).items():
+        part = next((p for p in bench.parts if p.name == name), None)
+        payload = {
+            "model": bench.model,
+            "environment": bench.env_script,
+            "extra_args": list(bench.extra_args),
+            "workload": [isl, osl, list(con), resolve_config(list(paths), [])],
+            "constraint": dict(part.constraint) if part else {},
+            "client": bench.client(name),
+        }
+        digest = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode())
+        keys[name] = digest.hexdigest()[:16]
+    return keys
 
 
 def archive_evidence(path: Path) -> None:
     """Preserve stale results without leaving their deterministic label reusable."""
     if path.exists():
         path.rename(path.with_name(f"{path.name}.stale-{time.time_ns()}"))
+
+
+def archive_parts(path: Path, parts: Sequence[str]) -> None:
+    """Set aside ``parts`` of the measurement under ``path`` and its join; keep its other runs.
+
+    The next measurement of the label runs only what is missing, reusing each run left that
+    still matches (:meth:`MeasurementRunner._run_reusable`), and joins them again.
+    """
+    if not path.is_dir():
+        return
+    # meta.json first: it marks the joined measurement complete.
+    for name in ("meta.json", PARTS_FILE, "summary.json"):
+        (path / name).unlink(missing_ok=True)
+    for part in parts:
+        archive_evidence(path / part)
 
 
 def measurement_hosts(m: Measurement) -> dict[str, str]:
@@ -139,7 +182,17 @@ UNMEASURED_RCS = INFRA_RCS | {RC_REFUSED, RC_MIXED_CHECKOUT, RC_WALL_LIMIT}
 
 
 class MeasurementUnavailable(RuntimeError):
-    """Measurement infrastructure stopped; the campaign checkpoint remains resumable."""
+    """Measurement infrastructure stopped; the campaign checkpoint remains resumable.
+
+    ``transient``: waiting can bring it back (a job to finish, a session to come back, a run
+    that ended without a verdict), so the stage waits it out in process. Each such cause says so
+    where it is raised; any other (the tested source conflicts with the keeps, a baseline that
+    failed, a cause no one has judged yet) ends the stage without a verdict at once.
+    """
+
+    def __init__(self, *args: object, transient: bool = False) -> None:
+        super().__init__(*args)
+        self.transient = transient
 
 
 def unmeasured(rc: int, record: Mapping[str, Any]) -> bool:
@@ -233,6 +286,25 @@ def receipt_rc(path: Path) -> int | None:
         return None
 
 
+#: AgentX settings that say where the client caches its corpus, not what it measures.
+AGENTX_LOCATION_KEYS = frozenset({"hf_home"})
+
+
+def client_identity(
+    client: str | None, agentx: Mapping[str, Any] | None, score: str | None = None
+) -> tuple[str, dict]:
+    """A measurement's client and the AgentX settings that shape its load (``meta.json``'s).
+
+    An AgentX measurement's also holds how its points were scored (``score``: ``meta.json``'s
+    ``agentx_score``, :data:`~.harness.bench.AGENTX_SCORE` for the campaign's own), so one
+    scored otherwise is measured again rather than compared.
+    """
+    settings = {k: v for k, v in (agentx or {}).items() if k not in AGENTX_LOCATION_KEYS}
+    if (client or "random") == "agentx":
+        settings["score"] = score
+    return client or "random", settings
+
+
 @dataclass(frozen=True)
 class BenchPart:
     """One perf config of a campaign over several: its workload and its own base configs."""
@@ -243,6 +315,10 @@ class BenchPart:
     concurrencies: Sequence[int]
     configs: Sequence[Path]
     constraint: Mapping[str, float] = field(default_factory=dict)
+    #: The load each point runs: ``random`` (benchmark_serving) or ``agentx`` (trace replay,
+    #: ``agentx`` its settings with their defaults; ISL/OSL then only describe it).
+    client: str = "random"
+    agentx: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -310,6 +386,13 @@ class BenchSpec:
         )
         return command + " && " + merge_command
 
+    def client(self, part: str) -> tuple[str, dict]:
+        """``part``'s :func:`client_identity`: what its measurements must have recorded."""
+        for entry in self.parts:
+            if entry.name == part:
+                return client_identity(entry.client, entry.agentx, AGENTX_SCORE)
+        return client_identity(None, None)
+
     def runs(self, label: str) -> list[Run]:
         """``label``'s runs: one per perf config, or the label itself over one config."""
         return [Run(label, part.name) for part in self.parts] or [Run(label)]
@@ -333,6 +416,7 @@ class BenchSpec:
                     isl,
                     osl,
                     concurrencies,
+                    next((p for p in self.parts if p.name == run.part), None),
                 )
             )
         return f"source {shlex.quote(self.env_script)}\n" + " && \\\n".join(steps)
@@ -345,6 +429,7 @@ class BenchSpec:
         isl: int,
         osl: int,
         concurrencies: Sequence[int],
+        part: BenchPart | None = None,
     ) -> str:
         argv = [
             "python",
@@ -366,6 +451,13 @@ class BenchSpec:
             self.tree,
             "--force",
         ]
+        if part is not None and part.client != "random":
+            argv += [
+                "--client",
+                part.client,
+                "--agentx",
+                json.dumps(dict(part.agentx), sort_keys=True),
+            ]
         argv += list(self.extra_args)
         line = " ".join(shlex.quote(a) for a in argv)
         return line
@@ -434,11 +526,17 @@ class SpoolRunner:
 
     A whole-node measurement goes to a session with nothing of ours in flight, an idle node first
     (:meth:`free_spools`); the keep gate's jobs share sessions by device count (:meth:`place`).
-    ``earlier`` names the prefixes earlier attempts of the same work queued under.
+    ``earlier`` names the prefixes earlier attempts of the same work queued under. Once a job has
+    been polled for ``spoolctl.WAIT_NOTE_S``, and then at most that often, :meth:`poll` says
+    every such job to ``note`` (:func:`spoolctl.waiting_line`).
     """
 
     def __init__(
-        self, spools: Sequence[str], prefix: str = "tune", earlier: Sequence[str] = ()
+        self,
+        spools: Sequence[str],
+        prefix: str = "tune",
+        earlier: Sequence[str] = (),
+        note: Callable[[str], None] | None = None,
     ) -> None:
         self.spools = list(spools)
         self.prefix = prefix
@@ -453,6 +551,10 @@ class SpoolRunner:
         self.held: dict[str, int] = {}
         #: The last finished job of each label: label -> (spool, job), for :meth:`output`.
         self.finished: dict[str, tuple[str, str]] = {}
+        self.note = note
+        #: When :meth:`poll` first saw each job in flight, and when it last said a long wait.
+        self._since: dict[str, float] = {}
+        self._noted = 0.0
 
     def queued(self, label: str) -> bool:
         """A job of ``label`` is in flight: queued by this process, or adopted."""
@@ -636,6 +738,14 @@ class SpoolRunner:
                 self.held.pop(name, None)
                 self.finished[label] = (spool, name)
                 done.append((label, spool, rc))
+        now = time.time()
+        self._since = {name: self._since.get(name, now) for name in self.inflight}
+        due = [n for n, since in self._since.items() if now - since >= spoolctl.WAIT_NOTE_S]
+        if self.note is not None and due and now - self._noted >= spoolctl.WAIT_NOTE_S:
+            lines = [spoolctl.waiting_line(self.inflight[n][0], n, now) for n in due]
+            if any(lines):
+                self.note("; ".join(line for line in lines if line))
+                self._noted = now
         return done
 
 
@@ -662,6 +772,10 @@ def _differs(path: Path, bench: BenchSpec, configs: Sequence[Path], tree: str | 
         for key, want in (("isl", isl), ("osl", osl), ("concurrencies", list(concurrencies))):
             if key in meta and meta[key] != want:
                 return f"was measured at {key} {meta[key]}, not {want}"
+        client, agentx = bench.client(name)
+        recorded = client_identity(meta.get("client"), meta.get("agentx"), meta.get("agentx_score"))
+        if recorded != (client, agentx):
+            return f"was measured with another client than {client} {agentx or ''}".rstrip()
         if "config" in meta:
             try:
                 # The same round trip bench.py's meta.json took.
@@ -744,7 +858,7 @@ class MeasurementRunner:
             self._note_queued(queued)
             if waiting and not queued and not any(self.perf.alive(sp) for sp in self.perf.spools):
                 raise MeasurementUnavailable(
-                    "no live measurement session; resume after replacement"
+                    "no live measurement session; resume after replacement", transient=True
                 )
             unavailable = []
             for job, spool, rc in self.perf.poll():
@@ -776,7 +890,7 @@ class MeasurementRunner:
                 todo = [run for run in todo if run not in runs or run in missing]
             if unavailable:
                 self._note_queued(queued)
-                raise MeasurementUnavailable("; ".join(unavailable))
+                raise MeasurementUnavailable("; ".join(unavailable), transient=True)
             if todo:
                 time.sleep(self.poll_s)
         self._note_queued({})
@@ -940,10 +1054,13 @@ __all__ = [
     "BenchPart",
     "BenchSpec",
     "Run",
+    "client_identity",
     "SpoolRunner",
+    "archive_parts",
     "host_controls",
     "load_measurement",
     "node_busy",
+    "part_keys",
     "receipt_rc",
     "spool_host",
     "validate_measurement",

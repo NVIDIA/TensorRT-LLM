@@ -12,6 +12,12 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_eagle3_worker_api.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_spec_tail_contracts.py
+  # MiniMax-M3 Rubin target unit tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8/test_modeling_v2_m3_tp4_drift.py
   - unittest/_torch/modules/test_linear_output_slice.py::test_fp8_weight_slice_cache
@@ -38,6 +44,8 @@ l0_cpu:
   - model_express/test_model_express_accuracy.py::test_mx_accuracy_cases_have_references
   - unittest/test_s3_output.py
   - unittest/others/test_http_utils_fail_fast.py
+  # perf-sanity multi-frontend port reservation vs the trtllm-serve launcher probe (sockets only, no GPUs).
+  - unittest/others/test_perf_sanity_port_reservation.py
   - unittest/_torch/visual_gen/multi_gpu/test_worker_pool.py
   # Covers the cpu_only cases of tests/unittest/_torch/attention/. On this CPU-only list,
   # pytest_ignore_collect in tests/unittest/conftest.py drops every file without a
@@ -55,8 +63,12 @@ l0_cpu:
   - unittest/_torch/compilation/test_remove_copy_pass.py::test_remove_copy_preserves_minimax_producer_outputs
   - unittest/_torch/distributed
   # GLM routing and draft workspace setup use CPU metadata and mocked allocations.
-  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__tp16/spec/test_modeling_v2_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_draft_exchange.py
+  - unittest/_torch/modeling_v2/models/glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/spec/test_modeling_v2_small_batch_mtp.py
   - unittest/_torch/modeling_v2/models/glm_moe_dsa/test_routing.py
+  # The qwen4_exp default target's cpu_only tests (its routing among them); this stage runs
+  # -m cpu_only, so the directory's GPU tests are left to l0_b300's modeling_v2 entry.
+  - unittest/_torch/modeling_v2/models/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default
   - unittest/_torch/pyexecutor
   - unittest/_torch/test_connector.py::test_a_partial_grouped_scheduler_is_rejected_at_bring_up
   - unittest/_torch/test_connector.py::test_a_grouped_scheduler_and_a_single_group_cache_are_accepted
@@ -68,11 +80,8 @@ l0_cpu:
   - unittest/_torch/modeling
   # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
   # compute capability, no device. The default targets' shard tests: small CPU
-  # tensors and the CPU block_scale_interleave. The qwen4_exp entries are the target's
-  # tests that run on the source text, stubbed weights and meta tensors: its multimodal
-  # splice and admission check on a stub tower, the KV pool contract, its KV storage
-  # derivation and attention-call arguments, its routed-expert scalars and its weight table.
-  # The rest of unittest/_torch/modeling_v2 needs a GPU.
+  # tensors and the CPU block_scale_interleave. The rest of unittest/_torch/modeling_v2
+  # needs a GPU.
   - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
@@ -95,14 +104,13 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
   - unittest/_torch/modeling_v2/models/deepseek_v3/test_modeling_v2_deepseek_default_shards.py
   - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_gpt_oss_default_shards.py
+  # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
+  - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_multimodal_embeds.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_moe_scalars.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_validate_request.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_pool_contract.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_kv_quant.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_thop_attention_calls.py
-  - unittest/_torch/modeling_v2/models/qwen4_exp/test_modeling_v2_qwen4_exp_weight_table.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_decoder_layer_sets_post_fusion_from_moe_scheduler
@@ -136,15 +144,18 @@ l0_cpu:
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
+  - unittest/_torch/misc/test_grammar_matcher.py
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
   - unittest/_torch/ray_orchestrator/single_gpu/test_cache_transceiver_comm.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py::test_index_mapper_reservation_tracks_confidence_scheduling
   - unittest/_torch/speculative/hw_agnostic
   - unittest/_torch/speculative/test_device_window_sampling_layout.py
   # l0_h100 selects with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
+  - unittest/_torch/flashinfer/test_flashinfer_cubin_pool.py
   - unittest/_torch/test_custom_config_registration.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
@@ -199,10 +210,12 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_utils.py
   - unittest/_torch/visual_gen/test_vanilla_key_padding_mask.py
   - unittest/_torch/visual_gen/test_visual_gen_args.py
+  - unittest/_torch/visual_gen/test_vc_smooth_schedule.py
   - unittest/_torch/visual_gen/test_visual_gen_params.py
   - unittest/_torch/visual_gen/test_visual_gen_utils.py
   - unittest/_torch/visual_gen/test_wan_i2v_reference_conditioning.py
   - unittest/_torch/visual_gen/test_wan_timestep_routing.py
+  - unittest/_torch/visual_gen/test_wan_fixed_latent.py
   - unittest/_torch/weight_sharing
   - unittest/api_stability
   - unittest/bindings
@@ -225,6 +238,7 @@ l0_cpu:
   - unittest/executor/test_stats_serializer.py
   - unittest/executor/test_spec_dec_perf_metrics.py
   - unittest/executor/test_stop_word_side_output_trim.py
+  - unittest/executor/test_stop_word_streaming_text.py
   - unittest/executor/test_ray_stub.py
   - unittest/executor/test_generation_request_array_prompt.py
   - unittest/grpc/openengine/test_coordinator.py
@@ -266,6 +280,7 @@ l0_cpu:
   - unittest/llmapi/apps/test_openai_chat_multimodal_prompt.py
   - unittest/llmapi/apps/test_openai_protocol_chat_agent_fields.py
   - unittest/llmapi/apps/test_openai_protocol_chat_store.py
+  - unittest/llmapi/apps/test_openai_server_graceful_shutdown.py
   - unittest/llmapi/apps/test_openai_server_iteration_stats.py
   - unittest/llmapi/apps/test_reasoning_prompt_resolution.py
   - unittest/llmapi/apps/test_render_callers.py
@@ -324,6 +339,7 @@ l0_cpu:
   - unittest/llmapi/test_sampling_params.py
   - unittest/llmapi/test_serialization.py
   - unittest/llmapi/test_serve_frontend_affinity.py
+  - unittest/llmapi/test_serve_context_only_settings.py
   - unittest/llmapi/test_serve_multi_frontend_helpers.py
   - unittest/llmapi/test_serve_multi_frontend_route_gate.py
   - unittest/llmapi/test_serve_num_frontends_default.py
@@ -339,6 +355,7 @@ l0_cpu:
   - unittest/models/test_quant_config_utils.py
   - unittest/others
   - unittest/quantization/test_mode.py
+  - unittest/quantization/test_nvfp4_plus_format.py
   - unittest/scaffolding
   - unittest/scripts
   - unittest/tools

@@ -338,7 +338,9 @@ class Campaign:
             self.perf.poll()
             self.gates.poll()
             if self.perf.inflight or self.gates.inflight:
-                raise MeasurementUnavailable("evidence inputs changed; earlier jobs must finish")
+                raise MeasurementUnavailable(
+                    "evidence inputs changed; earlier jobs must finish", transient=True
+                )
             self.invalidate_evidence("campaign inputs or judgment policy changed")
         self.state.inputs = inputs
         self.state.save(self.state_path)
@@ -539,7 +541,7 @@ class Campaign:
         """
         best = self._best_head()
         if tree_in_use(Path(self.state.best_tree), [*self.perf.spools, *self.gates.spools]):
-            raise MeasurementUnavailable("tune best is held by an older job")
+            raise MeasurementUnavailable("tune best is held by an older job", transient=True)
         if source == before:
             return best
         ancestor = subprocess.run(
@@ -549,7 +551,9 @@ class Campaign:
         if ancestor.returncode != 0:
             raise MeasurementUnavailable("tested source does not descend from tune's source")
         if self.perf.inflight or self.gates.inflight:
-            raise MeasurementUnavailable("source synchronization waits for measurement jobs")
+            raise MeasurementUnavailable(
+                "source synchronization waits for measurement jobs", transient=True
+            )
         commits = git_checked(
             self.repo, "rev-list", "--reverse", "--no-merges", f"{before}..{best}"
         ).splitlines()
@@ -660,7 +664,9 @@ class Campaign:
                 output, record = self.gates.output(job)
                 rc = self._gate_done.pop(job)
                 if unmeasured(rc, record):
-                    raise MeasurementUnavailable(f"{job}: gate unavailable (rc={rc})")
+                    raise MeasurementUnavailable(
+                        f"{job}: gate unavailable (rc={rc})", transient=True
+                    )
                 verdict = gate.judge(part, tree, where, rc=rc, output=output, record=record)
                 if verdict["verdict"] in (PASS, FAIL) or not self._requeue(key, where, verdict):
                     parts[part] = self._write(where / PART_FILE, verdict)
@@ -709,7 +715,7 @@ class Campaign:
                 self.gates.alive(sp) for sp in self.gates.spools
             ):
                 raise MeasurementUnavailable(
-                    "no live correctness session; resume after replacement"
+                    "no live correctness session; resume after replacement", transient=True
                 )
             return None
         if running:
@@ -730,7 +736,8 @@ class Campaign:
                         path.rename(path.with_name(f"{label}.unmeasured-{time.time_ns()}"))
                     self.state.save(self.state_path)
                     raise MeasurementUnavailable(
-                        f"{label}: no verdict (rc={rc}, {record.get('reason') or 'infrastructure'})"
+                        f"{label}: no verdict (rc={rc}, {record.get('reason') or 'infrastructure'})",
+                        transient=True,
                     )
         active = next(
             (st for st in self.state.candidates.values() if st.status in ("micro", "e2e", "gate")),
@@ -741,7 +748,9 @@ class Campaign:
             and not self.perf.inflight
             and not any(self.perf.alive(sp) for sp in self.perf.spools)
         ):
-            raise MeasurementUnavailable("no live performance session; resume after replacement")
+            raise MeasurementUnavailable(
+                "no live performance session; resume after replacement", transient=True
+            )
         if active is None and self._checkpoint_due():
             # Verification is serialized: the checkpoint measures before the next candidate.
             self._checkpoint(done)
@@ -1068,7 +1077,7 @@ class Campaign:
     def _keep(self, st: CandidateState) -> None:
         best = Path(self.state.best_tree)
         if tree_in_use(best, [*self.perf.spools, *self.gates.spools]):
-            raise MeasurementUnavailable("tune best is held by an older job")
+            raise MeasurementUnavailable("tune best is held by an older job", transient=True)
         before = self._best_head()
         if before != st.eval_base:
             st.status, st.reason = "blocked", "best tree moved outside the serialized verification"
@@ -1148,7 +1157,7 @@ class Campaign:
             rc = self._gate_done.pop(job)
             output, record = self.gates.output(job)
             if unmeasured(rc, record):
-                raise MeasurementUnavailable(f"{job}: logits unavailable (rc={rc})")
+                raise MeasurementUnavailable(f"{job}: logits unavailable (rc={rc})", transient=True)
             rows = logits_check.first_tokens(output)
             if rc != 0 or not rows:
                 why = f"{job}: rc {rc}, {len(rows)} of {len(self.logits.prompts)} prompts answered"
@@ -1281,7 +1290,7 @@ class Campaign:
         )  # fmt: skip
         if lost:
             if tree_in_use(Path(self.state.best_tree), [*self.perf.spools, *self.gates.spools]):
-                raise MeasurementUnavailable("tune best is held by an older job")
+                raise MeasurementUnavailable("tune best is held by an older job", transient=True)
             git_checked(Path(self.state.best_tree), "reset", "-q", "--hard", good)
             self.state.best_commit = good
             why = cmp.reason if cmp.verdict == "LOSS" else correct[1]

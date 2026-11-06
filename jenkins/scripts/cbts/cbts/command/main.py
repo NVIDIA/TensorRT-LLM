@@ -39,7 +39,6 @@ from typing import Optional
 import click
 
 from cbts.blocks import (
-    ALWAYS_RUN_STAGE_PREFIX,
     Stage,
     YAMLIndex,
     compute_stage_split_counts,
@@ -236,6 +235,7 @@ def _rule_reason(rule, r) -> dict:
 # combines to a single "testsonly" scope rather than falling back.
 _TESTSONLY_FAMILY: frozenset[str] = frozenset(
     {
+        "testsonly",
         "waiveonly",
         "testdefonly",
         "testlistonly",
@@ -639,10 +639,6 @@ def _run(args: _Args) -> int:
             block_filters=result.block_filters,
             durations=durations,
         )
-
-    # Added before the trigger-mode filter, and outside the counts Layer 2.5 resizes.
-    if result.scope is not None:
-        result.affected_stages |= {s for s in stages if s.startswith(ALWAYS_RUN_STAGE_PREFIX)}
 
     # Trigger-mode filter; recompute derived counts. pre-merge drops Post-Merge
     # stages; post-merge keeps both (adds Post-Merge on top, matching baseline).

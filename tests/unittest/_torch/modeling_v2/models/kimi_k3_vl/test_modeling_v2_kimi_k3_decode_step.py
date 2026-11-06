@@ -264,7 +264,13 @@ def test_kda_verify_keeps_builtin_fallback_dense(
         else KDAIntermediateLayerCache(conv=torch.empty(0), temporal=torch.empty(0))
     )
 
-    def verify_fused(self, *args, output=None, allow_prequantized_output=False):
+    mxfp8_input = (torch.empty(8, 16, dtype=torch.uint8), torch.empty(4, dtype=torch.uint8))
+    seen_inputs = []
+
+    def verify_fused(
+        self, *args, output=None, allow_prequantized_output=False, prequantized_input=None
+    ):
+        seen_inputs.append(prequantized_input)
         if allow_prequantized_output:
             return _KdaPrequantizedCore(core.reshape(8, -1), torch.ones(1, dtype=torch.uint8))
         return self._store_core(core, output)
@@ -273,7 +279,9 @@ def test_kda_verify_keeps_builtin_fallback_dense(
     monkeypatch.setattr(
         route_a.KimiKDALinearAttention,
         "forward_verify_sequential",
-        lambda self, *args, output=None: self._store_core(core, output),
+        lambda self, *args, output=None, prequantized_input=None: (
+            seen_inputs.append(prequantized_input) or self._store_core(core, output)
+        ),
     )
     result = module.forward_verify(
         torch.empty(8, 16),
@@ -284,11 +292,14 @@ def test_kda_verify_keeps_builtin_fallback_dense(
         torch.tensor([0]),
         output=output,
         allow_prequantized_output=allow_prequantized_output,
+        prequantized_input=mxfp8_input,
     )
     assert isinstance(result, torch.Tensor)
     torch.testing.assert_close(result, core, rtol=0, atol=0)
     if output is not None:
         assert result is output
+    # The MXFP8 input reaches the built-in verify path.
+    assert len(seen_inputs) == 1 and seen_inputs[0] is mxfp8_input
 
 
 def _slot_worker(target):
