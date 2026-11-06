@@ -16,6 +16,7 @@
 
 import multiprocessing
 import os
+import socket
 from concurrent.futures import ThreadPoolExecutor
 from typing import Iterable, Optional, Set
 
@@ -36,51 +37,25 @@ def _dist_barrier() -> None:
         dist.barrier()
 
 
-def _get_int_env(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except ValueError:
-        return default
+def _local_prefetch_context() -> tuple[int, int, int]:
+    """Discover node peers and their minimum available memory on every call.
 
-
-def _local_rank_and_size() -> tuple[int, int]:
-    if not _dist_initialized():
-        return 0, 1
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = _get_int_env("LOCAL_RANK", rank)
-    local_size = _get_int_env("LOCAL_WORLD_SIZE", world_size)
-
-    if local_size < 1 or local_rank < 0 or local_rank >= local_size:
-        return rank, world_size
-    return local_rank, local_size
-
-
-def _get_local_available_host_memory() -> int:
-    """Return the minimum available host memory observed by local ranks.
-
-    The prefetch/skip decision must be the same for all ranks that synchronize
-    at the post-prefetch barrier. Use torch.distributed to collect per-rank
-    snapshots and reduce the local slice to its minimum.
+    Host page-cache sharing follows host membership, not the number of visible
+    GPUs or global ranks. Gathering host identities also supports interleaved
+    ranks and launchers that do not export LOCAL_WORLD_SIZE.
     """
-    available_memory = psutil.virtual_memory().available
+    available_memory = int(psutil.virtual_memory().available)
     if not _dist_initialized() or dist.get_world_size() == 1:
-        return available_memory
+        return 0, 1, available_memory
 
-    world_size = dist.get_world_size()
-    gathered_memory: list[int | None] = [None] * world_size
-    dist.all_gather_object(gathered_memory, int(available_memory))
-
-    local_rank, local_size = _local_rank_and_size()
-    local_start = dist.get_rank() - local_rank
-    local_end = min(local_start + local_size, world_size)
-    local_memory = [
-        memory for memory in gathered_memory[local_start:local_end] if memory is not None
+    hostname = socket.gethostname()
+    gathered: list[tuple[str, int] | None] = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, (hostname, available_memory))
+    local_ranks = [
+        rank for rank, entry in enumerate(gathered) if entry is not None and entry[0] == hostname
     ]
-    if not local_memory:
-        return available_memory
-    return min(local_memory)
+    local_memory = [entry[1] for entry in gathered if entry is not None and entry[0] == hostname]
+    return local_ranks.index(dist.get_rank()), len(local_ranks), min(local_memory)
 
 
 def _normalize_paths(
@@ -122,17 +97,23 @@ def prefetch_files_to_host_cache(
 
     Returns True only when all selected files were already prefetched or were
     prefetched successfully. If prefetch is skipped or fails, returns False
-    when ignore_errors=True and raises otherwise.
+    when ignore_errors=True and raises otherwise. The optional process-local
+    cache records only files assigned to this rank.
     """
-    paths = _normalize_paths(file_names, prefetched_paths)
+    local_paths: list[str] = []
     success = False
     try:
-        if not paths:
+        # Cache hits and empty inputs must participate in the same collectives
+        # as ranks that still need to read files.
+        local_rank, local_size, available_memory = _local_prefetch_context()
+        paths = _normalize_paths(file_names, None)
+        # Keep shard ownership stable when process-local caches differ.
+        local_paths = _normalize_paths(paths[local_rank::local_size], prefetched_paths)
+        if not local_paths:
             success = True
             return True
 
         prefetch_size = sum(os.path.getsize(path) for path in paths if os.path.exists(path))
-        available_memory = _get_local_available_host_memory()
         if prefetch_size >= available_memory * 0.9:
             logger.info(
                 f"Skipping {description} prefetch because files require "
@@ -141,8 +122,6 @@ def prefetch_files_to_host_cache(
             )
             return False
 
-        local_rank, local_size = _local_rank_and_size()
-        local_paths = paths[local_rank::local_size]
         if local_paths:
             logger.info(
                 f"Prefetching {prefetch_size / (1024**3):.2f}GB {description} "
@@ -161,5 +140,5 @@ def prefetch_files_to_host_cache(
         return False
     finally:
         if success and prefetched_paths is not None:
-            prefetched_paths.update(paths)
+            prefetched_paths.update(local_paths)
         _dist_barrier()
