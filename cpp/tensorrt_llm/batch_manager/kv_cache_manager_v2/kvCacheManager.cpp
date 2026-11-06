@@ -22,6 +22,7 @@
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storage/config.h"
 #include "kv_cache_manager_v2/storage/core.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -31,6 +32,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -141,6 +143,8 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
     mStorage = std::make_shared<StorageManager>(mLifeCycles, storageConfig, mConfig.tokensPerBlock,
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
+    // The context the storage above lives in; teardown pushes it on threads that have none.
+    mCudaContext = CudaContextScope::current();
 
     _computeSparseCacheShape();
 
@@ -158,6 +162,38 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
 
 KvCacheManager::~KvCacheManager()
 {
+    if (mShutDown)
+    {
+        return;
+    }
+    // Finalised rather than shut down. Python's cyclic garbage collector, and a std::shared_ptr
+    // released on a helper thread, run this on whatever thread dropped the last reference, and
+    // that thread may have no CUDA context; every driver call in the teardown needs one. The
+    // manager's own context is pushed for the duration, and everything that needs it must be
+    // released inside shutdown(): the scope ends before the members are destroyed.
+    CudaContextScope const context(mCudaContext);
+    if (!context.usable())
+    {
+        // The context or the driver is already gone, so nothing of this manager can be released.
+        // Its storage and tree are handed to allocations that are never freed, which keeps their
+        // destructors -- and the driver calls in them -- from running at all. That is deliberately
+        // not a poisoning: no structure is left half-torn, and the managers that follow in this
+        // process stay usable.
+        TLLM_LOG_ERROR(
+            "KVCacheManagerV2 is being finalised without a usable CUDA context (CUDA driver error %d); its memory "
+            "is leaked. Call shutdown() from the thread that drives the manager.",
+            static_cast<int>(context.error()));
+        new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
+        new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
+        return;
+    }
+    if (context.pushed())
+    {
+        TLLM_LOG_WARNING(
+            "KVCacheManagerV2 is being finalised without shutdown() on a thread that does not have its CUDA context "
+            "current; call shutdown() from the thread that drives the manager. Tearing it down with its own "
+            "context.");
+    }
     KVCM2_POISON_ON_EXCEPT([this]() { shutdown(); });
 }
 
@@ -423,8 +459,11 @@ void KvCacheManager::shutdown()
     // The latch is read under the lock because it is normally set by a thread holding it: a read
     // taken before blocking would only say the cache was intact before this call started waiting.
     auto const apiLock = lockExclusive();
-    if (Poison::poisoned())
+    if (Poison::poisoned() || mShutDown)
     {
+        // Recorded on the poisoned path too: nothing will be released later either way, and the
+        // destructor should not then report a missing shutdown() to a caller who made it.
+        mShutDown = true;
         return;
     }
     _checkNoLivingKvCaches("shutdown()");
@@ -442,6 +481,7 @@ void KvCacheManager::shutdown()
     }
 
     mStorage->destroy();
+    mShutDown = true;
 }
 
 void KvCacheManager::clearReusableBlocks()

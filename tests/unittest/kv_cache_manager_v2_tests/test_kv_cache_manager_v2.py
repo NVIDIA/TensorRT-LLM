@@ -22,6 +22,7 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 import unittest
 from contextlib import contextmanager
@@ -30,7 +31,7 @@ from datetime import timedelta
 from importlib.util import find_spec
 from random import randbytes
 from statistics import median
-from typing import TYPE_CHECKING, Any, Iterator, NamedTuple, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Iterator, NamedTuple, Sequence, cast
 
 import pytest
 
@@ -11387,6 +11388,99 @@ class TestPoison(TestKVCacheManagerV2):
 
         self.assertIn("deliberate test poisoning", take_poison())
         self.assertIsNone(poison_reason())
+
+
+class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):
+    """Finalisation on a thread that has no CUDA context must not poison the process.
+
+    A manager or cache that was never shut down is freed by whichever thread drops its last
+    reference, and a thread that never touched CUDA has no current context. Teardown then has to
+    make the manager's own context current: otherwise its driver calls fail with
+    CUDA_ERROR_INVALID_CONTEXT, and since a destructor can only report that through the
+    process-wide latch, every later manager in the process would raise CorruptedError.
+
+    Each test here leaves no manager alive, so a failure is blamed on it rather than on the test
+    that happens to run next.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        if not hasattr(_introspection, "poison_for_testing"):
+            raise unittest.SkipTest("the poison latch is C++-backend only")
+        # A host tier as well, so the teardown also unregisters host memory.
+        self.cfg = create_config(32, 64 << 20, 16 << 20, 0, 2, None, 0)
+
+    @staticmethod
+    def _run_without_cuda_context(func: Callable[[], None]) -> None:
+        """Runs func on a fresh thread, which has no current CUDA context."""
+        errors: list[BaseException] = []
+
+        def target() -> None:
+            try:
+                func()
+            except BaseException as error:  # noqa: BLE001 - re-raised on the test thread
+                errors.append(error)
+
+        thread = threading.Thread(target=target, name="no-cuda-context")
+        thread.start()
+        thread.join()
+        if errors:
+            raise errors[0]
+
+    def _drop_without_cuda_context(self, holder: list[object]) -> None:
+        def drop() -> None:
+            holder.clear()
+            gc.collect()
+
+        self._run_without_cuda_context(drop)
+
+    def _open_cache(self, manager: KVCacheManager) -> _KVCache:
+        """A resumed cache: its close, explicit or not, has a finish event to record."""
+        cache = manager.create_kv_cache(input_tokens=[self.next_token() for _ in range(64)])
+        self.assertTrue(cache.resume(cast(CudaStream, CachedCudaStream().handle)))
+        return cache
+
+    def _exercise(self, manager: KVCacheManager) -> None:
+        """Runs a request through the manager, so the teardown has events and pages to release."""
+        self._open_cache(manager).close()
+
+    def _assert_process_still_usable(self) -> None:
+        self.assertIsNone(poison_reason())
+        self.assertEqual(num_live_managers(), 0)
+        fresh = KVCacheManager(self.cfg)
+        try:
+            self._exercise(fresh)
+        finally:
+            fresh.shutdown()
+        self.assertIsNone(poison_reason())
+
+    def test_manager_finalised_without_cuda_context_does_not_poison(self) -> None:
+        holder: list[object] = [KVCacheManager(self.cfg)]
+        self._exercise(cast(KVCacheManager, holder[0]))
+
+        self._drop_without_cuda_context(holder)
+        self._assert_process_still_usable()
+
+    def test_open_cache_and_manager_finalised_together_without_cuda_context(self) -> None:
+        """The cache's own finalisation closes it, which records its finish event."""
+        manager = KVCacheManager(self.cfg)
+        holder: list[object] = [manager, self._open_cache(manager)]
+        del manager
+
+        self._drop_without_cuda_context(holder)
+        self._assert_process_still_usable()
+
+    def test_cache_finalised_without_cuda_context_leaves_the_manager_usable(self) -> None:
+        self.manager = KVCacheManager(self.cfg)
+        holder: list[object] = [self._open_cache(self.manager)]
+
+        self._drop_without_cuda_context(holder)
+        self.assertIsNone(poison_reason())
+        self._exercise(self.manager)
+        self.manager.shutdown()
+        del self.manager
+        gc.collect()
+        self._assert_process_still_usable()
 
 
 if __name__ == "__main__":
