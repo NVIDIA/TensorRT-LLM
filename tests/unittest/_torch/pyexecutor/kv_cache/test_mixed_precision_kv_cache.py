@@ -338,9 +338,9 @@ def test_mixed_precision_warns_when_no_layer_takes_it(make_manager):
 
 
 def test_cold_page_mixed_precision_rejects_a_pool_with_a_layer_that_takes_none(make_manager):
-    """A layer whose KV cache another layer shares takes no mixed precision, so the high layers
-    cannot share its pool (their slot lacks its page); dense attention would otherwise redirect its
-    block offsets without copying its rows back. The manager refuses the model and says why."""
+    """A layer whose KV cache another layer shares takes no mixed precision but sits in the pool of
+    layers that do; dense attention would redirect its block offsets without copying its rows
+    back, so the manager refuses the model and names the layer."""
     options = dict(
         num_layers=4,
         pretrained_config=type(
@@ -354,7 +354,9 @@ def test_cold_page_mixed_precision_rejects_a_pool_with_a_layer_that_takes_none(m
         )(),
     )
     # Two layer groups: the full-attention layers (the shared source among them) and the high group.
-    with pytest.raises(ValueError, match="every KV layer of that pool must take"):
+    with pytest.raises(
+        ValueError, match="takes no first/last-N mixed precision but shares KV cache pool"
+    ):
         make_manager(
             config=cold_page_config(pool_ratio=[0.75, 0.25]),
             cold_page_codec_provider=_ColdPageProvider(),
