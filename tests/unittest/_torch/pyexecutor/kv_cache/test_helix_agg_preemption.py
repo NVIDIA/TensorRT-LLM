@@ -731,7 +731,7 @@ def test_suspended_prefill_preempts_a_newer_prefill_to_resume() -> None:
         for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
     ]
     assert all(d == decisions[0] for d in decisions), decisions
-    assert decisions[0][0] == ((2, 128),)
+    assert decisions[0][0] == ((2, 256, 128),)
 
     decisions = [
         _step(cp_rank, manager, scheduler, rank_active, scenario)
@@ -753,7 +753,7 @@ def test_suspended_prefill_preempts_a_newer_prefill_to_resume() -> None:
             for cp_rank, ((manager, scheduler), rank_active) in enumerate(zip(ranks, active))
         ]
         assert all(d == decisions[0] for d in decisions), decisions
-        if resumed_at is None and any(request_id == 1 for request_id, _ in decisions[0][0]):
+        if resumed_at is None and any(request_id == 1 for request_id, _, _ in decisions[0][0]):
             resumed_at = [rank_positions[1] for rank_positions in positions]
 
     assert not any(active), "requests did not finish"
@@ -791,7 +791,7 @@ def test_context_fallback_skips_requests_given_up_earlier_in_the_pass() -> None:
         for cp_rank, ((manager, scheduler), rank_requests) in enumerate(zip(ranks, requests))
     ]
     assert all(d == decisions[0] for d in decisions), decisions
-    assert decisions[0][0] == ((3, 64), (4, 64))
+    assert decisions[0][0] == ((3, 0, 64), (4, 0, 64))
     for (_, scheduler), rank_requests in zip(ranks, requests):
         for request_id in (3, 4):
             assert rank_requests[request_id].state == LlmRequestState.GENERATION_IN_PROGRESS
