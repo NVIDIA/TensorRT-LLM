@@ -565,12 +565,14 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 forced_name = _forced_call_name(calls,
                                                 forced_tool.function.name)
                 calls = calls[:1]
-                if calls[0].name:
+                if calls[0].name is not None:
                     calls[0].name = forced_name
             tool_calls = []
             for call_item in calls:
-                # Tool call ID should be generated only once per tool call
-                if call_item.name:
+                # Tool call ID should be generated only once per tool call.
+                # Only an absent name marks an argument delta: a call the model
+                # left unnamed arrives as "" and still opens with its ID.
+                if call_item.name is not None:
                     # First chunk: include ID and function name
                     tool_call_id = make_tool_call_id(
                         id_type=args.tool_call_id_type,

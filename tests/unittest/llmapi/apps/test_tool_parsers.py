@@ -6965,6 +6965,57 @@ class TestForcedToolChoicePostprocessing:
         assert finish_reasons[-1] == "stop"
 
 
+class TestStreamedToolCallOpening:
+    """The first streamed delta of a tool call carries its ID and name."""
+
+    _DEEPSEEK_V3_UNNAMED_CALL = (
+        "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>"
+        '\n```json\n{"location": "Tokyo"}\n```'
+        "<｜tool▁call▁end｜><｜tool▁calls▁end｜>")
+    _MINIMAX_M2_UNNAMED_CALL = ('<minimax:tool_call>\n<invoke name="">\n'
+                                '<parameter name="location">Tokyo</parameter>\n'
+                                '</invoke>\n</minimax:tool_call>')
+
+    @pytest.mark.parametrize("tool_parser,text,chunk_size", [
+        pytest.param(
+            "deepseek_v3", _DEEPSEEK_V3_UNNAMED_CALL, 1, id="deepseek_v3-1"),
+        pytest.param(
+            "deepseek_v3", _DEEPSEEK_V3_UNNAMED_CALL, 7, id="deepseek_v3-7"),
+        pytest.param(
+            "minimax_m2", _MINIMAX_M2_UNNAMED_CALL, 1, id="minimax_m2-1"),
+        pytest.param(
+            "minimax_m2", _MINIMAX_M2_UNNAMED_CALL, 7, id="minimax_m2-7"),
+        pytest.param(
+            "minimax_m2", _MINIMAX_M2_UNNAMED_CALL, 1000,
+            id="minimax_m2-whole"),
+    ])
+    def test_unnamed_call_opens_with_an_id(self, sample_tools, tool_parser,
+                                           text, chunk_size):
+        """A call the model leaves unnamed is reported with the name "".
+
+        Only an absent name marks an argument delta; an empty one must still
+        open the call with an ID instead of streaming orphan arguments.
+        """
+        args = TestForcedToolChoicePostprocessing._make_args(
+            sample_tools, tool_parser=tool_parser, stream=True)
+        payloads = TestForcedToolChoicePostprocessing._stream_deltas(
+            args,
+            [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)])
+        calls = [
+            call for payload in payloads for choice in payload["choices"]
+            for call in choice["delta"].get("tool_calls", [])
+        ]
+        assert calls, payloads
+        opening, *argument_deltas = calls
+        assert opening["id"]
+        assert opening["function"]["name"] == ""
+        assert all("id" not in call for call in argument_deltas)
+        assert all("name" not in call["function"] for call in argument_deltas)
+        arguments = "".join(call["function"].get("arguments", "")
+                            for call in calls)
+        assert json.loads(arguments) == {"location": "Tokyo"}
+
+
 class TestChatStreamFinishChunk:
     """A streamed choice ends with a chunk of its own carrying the finish.
 
