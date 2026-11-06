@@ -154,7 +154,10 @@ def _install_fake_nccl(
 
 @pytest.fixture
 def nccl_ep_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
-    """Patch everything around ``NcclEpContext.__init__`` except the bootstrap branch."""
+    """Patch everything around ``NcclEpContext.__init__`` except the bootstrap branch.
+
+    Tests pick the branch with ``TLLM_DISABLE_MPI``, so the real ``mpi_disabled()`` runs.
+    """
     torch_group_comm = Mock(name="torch_group_comm")
     mpi_comm_result = Mock(name="mpi_seeded_comm")
     ep_group = Mock(name="ep_group")
@@ -185,7 +188,6 @@ def nccl_ep_fakes(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         mpi_comm=mpi_comm,
         register=register,
         unregister=unregister,
-        monkeypatch=monkeypatch,
     )
 
 
@@ -199,8 +201,10 @@ def _create_context(mapping: SimpleNamespace) -> nccl_ep_utils.NcclEpContext:
     )
 
 
-def test_ray_orchestrator_seeds_comm_from_torch_ep_group(nccl_ep_fakes: SimpleNamespace) -> None:
-    nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: True)
+def test_ray_orchestrator_seeds_comm_from_torch_ep_group(
+    nccl_ep_fakes: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
     mapping = _make_mapping()
 
     ctx = _create_context(mapping)
@@ -233,9 +237,9 @@ def test_ray_orchestrator_seeds_comm_from_torch_ep_group(nccl_ep_fakes: SimpleNa
 
 @pytest.mark.parametrize("ep_world_rank", [0, 1])
 def test_mpi_orchestrator_splits_session_comm_by_pipeline_stage(
-    nccl_ep_fakes: SimpleNamespace, ep_world_rank: int
+    nccl_ep_fakes: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, ep_world_rank: int
 ) -> None:
-    nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "0")
     nccl_ep_fakes.sub_comm.Get_rank.return_value = ep_world_rank
     mapping = _make_mapping()
     mapping.moe_ep_rank = ep_world_rank
@@ -262,9 +266,9 @@ def test_mpi_orchestrator_splits_session_comm_by_pipeline_stage(
 
 @pytest.mark.parametrize("use_ray", [True, False], ids=["ray", "mpi"])
 def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
-    nccl_ep_fakes: SimpleNamespace, use_ray: bool
+    nccl_ep_fakes: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, use_ray: bool
 ) -> None:
-    nccl_ep_fakes.monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: use_ray)
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1" if use_ray else "0")
     ctx = _create_context(_make_mapping())
     comm = ctx.comm
     proxy = nccl_ep_fakes.register.call_args.args[0]
