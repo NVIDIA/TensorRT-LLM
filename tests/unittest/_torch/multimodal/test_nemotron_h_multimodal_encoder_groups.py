@@ -18,8 +18,10 @@ the class:
   assertion.
 * `_encode_video_group` stashes per-video EVS retained-token counts on
   the caller's `multimodal_data` for the downstream `merge_evs_mm_embeds`.
-* `_encode_audio_group` concatenates `_encode_audio` outputs in
-  request order.
+* The audio group declares its payload fields, so the framework joins the
+  clips of all requests; `_encode_audio_group` concatenates the clips'
+  rows from one `_encode_audio_clips` call. Fixed-tile images declare
+  their pixels the same way.
 """
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -115,14 +117,28 @@ class TestMmEncoderGroups:
         m._encode_video_group([p])
         assert torch.equal(p.multimodal_data["num_tokens_in_video"], torch.tensor([3, 2]))
 
-    def test_audio_group_concats_encode_audio_outputs(self) -> None:
+    def test_audio_group_declares_fields_and_concats_clips(self) -> None:
         m = _model_with_stubs()
-        params = [
-            _make_multimodal_params(audio={"marker": 7, "rows": 4}),
-            _make_multimodal_params(audio={"marker": 8, "rows": 3}),
-        ]
-        out = m._encode_audio_group(params)
+        audio_group = m.mm_encoder_groups[2]
+        assert audio_group.input_fields == {
+            "input_audio_features": {"audio": "input_audio_features"},
+            "feature_attention_mask": {"audio": "feature_attention_mask"},
+            "audio_output_lengths": {"audio": "audio_output_lengths"},
+        }
+        m._encode_audio_clips = MagicMock(
+            return_value=([_marker_tensor(7, 4), _marker_tensor(8, 3)], [4, 3])
+        )
+        features, mask = torch.zeros(2, 8, 4), torch.ones(2, 8, dtype=torch.bool)
+        out = m._encode_audio_group(features, mask, torch.tensor([4, 3]))
         assert torch.equal(out[:, 0], torch.tensor([7.0, 7.0, 7.0, 7.0, 8.0, 8.0, 8.0]))
+        m._encode_audio_clips.assert_called_once_with(features, mask, [4, 3])
+
+    def test_image_group_follows_the_image_format(self) -> None:
+        m = _model_with_stubs()
+        m.vision_encoder.dynamic_resolution = False
+        assert m.mm_encoder_groups[0] is m.vision_encoder.image_tile_group
+        m.vision_encoder.dynamic_resolution = True
+        assert m.mm_encoder_groups[0].input_fields is None
 
     def test_video_group_skips_audio_when_video_has_no_audio(self) -> None:
         # Video-only (no embedded audio) must not touch the sound encoder.

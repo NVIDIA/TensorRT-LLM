@@ -180,28 +180,35 @@ def test_processors_use_the_common_metadata_hook(model, custom):
         )
 
 
-def test_gemma_unified_processor_describes_image_and_audio_without_encoder_costs():
+@pytest.mark.parametrize("modality", ["image", "audio"])
+def test_gemma_unified_processor_describes_items_without_encoder_costs(modality: str) -> None:
     from tensorrt_llm._torch.models.modeling_gemma4_unified import Gemma4UnifiedInputProcessor
 
     processor = object.__new__(Gemma4UnifiedInputProcessor)
-    data = {
+    payloads = {
         "image": {
             "pixel_values": torch.zeros(1, 4, 6),
             "image_position_ids": torch.zeros(1, 4, 2),
-            "image_seq_lens": [4],
+            "image_seq_lens": torch.tensor([4]),
         },
         "audio": {"audio_features": torch.zeros(1, 5, 8), "audio_features_mask": torch.ones(1, 5)},
+    }
+    data = {
+        modality: payloads[modality],
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
-            [("audio", 0), ("image", 0)], output_embedding_lengths=[2, 4]
+            [(modality, 0)], output_embedding_lengths=[4]
         ),
     }
-    order = [{"modality": "audio", "index": 0}, {"modality": "image", "index": 0}]
-    metadata = processor.get_mm_item_metadata([], data, order)
+    metadata = processor.get_mm_item_metadata([], data, [{"modality": modality, "index": 0}])
     metadata.validate()
-    assert metadata.item_refs == (("audio", 0), ("image", 0))
+    assert metadata.item_refs == ((modality, 0),)
     assert metadata.encoder_token_lengths is None
-    assert metadata.input_partitions["audio"]["audio_features_mask"].item_axis == 0
-    assert metadata.input_partitions["image"]["image_position_ids"].item_axis == 0
+    sibling = "image_position_ids" if modality == "image" else "audio_features_mask"
+    assert metadata.input_partitions[modality][sibling].item_axis == 0
+
+    # Requests with more than one input type are rejected at the input boundary.
+    with pytest.raises(ValueError, match="multiple multimodal input types"):
+        processor.get_mm_item_metadata([], dict(payloads))
 
 
 @pytest.mark.parametrize(
@@ -337,6 +344,9 @@ def _grid_for_rows(rows: int) -> list[int]:
     return [1, 1, rows]
 
 
+_VISION_INPUT_FIELDS = {"pixel_values": {"image": "pixel_values", "video": "pixel_values_videos"}}
+
+
 class _GroupedEncoderModel(MultimodalModelMixin):
     """Minimal model whose encoder serves image and video in one call.
 
@@ -357,21 +367,9 @@ class _GroupedEncoderModel(MultimodalModelMixin):
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self._encode,
-                build_batched_input=self._build_batched_input,
+                input_fields=_VISION_INPUT_FIELDS,
             ),
         )
-
-    @staticmethod
-    def _build_batched_input(params: list[MultimodalParams]) -> dict:
-        # Per the EncoderGroup contract: all items of the first modality across
-        # requests, then all items of the second.
-        pixels = []
-        for modality, pixel_key in (("image", "pixel_values"), ("video", "pixel_values_videos")):
-            for mp in params:
-                data = mp.multimodal_data.get(modality)
-                if data is not None:
-                    pixels.append(data[pixel_key])
-        return {"pixel_values": torch.cat(pixels, dim=0)}
 
     def _encode(self, pixel_values: torch.Tensor) -> torch.Tensor:
         self.encoder_calls.append(pixel_values.shape[0])
@@ -445,7 +443,7 @@ def test_qwen_profiling_dummy_supports_grouped_encoding(
     group = EncoderGroup(
         modalities=("image", "video"),
         encoder_fn=lambda pixel_values: pixel_values[::4],
-        build_batched_input=_GroupedEncoderModel._build_batched_input,
+        input_fields=_VISION_INPUT_FIELDS,
     )
     output = encode_multimodal_by_groups([group], [params])
     assert output.shape == (sum(expected_rows), HIDDEN)

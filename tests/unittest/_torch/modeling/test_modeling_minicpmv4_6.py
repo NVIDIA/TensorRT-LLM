@@ -33,6 +33,8 @@ once the pin is bumped (at which point the local shim can be removed).
 
 import copy
 import json
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -274,7 +276,11 @@ def test_minicpmv46_multimodal_forward():
     from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6Model
     from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
     from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
-    from tensorrt_llm.inputs.multimodal import MultimodalParams
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalItemMetadata,
+        MultimodalParams,
+    )
 
     raw = _minicpmv4_6_config_dict()
     raw.update(
@@ -350,10 +356,26 @@ def test_minicpmv46_multimodal_forward():
         pixels = torch.randn(1, 3, 2, 32, dtype=torch.bfloat16, device="cuda")
         target_sizes = torch.tensor([[4, 4]], dtype=torch.int32)
         image = MultimodalParams(
-            multimodal_data={"image": {"pixel_values": pixels, "target_sizes": target_sizes}}
+            multimodal_data={
+                "image": {
+                    "pixel_values": pixels.squeeze(0).permute(2, 0, 1),
+                    "target_sizes": target_sizes,
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
+            }
         )
         changed_image = MultimodalParams(
-            multimodal_data={"image": {"pixel_values": -pixels, "target_sizes": target_sizes}}
+            multimodal_data={
+                "image": {
+                    "pixel_values": -pixels.squeeze(0).permute(2, 0, 1),
+                    "target_sizes": target_sizes,
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[1]
+                ),
+            }
         )
         forward_kwargs = dict(
             attn_metadata=metadata,
@@ -430,3 +452,228 @@ def test_minicpmv46_vision_attn_capacity_is_stable_across_grids():
     grown = vision._make_attn_metadata([100])
     assert grown.max_seq_len == 128
     assert grown.seq_lens.tolist() == [100]
+
+
+def _main_minicpm_forward(self, multimodal_params):
+    pixel_values_list = []
+    target_sizes_list = []
+    for param in multimodal_params:
+        # Image and video share the NaViT-packed vision path. A request
+        # carries at most one modality (the input processor rejects mixed
+        # image+video requests), so the fixed image-then-video iteration
+        # order here is unambiguous and matches the placeholder order in
+        # `input_ids`.
+        for modality in ("image", "video"):
+            modality_data = param.multimodal_data.get(modality)
+            if modality_data is None:
+                continue
+            pixel_values_list.append(modality_data["pixel_values"])
+            target_sizes_list.append(modality_data["target_sizes"])
+
+    if not pixel_values_list:
+        return []
+
+    # NaViT packing: concat along the packed patch axis; target grids stack.
+    pixel_values = (
+        torch.cat(pixel_values_list, dim=-1) if len(pixel_values_list) > 1 else pixel_values_list[0]
+    )
+    target_sizes = (
+        torch.cat(target_sizes_list, dim=0) if len(target_sizes_list) > 1 else target_sizes_list[0]
+    )
+    target_sizes = target_sizes.to("cpu")
+
+    features = self._get_image_features(pixel_values, target_sizes)
+    fused = torch.cat(features, dim=0)
+
+    # Contract-4 invariants (this forward returns ONE pre-concatenated
+    # tensor that find_input_mm_embeds / _cache_multimodal_embeddings slice
+    # back per request):
+    #   I.  Order -- `features` are concatenated in `multimodal_params`
+    #       order; the loop above and the per-grid merger both preserve it,
+    #       which is exactly the order the downstream slicers assume. (Not
+    #       assertable cheaply -- covered by the multi-request E2E test.)
+    #   II. Count -- the produced row count must equal the sum of each
+    #       request's placeholder count (`total_embeds_in_request`). A
+    #       mismatch means the vision output and the fused `input_ids` will
+    #       misalign, so fail loudly here instead of silently scattering
+    #       wrong rows downstream. Only checked when every request carries
+    #       runtime counts (absent on some warmup / JIT paths).
+    runtimes = [p.multimodal_runtime for p in multimodal_params]
+    if all(r is not None and r.total_embeds_in_request is not None for r in runtimes):
+        expected = sum(r.total_embeds_in_request for r in runtimes)
+        assert fused.shape[0] == expected, (
+            f"MiniCPMV4_6 vision produced {fused.shape[0]} embedding rows "
+            f"but the batch's per-request placeholder counts sum to "
+            f"{expected}; vision output would misalign with input_ids."
+        )
+    return [fused]
+
+
+class _MiniCpmCpuEncoder:
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import MiniCPMV4_6VisionModel
+
+    mm_encoder_groups = MiniCPMV4_6VisionModel.mm_encoder_groups
+    encode_batched = MiniCPMV4_6VisionModel.encode_batched
+    forward = MiniCPMV4_6VisionModel.forward
+
+    def __init__(self):
+        self.calls = []
+
+    def _get_image_features(self, pixel_values, target_sizes):
+        self.calls.append((pixel_values, target_sizes))
+        packed = pixel_values.squeeze(0).permute(2, 0, 1).reshape(-1, 6)
+        result = []
+        offset = 0
+        for height, width in target_sizes:
+            count = int(height * width)
+            values = packed[offset : offset + count * 2]
+            result.append(values.reshape(count // 16, 32, 6).sum(dim=1))
+            offset += count * 2
+        return result
+
+
+def _minicpm_cpu_request(modality, grids, slices_per_item):
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import (
+        MiniCPMV4_6InputProcessor,
+        _MiniCPMItemLengthsProcessor,
+    )
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+        MultimodalParams,
+    )
+
+    processor = object.__new__(MiniCPMV4_6InputProcessor)
+    processor._config = SimpleNamespace(
+        text_config=SimpleNamespace(vocab_size=32), image_token_id=21, video_token_id=22
+    )
+    processor._dtype = torch.float32
+    processor._tokenizer = Mock()
+    processor.tllm_multimodal_token_id = 33
+    processor.image_token_str, processor.video_token_str = "<i>", "<v>"
+    target_sizes = torch.tensor(grids, dtype=torch.int32)
+    total = int(target_sizes.prod(dim=-1).sum())
+    pixels = torch.arange(total * 12, dtype=torch.float32).reshape(1, 3, 2, total * 2)
+    lengths = []
+    start = 0
+    for count in slices_per_item:
+        lengths.append(int(target_sizes[start : start + count].prod(dim=-1).sum()) // 16)
+        start += count
+    token = processor.image_token_str if modality == "image" else processor.video_token_str
+    pixel_key = "pixel_values" if modality == "image" else "pixel_values_videos"
+    size_key = "target_sizes" if modality == "image" else "target_sizes_videos"
+    media_inputs = {pixel_key: pixels, size_key: target_sizes}
+    if modality == "image":
+        media_inputs["num_patches_per_image"] = slices_per_item
+    else:
+        media_inputs["num_frames_per_video"] = slices_per_item
+        media_inputs["num_patches_per_frame"] = [1] * len(grids)
+    native_media = Mock(return_value=media_inputs, downsample_mode="16x")
+    media_processor = _MiniCPMItemLengthsProcessor(native_media, modality)
+
+    def preprocess(**kwargs):
+        result = dict(media_processor(**kwargs))
+        result.pop("num_patches_per_image", None)
+        result.pop("num_frames_per_video", None)
+        result.pop("num_patches_per_frame", None)
+        result["input_ids"] = torch.tensor([[21 if modality == "image" else 22] * sum(lengths)])
+        return result
+
+    processor._processor = Mock(side_effect=preprocess)
+    raw = (
+        {"image": [object()] * len(lengths)}
+        if modality == "image"
+        else {"video": [SimpleNamespace(frames=[object()], metadata={})] * len(lengths)}
+    )
+    _, extra = processor.call_with_text_prompt(
+        {"prompt": token * len(lengths), "multi_modal_data": raw}, None
+    )
+    assert "return_text_replacement_offsets" not in processor._processor.call_args.kwargs
+    data = extra["multimodal_data"]
+    order = [{"modality": modality, "index": index} for index in range(len(lengths))]
+    metadata = processor.get_mm_item_metadata([], data, order)
+    assert metadata.output_embedding_lengths == tuple(lengths)
+    assert processor.get_mm_item_metadata([], data).item_refs == metadata.item_refs
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = metadata
+    param = MultimodalParams(multimodal_data=data)
+    original = MultimodalParams(
+        multimodal_data={modality: {"pixel_values": pixels, "target_sizes": target_sizes}}
+    )
+    return param, original
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("case", ["single", "images", "videos", "mixed-batch"])
+def test_minicpm_declared_inputs_match_main(case):
+    if case == "single":
+        specs = [("image", [(4, 4)], [1])]
+    elif case == "images":
+        specs = [
+            ("image", [(4, 4), (4, 8), (8, 4)], [2, 1]),
+            ("image", [(8, 8)], [1]),
+        ]
+    elif case == "videos":
+        specs = [
+            ("video", [(4, 4), (4, 8), (8, 4)], [2, 1]),
+            ("video", [(8, 8)], [1]),
+        ]
+    else:
+        specs = [
+            ("video", [(4, 4), (4, 8)], [2]),
+            ("image", [(8, 4), (4, 4)], [1, 1]),
+            ("video", [(8, 8)], [1]),
+        ]
+    pairs = [_minicpm_cpu_request(*spec) for spec in specs]
+    encoder = _MiniCpmCpuEncoder()
+    actual = encoder.forward([param for param, _ in pairs])
+    assert len(actual) == 1
+    assert len(encoder.calls) == 1
+    reference_encoder = _MiniCpmCpuEncoder()
+    expected = torch.cat(
+        [_main_minicpm_forward(reference_encoder, [original])[0] for _, original in pairs]
+    )
+    assert torch.equal(actual[0], expected)
+    modality_order = [
+        original
+        for modality in ("image", "video")
+        for _, original in pairs
+        if modality in original.multimodal_data
+    ]
+    packed_reference = _MiniCpmCpuEncoder()
+    _main_minicpm_forward(packed_reference, modality_order)
+    for captured, oracle in zip(encoder.calls[0], packed_reference.calls[0]):
+        assert torch.equal(captured, oracle)
+        assert captured.dtype == oracle.dtype
+        assert captured.device == oracle.device
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tensor_counts", [False, True], ids=["hf57-list", "latest-tensor"])
+@pytest.mark.parametrize("downsample_mode", ["4x", "16x"])
+def test_minicpm_retains_video_item_lengths_before_hf_pops(tensor_counts, downsample_mode):
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import _MiniCPMItemLengthsProcessor
+
+    inputs = {
+        "target_sizes_videos": torch.tensor([[4, 4], [4, 8], [8, 4], [8, 8]]),
+        "num_patches_per_frame": torch.tensor([2, 1, 1]) if tensor_counts else [2, 1, 1],
+        "num_frames_per_video": [2, 1],
+    }
+    native = Mock(return_value=inputs, downsample_mode="16x")
+    processor = _MiniCPMItemLengthsProcessor(native, "video")
+    result = processor(downsample_mode=downsample_mode)
+    assert processor.downsample_mode == "16x"
+    result.pop("num_patches_per_frame")
+    result.pop("num_frames_per_video")
+    divisor = 4 if downsample_mode == "4x" else 16
+    lengths = result["video_output_embedding_lengths"]
+    assert torch.equal(lengths, torch.tensor([80 // divisor, 64 // divisor]))
+    assert lengths.dtype == torch.int64
+    assert lengths.device.type == "cpu"
+
+
+@pytest.mark.cpu_only
+def test_minicpm_processor_proxy_unpickles_without_recursive_attribute_lookup():
+    from tensorrt_llm._torch.models.modeling_minicpmv4_6 import _MiniCPMItemLengthsProcessor
+
+    uninitialized = object.__new__(_MiniCPMItemLengthsProcessor)
+    with pytest.raises(AttributeError):
+        getattr(uninitialized, "__setstate__")

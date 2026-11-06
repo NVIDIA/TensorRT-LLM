@@ -2,8 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, Dict, List, Tuple
 from unittest import mock
 from unittest.mock import MagicMock
 
@@ -17,6 +19,7 @@ from test_modeling_nemotron_h import extract_decode_logprobs
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.models import modeling_nemotron_h_multimodal as nemotron_h_multimodal
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import ConsumableWeightsDict
+from tensorrt_llm._torch.models.modeling_multimodal_mixin import encode_multimodal_by_groups
 from tensorrt_llm._torch.models.modeling_multimodal_utils import get_multimodal_embeddings
 from tensorrt_llm._torch.models.modeling_nemotron_h import NemotronHForCausalLM
 from tensorrt_llm._torch.models.modeling_nemotron_h_multimodal import (
@@ -942,6 +945,7 @@ class TestEncodeAudio:
         model = mock.MagicMock(spec=NemotronHMultimodalModel)
         model.sound_encoder = stub
         model.model_dtype = torch.float32
+        model._encode_audio_clips = partial(NemotronHMultimodalModel._encode_audio_clips, model)
 
         # Two inputs with different time / clip counts.
         a1 = self._make_audio_data(num_clips=2, time_len=10, valid_lens=[10, 6])
@@ -970,6 +974,244 @@ class TestEncodeAudio:
         assert NemotronHMultimodalModel._encode_audio(model, []) == []
 
 
+# Verbatim copies of main's `NemotronHMultimodalModel._encode_audio` and
+# `NemotronHVisionEncoder._encode_fixed_tile`: main packed standalone audio and
+# fixed-tile images itself before the encoder groups declared their fields.
+
+
+def _main_encode_audio(self, audio_data_list: List[dict]) -> List[Tuple[torch.Tensor, List[int]]]:
+    """Encode a batch of audio feature dicts in a single ``sound_encoder`` call.
+
+    Inputs may have different time dimensions (variable mel-feature
+    lengths). They are zero-padded to the max time across the inputs
+    and the per-clip ``feature_attention_mask`` is padded to match;
+    the encoder uses the mask to keep valid output lengths intact, so
+    padded positions don't leak into the kept slice. Returns one
+    ``(per_input_embeddings, per_clip_token_counts)`` tuple per input,
+    in input order.
+    """
+    if not audio_data_list:
+        return []
+
+    max_time = max(ad["input_audio_features"].shape[1] for ad in audio_data_list)
+
+    padded_features: List[torch.Tensor] = []
+    padded_masks: List[torch.Tensor] = []
+    clips_per_input: List[int] = []
+    valid_output_lens: List[int] = []
+    has_output_lengths = all(ad.get("audio_output_lengths") is not None for ad in audio_data_list)
+    for audio_data in audio_data_list:
+        features = audio_data["input_audio_features"].to(dtype=self.model_dtype)
+        mask = audio_data["feature_attention_mask"]
+        if has_output_lengths:
+            valid_output_lens.extend(audio_data["audio_output_lengths"].tolist())
+        pad_amount = max_time - features.shape[1]
+        if pad_amount > 0:
+            features = torch.nn.functional.pad(features, (0, 0, 0, pad_amount))
+            mask = torch.nn.functional.pad(mask, (0, pad_amount))
+        padded_features.append(features)
+        padded_masks.append(mask)
+        clips_per_input.append(features.shape[0])
+
+    all_features = torch.cat(padded_features, dim=0)
+    all_masks = torch.cat(padded_masks, dim=0)
+
+    sound_embeds = self.sound_encoder(all_features, all_masks)
+
+    if not has_output_lengths:
+        # Compatibility for feature dicts not built by ParakeetExtractor.
+        # Keep one batched readback rather than synchronizing per input.
+        valid_output_lens = self.sound_encoder.encoder._get_subsampling_output_length(
+            all_masks.sum(dim=1)
+        ).tolist()
+
+    per_clip_embeds: List[torch.Tensor] = []
+    per_clip_counts: List[int] = []
+    for i in range(sound_embeds.shape[0]):
+        valid_len = valid_output_lens[i]
+        per_clip_embeds.append(sound_embeds[i, :valid_len])
+        per_clip_counts.append(valid_len)
+
+    results: List[Tuple[torch.Tensor, List[int]]] = []
+    cursor = 0
+    for n_clips in clips_per_input:
+        input_embeds = torch.cat(per_clip_embeds[cursor : cursor + n_clips], dim=0)
+        input_counts = per_clip_counts[cursor : cursor + n_clips]
+        results.append((input_embeds, input_counts))
+        cursor += n_clips
+    return results
+
+
+def _main_encode_fixed_tile(self, data_list: List[Dict[str, Any]]) -> List[torch.Tensor]:
+    """Encode all fixed-tile requests (images + T==1 videos) in a single ViT forward.
+
+    Returns one 3-D embedding tensor per request, in input order.
+    """
+    if not data_list:
+        return []
+    pixel_values = torch.cat([data["pixel_values"] for data in data_list], dim=0)
+    patches_per_request = [data["pixel_values"].shape[0] for data in data_list]
+    batched_embeds = self.extract_feature(pixel_values)
+    return list(torch.split(batched_embeds, patches_per_request, dim=0))
+
+
+def _main_encode_tile_images(vision, multimodal_params):
+    """Main's image group for fixed tiles: `_encode_fixed_tile`, then each
+    request's rows reshaped to `[rows, hidden]` (`forward`) and joined."""
+    per_request = _main_encode_fixed_tile(
+        vision, [p.multimodal_data["image"] for p in multimodal_params]
+    )
+    return torch.cat([embed.reshape(-1, vision.llm_hidden_size) for embed in per_request])
+
+
+@pytest.mark.cpu_only
+class TestEncoderGroupsMatchMain:
+    """Standalone audio and fixed-tile images now declare their payload fields;
+    the framework joins them across requests. Batched encoding must equal main's
+    packing with the same encoder calls, so the outputs are equal exactly."""
+
+    HIDDEN = TestEncodeAudio.HIDDEN
+    TOKENS_PER_TILE = 2
+
+    def _tile_extract_feature(self, pixel_values):
+        # Per-tile stand-in for RADIO + pixel shuffle + mlp1: [tiles, tokens, hidden].
+        flat = pixel_values.reshape(pixel_values.shape[0], -1)
+        return (
+            flat[:, : self.TOKENS_PER_TILE * self.HIDDEN].reshape(
+                -1, self.TOKENS_PER_TILE, self.HIDDEN
+            )
+            * 2.0
+            + 1.0
+        )
+
+    def _model(self):
+        """The real group declarations and encoder_fns, bound to CPU stubs."""
+        calls = {"tiles": 0, "audio": 0}
+        vision = SimpleNamespace(llm_hidden_size=self.HIDDEN, dynamic_resolution=False)
+
+        def extract_feature(pixel_values):
+            calls["tiles"] += 1
+            return self._tile_extract_feature(pixel_values)
+
+        vision.extract_feature = extract_feature
+        vision.encode_image_tiles = lambda **fields: NemotronHVisionEncoder.encode_image_tiles(
+            vision, **fields
+        )
+        vision.image_tile_group = NemotronHVisionEncoder.image_tile_group.fget(vision)
+        torch.manual_seed(0)
+        sound = TestEncodeAudio._make_stub_sound_encoder(TestEncodeAudio())
+
+        def sound_encoder(features, mask):
+            calls["audio"] += 1
+            return sound(features, mask)
+
+        sound_encoder.encoder = sound.encoder
+        model = SimpleNamespace(
+            vision_encoder=vision, sound_encoder=sound_encoder, model_dtype=torch.float32
+        )
+        for name in ("_encode_audio_group", "_encode_audio_clips", "_encode_audio"):
+            setattr(model, name, partial(getattr(NemotronHMultimodalModel, name), model))
+        model._encode_image_group = model._encode_video_group = None
+        model.mm_encoder_groups = NemotronHMultimodalModel.mm_encoder_groups.fget(model)
+        return model, calls
+
+    def _audio(self, valid_lens, time_len, with_lengths=True):
+        data = TestEncodeAudio._make_audio_data(
+            TestEncodeAudio(), len(valid_lens), time_len, valid_lens
+        )
+        if with_lengths:
+            data["audio_output_lengths"] = torch.tensor(
+                [n // TestEncodeAudio.SUBSAMPLE for n in valid_lens], dtype=torch.int32
+            )
+        return data
+
+    def _tiles(self, num_tiles):
+        return {"pixel_values": torch.randn(num_tiles, 3, 4, 4)}
+
+    def _request(self, items):
+        """`items`: prompt-ordered `(modality, payload)` pairs, at most one per modality."""
+        data = dict(items)
+        lengths = []
+        for modality, payload in items:
+            if modality == "image":
+                lengths.append(payload["pixel_values"].shape[0] * self.TOKENS_PER_TILE)
+            else:
+                lengths.append(
+                    int(
+                        (payload["feature_attention_mask"].sum(dim=1) // TestEncodeAudio.SUBSAMPLE)
+                        .sum()
+                        .item()
+                    )
+                )
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            [(modality, 0) for modality, _ in items], output_embedding_lengths=lengths
+        )
+        return MultimodalParams(multimodal_data=data)
+
+    @pytest.mark.parametrize("precomputed_lengths", [True, False, "some"])
+    def test_audio_group_matches_main(self, precomputed_lengths):
+        torch.manual_seed(0)
+        model, calls = self._model()
+        audios = [
+            self._audio([10, 6], 10, precomputed_lengths is not False),
+            self._audio([12], 14, precomputed_lengths is True),
+            self._audio([4, 8, 2], 8, precomputed_lengths is not False),
+        ]
+        params = [self._request([("audio", audio)]) for audio in audios]
+        expected = torch.cat([emb for emb, _ in _main_encode_audio(model, audios)])
+        calls["audio"] = 0
+        actual = encode_multimodal_by_groups(model.mm_encoder_groups, params)
+        # One sound_encoder call over the clips main padded the same way. Payloads
+        # without output lengths are encoded apart, so only that case changes the
+        # call shape (and so the FP order).
+        if precomputed_lengths == "some":
+            assert calls["audio"] == 2
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        else:
+            assert calls["audio"] == 1
+            assert torch.equal(actual, expected)
+
+    def test_tile_image_group_matches_main(self):
+        torch.manual_seed(0)
+        model, calls = self._model()
+        params = [self._request([("image", self._tiles(n))]) for n in (1, 3, 2)]
+        expected = _main_encode_tile_images(model.vision_encoder, params)
+        calls["tiles"] = 0
+        actual = encode_multimodal_by_groups(model.mm_encoder_groups, params)
+        assert torch.equal(actual, expected)
+        assert calls["tiles"] == 1
+
+    def test_mixed_requests_keep_prompt_order(self):
+        """Audio before an image in one prompt, and requests of one modality around it."""
+        torch.manual_seed(0)
+        model, calls = self._model()
+        image_a, image_b = self._tiles(2), self._tiles(1)
+        audio_a, audio_b = self._audio([10, 6], 10), self._audio([12], 14)
+        params = [
+            self._request([("image", image_a)]),
+            self._request([("audio", audio_a), ("image", image_b)]),
+            self._request([("audio", audio_b)]),
+        ]
+        image_rows = [
+            _main_encode_tile_images(model.vision_encoder, [self._request([("image", image)])])
+            for image in (image_a, image_b)
+        ]
+        audio_rows = [emb for emb, _ in _main_encode_audio(model, [audio_a, audio_b])]
+        expected = torch.cat([image_rows[0], audio_rows[0], image_rows[1], audio_rows[1]])
+        calls.update(tiles=0, audio=0)
+        actual = encode_multimodal_by_groups(model.mm_encoder_groups, params)
+        assert torch.equal(actual, expected)
+        assert calls == {"tiles": 1, "audio": 1}
+
+    def test_dynamic_resolution_images_keep_the_routed_group(self):
+        model, _ = self._model()
+        model.vision_encoder.dynamic_resolution = True
+        model._encode_image_group = MagicMock()
+        image_group = NemotronHMultimodalModel.mm_encoder_groups.fget(model)[0]
+        assert image_group.input_fields is None
+        assert image_group.encoder_fn is model._encode_image_group
+
+
 @pytest.mark.cpu_only
 class TestChunkedPrefillCaching:
     """Verify chunked-prefill caching still works through the group encoder path.
@@ -988,6 +1230,9 @@ class TestChunkedPrefillCaching:
     def _make_mock_model(self):
         model = mock.MagicMock(spec=NemotronHMultimodalModel)
         model.vision_encoder = mock.MagicMock(spec=NemotronHVisionEncoder)
+        # These vision payloads are stand-ins that the stubbed vision encoder
+        # reads off the params, as it does for dynamic-resolution images.
+        model.vision_encoder.dynamic_resolution = True
         model.sound_encoder = mock.MagicMock(spec=ProjectedParakeet)
         return model
 
@@ -1018,36 +1263,14 @@ class TestChunkedPrefillCaching:
         )
 
     def _make_encoder_fn(self, model):
-        """Route through `encode_multimodal_by_groups` with real group methods
-        bound to the mock's stubbed sub-encoders — matches the production
+        """Route through `encode_multimodal_by_groups` with the model's real
+        groups, whose encoder_fns are the real methods bound to the mock's
+        stubbed sub-encoders — matches the production
         `NemotronHMultimodalModel.forward` path.
-
-        The group encoder_fns are invoked via `**build_batched_input(...)`,
-        which spreads the pack dict as kwargs — so the wrappers must accept
-        `multimodal_params` by keyword.
         """
-        from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
-            EncoderGroup,
-            encode_multimodal_by_groups,
-        )
-
-        def _pack(params):
-            return {"multimodal_params": params}
-
-        def _run_group(method):
-            return lambda multimodal_params: method(model, multimodal_params)
-
-        groups = (
-            EncoderGroup(
-                ("image",), _run_group(NemotronHMultimodalModel._encode_image_group), _pack
-            ),
-            EncoderGroup(
-                ("video",), _run_group(NemotronHMultimodalModel._encode_video_group), _pack
-            ),
-            EncoderGroup(
-                ("audio",), _run_group(NemotronHMultimodalModel._encode_audio_group), _pack
-            ),
-        )
+        for name in ("_encode_image_group", "_encode_video_group", "_encode_audio_group"):
+            setattr(model, name, partial(getattr(NemotronHMultimodalModel, name), model))
+        groups = NemotronHMultimodalModel.mm_encoder_groups.fget(model)
         return lambda params: encode_multimodal_by_groups(groups, params)
 
     @pytest.mark.parametrize("modality", ["image", "video"])
@@ -1082,9 +1305,14 @@ class TestChunkedPrefillCaching:
     def test_audio_encoder_not_called_on_second_chunk(self):
         model = self._make_mock_model()
         fake_emb = torch.randn(self.NUM_TOKENS, self.HIDDEN)
-        model._encode_audio = mock.MagicMock(return_value=[(fake_emb, [self.NUM_TOKENS])])
+        model._encode_audio_clips = mock.MagicMock(return_value=([fake_emb], [self.NUM_TOKENS]))
 
-        param = self._make_param_with_runtime("audio", self.NUM_TOKENS, audio={})
+        audio = {
+            "input_audio_features": torch.zeros(1, 2 * self.NUM_TOKENS, 4),
+            "feature_attention_mask": torch.ones(1, 2 * self.NUM_TOKENS, dtype=torch.long),
+            "audio_output_lengths": torch.tensor([self.NUM_TOKENS]),
+        }
+        param = self._make_param_with_runtime("audio", self.NUM_TOKENS, audio=audio)
         encoder_fn = self._make_encoder_fn(model)
 
         result = get_multimodal_embeddings(
@@ -1092,14 +1320,14 @@ class TestChunkedPrefillCaching:
             multimodal_params=[param],
         )
         assert len(result) == 1
-        assert model._encode_audio.call_count == 1
+        assert model._encode_audio_clips.call_count == 1
 
         result2 = get_multimodal_embeddings(
             encoder_forward_fn=encoder_fn,
             multimodal_params=[param],
         )
-        assert model._encode_audio.call_count == 1, (
-            "`_encode_audio` was called again on the second chunk. Caching is broken."
+        assert model._encode_audio_clips.call_count == 1, (
+            "`_encode_audio_clips` was called again on the second chunk. Caching is broken."
         )
         assert torch.equal(result2[0], result[0])
 

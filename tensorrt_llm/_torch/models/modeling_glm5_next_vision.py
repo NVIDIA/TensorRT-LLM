@@ -708,7 +708,7 @@ class Glm5NextVisionModelBase(nn.Module):
         """Run the tower over HF-processor pixel rows (images and video frame
         pairs share one layout: ``[patches, C * T * P * P]``)."""
         pixel_values = pixel_values.to(device=self.visual.device, dtype=self.model_dtype)
-        return self.visual(pixel_values, grid_thw=grid_thw)
+        return self.visual(pixel_values, grid_thw=grid_thw.to(pixel_values.device))
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
@@ -718,7 +718,10 @@ class Glm5NextVisionModelBase(nn.Module):
             EncoderGroup(
                 modalities=("image", "video"),
                 encoder_fn=self.encode_batched,
-                build_batched_input=_glm5_next_build_batched_input,
+                input_fields={
+                    "pixel_values": {"image": "pixel_values", "video": "pixel_values_videos"},
+                    "grid_thw": {"image": "image_grid_thw", "video": "video_frame_grid_thw"},
+                },
             ),
         )
 
@@ -733,26 +736,6 @@ def _flatten_video_grid_thw(video_grid_thw: torch.Tensor) -> torch.Tensor:
     t = video_grid_thw[:, 0]
     hw = torch.repeat_interleave(video_grid_thw[:, 1:], t, dim=0)
     return torch.cat([hw.new_ones(hw.shape[0], 1), hw], dim=1)
-
-
-def _glm5_next_build_batched_input(multimodal_params: List[MultimodalParams]) -> Dict[str, Any]:
-    pixels: List[torch.Tensor] = []
-    grids: List[torch.Tensor] = []
-    for param in multimodal_params:
-        bucket = param.multimodal_data.get("image")
-        if bucket is not None:
-            pixels.append(bucket["pixel_values"])
-            grids.append(bucket["image_grid_thw"])
-    for param in multimodal_params:
-        bucket = param.multimodal_data.get("video")
-        if bucket is not None:
-            pixels.append(bucket["pixel_values_videos"])
-            grids.append(_flatten_video_grid_thw(bucket["video_grid_thw"]))
-    device = pixels[0].device
-    return {
-        "pixel_values": torch.cat(pixels, dim=0),
-        "grid_thw": torch.cat([g.to(device) for g in grids], dim=0),
-    }
 
 
 class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInputsBuilder):
@@ -870,6 +853,55 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             )["video_grid_thw"]
         grid = torch.as_tensor(video_grid_thw)
         return int(grid.prod(dim=-1).sum().item()) // self.spatial_merge_unit
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids, multimodal_data, mm_item_order)
+        if metadata is not None:
+            return metadata
+        costs = {}
+        for modality, grid_key in (("image", "image_grid_thw"), ("video", "video_grid_thw")):
+            data = multimodal_data.get(modality)
+            if isinstance(data, dict):
+                costs[modality] = data[grid_key].prod(dim=-1).tolist()
+        if not costs:
+            return None
+        rows = {
+            modality: [cost // self.spatial_merge_unit for cost in lengths]
+            for modality, lengths in costs.items()
+        }
+        if mm_item_order:
+            refs = [(entry["modality"], entry["index"]) for entry in mm_item_order]
+        elif len(rows) == 1:
+            modality = next(iter(rows))
+            refs = [(modality, index) for index in range(len(rows[modality]))]
+        else:
+            refs = []
+            indices = {modality: 0 for modality in rows}
+            remaining = {modality: 0 for modality in rows}
+            token_modalities = {
+                int(self.config.image_token_id): "image",
+                int(self.config.video_token_id): "video",
+            }
+            for token in prompt_token_ids:
+                modality = token_modalities.get(token)
+                if modality not in rows:
+                    continue
+                if remaining[modality] == 0:
+                    index = indices[modality]
+                    refs.append((modality, index))
+                    remaining[modality] = rows[modality][index]
+                    indices[modality] += 1
+                remaining[modality] -= 1
+        return MultimodalItemMetadata(
+            refs,
+            encoder_token_lengths=[costs[modality][index] for modality, index in refs],
+            output_embedding_lengths=[rows[modality][index] for modality, index in refs],
+        )
 
     # -- profiling dummies ----------------------------------------------------
     def _max_grid_side(self, max_patches: int) -> int:
@@ -1000,6 +1032,7 @@ class Glm5NextInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
             multimodal_data["video"] = {
                 "pixel_values_videos": processed["pixel_values_videos"].to(self._dtype),
                 "video_grid_thw": processed["video_grid_thw"],
+                "video_frame_grid_thw": _flatten_video_grid_thw(processed["video_grid_thw"]),
             }
         fused_input_ids = processed["input_ids"][0]
         return fused_input_ids.to(torch.int32).tolist(), {"multimodal_data": multimodal_data}

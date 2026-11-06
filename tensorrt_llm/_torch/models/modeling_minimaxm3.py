@@ -80,6 +80,7 @@ from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_co
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (
     DecoderModel,
@@ -3202,6 +3203,32 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             allow_partial_loading=allow_partial_loading,
         )
 
+    @property
+    def multimodal_data_device_paths(self) -> List[str]:
+        return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
+
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self._encode_vision,
+                input_fields={
+                    "pixel_values": {"image": "pixel_values", "video": "pixel_values_videos"},
+                    "grid_thw": {"image": "image_grid_thw", "video": "video_grid_thw"},
+                },
+            ),
+        )
+
+    def _encode_vision(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        weight = self.model.embed_tokens.weight
+        vision_dtype = getattr(self.vision_tower, "dtype", weight.dtype)
+        feats = self.vision_tower(
+            pixel_values=pixel_values.to(device=weight.device, dtype=vision_dtype),
+            grid_thw=grid_thw,
+        )
+        return feats.to(dtype=weight.dtype, device=weight.device)
+
     def forward(
         self,
         attn_metadata: "AttentionMetadata",
@@ -3282,25 +3309,11 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # the runtime via kwargs, or falls back to scanning
             # ``input_ids`` for ``mm_token_ids`` — exactly the right
             # semantics for visual-input requests.
-            from .modeling_minimaxm3_vl import extract_multimodal_items_in_request_order
             from .modeling_multimodal_utils import find_input_mm_embeds, fuse_input_embeds
 
-            # Walk ``multimodal_params`` in left-to-right request order
-            # and produce ``mm_embeds`` per-item so the concatenated rows
-            # match ``mm_token_indices`` in prompt order — required for
-            # mixed image+video prompts.
-            items = extract_multimodal_items_in_request_order(mm_params_with_data)
             embed_tokens = self.model.embed_tokens
             flat_ids = input_ids.flatten()
-            mm_embeds: List[torch.Tensor] = []
-            vision_dtype = getattr(self.vision_tower, "dtype", embed_tokens.weight.dtype)
-            vision_device = embed_tokens.weight.device
-            for item in items:
-                feats = self.vision_tower(
-                    pixel_values=item["pixel_values"].to(device=vision_device, dtype=vision_dtype),
-                    grid_thw=item["grid_thw"],
-                )
-                mm_embeds.append(feats.to(dtype=embed_tokens.weight.dtype, device=vision_device))
+            mm_embeds = encode_multimodal_by_groups(self.mm_encoder_groups, mm_params_with_data)
 
             # ``self.mm_token_ids`` covers both image and video
             # placeholders and is registered as a buffer in __init__ so
@@ -3314,7 +3327,7 @@ class MiniMaxM3VLForConditionalGeneration(MiniMaxM3ForCausalLM):
             # this forward (``multimodal_runtime`` carries the counts). The
             # list is pre-concatenated in request order so one cursor covers
             # multi-image requests.
-            mm_embeds = find_input_mm_embeds([torch.cat(mm_embeds, dim=0)], mm_params_with_data)
+            mm_embeds = find_input_mm_embeds([mm_embeds], mm_params_with_data)
             if mm_embeds:
                 fused_ids, fused_embeds = fuse_input_embeds(
                     embedding_layer=embed_tokens,

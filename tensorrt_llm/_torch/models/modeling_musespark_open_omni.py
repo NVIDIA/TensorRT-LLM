@@ -64,13 +64,17 @@ from ...inputs import (
     TextPrompt,
     register_input_processor,
 )
-from ...inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY
+from ...inputs.multimodal import MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..model_config import ModelConfig
 from ..modules.embedding import Embedding
 from .checkpoints.hf.musespark_open_weight_mapper import load_musespark_open_omni_weights
-from .modeling_multimodal_mixin import MultimodalModelMixin
+from .modeling_multimodal_mixin import (
+    EncoderGroup,
+    MultimodalModelMixin,
+    encode_multimodal_by_groups,
+)
 from .modeling_musespark_open import MuseSparkOpenForCausalLM
 from .modeling_utils import register_auto_model, register_vision_encoder
 from .musespark_open_audio import (
@@ -482,7 +486,7 @@ class MuseSparkInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyI
             }
         # Profiling calls this directly, bypassing input preparation, so the
         # dummy data carries the item record that preparation would have added:
-        # the encoder orders mixed-modality items by it.
+        # grouped encoding splits and orders the encoder rows by it.
         item_refs: List[Tuple[str, int]] = []
         output_rows: List[int] = []
         for modality, payload in data.items():
@@ -801,9 +805,8 @@ def _sampling_from(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 
 #: The two pixel modalities the vision tower encodes, and where each keeps its
-#: geometry. This order is not prompt order; :func:`_items_in_prompt_order`
-#: restores that. Audio is handled alongside, not here: its items are
-#: waveforms, not pixel/grid pairs.
+#: geometry. Audio is handled alongside, not here: its items are waveforms, not
+#: pixel/grid pairs.
 _VISION_MODALITIES: Tuple[Tuple[str, str], ...] = (
     ("image", "image_grid_thw"),
     ("video", "video_grid_thw"),
@@ -838,52 +841,6 @@ def validate_vision_segment_lengths(mm_data: Dict[str, Any], max_seq_len: int) -
                     f"vision attention segment length {segment} exceeds the configured maximum "
                     f"{max_seq_len}; raise the encoder token budget or lower max_pixels"
                 )
-
-
-def _per_item_chunks(
-    item: Dict[str, Any], grid_key: str
-) -> List[Tuple[torch.Tensor, torch.Tensor]]:
-    """Split one modality's packed tensors back into per-item pairs.
-
-    `call_with_text_prompt` concatenates every item of a modality into one
-    `pixel_values` and stacks their grids, so item boundaries survive only in
-    the grid: row `i` describes `t * h * w` patches. Reading them off the
-    grid is a HOST read, not a device sync -- `multimodal_data_device_paths`
-    deliberately leaves `*_grid_thw` behind, and the tower's
-    `_host_grid_rows` raises if it ever arrives on the device.
-    """
-    values, grid = item["pixel_values"], item[grid_key]
-    chunks: List[Tuple[torch.Tensor, torch.Tensor]] = []
-    start = 0
-    for row in grid:
-        patches = int(row[0]) * int(row[1]) * int(row[2])
-        chunks.append((values[start : start + patches], row.reshape(1, -1)))
-        start += patches
-    if start != values.shape[0]:
-        raise ValueError(
-            f"{grid_key} describes {start} patches but pixel_values holds "
-            f"{values.shape[0]}; the input processor and the encoder disagree on geometry"
-        )
-    return chunks
-
-
-def _per_audio_chunks(item: Dict[str, Any]) -> List[torch.Tensor]:
-    """Split one request's packed audio back into per-clip waveforms.
-
-    `call_with_text_prompt` concatenates every clip into one 1-D
-    `waveforms` tensor; the boundaries survive in `sample_counts`, which
-    stays on the HOST (it is absent from `multimodal_data_device_paths`), so
-    reading it here is not a device sync.
-    """
-    waveforms, counts = item["waveforms"], item["sample_counts"]
-    lengths = [int(count) for count in counts]
-    if sum(lengths) != waveforms.shape[0]:
-        raise ValueError(
-            f"audio sample_counts describes {sum(lengths)} samples but waveforms "
-            f"holds {waveforms.shape[0]}; the input processor and the encoder "
-            "disagree on the packing"
-        )
-    return list(torch.split(waveforms, lengths))
 
 
 #: Per modality: the id that opens one expanded item, the id that closes it,
@@ -965,57 +922,6 @@ def item_metadata_from_prompt(
     return MultimodalItemMetadata(item_refs, output_embedding_lengths=output_rows)
 
 
-def _items_in_prompt_order(params: Any) -> List[Tuple[str, Any]]:
-    """One request's media items as `(modality, payload)`, in prompt order.
-
-    The payload is `(pixel_values, grid_thw)` for image/video and a 1-D
-    waveform tensor for audio.
-
-    `fuse_input_embeds` writes the encoder's rows into the prompt's media
-    positions left to right, so rows must come out in prompt order, which is
-    the order of the request's `item_metadata.item_refs`. Within one
-    modality, item order already is prompt order, so a single-modality request
-    needs no record. Reordering the encoder input rather than its output is
-    exact because both towers process each item independently.
-    """
-    data = params.multimodal_data or {}
-    per_modality: Dict[str, List[Any]] = {
-        modality: _per_item_chunks(data[modality], grid_key)
-        for modality, grid_key in _VISION_MODALITIES
-        if data.get(modality)
-    }
-    if data.get("audio"):
-        per_modality["audio"] = _per_audio_chunks(data["audio"])
-    if not per_modality:
-        return []
-
-    metadata = params.item_metadata
-    if metadata is None:
-        if len(per_modality) > 1:
-            raise ValueError(
-                f"request carries {sorted(per_modality)} but no prompt-ordered item "
-                "metadata; a mixed-modality request must state its prompt order"
-            )
-        modality, chunks = next(iter(per_modality.items()))
-        return [(modality, chunk) for chunk in chunks]
-
-    ordered: List[Tuple[str, Any]] = []
-    for modality, index in metadata.item_refs:
-        chunks = per_modality.get(modality)
-        if chunks is None:
-            # A modality that arrived with no data attached; the count check
-            # below catches a record/data mismatch.
-            continue
-        ordered.append((modality, chunks[index]))
-    expected = sum(len(chunks) for chunks in per_modality.values())
-    if len(ordered) != expected:
-        raise ValueError(
-            f"the item metadata names {len(ordered)} of the {expected} media items "
-            "attached to the request; every item must appear exactly once"
-        )
-    return ordered
-
-
 class MuseSparkOpenVisionEncoder(nn.Module):
     """Runs the towers once over every media item in the batch.
 
@@ -1025,18 +931,17 @@ class MuseSparkOpenVisionEncoder(nn.Module):
     placeholder count across the batch, which is what the mixin checks the
     result against before merging and caching it.
 
-    Rows come out in request order and, within a request, in prompt order
-    (see :func:`_items_in_prompt_order`). Both towers emit decoder-width
-    (`hidden_size`) rows, un-normed: the decoder applies its weightless
-    `embed_norm` to the merged embedding tensor exactly once, text, vision
-    and audio alike.
+    Rows come out in request order and, within a request, in prompt order:
+    `encode_multimodal_by_groups` restores it from each request's
+    `item_metadata`. Both towers emit decoder-width (`hidden_size`) rows,
+    un-normed: the decoder applies its weightless `embed_norm` to the merged
+    embedding tensor exactly once, text, vision and audio alike.
     """
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         self.tower = MuseSparkOpenNaViTVisionTower(model_config)
         config = model_config.pretrained_config
-        self._vision_config = config.vision_config
         # Same config gate as the input processor. The audio tower is plain
         # torch in BF16 and never quantized: the checkpoint stores it in BF16
         # with no scales (see musespark_open_audio.py).
@@ -1045,35 +950,41 @@ class MuseSparkOpenVisionEncoder(nn.Module):
         if audio_args.get("input_mode") == "wav":
             self.audio_tower = MuseSparkOpenAudioEncoder(config.hidden_size)
 
-    def forward(self, multimodal_params: List[Any]) -> torch.Tensor:
-        ordered: List[Tuple[str, Any]] = []
-        for params in multimodal_params:
-            ordered.extend(_items_in_prompt_order(params))
-        if not ordered:
-            return torch.empty(0)
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """Images and video clips share one vision tower call; audio has its own.
 
-        pixel_values, grids, waveforms = [], [], []
-        for modality, payload in ordered:
-            if modality == "audio":
-                waveforms.append(payload)
-            else:
-                values, grid = payload
-                pixel_values.append(values)
-                grids.append(grid)
+        The vision tower is packed variable-resolution, so one pass over every
+        image and video of the batch replaces per-item passes.
+        """
+        return (
+            EncoderGroup(
+                modalities=("image", "video"),
+                encoder_fn=self._encode_vision,
+                input_fields={
+                    "pixel_values": {"image": "pixel_values", "video": "pixel_values"},
+                    "grid_thw": {"image": "image_grid_thw", "video": "video_grid_thw"},
+                },
+            ),
+            EncoderGroup(
+                modalities=("audio",),
+                encoder_fn=self._encode_audio,
+                input_fields={
+                    "waveforms": {"audio": "waveforms"},
+                    "sample_counts": {"audio": "sample_counts"},
+                },
+            ),
+        )
 
-        vision_rows = None
-        if pixel_values:
-            # The preprocessing normalizes `(x/255 - 0.5)/0.5` in fp32, the
-            # reference's arithmetic, and the engine stages `pixel_values` to
-            # the device without changing its dtype, so the cast to the tower's
-            # dtype happens here.
-            packed = torch.cat(pixel_values, dim=0).to(dtype=self.tower.dtype)
-            # One tower pass for the whole vision batch: the tower is packed
-            # variable-resolution, so per-item passes would only add launches.
-            vision_rows = self.tower(packed, torch.cat(grids, dim=0))
-        if not waveforms:
-            return vision_rows
+    def _encode_vision(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
+        # The preprocessing normalizes `(x/255 - 0.5)/0.5` in fp32, the
+        # reference's arithmetic, and the engine stages `pixel_values` to the
+        # device without changing its dtype, so the cast to the tower's dtype
+        # happens here. The grids stay on the host (see
+        # `multimodal_data_device_paths`).
+        return self.tower(pixel_values.to(dtype=self.tower.dtype), grid_thw)
 
+    def _encode_audio(self, waveforms: torch.Tensor, sample_counts: torch.Tensor) -> torch.Tensor:
         if self.audio_tower is None:
             # The input processor refuses audio when the config disables it,
             # so reaching here means data arrived through a path that skipped
@@ -1085,34 +996,15 @@ class MuseSparkOpenVisionEncoder(nn.Module):
                 "!= 'wav')"
             )
         # Per-clip passes: clips have unequal lengths and each is padded
-        # independently to its own multiple of 1920. The tower casts the
-        # float32 waveform to its own dtype (BF16).
-        audio_rows = self.audio_tower(waveforms)
-        if vision_rows is None:
-            return torch.cat(audio_rows, dim=0)
+        # independently to its own multiple of 1920. `sample_counts` stays on
+        # the host, so splitting the packed waveforms is a host read. The tower
+        # casts the float32 waveform to its own dtype (BF16).
+        clips = torch.split(waveforms, sample_counts.tolist())
+        return torch.cat(self.audio_tower(list(clips)), dim=0)
 
-        # Interleave back into prompt order. The vision tower emitted its rows
-        # in the order its items appear in `ordered`; per-item row counts
-        # come from the grids, a host read (see _per_item_chunks).
-        rows: List[torch.Tensor] = []
-        vision_offset, audio_index = 0, 0
-        for modality, payload in ordered:
-            if modality == "audio":
-                rows.append(audio_rows[audio_index])
-                audio_index += 1
-            else:
-                _, grid = payload
-                count = num_placeholder_rows(
-                    [int(x) for x in grid.reshape(-1)], self._vision_config
-                )
-                rows.append(vision_rows[vision_offset : vision_offset + count])
-                vision_offset += count
-        if vision_offset != vision_rows.shape[0]:
-            raise ValueError(
-                f"vision tower emitted {vision_rows.shape[0]} rows but the grids "
-                f"describe {vision_offset}; the interleave would misalign audio"
-            )
-        return torch.cat(rows, dim=0)
+    def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        """Encoder-only entry: one tensor of rows in request, then prompt, order."""
+        return [encode_multimodal_by_groups(self.mm_encoder_groups, multimodal_params)]
 
 
 @register_vision_encoder(MuseSparkOpenVisionEncoder)
@@ -1295,15 +1187,17 @@ class MuseSparkForConditionalGeneration(MultimodalModelMixin, PreTrainedModel):
             "multimodal_embedding",
         ]
 
-    def encode_multimodal_inputs(self, multimodal_params: List[Any]) -> torch.Tensor:
-        """The mixin's uniform encoder entry: one tower pass over the batch.
+    def encode_multimodal_inputs(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
+        """The mixin's uniform encoder entry: one tower pass per encoder group.
 
         Called by the startup KV-cache profiler, which runs the encoder at the
         scheduling limits so the towers' activations land in the measured
         peak. The request path reaches the same encoder through
         `get_multimodal_embeddings`, which keeps the per-chunk cache.
         """
-        return self.mm_encoder.forward(multimodal_params)
+        return encode_multimodal_by_groups(
+            self.mm_encoder.mm_encoder_groups, list(multimodal_params)
+        )
 
     # No `forward` here: `MultimodalModelMixin.forward` runs the encoder,
     # selects the rows active in this chunk and merges them with

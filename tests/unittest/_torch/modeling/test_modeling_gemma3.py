@@ -5,6 +5,7 @@ import unittest
 from copy import deepcopy
 from dataclasses import dataclass
 
+import pytest
 import torch
 from _torch.helpers import make_hf_hybrid_cache_for_tests
 from parameterized import parameterized
@@ -21,6 +22,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
     Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
+from tensorrt_llm._torch.models.modeling_gemma3vl import Gemma3VLM
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
     KVCacheManagerV2
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
@@ -688,3 +690,220 @@ class TestGemma3(unittest.TestCase):
             ],
             device=device).bool()
         torch.testing.assert_close(attention_mask, expected_attention_mask)
+
+
+class _Gemma3CpuTower:
+
+    def __init__(self):
+        self.calls = []
+
+    def prepare_attn_metadata(self, count):
+        return count
+
+    def __call__(self, pixel_values, attn_metadata):
+        self.calls.append(pixel_values.clone())
+        assert attn_metadata == pixel_values.shape[0]
+        return [pixel_values.flatten(2).transpose(1, 2)]
+
+
+class _Gemma3CpuEncoder:
+    mm_encoder_groups = Gemma3VLM.mm_encoder_groups
+    _get_image_features = Gemma3VLM._get_image_features
+    forward = Gemma3VLM.forward
+
+    def __init__(self):
+        from types import SimpleNamespace
+
+        self.siglip_tower = _Gemma3CpuTower()
+        self.mm_projector = lambda features: features[:, :2].reshape(-1, 3) * 2
+        self.model_dtype = torch.float32
+        self.image_token_ids = torch.tensor([9])
+        self.llm = SimpleNamespace(
+            model=SimpleNamespace(embed_tokens=torch.nn.Embedding(10, 3)),
+            forward=lambda **kwargs: kwargs)
+
+
+def _main_gemma3_image_features(model, multimodal_params):
+    pixel_values = [
+        multimodal_param.multimodal_data["image"]["pixel_values"]
+        for multimodal_param in multimodal_params
+    ]
+
+    mm_embeds = []
+    if len(pixel_values) > 0:
+        image_features = model._get_image_features(
+            pixel_values=torch.cat(pixel_values))
+        mm_embeds = [image_features.contiguous()]
+    return mm_embeds
+
+
+def _gemma3_cpu_param(count, offset=0, dtype=torch.float32):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models.modeling_gemma3vl import \
+        Gemma3InputProcessor
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalParams)
+
+    processor = Gemma3InputProcessor.__new__(Gemma3InputProcessor)
+    processor._config = SimpleNamespace(mm_tokens_per_image=2)
+    pixels = torch.arange(count * 12, dtype=torch.float32).reshape(
+        count, 3, 2, 2) + offset
+    data = {"image": {"pixel_values": pixels.to(dtype)}}
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = processor.get_mm_item_metadata(
+        [], data)
+    return MultimodalParams(multimodal_data=data)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("counts", [[1], [2, 1], [1, 2, 1]])
+def test_gemma3_encoder_group_matches_main(counts):
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
+        encode_multimodal_by_groups
+
+    params = [
+        _gemma3_cpu_param(count, index * 1000)
+        for index, count in enumerate(counts)
+    ]
+    model = _Gemma3CpuEncoder()
+    expected = _main_gemma3_image_features(_Gemma3CpuEncoder(), params)[0]
+    actual = encode_multimodal_by_groups(model.mm_encoder_groups, params)
+    assert torch.equal(actual, expected)
+    assert len(model.siglip_tower.calls) == 1
+    pixels = torch.cat(
+        [param.multimodal_data["image"]["pixel_values"] for param in params])
+    assert torch.equal(model.siglip_tower.calls[0], pixels)
+    assert model.siglip_tower.calls[0].dtype == pixels.dtype
+    assert model.siglip_tower.calls[0].device == pixels.device
+    per_request = [
+        _main_gemma3_image_features(_Gemma3CpuEncoder(), [param])[0]
+        for param in params
+    ]
+    assert torch.equal(actual, torch.cat(per_request))
+
+    input_ids = torch.tensor([1] + [9] * expected.shape[0] + [2])
+    result = model.forward(SimpleNamespace(num_contexts=len(params),
+                                           num_generations=0),
+                           input_ids=input_ids,
+                           multimodal_params=params)
+    assert len(model.siglip_tower.calls) == 2
+    assert torch.equal(result["inputs_embeds"][1:-1], expected)
+    assert torch.equal(result["image_token_mask"], input_ids == 9)
+
+
+@pytest.mark.cpu_only
+def test_gemma3_encoder_group_splits_pixel_dtypes():
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import \
+        encode_multimodal_by_groups
+
+    params = [
+        _gemma3_cpu_param(1, dtype=torch.float32),
+        _gemma3_cpu_param(2, 100, dtype=torch.float64),
+        _gemma3_cpu_param(1, 200, dtype=torch.float32)
+    ]
+    model = _Gemma3CpuEncoder()
+    actual = encode_multimodal_by_groups(model.mm_encoder_groups, params)
+    expected = torch.cat([
+        _main_gemma3_image_features(_Gemma3CpuEncoder(), [param])[0]
+        for param in params
+    ])
+    assert len(model.siglip_tower.calls) == 2
+    assert torch.equal(actual, expected)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pan_and_scan", [False, True])
+@pytest.mark.parametrize("image_format", ["pil", "tensor", "numpy"])
+def test_gemma3_metadata_fallback_preserves_crop_items(pan_and_scan,
+                                                       image_format):
+    from types import SimpleNamespace
+
+    from PIL import Image
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.gemma3.image_processing_gemma3 import \
+        Gemma3ImageProcessor
+    from transformers.models.gemma3.processing_gemma3 import Gemma3Processor
+
+    from tensorrt_llm._torch.models.modeling_gemma3vl import \
+        Gemma3InputProcessor
+    from tensorrt_llm.inputs.multimodal import (
+        MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata)
+
+    image_processor = Gemma3ImageProcessor(
+        size={
+            "height": 2,
+            "width": 2
+        },
+        do_pan_and_scan=True,
+        pan_and_scan_min_crop_size=4,
+        pan_and_scan_max_num_crops=2,
+        pan_and_scan_min_ratio_to_activate=2.0)
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"<unk>": 0}, unk_token="<unk>")))
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": ["<boi>", "<image>", "<eoi>"]})
+    tokenizer.boi_token = "<boi>"
+    tokenizer.image_token = "<image>"
+    tokenizer.eoi_token = "<eoi>"
+    tokenizer.image_token_id = tokenizer.convert_tokens_to_ids("<image>")
+    # Exercise the actual processor defaults and tokenizer overrides, which
+    # take precedence over image_processor's stored pan-and-scan settings.
+    if pan_and_scan:
+        tokenizer.init_kwargs.update(do_pan_and_scan=True,
+                                     pan_and_scan_min_crop_size=2,
+                                     pan_and_scan_max_num_crops=3,
+                                     pan_and_scan_min_ratio_to_activate=1.5)
+    hf_processor = Gemma3Processor(image_processor,
+                                   tokenizer,
+                                   image_seq_length=2)
+    sizes = [(5, 15), (16, 5), (5, 5), (2, 20)]
+    crops = [
+        len(
+            image_processor.pan_and_scan_batched(
+                torch.empty(1, 3, height, width), 2, 3, 1.5))
+        if pan_and_scan else 0 for height, width in sizes
+    ]
+
+    processor = Gemma3InputProcessor.__new__(Gemma3InputProcessor)
+    processor._config = SimpleNamespace(mm_tokens_per_image=2)
+    processor._processor = hf_processor
+    processor._dtype = torch.float32
+    images = [Image.new("RGB", (width, height)) for height, width in sizes]
+    if image_format == "tensor":
+        images = [torch.zeros(3, height, width) for height, width in sizes]
+    elif image_format == "numpy":
+        import numpy as np
+        images = [
+            np.zeros((height, width, 3), dtype=np.uint8)
+            for height, width in sizes
+        ]
+    _, extra = processor.call_with_text_prompt(
+        {
+            "prompt":
+            "describe " + " ".join([tokenizer.boi_token] * len(images)),
+            "multi_modal_data": {
+                "image": images
+            }
+        }, None)
+    data = extra["multimodal_data"]
+    pixels = data["image"]["pixel_values"]
+    order = [{
+        "modality": "image",
+        "index": index
+    } for index in range(len(sizes))]
+    metadata = processor.get_mm_item_metadata([], data, order)
+    metadata.validate()
+    assert metadata.item_refs == tuple(
+        ("image", index) for index in range(len(sizes)))
+    assert metadata.output_embedding_lengths == tuple(
+        (1 + count) * 2 for count in crops)
+    assert sum(metadata.output_embedding_lengths) == pixels.shape[0] * 2
+    data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+        [("image", 0)], output_embedding_lengths=[pixels.shape[0] * 2])
+    assert processor.get_mm_item_metadata(
+        [], data) is data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert processor.get_mm_item_metadata([], {}) is None

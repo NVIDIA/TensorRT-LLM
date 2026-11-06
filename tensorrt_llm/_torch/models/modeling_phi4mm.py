@@ -31,7 +31,9 @@ from transformers.image_utils import (ImageInput, is_pil_image,
 from transformers.utils import TensorType
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY, MultimodalItemMetadata,
+    MultimodalParams)
 
 from ...executor.request import LoRARequest
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
@@ -46,6 +48,7 @@ from ..model_config import ModelConfig
 from ..peft.lora.config import LoraConfig
 from ..peft.lora.ownership import DecoderLoraOwner
 from .modeling_auto import AutoModelForCausalLM
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (_is_mm_disagg, find_input_mm_embeds,
                                         fuse_input_embeds,
                                         get_multimodal_embeddings)
@@ -55,7 +58,6 @@ from .modeling_utils import register_auto_model
 # Hardcoded in https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/processing_phi4mm.py#L44.
 _IMAGE_SPECIAL_TOKEN_ID = 200010  # '<|endoftext10|>' from HF `modeling_phi4mm.py`
 _AUDIO_SPECIAL_TOKEN_ID = 200011  # '<|endoftext11|>' from HF `modeling_phi4mm.py`
-_PAD_TOKEN_ID = 199999  # '<|endoftext|>' from HF `special_tokens_map.json`
 _COMPATIBLE_IMAGE_SPECIAL_TOKEN_ID_RANGE = [-9999,
                                             -1]  # from HF `modeling_phi4mm.py`
 _COMPATIBLE_AUDIO_SPECIAL_TOKEN_ID_RANGE = [float('-inf'), -10000
@@ -127,27 +129,20 @@ def _load_phi4mm_classes(local_path):
 
 
 # Below code is optimized for image modality inference, including input_processor and vision encoder forward.
-def vision_encoder_forward(self,
-                           input_ids: torch.LongTensor,
-                           input_embeds: torch.FloatTensor,
-                           image_sizes=None,
-                           **kwargs) -> torch.FloatTensor:
+def vision_encoder_forward(
+        self, input_embeds: torch.FloatTensor, image_sizes: torch.Tensor,
+        image_attention_mask: torch.Tensor) -> torch.FloatTensor:
     """Optimize vision encoder forward.
 
     * Remove many unnecessary if-else conditions and assertions.
-    * Optimize positions/positions_tuple calculation.
+    * Return the image embedding rows, image after image, instead of
+      scattering them into the text embeddings at the image token positions.
     * Optimize the input parameters for get_img_features.
 
     Ref code: https://huggingface.co/microsoft/Phi-4-multimodal-instruct/blob/main/modeling_phi4mm.py#L268
     """
     if isinstance(image_sizes, torch.Tensor):
         image_sizes = image_sizes.view(-1, 2)
-    image_attention_mask = kwargs['image_attention_mask']
-    input_shape = input_ids.size()
-    input_ids = input_ids.view(-1, input_shape[-1])
-    positions = torch.nonzero(input_ids == _IMAGE_SPECIAL_TOKEN_ID,
-                              as_tuple=False)
-    positions_tuple = torch.unbind(positions, dim=1)
     if isinstance(self.img_projection, torch.nn.Sequential):
         target_device = self.img_projection[0].bias.device
         target_dtype = self.img_projection[0].bias.dtype
@@ -248,21 +243,10 @@ def vision_encoder_forward(self,
             _output_img.to(target_device).to(target_dtype))
         img_set_tensor.append(img_feature_proj)
 
-    # Combine image embeddings with text embeddings.
-    hidden_states = kwargs['wte'](input_ids)
     merged_img_set_tensor = torch.cat(img_set_tensor, dim=1).squeeze(0)
-    with torch.autocast(device_type=hidden_states.device.type, enabled=False):
-        new_hidden_states = hidden_states.index_put(
-            indices=positions_tuple,
-            values=merged_img_set_tensor,
-            accumulate=False,
-        )  # Not optimized for D2D memcpy.
-    hidden_states = new_hidden_states
-
     if self.drop is not None:
-        hidden_states = self.drop(hidden_states)
-
-    return hidden_states
+        merged_img_set_tensor = self.drop(merged_img_set_tensor)
+    return merged_img_set_tensor
 
 
 def siglip_embedding_forward(
@@ -602,163 +586,100 @@ class HFPhi4MultimodalEncoder(transformers.PreTrainedModel):
         self.audio_embed = Phi4MMAudioEmbedding(config,
                                                 **self.audio_embd_layer_kwargs)
 
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        """One vision encoder call over all images and one audio encoder call over all clips."""
+        # Every encoder input is the payload field of the same name.
+        image_fields = ("input_image_embeds", "image_attention_mask",
+                        "image_sizes")
+        audio_fields = ("input_audio_embeds", "audio_attention_mask",
+                        "audio_embed_sizes")
+        return (
+            EncoderGroup(
+                modalities=("image", ),
+                encoder_fn=self._batch_infer_image_embeds,
+                input_fields={name: dict(image=name)
+                              for name in image_fields},
+            ),
+            EncoderGroup(
+                modalities=("audio", ),
+                encoder_fn=self._batch_infer_audio_embeds,
+                input_fields={name: dict(audio=name)
+                              for name in audio_fields},
+            ),
+        )
+
     @nvtx_range("[Encoder][Image] batch_infer_image_embeds")
-    def _batch_infer_image_embeds(
-            self, batched_input_ids: torch.Tensor,
-            multimodal_params: List[MultimodalParams]) -> torch.Tensor:
-        # Batch image inputs and attention mask with padding along dim=1 (patch num).
-        input_image_embeds_list, input_image_attn_mask_list, input_image_sizes_list = [], [], []
-        for mm_param in multimodal_params:
-            mm_data = mm_param.multimodal_data
-            input_image_embeds = mm_data["input_image_embeds"]
-            if input_image_embeds is not None and input_image_embeds.numel(
-            ) > 0:
-                input_image_embeds_list.append(input_image_embeds)
-                input_image_attn_mask_list.append(
-                    mm_data["image_attention_mask"])
-                input_image_sizes_list.append(mm_data["image_sizes"])
-        batched_image_hidden_states = None
-        if len(input_image_embeds_list) > 0:
-            # Padding image embeds/attn_masks along dim=1 (patch dimension).
-            b_list = [x.shape[0] for x in input_image_embeds_list]
-            p_list = [x.shape[1] for x in input_image_embeds_list]
-            c_i, h_i, w_i = input_image_embeds_list[0].shape[2:5]
-            h_i_attn, w_i_attn = input_image_attn_mask_list[0].shape[2:4]
-            total_b = sum(b_list)
-            max_p = max(p_list)
-            batched_image_embeds = torch.zeros(
-                (total_b, max_p, c_i, h_i, w_i),
-                dtype=input_image_embeds_list[0].dtype,
-                device=input_image_embeds_list[0].device)
-            batched_image_attn_mask = torch.zeros(
-                (total_b, max_p, h_i_attn, w_i_attn),
-                dtype=input_image_embeds_list[0].dtype,
-                device=input_image_embeds_list[0].device)
-            b_offset = 0
-            for i, tensor in enumerate(input_image_embeds_list):
-                b, p = tensor.shape[:2]
-                batched_image_embeds[b_offset:b_offset + b, :p] = tensor
-                if input_image_attn_mask_list[i] is not None:
-                    batched_image_attn_mask[
-                        b_offset:b_offset +
-                        b, :p] = input_image_attn_mask_list[i]
-                else:
-                    batched_image_attn_mask[b_offset:b_offset + b, :p] = 1
-                b_offset += b
-            batched_image_sizes = torch.cat(input_image_sizes_list, dim=0)
-            # Forward image encoder with batched image embeds.
-            batched_image_hidden_states = self.image_embed(
-                input_ids=batched_input_ids,
-                input_embeds=batched_image_embeds,
-                image_sizes=batched_image_sizes,
-                image_attention_mask=batched_image_attn_mask,
-                wte=self.embed_tokens,
-            )
-        return batched_image_hidden_states
+    def _batch_infer_image_embeds(self, input_image_embeds: torch.Tensor,
+                                  image_attention_mask: torch.Tensor,
+                                  image_sizes: torch.Tensor) -> torch.Tensor:
+        # Images are zero-padded along dim=1 (crops) to the most crops in the
+        # batch, and their attention masks with zeros.
+        return self.image_embed(input_embeds=input_image_embeds,
+                                image_sizes=image_sizes,
+                                image_attention_mask=image_attention_mask)
 
     @nvtx_range("[Encoder][Audio] batch_infer_audio_embeds")
     def _batch_infer_audio_embeds(
-            self, batched_input_ids: torch.Tensor,
-            multimodal_params: List[MultimodalParams]) -> torch.Tensor:
-        # Batch audio inputs and attention mask with padding along dim=1 (patch num).
-        input_audio_embeds_list, input_audio_attn_mask_list, input_audio_sizes_list = [], [], []
-        for mm_param in multimodal_params:
-            mm_data = mm_param.multimodal_data
-            input_audio_embeds = mm_data["input_audio_embeds"]
-            if input_audio_embeds is not None and input_audio_embeds.numel(
-            ) > 0:
-                input_audio_embeds_list.append(input_audio_embeds)
-                input_audio_attn_mask_list.append(
-                    mm_data["audio_attention_mask"])
-                input_audio_sizes_list.append(mm_data["audio_embed_sizes"])
-        batched_audio_hidden_states = None
-        if len(input_audio_embeds_list) > 0:
-            b_list = [x.shape[0] for x in input_audio_embeds_list]
-            p_list = [x.shape[1] for x in input_audio_embeds_list]
-            d_a = input_audio_embeds_list[0].shape[2]
-            total_b = sum(b_list)
-            max_p = max(p_list)
-            batched_audio_embeds = torch.zeros(
-                (total_b, max_p, d_a),
-                dtype=input_audio_embeds_list[0].dtype,
-                device=input_audio_embeds_list[0].device)
-            batched_audio_attn_mask = torch.zeros(
-                (total_b, max_p),
-                dtype=input_audio_embeds_list[0].dtype,
-                device=input_audio_embeds_list[0].device)
-            b_offset = 0
-            for i, tensor in enumerate(input_audio_embeds_list):
-                b, p = tensor.shape[:2]
-                batched_audio_embeds[b_offset:b_offset + b, :p] = tensor
-                if input_audio_attn_mask_list[i] is not None:
-                    batched_audio_attn_mask[
-                        b_offset:b_offset +
-                        b, :p] = input_audio_attn_mask_list[i]
-                else:
-                    batched_audio_attn_mask[b_offset:b_offset + b, :p] = 1
-                b_offset += b
-            batched_audio_sizes = torch.cat(input_audio_sizes_list, dim=0)
-            # Forward audio encoder with batched audio embeds.
-            batched_audio_hidden_states = self.audio_embed(
-                input_ids=batched_input_ids,
-                input_embeds=batched_audio_embeds,
-                audio_embed_sizes=batched_audio_sizes,
-                audio_attention_mask=batched_audio_attn_mask,
-                wte=self.embed_tokens,
-            )
-        return batched_audio_hidden_states
-
-    @nvtx_range("[HFPhi4MultimodalEncoder] encoding_batch_request")
-    def _encoding_batch_request(
-            self, multimodal_params: List[MultimodalParams],
-            mm_token_ids: torch.Tensor) -> List[torch.FloatTensor]:
-        # Batch input_ids.
-        input_ids_list = [
-            multimodal_params[i].multimodal_data["input_ids"]
-            for i in range(len(multimodal_params))
-        ]
-        max_input_ids_len = max(
-            [input_ids.shape[1] for input_ids in input_ids_list])
-        batched_input_ids = torch.full(
-            (len(multimodal_params), max_input_ids_len),
-            _PAD_TOKEN_ID,
-            device=input_ids_list[0].device)
-        for i, input_ids in enumerate(input_ids_list):
-            batched_input_ids[i, :input_ids.shape[1]] = input_ids
-        batched_input_ids = batched_input_ids.view(-1, max_input_ids_len)
-        image_position_mask = batched_input_ids == _IMAGE_SPECIAL_TOKEN_ID
-        non_image_position_mask = ~image_position_mask
-
-        # Batch inference for image and audio embeds.
-        batched_image_hidden_states = self._batch_infer_image_embeds(
-            batched_input_ids, multimodal_params)
-        batched_audio_hidden_states = self._batch_infer_audio_embeds(
-            batched_input_ids, multimodal_params)
-
-        # Combine different modalities into one.
-        if batched_image_hidden_states is not None and batched_audio_hidden_states is not None:
-            batched_hidden_states = batched_image_hidden_states * image_position_mask.unsqueeze(
-                -1
-            ) + batched_audio_hidden_states * non_image_position_mask.unsqueeze(
-                -1)
-        elif batched_image_hidden_states is not None:
-            batched_hidden_states = batched_image_hidden_states
-        elif batched_audio_hidden_states is not None:
-            batched_hidden_states = batched_audio_hidden_states
-        else:
-            batched_hidden_states = self.embed_tokens(batched_input_ids)
-
-        # Postprocessing to get multimodal-only embeddings.
-        mm_token_mask = torch.isin(batched_input_ids, mm_token_ids)
-        batched_hidden_states = batched_hidden_states[mm_token_mask]
-        batched_hidden_states = [batched_hidden_states]
-        return batched_hidden_states
+            self, input_audio_embeds: torch.Tensor,
+            audio_attention_mask: torch.Tensor,
+            audio_embed_sizes: torch.Tensor) -> torch.Tensor:
+        # Clips are zero-padded along dim=1 (frames) to the longest clip in the
+        # batch, and their attention masks with zeros. The audio embedding
+        # casts the features to its projection dtype and device, encodes all
+        # clips at once and keeps audio_embed_sizes rows of each.
+        audio_embed = self.audio_embed
+        projection = next(audio_embed.audio_projection.parameters())
+        audio_set_tensor = audio_embed.get_audio_features(
+            input_audio_embeds.to(projection.device).to(projection.dtype),
+            audio_attention_mask)
+        sizes = audio_embed_sizes.tolist()
+        merged_audio_set_tensor = torch.cat(
+            [audio_set_tensor[i, :size] for i, size in enumerate(sizes)],
+            dim=0).to(self.embed_tokens.weight.dtype)
+        if audio_embed.drop is not None:
+            merged_audio_set_tensor = audio_embed.drop(merged_audio_set_tensor)
+        return merged_audio_set_tensor
 
     @torch.compile(disable=not _is_torch_compile())
     @torch.inference_mode()
-    def forward(self, multimodal_params: List[MultimodalParams],
-                mm_token_ids: torch.Tensor) -> List[torch.FloatTensor]:
-        return self._encoding_batch_request(multimodal_params, mm_token_ids)
+    def forward(
+            self,
+            multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
+        return [
+            encode_multimodal_by_groups(self.mm_encoder_groups,
+                                        multimodal_params)
+        ]
+
+
+def _item_metadata_from_prompt(
+        prompt_token_ids: List[int],
+        output_rows: Dict[str, List[int]]) -> MultimodalItemMetadata:
+    """Prompt-ordered item references and rows of an expanded prompt.
+
+    The processor expands every image or audio placeholder into a run of its
+    special token, one run per item in item order, as long as the item's
+    rows. Walking the runs gives the items in prompt order, also when two
+    runs of one modality are adjacent.
+    """
+    modalities = {
+        _IMAGE_SPECIAL_TOKEN_ID: 'image',
+        _AUDIO_SPECIAL_TOKEN_ID: 'audio'
+    }
+    next_index = {modality: 0 for modality in output_rows}
+    item_refs, lengths = [], []
+    position = 0
+    while position < len(prompt_token_ids):
+        modality = modalities.get(prompt_token_ids[position])
+        if modality is None:
+            position += 1
+            continue
+        index = next_index[modality]
+        item_refs.append((modality, index))
+        lengths.append(output_rows[modality][index])
+        next_index[modality] = index + 1
+        position += output_rows[modality][index]
+    return MultimodalItemMetadata(item_refs, output_embedding_lengths=lengths)
 
 
 class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
@@ -923,19 +844,46 @@ class Phi4MMInputProcessor(BaseMultimodalInputProcessor,
         # Postprocessing for multimodal data.
         inputs = self._post_process(image_inputs, audio_inputs, text_prompt)
 
-        # Package inputs for language model forward in AGGREGATE mode.
+        # Package inputs for language model forward in AGGREGATE mode. Each
+        # modality's tensors hold its items on dim 0; the attention masks
+        # follow the dtype of their features.
         multimodal_data = {}
-        multimodal_data['input_ids'] = inputs['input_ids']
-        multimodal_data['input_image_embeds'] = inputs['input_image_embeds'].to(
-            self.dtype)
-        multimodal_data['image_sizes'] = inputs['image_sizes']
-        multimodal_data['image_attention_mask'] = inputs['image_attention_mask']
-        multimodal_data['input_audio_embeds'] = inputs['input_audio_embeds']
-        multimodal_data['audio_embed_sizes'] = inputs['audio_embed_sizes']
-        multimodal_data['audio_attention_mask'] = inputs['audio_attention_mask']
+        output_rows = {}
+        if images is not None:
+            input_image_embeds = inputs['input_image_embeds'].to(self.dtype)
+            multimodal_data['image'] = {
+                'input_image_embeds':
+                input_image_embeds,
+                'image_attention_mask':
+                inputs['image_attention_mask'].to(input_image_embeds.dtype),
+                'image_sizes':
+                inputs['image_sizes'],
+            }
+            output_rows['image'] = [
+                int(rows) for rows in image_inputs['num_img_tokens']
+            ]
+        if audios is not None:
+            input_audio_embeds = inputs['input_audio_embeds']
+            audio_attention_mask = inputs['audio_attention_mask']
+            if audio_attention_mask is None:
+                # The audio processor leaves the mask out for a single clip.
+                audio_attention_mask = torch.ones(input_audio_embeds.shape[:2])
+            multimodal_data['audio'] = {
+                'input_audio_embeds':
+                input_audio_embeds,
+                'audio_attention_mask':
+                audio_attention_mask.to(input_audio_embeds.dtype),
+                'audio_embed_sizes':
+                inputs['audio_embed_sizes'],
+            }
+            output_rows['audio'] = inputs['audio_embed_sizes'].tolist()
         multimodal_data['audio_projection_mode'] = inputs[
             'audio_projection_mode']
-        return inputs['input_ids'][0].to(torch.int32).tolist(), {
+        prompt_token_ids = inputs['input_ids'][0].to(torch.int32).tolist()
+        multimodal_data[
+            MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = _item_metadata_from_prompt(
+                prompt_token_ids, output_rows)
+        return prompt_token_ids, {
             "multimodal_data": multimodal_data,
         }
 
@@ -1064,8 +1012,8 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         # The data with the following keys will be moved to CUDA device,
         # the rest of them will be kept on CPU.
         return [
-            "input_ids", "input_image_embeds", "image_attention_mask",
-            "input_audio_embeds", "audio_attention_mask"
+            "image.input_image_embeds", "image.image_attention_mask",
+            "audio.input_audio_embeds", "audio.audio_attention_mask"
         ]
 
     @torch.inference_mode()
@@ -1090,13 +1038,9 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         mm_embedding = []
         if len(multimodal_params) > 0:
             if not _is_mm_disagg():
-                encoder_kwargs = {
-                    "mm_token_ids": self._mm_token_ids_device,
-                }
                 mm_embedding = get_multimodal_embeddings(
                     encoder_forward_fn=self.hf_phi4mm_model.forward,
                     multimodal_params=multimodal_params[:num_context_requests],
-                    encoder_kwargs=encoder_kwargs,
                 )
             else:
                 raise NotImplementedError(

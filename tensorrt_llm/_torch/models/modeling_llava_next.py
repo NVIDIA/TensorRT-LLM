@@ -32,6 +32,7 @@ from ..attention.backends import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
+from .modeling_multimodal_mixin import EncoderGroup, encode_multimodal_by_groups
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_attached_multimodal_embeddings,
                                         get_multimodal_embeddings)
@@ -92,6 +93,48 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def get_mm_token_ids(self) -> Optional[torch.Tensor]:
         """Return in-vocab multimodal placeholder token IDs."""
         return torch.tensor([self.image_token_index], dtype=torch.int32)
+
+    def get_mm_item_metadata(
+        self,
+        prompt_token_ids: List[int],
+        multimodal_data: Dict[str, Any],
+        mm_item_order: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[MultimodalItemMetadata]:
+        metadata = super().get_mm_item_metadata(prompt_token_ids,
+                                                multimodal_data, mm_item_order)
+        image_data = multimodal_data.get("image")
+        if metadata is not None or not image_data:
+            return metadata
+
+        vision_config = self.config.vision_config
+        patches_per_side = vision_config.image_size // vision_config.patch_size
+        rows = []
+        for image_size in image_data["image_sizes"].tolist():
+            num_patches = image_size_to_num_patches(
+                image_size,
+                self.config.image_grid_pinpoints,
+                vision_config.image_size,
+            )
+            if num_patches > 1:
+                grid_height, grid_width = get_anyres_image_grid_shape(
+                    image_size,
+                    self.config.image_grid_pinpoints,
+                    vision_config.image_size,
+                )
+                # Unpadding only slices this view; its values are not needed to count rows.
+                shape = torch.empty(1).expand(1, grid_height * patches_per_side,
+                                              grid_width * patches_per_side)
+                height, width = unpad_image(shape, image_size).shape[-2:]
+                rows.append(patches_per_side**2 + height * (width + 1))
+            else:
+                rows.append(patches_per_side**2 + 1)
+        item_refs = ([(entry["modality"], entry["index"])
+                      for entry in mm_item_order] if mm_item_order else
+                     [("image", index) for index in range(len(rows))])
+        return MultimodalItemMetadata(
+            item_refs,
+            output_embedding_lengths=[rows[index] for _, index in item_refs],
+        )
 
     def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
         """
@@ -544,57 +587,30 @@ class LlavaNextVisionModel(nn.Module):
                                     device=image_features[0].device)
         return new_image_features, feature_lens
 
-    def _pad_for_batching(
-        self,
-        pixel_values: list[torch.Tensor],
-    ):
-        """
-        Pads images on the `num_of_patches` dimension with zeros to form a batch of same number of patches.
-
-        Args:
-            pixel_values (`list[torch.Tensor]`):
-                A list of pixel value tensors, each of shape (`batch`, `num_patches`, `channels`, `height`, `width`)
-
-        Returns:
-            list[`torch.Tensor`]: The padded image tensors.
-        """
-        if not pixel_values:
-            return pixel_values
-
-        # Find max patches across all images
-        max_patches = max(tensor.shape[1] for tensor in pixel_values)
-
-        # Pad each tensor by concatenating zeros on dim=1 (num_patches)
-        padded_values = []
-
-        for pixel_value in pixel_values:
-            current_patches = pixel_value.shape[1]
-            if current_patches < max_patches:
-                pad_len = max_patches - current_patches
-                zeros = pixel_value.new_zeros(
-                    (pixel_value.shape[0], pad_len, *pixel_value.shape[2:]))
-                padded_pixel_value = torch.cat([pixel_value, zeros], dim=1)
-            else:
-                padded_pixel_value = pixel_value
-
-            padded_values.append(padded_pixel_value)
-
-        return padded_values
+    @property
+    def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
+        return (EncoderGroup(
+            modalities=("image", ),
+            encoder_fn=self.encode_batched,
+            input_fields={
+                "pixel_values": {
+                    "image": "pixel_values"
+                },
+                "image_sizes": {
+                    "image": "image_sizes"
+                },
+            },
+        ), )
 
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]):
-        pixel_values = [
-            multimodal_param.multimodal_data["image"]["pixel_values"]
-            for multimodal_param in multimodal_params
+        return [
+            encode_multimodal_by_groups(self.mm_encoder_groups,
+                                        multimodal_params)
         ]
-        image_sizes = [
-            multimodal_param.multimodal_data["image"]["image_sizes"]
-            for multimodal_param in multimodal_params
-        ]
-        pixel_values = self._pad_for_batching(pixel_values)
-        pixel_values = torch.cat(pixel_values, dim=0)
-        image_sizes = torch.cat(image_sizes, dim=0)
 
+    def encode_batched(self, pixel_values: torch.Tensor,
+                       image_sizes: torch.Tensor) -> torch.Tensor:
         image_num_patches = [
             image_size_to_num_patches(
                 image_size=imsize,
@@ -629,7 +645,7 @@ class LlavaNextVisionModel(nn.Module):
             image_newline=self.image_newline,
         )
         image_features = torch.cat(image_features, dim=0)
-        return [image_features]
+        return image_features
 
 
 @support_multimodal_disaggregated

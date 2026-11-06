@@ -914,7 +914,7 @@ class _DtypeRecordingTower(torch.nn.Module):
                 "expected mat1 and mat2 to have the same dtype, but got: "
                 f"{pixel_values.dtype} != {self.dtype}"
             )
-        return torch.zeros(int(grids.sum()), 8, dtype=self.dtype)
+        return torch.zeros(grids.shape[0], 8, dtype=self.dtype)
 
 
 def _encoder_with(tower):
@@ -939,10 +939,11 @@ def test_the_encoder_casts_preprocessed_pixels_to_the_towers_dtype():
                 "pixel_values": torch.zeros(4, 1176, dtype=torch.float32),
                 "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.int32),
             }
-        }
+        },
+        item_refs=[("image", 0)],
     )
 
-    out = encoder.forward([params])
+    (out,) = encoder.forward([params])
     assert tower.seen == [torch.bfloat16], f"tower was handed {tower.seen}"
     assert out.dtype is torch.bfloat16
 
@@ -958,7 +959,8 @@ def test_the_cast_follows_the_tower_rather_than_being_hardcoded():
                 "pixel_values": torch.zeros(4, 1176, dtype=torch.float32),
                 "image_grid_thw": torch.tensor([[1, 2, 2]], dtype=torch.int32),
             }
-        }
+        },
+        item_refs=[("image", 0)],
     )
     encoder.forward([params])
     assert tower.seen == [torch.float32]
@@ -1406,8 +1408,8 @@ def test_the_mixins_opt_in_features_stay_off():
 #
 # The rows the encoder returns are consumed POSITIONALLY: `fuse_input_embeds`
 # writes them into the prompt's media positions from left to right. So the
-# encoder owes prompt order, which a mixed-modality request states in its
-# `MultimodalItemMetadata.item_refs`.
+# encoder owes prompt order, which every request states in its
+# `MultimodalItemMetadata`: the item refs and each item's row count.
 
 
 class _OrderRecordingTower(torch.nn.Module):
@@ -1452,6 +1454,7 @@ def _modality_data(modality, fills, side=2, patch_dim=3):
 
 
 def _params(data, item_refs=None):
+    """Params with the item record the processor attaches; every stub emits one row per item."""
     from tensorrt_llm.inputs.multimodal import (  # noqa: PLC0415
         MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
         MultimodalItemMetadata,
@@ -1459,13 +1462,16 @@ def _params(data, item_refs=None):
     )
 
     if item_refs is not None:
-        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(item_refs)
+        data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY] = MultimodalItemMetadata(
+            item_refs, output_embedding_lengths=[1] * len(item_refs)
+        )
     return MultimodalParams(multimodal_data=data)
 
 
 def _encoded_order(params_list):
     encoder = _encoder_with_stub_tower()
-    return encoder.forward(params_list)[:, 0].tolist()
+    (encoded,) = encoder.forward(params_list)
+    return encoded[:, 0].tolist()
 
 
 def test_a_mixed_request_is_encoded_in_prompt_order_not_modality_order():
@@ -1504,7 +1510,6 @@ def test_audio_and_vision_rows_interleave_in_prompt_order():
     must land between the two clips' rows, not after them."""
     encoder = _encoder_with_stub_tower()
     encoder.audio_tower = _OrderRecordingAudioTower()
-    encoder._vision_config = _tiny_vision_config().vision_config
     params = _params(
         {
             "image": _modality_data("image", [2.0]),
@@ -1515,7 +1520,8 @@ def test_audio_and_vision_rows_interleave_in_prompt_order():
         },
         item_refs=[("audio", 0), ("image", 0), ("audio", 1)],
     )
-    assert encoder.forward([params])[:, 0].tolist() == [1.0, 2.0, 3.0]
+    (encoded,) = encoder.forward([params])
+    assert encoded[:, 0].tolist() == [1.0, 2.0, 3.0]
 
 
 def test_requests_stay_in_batch_order_and_items_in_prompt_order_within_them():
@@ -1524,45 +1530,50 @@ def test_requests_stay_in_batch_order_and_items_in_prompt_order_within_them():
         {"video": _modality_data("video", [1.0]), "image": _modality_data("image", [2.0])},
         item_refs=[("video", 0), ("image", 0)],
     )
-    second = _params({"image": _modality_data("image", [3.0, 4.0])})
+    second = _params(
+        {"image": _modality_data("image", [3.0, 4.0])}, item_refs=[("image", 0), ("image", 1)]
+    )
     assert _encoded_order([first, second]) == [1.0, 2.0, 3.0, 4.0]
 
 
-def test_a_single_modality_request_needs_no_item_metadata():
-    """Within one modality, item order already is prompt order."""
-    params = _params({"image": _modality_data("image", [1.0, 2.0, 3.0])})
-    assert _encoded_order([params]) == [1.0, 2.0, 3.0]
-
-
-def test_a_mixed_request_without_item_metadata_is_refused_not_guessed():
-    params = _params(
-        {"image": _modality_data("image", [1.0]), "video": _modality_data("video", [2.0])}
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"image": [1.0, 2.0, 3.0]},
+        {"image": [1.0], "video": [2.0]},
+    ],
+    ids=["single_modality", "mixed"],
+)
+def test_a_request_without_item_metadata_is_refused_not_guessed(data):
+    """The record splits the encoder rows per item; the processor always attaches it."""
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (  # noqa: PLC0415
+        MultimodalEncoderContractError,
     )
-    with pytest.raises(ValueError, match="prompt-ordered item metadata"):
+
+    params = _params(
+        {modality: _modality_data(modality, fills) for modality, fills in data.items()}
+    )
+    with pytest.raises(MultimodalEncoderContractError, match="item metadata"):
         _encoded_order([params])
 
 
 def test_item_metadata_that_does_not_cover_every_item_is_refused():
     """A short record would drop rows and misalign every placeholder after it."""
+    from tensorrt_llm._torch.models.modeling_multimodal_mixin import (  # noqa: PLC0415
+        MultimodalEncoderContractError,
+    )
+
     params = _params(
         {"image": _modality_data("image", [1.0, 3.0]), "video": _modality_data("video", [2.0])},
         item_refs=[("image", 0), ("video", 0)],
     )
-    with pytest.raises(ValueError, match="every item must appear exactly once"):
+    with pytest.raises(MultimodalEncoderContractError, match="item metadata expects 2"):
         _encoded_order([params])
-
-
-def test_a_grid_that_disagrees_with_the_pixels_says_so():
-    """The split is read off the grid, so a mismatch has to be an error here."""
-    data = _modality_data("image", [1.0, 2.0])
-    data["pixel_values"] = data["pixel_values"][:-1]
-    with pytest.raises(ValueError, match="disagree on geometry"):
-        _encoded_order([_params({"image": data})])
 
 
 def test_an_empty_batch_still_returns_a_tensor():
     """The profiler's no-media path and generation-phase batches both land here."""
-    encoded = _encoder_with_stub_tower().forward([])
+    (encoded,) = _encoder_with_stub_tower().forward([])
     assert isinstance(encoded, torch.Tensor)
     assert encoded.numel() == 0
 

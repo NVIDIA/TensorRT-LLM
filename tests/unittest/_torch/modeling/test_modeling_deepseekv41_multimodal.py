@@ -27,7 +27,11 @@ from tensorrt_llm._torch.models.modeling_deepseekv41_multimodal import (
     DeepseekV41ForConditionalGeneration,
 )
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
-from tensorrt_llm.inputs.multimodal import MultimodalParams
+from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
+    MultimodalItemMetadata,
+    MultimodalParams,
+)
 from tensorrt_llm.llmapi.llm_args import CSA2SparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -112,11 +116,14 @@ def test_conditional_generation_image_forward(monkeypatch):
         raw = MultimodalParams(
             multimodal_data={
                 "image": {
-                    "pixel_values": [pixels],
-                    "image_grid_hw": [(3, 3)],
-                    "llm_grid_hw": [(1, 1)],
-                    "num_tokens": [4],
-                }
+                    "pixel_values": pixels,
+                    "image_grid_hw": torch.tensor([[3, 3]], device="cpu"),
+                    "llm_grid_hw": torch.tensor([[1, 1]], device="cpu"),
+                    "num_tokens": torch.tensor([4], device="cpu"),
+                },
+                MULTIMODAL_ENCODER_ITEM_METADATA_KEY: MultimodalItemMetadata(
+                    [("image", 0)], output_embedding_lengths=[4]
+                ),
             }
         )
         features = model.aligner(model.vision(pixels, 3, 3), 3, 3)
