@@ -12,20 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared helpers of the fused top-p rejection-sampling tests: a float64 model of RS2's Philox
-streams and of the inverse-CDF / chain-verify decisions, the row generators, and the float64 nucleus oracle
-(flashinfer's ``top_p_renorm_probs`` semantics: the pivot is the first token, in descending order of the scaled
-logit ``z``, at which the cumulative mass reaches ``top_p * sum``; every token with ``z >= z_pivot`` is kept,
-ties included).
+"""Shared helpers of the fused top-p rejection-sampling tests (``test_fast_topp_*.py``).
 
-Every disagreement with flashinfer or with the oracle must be explained by float32 rounding: a draw within
-``_CDF_TOL`` of an inverse-CDF boundary, an accept threshold within ``_ACCEPT_TOL``, or a nucleus inside the
-oracle's sandwich: ``target_error`` is the relative change of the target mass ``fl32(p) * S`` that would make a
-kept-set the exact nucleus (0 inside the exact interval, infinite for a set that is not a ``z >= threshold`` set,
-so one that splits a tie group), and the kernels' sets must stay within ``_NUC_MASS_TOL`` of it (flashinfer's
-approximate float32 search within ``_FI_MASS_TOL``). That is exact for tie groups, and it cannot excuse a pivot
-that is off by more than float32 rounding, however thin the tokens around it are (a flat row of 163,840 tokens
-has ~6e-6 per token).
+They hold float64 models of the kernels' Philox draws and of the inverse-CDF and chain-verify decisions, the
+logits row generators, and `Nucleus`, a float64 oracle of flashinfer's top-p nucleus. Every disagreement of a
+kernel with flashinfer or with the oracle must be explained by float32 rounding, within the tolerances below.
 """
 
 import math
@@ -363,10 +354,10 @@ def support_diff_ok(nuc, r, kept_a, kept_b):
     return sandwich_ok(nuc, r, kept_a) and sandwich_ok(nuc, r, kept_b)
 
 
-# flashinfer's top_p_renorm_probs at top_p == 1 is not "keep everything": it zeroes low-probability tokens
-# (measured, job 813066: tokens of probability <= 2**-23, in a "medium" row 23,000 of them = 2e-3 of the mass; a
-# "flat" row loses up to 1e-5). The kernels keep the whole vocabulary there (the exact softmax), so against
-# flashinfer such rows are compared on that rule instead of the nucleus tolerance.
+# flashinfer's `top_p_renorm_probs` at top_p == 1 does not keep everything: it zeroes the tokens of probability
+# <= 2**-23 (in a "medium" row 23,000 of them, 2e-3 of the mass; a "flat" row loses up to 1e-5). The kernels keep
+# the whole vocabulary there (the exact softmax), so against flashinfer such rows are compared on that rule (with
+# a 1% margin) instead of the nucleus tolerance.
 _FI_FULL_DROP_P = 2.0**-23 * 1.01
 
 

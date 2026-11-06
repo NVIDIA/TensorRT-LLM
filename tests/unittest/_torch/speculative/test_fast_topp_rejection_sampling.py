@@ -402,7 +402,7 @@ def test_short_draft_and_ragged_vocab():
 
 
 def test_top_p_one_reproduces_the_temperature_kernels():
-    """With top-p 1 the nucleus kernels draw the same Philox words as RS2's temperature-only
+    """With top-p 1 the nucleus kernels draw the same Philox words as the temperature-only
     kernels (accept i -> word i, residual / bonus -> word K, draft -> the draft key's word 0), so
     their outputs agree wherever float rounding does not decide a draw."""
     gen = torch.Generator(device=DEV).manual_seed(8)
@@ -434,10 +434,10 @@ def test_top_p_one_reproduces_the_temperature_kernels():
 
 
 def test_philox_layout_never_reuses_a_draw():
-    """Over consecutive steps (offset window max_draft_len + 1, as
-    _populate_request_rng_state advances it), no (key, subsequence, word) is drawn twice, even
-    with every request on one seed: the layout of the nucleus kernels is RS2's (see
-    test_top_p_one_reproduces_the_temperature_kernels)."""
+    """Over consecutive steps whose offsets are only ``K + 1`` words apart (the narrowest spacing;
+    `SpecMetadata._take_rng_window_offsets` spaces them further), no ``(key, subsequence, word)`` is
+    drawn twice, even with every request on one seed: the layout of the nucleus kernels is that of
+    the temperature-only kernels (see `test_top_p_one_reproduces_the_temperature_kernels`)."""
     window = K + 1
     seed = 7
     for k in range(1, K + 1):

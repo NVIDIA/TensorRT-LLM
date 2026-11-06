@@ -18,6 +18,7 @@
 The kernels are checked for exactness against the reference samplers (flashinfer's draft sampling,
 `chain_speculative_sampling` for the verify) and float64 models on the same Philox draws, for
 losslessness with chi-square tests, and through the `SpecWorkerBase` entry points and CUDA graphs.
+The top-p kernels are tested in ``test_fast_topp_*.py``.
 """
 
 import math

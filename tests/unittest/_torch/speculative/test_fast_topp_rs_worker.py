@@ -83,9 +83,11 @@ def _worker_metadata(mbs, slots, seed, offset, mode=AdvancedSamplingMode.NO_TOPK
     rows = mbs * (K + 1)
     md.temperatures = torch.ones(rows, device=DEV)
     md.top_ks = torch.full((rows,), 2**31 - 1, dtype=torch.int32, device=DEV)
+    md.min_ps = torch.zeros(rows, device=DEV)
     md.top_ps = torch.full((rows,), top_p, device=DEV)
     md.request_temperatures = torch.ones(mbs, device=DEV)
     md.request_top_ks = torch.full((mbs,), 2**31 - 1, dtype=torch.int32, device=DEV)
+    md.request_min_ps = torch.zeros(mbs, device=DEV)
     md.request_top_ps = torch.full((mbs,), top_p, device=DEV)
     md.request_seeds = torch.full((mbs,), seed, dtype=torch.int64, device=DEV)
     md.request_offsets = torch.full((mbs,), offset, dtype=torch.int64, device=DEV)
@@ -243,7 +245,7 @@ def test_worker_mixed_per_request_temperature_and_top_p(monkeypatch):
     ],
 )
 def test_gate_and_dispatch_follow_the_sampling_mode(monkeypatch, mode, variant):
-    """The fused path covers the top-k-free modes: ``no_topk_no_topp`` runs RS2's temperature-only
+    """The fused path covers the top-k-free modes: ``no_topk_no_topp`` runs the temperature-only
     kernels, ``no_topk`` the nucleus kernels; modes that keep top-k use the reference. The other
     disqualifiers (guided decoding, a draft-to-target map, a synthetic acceptance override,
     vocab-sharded logits) and the flag keep the reference in every mode."""

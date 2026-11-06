@@ -27,6 +27,7 @@ for the verify. They have static shapes and never sync with the host, so they ca
 graphs. All reductions run in a fixed order (no atomics), so every tensor-parallel rank holding the
 same logits draws the same tokens. Logits of ``-inf`` (masked tokens) get probability 0, including
 chunks with no finite logit.
+`fast_topp_rejection_sampling` builds the top-p kernels on this module.
 """
 
 import os

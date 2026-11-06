@@ -14,77 +14,21 @@
 # limitations under the License.
 """Fused rejection sampling with a top-p (nucleus) filter for one-model block drafters.
 
-:mod:`fast_rejection_sampling` covers ``AdvancedSamplingMode.NO_TOPK_NO_TOPP`` (temperature-only
-sampling). This module adds ``AdvancedSamplingMode.NO_TOPK``: the target and the draft distributions
-are both filtered by top-p, as the reference does (``softmax`` then flashinfer's AIR
-``top_p_renorm_probs`` on the target rows and on the draft rows), and then the same chain rejection
-sampling runs on the renormalised nuclei. The Philox streams, the verify / draft layout and the
-buffers are RS2's, unchanged.
+`fast_rejection_sampling` covers ``AdvancedSamplingMode.NO_TOPK_NO_TOPP`` (temperature only). This
+module adds ``AdvancedSamplingMode.NO_TOPK``. Like the reference path (softmax, then flashinfer's AIR
+``top_p_renorm_probs`` on the target rows and on the draft rows), it filters the target and the
+draft distributions to their top-p nuclei, then runs the same chain rejection sampling on the
+renormalized nuclei. It reuses the Philox layout, the draft and verify structure and the scratch
+workspace of `fast_rejection_sampling`.
 
-Nucleus semantics (flashinfer AIR top-p renorm): with ``w_v = exp(z_v - max z)``, ``S = sum w`` and
-``z = logits / T``, the pivot is the first token, in descending order of ``z``, at which the
-cumulative mass reaches ``top_p * S``; every token with ``z >= z_pivot`` (ties included) is kept and
-renormalised: ``p~_v = w_v / Z`` with ``Z`` the kept mass. Rows with ``top_p >= 1`` keep everything.
+Nucleus of a row (flashinfer's AIR top-p renorm): with ``z = logits / T``, ``w_v = exp(z_v - max z)``
+and ``S = sum w``, the pivot is the first token, in descending order of ``z``, at which the
+cumulative mass reaches ``top_p * S``. Every token with ``z >= z_pivot`` (ties included) is kept and
+renormalized: ``p~_v = w_v / Z`` with ``Z`` the kept mass. Rows with ``top_p >= 1`` keep every token.
 
-Nucleus search, no sort of the vocabulary: the rows are processed by a pipeline of kernels with one
-program per ``(row, chunk of the vocabulary)`` (hundreds of programs per step, instead of one program
-per row), and every kernel after the search reads only the per-row nucleus record ``rec`` (``z_pivot``,
-``Z``, ``S``, status, ``max z``, ``1/T``, padding flag), so the target rows, the draft rows and the
-verify kernels classify every token by the same comparison ``z >= z_pivot``:
-
-1. :func:`_topp_stats_kernel`: per chunk ``(max z, sum exp(z - max z), number of tokens equal to the
-   maximum)``. The last program of a row (an atomic ticket) combines the partials in index order into
-   the row descriptor ``rd``: ``max z``, ``S``, ``target = top_p * S``, the search mode (the row keeps
-   the whole vocabulary / its maximum alone reaches the target / a search is needed) and the window
-   of the histogram. The pivot is bounded: the tokens at or below it carry more than ``(1 - p) * S``
-   of the mass and each weighs at most ``exp(-depth)``, so ``depth < ln(V / ((1 - p) * S))``.
-2. :func:`_topp_hist_kernel`: counts the tokens of ``[max z - depth, max z]`` in ``NB`` equal-width
-   bins (integer atomics). Counts bound each bin's mass (``count * [w_low, w_high]``) and so the
-   cumulative mass; the last program of the row selects the *zone* (:func:`_zone_from_hist`): either
-   every token at or above ``z_lo`` is a candidate (mode 1) or the pivot lies among the tokens of
-   ``[z_lo, z_hi]`` and the mass above ``z_hi`` is summed exactly (mode 2), when at most ``CAP``
-   candidates result.
-3. :func:`_topp_gather_kernel`: each chunk compacts its zone tokens (at most ``CHUNK_CAP``, counted
-   exactly) and, in mode 2, the mass above and inside the zone. A chunk is a set of interleaved
-   256-token segments spread over the vocabulary (the probable tokens of a language model cluster at
-   the lowest ids, which would overflow one contiguous chunk long before ``CAP`` candidates).
-4. :func:`_topp_resolve_kernel` (one program per row): concatenates the candidates, sorts them
-   (three size classes) and takes as pivot the first one, in descending order, at which the running mass
-   (started at the exact mass above the zone) reaches the target. ``Z`` is the mass of every token at or
-   above the pivot (ties included, no special case). A list longer than ``bin_min`` is first narrowed
-   (:func:`_bin_select_resolve`): its ``z`` range is split into ``sub_bins`` equal bins, the exact (fixed
-   order) mass of every bin is summed, and only the bin where the running mass from the top reaches the
-   target is sorted, starting from the mass of the bins above; a token's bin depends on its ``z`` alone,
-   so a tied group is never split, and a sort of thousands of candidates (tens of microseconds of
-   latency) shrinks to a few hundred. A zone whose tokens are all equal needs no sort; a row whose
-   maximum alone reaches the target keeps the tokens tied with it (``Z`` from the tie count) without
-   any pass over the row.
-5. :func:`_topp_nucleus_kernel`, the exact fallback: one program per row that still has status
-   pending (a chunk overflowed, more than ``CAP`` candidates, or the candidate mass is short of the
-   target) refines the histogram zone pass by pass (each refinement narrows the zone by about
-   ``NB / 5``). A violated certificate (only possible for non-finite input) or exhausted iterations
-   set ``status != 0``; the row then keeps every token at or above the lowest ``z`` of the last
-   certified zone (a superset of the exact nucleus), the whole vocabulary when no zone was certified.
-   After its first pass the search knows the exact mass inside the window, so it bounds the mass
-   below the window by ``S - mass above - mass inside`` instead of by counting each token below at the
-   window's edge weight. Rows the pipeline resolved exit at once.
-
-Exactness. The record is exact up to the rounding of float32 mass sums: a zone is accepted only when
-the mass above it is below the target and the mass through it reaches the target, both compared with
-a relative tolerance ``_MASS_TOL`` (the rounding of a float32 sum of up to ~1e5 weights); only a token
-boundary within that tolerance of the target can differ from the exact-arithmetic nucleus, and there
-flashinfer's own float32 ternary search is arbitrary as well. The pivot is always the stored ``z`` of
-a token of the row, so no comparison involves computed thresholds.
-
-Determinism. The only atomics are integer (tickets and histogram counts, order independent); every
-floating-point sum is of fixed-order per-chunk partials combined by one program in index order, so
-the result is a pure function of the logits: tensor-parallel ranks holding the same logits find
-bit-identical nuclei and draws. The ticket counters and the histograms live in one control buffer
-that is zeroed before every call (a buffer first allocated inside a CUDA-graph capture is not
-reliably zero until the first replay, so the kernels do not reset counters themselves).
-
-The per-call scratch (partials, descriptors, records, candidate lists) comes from RS2's grow-only
-workspace, whose retired buffers are never freed, so CUDA graphs captured earlier stay valid.
+`_nucleus_records` finds the nucleus of every row without sorting the vocabulary and stores it in a
+per-row record. The draft-write and verify kernels read only that record and keep a token when
+``z >= z_pivot``, so the target rows, the draft rows and the verify kernels agree on the nucleus.
 """
 
 import dataclasses
@@ -120,7 +64,8 @@ STATUS_OK = 0
 STATUS_INVALID_ZONE = 1
 STATUS_NOT_RESOLVED = 2
 STATUS_PENDING = 3  # handed to the single-program kernel
-# Vocab elements per program of the draft-write / verify kernels (RS2's chunking of the draft proposals).
+# Vocab elements per program of the draft-write / verify kernels (the chunking of the draft
+# proposals of ``fast_rejection_sampling``).
 _CHUNK = 4096
 _NUM_WARPS = 8
 # Largest top_p below one that the nucleus search handles (1 - 2^-24 is the largest float32 < 1).
@@ -408,7 +353,7 @@ def _topp_stats_kernel(
     NC_POW2: tl.constexpr,
     HAS_BIAS: tl.constexpr,
 ):
-    """RS2's per-chunk ``(max, sum exp(x - max))`` plus the number of tokens equal to the chunk's maximum;
+    """Per chunk, ``(max, sum exp(x - max))`` plus the number of tokens equal to the chunk's maximum;
     the last program of a row (an atomic ticket; ``ctl`` is zeroed before every call) combines the
     partials, in a fixed order, into the row descriptor (`_RD_WIDTH`) that every later kernel
     reads instead."""
