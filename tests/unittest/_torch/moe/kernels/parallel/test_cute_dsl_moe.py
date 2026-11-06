@@ -5485,6 +5485,7 @@ def test_moe_module_mxfp8_chunked_forward_with_aux_stream():
     get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
     reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
 )
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 0.5], ids=["nolimit", "limit0.5"])
 @pytest.mark.parametrize("tile_size", [128, 256])
 @pytest.mark.parametrize(
     "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",
@@ -5505,6 +5506,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
     interm_size: int,
     num_experts: int,
     tile_size: int,
+    swiglu_limit: float,
 ):
     """End-to-end check of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
 
@@ -5512,14 +5514,17 @@ def test_mxfp8_fused_fc12_moe_rubin(
     swizzled + gate/up-interleaved FC1 weights and scales, swizzled FC2 scales,
     unit alphas / norm const, moe_sort metadata, and the scatter-add finalize
     into a pre-zeroed output. The small shapes additionally run every tactic
-    the runner enumerates for the routing tile.
+    the runner enumerates for the routing tile. A finite ``swiglu_limit``
+    (smallest shape only) clamps a large share of the FC1 gate and up values,
+    which are O(1) here.
     """
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
 
+    if swiglu_limit != float("inf") and num_experts != 16:
+        pytest.skip("The clamp runs on the smallest shape only")
     torch.manual_seed(0)
     sf_vec_size = 32
     num_local_experts = num_experts // ep_size
-    swiglu_limit = float("inf")
 
     routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
     token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
@@ -5625,7 +5630,8 @@ def test_mxfp8_fused_fc12_moe_rubin(
         num_local_experts=num_local_experts,
         local_expert_offset=0,
         tile_size=tile_size,
-        swiglu_limit=-1.0,
+        # A negative limit disables the clamp.
+        swiglu_limit=swiglu_limit if swiglu_limit != float("inf") else -1.0,
     )
 
     # 1. Public op with the default tactic; the output must be pre-zeroed.
@@ -5666,7 +5672,7 @@ def test_mxfp8_fused_fc12_moe_rubin(
 
     # 2. Every tactic the runner enumerates (small shapes only: each distinct
     #    geometry is a DSL compile).
-    if num_experts > 64:
+    if num_experts > 64 or swiglu_limit != float("inf"):
         return
     runner = Sm107Mxfp8FusedFc12MoeRunner(
         num_experts, top_k, num_local_experts, 0, tile_size, swiglu_limit=swiglu_limit
