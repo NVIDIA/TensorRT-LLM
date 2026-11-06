@@ -581,6 +581,32 @@ def test_encoder_warmup_runs_nested_output_models_eagerly(nested: bool) -> None:
     assert warning.called is nested
 
 
+def test_encoder_warmup_stays_within_a_one_token_budget() -> None:
+    runner = _warmup_runner(world_size=1)
+    runner._encoder_cuda_graph_runner.build_capture_sequence_lengths = (
+        EncoderCUDAGraphRunner.build_capture_sequence_lengths
+    )
+    runner._model = SimpleNamespace(extra_attrs={})
+    runner._config = SimpleNamespace(max_batch_size=1, max_num_tokens=1, max_seq_len=4)
+    runner._prepare_capture_inputs = Mock(
+        return_value=EncoderPreparedInputs({}, sequence_lengths=[1])
+    )
+    runner._execute_prepared = Mock(return_value={"logits": torch.ones(1, 2)})
+    runner._run_autotuner_warmup = Mock()
+    runner._capture_encoder_cuda_graphs = Mock()
+
+    with (
+        patch.object(encoder_module.AutoTuner, "get"),
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.synchronize"),
+    ):
+        runner.warmup()
+
+    warmup_batches = [call.args[0] for call in runner._prepare_capture_inputs.call_args_list]
+    assert warmup_batches
+    assert all(sum(batch) <= 1 for batch in warmup_batches)
+
+
 def _capture_input_runner(extra_input_specs: list[EncodeExtraInputSpec]) -> EncoderRunner:
     runner = object.__new__(EncoderRunner)
     runner._encoder_cuda_graph_runner = SimpleNamespace(extra_input_specs=extra_input_specs)

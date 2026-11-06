@@ -969,15 +969,11 @@ class EncoderRunner(EncoderMixin, ScheduledModelRunner):
             self._config.max_num_tokens,
             self._config.max_seq_len,
         )
-        warmup_shapes = list(
-            dict.fromkeys(
-                [
-                    (1, 1, 1),
-                    max_shape,
-                    (1, 2, 2),
-                ]
-            )
-        )
+        warmup_shapes = [
+            shape
+            for shape in dict.fromkeys([(1, 1, 1), max_shape, (1, 2, 2)])
+            if all(dim <= limit for dim, limit in zip(shape, max_shape))
+        ]
         nested_outputs = self._run_warmup_shapes(warmup_shapes)
         graph_runner = self._encoder_cuda_graph_runner
         if nested_outputs and graph_runner.enabled:
