@@ -43,8 +43,9 @@ class CharTokenizer:
     def decode(self, token_ids, **kwargs):
         return "".join(chr(t) for t in token_ids)
 
-    def decode_incrementally(self, token_ids, prev_text=None, states=None, *, flush=False,
-                             stream_interval=1, **kwargs):
+    def decode_incrementally(
+        self, token_ids, prev_text=None, states=None, *, flush=False, stream_interval=1, **kwargs
+    ):
         return (prev_text or "") + self.decode(token_ids), states
 
 
@@ -56,10 +57,14 @@ class _Result(SimpleNamespace):
 
 
 def _response(seq_idx, ids, finish_reason, is_final, cum_log_prob=None):
-    result = _Result(sequence_index=seq_idx, output_token_ids=[ids], finish_reasons=[finish_reason],
-                     is_final=is_final,
-                     log_probs=[[{t: Logprob(logprob=-0.5, rank=1)} for t in ids]],
-                     cum_log_probs=None if cum_log_prob is None else [cum_log_prob])
+    result = _Result(
+        sequence_index=seq_idx,
+        output_token_ids=[ids],
+        finish_reasons=[finish_reason],
+        is_final=is_final,
+        log_probs=[[{t: Logprob(logprob=-0.5, rank=1)} for t in ids]],
+        cum_log_probs=None if cum_log_prob is None else [cum_log_prob],
+    )
     return SimpleNamespace(has_error=lambda: False, result=result)
 
 
@@ -81,16 +86,18 @@ def test_outputs_match_their_tokens(streaming, n, best_of):
     while any(pos[k] < len(ids[k]) for k in range(best_of)):
         for k in range(best_of):
             if pos[k] < len(ids[k]):
-                order.append((k, ids[k][pos[k]:pos[k] + step]))
+                order.append((k, ids[k][pos[k] : pos[k] + step]))
                 pos[k] += step
     for i, (k, chunk) in enumerate(order):
-        last_of_k = all(kk != k for kk, _ in order[i + 1:])
+        last_of_k = all(kk != k for kk, _ in order[i + 1 :])
         reason = tllm.FinishReason.LENGTH if last_of_k else tllm.FinishReason.NOT_FINISHED
         result._handle_response(_response(k, chunk, reason, i == len(order) - 1))
         for j, out in enumerate(result._outputs):
             if j != k:
                 # Outputs this response did not update report nothing new.
-                assert out.text_diff == "" and out.token_ids_diff == [] and len(out.logprobs_diff) == 0
+                assert (
+                    out.text_diff == "" and out.token_ids_diff == [] and len(out.logprobs_diff) == 0
+                )
             streamed[j] += out.text_diff
             streamed_ids[j] += out.token_ids_diff
             streamed_logprobs[j] += len(out.logprobs_diff)
@@ -111,10 +118,19 @@ def test_outputs_match_their_tokens(streaming, n, best_of):
 # selected later: in the first case after two responses of its own, in the second because the other
 # sequence's score drops.
 _RERANK_CASES = {
-    "selected_after_own_responses": [(0, "aaa", -1.0), (1, "bbb", -5.0), (0, "ccc", -3.0),
-                                      (1, "ddd", -2.0), (0, "eee", -9.0)],
-    "selected_by_other_response": [(0, "aaa", -1.0), (1, "bbb", -5.0), (0, "ccc", -9.0),
-                                   (1, "ddd", -6.0)],
+    "selected_after_own_responses": [
+        (0, "aaa", -1.0),
+        (1, "bbb", -5.0),
+        (0, "ccc", -3.0),
+        (1, "ddd", -2.0),
+        (0, "eee", -9.0),
+    ],
+    "selected_by_other_response": [
+        (0, "aaa", -1.0),
+        (1, "bbb", -5.0),
+        (0, "ccc", -9.0),
+        (1, "ddd", -6.0),
+    ],
 }
 
 
@@ -126,10 +142,11 @@ def test_streaming_best_of_rerank_keeps_text(case):
     sp._setup(tok, None, None)
     result = DetokenizedGenerationResultBase(0, sp, tokenizer=tok, streaming=True)
     for i, (k, chunk, cum) in enumerate(steps):
-        last_of_k = all(kk != k for kk, _, _ in steps[i + 1:])
+        last_of_k = all(kk != k for kk, _, _ in steps[i + 1 :])
         reason = tllm.FinishReason.LENGTH if last_of_k else tllm.FinishReason.NOT_FINISHED
         result._handle_response(
-            _response(k, tok.encode(chunk), reason, i == len(steps) - 1, cum_log_prob=cum))
+            _response(k, tok.encode(chunk), reason, i == len(steps) - 1, cum_log_prob=cum)
+        )
     (selected,) = result.outputs
     assert selected is result._outputs[1]
     assert selected.text == tok.decode(selected.token_ids)
