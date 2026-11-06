@@ -196,9 +196,11 @@ eligible, the script scans all product Python files. `--full-project` requests
 that scan explicitly. For supplied files, diagnostics are filtered to added
 and modified lines when Git provides them and retained at file level otherwise.
 Jenkins runs a full-project check with path/module and symbol exclusions.
-Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]` section in
-`pyproject.toml` defines the product roots, diagnostics, and native exclusions;
-`[tool.pyrefly-exclusions]` defines additional symbol exclusions for the wrapper.
+Whole-project checks always return success; file-list checks can opt into
+`--strict`. Jenkins and pre-commit checks are advisory. The `[tool.pyrefly]`
+section in `pyproject.toml` defines the product roots, diagnostics, and native
+exclusions. `[tool.pyrefly-exclusions]` defines additional symbol exclusions
+for the wrapper.
 Pyrefly is pinned in `requirements-dev.txt`. Missing imports are reported except for
 PyTorch, generated bindings, and configured third-party libraries.
 
