@@ -196,7 +196,7 @@ def _fp8_input_scale(layer: nn.Module) -> Optional[torch.Tensor]:
 
 
 def _fp8_linear_input_scale(
-        linear: Optional[nn.Module]) -> Optional[torch.Tensor]:
+        linear: Optional[Linear]) -> Optional[torch.Tensor]:
     """Static input scale of an FP8 per-tensor Linear, or None."""
     # remove_weights (layer-wise benchmark) leaves no input_scale.
     if (linear is None
