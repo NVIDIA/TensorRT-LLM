@@ -33,10 +33,12 @@ from defs.examples.visual_gen.visual_gen_test_utils import (
     _llm_models_root,
     _multi_resolution_log_stft_distance,
 )
-from diffusers import ModularPipeline
+from diffusers import MiniMaxH3Scheduler, ModularPipeline
 from PIL import Image
 
 from tensorrt_llm import VisualGen, VisualGenParams
+from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline_minimax_h3
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.heun_scheduler import MiniMaxH3HeunScheduler
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm._torch.visual_gen.pipeline_registry import PipelineComponent
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -134,8 +136,14 @@ def _generate_diffusers_reference(
     checkpoint_path: str,
     keyframes: list[Image.Image],
     references: list | None = None,
+    sampler: str = "euler",
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Generate a fresh reference with the installed, repository-pinned Diffusers."""
+    """Generate a fresh reference with the installed, repository-pinned Diffusers.
+
+    ``sampler="heun"`` swaps both schedulers for ``MiniMaxH3HeunScheduler``; the
+    Diffusers loop drives any scheduler through its ``timesteps``, so the
+    reference runs the same Heun evaluations through an independent pipeline.
+    """
     pipeline = ModularPipeline.from_pretrained(
         checkpoint_path,
         workflow="ref2va" if references else ("fl2va" if keyframes else "t2va"),
@@ -148,6 +156,11 @@ def _generate_diffusers_reference(
         pretrained_model_name_or_path=checkpoint_path,
         local_files_only=True,
     )
+    if sampler == "heun":
+        pipeline.update_components(
+            scheduler=MiniMaxH3HeunScheduler.from_config(pipeline.scheduler.config),
+            audio_scheduler=MiniMaxH3HeunScheduler.from_config(pipeline.audio_scheduler.config),
+        )
     pipeline.to("cuda")
     try:
         keyframe_inputs = {"image": keyframes[0], "last_image": keyframes[1]} if keyframes else {}
@@ -468,14 +481,37 @@ def test_minimax_h3_public_visual_gen_api_smoke() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize(
-    ("task", "quant_algo"),
-    [("t2va", None), ("fl2va", None), ("t2va", "FP8_BLOCK_SCALES"), ("ref2va", None)],
-    ids=["t2va", "fl2va", "t2va-fp8-blockwise", "ref2va"],
+    ("task", "quant_algo", "sampler"),
+    [
+        ("t2va", None, "euler"),
+        ("fl2va", None, "euler"),
+        ("t2va", "FP8_BLOCK_SCALES", "euler"),
+        ("ref2va", None, "euler"),
+        ("t2va", None, "heun"),
+        ("fl2va", None, "heun"),
+        ("ref2va", None, "heun"),
+        ("t2va", "FP8_BLOCK_SCALES", "heun"),
+    ],
+    ids=[
+        "t2va",
+        "fl2va",
+        "t2va-fp8-blockwise",
+        "ref2va",
+        "t2va-heun",
+        "fl2va-heun",
+        "ref2va-heun",
+        "t2va-fp8-blockwise-heun",
+    ],
 )
 def test_minimax_h3_diffusers_lpips_and_audio_reference(
-    task: str, quant_algo: str | None, tmp_path: Path, _full_cuda_memory_budget: None
+    task: str,
+    quant_algo: str | None,
+    sampler: str,
+    tmp_path: Path,
+    _full_cuda_memory_budget: None,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Gate both supported tasks against a fresh Diffusers reference."""
+    """Gate every supported task and sampler against a fresh Diffusers reference."""
     checkpoint_path = _minimax_h3_checkpoint_path()
     _disable_inductor_compile_worker_quiesce()
     keyframes = (
@@ -497,9 +533,19 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
             MiniMaxH3AudioReference(waveform.repeat(2, 1), sample_rate=32000),
         ]
     golden_video, golden_audio = _generate_diffusers_reference(
-        checkpoint_path, keyframes, references
+        checkpoint_path, keyframes, references, sampler
     )
 
+    # _check_denoise_step runs once per stream per transformer evaluation.
+    video_evaluations = []
+    check_denoise_step = pipeline_minimax_h3._check_denoise_step
+
+    def counting_check(velocity: torch.Tensor, name: str, step: int) -> None:
+        if name == "video":
+            video_evaluations.append(step)
+        check_denoise_step(velocity, name, step)
+
+    monkeypatch.setattr(pipeline_minimax_h3, "_check_denoise_step", counting_check)
     pipeline = PipelineLoader(
         VisualGenArgs(
             model=checkpoint_path,
@@ -520,12 +566,21 @@ def test_minimax_h3_diffusers_lpips_and_audio_reference(
             num_frames=MINIMAX_H3_QUALITY_NUM_FRAMES,
             frame_rate=24.0,
             num_inference_steps=MINIMAX_H3_NUM_INFERENCE_STEPS,
+            sampler=sampler,
         )
         generated_video = output.video.detach().cpu()
         generated_audio = output.audio.detach().cpu()
     finally:
         del pipeline
         _cleanup_cuda()
+
+    # Heun adds a second evaluation to every Euler step except the last.
+    euler = MiniMaxH3Scheduler()
+    euler.set_timesteps(MINIMAX_H3_NUM_INFERENCE_STEPS)
+    num_evaluations = len(euler.timesteps)
+    if sampler == "heun":
+        num_evaluations = 2 * num_evaluations - 1
+    assert video_evaluations == list(range(num_evaluations))
 
     # Keep local tensors for inspecting quality failures; do not upload model output.
     torch.save(
