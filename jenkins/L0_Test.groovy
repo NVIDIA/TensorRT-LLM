@@ -2236,13 +2236,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
 
-                def profilerEnvUploadPath = "${scriptProfilerEnvPathNode}.${UUID.randomUUID()}.tmp"
                 Utils.copyFileToRemoteHost(
-                    pipeline, remote, scriptProfilerEnvLocalPath, profilerEnvUploadPath
-                )
-                // An active job may start another Bash while a frontend retry redelivers this hook.
-                Utils.exec(
-                    pipeline, script: Utils.sshUserCmd(remote, "\"mv -f '${profilerEnvUploadPath}' '${scriptProfilerEnvPathNode}'\"")
+                    pipeline,
+                    remote,
+                    scriptProfilerEnvLocalPath,
+                    scriptProfilerEnvPathNode,
+                    true
                 )
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
