@@ -150,3 +150,25 @@ def test_streaming_best_of_rerank_keeps_text(case):
     (selected,) = result.outputs
     assert selected is result._outputs[1]
     assert selected.text == tok.decode(selected.token_ids)
+
+
+def test_streaming_best_of_stop_word_trimmed_outside_top_n():
+    """A candidate decoded, then trimmed by a stop word while outside the top n, then selected again."""
+    sp = SamplingParams(n=1, best_of=2, temperature=1.0, max_tokens=64, logprobs=1, stop=["XY"])
+    tok = CharTokenizer()
+    sp._setup(tok, None, None)
+    result = DetokenizedGenerationResultBase(0, sp, tokenizer=tok, streaming=True)
+    steps = [
+        (0, "aaX", -1.0, tllm.FinishReason.NOT_FINISHED),
+        (1, "bbb", -0.5, tllm.FinishReason.NOT_FINISHED),
+        (0, "Y", -2.0, tllm.FinishReason.STOP_WORDS),
+        (1, "ccc", -9.0, tllm.FinishReason.LENGTH),
+    ]
+    for i, (k, chunk, cum, reason) in enumerate(steps):
+        result._handle_response(
+            _response(k, tok.encode(chunk), reason, i == len(steps) - 1, cum_log_prob=cum)
+        )
+    (selected,) = result.outputs
+    assert selected is result._outputs[0]
+    assert selected.token_ids == tok.encode("aa")
+    assert selected.text == "aa"

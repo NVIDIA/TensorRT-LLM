@@ -1069,8 +1069,13 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 # into text, or holds the lead bytes of a character that the
                 # final flush would emit as U+FFFD. Decode the kept ids afresh
                 # instead, as the non-streaming path does.
-                trimmed_streamed_ids = (len(beam_output.token_ids)
-                                        < beam_output._last_token_ids_len)
+                # With best_of > n, a candidate can be trimmed while outside the
+                # top n, and a later response then moves _last_token_ids_len to
+                # the kept length; the decoder cursor still shows the cut ids.
+                trimmed_streamed_ids = (
+                    len(beam_output.token_ids) < beam_output._last_token_ids_len
+                    or len(beam_output.token_ids)
+                    < beam_output._detokenized_token_ids_len)
                 use_incremental = (self._streaming
                                    and not self.sampling_params.use_beam_search
                                    and not trimmed_streamed_ids and hasattr(
