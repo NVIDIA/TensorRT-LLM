@@ -332,3 +332,184 @@ class TestFlux2AttentionBackend(unittest.TestCase):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.cpu_only
+def test_flux_attention_quant_ignore_bypasses_explicit_qkv_quantization() -> None:
+    """Flux QKV preparation uses BF16 when attention quantization is ignored."""
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    attention = FluxJointAttention.__new__(FluxJointAttention)
+    torch.nn.Module.__init__(attention)
+    attention._quant_attention_config = QuantAttentionConfig(
+        qk_dtype="fp8", v_dtype="fp8", ignored_steps=[0]
+    )
+    attention._quantization_excluded = False
+    attention._quant_ignore_state = {}
+    attention.requires_static_e4m3_attention = True
+    attention._static_e4m3_attention_scales_loaded = True
+    attention.added_kv_proj_dim = None
+    attention.pre_only = True
+    attention.fuse_qk_norm_rope = True
+    attention.num_attention_heads = attention.num_key_value_heads = 1
+    attention.head_dim = attention.local_q_dim = attention.local_kv_dim = 128
+    attention.eps = 1e-6
+    attention.interleave = True
+    attention.norm_q = attention.norm_k = SimpleNamespace(weight=torch.ones(128))
+    attention.qkv_proj = torch.nn.Linear(128, 384, bias=False, dtype=torch.bfloat16)
+    for name in ("q", "k", "v"):
+        setattr(attention, f"_static_{name}_dequant_scale", torch.ones(()))
+    x = torch.randn(1, 4, 128, dtype=torch.bfloat16)
+    rotary = (torch.ones(1, 4, 1, 128), torch.zeros(1, 4, 1, 128))
+    fp8_qkv = tuple(torch.ones(4, 128).to(torch.float8_e4m3fn) for _ in range(3))
+    calls = []
+
+    def attend(q, k, v, **kwargs):
+        calls.append((q.dtype, kwargs))
+        return q.to(torch.bfloat16)
+
+    with (
+        patch.object(attention, "apply_packed_qk_norm_rope") as bf16,
+        patch.object(attention, "_attn_impl", side_effect=attend),
+        patch("torch.ops.trtllm.fused_dit_qk_norm_rope_quant_fp8", return_value=fp8_qkv) as fp8,
+    ):
+        for quant_ignored in (False, True, False):
+            attention._quant_ignore_state["attention_quant_ignored"] = quant_ignored
+            attention(x, image_rotary_emb=rotary)
+    assert fp8.call_count == 2 and bf16.call_count == 1
+    assert [dtype for dtype, _ in calls] == [
+        torch.float8_e4m3fn,
+        torch.bfloat16,
+        torch.float8_e4m3fn,
+    ]
+    assert ["static_q_scale" in kwargs for _, kwargs in calls] == [True, False, True]
+
+
+@pytest.mark.cpu_only
+def test_flux2_linear_quant_ignore_bypasses_fp4_mlp_fusion() -> None:
+    from unittest.mock import patch
+
+    from tensorrt_llm._torch.visual_gen.models.flux.attention import Flux2ParallelSelfAttention
+
+    class InputProjection(torch.nn.Module):
+        tp_size = 2
+
+        def __init__(self):
+            super().__init__()
+            self.qkv_proj = torch.nn.Linear(128, 384, bias=False, dtype=torch.bfloat16)
+            self.mlp_proj = torch.nn.Linear(128, 256, bias=False, dtype=torch.bfloat16)
+            self.mlp_proj.can_use_cute_dsl_nvfp4_swiglu_blackwell = lambda: False
+
+        def forward(self, value):
+            return self.qkv_proj(value), self.mlp_proj(value)
+
+    class OutputProjection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp_proj = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+            self.mlp_proj._weights_created = self.mlp_proj.has_nvfp4 = True
+            self.mlp_proj.requires_unquantized_activation = True
+            self.mlp_proj.input_scale = torch.ones(())
+            self.mlp_proj.pre_quant_scale = None
+            self.mlp_proj.force_dynamic_quantization = False
+
+        def forward(self, attention, mlp):
+            return attention + self.mlp_proj(mlp)
+
+    attention = Flux2ParallelSelfAttention.__new__(Flux2ParallelSelfAttention)
+    torch.nn.Module.__init__(attention)
+    attention.to_qkv_mlp_proj = InputProjection()
+    attention.to_out = OutputProjection()
+    attention._apply_norm_rope = lambda value, rotary: value.chunk(3, dim=-1)
+    attention._attn_impl = lambda q, k, v, **kwargs: q
+    with (
+        patch("tensorrt_llm._torch.visual_gen.models.flux.attention.is_sm_100f", return_value=True),
+        patch("torch.cuda.is_available", return_value=True),
+        patch(
+            "tensorrt_llm._torch.visual_gen.models.flux.attention.swiglu",
+            side_effect=lambda value: value[:, :128],
+        ),
+        patch.object(
+            attention,
+            "_project_hidden_mlp_with_cute_dsl",
+            side_effect=AssertionError("Fused weight layout must not be used"),
+        ),
+        patch.object(
+            attention,
+            "_project_split_output_with_fp4_mlp",
+            side_effect=AssertionError("FP4 output must not be produced"),
+        ),
+        patch.object(
+            attention.to_out.mlp_proj, "forward", wraps=attention.to_out.mlp_proj.forward
+        ) as bf16,
+    ):
+        attention(torch.randn(1, 8, 128, dtype=torch.bfloat16))
+    bf16.assert_called_once()
+    assert bf16.call_args.args[0].dtype == torch.bfloat16
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("variant", ["flux1", "flux2"])
+def test_flux_attention_ignore_matches_real_module_path(
+    variant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import patch
+
+    from test_common.visual_gen_quantization import ToyAttentionBackend
+
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import FluxTransformer2DModel
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import Flux2Transformer2DModel
+    from tensorrt_llm.visual_gen.args import QuantAttentionConfig
+
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "0")
+    for component, target, tp_size in (
+        (None, "single_transformer_blocks.0.attn", 1),
+        ("transformer", "transformer.single_transformer_blocks.1.attn", 2),
+        ("transformer", "transformer_blocks.0.attn", 1),
+    ):
+        config = DiffusionModelConfig(
+            component_name=component,
+            mapping=Mapping(world_size=tp_size, rank=0, tp_size=tp_size),
+            pretrained_config=SimpleNamespace(
+                num_layers=1,
+                num_single_layers=2,
+                num_attention_heads=2,
+                attention_head_dim=128,
+                joint_attention_dim=128,
+                pooled_projection_dim=128,
+                timestep_guidance_channels=32,
+                in_channels=128,
+                axes_dims_rope=[32, 32, 32, 32] if variant == "flux2" else [16, 56, 56],
+            ),
+            attention=AttentionConfig(
+                backend="CUTEDSL",
+                quant_attention_config=QuantAttentionConfig(
+                    qk_dtype="nvfp4", v_dtype="fp8", ignore=[target]
+                ),
+            ),
+        )
+        with (
+            torch.device("meta"),
+            patch(
+                "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
+                return_value=ToyAttentionBackend,
+            ),
+        ):
+            model_type = Flux2Transformer2DModel if variant == "flux2" else FluxTransformer2DModel
+            model = model_type(config)
+        found = []
+        for name, module in model.named_modules():
+            if name.endswith(".attn"):
+                prefix = f"{component}." if component else ""
+                assert module.module_name == prefix + name
+                assert module._quantization_excluded == (target in (name, prefix + name))
+                global_index = int(name.split(".")[1])
+                if name.startswith("single_transformer_blocks."):
+                    global_index += len(model.transformer_blocks)
+                assert module.layer_idx == global_index
+                assert module.tp_size == tp_size
+                found.append(name)
+        assert target.removeprefix("transformer.") in found

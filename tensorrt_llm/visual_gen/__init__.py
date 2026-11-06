@@ -46,6 +46,7 @@ if TYPE_CHECKING:
         CompilationConfig,
         CpuOffloadConfig,
         CudaGraphConfig,
+        DiffusionQuantConfig,
         ParallelConfig,
         QuantAttentionConfig,
         RuntimeLoRAConfig,
@@ -78,6 +79,7 @@ _LAZY_ATTRS = {
     "CudaGraphConfig": "tensorrt_llm.visual_gen.args",
     "ParallelConfig": "tensorrt_llm.visual_gen.args",
     "QuantAttentionConfig": "tensorrt_llm.visual_gen.args",
+    "DiffusionQuantConfig": "tensorrt_llm.visual_gen.args",
     "RuntimeLoRAConfig": "tensorrt_llm.visual_gen.args",
     "SeaCacheConfig": "tensorrt_llm.visual_gen.args",
     "SkipSoftmaxAttentionConfig": "tensorrt_llm.visual_gen.args",
@@ -166,4 +168,5 @@ __all__ = [
     "SeaCacheConfig",
     # Re-exported for convenience
     "QuantConfig",
+    "DiffusionQuantConfig",
 ]

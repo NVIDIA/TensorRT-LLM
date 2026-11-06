@@ -168,3 +168,67 @@ def test_ltx23_example_recipe_config(
         assert (
             config.attention.quant_attention_config == args.attention_config.quant_attention_config
         )
+
+
+@pytest.mark.parametrize("mode", ["block", "step"])
+def test_attention_quant_ignore_scope(mode: str) -> None:
+    import torch
+    from test_common.visual_gen_quantization import (
+        ToyAttentionBackend,
+        assert_quantization_routes,
+        observe_quantization_paths,
+    )
+
+    from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
+    from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import TransformerConfig
+    from tensorrt_llm._torch.visual_gen.models.ltx23.transformer_ltx23 import LTX23TransformerBlock
+    from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+
+    config = DiffusionModelConfig(
+        attention=AttentionConfig(
+            backend="CUTEDSL",
+            quant_attention_config=QuantAttentionConfig(
+                qk_dtype="nvfp4",
+                v_dtype="fp8",
+                ignore=["transformer_blocks.0.attn1"] if mode == "block" else [],
+                ignored_steps=[1] if mode == "step" else [],
+            ),
+        ),
+        attention_metadata_state={},
+    )
+    with patch(
+        "tensorrt_llm._torch.visual_gen.attention.backends.utils.get_visual_gen_attention_backend",
+        return_value=ToyAttentionBackend,
+    ):
+        block = LTX23TransformerBlock(
+            0,
+            video=TransformerConfig(128, 1, 128, 64),
+            audio=TransformerConfig(64, 1, 64, 64),
+            config=config,
+        )
+    names = (
+        "attn1",
+        "attn2",
+        "audio_attn1",
+        "audio_attn2",
+        "audio_to_video_attn",
+        "video_to_audio_attn",
+    )
+    with observe_quantization_paths(block) as trace:
+        for step in range(2):
+            trace.step = step
+            config.attention_metadata_state["attention_quant_ignored"] = step == 1
+            for name in names:
+                attention = getattr(block, name)
+                values = torch.randn(1, 8, 1, attention.head_dim, dtype=torch.bfloat16)
+                attention.attn(values, values, values)
+    assert_quantization_routes(
+        trace,
+        {
+            (step, name, "attention"): "quantized"
+            if mode == "step" and name == "attn1" and step == 0
+            else "bf16"
+            for step in range(2)
+            for name in names
+        },
+    )

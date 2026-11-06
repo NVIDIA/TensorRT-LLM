@@ -456,6 +456,7 @@ class FluxSingleTransformerBlock(nn.Module):
         force_dynamic_quant: bool = False,
         config: Optional[DiffusionModelConfig] = None,
         layer_idx: int = 0,
+        module_name: Optional[str] = None,
     ):
         super().__init__()
         self.config = config
@@ -498,7 +499,7 @@ class FluxSingleTransformerBlock(nn.Module):
             pre_only=True,  # No output projection in attention
             config=config,
             layer_idx=layer_idx,
-            module_name=f"single_transformer_blocks.{layer_idx}.attn",
+            module_name=module_name or f"single_transformer_blocks.{layer_idx}.attn",
         )
 
         # MLP + Attn Output projection, requires special handling for TP
@@ -547,6 +548,7 @@ class FluxSingleTransformerBlock(nn.Module):
             and qkv_proj is not None
             and all(
                 getattr(projection, "has_nvfp4_activation_quantization", False)
+                and not getattr(getattr(projection, "quant_config", None), "ignored_steps", [])
                 and projection.input_scale is not None
                 and projection.pre_quant_scale is None
                 and not projection.force_dynamic_quantization
@@ -796,6 +798,7 @@ class FluxTransformer2DModel(BaseDiffusionModel):
                     force_dynamic_quant=force_dynamic_quant,
                     config=model_config,
                     layer_idx=num_layers + i,  # Continue numbering from dual-stream blocks
+                    module_name=f"single_transformer_blocks.{i}.attn",
                 )
                 for i in range(num_single_layers)
             ]

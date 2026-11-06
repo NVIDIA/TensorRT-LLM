@@ -420,6 +420,7 @@ class PipelineLoader:
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+        pipeline._setup_linear_quant_dispatcher()
         pipeline._setup_runtime_lora()
         pipeline.initialize_offload_pipeline()
 

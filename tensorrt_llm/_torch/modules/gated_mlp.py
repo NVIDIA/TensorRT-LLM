@@ -226,7 +226,9 @@ class GatedMLP(nn.Module):
 
     def _apply_activation(self, x, *, has_lora: bool = False):
         if self.activation == F.silu:
-            if self.down_proj.has_fp8_qdq or self.down_proj.has_w4a8_nvfp4_fp8:
+            if ((self.down_proj.has_fp8_qdq
+                 or self.down_proj.has_w4a8_nvfp4_fp8)
+                    and not self.down_proj.requires_unquantized_activation):
                 if has_lora:
                     # NOTE: This is a WAR, since LoRA grouped_gemm does not support FP8 yet.
                     # TODO: Remove this path when LoRA grouped_gemm supports FP8
@@ -432,7 +434,8 @@ class GatedMLP(nn.Module):
         # M3 SwiGLU-OAI reaches here with plain F.silu plus swiglu_alpha and
         # swiglu_beta, so the activation check alone does not exclude it.
         if not (self.activation == F.silu and self._is_plain_swiglu()
-                and self.down_proj.has_fp8_block_scales):
+                and self.down_proj.has_fp8_block_scales
+                and not self.down_proj.requires_unquantized_activation):
             return False
         if get_sm_version() == 107:
             return (IS_CUTLASS_DSL_RUBIN_AVAILABLE

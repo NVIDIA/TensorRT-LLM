@@ -217,3 +217,53 @@ def test_rank_is_preserved(shape):
     q, k, v = attn.get_qkv(x)
     assert q.shape == (*shape[:-1], HEADS * HEAD_DIM)
     assert k.shape == v.shape == (*shape[:-1], KV_HEADS * HEAD_DIM)
+
+
+@pytest.mark.cpu_only
+def test_linear_quant_ignore_bypasses_shared_qkv_quantization() -> None:
+    from unittest.mock import patch
+
+    from test_common.visual_gen_quantization import (
+        assert_quantization_routes,
+        observe_quantization_paths,
+    )
+
+    from tensorrt_llm._torch.visual_gen.quantization.quant_dispatcher import (
+        install_linear_quant_dispatcher,
+    )
+    from tensorrt_llm.visual_gen.args import AttentionConfig
+
+    config = DiffusionModelConfig(
+        quant_config=QuantConfig(quant_algo="FP8"), attention=AttentionConfig(backend="VANILLA")
+    )
+    attention = Attention(
+        hidden_size=128,
+        num_attention_heads=1,
+        head_dim=128,
+        qkv_mode=QKVMode.SEPARATE_QKV,
+        qk_norm=False,
+        config=config,
+        enable_sequence_parallel=False,
+    )
+    assert attention._maybe_share_qkv_quantize
+    for name, module in attention.named_modules():
+        if hasattr(module, "quant_method"):
+            module.register_buffer(
+                "_unquantized_weight",
+                torch.randn(module.weight.shape, dtype=torch.bfloat16) * 0.02,
+                persistent=False,
+            )
+    install_linear_quant_dispatcher(attention, {"linear_quant_ignored": True})
+    with (
+        patch.object(
+            attention,
+            "_static_quantize_fp8",
+            side_effect=AssertionError("Shared quantization must be bypassed"),
+        ),
+        observe_quantization_paths(attention) as trace,
+    ):
+        trace.step = 0
+        attention.get_qkv(torch.randn(1, 8, 128, dtype=torch.bfloat16))
+    assert_quantization_routes(
+        trace, {(0, name, "linear"): "bf16" for name in ("to_q", "to_k", "to_v")}
+    )

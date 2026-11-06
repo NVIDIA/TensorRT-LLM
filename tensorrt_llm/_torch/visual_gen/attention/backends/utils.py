@@ -194,6 +194,19 @@ def get_padding_support(attention_config: AttentionConfig) -> PaddingSupport:
     return PaddingSupport(supports_mask, supports_length, requires_trailing)
 
 
+def is_quant_excluded(recipe: QuantAttentionConfig, module_name: Optional[str]) -> bool:
+    """Match attention quantization exclusions against qualified and relative layer paths."""
+    if not recipe.ignore:
+        return False
+    if module_name is None:
+        raise ValueError("Attention ignore requires a module_name for matching layer paths.")
+    matcher = QuantConfig(exclude_modules=recipe.ignore)
+    relative_name = module_name.split(".", 1)[1] if "." in module_name else module_name
+    return matcher.is_module_excluded_from_quantization(
+        module_name
+    ) or matcher.is_module_excluded_from_quantization(relative_name)
+
+
 def create_attention(
     backend: str,
     layer_idx: int,
@@ -206,6 +219,7 @@ def create_attention(
     max_seq_len: int = 4096,
     attention_config: Optional[AttentionConfig] = None,
     attention_metadata_state: Optional[dict] = None,
+    module_name: Optional[str] = None,
     **kwargs,
 ) -> AttentionBackend:
     """
@@ -231,11 +245,19 @@ def create_attention(
         attention_metadata_state: Optional per-component VisualGen attention state.
             It keeps shape-stable attention metadata alive across layers and
             CUDA Graph captures. Required for TRTLLM and shared by FlashInfer layers.
+        module_name: Attention path used to match quantization exclusions.
         **kwargs: Additional backend-specific arguments
 
     Returns:
         AttentionBackend instance
     """
+    recipe = attention_config.quant_attention_config if attention_config is not None else None
+    if recipe is not None and is_quant_excluded(recipe, module_name):
+        recipe = None
+        kwargs["quant_attention_config"] = None
+    if recipe is not None and recipe.ignored_steps and attention_metadata_state is None:
+        raise ValueError("Attention ignored_steps requires per-component attention state.")
+
     sparse_config = (
         attention_config.sparse_attention_config if attention_config is not None else None
     )
@@ -243,13 +265,9 @@ def create_attention(
     is_vsa = sparse_algorithm == "vsa"
     is_sol = sparse_algorithm == "sol_attn"
 
-    quant_attention_config = (
-        attention_config.quant_attention_config if attention_config is not None else None
-    )
-
     backend_name = backend.upper()
     attn_cls = get_visual_gen_attention_backend(
-        backend_name, sparse_algorithm, get_quant_algorithm(quant_attention_config)
+        backend_name, sparse_algorithm, get_quant_algorithm(recipe)
     )
 
     if is_vsa:
@@ -263,8 +281,8 @@ def create_attention(
 
     # Forward the validated quantization recipe to TRTLLM, cuDNN, FlashInfer, or the dense CuTe DSL
     # FMHA or DeCo-Attention backend.
-    if quant_attention_config is not None:
-        kwargs["quant_attention_config"] = quant_attention_config
+    if recipe is not None:
+        kwargs["quant_attention_config"] = recipe
     if backend_name == "TRTLLM":
         if attention_metadata_state is None:
             raise ValueError(
@@ -279,7 +297,7 @@ def create_attention(
                 "DiffusionModelConfig for shared workspace allocation."
             )
         kwargs["attention_metadata_state"] = attention_metadata_state
-    return attn_cls(
+    kwargs.update(
         layer_idx=layer_idx,
         num_heads=num_heads,
         head_dim=head_dim,
@@ -288,5 +306,11 @@ def create_attention(
         dtype=dtype,
         max_batch_size=max_batch_size,
         max_seq_len=max_seq_len,
-        **kwargs,
     )
+    attention = attn_cls(**kwargs)
+    if recipe is not None and recipe.ignored_steps:
+        from .quant_dispatcher import AttentionQuantDispatcher
+
+        unquantized = attn_cls(**{**kwargs, "quant_attention_config": None})
+        return AttentionQuantDispatcher(attention, unquantized, attention_metadata_state)
+    return attention
