@@ -343,7 +343,9 @@ order:
   multi-request window attention;
 * ``draft_head`` on the DFlash worker and the drafter's logits processor, then
   ``wide_draft_topk`` (tep4 on sm_103 only) on the draft head's key all-reduce: draft
-  steps of 33 or more rows exchange each rank's own top-k keys;
+  steps of 33 or more rows exchange each rank's own top-k keys; then
+  ``draft_head_sampled`` on the draft head's worker: sampled drafts walk the
+  draft head's lattice in one launch (it loads the head sampler library);
 * ``drafter_fc_shard``, ``fused_accept`` and ``drafter_fixed_gemms`` on the
   drafter's ``fc`` and GEMMs and on the worker's acceptance -- after
   ``draft_head``, because ``fused_accept`` derives its worker class from
@@ -916,10 +918,14 @@ _TEP4_BITWISE_PATHS = frozenset(
         "split_sampler",
     }
 )
-#: TEP4: the bitwise paths and ``drafter_fc_shard``, whose
+#: TEP4: the bitwise paths, ``drafter_fc_shard``, whose
 #: sharded drafter projection can move a draft token's bf16 last place (the target
-#: still verifies every draft; it shards every row count at TP4).
-_TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard"})
+#: still verifies every draft; it shards every row count at TP4), and
+#: ``draft_head_sampled``, whose sampled drafts take the full-vocab ``torch.topk``
+#: candidates where the built-in sampled path tops each shard first (the two order
+#: exactly tied logits differently; rejection sampling verifies against the
+#: distribution each draft was drawn from).
+_TEP4_PATHS = _TEP4_BITWISE_PATHS | frozenset({"drafter_fc_shard", "draft_head_sampled"})
 #: TEP4 on sm103 adds the attention paths validated at a tep4 rank's 32 query / 4 KV
 #: heads, the dense projections and drafter GEMMs on their tep4 kernel tables, the
 #: drafter hops and PDL chain on the tray's MNNVL one-shot, the LM-head inbox on the

@@ -71,6 +71,7 @@ SOURCES = (
     "fusedSamplingKernels.h",
     "fusedSamplingKernelsInternal.h",
     "fusedSamplingKernelsCommon.cuh",
+    "draft_path_sample.cuh",
 )
 #: nvcc flags. No ``--use_fast_math``: the shipped sampler library is built without it,
 #: and with it the soft cap's ``tanhf`` and the sampler's arithmetic change bits.

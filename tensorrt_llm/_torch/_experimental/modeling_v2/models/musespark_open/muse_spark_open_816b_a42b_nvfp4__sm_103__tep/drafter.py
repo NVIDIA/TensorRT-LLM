@@ -37,6 +37,11 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
         from .kernels.wide_draft_topk import exchange as _wide_topk
 
         _wide_topk.install(shell.llm)
+    if plan.enabled("draft_head_sampled"):
+        # On the worker class draft_head just set, before fused_accept derives from it.
+        from .kernels.draft_head import head as _draft_head
+
+        _draft_head.install_sampled(shell.llm)
     fc_shard = plan.enabled("drafter_fc_shard")
     fused_accept = plan.enabled("fused_accept")
     fixed_gemms = plan.enabled("drafter_fixed_gemms")
