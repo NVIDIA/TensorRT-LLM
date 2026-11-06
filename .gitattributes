@@ -11,6 +11,7 @@ docs/source/blogs/media/tech_blog3_mla_absorb.png filter=lfs diff=lfs merge=lfs 
 tests/integration/test_input_files/*.png filter=lfs diff=lfs merge=lfs -text
 tests/integration/test_input_files/*.jpg filter=lfs diff=lfs merge=lfs -text
 tests/integration/defs/examples/visual_gen/golden/visual_gen_lpips/*.zip filter=lfs diff=lfs merge=lfs -text
+tests/unittest/_torch/visual_gen/l2/test_data/*.safetensors filter=lfs diff=lfs merge=lfs -text
 docs/source/blogs/media/tech_blog10_baseline_performance_detail.png filter=lfs diff=lfs merge=lfs -text
 docs/source/blogs/media/tech_blog10_full_strategy_performance.png filter=lfs diff=lfs merge=lfs -text
 docs/source/blogs/media/tech_blog10_context_wait_performance.png  filter=lfs diff=lfs merge=lfs -text
