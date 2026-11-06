@@ -93,7 +93,9 @@ class RemoteWorkerProcessMonitor:
                 raise ValueError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535")
             port = str(port_number)
         ipv6 = family == socket.AF_INET6
-        bind_address = f"tcp://{'[::]' if ipv6 else '0.0.0.0'}:{port}"
+        # The advertised address may be forwarded from outside this namespace.
+        # IpcQueue checks HMAC before unpickling; restrict ingress to MPI workers.
+        bind_address = f"tcp://{'[::]' if ipv6 else '0.0.0.0'}:{port}"  # nosec B104
         try:
             self._queue = IpcQueue(
                 (bind_address, None),
