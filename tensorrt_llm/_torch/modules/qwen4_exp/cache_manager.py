@@ -39,6 +39,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHyb
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _get_local_mamba_cache_layout,
 )
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm._utils import TensorWrapper, binding_to_torch_dtype, convert_to_torch_tensor
 from tensorrt_llm.bindings import DataType
@@ -183,6 +184,23 @@ class Qwen4ExpHybridCacheManager(MambaHybridCacheManagerV2):
 
     # Its QSA side buffers and get_buffers override do not support mixed-precision KV.
     _supports_mixed_precision_kv = False
+
+    def page_table_spec(self) -> PageTableSpec:
+        """PLE state is computed from replicated inputs and index positions are request-wide
+        coordinates, so every rank holds the same bytes; so do the packed side planes and the index
+        keys, which project one head alike on every rank. They carry no head axis, which splitting
+        them by the rank's KV heads would assume."""
+        spec = super().page_table_spec()
+        roles = (
+            PLE_CONV_STATE,
+            PLE_NGRAM_CONTEXT,
+            QSA_INDEX_POSITION,
+            QSA_SIDE_PLANES,
+            Role.INDEX_KEY,
+        )
+        return replace(
+            spec, role_layouts={**spec.role_layouts, **{role: Replicated() for role in roles}}
+        )
 
     @override
     def get_disagg_role_mapper_kinds(self) -> dict[DataRole, MapperKind]:

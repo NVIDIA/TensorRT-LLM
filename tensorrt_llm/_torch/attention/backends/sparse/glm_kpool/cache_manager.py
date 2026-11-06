@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 
 import torch
 
@@ -40,6 +41,7 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _host_slots_to_device
+from tensorrt_llm._torch.pyexecutor.kv_cache.page_table import PageTableSpec, Replicated
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
@@ -126,6 +128,11 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
     @property
     def use_kda_replay_update(self) -> bool:
         return self._kda_replay is not None
+
+    def page_table_spec(self) -> PageTableSpec:
+        """The indexer rows are as wide on every tensor rank and hold the same bytes."""
+        spec = super().page_table_spec()
+        return replace(spec, role_layouts={**spec.role_layouts, Role.INDEX_KEY: Replicated()})
 
     @override
     def _build_cache_config(self, config):
