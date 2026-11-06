@@ -4058,11 +4058,12 @@ class KVCacheManagerV2(BaseResourceManager):
         self._shared_kv_layers: set[int] = set()
         # Tests pass plain config stand-ins that predate the mixed-precision fields.
         mixed = getattr(kv_cache_config, "mixed_precision_kv", None)
-        window = getattr(cold_page_codec_provider, "mixed_precision_high_window", None)
-        if not isinstance(window, tuple):
+        # (first_n, last_n) of the cold-page compression config, if it asks for the window.
+        cold_page_window = getattr(cold_page_codec_provider, "mixed_precision_high_window", None)
+        if not isinstance(cold_page_window, tuple):
             # Providers without the property, and Mock providers in tests.
-            window = None
-        if mixed is None and window is None:
+            cold_page_window = None
+        if mixed is None and cold_page_window is None:
             return
         requested = (
             f"kv_cache_config.dtype={kv_cache_config.dtype!r}"
@@ -4087,8 +4088,9 @@ class KVCacheManagerV2(BaseResourceManager):
                     f"tokens in {mixed.high}, but the model's KV cache dtype resolved to {dtype}."
                 )
         else:
-            # Cold-page window: the history keeps the model's KV dtype; only cold pages are quantized.
-            self.first_n, self.last_n = window
+            # Cold-page window: the GPU history keeps the model's KV dtype, so the low and the high
+            # dtype are the same; only pages in the cold tiers are quantized.
+            self.first_n, self.last_n = cold_page_window
             self.mixed_precision_low_dtype = self.mixed_precision_high_dtype = dtype
         if getattr(pretrained_config, "num_kv_shared_layers", 0):
             config = pretrained_config
@@ -4128,33 +4130,43 @@ class KVCacheManagerV2(BaseResourceManager):
         )
 
     def _init_mixed_precision_high_layer_offsets(self) -> None:
-        """Record each cold-page high layer's slot offset and the per-pool block delta."""
+        """Record where each cold-page high layer sits in its pool.
+
+        For every high layer: its page offset inside the pool slot, and per pool the block
+        distance from a layer's block to its high layer's block (None if the pool's high
+        layers are not all at the same distance).
+        """
         self.mixed_precision_high_layer_offsets: dict[int, int] = {}
         self.mixed_precision_high_block_deltas: dict[int, int | None] = {}
         if self.mixed_precision_low_dtype != self.mixed_precision_high_dtype:
             return
-        for local, high_layer in self.mixed_precision_high_layers.items():
-            source, role = self._mixed_precision_layer_page(local)
-            converter = self.impl.get_page_index_converter(source, role)
+        for local_layer, high_layer in self.mixed_precision_high_layers.items():
+            source_layer, row_role = self._mixed_precision_layer_page(local_layer)
+            source_converter = self.impl.get_page_index_converter(source_layer, row_role)
             high_converter = self.impl.get_page_index_converter(high_layer, Role.KEY)
-            stride = int(self.impl.get_page_stride(source, role))
-            pool_base = int(self.impl.get_mem_pool_base_address(source, role, PageIndexMode.SHARED))
-            pool_base -= int(converter.layer_offset) * stride
-            address = int(
+            page_stride = int(self.impl.get_page_stride(source_layer, row_role))
+            pool_base = int(
+                self.impl.get_mem_pool_base_address(source_layer, row_role, PageIndexMode.SHARED)
+            )
+            pool_base -= int(source_converter.layer_offset) * page_stride
+            high_address = int(
                 self.impl.get_mem_pool_base_address(high_layer, Role.KEY, PageIndexMode.SHARED)
             )
             if (
-                int(high_converter.scale) != int(converter.scale)
+                int(high_converter.scale) != int(source_converter.scale)
                 or int(high_converter.expansion) != 1
-                or address != pool_base + int(high_converter.layer_offset) * stride
+                or high_address != pool_base + int(high_converter.layer_offset) * page_stride
             ):
                 raise ValueError(
-                    f"mixed-precision high layer {high_layer} must share the pool of layer {source}"
+                    f"mixed-precision high layer {high_layer} must share the pool of layer {source_layer}"
                 )
-            self.mixed_precision_high_layer_offsets[local] = int(high_converter.layer_offset)
-            delta = int(high_converter.layer_offset) - int(converter.layer_offset)
-            pool_id = int(self.impl.get_layer_group_id(source))
-            if self.mixed_precision_high_block_deltas.setdefault(pool_id, delta) != delta:
+            self.mixed_precision_high_layer_offsets[local_layer] = int(high_converter.layer_offset)
+            block_delta = int(high_converter.layer_offset) - int(source_converter.layer_offset)
+            pool_id = int(self.impl.get_layer_group_id(source_layer))
+            if (
+                self.mixed_precision_high_block_deltas.setdefault(pool_id, block_delta)
+                != block_delta
+            ):
                 self.mixed_precision_high_block_deltas[pool_id] = None
 
     def _mixed_precision_rows_per_page(self, local_layer_idx: int) -> int:
