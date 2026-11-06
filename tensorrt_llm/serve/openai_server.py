@@ -1184,6 +1184,18 @@ class OpenAIServer(_VideoRoutesMixin):
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE)
         return OpenAIServer.create_error_response(str(error))
 
+    @staticmethod
+    def _create_streaming_error_response(error: Exception) -> str:
+        error_data = json.dumps({
+            "error": {
+                "message": str(error),
+                "type": "server_error",
+                "code": None,
+                "param": None,
+            }
+        })
+        return f"data: {error_data}\n\n"
+
     def _create_invalid_response_id_error(self, response_id: str) -> Response:
         return self.create_error_response(
             err_type="InvalidRequestError",
@@ -3051,15 +3063,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 # chunk, so we cannot change the status code.  Yield
                 # an SSE error event so the stream terminates cleanly
                 # instead of breaking the HTTP connection.
-                error_data = json.dumps({
-                    "error": {
-                        "message": str(e),
-                        "type": "server_error",
-                        "code": None,
-                        "param": None,
-                    }
-                })
-                yield f"data: {error_data}\n\n"
+                yield self._create_streaming_error_response(e)
                 yield "data: [DONE]\n\n"
 
         async def merge_generators(generators: List[AsyncIterator[Any]]):
@@ -3246,6 +3250,9 @@ class OpenAIServer(_VideoRoutesMixin):
                 await self._extract_metrics(res, raw_request)
             except asyncio.CancelledError:
                 raise
+            except (EngineUnavailableError, EngineDeadError) as e:
+                yield self._create_streaming_error_response(e)
+                yield "data: [DONE]\n\n"
             except Exception:
                 logger.error(traceback.format_exc())
                 raise
@@ -3366,7 +3373,7 @@ class OpenAIServer(_VideoRoutesMixin):
                     promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
-        except EngineUnavailableError as e:
+        except (EngineUnavailableError, EngineDeadError) as e:
             return self._create_exception_response(e)
         except ValueError as e:
             return self._create_exception_response(e)
