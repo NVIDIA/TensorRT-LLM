@@ -193,6 +193,16 @@ def _run_collective(
     group = [0, 1]
     local = torch.full((2, 4), rank + 1.0, device="cuda")
     gathered = torch.cat([torch.ones_like(local), torch.full_like(local, 2)])
+    updates = [(local, rank + 1, 10)]
+    run = 0
+
+    def before_run() -> None:
+        """Refresh inputs and independent expected buffers for every measured run."""
+        nonlocal run
+        run += 1
+        for tensor, initial, increment in updates:
+            tensor.fill_(initial + increment * run)
+
     if case == "allreduce":
         # NCCL=0 and fusion NONE=0 are the checked-in native enum values.
         def operation() -> list[torch.Tensor]:
@@ -202,8 +212,11 @@ def _run_collective(
                 )
             )
 
-        _profile(operation, [torch.full_like(local, 3)], graph, "trtllm::allreduce")
+        reference = torch.full_like(local, 3)
+        updates.append((reference, 3, 20))
+        _profile(operation, [reference], graph, "trtllm::allreduce", before_run=before_run)
     elif case in {"equal", "list"}:
+        updates.extend([(gathered[:2], 1, 10), (gathered[2:], 2, 10)])
 
         def operation() -> list[torch.Tensor]:
             """Execute the selected tensor or list allgather for profiler
@@ -218,17 +231,20 @@ def _run_collective(
             [gathered] * (2 if case == "list" else 1),
             graph,
             "trtllm::allgather_list" if case == "list" else "trtllm::allgather",
+            before_run=before_run,
         )
     elif case == "uneven":
         local = torch.full((rank + 1, 4), rank + 1.0, device="cuda")
         reference = torch.cat(
             [torch.ones((1, 4), device="cuda"), torch.full((2, 4), 2, device="cuda")]
         )
+        updates = [(local, rank + 1, 10), (reference[:1], 1, 10), (reference[1:], 2, 10)]
         _profile(
             lambda: [torch.ops.trtllm.allgather(local, [1, 2], group)],
             [reference],
             graph,
             "trtllm::allgather",
+            before_run=before_run,
         )
     else:
         inputs = [
@@ -240,11 +256,21 @@ def _run_collective(
             torch.stack([torch.full_like(local, 100 * peer + 10 * field + rank) for peer in group])
             for field in range(2)
         ]
+        updates = [
+            (inputs[2 * field + peer], 100 * rank + 10 * field + peer, 1000)
+            for field in range(2)
+            for peer in group
+        ] + [
+            (expected[field][peer], 100 * peer + 10 * field + rank, 1000)
+            for field in range(2)
+            for peer in group
+        ]
         _profile(
             lambda: list(torch.ops.trtllm.alltoall_helix(inputs, group, 2)),
             expected,
             graph,
             "trtllm::alltoall_helix",
+            before_run=before_run,
         )
     return True
 
