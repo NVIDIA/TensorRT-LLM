@@ -1108,6 +1108,30 @@ def test_fasth3_generation_steps_follow_inference_contract(
     assert pipeline.default_generation_params["num_inference_steps"] == expected_steps
 
 
+@pytest.mark.parametrize("fasth3", [False, True])
+def test_warmup_uses_model_schedule(fasth3: bool) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config.compilation = SimpleNamespace(resolutions=[(32, 32)], num_frames=[124])
+    if fasth3:
+        pipeline.scheduler = MiniMaxH3Scheduler(shift=10.0)
+        pipeline._fastvideo_inference = {
+            "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125],
+            "video_scheduler_shift": 10.0,
+            "audio_scheduler_shift": 3.0,
+        }
+    pipeline.post_load_weights()
+    shapes, steps = pipeline.resolve_warmup_plan()
+    assert shapes == [(32, 32, 124)]
+    assert steps == (9 if fasth3 else 2)
+
+    for height, width, num_frames in shapes:
+        pipeline._run_warmup(height, width, num_frames, steps)
+
+    assert pipeline.transformer.forward_calls == steps - 1
+    assert len(pipeline.scheduler.timesteps) == steps - 1
+    assert len(pipeline.audio_scheduler.timesteps) == steps - 1
+
+
 def test_fasth3_v2_trained_schedule() -> None:
     pipeline = _SyntheticMiniMaxH3Pipeline()
     pipeline.scheduler = MiniMaxH3Scheduler(shift=10.0)

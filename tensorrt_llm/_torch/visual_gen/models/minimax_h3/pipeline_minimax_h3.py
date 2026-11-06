@@ -438,6 +438,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         return super().load_transformer_weights(checkpoint_dir)
 
     @property
+    def default_warmup_steps(self) -> int:
+        steps = getattr(self, "_fastvideo_inference", {}).get("dmd_denoising_steps")
+        if steps is not None:
+            return len(steps) + 1
+        return super().default_warmup_steps
+
+    @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(768, 1344)]
 
