@@ -91,6 +91,7 @@ from tensorrt_llm._utils import CUASSERT
 from tensorrt_llm.logger import logger
 
 from ...ops.spec.context_kv_commit import MAX_REQUESTS, context_kv_commit
+from ...ops.spec.context_kv_commit_paged import context_kv_commit_paged
 from ...ops.spec.context_kv_commit_windowed import context_kv_commit_windowed
 
 #: Where the side chain forks: right after the LM head's GEMM.
@@ -217,6 +218,8 @@ class ContextKvFork:
         self._armed: Optional[tuple] = None
         self._launched: Optional[Launched] = None
         self._fallback_logged = False
+        #: ``paged_context_commit``: a paged context's commit runs ``context_kv_commit_paged``.
+        self.paged_commit_on = False
         #: Reports a step a lever left to the path below it (``dispatch.Plan.declined``), or None.
         self.declined: Optional[Callable[..., None]] = None
 
@@ -311,7 +314,22 @@ class ContextKvFork:
         base, last = arena_columns(worker)
         self.stream.wait_stream(main)
         with torch.cuda.stream(self.stream):
-            if worker._ctx_paged:
+            if worker._ctx_paged and self._commits_paged(worker, slots, num_accepted):
+                context_kv_commit_paged(
+                    worker._ctx_len,
+                    worker._ctx_base,
+                    slots,
+                    num_accepted,
+                    rows,
+                    worker._ctx_block_counts if worker._ctx_block_tables is not None else None,
+                    worker._ctx_page_size,
+                    worker._compute_block_size,
+                    worker._max_ctx,
+                    worker._dummy_slot,
+                    worker._ctx_unified_cache,
+                    num_ctx,
+                )
+            elif worker._ctx_paged:
                 num_ctx.copy_(worker._commit_context(slots, num_accepted.long(), rows))
             elif base is None or compacts_after_join(worker):
                 context_kv_commit(
@@ -346,6 +364,35 @@ class ContextKvFork:
                 worker._empty_dummy_slot()
                 num_ctx.copy_(worker._drafter_context_lengths(slots, rows))
         return num_ctx
+
+    def _commits_paged(self, worker, slots, num_accepted) -> bool:
+        """Whether ``context_kv_commit_paged`` takes this paged context's commit (``paged_context_commit``)."""
+        return (
+            self.paged_commit_on
+            and worker._dummy_slot is not None
+            and (
+                worker._ctx_base is None
+                or (
+                    worker._ctx_base.dtype == torch.int64
+                    and worker._ctx_base.is_contiguous()
+                    and worker._ctx_base.shape == worker._ctx_len.shape
+                )
+            )
+            and worker._ctx_len.dtype == torch.int64
+            and worker._ctx_len.is_contiguous()
+            and slots.dtype == torch.int64
+            and slots.is_contiguous()
+            and num_accepted.dtype in (torch.int32, torch.int64)
+            and num_accepted.is_contiguous()
+            and (
+                worker._ctx_block_tables is None
+                or (
+                    worker._ctx_block_counts is not None
+                    and worker._ctx_block_counts.dtype == torch.int64
+                    and worker._ctx_block_counts.is_contiguous()
+                )
+            )
+        )
 
     def settle(self) -> None:
         """Forget an armed step and join a side chain a failed step left behind.
@@ -648,6 +695,28 @@ def worker_unsupported_reason(spec_worker, draft_model) -> Optional[str]:
     return None
 
 
+#: The worker methods ``context_kv_commit_paged`` stands in for, as ``DFlashWorker`` defines them.
+PAGED_COMMIT_METHODS = (
+    "_commit_context",
+    "_advance_ctx_len",
+    "_empty_dummy_slot",
+    "_settle_context",
+    "_drafter_context_lengths",
+    "_check_block_within_allocation",
+)
+
+
+def paged_commit_unsupported_reason(spec_worker) -> Optional[str]:
+    """Why ``context_kv_commit_paged`` cannot stand in for this worker's paged commit, or None."""
+    cls = type(spec_worker)
+    for name in PAGED_COMMIT_METHODS:
+        if getattr(cls, name, None) is not getattr(DFlashWorker, name):
+            return f"the spec worker class {cls.__name__} overrides {name}"
+        if name in vars(spec_worker):
+            return f"{name} is already replaced on this worker"
+    return None
+
+
 def head_unsupported_reason(lm_head) -> Optional[str]:
     """Why the LM head's GEMM call cannot carry the ``context_kv_fork`` fork point, or None."""
     if not isinstance(lm_head, Linear):
@@ -701,13 +770,17 @@ def install(
     parallel_min_requests: Optional[int] = None,
     late_join: bool = False,
     declined: Optional[Callable[..., None]] = None,
+    paged_commit: bool = False,
 ) -> None:
     """Install the fork on the DFlash worker, the target core and the LM head (``POINT``).
 
     Idempotent; the shell calls it from every load hook after the other
     drafter features, so it composes with the worker class they left. A
     repeated install keeps the fork and its stream and takes the current
-    drafter and ``declined`` (``dispatch.Plan.declined``); the other keywords are ignored.
+    drafter, ``declined`` (``dispatch.Plan.declined``) and ``paged_commit``
+    (``paged_context_commit``: a paged context's commit in one launch; refused when the
+    worker's class overrides one of the methods it stands in for, ``PAGED_COMMIT_METHODS``);
+    the other keywords are ignored.
 
     Raises:
         ValueError: if the fork cannot be installed (the reason), so the
@@ -722,6 +795,10 @@ def install(
         reason = head_unsupported_reason(getattr(llm, "lm_head", None))
     if reason is not None:
         raise ValueError(f"[musespark_open] {name} cannot run here: {reason}")
+    if paged_commit:
+        reason = paged_commit_unsupported_reason(worker)
+        if reason is not None:
+            raise ValueError(f"[musespark_open] paged_context_commit cannot run here: {reason}")
     _reclass(worker)
     fork: Optional[ContextKvFork] = worker.__dict__.get("_kv_fork")
     fresh = fork is None
@@ -730,6 +807,7 @@ def install(
         worker._kv_fork = fork
     fork.draft_model = drafter
     fork.declined = declined
+    fork.paged_commit_on = bool(paged_commit)
     core._context_kv_fork = fork
     if point == "head":
         lm_head = llm.lm_head
