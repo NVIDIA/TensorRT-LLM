@@ -4,14 +4,18 @@
 """The contract: every check a run must pass, compiled from the resolved task spec.
 
 The contract is the run's definition of "done". It names each check by unit,
-gate and member, with a tier that says when it runs:
+gate and member, with a tier:
 
-- ``inner``: after every change to the target (boot, accuracy, and the serve
-  gate where the spec turns it on or can derive it);
+- ``inner``: boot, accuracy, and the serve gate where the spec turns it on or
+  can derive it;
 - ``proof``: what proves a feature is on (acceptance, the disaggregated-serving
   test), and the checks of each configuration variant (``spec/variants.py``);
-- ``delivery``: once, on the tree being delivered (the
-  serve gate at one rank).
+- ``delivery``: the serve gate at one rank, on the tree being delivered.
+
+A check runs when a task that claims it lands, when the planner adds a
+``check`` task that names it, and in one final round: once no required task
+is open, every check a finished task claims with no verdict on the target as
+it is runs again, the delivery tier last (``run/orchestrator.py``).
 
 Verdicts are appended to ``contract_status.jsonl`` as gates return, keyed by
 unit. Delivery evaluates the contract: every required check's latest verdict
@@ -623,6 +627,14 @@ class ContractStatus:
             last[f"{v.unit}:{v.gate}@{v.member}"] = v
         return last
 
+    def last_passes(self) -> dict[str, str]:
+        """Per check key, the commit its last pass measured; a key whose pass names none is left out."""
+        passes: dict[str, str] = {}
+        for v in self.verdicts:
+            if v.passed and len(set(v.imported)) == 1:
+                passes[f"{v.unit}:{v.gate}@{v.member}"] = v.imported[0]
+        return passes
+
 
 @dataclass(frozen=True)
 class Evaluation:
@@ -637,12 +649,21 @@ class Evaluation:
     def holds(self) -> bool:
         return not self.failed and not self.missing
 
-    def render(self) -> str:
+    def render(self, last_passes: Mapping[str, str] | None = None) -> str:
+        """One line of counts, then a line per check that does not pass, and per shared pass.
+
+        A missing check names the commit of its last pass (``last_passes``) when there is one.
+        """
+        last_passes = last_passes or {}
         lines = [
             f"{len(self.passed)} passed, {len(self.failed)} failed, {len(self.missing)} missing"
         ]
         lines += [f"- {'VOID' if v.void else 'FAILED'} {c.key}: {v.detail}" for c, v in self.failed]
-        lines += [f"- MISSING {c.key}" for c in self.missing]
+        lines += [
+            f"- MISSING {c.key}"
+            + (f" (last passed at {last_passes[c.key][:10]})" if c.key in last_passes else "")
+            for c in self.missing
+        ]
         lines += [f"- SHARED {c.key}: holds by the pass of {s.key}" for c, s in self.shared]
         return "\n".join(lines)
 
@@ -812,10 +833,12 @@ def record_milestone(workspace: Path, milestone: Milestone) -> None:
 def standing(evaluation: Evaluation, workspace: Path, marker: str | None = None) -> str:
     """``evaluation`` rendered, then where the bring-up and correctness stand delivered once they have been.
 
-    ``marker`` is the state of the target ``evaluation`` was read on; ``""`` or ``None``
-    when it is not established, and then nothing is said of whether the target moved.
+    Each missing check names the commit of its last pass recorded in ``workspace``, the
+    tree a change since is diffed from. ``marker`` is the state of the target
+    ``evaluation`` was read on; ``""`` or ``None`` when it is not established, and then
+    nothing is said of whether the target moved.
     """
-    rendered = evaluation.render()
+    rendered = evaluation.render(ContractStatus.load(workspace).last_passes())
     bringup = bringup_milestone(workspace)
     if bringup is not None:
         rendered = f"{rendered}\n\n{bringup.describe()}"
