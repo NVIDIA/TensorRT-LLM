@@ -2680,6 +2680,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
+                    # Batch Bash commands must use BASH_ENV, not SSH startup files.
+                    unset SSH_CLIENT SSH2_CLIENT
                     export BASH_ENV="$scriptProfilerEnvPathNode"
                     export tarName=$tarName
                     export llmTarArtifactPath=$llmTarArtifactPath
