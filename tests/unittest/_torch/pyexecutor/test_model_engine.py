@@ -1140,9 +1140,10 @@ class TestWarmupCleanup(unittest.TestCase):
             with (
                 self.subTest(configured=configured),
                 patch.object(AllReduceRunner, "configure_tuning_buckets") as configure,
+                patch.object(model_engine_module, "resolve_max_seq_len", return_value=2048),
             ):
                 engine.max_num_tokens = configured
-                engine._init_max_num_tokens()
+                engine._init_model_capacity()
                 engine._configure_allreduce_tuning()
                 configure.assert_called_once_with(expected)
         engine.llm_args.enable_autotuner = False

@@ -19,6 +19,9 @@ pytestmark = pytest.mark.cpu_only
 @pytest.fixture
 def tuner(monkeypatch: pytest.MonkeyPatch) -> Iterator[AutoTuner]:
     monkeypatch.setenv("TLLM_PROFILING_TIMER", "cuda_event")
+    # Cache metadata is the only device-dependent part of these host-only tests.
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda: "cpu-test")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
     original = AllReduceRunner.tuning_config
     original_buckets = torch.ops.trtllm.get_allreduce_tuning_buckets()
     AutoTuner._find_nearest_profile.cache_clear()
