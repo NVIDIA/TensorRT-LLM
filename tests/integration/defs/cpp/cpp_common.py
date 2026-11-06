@@ -161,6 +161,10 @@ def parallel_run_ctest(
             return None
         return report if report.is_file() else None
 
+    stale_report = get_report()
+    if stale_report is not None:
+        stale_report.unlink()
+
     report = None
     try:
         run_ctest(command, cwd=cwd, shell=shell, env=env, timeout=timeout)

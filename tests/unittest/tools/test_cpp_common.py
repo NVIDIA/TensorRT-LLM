@@ -70,6 +70,9 @@ def test_parallel_ctest_merges_retry_into_requested_report(
                 encoding="utf-8",
             )
             raise subprocess.CalledProcessError(1, command)
+
+        assert command[-1] == "--rerun-failed"
+        assert "CTEST_PARALLEL_LEVEL" not in _kwargs["env"]
         output_path.write_text(
             '<testsuite failures="0" time="1"><testcase name="flaky"/></testsuite>',
             encoding="utf-8",
@@ -111,3 +114,32 @@ def test_parallel_ctest_does_not_retry_from_stale_report(
     assert len(calls) == 1
     assert stale_report.read_text(encoding="utf-8") == stale_contents
     assert not list(tmp_path.rglob("*.intermediate"))
+
+
+def test_parallel_ctest_does_not_accept_existing_requested_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cpp_common = _load_cpp_common(monkeypatch)
+    report = tmp_path / "reports" / "results-current.xml"
+    report.parent.mkdir()
+    stale_contents = '<testsuite failures="0" time="1"><testcase name="stale"/></testsuite>'
+    report.write_text(stale_contents, encoding="utf-8")
+
+    unrelated_report = tmp_path / "results-unrelated.xml"
+    unrelated_contents = '<testsuite failures="0" time="1"><testcase name="unrelated"/></testsuite>'
+    unrelated_report.write_text(unrelated_contents, encoding="utf-8")
+    calls = []
+
+    def fail_without_report(command: list[str], **_kwargs: object) -> None:
+        calls.append(command)
+        raise subprocess.CalledProcessError(1, command)
+
+    monkeypatch.setattr(cpp_common, "run_ctest", fail_without_report)
+    command = ["ctest", "--output-junit", str(report)]
+
+    with pytest.raises(subprocess.CalledProcessError):
+        cpp_common.parallel_run_ctest(command, cwd=tmp_path, env={}, parallel=2)
+
+    assert len(calls) == 1
+    assert not report.exists()
+    assert unrelated_report.read_text(encoding="utf-8") == unrelated_contents
