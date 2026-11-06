@@ -78,7 +78,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import resolve_mrope_position_d
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyStore
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SleepConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, SkipSoftmaxAttentionConfig, SleepConfig
 from tensorrt_llm.mapping import Mapping
 
 # (pp_size, disable_overlap, enable_overlap_headroom, expected_factor)
@@ -352,6 +352,63 @@ def test_resolved_v2_agrees_with_the_manager_the_creator_selects(
     assert selected is (KVCacheManager if enable_sleep else KVCacheManagerV2)
     assert resolved is issubclass(selected, KVCacheManagerV2)
     assert selected is (KVCacheManagerV2 if resolved else KVCacheManager)
+
+
+@pytest.mark.parametrize("use_v2", [True, False])
+@pytest.mark.parametrize(
+    "max_beam_width,enable_sleep",
+    [(1, False), (4, False), (1, True)],
+)
+def test_skip_softmax_selects_the_dense_manager_resolved_v2_predicts(
+    use_v2, max_beam_width, enable_sleep
+):
+    """Skip Softmax keeps the dense KV cache, so it follows the dense V2 rules.
+
+    ``resolved_kv_cache_manager_is_v2`` sizes the seat pool from the dense
+    rules alone, so the manager the creator selects for a Skip Softmax model
+    must be the one those rules predict: V2 when requested, including beam
+    search, and the plain V1 fallback only for a V2-incompatible feature.
+    """
+    kv_cache_config = KvCacheConfig(use_kv_cache_manager_v2=use_v2)
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(
+            architectures=["Qwen3MoeForCausalLM"], num_hidden_layers=2
+        ),
+        sparse_attention_config=SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=SimpleNamespace(model_config=model_config))
+    creator._kv_cache_config = kv_cache_config
+    creator._max_beam_width = max_beam_width
+    creator._is_disagg = False
+    creator._cache_transceiver_config = None
+    creator._speculative_config = None
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
+
+    selected = creator._get_model_kv_cache_manager_cls()
+    resolved = resolved_kv_cache_manager_is_v2(
+        kv_cache_config, max_beam_width, enable_sleep=enable_sleep
+    )
+
+    assert selected is (KVCacheManagerV2 if use_v2 and not enable_sleep else KVCacheManager)
+    assert resolved is issubclass(selected, KVCacheManagerV2)
+
+
+@pytest.mark.parametrize("max_beam_width,enable_sleep", [(4, False), (1, True)])
+def test_sparse_kv_cache_manager_v2_does_not_fall_back(max_beam_width, enable_sleep):
+    """A sparse algorithm with its own cache manager still refuses the V1 fallback."""
+    model_config = SimpleNamespace(
+        pretrained_config=SimpleNamespace(architectures=["DeepseekV32ForCausalLM"]),
+        sparse_attention_config=SimpleNamespace(algorithm="dsa"),
+    )
+    creator = object.__new__(KvCacheCreator)
+    creator._max_beam_width = max_beam_width
+    creator._llm_args = SimpleNamespace(sleep_config=SleepConfig() if enable_sleep else None)
+
+    with pytest.raises(NotImplementedError, match="sparse-attention models.*'dsa'"):
+        creator._validate_or_fallback_kv_cache_manager_v2(
+            KVCacheManagerV2, model_config, KvCacheConfig()
+        )
 
 
 @pytest.mark.parametrize("max_beam_width", [1, 2, 4])

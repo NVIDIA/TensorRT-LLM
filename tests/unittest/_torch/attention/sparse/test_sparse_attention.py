@@ -409,6 +409,21 @@ def test_sparse_attention_backend_fallback_does_not_redispatch(
     trtllm_sparse_resolver.assert_not_called()
 
 
+@pytest.mark.parametrize("use_kv_cache_manager_v2", [True, False])
+def test_skip_softmax_uses_the_dense_kv_cache_manager(use_kv_cache_manager_v2: bool) -> None:
+    from tensorrt_llm._torch.attention.backends.sparse import get_sparse_attn_kv_cache_manager
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+    from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+    from tensorrt_llm.llmapi.llm_args import SkipSoftmaxAttentionConfig
+
+    manager_cls = get_sparse_attn_kv_cache_manager(
+        SkipSoftmaxAttentionConfig(threshold_scale_factor=1000.0),
+        use_kv_cache_manager_v2=use_kv_cache_manager_v2,
+    )
+
+    assert manager_cls is (KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager)
+
+
 @pytest.mark.parametrize("backend_name", ["FLASHINFER", "unknown"])
 def test_trtllm_fallback_without_sparse_params_remains_dense(
     backend_name: str, monkeypatch: pytest.MonkeyPatch

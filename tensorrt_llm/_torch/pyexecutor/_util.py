@@ -1130,6 +1130,11 @@ class KvCacheCreator:
         # also go through the V2-incompatible-feature gate below.
         if issubclass(kv_cache_manager_cls, KVCacheManagerV2):
             sparse_attn_config = model_config.sparse_attention_config
+            sparse_algorithm = getattr(sparse_attn_config, "algorithm", None)
+            # Skip Softmax keeps the dense KV cache and TrtllmAttention
+            # metadata, so it follows the dense V2 rules below.
+            uses_sparse_kv_cache_manager = sparse_algorithm not in (
+                None, "skip_softmax")
             quant_config = getattr(model_config, "quant_config", None)
             fp4_mla = (sparse_attn_config is None and is_mla(config)
                        and quant_config is not None
@@ -1147,7 +1152,7 @@ class KvCacheCreator:
             # the prompt's partial tail before the first generation step.
             if (self._max_beam_width is not None and self._max_beam_width > 1
                     and (is_hybrid_linear(config)
-                         or sparse_attn_config is not None or fp4_mla)
+                         or uses_sparse_kv_cache_manager or fp4_mla)
                     and "max_beam_width > 1" not in incompat):
                 incompat.append("max_beam_width > 1")
             if incompat:
@@ -1156,7 +1161,7 @@ class KvCacheCreator:
                 # sparse models require V2 structurally; for models such as DSA
                 # that support both managers, fallback would ignore the user's
                 # explicit manager selection.
-                if sparse_attn_config is not None:
+                if uses_sparse_kv_cache_manager:
                     raise NotImplementedError(
                         f"KVCacheManagerV2 for sparse-attention models "
                         f"(algorithm={sparse_attn_config.algorithm!r}) is not "
