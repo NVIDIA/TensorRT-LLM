@@ -22,6 +22,7 @@ from tensorrt_llm._torch.attention.backends.fmha import msa_prefill
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     MiniMaxM3KVCacheManagerV2,
     MiniMaxM3MsaSparseAttention,
+    msa_indexer,
 )
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import (
     msa_backend as msa_backend_module,
@@ -2495,7 +2496,8 @@ def test_proxy_segmented_only_on_sm107(monkeypatch, sm_version, enabled, expecte
     assert msa_backend_module._proxy_segmented() is expected
 
 
-def test_proxy_segment_rows_keep_each_tokens_causal_range():
+@pytest.mark.cpu_only
+def test_proxy_segment_rows_keep_each_tokens_causal_range() -> None:
     """Segments tile each request's query tokens in order and keep every token's key range."""
     # A 300-token chunk over 1000 cached tokens, an empty row, and a 5-token chunk.
     qo = torch.tensor([300, 0, 5], dtype=torch.int32)
@@ -2512,7 +2514,8 @@ def test_proxy_segment_rows_keep_each_tokens_causal_range():
     assert int(seg_qo.sum()) == int(qo.sum())
 
 
-def test_proxy_segment_page_table_matches_per_segment_build():
+@pytest.mark.cpu_only
+def test_proxy_segment_page_table_matches_per_segment_build() -> None:
     """The device-gathered segmented page table equals a per-segment host build."""
     page = 128
     qo = torch.tensor([300, 0, 5, 130], dtype=torch.int32)
@@ -2527,3 +2530,29 @@ def test_proxy_segment_page_table_matches_per_segment_build():
     gather_page_ranges(flat, starts, counts, total, out)
     assert torch.equal(out[:total], expected)
     assert (out[total:] == -1).all()
+    planner = Mock(spec_set=["fmha_sm100_plan"])
+    planner.fmha_sm100_plan.return_value = ("segmented plan",)
+    plan, gathered = msa_indexer._segmented_proxy_plan(
+        planner,
+        qo.tolist(),
+        (kv - qo).tolist(),
+        num_index_heads=2,
+        page_size=page,
+        num_kv_splits=3,
+        kv_indices=flat,
+    )
+    assert plan is planner.fmha_sm100_plan.return_value
+    assert torch.equal(gathered, expected)
+    planner.fmha_sm100_plan.assert_called_once()
+    args, kwargs = planner.fmha_sm100_plan.call_args
+    assert torch.equal(args[0], seg_qo)
+    assert torch.equal(args[1], seg_kv)
+    assert torch.equal(kwargs.pop("qo_offset"), seg_off)
+    assert kwargs == dict(
+        page_size=page,
+        num_kv_splits=3,
+        causal=True,
+        num_qo_heads=2,
+        num_kv_heads=1,
+        output_maxscore=True,
+    )

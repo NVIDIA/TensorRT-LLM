@@ -66,7 +66,14 @@ from .kernels.trtllm_gen_dense_decode import (
     uniform_subpages_per_slot,
     write_subpage_block_table,
 )
-from .msa_indexer import MsaIndexer, cutedsl_score_runner, segmented_proxy_plan
+from .msa_indexer import (
+    MsaIndexer,
+    cutedsl_score_runner,
+    gather_page_ranges,
+    proxy_segment_page_ranges,
+    proxy_segment_rows,
+    segmented_proxy_plan,
+)
 
 # The short-prefill identity table is materialized with a plain copy, so the sparse prefill that follows the layer's
 # producer (which can trigger its dependents before its last Q/KV stores) never starts before those stores land.
@@ -192,70 +199,6 @@ def proxy_kv_splits(num_rows: int, device: torch.device) -> int:
         key="msa_proxy_few_rows_kv_splits",
     )
     return splits
-
-
-def proxy_segment_rows(
-    qo_lens_cpu: torch.Tensor,
-    kv_lens_cpu: torch.Tensor,
-    qo_offset_cpu: torch.Tensor,
-    segment_tokens: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Cut each request's query rows into consecutive rows of at most segment_tokens.
-
-    Segment j of a request covers its query tokens [j * segment_tokens, end) and keeps the
-    causal key range those tokens see: the request's kv_len shortened by the tokens after the
-    segment, and its qo_offset advanced to the segment's first token. Requests with no query
-    tokens contribute no rows. Returns host int32 (qo_lens, kv_lens, qo_offset) and the int64
-    source request of every segment, in token order.
-    """
-    seg_qo, seg_kv, seg_off, seg_src = [], [], [], []
-    for row, (q, kv, off) in enumerate(
-        zip(qo_lens_cpu.tolist(), kv_lens_cpu.tolist(), qo_offset_cpu.tolist())
-    ):
-        for start in range(0, q, segment_tokens):
-            end = min(start + segment_tokens, q)
-            seg_qo.append(end - start)
-            seg_kv.append(kv - (q - end))
-            seg_off.append(off + start)
-            seg_src.append(row)
-    as_i32 = lambda values: torch.tensor(values, dtype=torch.int32)  # noqa: E731
-    return (
-        as_i32(seg_qo),
-        as_i32(seg_kv),
-        as_i32(seg_off),
-        torch.tensor(seg_src, dtype=torch.long),
-    )
-
-
-def proxy_segment_page_ranges(
-    kv_lens_cpu: torch.Tensor, seg_kv: torch.Tensor, seg_src: torch.Tensor, page_size: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Locate each segment's pages in the flat per-request page table (build_kv_page_indices).
-
-    Request r's pages start at the sum of the earlier requests' page counts, and a segment
-    needs the first ceil(seg_kv / page_size) of them. Returns host int64 (starts, counts).
-    """
-    pages = ((kv_lens_cpu.to(torch.long) + (page_size - 1)) // page_size).clamp_(min=0)
-    request_start = torch.cumsum(pages, 0) - pages
-    counts = (seg_kv.to(torch.long) + (page_size - 1)) // page_size
-    return request_start.index_select(0, seg_src), counts
-
-
-def gather_page_ranges(
-    flat: torch.Tensor, starts: torch.Tensor, counts: torch.Tensor, total: int, out: torch.Tensor
-) -> None:
-    """Write the concatenation of flat[start : start + count] for every range to out[:total].
-
-    Runs on flat's device with no host synchronization: the index is expanded on the device
-    from the per-range starts and counts, so only those two short vectors are copied over.
-    """
-    device = flat.device
-    starts = maybe_pin_memory(starts).to(device, non_blocking=True)
-    counts = maybe_pin_memory(counts).to(device, non_blocking=True)
-    range_first = torch.cumsum(counts, 0) - counts
-    index = torch.repeat_interleave(starts - range_first, counts, output_size=total)
-    index += torch.arange(total, device=device)
-    torch.index_select(flat, 0, index, out=out[:total])
 
 
 class MsaDecodeSpan(NamedTuple):
