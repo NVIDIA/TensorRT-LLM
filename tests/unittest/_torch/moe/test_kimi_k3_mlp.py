@@ -372,6 +372,7 @@ def test_kimi_k3_shared_allreduce_ordering(
     has_aux_stream: bool,
 ) -> None:
     """Check shared-allreduce dependencies and result propagation without CUDA work."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.distributed import AllReduceParams
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
@@ -478,6 +479,11 @@ def test_kimi_k3_shared_allreduce_ordering(
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
     monkeypatch.setattr(torch.cuda, "Event", lambda: pytest.fail("Events must be initialized once"))
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: is_compiling)
+    # The serial path still asks the AutoTuner whether a tuning pass owns this
+    # forward, and bringing the real singleton up needs a CUDA device the CPU
+    # stand-in lacks. Not tuning: the reserve is the zero the no-reserve
+    # backend above declares.
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=False))
 
     shared_stream = "aux" if parallel else "main"
 
@@ -512,6 +518,7 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
 ) -> None:
     """The latent down-projection forks onto the CuteDSL quantization stream
     before the router GEMM, and the MoE receives the event to join."""
+    from tensorrt_llm._torch.autotuner import AutoTuner
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 
@@ -606,6 +613,11 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
 
     monkeypatch.setattr(torch.cuda, "stream", use_stream)
     monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    # The serial path still asks the AutoTuner whether a tuning pass owns this
+    # forward, and bringing the real singleton up needs a CUDA device the CPU
+    # stand-in lacks. Not tuning: the reserve is the zero the no-reserve
+    # backend above declares.
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=False))
 
     with with_multi_stream(multi_stream):
         output = runtime(torch.zeros(2, 4))
