@@ -358,6 +358,7 @@ def _run_capturable_step(
 ) -> torch.Tensor:
     """Hand `requests` to the host functions like add_batch does and run one target step."""
     decoder.requests = requests
+    decoder.active = True
     decoder._hand_over_batch(has_new_tokens=False)
     logits = torch.zeros(requests.num_bitmask_tokens, _VOCAB_SIZE, device="cuda")
     decoder.execute(logits)

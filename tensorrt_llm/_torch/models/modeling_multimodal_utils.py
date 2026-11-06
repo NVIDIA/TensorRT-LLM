@@ -308,6 +308,12 @@ def _get_uncached_multimodal_params(
     return params_to_run
 
 
+def needs_multimodal_encoder(
+        multimodal_params: Optional[List[MultimodalParams]]) -> bool:
+    """Return True if any param has multimodal content but no embedding."""
+    return bool(_get_uncached_multimodal_params(multimodal_params or []))
+
+
 def _store_chunked_prefill_embeddings(
     multimodal_params: List[MultimodalParams],
     embeddings: List[torch.Tensor],
