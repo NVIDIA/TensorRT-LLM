@@ -57,13 +57,11 @@ separate `trtllm::moe_routing_ids` scopes from the raw completed CPU buffer:
 | `moe.step`, `moe.rank` | Originating executor iteration and engine rank |
 | `moe.num_tokens` | R3 forward-layout row count, including any dummy rows |
 | `moe.experts_per_token` | Top-k column count |
-| `moe.recorded_tokens` | Number of leading rows serialized |
-| `moe.truncated` | Whether rows were omitted from the trace payload |
 | `moe.selected_expert_ids` | Logical integer IDs in original top-k order |
 
-Each layer records at most 64 rows and 4096 IDs. These caps bound trace
-serialization only; R3 retains its complete returned routes. Routing weights are
-not recorded. ID records cover a full forward layout rather than individual
+Each layer records all rows and top-k IDs from the completed R3 buffer, without
+sampling or truncation. Routing weights are not recorded. ID records cover a
+full forward layout rather than individual
 scheduler chunks; they do not reconstruct cached prefix rows or fabricated
 empty-chunk work. Shape coverage of `PreroutedRouting` does not add R3 capture
 of caller-provided IDs; ID scopes report only the existing R3 buffer. They
@@ -72,7 +70,10 @@ describe logical experts, not physical EPLB slots or expert placement on ranks.
 ## Cost and coverage limits
 
 The profiler adds no device buffer, copy stream, device-to-host copy, or wait.
-CPU list conversion and literal encoding still cost time when IDs are emitted.
+CPU list conversion and literal encoding scale with the full row count, top-k,
+and number of layers when IDs are emitted. Disabled or inactive MoE profiling
+installs no R3 annotation callback and skips tensor-value serialization; the
+helper/activity checks still execute.
 R3 keeps its existing costs, including forced drains for prefill/request
 completion and ring reuse. Enabling R3 solely for profiling therefore has a cost.
 

@@ -605,8 +605,6 @@ def test_completed_cpu_ids_keep_layer_mapping_and_step(
             "moe.rank": 2,
             "moe.num_tokens": 2,
             "moe.experts_per_token": 2,
-            "moe.recorded_tokens": 2,
-            "moe.truncated": False,
             "moe.selected_expert_ids": values,
         }
         for layer, values in ((3, [[0, 1], [2, 3]]), (7, [[3, 2], [1, 0]]))
@@ -614,11 +612,11 @@ def test_completed_cpu_ids_keep_layer_mapping_and_step(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("rows,top_k,recorded", [(65, 2, 64), (3, 2048, 2)])
-def test_completed_cpu_ids_bound_rows_and_total_values(
-    rows: int, top_k: int, recorded: int, trace_routing: TraceRouting
+@pytest.mark.parametrize("rows,top_k", [(65, 2), (3, 2048)])
+def test_completed_cpu_ids_preserve_all_rows_and_values(
+    rows: int, top_k: int, trace_routing: TraceRouting
 ) -> None:
-    """Truncate whole token rows while preserving the source shape and top-k order."""
+    """Preserve every route beyond the former row and total-ID thresholds."""
     host_rows = torch.arange(rows * top_k, dtype=torch.int32).reshape(rows, 1, top_k)
     records = trace_routing(
         lambda: profiler.record_moe_routing_ids(host_rows, step=None, rank=0, layer_pos=((7, 0),))
@@ -630,9 +628,7 @@ def test_completed_cpu_ids_bound_rows_and_total_values(
             "moe.rank": 0,
             "moe.num_tokens": rows,
             "moe.experts_per_token": top_k,
-            "moe.recorded_tokens": recorded,
-            "moe.truncated": True,
-            "moe.selected_expert_ids": host_rows[:recorded, 0].tolist(),
+            "moe.selected_expert_ids": host_rows[:, 0].tolist(),
         }
     ]
 
@@ -758,8 +754,6 @@ def test_completed_r3_copy_emits_ids_without_an_additional_d2h(
             "moe.rank": 2,
             "moe.num_tokens": 2,
             "moe.experts_per_token": 2,
-            "moe.recorded_tokens": 2,
-            "moe.truncated": False,
             "moe.selected_expert_ids": [[3, 1], [0, 2]],
         }
     ]
