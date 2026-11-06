@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Bitwise and CUDA-graph tests for fused Qwen4-Exp PLE decode kernels."""
+"""Bitwise and CUDA-graph tests for fused Qwen4-Exp PLE kernels."""
 
 import pytest
 import torch
@@ -10,10 +10,12 @@ from tensorrt_llm._torch.modules.qwen4_exp.ple_kernels import (
     can_use_ple_decode_short_conv,
     can_use_ple_gate_value,
     can_use_ple_ngram_hash,
+    can_use_ple_packed_short_conv,
     can_use_ple_short_conv_state,
     ple_decode_short_conv,
     ple_gate_value,
     ple_ngram_hash,
+    ple_packed_short_conv,
     ple_short_conv_state,
 )
 
@@ -223,3 +225,73 @@ def test_ple_decode_kernels_replay_in_cuda_graph() -> None:
     )
     assert conv_input.shape == (64, 32, 10)
     assert conv_output.shape == (64, 32)
+
+
+def _packed_layout(lengths: list[int]) -> tuple[torch.Tensor, torch.Tensor]:
+    length_tensor = torch.tensor(lengths, device="cuda")
+    req_indices = torch.repeat_interleave(torch.arange(len(lengths), device="cuda"), length_tensor)
+    starts = torch.cumsum(length_tensor, 0) - length_tensor
+    token_offsets = torch.arange(sum(lengths), device="cuda") - starts[req_indices]
+    return req_indices, token_offsets
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("channels", [32, 10240])
+@pytest.mark.parametrize(
+    "lengths",
+    [[1], [5, 1, 9, 2], [37, 10, 3, 64], [8, 0, 11]],
+    ids=["single", "shorter-than-state", "long", "empty-request"],
+)
+def test_ple_packed_short_conv_matches_per_request_conv(channels: int, lengths: list[int]) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(20261106 + sum(lengths))
+    dilation, state_len = 3, 9
+    # Distinct, non-monotonic slots; slot 0 and the last slot stay unused.
+    indices = torch.tensor([4, 1, 5, 2][: len(lengths)], device="cuda")
+    state = torch.randn(
+        7, channels, state_len, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    value = torch.randn(
+        sum(lengths), channels, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    weight = torch.randn(channels, 1, 4, dtype=torch.bfloat16, device="cuda", generator=generator)
+    req_indices, token_offsets = _packed_layout(lengths)
+    length_tensor = torch.tensor(lengths, device="cuda")
+
+    expected_state = state.clone()
+    outputs = []
+    start = 0
+    for slot, length in zip(indices.tolist(), lengths):
+        conv_input = torch.cat((state[slot], value[start : start + length].T), dim=1)
+        if length:
+            conv = F.conv1d(conv_input.unsqueeze(0), weight, dilation=dilation, groups=channels)
+            outputs.append(F.silu(conv).squeeze(0).T)
+        expected_state[slot] = conv_input[:, length:]
+        start += length
+
+    assert can_use_ple_packed_short_conv(
+        state, indices, value, weight, req_indices, token_offsets, length_tensor, dilation
+    )
+    actual = ple_packed_short_conv(
+        state, indices, value, weight, req_indices, token_offsets, length_tensor, dilation
+    )
+    assert torch.equal(actual, torch.cat(outputs))
+    assert torch.equal(state, expected_state)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_ple_packed_short_conv_rejects_unsupported_inputs() -> None:
+    state = torch.zeros(2, 32, 9, dtype=torch.bfloat16, device="cuda")
+    indices = torch.arange(2, device="cuda")
+    value = torch.zeros(3, 32, dtype=torch.bfloat16, device="cuda")
+    weight = torch.zeros(32, 1, 4, dtype=torch.bfloat16, device="cuda")
+    req_indices, token_offsets = _packed_layout([2, 1])
+    lengths = torch.tensor([2, 1], device="cuda")
+    args = (state, indices, value, weight, req_indices, token_offsets, lengths)
+
+    assert can_use_ple_packed_short_conv(*args, 3)
+    assert not can_use_ple_packed_short_conv(*args, 2)
+    assert not can_use_ple_packed_short_conv(state.float(), *args[1:], 3)
+    assert not can_use_ple_packed_short_conv(*args[:4], req_indices[:2], *args[5:], 3)
+    assert not can_use_ple_packed_short_conv(*args[:6], lengths.int(), 3)
+    with pytest.raises(ValueError, match="unsupported tensor geometry"):
+        ple_packed_short_conv(*args[:2], value.float(), *args[3:], 3)

@@ -36,10 +36,12 @@ from .ple_kernels import (
     can_use_ple_decode_short_conv,
     can_use_ple_gate_value,
     can_use_ple_ngram_hash,
+    can_use_ple_packed_short_conv,
     can_use_ple_short_conv_state,
     ple_decode_short_conv,
     ple_gate_value,
     ple_ngram_hash,
+    ple_packed_short_conv,
     ple_short_conv_state,
 )
 
@@ -174,6 +176,8 @@ class PLEMetadata:
     context_tokens: int = 0
     use_spec_decoding: bool = False
     is_cuda_graph: bool = False
+    context_row_width: int = 1  # max context chunk length, independent of generation
+    generation_row_width: int = 1  # max generation chunk length, independent of context
 
     @classmethod
     def build(
@@ -217,6 +221,8 @@ class PLEMetadata:
                 f"the {processed_tokens} processed tokens"
             )
         positions = torch.arange(processed_tokens, device=device, dtype=torch.long)
+        context_row_width = 1
+        generation_row_width = 1
 
         if is_decode:
             num_seq = processed_tokens
@@ -237,6 +243,7 @@ class PLEMetadata:
                     f"{processed_tokens} != {num_seq} * {uniform_row_width}"
                 )
             row_width = uniform_row_width
+            generation_row_width = row_width
             lengths = torch.full((num_seq,), row_width, dtype=torch.long, device=device)
             req_indices = torch.div(positions, row_width, rounding_mode="floor")
             token_offsets = positions.remainder(row_width)
@@ -265,6 +272,8 @@ class PLEMetadata:
             row_width = max(seq_lens_cpu) if seq_lens_cpu else processed_tokens
             num_seq = lengths.shape[0]
             context_tokens = sum(seq_lens_cpu[:num_contexts])
+            context_row_width = max(seq_lens_cpu[:num_contexts], default=1)
+            generation_row_width = max(seq_lens_cpu[num_contexts:], default=1)
             query_start_loc = torch.cat([lengths.new_zeros(1), torch.cumsum(lengths, dim=0)])
             req_indices = torch.searchsorted(query_start_loc, positions, right=True) - 1
             # Keep this tensor-only: ``processed_tokens`` can be symbolic under
@@ -307,6 +316,8 @@ class PLEMetadata:
             context_tokens=context_tokens,
             use_spec_decoding=use_spec_decoding,
             is_cuda_graph=is_cuda_graph,
+            context_row_width=context_row_width,
+            generation_row_width=generation_row_width,
         )
 
 
@@ -1178,16 +1189,10 @@ class Qwen4ExpPLE(nn.Module):
         m = metadata
         num_seq = m.lengths.shape[0]
 
-        # In-flight batching places context requests before generation requests.
-        # Padding their joint convolution input to the longest context chunk
-        # would scale as ``num_seq * row_width * conv_channels``. A single 8K
-        # prefill mixed with hundreds of decode rows can therefore allocate tens
-        # of GiB even though only ``processed_tokens`` rows carry data. Split the
-        # two contiguous groups: context rows retain their variable-width path,
-        # while generation rows use width one. Target verification keeps the
-        # joint path below because its per-prefix state candidates span the full
-        # static verification row.
-        if 0 < m.num_contexts < num_seq and not m.use_spec_decoding:
+        # Context chunks and generation rows have independent padding widths.
+        # Verification retains every proposal and its rollback candidate, while
+        # ordinary decode keeps the width-one fused path.
+        if 0 < m.num_contexts < num_seq:
             context_tokens = m.context_tokens
             if not 0 < context_tokens < x.shape[0]:
                 raise RuntimeError(
@@ -1199,28 +1204,32 @@ class Qwen4ExpPLE(nn.Module):
                 physical_tokens=context_tokens,
                 processed_tokens=context_tokens,
                 lengths=m.lengths[: m.num_contexts],
+                row_width=m.context_row_width,
                 req_indices=m.req_indices[:context_tokens],
                 token_offsets=m.token_offsets[:context_tokens],
                 valid_tokens=m.valid_tokens[:context_tokens],
                 state_indices=m.state_indices[: m.num_contexts],
-                padded_tokens=m.padded_tokens[: m.num_contexts],
+                padded_tokens=m.padded_tokens[: m.num_contexts, : m.context_row_width],
                 context_tokens=context_tokens,
+                use_spec_decoding=False,
+                generation_row_width=1,
             )
             generation_tokens = x.shape[0] - context_tokens
             generation_meta = dataclasses.replace(
                 m,
-                is_decode=True,
+                is_decode=not m.use_spec_decoding,
                 physical_tokens=generation_tokens,
                 processed_tokens=generation_tokens,
                 lengths=m.lengths[m.num_contexts :],
-                row_width=1,
+                row_width=m.generation_row_width,
                 req_indices=m.req_indices[context_tokens:] - m.num_contexts,
                 token_offsets=m.token_offsets[context_tokens:],
                 valid_tokens=m.valid_tokens[context_tokens:],
                 state_indices=m.state_indices[m.num_contexts :],
-                padded_tokens=m.padded_tokens[m.num_contexts :, :1],
+                padded_tokens=m.padded_tokens[m.num_contexts :, : m.generation_row_width],
                 num_contexts=0,
                 context_tokens=0,
+                context_row_width=1,
             )
             context_output = self._short_conv(x[:context_tokens], context_meta, conv_state)
             generation_output = self._short_conv(x[context_tokens:], generation_meta, conv_state)
@@ -1242,6 +1251,29 @@ class Qwen4ExpPLE(nn.Module):
                 groups=self.conv_channels,
             ).squeeze(-1)
             return F.silu(conv_output)
+
+        # Mixed batches were split above, so verification rows reach here alone.
+        needs_candidates = m.use_spec_decoding and m.num_contexts == 0
+        if not needs_candidates and can_use_ple_packed_short_conv(
+            conv_state,
+            m.state_indices,
+            x,
+            conv_weight,
+            m.req_indices,
+            m.token_offsets,
+            m.lengths,
+            self.short_conv_dilation,
+        ):
+            return ple_packed_short_conv(
+                conv_state,
+                m.state_indices,
+                x,
+                conv_weight,
+                m.req_indices,
+                m.token_offsets,
+                m.lengths,
+                self.short_conv_dilation,
+            )
 
         state = conv_state.index_select(0, m.state_indices).to(dtype=x.dtype)
 
@@ -1266,17 +1298,17 @@ class Qwen4ExpPLE(nn.Module):
                 .expand(-1, self.conv_channels, -1),
             )
 
-        if m.use_spec_decoding and m.num_contexts < num_seq:
-            generation_slots = m.state_indices[m.num_contexts :]
+        if needs_candidates:
+            generation_slots = m.state_indices
             candidates = conv_input.unfold(2, self.short_conv_state_len, 1)[
-                :, :, 1 : m.row_width + 1
+                :, :, 1 : m.generation_row_width + 1
             ]
             candidates = candidates.permute(0, 2, 1, 3).contiguous()
             self._pending_conv_states = (
                 conv_state,
                 generation_slots,
                 conv_state[generation_slots].clone(),
-                candidates[m.num_contexts :],
+                candidates,
             )
 
         next_state = _gather_at(m.lengths)
@@ -1298,12 +1330,16 @@ class Qwen4ExpPLE(nn.Module):
         next_context = combined.gather(1, m.lengths.unsqueeze(1) + context_cols.unsqueeze(0))
         if m.use_spec_decoding and m.num_contexts < m.lengths.shape[0]:
             generation_slots = m.state_indices[m.num_contexts :]
-            candidates = combined.unfold(1, context_len, 1)[:, 1 : m.row_width + 1].contiguous()
+            candidates = (
+                combined[m.num_contexts :]
+                .unfold(1, context_len, 1)[:, 1 : m.generation_row_width + 1]
+                .contiguous()
+            )
             self._pending_ngram_contexts = (
                 ngram_context,
                 generation_slots,
                 ngram_context[generation_slots].clone(),
-                candidates[m.num_contexts :],
+                candidates,
             )
 
         ngram_context[m.state_indices] = next_context.to(dtype=ngram_context.dtype)

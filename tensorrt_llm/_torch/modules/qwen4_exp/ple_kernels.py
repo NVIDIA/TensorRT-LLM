@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from SGLang's Qwen4 PLE kernels.
-"""Shape-specialized fused kernels for decode-sized Qwen4-Exp PLE.
+"""Shape-specialized fused kernels for Qwen4-Exp PLE decode and packed context chunks.
 
 Each entry point has a matching ``can_use_*`` guard; other legal model
 geometries remain on the generic PyTorch path.
@@ -486,13 +486,243 @@ def _(
     return torch.empty_like(value)
 
 
+@triton.jit
+def _packed_short_conv_kernel(
+    value_ptr,
+    state_ptr,
+    state_indices_ptr,
+    req_indices_ptr,
+    token_offsets_ptr,
+    weight_ptr,
+    output_ptr,
+    num_tokens,
+    channels: tl.constexpr,
+    kernel_size: tl.constexpr,
+    dilation: tl.constexpr,
+    state_len: tl.constexpr,
+    block_tokens: tl.constexpr,
+    block_channels: tl.constexpr,
+) -> None:
+    token = tl.program_id(0) * block_tokens + tl.arange(0, block_tokens)[:, None]
+    channel = tl.program_id(1) * block_channels + tl.arange(0, block_channels)[None, :]
+    token_mask = token < num_tokens
+    channel_mask = channel < channels
+    mask = token_mask & channel_mask
+    token = token.to(tl.int64)
+    request = tl.load(req_indices_ptr + token, mask=token_mask, other=0)
+    offset = tl.load(token_offsets_ptr + token, mask=token_mask, other=0)
+    state_base = tl.load(state_indices_ptr + request, mask=token_mask, other=0)
+    state_base = state_base * channels * state_len + channel * state_len
+
+    # Tap ``k`` reads position ``offset + k * dilation`` of the virtual
+    # ``[carried state | chunk tokens]`` row. Positions before the chunk come
+    # from the state pool; later ones are earlier tokens of the same request.
+    chunk_start = token - offset
+    conv = tl.zeros((block_tokens, block_channels), dtype=tl.float32)
+    for tap in tl.static_range(kernel_size):
+        position = offset + tap * dilation
+        from_state = position < state_len
+        state_value = tl.load(
+            state_ptr + state_base + position,
+            mask=mask & from_state,
+            other=0.0,
+        )
+        token_value = tl.load(
+            value_ptr + (chunk_start + position - state_len) * channels + channel,
+            mask=mask & ~from_state,
+            other=0.0,
+        )
+        weight = tl.load(
+            weight_ptr + channel * kernel_size + tap,
+            mask=channel_mask,
+            other=0.0,
+        )
+        tap_value = tl.where(from_state, state_value, token_value)
+        conv += tap_value.to(tl.float32) * weight.to(tl.float32)
+
+    # Match the BF16 conv output that F.conv1d materializes before F.silu.
+    conv = _round_bf16_to_fp32(conv)
+    tl.store(
+        output_ptr + token * channels + channel,
+        conv * tl.sigmoid(conv),
+        mask=mask,
+    )
+
+
+@triton.jit
+def _packed_short_conv_state_kernel(
+    value_ptr,
+    state_ptr,
+    state_indices_ptr,
+    lengths_ptr,
+    starts_ptr,
+    channels: tl.constexpr,
+    state_len: tl.constexpr,
+    block_channels: tl.constexpr,
+    block_state_len: tl.constexpr,
+) -> None:
+    request = tl.program_id(0)
+    channel = tl.program_id(1) * block_channels + tl.arange(0, block_channels)[:, None]
+    state_col = tl.arange(0, block_state_len)[None, :]
+    mask = (channel < channels) & (state_col < state_len)
+    length = tl.load(lengths_ptr + request)
+    start = tl.load(starts_ptr + request)
+    state_base = tl.load(state_indices_ptr + request) * channels * state_len
+    state_base += channel * state_len
+
+    # The next state is the last ``state_len`` positions of the virtual row,
+    # i.e. positions ``length .. length + state_len - 1``.
+    position = length + state_col
+    from_state = position < state_len
+    state_value = tl.load(
+        state_ptr + state_base + position,
+        mask=mask & from_state,
+        other=0.0,
+    )
+    token_value = tl.load(
+        value_ptr + (start + position - state_len) * channels + channel,
+        mask=mask & ~from_state,
+        other=0.0,
+    )
+    next_state = tl.where(from_state, state_value, token_value)
+    # Shifting a short chunk reads columns that other threads overwrite.
+    tl.debug_barrier()
+    tl.store(state_ptr + state_base + state_col, next_state, mask=mask)
+
+
+def can_use_ple_packed_short_conv(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    req_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    dilation: int,
+) -> bool:
+    """Return whether a packed variable-length chunk batch can use the fused kernels."""
+    index_tensors = (state_indices, req_indices, token_offsets, lengths)
+    return (
+        _same_cuda_device(state, value, weight, *index_tensors)
+        and state.dtype == torch.bfloat16
+        and state.dim() == 3
+        and state.is_contiguous()
+        and value.dtype == state.dtype
+        and value.dim() == 2
+        and value.is_contiguous()
+        and value.shape[1] == state.shape[1]
+        and weight.dtype == state.dtype
+        and weight.dim() == 3
+        and weight.shape[:2] == (state.shape[1], 1)
+        and weight.is_contiguous()
+        and dilation > 0
+        and state.shape[2] == (weight.shape[2] - 1) * dilation
+        and state.shape[2] <= _MAX_SHORT_CONV_STATE_LEN
+        and all(
+            tensor.dtype == torch.long and tensor.dim() == 1 and tensor.is_contiguous()
+            for tensor in index_tensors
+        )
+        and req_indices.shape[0] == value.shape[0]
+        and token_offsets.shape[0] == value.shape[0]
+        and lengths.shape[0] == state_indices.shape[0]
+    )
+
+
+@torch.library.custom_op(
+    "trtllm::qwen4_exp_ple_packed_short_conv",
+    mutates_args=("state",),
+)
+def ple_packed_short_conv(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    req_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    """Dilated causal short-conv SiLU over packed chunks, advancing each request's state.
+
+    Requests own contiguous token ranges of ``value`` in request order, with
+    ``token_offsets`` counting from zero within each range, and distinct state
+    slots. Returns ``[num_tokens, channels]`` without padding chunks to a
+    common width.
+    """
+    if not can_use_ple_packed_short_conv(
+        state, state_indices, value, weight, req_indices, token_offsets, lengths, dilation
+    ):
+        raise ValueError("PLE packed short convolution received unsupported tensor geometry")
+    output = torch.empty_like(value)
+    num_tokens, channels = value.shape
+    num_requests = state_indices.shape[0]
+    state_len = state.shape[2]
+    if num_tokens:
+        block_tokens = 16
+        block_channels = 128
+        with torch.cuda.device(state.device.index):
+            _packed_short_conv_kernel[
+                (triton.cdiv(num_tokens, block_tokens), triton.cdiv(channels, block_channels))
+            ](
+                value,
+                state,
+                state_indices,
+                req_indices,
+                token_offsets,
+                weight,
+                output,
+                num_tokens,
+                channels=channels,
+                kernel_size=weight.shape[2],
+                dilation=dilation,
+                state_len=state_len,
+                block_tokens=block_tokens,
+                block_channels=block_channels,
+                num_warps=4,
+            )
+    if num_requests:
+        starts = torch.cumsum(lengths, dim=0) - lengths
+        block_channels = 128
+        with torch.cuda.device(state.device.index):
+            _packed_short_conv_state_kernel[(num_requests, triton.cdiv(channels, block_channels))](
+                value,
+                state,
+                state_indices,
+                lengths,
+                starts,
+                channels=channels,
+                state_len=state_len,
+                block_channels=block_channels,
+                block_state_len=triton.next_power_of_2(state_len),
+                num_warps=8,
+            )
+    return output
+
+
+@ple_packed_short_conv.register_fake
+def _(
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    req_indices: torch.Tensor,
+    token_offsets: torch.Tensor,
+    lengths: torch.Tensor,
+    dilation: int,
+) -> torch.Tensor:
+    del state, state_indices, weight, req_indices, token_offsets, lengths, dilation
+    return torch.empty_like(value)
+
+
 __all__ = [
     "can_use_ple_decode_short_conv",
     "can_use_ple_gate_value",
     "can_use_ple_ngram_hash",
+    "can_use_ple_packed_short_conv",
     "can_use_ple_short_conv_state",
     "ple_gate_value",
     "ple_decode_short_conv",
     "ple_ngram_hash",
+    "ple_packed_short_conv",
     "ple_short_conv_state",
 ]
