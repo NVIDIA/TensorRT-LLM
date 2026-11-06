@@ -770,6 +770,26 @@ def test_logit_transform_scales_then_soft_caps_in_fp32():
     assert transformed.abs().max() < 20.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_logit_transform_on_cuda_is_the_torch_chain_bitwise(dtype):
+    # Every BF16 value (as BF16, or widened to an FP32 input that is transformed
+    # in place, as the built-in chain did).
+    bits = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
+    logits = bits.view(torch.bfloat16).reshape(64, 1024).cuda().to(dtype)
+    multiplier = MUSESPARK_LOGIT_TRANSFORM["output_multiplier"]
+    cap = MUSESPARK_LOGIT_TRANSFORM["final_logit_softcapping"]
+    expected = cap * torch.tanh(logits.float() * multiplier / cap)
+
+    transformed = _transform_wrapper(MUSESPARK_LOGIT_TRANSFORM).apply_draft_logit_transform(logits)
+
+    assert transformed.dtype == torch.float32
+    assert (transformed is logits) == (dtype == torch.float32)
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(transformed), nan)
+    assert torch.equal(transformed[~nan].view(torch.int32), expected[~nan].view(torch.int32))
+
+
 def test_logit_transform_decides_the_selector_walk():
     """The transform keeps every position's argmax, but the selector adds the
     drafter logits to its pairwise scores, so their scale picks the path."""
