@@ -530,9 +530,9 @@ class TestsDefRule(Rule):
                     handled.add(git_path)
                     no_match.add(git_path)
                     continue
-                # conftest / __init__ / helper / data — could impact
-                # selection via implicit pytest discovery; let Selector
-                # report it as Unhandled → fallback.
+                # conftest / __init__ / helper / data can carry shared pytest
+                # state. Leave them unclaimed for coverage's AST dependency
+                # checks; shared fixture/hook/state changes still fall back.
                 out_of_namespace.add(git_path)
                 continue
             handled.add(git_path)
