@@ -197,9 +197,10 @@ A target runs speculative decoding in one of two ways.
   the engine's speculative worker. Inherit `SpecDecOneEngineForCausalLM`: it
   builds the drafter and the worker from the speculative config, and its
   `forward` hands the target's hidden states and logits to the worker, which
-  verifies, accepts and drafts. For one-model MTP, the stock drafter builds
-  the MTP layer that the target's decoder model names in `mtp_layer_cls`, so
-  the target runs its own MTP layer rather than the Modeling V1 one.
+  verifies, accepts and drafts. For one-model MTP, the stock drafter normally
+  picks the built-in MTP layer for the checkpoint's model type. A target that
+  has its own MTP layer names it in its decoder model's `mtp_layer_cls`, and
+  the drafter builds that class instead.
 * **Fused.** The target runs the whole speculative step in its own
   `forward`: the main model, verification, acceptance, the commit of any
   per-token state and the draft chain. It builds no speculative worker
