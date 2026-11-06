@@ -4,6 +4,7 @@
 
 from contextlib import closing
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -313,6 +314,27 @@ def test_cold_page_mixed_precision_is_per_layer_and_skips_sliding_window_layers(
     assert [
         [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
     ] == [[0, 1]]
+
+
+def test_mixed_precision_warns_when_no_layer_takes_it(make_manager):
+    """When every attention layer has a sliding window, neither way of asking for mixed precision
+    reaches a layer; the manager says so instead of staying silent."""
+    from tensorrt_llm.logger import logger
+
+    with patch.object(logger, "warning") as warning:
+        hot = make_manager(
+            config=mixed_config(pool_ratio=None, max_attention_window=[64]), num_layers=2
+        )
+    assert hot.mixed_precision_high_layers == {}
+    assert any("has no effect" in str(call.args[0]) for call in warning.call_args_list)
+    with patch.object(logger, "warning") as warning:
+        cold = make_manager(
+            config=cold_page_config(pool_ratio=None, max_attention_window=[64]),
+            num_layers=2,
+            cold_page_codec_provider=_ColdPageProvider(),
+        )
+    assert cold.mixed_precision_high_layers == {}
+    assert any("has no effect" in str(call.args[0]) for call in warning.call_args_list)
 
 
 def test_cold_page_window_skips_the_codec_while_estimating(make_manager):
