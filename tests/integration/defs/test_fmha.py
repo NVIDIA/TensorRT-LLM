@@ -23,6 +23,7 @@ from .conftest import get_sm_version
 
 
 def test_fmha():
+    """Build FMHA for the current GPU architecture and run its test executable."""
     build_run = partial(run, shell=True, check=True)
 
     current_dir = Path.cwd()
