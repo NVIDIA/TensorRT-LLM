@@ -8,9 +8,10 @@ once per process (``MOONCAKE_STORE_CHECKSUM``), some per client (``MC_STORE_MEMC
 ``MC_FORCE_TCP``) and ``MC_TCP_PROTO`` on every transfer; this module logs them before setup and
 never sets them. ``open_sdk`` refuses the settings the driver's rules do not cover: TCP's legacy
 framing (``MC_TCP_PROTO=1``), the local hot cache (``MC_STORE_LOCAL_HOT_CACHE_SIZE``), the newer
-transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``), the SDK picking the transport itself
-(``MC_MS_AUTO_DISC``, or RDMA with no device named or found) and any SDK build other than the
-pinned ones.
+transfer engine (``MC_USE_TENT``, ``MC_USE_TEV1``) and the SDK picking the transport itself
+(``MC_MS_AUTO_DISC``, or RDMA with no device named or found). It accepts only SDK 0.3.13 of the
+``PINNED_SDK_DISTRIBUTIONS`` builds and raises ``ImportError`` for any other version or build
+before it connects to the master.
 
 Over RDMA, a process that used ibverbs before its first Mooncake client (importing
 ``tensorrt_llm`` does) logs ``RDMA context setup failed: fork compatibility: Invalid argument``

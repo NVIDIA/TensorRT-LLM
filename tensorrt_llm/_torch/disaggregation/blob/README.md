@@ -36,6 +36,11 @@ store SDK
 | `mooncake_setup.py` | `open_mooncake_driver`: reads a store config and opens the SDK client and the driver |
 | `../testing/` | what a driver's own CI imports from the wheel: the conformance suite, the in-memory store and drivers, the broken drivers that prove every check bites |
 
+The Mooncake driver accepts only Mooncake SDK 0.3.13, from `mooncake-transfer-engine-cuda13` (the
+one TensorRT-LLM installs), `mooncake-transfer-engine` or `mooncake-transfer-engine-non-cuda`.
+`open_sdk`, which `open_mooncake_driver` calls, rejects any other version or build at startup:
+it raises `ImportError`, naming the build to install, before it connects to the master.
+
 ## Running the tests
 
 ```bash
