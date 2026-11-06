@@ -711,11 +711,16 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
         q_scale_quant_orig=None,
         softmax_scale=512**-0.5,
         main_logical=None,
-    ) -> None:
+    ) -> bool:
         """Refresh bounded native staging pools and indices for one selected query tile.
 
         This prepares compute buffers only; the backend publishes native ABI
         arguments and performs attention after staging completes.
+
+        Returns whether ``prepared_indices`` already address zero-filled rows of
+        the staging pools past ``prepared_lens``, which only native per-token
+        staging publishes. The shared context bank and the PyTorch staging leave
+        ``-1`` there.
         """
         from .quantization import _fused_gather_supported, gather_rows, row_bytes
 
@@ -805,7 +810,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 q_scale_quant_orig=q_scale_quant_orig,
                 softmax_scale=softmax_scale,
             )
-            return
+            return False
         native = (
             count > 0
             and all(pool.is_cuda and pool.stride(1) == 1 for pool, _, _ in sources)
@@ -834,7 +839,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                 q_scale_quant_orig=q_scale_quant_orig,
                 softmax_scale=softmax_scale,
             )
-            return
+            return True
         topk_indices = inputs.topk_indices
         if mapping is not None and topk_indices is not None:
             table, page_size, max_positions, requests, visible = mapping
@@ -901,6 +906,7 @@ class CSA2TrtllmMetadata(TrtllmAttentionMetadata):
                     -1,
                 )
             )
+        return False
 
     def set_source_batch(self, seq_lengths: list[int], start_positions: list[int]) -> None:
         """Set encoder source rows independently of decoder query rows.
