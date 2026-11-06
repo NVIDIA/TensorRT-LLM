@@ -7777,7 +7777,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
-        parallelJobsFiltered = sanityCheckJobs
+        parallelJobsFiltered = docBuildJobs + sanityCheckJobs
     }
 
     echo "Check the passed GitLab bot testFilter parameters."
