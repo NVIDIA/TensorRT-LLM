@@ -204,10 +204,15 @@ class MiniMaxH3Attention(Attention):
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         if self.use_async_ulysses:
             return self.forward_async(
-                hidden_states, rotary_emb, key_padding_mask=key_padding_mask, timestep=timestep
+                hidden_states,
+                rotary_emb,
+                key_padding_mask=key_padding_mask,
+                timestep=timestep,
+                valid_seq_len=valid_seq_len,
             )
         batch_size, sequence_length = hidden_states.shape[:2]
         if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
@@ -246,6 +251,7 @@ class MiniMaxH3Attention(Attention):
             value,
             key_padding_mask=key_padding_mask,
             discard_padded_queries=True,
+            valid_seq_len=valid_seq_len,
             timestep=timestep,
         )
         return self.to_out[0](hidden_states)
@@ -256,6 +262,7 @@ class MiniMaxH3Attention(Attention):
         rotary_emb: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         """``forward`` with each projection pushed to the peers as soon as it is
         computed: V, then Q and K with their per-head norm and RoPE, run on the
@@ -287,6 +294,7 @@ class MiniMaxH3Attention(Attention):
             compute_v,
             key_padding_mask=key_padding_mask,
             discard_padded_queries=True,
+            valid_seq_len=valid_seq_len,
             timestep=timestep,
         )
         batch_size, local_seq_len = out_4d.shape[:2]
@@ -447,10 +455,12 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         hidden_states = hidden_states + self.attn(
             _norm_2d(self.norm1, hidden_states),
             key_padding_mask=key_padding_mask,
+            valid_seq_len=valid_seq_len,
         )
         residual = hidden_states
         hidden_states = _norm_2d(self.norm2, hidden_states)
@@ -476,7 +486,8 @@ class MiniMaxH3TokenRefiner(nn.Module):
         fuse_bf16_gate_up_swiglu: bool = False,
     ) -> None:
         super().__init__()
-        self._supports_key_padding_mask = model_config.attention.backend.upper() in (
+        self._attn_backend = model_config.attention.backend.upper()
+        self._supports_key_padding_mask = self._attn_backend in (
             "VANILLA",
             "FA4",
             "TRTLLM",
@@ -519,14 +530,17 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     "Padded token-refiner sequences require key_padding_mask support; "
                     "use VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
-            # Backends cache mask plans using the tensor mutation counter.
-            with torch.inference_mode(False):
+            if self._attn_backend != "TRTLLM":
                 valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
                 key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
             hidden_states = _pad_tensor_dim(hidden_states, 1, pad)
         hidden_states = self.sharder.shard(hidden_states, dim=1)
         for block in self.refiner_blocks:
-            hidden_states = block(hidden_states, key_padding_mask=key_padding_mask)
+            hidden_states = block(
+                hidden_states,
+                key_padding_mask=key_padding_mask,
+                valid_seq_len=seq_len if pad else None,
+            )
         hidden_states = _norm_2d(self.final_norm, hidden_states)
         return self.sharder.gather(hidden_states, dim=1, unpad_to=seq_len)
 
@@ -599,10 +613,17 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         key_padding_mask: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
+        valid_seq_len: Optional[int] = None,
     ) -> torch.Tensor:
         if self._fused_adaln and hidden_states.dtype == torch.bfloat16:
             return self._forward_fused_adaln(
-                hidden_states, temb, adaln_indices, rotary_emb, key_padding_mask, timestep
+                hidden_states,
+                temb,
+                adaln_indices,
+                rotary_emb,
+                key_padding_mask,
+                timestep,
+                valid_seq_len,
             )
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(temb)
 
@@ -616,6 +637,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
             rotary_emb,
             key_padding_mask,
             timestep,
+            valid_seq_len,
         )
 
         residual = hidden_states
@@ -636,13 +658,16 @@ class MiniMaxH3TransformerBlock(nn.Module):
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
         key_padding_mask: Optional[torch.Tensor],
         timestep: Optional[torch.Tensor],
+        valid_seq_len: Optional[int],
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
         norm_hidden_states = h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
-        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
+        attn_output = self.attn(
+            norm_hidden_states, rotary_emb, key_padding_mask, timestep, valid_seq_len
+        )
         hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
             hidden_states,
             attn_output,
@@ -994,6 +1019,12 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         timestep_indices_for_norm = timestep_indices
         rotary_emb = static_context.rotary_emb
         pad = _padding_to_multiple(sequence_length, self.sharder.size)
+        has_existing_padding = bool((token_tags < 0).any())
+        valid_seq_len = None
+        if self._attn_backend == "TRTLLM" and (pad or has_existing_padding):
+            valid_seq_len = sequence_length
+            if has_existing_padding:
+                valid_seq_len = int((token_tags >= 0).sum().item())
         token_tags_for_mask = token_tags
         if pad:
             packed_hidden_states = _pad_tensor_dim(packed_hidden_states, 1, pad)
@@ -1003,7 +1034,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             rotary_emb = _pad_rotary_emb(rotary_emb, pad)
 
         key_padding_mask = None
-        if bool((token_tags_for_mask < 0).any()):
+        if pad or has_existing_padding:
             if not self._supports_key_padding_mask:
                 raise NotImplementedError(
                     "Padded packed sequences (negative token_tags) need an attention "
@@ -1019,8 +1050,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 raise NotImplementedError(
                     f"{self._attn_backend} requires trailing packed-row padding; use VANILLA for interior padding."
                 )
-            # Preserve a mutation counter for shared backend mask-plan caches.
-            with torch.inference_mode(False):
+            if self._attn_backend != "TRTLLM":
                 key_padding_mask = (
                     (token_tags_for_mask >= 0)
                     .unsqueeze(0)
@@ -1045,6 +1075,7 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                 rotary_emb,
                 key_padding_mask,
                 timestep,
+                valid_seq_len=valid_seq_len,
             )
 
         packed_hidden_states = self.norm_out(

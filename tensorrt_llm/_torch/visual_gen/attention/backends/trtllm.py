@@ -598,72 +598,30 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         q: torch.Tensor,
         k: Optional[torch.Tensor],
         v: Optional[torch.Tensor],
-        key_padding_mask: torch.Tensor,
+        valid_seq_len: int,
         timestep: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Attend to a valid prefix; callers explicitly discard padded query rows.
+        """Attend to one valid prefix shared by every batch row.
 
         Ulysses still needs the padded output shape for its return collective.
-        Cache prefix lengths across layers sharing the same request mask to avoid
-        repeating the device-to-host synchronization in every attention block.
+        The caller validates the prefix layout before passing its host length.
         """
-        if key_padding_mask.dtype != torch.bool or key_padding_mask.shape != q.shape[:2]:
-            raise ValueError("TRTLLM padding mask must be boolean with shape [batch, sequence].")
-        state = self.metadata._metadata_state
-        cached = state.get("padding_prefix_lengths")
-        version = None if torch.is_inference(key_padding_mask) else key_padding_mask._version
-        if (
-            version is None
-            or cached is None
-            or cached[0] is not key_padding_mask
-            or cached[1] != version
-        ):
-            mask = key_padding_mask.cpu()
-            lengths = mask.sum(dim=1).tolist()
-            expected = torch.arange(mask.shape[1]).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
-            if not torch.equal(mask, expected):
-                raise ValueError("TRTLLM padded self-attention requires trailing padding.")
-            state["padding_prefix_lengths"] = (key_padding_mask, version, lengths)
-        else:
-            lengths = cached[2]
         batch_size, seq_len = q.shape[:2]
-        if all(length == seq_len for length in lengths):
+        if type(valid_seq_len) is not int or not 0 <= valid_seq_len <= seq_len:
+            raise ValueError("valid_seq_len must be a host integer in [0, sequence length].")
+        if valid_seq_len == seq_len:
             return self.forward(q, k, v, batch_size, seq_len, timestep=timestep)
-
-        groups: dict[int, list[int]] = {}
-        for batch_idx, length in enumerate(lengths):
-            groups.setdefault(length, []).append(batch_idx)
-        if len(groups) == 1:
-            length = lengths[0]
-            if length == 0:
-                return q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
-            output = self.forward(
-                q=q[:, :length].contiguous(),
-                k=k[:, :length].contiguous() if k is not None else None,
-                v=v[:, :length].contiguous() if v is not None else None,
-                batch_size=batch_size,
-                seq_len=length,
-                timestep=timestep,
-            )
-            return torch.nn.functional.pad(output, (0, 0, 0, seq_len - length))
-
-        output = q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
-        for length, batch_indices in groups.items():
-            if length == 0:
-                continue
-            indices = torch.tensor(batch_indices, device=q.device)
-            group_output = self.forward(
-                q=q[:, :length].index_select(0, indices),
-                k=k[:, :length].index_select(0, indices) if k is not None else None,
-                v=v[:, :length].index_select(0, indices) if v is not None else None,
-                batch_size=len(batch_indices),
-                seq_len=length,
-                timestep=timestep,
-            )
-            output.index_copy_(
-                0, indices, torch.nn.functional.pad(group_output, (0, 0, 0, seq_len - length))
-            )
-        return output
+        if valid_seq_len == 0:
+            return q.new_zeros((batch_size, seq_len, self.num_heads * self.head_dim))
+        output = self.forward(
+            q=q[:, :valid_seq_len].contiguous(),
+            k=k[:, :valid_seq_len].contiguous() if k is not None else None,
+            v=v[:, :valid_seq_len].contiguous() if v is not None else None,
+            batch_size=batch_size,
+            seq_len=valid_seq_len,
+            timestep=timestep,
+        )
+        return torch.nn.functional.pad(output, (0, 0, 0, seq_len - valid_seq_len))
 
     def forward(
         self,
@@ -679,6 +637,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
         kv: Optional[ForwardPlan] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         discard_padded_queries: bool = False,
+        valid_seq_len: Optional[int] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -715,19 +674,21 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 The first ``kv.num_tokens`` rows are real; rows past them are padding,
                 neither cached nor attended, and output zero. ``batch_size`` must be 1.
                 Sparse attention is not supported on this path.
-            key_padding_mask: Boolean valid-prefix mask, honored only when
-                discard_padded_queries=True. Otherwise retains the legacy TRTLLM
-                behavior of ignoring this backend-specific keyword.
+            key_padding_mask: Ignored, preserving legacy TRTLLM behavior. Callers
+                opting into prefix trimming must supply valid_seq_len instead.
             discard_padded_queries: Opt in to valid-prefix dense self-attention.
-                Caller guarantees masked query rows are unused; their outputs
-                are zero-filled. Callers requiring general masking must select
-                a backend that supports it, such as VANILLA.
+                Caller guarantees padded query rows are unused; their outputs
+                are zero-filled.
+            valid_seq_len: Host length of the contiguous valid prefix, identical
+                for every batch row, in the global sequence after Ulysses exchange.
+                Required when opting into padding. The caller must validate
+                trailing padding; arbitrary masks and unequal lengths are unsupported.
             **kwargs: Additional backend-specific arguments.
 
         Returns:
             Output tensor [B, S, H*D]
         """
-        if key_padding_mask is not None and discard_padded_queries:
+        if discard_padded_queries and (valid_seq_len is not None or key_padding_mask is not None):
             if (
                 kv is not None
                 or attention_mask != PredefinedAttentionMask.FULL
@@ -739,7 +700,7 @@ class TrtllmAttention(BaseTrtllmAttention, AttentionBackend):
                 raise ValueError(
                     "TRTLLM padding requires dense self-attention with discarded padded queries."
                 )
-            return self._forward_padded_self_attention(q, k, v, key_padding_mask, timestep)
+            return self._forward_padded_self_attention(q, k, v, valid_seq_len, timestep)
         if kv is not None:
             if sparse_backend_args is not None:
                 raise NotImplementedError("Sparse attention is not supported over a K/V cache.")

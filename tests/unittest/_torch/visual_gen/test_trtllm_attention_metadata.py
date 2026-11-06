@@ -413,9 +413,9 @@ def test_vc_attention_eager_runs_keep_only_the_current_shape(monkeypatch) -> Non
 
 @_REQUIRES_SM100
 @pytest.mark.parametrize("fused", [False, True])
-@pytest.mark.parametrize("lengths", [[5, 7], [5, 5], [8, 8], [5, 7, 5, 0], [0, 0]])
-def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, lengths: list[int]) -> None:
-    """Padding never contributes keys, including when ranks need unequal real lengths."""
+@pytest.mark.parametrize("valid_seq_len", [0, 5, 8])
+def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, valid_seq_len: int) -> None:
+    """Uniform prefix trimming matches masked attention for fused and separate QKV."""
     attention = visual_trtllm.TrtllmAttention(
         num_heads=2,
         head_dim=128,
@@ -423,11 +423,12 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, lengths: l
         attention_metadata_state=create_attention_metadata_state(),
     )
     torch.manual_seed(42)
-    batch_size = len(lengths)
+    batch_size = 2
     q, k, v = [
         torch.randn(batch_size, 8, 2, 128, device="cuda", dtype=torch.bfloat16) for _ in range(3)
     ]
-    mask = torch.arange(8, device="cuda")[None] < torch.tensor(lengths, device="cuda")[:, None]
+    mask = torch.arange(8, device="cuda")[None] < valid_seq_len
+    mask = mask.expand(batch_size, -1)
     expected = (
         torch.nn.functional.scaled_dot_product_attention(
             q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), attn_mask=mask[:, None, None]
@@ -437,12 +438,12 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, lengths: l
     )
     query = torch.cat((q, k, v), dim=2) if fused else q
     kwargs = dict(
-        batch_size=batch_size, seq_len=8, key_padding_mask=mask, discard_padded_queries=True
+        batch_size=batch_size, seq_len=8, valid_seq_len=valid_seq_len, discard_padded_queries=True
     )
     forward = attention.forward
     attention.forward = Mock(wraps=forward)
     actual = forward(query, None if fused else k, None if fused else v, **kwargs)
-    assert attention.forward.call_count == len(set(lengths) - {0})
+    assert attention.forward.call_count == int(valid_seq_len > 0)
     attention.forward = forward
     torch.testing.assert_close(actual[mask], expected[mask], atol=2e-2, rtol=2e-2)
     assert torch.count_nonzero(actual[~mask]) == 0
@@ -450,10 +451,11 @@ def test_trtllm_padded_self_attention_matches_valid_rows(fused: bool, lengths: l
         attention.forward(q, k, v, kv=Mock(), **kwargs)
     with pytest.raises(ValueError, match="discarded padded queries"):
         attention.forward(q, k, v, attention_mask=PredefinedAttentionMask.CAUSAL, **kwargs)
-    mask[0] = True
-    mask[0, 1] = False
-    with pytest.raises(ValueError, match="trailing padding"):
-        attention.forward(q, k, v, **kwargs)
+    for invalid_length in (None, -1, 9, [5, 7], True, 5.0, torch.tensor(5)):
+        with pytest.raises(ValueError, match="host integer"):
+            attention.forward(
+                q, k, v, key_padding_mask=mask, **{**kwargs, "valid_seq_len": invalid_length}
+            )
 
 
 @_REQUIRES_SM100
@@ -497,6 +499,6 @@ def test_legacy_mask_preserves_attention_dispatch(monkeypatch, mode: str) -> Non
     actual = attention.forward(q, q, q, key_padding_mask=mask, **kwargs)
     torch.testing.assert_close(actual, expected)
     assert captured["forward_args"] == expected_args
-    match = "trailing padding" if mode == "dense" else "dense self-attention"
+    match = "host integer" if mode == "dense" else "dense self-attention"
     with pytest.raises(ValueError, match=match):
         attention.forward(q, q, q, key_padding_mask=mask, discard_padded_queries=True, **kwargs)
