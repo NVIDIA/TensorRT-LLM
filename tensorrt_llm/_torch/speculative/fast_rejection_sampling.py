@@ -14,9 +14,10 @@
 # limitations under the License.
 """Fused rejection sampling for one-model block drafters (DSpark and DFlash), as Triton kernels.
 
-With ``TLLM_SPEC_FAST_RS=1``, `SpecWorkerBase` calls these kernels instead of its reference path
+`SpecWorkerBase` calls these kernels instead of its reference path
 (`SpecWorkerBase._sample_and_accept_draft_tokens_rejection` and the rejection branch of
-`SpecWorkerBase.advanced_sample_draft_block`). The reference path runs about ten flashinfer and
+`SpecWorkerBase.advanced_sample_draft_block`) whenever they cover the step (see
+`SpecWorkerBase._fast_rs_applies`). The reference path runs about ten flashinfer and
 PyTorch launches per step, most of them one CTA per row over the full vocabulary, which leaves the
 GPU nearly idle for hundreds of microseconds at a few rows per step. Here every row is split into
 ``_CHUNK``-wide pieces, so a few rows fill the GPU.
@@ -29,14 +30,11 @@ same logits draws the same tokens. Logits of ``-inf`` (masked tokens) get probab
 chunks with no finite logit.
 """
 
-import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
-
-FAST_RS_ENV_VAR = "TLLM_SPEC_FAST_RS"
 
 # Vocab elements per program (one load per program; 163840 = 40 chunks).
 _CHUNK = 4096
@@ -59,11 +57,6 @@ _DRAFT_KEY_XOR = tl.constexpr(DRAFT_KEY_XOR)
 # kPerRowSubsequenceBase (1 << 63) of the C++ samplers, as the int64 bit pattern.
 PER_ROW_SUBSEQUENCE_BASE = -(1 << 63)
 _PER_ROW_SUBSEQUENCE_BASE = tl.constexpr(PER_ROW_SUBSEQUENCE_BASE)
-
-
-def fast_rs_enabled() -> bool:
-    """Whether ``TLLM_SPEC_FAST_RS=1`` selects the fused rejection-sampling kernels."""
-    return os.environ.get(FAST_RS_ENV_VAR, "0") == "1"
 
 
 @triton.jit

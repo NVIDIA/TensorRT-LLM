@@ -58,8 +58,8 @@ from ..pyexecutor.sampler.ops.vanilla import (GREEDY_TEMPERATURE_THRESHOLD,
 from ..pyexecutor.sampler.sampler_common import request_random_seed
 from ..pyexecutor.sampler.watermark import WatermarkSpecState
 from .block_verification import block_verify, counter_uniforms
-from .fast_rejection_sampling import (fast_rs_draft_block, fast_rs_enabled,
-                                      fast_rs_supported, fast_rs_verify)
+from .fast_rejection_sampling import (fast_rs_draft_block, fast_rs_supported,
+                                      fast_rs_verify)
 from .fused_accept import (MAX_DRAFT_LEN, fused_strict_accept,
                            sample_and_strict_accept)
 from .greedy_argmax import greedy_argmax
@@ -1796,7 +1796,7 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling or self.enable_penalty
                 or self.watermark_ready) and self.batch_slot_ids is not None:
-            if fast_rs_enabled() and self.draft_probs is not None:
+            if self.draft_probs is not None:
                 # The fused kernels index draft_probs by these ids without a
                 # device-side bound check (the reference's advanced indexing
                 # has one), so check the host list before it is copied.
@@ -3366,21 +3366,19 @@ class SpecWorkerBase(nn.Module, ABC):
                          site: str = "verify") -> bool:
         """Whether the fused rejection-sampling kernels cover this step.
 
-        ``TLLM_SPEC_FAST_RS=1`` opts in. The kernels implement temperature-only
-        sampling, so the deploy-time ``advanced_sampling_mode`` must disable both
-        filters (``no_topk_no_topp``; the reference path ignores per-request
-        top-k / top-p in that mode too). They also need a shared draft/target
-        vocabulary, full-vocab fp32 logits, no synthetic acceptance override,
-        no guided decoding (not validated with the fused path) and no text
-        watermark (the reference verify redraws the emitted token under the
-        watermark key and commits the watermark state; the kernels do not).
-        Host-side checks only, so the decision is CUDA-graph safe. With the flag off
-        nothing else is read, so the reference dispatch is unchanged. The first
-        decision of each call site (``site``) is logged once per worker, so a
-        run's log shows which path the opt-in took.
+        The kernels run whenever the step fits them. They implement
+        temperature-only sampling, so the deploy-time ``advanced_sampling_mode``
+        must disable both filters (``no_topk_no_topp``; the reference path
+        ignores per-request top-k / top-p in that mode too). They also need a
+        shared draft/target vocabulary, full-vocab fp32 logits, no synthetic
+        acceptance override, no guided decoding (not validated with the fused
+        path) and no text watermark (the reference verify redraws the emitted
+        token under the watermark key and commits the watermark state; the
+        kernels do not). Other steps take the reference path. Host-side checks
+        only, so the decision is CUDA-graph safe. The first decision of each
+        call site (``site``) is logged once per worker, so a run's log shows
+        which path it took.
         """
-        if not fast_rs_enabled():
-            return False
         mode = spec_metadata.advanced_sampling_mode
         applies = (mode.skips_top_k and mode.skips_top_p and self._d2t is None
                    and self.guided_decoder is None
@@ -3395,13 +3393,12 @@ class SpecWorkerBase(nn.Module, ABC):
         if site not in reported:
             reported.add(site)
             if applies:
-                logger.info("TLLM_SPEC_FAST_RS=1: fused rejection sampling "
-                            f"active ({site}).")
+                logger.info(f"Fused rejection sampling active ({site}).")
             else:
-                logger.warning(
-                    "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
-                    f"not cover this step ({site}; it needs advanced_sampling_"
-                    "mode=no_topk_no_topp, a shared draft/target vocabulary, "
+                logger.info(
+                    "Fused rejection sampling does not cover this step "
+                    f"({site}; it needs advanced_sampling_mode="
+                    "no_topk_no_topp, a shared draft/target vocabulary, "
                     "full-vocab fp32 logits, no guided decoding and no "
                     "watermark; mode="
                     f"{mode.name}); using the reference path.")
