@@ -158,22 +158,31 @@ def _image_part(block: Any) -> Dict[str, Any]:
     raise AnthropicRequestError(f"image block with source type {source.type!r} has no url or data")
 
 
-def _tool_result_text(content: Any) -> str:
-    """Flatten a tool_result content payload into plain text."""
+def _tool_result_content(content: Any) -> Union[str, List[Dict[str, Any]]]:
+    """A tool_result payload as chat message content.
+
+    Text-only content is joined into plain text. An image stays an image part,
+    in place, and the chat parser decides what the model is given: the image,
+    or a note where the model has no image input.
+    """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
-    parts = []
+    parts: List[Dict[str, Any]] = []
     for block in content:
         block_type = block.type
         if block_type == "text":
-            parts.append(block.text)
+            parts.append({"type": "text", "text": block.text})
+        elif block_type == "image":
+            parts.append(_image_part(block))
         else:
             raise AnthropicRequestError(
                 f"Content block type {block_type!r} inside tool_result is not supported"
             )
-    return "\n".join(parts)
+    if any(part["type"] != "text" for part in parts):
+        return parts
+    return "\n".join(part["text"] for part in parts)
 
 
 def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]:
@@ -240,14 +249,20 @@ def _convert_messages(request: AnthropicMessagesRequest) -> List[Dict[str, Any]]
                 )
             elif block_type == "tool_result":
                 flush_parts()
-                tool_result_text = _tool_result_text(block.content)
+                tool_result = _tool_result_content(block.content)
                 if block.is_error:
-                    tool_result_text = f"Tool execution failed: {tool_result_text}"
+                    if isinstance(tool_result, str):
+                        tool_result = f"Tool execution failed: {tool_result}"
+                    else:
+                        tool_result = [
+                            {"type": "text", "text": "Tool execution failed:"},
+                            *tool_result,
+                        ]
                 converted.append(
                     {
                         "role": "tool",
                         "tool_call_id": block.tool_use_id,
-                        "content": tool_result_text,
+                        "content": tool_result,
                     }
                 )
             elif block_type == "thinking":
