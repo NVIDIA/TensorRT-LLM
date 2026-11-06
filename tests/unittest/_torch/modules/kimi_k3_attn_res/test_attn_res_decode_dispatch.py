@@ -262,6 +262,28 @@ def test_decoder_layers_with_deferred_moe_residual(m: int):
     assert torch.equal(deferred, materialized)
 
 
+@pytest.mark.parametrize("m", [7, 32])
+@torch.no_grad()
+def test_output_mix_folds_last_moe_residual(m: int):
+    """The model's output mix folds the last MoE layer's deferred residual update in: the same
+    prefix and normed output, bit for bit, as materializing it and running the mix; with no
+    snapshot the update is materialized and the mix left to the caller."""
+    layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    bank = _rows(8, m, HIDDEN)
+    h, snaps = _rows(m, HIDDEN), 3
+    for layer in layers:
+        h, snaps = layer(h, bank, snaps, _GENERATION, defer_moe_residual=True)
+    assert isinstance(h, mkl._DeferredMoEResidual)
+    proj, norm, out_norm = _modules(30)
+    prefix, output = mkl._fold_moe_residual(h, bank[:snaps], proj, norm, out_norm)
+    materialized = h.materialize()
+    ref = mkl._apply_attn_res_and_rmsnorm(materialized, bank[:snaps], proj, norm, out_norm)
+    assert torch.equal(prefix, materialized)
+    assert torch.equal(output, ref)
+    prefix, output = mkl._fold_moe_residual(h, bank[:0], proj, norm, out_norm)
+    assert output is None and torch.equal(prefix, materialized)
+
+
 class _FakeKdaMixer:
     """Stands in for the KDA mixer: records the MXFP8 hand-off it is given for each call."""
 

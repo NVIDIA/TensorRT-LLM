@@ -695,9 +695,34 @@ class _DeferredMoEResidual(NamedTuple):
 
 
 def _defers_moe_residual(prefix_sum: torch.Tensor, num_candidates: int) -> bool:
-    """Whether a MoE layer leaves its residual update to the next layer's pre-attention mix over
-    ``num_candidates``: where the decode kernel serves that mix and folds the update in."""
+    """Whether a MoE layer leaves its residual update to the next layer's pre-attention mix (or
+    the model's output mix) over ``num_candidates``: where the decode kernel serves that mix and
+    folds the update in."""
     return _attn_res_kernel(prefix_sum, num_candidates) is _AttnResKernel.DECODE
+
+
+def _fold_moe_residual(
+    deferred: _DeferredMoEResidual,
+    block_residual: torch.Tensor,
+    proj: nn.Linear,
+    norm: KimiK3RMSNorm,
+    output_norm: nn.Module,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """``(prefix_sum, normed mix)``: the deferred MoE residual update folded into the mix over
+    ``block_residual`` where the decode kernel serves it, else ``(materialized update, None)``
+    and the caller runs the mix."""
+    if block_residual.shape[0] > 0:
+        folded = _attn_res_decode_kernel(
+            deferred.residual,
+            (deferred.routed, deferred.shared),
+            block_residual,
+            proj,
+            norm,
+            output_norm,
+        )
+        if folded is not None:
+            return folded[0], folded[1]
+    return deferred.materialize(), None
 
 
 class _AttnResVariant(NamedTuple):
@@ -3789,11 +3814,11 @@ class KimiLinearDecoderLayer(nn.Module):
         number of valid bank rows.
 
         With ``defer_moe_residual`` (the caller passes the result on to the next
-        decoder layer), a MoE layer may return its residual update unapplied, as a
-        ``_DeferredMoEResidual``: where the next layer's decode mix folds it in
-        (``_defers_moe_residual``). ``hidden_states`` is accordingly a tensor or
-        the ``_DeferredMoEResidual`` of the previous layer; without the flag the
-        result is always a tensor.
+        decoder layer, or the last layer's to the model's output mix), a MoE layer may
+        return its residual update unapplied, as a ``_DeferredMoEResidual``: where the
+        next decode mix folds it in (``_defers_moe_residual``). ``hidden_states`` is
+        accordingly a tensor or the ``_DeferredMoEResidual`` of the previous layer;
+        without the flag the result is always a tensor.
 
         ``capture`` is ``(spec_metadata, layer_id)`` and taps the DSpark aux
         stream for the layer BEFORE this one: the aggregated stream for layer j
@@ -4195,6 +4220,11 @@ class KimiLinearModel(DecoderModel):
             if spec_metadata is not None
             else None
         )
+        last_captured = (
+            spec_metadata is not None
+            and len(self.layers) > 0
+            and (capture_set is None or self.layers[-1].layer_idx in capture_set)
+        )
         for i, layer in enumerate(self.layers):
             # DFlash/DSpark hidden-state capture. The drafter is distilled on
             # the aggregated stream value -- the pre-norm softmax mixture its
@@ -4227,7 +4257,9 @@ class KimiLinearModel(DecoderModel):
                 attn_metadata,
                 capture=capture,
                 helix_a2a=self.helix_a2a,
-                defer_moe_residual=i + 1 < len(self.layers),
+                # The last layer's goes to the output mix, which folds it in (not where that
+                # layer's pre-norm mixture is captured below).
+                defer_moe_residual=i + 1 < len(self.layers) or not last_captured,
                 # The bank scatter above is the last kernel before this layer's first mix.
                 fresh_block_residual=i == self.helix_a2a_first_layer,
             )
@@ -4235,6 +4267,16 @@ class KimiLinearModel(DecoderModel):
             # Joined by the first MLA layer; a no-op unless no layer read it.
             fp4_mla_state.join_generation_metadata()
         sliced = self.helix_a2a is not None
+        output = None
+        if isinstance(hidden_states, _DeferredMoEResidual):
+            # The last MoE layer's residual update, folded into the output mix.
+            hidden_states, output = _fold_moe_residual(
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
 
         # The last layer has no successor, so this one recompute is
         # unavoidable -- output-side score weights, matching SGLang's
@@ -4258,13 +4300,15 @@ class KimiLinearModel(DecoderModel):
                     tail = self.helix_a2a.all_gather(tail, num_tokens)
                 spec_metadata.maybe_capture_hidden_states(last.layer_idx, tail, None)
 
-        hidden_states = _apply_attn_res_and_rmsnorm(
-            hidden_states,
-            block_residual[:num_snapshots],
-            self.output_attn_res_proj,
-            self.output_attn_res_norm,
-            self.norm,
-        )
+        if output is None:
+            output = _apply_attn_res_and_rmsnorm(
+                hidden_states,
+                block_residual[:num_snapshots],
+                self.output_attn_res_proj,
+                self.output_attn_res_norm,
+                self.norm,
+            )
+        hidden_states = output
         if sliced:
             hidden_states = self.helix_a2a.all_gather(hidden_states, num_tokens)
         return hidden_states
