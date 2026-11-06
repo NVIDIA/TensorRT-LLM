@@ -19,11 +19,12 @@
 
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
 
 #include <cstdint>
 #include <cuda_runtime.h>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace kernels::glm_rubin_mtp
 {
@@ -60,4 +61,4 @@ void oneshotAllGatherOp(AllGatherParams const& params);
 
 } // namespace kernels::glm_rubin_mtp
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END

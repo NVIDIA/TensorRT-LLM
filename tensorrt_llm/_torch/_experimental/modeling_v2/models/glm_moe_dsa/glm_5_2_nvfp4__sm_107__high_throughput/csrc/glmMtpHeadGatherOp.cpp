@@ -15,8 +15,10 @@
  * limitations under the License.
  */
 
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmMtpHeadGather.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
-#include "tensorrt_llm/kernels/glmMoeDsaRubin/highThroughput/glmMtpHeadGather.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -26,7 +28,7 @@
 #include <cstdint>
 #include <vector>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -70,7 +72,7 @@ at::Tensor rubinMtpHeadGather(
         return out;
     }
 
-    tensorrt_llm::kernels::glm_rubin_mtp::AllGatherParams params;
+    TRTLLM_MV2_NS::kernels::glm_rubin_mtp::AllGatherParams params;
     params.nRanks = static_cast<int>(group_size);
     params.rank = static_cast<int>(mcastMem->getRank());
     params.dType = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
@@ -83,22 +85,22 @@ at::Tensor rubinMtpHeadGather(
     params.multicastPtr = mcastMem->getMulticastPtr();
     params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
     params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
-    tensorrt_llm::kernels::glm_rubin_mtp::oneshotAllGatherOp(params);
+    TRTLLM_MV2_NS::kernels::glm_rubin_mtp::oneshotAllGatherOp(params);
     return out;
 }
 
 } // namespace torch_ext
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "glm_rubin_mtp_head_gather(Tensor input, Tensor(a!) comm_buffer, Tensor(b!) buffer_flags, int group_size, "
         "bool float_output=False) -> Tensor");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("glm_rubin_mtp_head_gather", &tensorrt_llm::torch_ext::rubinMtpHeadGather);
+    m.impl("glm_rubin_mtp_head_gather", &TRTLLM_MV2_NS::torch_ext::rubinMtpHeadGather);
 }

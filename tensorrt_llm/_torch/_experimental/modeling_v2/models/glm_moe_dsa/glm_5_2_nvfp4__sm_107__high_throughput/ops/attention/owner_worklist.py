@@ -16,6 +16,8 @@ import torch
 
 import tensorrt_llm.bindings
 
+from ... import native_ops
+
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import (
         DSAtrtllmAttentionMetadata,
@@ -358,7 +360,7 @@ class Nvfp4OwnerWorklist:
             if not reuse:
                 # A group leader decodes the owner lists of the layers that reuse its top-k.
                 member_indices = batched if key is not None else indices.unsqueeze(0)
-                torch.ops.trtllm.glm_rubin_nvfp4_mla_gather_worklist_pipelined(
+                native_ops.glm_rubin_nvfp4_mla_gather_worklist_pipelined(
                     metadata.host_kv_cache_pool_pointers,
                     metadata.host_kv_cache_pool_mapping,
                     member_indices,
@@ -376,7 +378,7 @@ class Nvfp4OwnerWorklist:
                 )
                 self.last_dispatch = "leader" if key is not None else "per_layer"
             else:
-                torch.ops.trtllm.glm_rubin_nvfp4_mla_gather_worklist_member(
+                native_ops.glm_rubin_nvfp4_mla_gather_worklist_member(
                     metadata.host_kv_cache_pool_pointers,
                     metadata.host_kv_cache_pool_mapping,
                     self.members[slot],

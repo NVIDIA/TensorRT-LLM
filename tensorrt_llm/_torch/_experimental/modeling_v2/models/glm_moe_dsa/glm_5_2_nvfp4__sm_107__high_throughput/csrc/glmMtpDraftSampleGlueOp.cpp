@@ -15,8 +15,10 @@
  * limitations under the License.
  */
 
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__high_throughput/csrc/glmMtpDraftSampleGlue.h"
 #include "tensorrt_llm/common/mcastDevMemUtils.h"
-#include "tensorrt_llm/kernels/glmMoeDsaRubin/highThroughput/glmMtpDraftSampleGlue.h"
+#include "tensorrt_llm/modeling_v2/common/namespace.h"
+#include "tensorrt_llm/modeling_v2/common/torchLibrary.h"
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
@@ -25,7 +27,7 @@
 #include <cstdint>
 #include <optional>
 
-TRTLLM_NAMESPACE_BEGIN
+TRTLLM_MV2_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -33,7 +35,7 @@ namespace torch_ext
 namespace
 {
 
-namespace sd = tensorrt_llm::kernels::glm_rubin_mtp;
+namespace sd = TRTLLM_MV2_NS::kernels::glm_rubin_mtp;
 
 bool isAligned16(at::Tensor const& t)
 {
@@ -243,9 +245,9 @@ void rubinMtpDraftSampleGlueAdp(at::Tensor const& logits, at::Tensor& exchange_b
 
 } // namespace torch_ext
 
-TRTLLM_NAMESPACE_END
+TRTLLM_MV2_NAMESPACE_END
 
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
+TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
     m.def(
         "glm_rubin_mtp_sample_glue_adp(Tensor logits, Tensor(a!) exchange_buffer, Tensor(b!) exchange_flags, int "
@@ -257,7 +259,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? accepted_tokens, Tensor? batch_indices, Tensor? num_accepted, Tensor(h!)? next_new_tokens) -> ()");
 }
 
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
 {
-    m.impl("glm_rubin_mtp_sample_glue_adp", &tensorrt_llm::torch_ext::rubinMtpDraftSampleGlueAdp);
+    m.impl("glm_rubin_mtp_sample_glue_adp", &TRTLLM_MV2_NS::torch_ext::rubinMtpDraftSampleGlueAdp);
 }

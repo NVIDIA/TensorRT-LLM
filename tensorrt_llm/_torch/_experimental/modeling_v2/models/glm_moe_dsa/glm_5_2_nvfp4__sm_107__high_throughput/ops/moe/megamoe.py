@@ -27,6 +27,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode
 
+from ... import native_ops
 from .megamoe_runner import (
     get_rubin_runner,
     query_rubin_kernel_properties,
@@ -257,7 +258,7 @@ class RubinMegaMoE(MegaMoECuteDsl):
         ):
             return None
         n = stage.num_tokens
-        torch.ops.trtllm.glm_rubin_noaux_tc_fp4_quantize_out(
+        native_ops.glm_rubin_noaux_tc_fp4_quantize_out(
             router_logits,
             bias,
             x,
@@ -503,21 +504,3 @@ def create_rubin_moe(**kwargs):
     moe = ConfigurableMoE(moe_cls=RubinMegaMoE, **kwargs)
     moe.scheduler = RubinFusedCommScheduler(moe)
     return moe
-
-
-@torch.library.register_fake("trtllm::glm_rubin_noaux_tc_fp4_quantize_out")
-def _fake_route_quant(
-    scores,
-    bias,
-    hidden_states,
-    global_scale,
-    n_group,
-    topk_group,
-    topk,
-    routed_scaling_factor,
-    topk_values,
-    topk_indices,
-    fp4_out,
-    sf_out,
-):
-    return None

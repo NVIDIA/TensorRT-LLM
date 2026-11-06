@@ -8,20 +8,6 @@ from typing import Optional, Tuple
 import torch
 
 from tensorrt_llm._torch.attention.backends.interface import MLAParams, PositionalEmbeddingParams
-from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
-    _INDEXER_MQA_LOGITS_ELEM_BUDGET,
-    F,
-    Fp4QuantizedTensor,
-    Indexer,
-    _prefill_q_split_threshold,
-    _split_prefill_queries,
-    _tf32_matmul_enabled,
-    _to_float,
-    allgather,
-    do_multi_stream,
-    get_sm_version,
-    maybe_execute_in_parallel,
-)
 from tensorrt_llm._torch.attention.backends.sparse.dsa.metadata import DSAtrtllmAttentionMetadata
 from tensorrt_llm._torch.attention.backends.sparse.dsa.params import DSAParams
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -31,12 +17,26 @@ from tensorrt_llm._torch.pyexecutor.breakable_cuda_graph import is_in_breakable_
 from tensorrt_llm._torch.utils import is_piecewise_running, is_torch_compiling
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
+from ..._indexer import (
+    _INDEXER_MQA_LOGITS_ELEM_BUDGET,
+    F,
+    Fp4QuantizedTensor,
+    Glm52Indexer,
+    _prefill_q_split_threshold,
+    _split_prefill_queries,
+    _tf32_matmul_enabled,
+    _to_float,
+    allgather,
+    do_multi_stream,
+    get_sm_version,
+    maybe_execute_in_parallel,
+)
 from ...kernels.attention import indexer_prologue
 from .full_query_policy import fp8_full_query_weight_cache_limit
 from .topk import RubinTopK
 
 
-class RubinIndexer(Indexer):
+class RubinIndexer(Glm52Indexer):
     def __init__(
         self,
         quant_config: Optional[QuantConfig],
@@ -747,7 +747,10 @@ class RubinIndexer(Indexer):
                 # which uses its own handle and always falls back to CUDA-core SGEMM.
                 fused_out = F.linear(_to_float(hidden_states_bf), self._fused_wk_wp_weight)
         indexer_k, weights = fused_out.split([self.head_dim, self.n_heads], dim=-1)
-        if q_in is None and type(self)._qk_projection_and_rope is Indexer._qk_projection_and_rope:
+        if (
+            q_in is None
+            and type(self)._qk_projection_and_rope is Glm52Indexer._qk_projection_and_rope
+        ):
             q_in = self.wq_b(qr)
         if self._fused_prologue_eligible(q_in, indexer_k, weights, hidden_states_bf.dtype):
             outputs = self._prologue_fused(indexer_k, weights, q_in, position_ids, k_cache_metadata)
@@ -813,8 +816,8 @@ class RubinIndexer(Indexer):
             or self.use_fp4
             or self.head_dim != 128
             or q_in is None
-            or type(self)._qk_projection_and_rope is not Indexer._qk_projection_and_rope
-            or type(self)._prep_q_or_k is not Indexer._prep_q_or_k
+            or type(self)._qk_projection_and_rope is not Glm52Indexer._qk_projection_and_rope
+            or type(self)._prep_q_or_k is not Glm52Indexer._prep_q_or_k
         ):
             return False
         cos_sin = getattr(self.rotary_emb, "rotary_cos_sin", None)
