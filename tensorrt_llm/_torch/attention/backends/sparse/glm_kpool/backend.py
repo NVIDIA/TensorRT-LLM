@@ -46,15 +46,22 @@ from ...interface import (
 from ...trtllm import TrtllmAttention, TrtllmAttentionMetadata
 from .kernels import (
     append_paged_state_rows,
+    draft_step_rows,
     gather_fp8_kv_rows,
     kpool_expand,
     kpool_score,
     kpool_score_fp8,
     kpool_update,
+    verify_selection_rows,
 )
 from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
-from .params import INDEX_SENTINEL, GlmKpoolBackendForwardArgs, GlmKpoolSparseParams
+from .params import (
+    INDEX_SENTINEL,
+    GlmKpoolBackendForwardArgs,
+    GlmKpoolDraftRows,
+    GlmKpoolSparseParams,
+)
 
 try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
@@ -602,6 +609,91 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             tail_extra=tail_extra,
         )
 
+    def prepare_draft_step(
+        self,
+        latent: torch.Tensor,
+        packed: torch.Tensor,
+        ape: torch.Tensor,
+        selected: torch.Tensor,
+        query: torch.Tensor,
+        metadata,
+        *,
+        tail_extra: int,
+        advance_kv_lens: bool = False,
+    ) -> GlmKpoolDraftRows:
+        """A single-token draft step's cache update and attention inputs in one launch.
+
+        Generation rows only (one per request at its live length): equals
+        :meth:`append_paged_state` of ``latent`` / ``packed`` ``[N, dim]`` at
+        ``kv_lens - 1``, :meth:`update_pool_keys` there, and :meth:`expand_selection`
+        of ``selected`` with ``tail_extra``, already packed for the native decode
+        together with the FP8 query (``query`` ``[N, heads, kv_lora_rank]``).
+        ``advance_kv_lens``: finally add one to the rows' live lengths (the next draft step's).
+        """
+        state = self._cache_state(metadata)
+        tables, gen_lens = self._rows(state)
+        _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
+        rows, lengths, nonempty, query_fp8 = draft_step_rows(
+            latent,
+            packed,
+            gen_lens,
+            tables,
+            state.latent_pool,
+            state.index_pool,
+            state.tokens_per_block,
+            self.kv_scale_orig_quant,
+            ape,
+            selected,
+            query,
+            head_dim=self.sparse_params.index_head_dim,
+            kpool=self.sparse_params.index_kpool,
+            base_row=base_row,
+            rows_per_slot=rows_per_slot,
+            out_width=self.sparse_params.kernel_output_width,
+            tail_extra=tail_extra,
+            advance=advance_kv_lens,
+        )
+        return GlmKpoolDraftRows(rows=rows, lengths=lengths, nonempty=nonempty, query_fp8=query_fp8)
+
+    def prepare_verify_step(
+        self,
+        selected: torch.Tensor,
+        query: torch.Tensor,
+        metadata,
+        *,
+        kv_lens: torch.Tensor,
+        request_ids: torch.Tensor,
+        keep_rows: torch.Tensor | None = None,
+        keep_out: torch.Tensor | None = None,
+        first_table: int = 0,
+    ) -> GlmKpoolDraftRows:
+        """Verification rows' attention inputs in one launch: :meth:`expand_selection` of
+        ``selected`` with per-row ``kv_lens`` and ``request_ids``, already packed for the native
+        decode together with the FP8 query (``query`` ``[N, heads, kv_lora_rank]``). With
+        ``keep_rows`` (each request's drafting row; requests counted from block-table row
+        ``first_table``) also ``keep_out[:R] = selected[keep_rows]``.
+        """
+        state = self._cache_state(metadata)
+        tables, _ = self._rows(state, request_ids=request_ids)
+        _, base_row, rows_per_slot = latent_pool_rows(state.latent_pool)
+        rows, lengths, nonempty, query_fp8 = verify_selection_rows(
+            selected,
+            kv_lens,
+            request_ids,
+            tables,
+            state.latent_pool.dtype,
+            state.tokens_per_block,
+            query,
+            kpool=self.sparse_params.index_kpool,
+            base_row=base_row,
+            rows_per_slot=rows_per_slot,
+            out_width=self.sparse_params.kernel_output_width,
+            keep_rows=keep_rows,
+            keep_out=keep_out,
+            first_table=first_table,
+        )
+        return GlmKpoolDraftRows(rows=rows, lengths=lengths, nonempty=nonempty, query_fp8=query_fp8)
+
     # -- sparse core ----------------------------------------------------------
 
     def create_output(
@@ -734,7 +826,8 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             "glm_kpool requires GlmKpoolBackendForwardArgs"
         )
         topk_rows = sparse_args.topk_rows
-        if topk_rows is None:
+        draft_rows = sparse_args.draft_rows
+        if topk_rows is None and draft_rows is None:
             raise ValueError(
                 "glm_kpool requires pool-expanded selection in sparse_backend_args.topk_rows"
             )
@@ -822,7 +915,13 @@ class GlmKpoolSparseAttention(TrtllmAttention):
                 metadata,
                 kv_scale=self.kv_scale_quant_orig if native_fp8 else 1.0,
                 bmm1_scale=self._native_bmm1_scale if native_fp8 else None,
+                packed_rows=None
+                if draft_rows is None
+                else (draft_rows.rows, draft_rows.lengths, draft_rows.nonempty),
+                query_fp8=None if draft_rows is None else draft_rows.query_fp8,
             )
+        elif draft_rows is not None:
+            raise ValueError("glm_kpool draft_rows need the native decode path")
         else:
             out = self._dispatch_sparse_core(q, kv_rows, topk_rows)
         return self._finalize_output(out, output)

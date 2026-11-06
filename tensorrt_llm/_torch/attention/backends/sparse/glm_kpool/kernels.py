@@ -760,3 +760,448 @@ def compact_sparse_rows(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
         triton.next_power_of_2(width),
     )
     return packed, lengths, nonempty
+
+
+@triton.jit
+def _expand_packed_row(
+    sel,
+    kv_len,
+    bt,
+    tpb,
+    base_row,
+    rows_per_slot,
+    tail_extra,
+    rows_out,
+    length_out,
+    nonempty_out,
+    SELECT_K: tl.constexpr,
+    KPOOL: tl.constexpr,
+    TAIL_P2: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    PAD_BLOCK: tl.constexpr,
+):
+    """One row of ``kpool_expand`` (block table row ``bt``) followed by ``compact_sparse_rows``: the
+    selected complete pools' members, valid pools first in selection order, then the tail; -1 past
+    the length; an empty row keeps one dummy id 0 (discarded through the nonempty flag)."""
+    num_cand = kv_len // KPOOL
+    i = tl.arange(0, SELECT_K)
+    j = tl.load(sel + i).to(tl.int64)
+    valid = (j >= 0) & (j < num_cand)
+    rank = tl.cumsum(valid.to(tl.int32), axis=0) - valid.to(tl.int32)
+    num_valid = tl.sum(valid.to(tl.int32), axis=0)
+    m = tl.arange(0, TAIL_P2)
+    mmask = m < KPOOL
+    spos = j[:, None] * KPOOL + m[None, :]
+    spage = spos // tpb
+    soff = spos - spage * tpb
+    ok = valid[:, None] & mmask[None, :]
+    sslot = tl.load(bt + spage, mask=ok, other=0).to(tl.int64)
+    rows = base_row + sslot * rows_per_slot + soff
+    tl.store(rows_out + rank[:, None] * KPOOL + m[None, :], rows.to(tl.int32), mask=ok)
+    # The tail: the incomplete trailing pool and the last tail_extra positions.
+    tail_start = (tl.maximum(kv_len - tail_extra, 0) // KPOOL) * KPOOL
+    tail_count = kv_len - tail_start
+    t = tl.arange(0, TAIL_P2)
+    tpos = tail_start + t
+    tvalid = t < tail_count
+    tpage = tpos // tpb
+    toff = tpos - tpage * tpb
+    tslot = tl.load(bt + tpage, mask=tvalid, other=0).to(tl.int64)
+    trows = base_row + tslot * rows_per_slot + toff
+    length = num_valid * KPOOL + tail_count.to(tl.int32)
+    tl.store(rows_out + num_valid * KPOOL + t, trows.to(tl.int32), mask=tvalid)
+    first_pad = tl.maximum(length, 1)
+    for p0 in range(0, OUT_WIDTH, PAD_BLOCK):
+        p = p0 + tl.arange(0, PAD_BLOCK)
+        tl.store(
+            rows_out + p,
+            tl.full([PAD_BLOCK], -1, tl.int32),
+            mask=(p >= first_pad) & (p < OUT_WIDTH),
+        )
+    if length == 0:
+        tl.store(rows_out, 0)
+    tl.store(length_out, first_pad)
+    tl.store(nonempty_out, length > 0)
+
+
+@triton.jit
+def _saturate_row(src, dst, ELEMS: tl.constexpr, BLOCK: tl.constexpr):
+    """``dst[:ELEMS] = clamp(src, -448, 448)`` in the E4M3 destination dtype (round to nearest even)."""
+    for q0 in range(0, ELEMS, BLOCK):
+        qi = q0 + tl.arange(0, BLOCK)
+        qv = tl.load(src + qi).to(tl.float32)
+        tl.store(dst + qi, tl.clamp(qv, -448.0, 448.0).to(dst.dtype.element_ty))
+
+
+@triton.jit
+def _draft_step_rows_kernel(
+    LATENT,
+    PACKED,
+    KV_LENS,
+    BT,
+    LATENT_POOL,
+    INDEX_POOL,
+    SCALE,
+    APE,
+    SEL,
+    Q,
+    Q_OUT,
+    ROWS_OUT,
+    LENGTHS,
+    NONEMPTY,
+    latent_stride,
+    packed_stride,
+    bt_stride,
+    latent_slot_stride,
+    latent_row_stride,
+    index_slot_stride,
+    index_row_stride,
+    sel_stride,
+    q_stride,
+    q_out_stride,
+    tpb,
+    base_row,
+    rows_per_slot,
+    tail_extra,
+    LATENT_DIM: tl.constexpr,
+    PACKED_DIM: tl.constexpr,
+    FP8: tl.constexpr,
+    HD: tl.constexpr,
+    KPOOL: tl.constexpr,
+    SELECT_K: tl.constexpr,
+    TAIL_P2: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    PAD_BLOCK: tl.constexpr,
+    QUANT_Q: tl.constexpr,
+    Q_ELEMS: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
+    ADVANCE: tl.constexpr,
+):
+    """One single-token draft row ``r`` (block table ``r``) at position ``KV_LENS[r] - 1``.
+
+    In order: write its latent and packed state (``_append_paged_state_kernel``), refresh
+    the key of the pool holding it (``_kpool_update_kernel``), expand the shared selection
+    ``SEL[r]`` with ``tail_extra`` (``_kpool_expand_kernel``) straight into the packed
+    layout of ``_compact_sparse_rows_kernel`` (valid row ids first, in order; length;
+    nonempty flag), with ``QUANT_Q`` saturate-convert the query row to E4M3, and with
+    ``ADVANCE`` finally store ``KV_LENS[r] + 1`` (the next draft step's length).
+    """
+    r = tl.program_id(0)
+    tbl = r.to(tl.int64)
+    kv_len = tl.load(KV_LENS + r).to(tl.int64)
+    pos = kv_len - 1
+
+    # Append the row's latent and packed state.
+    page = pos // tpb
+    off = pos - page * tpb
+    slot = tl.load(BT + tbl * bt_stride + page).to(tl.int64)
+    ld = tl.arange(0, LATENT_DIM)
+    latent = tl.load(LATENT + r * latent_stride + ld)
+    latent_dst = LATENT_POOL + slot * latent_slot_stride + off * latent_row_stride + ld
+    if FP8:
+        scaled = latent.to(tl.float32) * tl.load(SCALE)
+        tl.store(latent_dst, tl.clamp(scaled, -448.0, 448.0).to(LATENT_POOL.dtype.element_ty))
+    else:
+        tl.store(latent_dst, latent.to(LATENT_POOL.dtype.element_ty))
+    pd = tl.arange(0, PACKED_DIM)
+    packed = tl.load(PACKED + r * packed_stride + pd)
+    tl.store(
+        INDEX_POOL + slot * index_slot_stride + off * index_row_stride + pd,
+        packed.to(INDEX_POOL.dtype.element_ty),
+    )
+    # The pool-key refresh below reads the state just written by other threads of this program.
+    tl.debug_barrier()
+
+    # Refresh the key of the pool holding pos; members past pos are masked.
+    start = (pos // KPOOL) * KPOOL
+    mk = tl.arange(0, KPOOL)
+    d = tl.arange(0, HD)
+    mem_pos = start + mk
+    visible = mem_pos <= pos
+    mpage = mem_pos // tpb
+    moff = mem_pos - mpage * tpb
+    mslot = tl.load(BT + tbl * bt_stride + mpage, mask=visible, other=0).to(tl.int64)
+    row = INDEX_POOL + mslot * index_slot_stride + moff * index_row_stride
+    k = tl.load(row[:, None] + d[None, :], mask=visible[:, None], other=0.0).to(tl.float32)
+    g = tl.load(row[:, None] + HD + d[None, :], mask=visible[:, None], other=0.0).to(tl.float32)
+    ape = tl.load(APE + mk[:, None] * HD + d[None, :]).to(tl.float32)
+    logits = tl.where(visible[:, None], g + ape, float("-inf"))
+    mx = tl.max(logits, axis=0)
+    e = tl.exp(logits - mx[None, :])
+    probs = e / tl.sum(e, axis=0)[None, :]
+    probs = probs.to(tl.bfloat16).to(tl.float32)
+    prod = (probs * k).to(tl.bfloat16).to(tl.float32)
+    pool_key = tl.sum(prod, axis=0)
+    page0 = start // tpb
+    off0 = start - page0 * tpb
+    slot0 = tl.load(BT + tbl * bt_stride + page0).to(tl.int64)
+    tl.store(
+        INDEX_POOL + slot0 * index_slot_stride + off0 * index_row_stride + 2 * HD + d,
+        pool_key.to(tl.bfloat16),
+    )
+
+    _expand_packed_row(
+        SEL + r * sel_stride, kv_len, BT + tbl * bt_stride, tpb, base_row, rows_per_slot, tail_extra,
+        ROWS_OUT + r * OUT_WIDTH, LENGTHS + r, NONEMPTY + r,
+        SELECT_K, KPOOL, TAIL_P2, OUT_WIDTH, PAD_BLOCK,
+    )  # fmt: skip
+    if QUANT_Q:
+        _saturate_row(Q + r * q_stride, Q_OUT + r * q_out_stride, Q_ELEMS, Q_BLOCK)
+    if ADVANCE:
+        tl.store(KV_LENS + r, (kv_len + 1).to(KV_LENS.dtype.element_ty))
+
+
+def draft_step_rows(
+    latent: torch.Tensor,
+    packed: torch.Tensor,
+    kv_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    latent_pool: torch.Tensor,
+    index_pool: torch.Tensor,
+    tokens_per_block: int,
+    scale: torch.Tensor | None,
+    ape: torch.Tensor,
+    selected: torch.Tensor,
+    query: torch.Tensor | None,
+    *,
+    head_dim: int,
+    kpool: int,
+    base_row: int,
+    rows_per_slot: int,
+    out_width: int,
+    tail_extra: int,
+    advance: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """A single-token draft step's cache update and attention rows in one launch.
+
+    Row ``r`` (block table ``r``) is at position ``kv_lens[r] - 1``. Equals, in order,
+    :func:`append_paged_state_rows` of ``latent`` / ``packed`` ``[N, dim]``, :func:`kpool_update`,
+    :func:`kpool_expand` of ``selected`` ``[N, select_k]`` with ``tail_extra`` and
+    :func:`compact_sparse_rows` of the result, whose ``(packed rows, lengths, nonempty)`` this
+    returns, plus, when ``query`` ``[N, ...]`` is given and the latent pool is FP8, the query
+    saturated to E4M3 (else ``None``). ``out_width`` is the expanded width
+    (:attr:`GlmKpoolSparseParams.kernel_output_width`). ``advance``: finally add one to
+    ``kv_lens`` in place. CUDA-graph safe.
+    """
+    n, select_k = selected.shape
+    tail_width = kpool - 1 + tail_extra
+    if out_width < select_k * kpool + tail_width:
+        raise ValueError(
+            f"draft_step_rows: out_width {out_width} < {select_k * kpool + tail_width}"
+        )
+    for name, width in (("latent", latent.shape[-1]), ("packed", packed.shape[-1])):
+        if width <= 0 or width & (width - 1):
+            raise ValueError(f"draft_step_rows: {name} width {width} is not a power of two")
+    if select_k & (select_k - 1):
+        raise ValueError(f"draft_step_rows: select_k {select_k} is not a power of two")
+    width = triton.cdiv(out_width, 64) * 64
+    device = selected.device
+    rows = torch.empty((n, width), dtype=torch.int32, device=device)
+    lengths = torch.empty(n, dtype=torch.int32, device=device)
+    nonempty = torch.empty(n, dtype=torch.bool, device=device)
+    fp8 = latent_pool.dtype == torch.float8_e4m3fn
+    quant_q = fp8 and query is not None
+    q_out = None
+    q_flat = q_out_flat = latent
+    q_elems = 1024
+    if quant_q:
+        q_flat = query.reshape(n, -1)
+        q_elems = q_flat.shape[1]
+        if q_flat.stride(1) != 1 or q_elems % 1024:
+            raise ValueError("draft_step_rows: query rows must be contiguous multiples of 1024")
+        q_out = torch.empty(query.shape, dtype=latent_pool.dtype, device=device)
+        q_out_flat = q_out.view(n, -1)
+    if n == 0:
+        return rows, lengths, nonempty, q_out
+    _draft_step_rows_kernel[(n,)](
+        latent,
+        packed,
+        kv_lens,
+        block_tables,
+        latent_pool,
+        index_pool,
+        scale if fp8 else latent,
+        ape,
+        selected,
+        q_flat,
+        q_out_flat,
+        rows,
+        lengths,
+        nonempty,
+        latent.stride(0),
+        packed.stride(0),
+        block_tables.stride(0),
+        latent_pool.stride(0),
+        latent_pool.stride(1),
+        index_pool.stride(0),
+        index_pool.stride(1),
+        selected.stride(0),
+        q_flat.stride(0),
+        q_out_flat.stride(0),
+        tokens_per_block,
+        base_row,
+        rows_per_slot,
+        tail_extra,
+        LATENT_DIM=latent.shape[-1],
+        PACKED_DIM=packed.shape[-1],
+        FP8=fp8,
+        HD=head_dim,
+        KPOOL=kpool,
+        SELECT_K=select_k,
+        TAIL_P2=triton.next_power_of_2(max(tail_width + 1, kpool)),
+        OUT_WIDTH=width,
+        PAD_BLOCK=64,
+        QUANT_Q=quant_q,
+        Q_ELEMS=q_elems,
+        Q_BLOCK=1024,
+        ADVANCE=advance,
+        num_warps=4,
+    )
+    return rows, lengths, nonempty, q_out
+
+
+@triton.jit
+def _verify_selection_rows_kernel(
+    SEL,
+    VISIBLE,
+    REQ,
+    BT,
+    Q,
+    Q_OUT,
+    KEEP_ROWS,
+    KEEP_OUT,
+    ROWS_OUT,
+    LENGTHS,
+    NONEMPTY,
+    sel_stride,
+    bt_stride,
+    q_stride,
+    q_out_stride,
+    keep_stride,
+    first_table,
+    tpb,
+    base_row,
+    rows_per_slot,
+    SELECT_K: tl.constexpr,
+    KPOOL: tl.constexpr,
+    TAIL_P2: tl.constexpr,
+    OUT_WIDTH: tl.constexpr,
+    PAD_BLOCK: tl.constexpr,
+    QUANT_Q: tl.constexpr,
+    Q_ELEMS: tl.constexpr,
+    Q_BLOCK: tl.constexpr,
+    KEEP: tl.constexpr,
+):
+    """Verify row ``r`` (block table ``REQ[r]``, visible length ``VISIBLE[r]``): its selection expanded
+    and packed, its query saturated to E4M3, and, when it is its request's drafting row
+    (``KEEP_ROWS[REQ[r] - first_table] == r``), its selection copied to that request's ``KEEP_OUT`` row."""
+    r = tl.program_id(0)
+    tbl = tl.load(REQ + r).to(tl.int64)
+    kv_len = tl.load(VISIBLE + r).to(tl.int64)
+    _expand_packed_row(
+        SEL + r * sel_stride, kv_len, BT + tbl * bt_stride, tpb, base_row, rows_per_slot, 0,
+        ROWS_OUT + r * OUT_WIDTH, LENGTHS + r, NONEMPTY + r,
+        SELECT_K, KPOOL, TAIL_P2, OUT_WIDTH, PAD_BLOCK,
+    )  # fmt: skip
+    if QUANT_Q:
+        _saturate_row(Q + r * q_stride, Q_OUT + r * q_out_stride, Q_ELEMS, Q_BLOCK)
+    if KEEP:
+        req = tbl - first_table
+        if tl.load(KEEP_ROWS + req).to(tl.int64) == r:
+            i = tl.arange(0, SELECT_K)
+            tl.store(KEEP_OUT + req * keep_stride + i, tl.load(SEL + r * sel_stride + i))
+
+
+def verify_selection_rows(
+    selected: torch.Tensor,
+    visible: torch.Tensor,
+    request_ids: torch.Tensor,
+    block_tables: torch.Tensor,
+    latent_pool_dtype: torch.dtype,
+    tokens_per_block: int,
+    query: torch.Tensor | None,
+    *,
+    kpool: int,
+    base_row: int,
+    rows_per_slot: int,
+    out_width: int,
+    keep_rows: torch.Tensor | None = None,
+    keep_out: torch.Tensor | None = None,
+    first_table: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Verification rows' attention inputs in one launch.
+
+    Equals :func:`kpool_expand` of ``selected`` ``[N, select_k]`` with per-row ``visible`` lengths and
+    ``request_ids`` (rows of ``block_tables``) followed by :func:`compact_sparse_rows`, whose
+    ``(packed rows, lengths, nonempty)`` this returns, plus, when ``query`` ``[N, ...]`` is given and
+    the latent pool is FP8, the query saturated to E4M3 (else ``None``). With ``keep_rows`` ``[R]``
+    (each request's drafting row, requests counted from block-table row ``first_table``) also
+    ``keep_out[:R] = selected[keep_rows]``. CUDA-graph safe.
+    """
+    n, select_k = selected.shape
+    if out_width < select_k * kpool + kpool - 1:
+        raise ValueError(
+            f"verify_selection_rows: out_width {out_width} < {select_k * kpool + kpool - 1}"
+        )
+    if select_k & (select_k - 1):
+        raise ValueError(f"verify_selection_rows: select_k {select_k} is not a power of two")
+    keep = keep_rows is not None
+    if keep and (
+        keep_out is None or keep_out.shape[1] != select_k or keep_out.dtype != selected.dtype
+    ):
+        raise ValueError(
+            "verify_selection_rows: keep_out must be [requests, select_k] like selected"
+        )
+    width = triton.cdiv(out_width, 64) * 64
+    device = selected.device
+    rows = torch.empty((n, width), dtype=torch.int32, device=device)
+    lengths = torch.empty(n, dtype=torch.int32, device=device)
+    nonempty = torch.empty(n, dtype=torch.bool, device=device)
+    quant_q = latent_pool_dtype == torch.float8_e4m3fn and query is not None
+    q_out = None
+    q_flat = q_out_flat = selected
+    q_elems = 1024
+    if quant_q:
+        q_flat = query.reshape(n, -1)
+        q_elems = q_flat.shape[1]
+        if q_flat.stride(1) != 1 or q_elems % 1024:
+            raise ValueError(
+                "verify_selection_rows: query rows must be contiguous multiples of 1024"
+            )
+        q_out = torch.empty(query.shape, dtype=latent_pool_dtype, device=device)
+        q_out_flat = q_out.view(n, -1)
+    if n == 0:
+        return rows, lengths, nonempty, q_out
+    _verify_selection_rows_kernel[(n,)](
+        selected,
+        visible,
+        request_ids,
+        block_tables,
+        q_flat,
+        q_out_flat,
+        keep_rows if keep else request_ids,
+        keep_out if keep else selected,
+        rows,
+        lengths,
+        nonempty,
+        selected.stride(0),
+        block_tables.stride(0),
+        q_flat.stride(0),
+        q_out_flat.stride(0),
+        keep_out.stride(0) if keep else 0,
+        first_table,
+        tokens_per_block,
+        base_row,
+        rows_per_slot,
+        SELECT_K=select_k,
+        KPOOL=kpool,
+        TAIL_P2=triton.next_power_of_2(kpool),
+        OUT_WIDTH=width,
+        PAD_BLOCK=64,
+        QUANT_Q=quant_q,
+        Q_ELEMS=q_elems,
+        Q_BLOCK=1024,
+        KEEP=keep,
+        num_warps=4,
+    )
+    return rows, lengths, nonempty, q_out

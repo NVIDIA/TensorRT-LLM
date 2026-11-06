@@ -20,10 +20,12 @@ import torch
 from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     append_paged_state_rows,
     compact_sparse_rows,
+    draft_step_rows,
     kpool_expand,
     kpool_score,
     kpool_score_fp8,
     kpool_update,
+    verify_selection_rows,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -1042,3 +1044,119 @@ def test_kpool_expand_tail_extra(tail_extra):
             selected, kv_lens, tables, TPB, base_row=0, rows_per_slot=TPB, kpool=KPOOL,
             out_width=select_k * KPOOL + KPOOL - 1 + tail_extra - 1, tail_extra=tail_extra,
         )  # fmt: skip
+
+
+@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("tail_extra", [1, 2])
+@pytest.mark.parametrize("advance", [False, True])
+def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, advance):
+    """One launch per draft step equals append_paged_state_rows, kpool_update, kpool_expand and
+    compact_sparse_rows at ``kv_lens - 1`` plus the saturating FP8 query cast, bit for bit; with
+    ``advance`` the live lengths end one longer."""
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    n, pages, slots, select_k, latent_dim, heads = 7, 6, 64, 8, 512, 2
+    tables = _paged_tables(n, pages, slots, gen)
+    kv_lens = torch.randint(1, pages * TPB, (n,), generator=gen, device="cuda", dtype=torch.int32)
+    kv_lens[0] = 1  # a row with only its own token
+    kv_lens[1] = KPOOL  # its token completes the first pool
+    selected = torch.randint(-1, 12, (n, select_k), generator=gen, device="cuda", dtype=torch.int32)
+    latent = (torch.randn(n, latent_dim + 64, generator=gen, device="cuda") * 50).to(
+        torch.bfloat16
+    )[:, :latent_dim]
+    packed = torch.randn(n, 2 * HD, generator=gen, device="cuda").to(torch.bfloat16)
+    ape = torch.randn(KPOOL, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    query = (torch.randn(n, heads, latent_dim, generator=gen, device="cuda") * 300).to(
+        torch.bfloat16
+    )
+    scale = torch.tensor([0.7], device="cuda")
+    base_row, rows_per_slot, out_width = 2, TPB + 4, 64
+
+    def pools():
+        g = torch.Generator(device="cuda").manual_seed(9)
+        latent_pool = (torch.randn(slots, 2, TPB, latent_dim, generator=g, device="cuda")).to(
+            latent_dtype
+        )[:, 0]
+        index_pool = _strided_index_pool(slots, g)
+        return latent_pool, index_pool
+
+    want_latent, want_index = pools()
+    positions = (kv_lens - 1).unsqueeze(1)
+    append_paged_state_rows(
+        latent.unsqueeze(1), packed.unsqueeze(1), positions, tables, want_latent, want_index, TPB,
+        scale,
+    )  # fmt: skip
+    kpool_update(want_index, tables, positions.squeeze(1), ape, TPB, head_dim=HD, kpool=KPOOL)
+    expanded = kpool_expand(
+        selected, kv_lens, tables, TPB, base_row=base_row, rows_per_slot=rows_per_slot,
+        kpool=KPOOL, out_width=out_width, tail_extra=tail_extra,
+    )  # fmt: skip
+    want_rows, want_lengths, want_nonempty = compact_sparse_rows(expanded)
+    fp8 = latent_dtype == torch.float8_e4m3fn
+    want_query = query.clamp(-448, 448).to(latent_dtype) if fp8 else None
+
+    got_latent, got_index = pools()
+    lens = kv_lens.clone()
+    rows, lengths, nonempty, query_fp8 = draft_step_rows(
+        latent, packed, lens, tables, got_latent, got_index, TPB, scale, ape, selected, query,
+        head_dim=HD, kpool=KPOOL, base_row=base_row, rows_per_slot=rows_per_slot,
+        out_width=out_width, tail_extra=tail_extra, advance=advance,
+    )  # fmt: skip
+    assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
+    assert torch.equal(got_index, want_index)
+    assert torch.equal(rows, want_rows)
+    assert torch.equal(lengths, want_lengths)
+    assert torch.equal(nonempty, want_nonempty)
+    if fp8:
+        assert torch.equal(query_fp8.view(torch.uint8), want_query.view(torch.uint8))
+    else:
+        assert query_fp8 is None
+    assert torch.equal(lens, kv_lens + 1 if advance else kv_lens)
+
+
+@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("first_table", [0, 2])
+def test_verify_selection_rows_match_expand_compact_and_keep(latent_dtype, first_table):
+    """Verify rows (T per request, rows of block table ``request_ids``) in one launch equal kpool_expand
+    with per-row visible lengths, compact_sparse_rows, the saturating FP8 query cast and
+    ``keep_out = selected[keep_rows]``, bit for bit."""
+    gen = torch.Generator(device="cuda").manual_seed(13)
+    requests, t, pages, slots, select_k, heads, latent_dim = 3, 4, 6, 64, 8, 2, 512
+    tables = _paged_tables(first_table + requests, pages, slots, gen)
+    kv_lens = torch.randint(t, pages * TPB, (requests,), generator=gen, device="cuda")
+    visible = ((kv_lens - t).unsqueeze(1) + torch.arange(1, t + 1, device="cuda")).reshape(-1)
+    request_ids = torch.arange(
+        first_table, first_table + requests, dtype=torch.int32, device="cuda"
+    ).repeat_interleave(t)
+    n = requests * t
+    selected = torch.randint(-1, 12, (n, select_k), generator=gen, device="cuda", dtype=torch.int32)
+    query = (torch.randn(n, heads, latent_dim, generator=gen, device="cuda") * 300).to(
+        torch.bfloat16
+    )
+    keep_rows = torch.arange(requests, device="cuda") * t + torch.randint(
+        0, t, (requests,), generator=gen, device="cuda"
+    )
+    base_row, rows_per_slot, out_width = 2, TPB + 4, 64
+
+    expanded = kpool_expand(
+        selected, visible, tables, TPB, base_row=base_row, rows_per_slot=rows_per_slot,
+        kpool=KPOOL, out_width=out_width, request_ids=request_ids,
+    )  # fmt: skip
+    want_rows, want_lengths, want_nonempty = compact_sparse_rows(expanded)
+    fp8 = latent_dtype == torch.float8_e4m3fn
+
+    keep_out = torch.full((requests + 1, select_k), -7, dtype=torch.int32, device="cuda")
+    rows, lengths, nonempty, query_fp8 = verify_selection_rows(
+        selected, visible, request_ids, tables, latent_dtype, TPB, query,
+        kpool=KPOOL, base_row=base_row, rows_per_slot=rows_per_slot, out_width=out_width,
+        keep_rows=keep_rows, keep_out=keep_out[:requests], first_table=first_table,
+    )  # fmt: skip
+    assert torch.equal(rows, want_rows)
+    assert torch.equal(lengths, want_lengths)
+    assert torch.equal(nonempty, want_nonempty)
+    assert torch.equal(keep_out[:requests], selected[keep_rows])
+    assert (keep_out[requests] == -7).all()
+    if fp8:
+        want_query = query.clamp(-448, 448).to(latent_dtype)
+        assert torch.equal(query_fp8.view(torch.uint8), want_query.view(torch.uint8))
+    else:
+        assert query_fp8 is None

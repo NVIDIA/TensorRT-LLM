@@ -99,7 +99,13 @@ if TYPE_CHECKING:
     from tensorrt_llm._torch.modules.mhc.hyper_connection import mHC
 
 from . import weights as _weights
-from .kernels import drafting_rows, embed_rms_norm_columns, mtp_commit
+from .kernels import (
+    advance_after_step0,
+    drafting_rows,
+    embed_rms_norm_columns,
+    mtp_commit,
+    verify_rows,
+)
 
 # A/B escape hatch (read once at import): run the speculative step on the stock MTP-Eagle worker instead of
 # ``Glm5NextMtpStep``, with the same drafter. Measures the in-model step against the worker it replaces.
@@ -424,6 +430,17 @@ class Glm5NextGenerationRows:
         kpool: int,
         first_table: int,
     ) -> Glm5NextGenerationRows:
+        if tokens_per_request > 1 and kv_lens.stride(0) == 1:
+            # Verification rows: every derived tensor in one launch.
+            positions, visible, num_candidates, request_ids = verify_rows(
+                kv_lens, tokens_per_request, kpool, first_table
+            )
+            return cls(
+                positions=positions,
+                visible=visible,
+                num_candidates=num_candidates,
+                request_ids=request_ids,
+            )
         request_ids = None
         if tokens_per_request <= 1:
             positions = kv_lens - 1
@@ -3107,18 +3124,30 @@ class _FusedMtpDraftStep:
             sequence_lengths=rows.num_candidates,
             scan_lengths=rows.num_candidates,
         )
-        layer.index_share.keep(selected, AttentionInputType.generation_only)
-        topk_rows = backend.expand_selection(
-            selected, ctx.metadata, kv_lens=rows.visible, request_ids=rows.request_ids
+        # One launch: the selection expanded and packed for the decode kernel, the query in FP8, and each
+        # request's drafting-row selection kept for the later steps (_MtpIndexShare.keep).
+        share = layer.index_share
+        query = w["q_latent"][:m0].view(m0, attn.num_heads, attn.kv_lora_rank)
+        nc = share.num_contexts
+        keep_rows = share.generation_rows
+        draft_rows = backend.prepare_verify_step(
+            selected,
+            query,
+            ctx.metadata,
+            kv_lens=rows.visible,
+            request_ids=rows.request_ids,
+            keep_rows=keep_rows,
+            keep_out=share.selection[nc : nc + keep_rows.shape[0]],
+            first_table=ctx.num_contexts,
         )
         out_latent = backend.forward(
-            w["q_latent"][:m0].view(m0, attn.num_heads, attn.kv_lora_rank),
+            query,
             None,
             None,
             ctx.metadata,
             AttentionForwardArgs(
                 attention_input_type=AttentionInputType.generation_only,
-                sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
+                sparse_backend_args=GlmKpoolBackendForwardArgs(draft_rows=draft_rows),
             ),
         )
         ops.glm5_mtp_v_up(
@@ -3143,8 +3172,10 @@ class _FusedMtpDraftStep:
         step_hidden: torch.Tensor,
         attn_metadata: AttentionMetadata,
         vocab_head: "_NcclVocabParallelHead",
+        advance_kv_lens: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``(hidden [rows, hidden], tokens [rows] int32)`` of draft step ``step`` (see :meth:`applies`)."""
+        """``(hidden [rows, hidden], tokens [rows] int32)`` of draft step ``step`` (see :meth:`applies`).
+        ``advance_kv_lens``: also add one to the rows' live KV lengths once the attention has read them."""
         ops = torch.ops.trtllm
         m = step_ids.shape[0]
         w = self._workspace()
@@ -3173,29 +3204,31 @@ class _FusedMtpDraftStep:
         )  # fmt: skip
         ops.glm5_mtp_absorb(w["query"][:m], self._wk_transposed(attn), w["q_latent"][:m])
 
-        # The attention backend, as forward_decode runs it on a draft step sharing step 0's selection.
+        # The attention backend, as forward_decode runs it on a draft step sharing step 0's selection: one row per
+        # request at its live length (num_contexts is 0 on a draft step). One launch appends the rows' state,
+        # refreshes their pools' keys, expands the shared selection packed for the decode kernel and quantizes
+        # the query.
         ctx = build_glm5_next_runtime_context(attn_metadata)
-        # One row per request at its live length (num_contexts is 0 on a draft step): only the positions.
-        positions = ctx.kv_lens[:m] - 1
         backend = attn.attn_backend
-        backend.append_paged_state(
-            w["latent"][:m].unsqueeze(1),
-            w["packed"][:m].unsqueeze(1),
-            positions.unsqueeze(1),
+        query = w["q_latent"][:m].view(m, attn.num_heads, attn.kv_lora_rank)
+        draft_rows = backend.prepare_draft_step(
+            w["latent"][:m],
+            w["packed"][:m],
+            indexer.index_kpool_compress_ape,
+            layer.index_share.selection[:m],
+            query,
             ctx.metadata,
-        )
-        backend.update_pool_keys(positions, indexer.index_kpool_compress_ape, ctx.metadata)
-        topk_rows = backend.expand_selection(
-            layer.index_share.selection[:m], ctx.metadata, kv_lens=None, tail_extra=step
+            tail_extra=step,
+            advance_kv_lens=advance_kv_lens,
         )
         out_latent = backend.forward(
-            w["q_latent"][:m].view(m, attn.num_heads, attn.kv_lora_rank),
+            query,
             None,
             None,
             ctx.metadata,
             AttentionForwardArgs(
                 attention_input_type=AttentionInputType.generation_only,
-                sparse_backend_args=GlmKpoolBackendForwardArgs(topk_rows=topk_rows),
+                sparse_backend_args=GlmKpoolBackendForwardArgs(draft_rows=draft_rows),
             ),
         )
 
@@ -3487,18 +3520,23 @@ class Glm5NextMtpStep:
         which it returns; anything else takes the cache manager's method and returns None."""
         manager = attn_metadata.kv_cache_manager
         state_indices = attn_metadata.mamba_metadata.state_indices
-        cache = getattr(manager, "mamba_cache", None)
-        prev = getattr(cache, "prev_num_accepted_tokens", None)
+        # Glm5NextCacheManager's KDA replay bookkeeping: KDAReplayState.record_acceptance writes
+        # prev[slot] = max(accepted - 1, 0) for every non-dummy generation request.
+        replay = getattr(manager, "_kda_replay", None)
+        prev = getattr(replay, "prev_num_accepted_tokens", None)
         dummy = getattr(manager, "_dummy_request_mask", None)
         num_gens = num_accepted_tokens.shape[0] - num_contexts
         if (
             num_contexts == 0
             and accepted_tokens.is_contiguous()
-            and getattr(manager, "_use_kda_replay_update", False)
+            and getattr(manager, "use_kda_replay_update", False)
             and not getattr(manager, "kda_context_only", False)
+            and getattr(manager, "local_num_mamba_layers", 0) > 0
             and prev is not None
             and prev.dtype == torch.int32
             and dummy is not None
+            and state_indices.stride(0) == 1
+            and num_accepted_tokens.is_contiguous()
         ):
             return mtp_commit(
                 spec_metadata.batch_indices_cuda[:num_gens],
@@ -3688,6 +3726,8 @@ class Glm5NextMtpStep:
     ) -> torch.Tensor:
         """The ``K`` MTP steps of :meth:`_draft` from its step-0 inputs."""
         drafts = []
+        # Later steps' positions, built only when a module step needs them: the fused step reads the live lengths.
+        pending_rows: list = []
         for step in range(draft_len):
             if share is not None:
                 share.step = step
@@ -3696,11 +3736,14 @@ class Glm5NextMtpStep:
             # Either way the MoE sees one row per request.
             rows = step0_rows if step == 0 else slice(0, batch_size)
             fused_step = self.fused_draft_step
+            kv_lens_advanced = False
             if (
                 step > 0
                 and fused_step is not None
                 and fused_step.applies(mtp_layer, step_ids.shape[0], attn_metadata)
             ):
+                # One row per request: the step's own launch advances the lengths for the next step.
+                kv_lens_advanced = step_ids.shape[0] == batch_size
                 request_hidden, tokens = fused_step(
                     step,
                     mtp_layer,
@@ -3709,6 +3752,7 @@ class Glm5NextMtpStep:
                     step_hidden,
                     attn_metadata,
                     self.vocab_head,
+                    advance_kv_lens=kv_lens_advanced,
                 )
             elif (
                 step == 0
@@ -3728,6 +3772,13 @@ class Glm5NextMtpStep:
                     self.vocab_head,
                 )
             else:
+                for pending in pending_rows:
+                    step_positions = (
+                        step_positions[pending]
+                        if step_positions.dim() == 1
+                        else step_positions[..., pending]
+                    ) + 1
+                pending_rows = []
                 request_hidden, tokens = self._module_step(
                     draft_model, mtp_layer, spec_metadata, attn_metadata, step_ids, step_positions,
                     step_hidden, step0_rows if step == 0 else None,
@@ -3736,12 +3787,11 @@ class Glm5NextMtpStep:
             if step + 1 < draft_len:
                 step_ids = tokens
                 step_hidden = request_hidden
-                step_positions = (
-                    step_positions[rows] if step_positions.dim() == 1 else step_positions[..., rows]
-                ) + 1
+                pending_rows.append(rows)
             self._advance_lengths(
-                attn_metadata, step, num_contexts, batch_size, draft_len, num_accepted_tokens
-            )
+                attn_metadata, step, num_contexts, batch_size, draft_len, num_accepted_tokens,
+                kv_lens_advanced,
+            )  # fmt: skip
         return torch.stack(drafts, dim=1)
 
     def _module_step(
@@ -3826,22 +3876,38 @@ class Glm5NextMtpStep:
         batch_size: int,
         draft_len: int,
         num_accepted_tokens: torch.Tensor,
+        kv_lens_advanced: bool = False,
     ) -> None:
         """Lengths for the next draft step. After step 0 every request feeds one row: a generation request's KV
-        length drops its rejected drafts and a context request's grows by its first draft, then each step adds one."""
+        length drops its rejected drafts and a context request's grows by its first draft, then each step adds one
+        (``kv_lens_advanced``: the step's fused launch already did)."""
         if step == 0:
             attn_metadata._seq_lens[:batch_size].fill_(1)
-            attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+            # on_update reads the host lengths (and num_contexts, still the target's); the device copy is
+            # filled below together with the KV lengths.
             attn_metadata.on_update()
+            seq_lens_cuda = attn_metadata._seq_lens_cuda[:batch_size]
             has_kv_cache = attn_metadata.kv_cache_manager is not None
             if has_kv_cache and hasattr(attn_metadata, "host_request_types"):
                 attn_metadata.host_request_types[: attn_metadata.num_contexts].fill_(1)
             if has_kv_cache:
                 attn_metadata.num_contexts = 0
-            attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                draft_len - num_accepted_tokens[num_contexts:]
-            )
-            attn_metadata.kv_lens_cuda[:num_contexts] += 1
+            kv_lens = attn_metadata.kv_lens_cuda[:batch_size]
+            if (
+                seq_lens_cuda.is_contiguous()
+                and kv_lens.is_contiguous()
+                and num_accepted_tokens.is_contiguous()
+                and num_accepted_tokens.shape[0] == batch_size
+                and num_accepted_tokens.dtype == kv_lens.dtype
+            ):
+                # The device lengths of step 1 in one launch.
+                advance_after_step0(
+                    seq_lens_cuda, kv_lens, num_accepted_tokens, num_contexts, draft_len
+                )
+            else:
+                seq_lens_cuda.fill_(1)
+                kv_lens[num_contexts:] -= draft_len - num_accepted_tokens[num_contexts:]
+                kv_lens[:num_contexts] += 1
             if (
                 has_kv_cache
                 and num_contexts > 0
@@ -3853,7 +3919,8 @@ class Glm5NextMtpStep:
             attn_metadata.update_for_spec_dec()
             attn_metadata.use_spec_decoding = False
         else:
-            attn_metadata.kv_lens_cuda[:batch_size] += 1
+            if not kv_lens_advanced:
+                attn_metadata.kv_lens_cuda[:batch_size] += 1
             attn_metadata.update_for_spec_dec()
 
     # -- attention metadata save / restore ----------------------------------

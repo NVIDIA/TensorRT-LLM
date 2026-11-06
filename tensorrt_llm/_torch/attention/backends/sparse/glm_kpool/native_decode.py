@@ -87,12 +87,21 @@ class GlmKpoolNativeDecode:
         *,
         kv_scale: float | torch.Tensor = 1.0,
         bmm1_scale: float | torch.Tensor | None = None,
+        packed_rows: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        query_fp8: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """``packed_rows``: ``compact_sparse_rows(topk_rows)`` when the caller already has it
+        (``topk_rows`` is then unused; every row nonempty); ``query_fp8``: ``q`` saturated to the
+        FP8 cache dtype."""
         from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
-        packed, lengths, nonempty = compact_sparse_rows(topk_rows)
+        packed, lengths, nonempty = (
+            packed_rows if packed_rows is not None else compact_sparse_rows(topk_rows)
+        )
         fp8 = kv_rows.dtype == torch.float8_e4m3fn
-        if fp8:
+        if fp8 and query_fp8 is not None:
+            query = query_fp8
+        elif fp8:
             # Saturating conversion keeps finite query outliers representable in FP8.
             bound = torch.finfo(kv_rows.dtype).max
             query = q.clamp(min=-bound, max=bound).to(kv_rows.dtype)
@@ -116,6 +125,10 @@ class GlmKpoolNativeDecode:
             multi_ctas_kv_counter_buffer=self._counter,
             use_fp16_softmax=False if fp8 else None,
         ).squeeze(1)
+        if packed_rows is not None:
+            # draft_step_rows / verify_selection_rows rows each hold the query's own position
+            # (their visible length is at least one), so none is empty.
+            return output
         # Empty (padded) requests use a dummy selection to keep the kernel's
         # length positive; discard that output, matching FlashMLA's empty row.
         return torch.where(nonempty[:, None, None], output, self._zero)

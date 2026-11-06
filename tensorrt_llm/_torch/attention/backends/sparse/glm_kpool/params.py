@@ -105,6 +105,19 @@ class GlmKpoolBackendForwardArgs(SparseBackendForwardArgs):
 
     topk_rows is int32 [tokens, kernel_output_width], with -1 marking invalid
     entries. Request-local topk_indices from the base carrier are unsupported.
+    draft_rows, from GlmKpoolAttention.prepare_draft_step, replaces topk_rows with
+    the native decode's packed rows, lengths, nonempty flags and FP8 query.
     """
 
     topk_rows: torch.Tensor | None = None
+    draft_rows: GlmKpoolDraftRows | None = None
+
+
+@dataclass(kw_only=True, slots=True)
+class GlmKpoolDraftRows:
+    """A single-token draft step's attention inputs from ``draft_step_rows``."""
+
+    rows: torch.Tensor
+    lengths: torch.Tensor
+    nonempty: torch.Tensor
+    query_fp8: torch.Tensor | None
