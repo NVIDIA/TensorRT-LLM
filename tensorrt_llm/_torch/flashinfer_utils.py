@@ -1,7 +1,8 @@
 import platform
 import traceback
 
-from .._utils import get_env_enable_pdl  # noqa: F401  (re-export)
+# Re-exported: many modules import get_env_enable_pdl from here.
+from .._utils import get_env_enable_pdl as get_env_enable_pdl  # noqa: F401
 from ..logger import logger
 
 IS_FLASHINFER_AVAILABLE = False

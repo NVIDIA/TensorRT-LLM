@@ -129,6 +129,7 @@ def _idle_executor(monkeypatch, calls: list) -> PyExecutor:
     executor._profiler = Mock(return_value=profiler)
     executor.hang_detector = MagicMock()
     executor.enable_iter_perf_stats = False
+    executor._metrics_all_ranks = False
     executor.enable_kv_cache_events = False
     executor.enable_attention_dp = False
     executor.is_benchmark_disagg = False
