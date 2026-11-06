@@ -264,7 +264,9 @@ def test_mpi_orchestrator_splits_session_comm_by_pipeline_stage(
     assert nccl_ep_fakes.fake.ep.Group.create.call_args.args[0] is nccl_ep_fakes.mpi_comm_result
 
 
-@pytest.mark.parametrize("use_ray", [True, False], ids=["ray", "mpi"])
+# pytest adds each id as a keyword, and tests/unittest/conftest.py skips any item with a
+# "ray" keyword unless --run-ray is given, so no id here may be exactly "ray".
+@pytest.mark.parametrize("use_ray", [True, False], ids=["ray_orchestrator", "mpi_orchestrator"])
 def test_destroy_releases_group_then_comm_and_frees_mpi_only_when_split(
     nccl_ep_fakes: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, use_ray: bool
 ) -> None:
