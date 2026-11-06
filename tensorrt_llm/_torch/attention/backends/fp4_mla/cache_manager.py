@@ -157,6 +157,12 @@ class Fp4MlaV2CacheLayoutPolicy:
     # draft KV of the last reused position may then come from a different
     # continuation, which affects draft acceptance only.
     _supports_reuse_match_backoff = False
+    # With whole-block claims (_context_reuse_tokens) the page a generation
+    # step appends to is never a reused one: the request allocated it, and its
+    # earlier rows carry the packed-V sidecar of the request's own steps. A
+    # generation step may therefore write packed V directly with block reuse
+    # on (cache_update). Hybrid managers do not inherit this policy attribute.
+    fp4_mla_reuse_claims_whole_blocks = True
 
     def __init__(self, *args, **kwargs) -> None:
         kv_cache_config = args[0] if args else kwargs.get("kv_cache_config")

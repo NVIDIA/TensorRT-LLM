@@ -593,7 +593,10 @@ The FMHA package is split by role:
   and keep block reuse tied to chunked prefill. The dense manager claims
   whole cache blocks only, without the reuse-match backoff of one-model
   drafts, and keeps its HP ring request-private
-  (`ReusePolicy.PRIVATE`), so the ring never cuts a match short.
+  (`ReusePolicy.PRIVATE`), so the ring never cuts a match short. With reuse
+  on, a context step repacks the packed V of every page it reads, reused
+  pages included, and a dense manager's generation steps write packed V
+  directly, since they append to pages their request allocated.
   Disaggregated serving (Python NIXL transceiver only) transfers the K, K-scale, and BF16
   HP-tail roles; before its first forward, the generation worker rebuilds the
   derived V-scale and packed-V sidecars from the imported cache

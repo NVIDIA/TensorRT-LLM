@@ -3649,9 +3649,22 @@ def test_fp4_mla_attention_decode_on_context_only_draft_layer(
     _is_cutedsl_unavailable(),
     reason="requires Rubin SM107 and the CuTeDSL runtime",
 )
+@pytest.mark.parametrize(
+    "whole_block_claims", [True, False], ids=["whole-block-claims", "other-claims"]
+)
 def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
     monkeypatch,
+    whole_block_claims: bool,
 ) -> None:
+    """With block reuse the context step repacks the packed V of every page it reads.
+
+    A generation step then writes packed V directly when the manager's reuse
+    claims whole blocks only (the dense manager's policy); for any other
+    manager it repacks the pages it touched.
+    """
+    monkeypatch.setattr(
+        Fp4MlaKVCacheManagerV2, "fp4_mla_reuse_claims_whole_blocks", whole_block_claims
+    )
     original_repack = fp4_mla_backend._repack_cutedsl_v_packed_cache
     repack_calls = []
 
@@ -3679,10 +3692,10 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
         enable_block_reuse=True,
     )
 
-    assert len(repack_calls) == 2
+    # the context step repacks every page of the prompt, reused ones included
+    assert len(repack_calls) == (1 if whole_block_claims else 2)
     expected_indptr = torch.tensor([0, 4, 8], dtype=torch.int32)
     torch.testing.assert_close(repack_calls[0]["page_indptr"], expected_indptr)
-    torch.testing.assert_close(repack_calls[1]["page_indptr"], expected_indptr)
     torch.testing.assert_close(
         repack_calls[0]["kv_lens"],
         torch.tensor([130, 511], dtype=torch.int32),
@@ -3691,6 +3704,11 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
         repack_calls[0]["generation_lens"],
         torch.tensor([130, 511], dtype=torch.int32),
     )
+    assert repack_calls[0]["max_touched_pages"] == 4
+    if whole_block_claims:
+        return
+    # the generation step repacks the trailing page it appended to
+    torch.testing.assert_close(repack_calls[1]["page_indptr"], expected_indptr)
     torch.testing.assert_close(
         repack_calls[1]["kv_lens"],
         torch.tensor([131, 512], dtype=torch.int32),
@@ -3699,7 +3717,6 @@ def test_fp4_mla_attention_decode_cutedsl_block_reuse_repack_matches_reference(
         repack_calls[1]["generation_lens"],
         torch.ones(2, dtype=torch.int32),
     )
-    assert repack_calls[0]["max_touched_pages"] == 4
     assert repack_calls[1]["max_touched_pages"] == 1
 
 
