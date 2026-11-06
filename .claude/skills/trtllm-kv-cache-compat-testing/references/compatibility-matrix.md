@@ -110,6 +110,11 @@ in pytest" in `../SKILL.md`.
     appends: the mixed-precision high pool is not filled. The log reports
     one total for the first fill, not each pool. To check a pool the fill
     does not reach, fill and check it with test instrumentation.
+  - For an NVFP4 KV cache, the fill writes the packed key and value data,
+    not the block-scale buffers, which have their own storage. An unwritten
+    scale keeps its old value in both the fill-on and the fill-off run, so
+    the comparison can miss that read; check the scale buffers with separate
+    instrumentation.
   - Only some paths point masked entries at a guard page: the FlashInfer
     sliding-window path, and the DeepSeek-V4 sparse cache manager with its
     own guard pages. On other paths, the reservation log does not show that
