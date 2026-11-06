@@ -248,7 +248,10 @@ uses as anchors, and its most recent tokens are the ones generation is most
 sensitive to. `mixed_precision_first_n` and `mixed_precision_last_n` take them
 out of the quantization: the leading N and the most recent N tokens of every
 sequence are stored in the cold tiers at the runtime KV type, and only the
-tokens in between are stored in the compact format.
+tokens in between are stored in the compact format. The window applies per
+attention layer: full-attention layers take it; sliding-window layers do not
+take part, as with the mixed-precision KV cache, and their pages are stored as
+ordinary cold pages.
 
 This is the same split as the
 [mixed-precision KV cache](kvcache.md#mixed-precision-kv-cache-prototype),
