@@ -124,6 +124,7 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_tp_matches_unsharded_reference
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_head_range_rejects_invalid_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_enables_clc_only_for_target_linears
   - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
   - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer

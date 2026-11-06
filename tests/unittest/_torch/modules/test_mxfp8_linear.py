@@ -193,6 +193,50 @@ def _mock_mxfp8_ops(
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("opted_in", [False, True])
+@pytest.mark.parametrize("platform_available", [False, True])
+def test_mxfp8_clc_requires_explicit_model_opt_in(
+    monkeypatch: pytest.MonkeyPatch, opted_in: bool, platform_available: bool
+) -> None:
+    """An eligible shape in another model must not enter or precompile the M3 CLC path."""
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "mxfp8_gemm_backend_override", lambda: None)
+    _, _, quantize, native, _, _, _ = _mock_mxfp8_ops(monkeypatch)
+    monkeypatch.setattr(linear_module, "take_prequantized_mxfp8", lambda x: None)
+    monkeypatch.setattr(linear_module, "ctx_eager_only", lambda: True)
+    available = Mock(spec_set=linear_module.ctx_clc_gemm_enabled, return_value=platform_available)
+    monkeypatch.setattr(linear_module, "ctx_clc_gemm_enabled", available)
+    m, n, k = 2048, 6144, 4096
+    act = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="meta")
+    scales = torch.empty(m * k // 32, dtype=torch.uint8, device="meta")
+    quantize.return_value = (act, scales)
+    expected_native = torch.empty((m, n), dtype=torch.bfloat16, device="meta")
+    native.return_value = expected_native
+    expected_clc = torch.empty_like(expected_native)
+    clc = Mock(spec_set=linear_module.try_ctx_clc_mxfp8_gemm, return_value=expected_clc)
+    monkeypatch.setattr(linear_module, "try_ctx_clc_mxfp8_gemm", clc)
+    module = Mock(spec_set=["weight", "weight_scale", "_mxfp8_alpha", "dtype", "_use_ctx_clc_gemm"])
+    module.weight = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="meta")
+    module.weight_scale = torch.empty(n * k // 32, dtype=torch.uint8, device="meta")
+    module._mxfp8_alpha = torch.ones(1, device="meta")
+    module.dtype = torch.bfloat16
+    method = MXFP8LinearMethod()
+    module._use_ctx_clc_gemm = opted_in
+    result = method.apply(module, torch.empty((m, k), dtype=torch.bfloat16, device="meta"), None)
+    if opted_in and platform_available:
+        assert result is expected_clc
+        clc.assert_called_once_with(
+            act, scales, module.weight, module.weight_scale, module._mxfp8_alpha, module.dtype
+        )
+        native.assert_not_called()
+    else:
+        assert result is expected_native
+        clc.assert_not_called()
+        native.assert_called_once()
+    assert available.call_count == int(opted_in)
+
+
+@pytest.mark.cpu_only
 def test_registered_flashinfer_mxfp8_wrapper_contract(monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise the real registered wrapper, mocking only the FlashInfer kernel."""
     expected = torch.full((2, 3), 7, dtype=torch.bfloat16)
@@ -262,7 +306,9 @@ def test_mxfp8_flashinfer_call_contract(monkeypatch):
 
     weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
     weight_scale = torch.empty(512, dtype=torch.uint8)
-    module = SimpleNamespace(weight=weight, weight_scale=weight_scale, dtype=torch.bfloat16)
+    module = SimpleNamespace(
+        weight=weight, weight_scale=weight_scale, dtype=torch.bfloat16, _use_ctx_clc_gemm=False
+    )
     activation = torch.randn((2, 4), dtype=torch.bfloat16)
 
     method = MXFP8LinearMethod()
@@ -298,6 +344,7 @@ def test_mxfp8_auto_keeps_eager_native_and_captures_flashinfer(monkeypatch):
     monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: False)
 
     module = SimpleNamespace(
+        _use_ctx_clc_gemm=False,
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
         _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
@@ -350,6 +397,7 @@ def test_mxfp8_compile_skips_context_dispatch(
     method.tune_decode_graph_backends = True
     method.mark_flashinfer_autotuned()
     module = SimpleNamespace(
+        _use_ctx_clc_gemm=False,
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
         _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
@@ -373,6 +421,7 @@ def test_mxfp8_auto_fallback_does_not_rearm_native_autotuning(monkeypatch):
     _, _, _, native_gemm, native_output, autotuned_gemm, _ = _mock_mxfp8_ops(monkeypatch)
 
     module = SimpleNamespace(
+        _use_ctx_clc_gemm=False,
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
         _mxfp8_alpha=torch.ones(1, dtype=torch.float32),
@@ -472,6 +521,7 @@ def test_mxfp8_native_autotuner_dispatch(monkeypatch):
     )
 
     module = SimpleNamespace(
+        _use_ctx_clc_gemm=False,
         weight=torch.empty((3, 4), dtype=torch.float8_e4m3fn),
         weight_scale=torch.empty(512, dtype=torch.uint8),
         _mxfp8_alpha=torch.ones(1, dtype=torch.float32),

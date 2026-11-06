@@ -501,6 +501,68 @@ def test_minimax_m3_uses_one_engine_speculative_base() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("deferred", [False, True])
+def test_minimax_m3_enables_clc_only_for_target_linears(
+    monkeypatch: pytest.MonkeyPatch, deferred: bool
+) -> None:
+    """Only target linears opt in, including before their quantization methods exist."""
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: True)
+    monkeypatch.setattr(linear_module, "mxfp8_gemm_backend_override", lambda: None)
+    monkeypatch.setattr(modeling_minimaxm3, "get_sm_version", lambda: 107)
+    projections = []
+    for _ in range(3):
+        projection = linear_module.Linear.__new__(linear_module.Linear)
+        nn.Module.__init__(projection)
+        if not deferred:
+            projection.quant_method = MXFP8LinearMethod()
+        projections.append(projection)
+    target_linear, draft_linear, unrelated_linear = projections
+    model, draft = nn.Module(), nn.Module()
+    model.projection = target_linear
+    draft.projection = draft_linear
+    other_method = linear_module.UnquantizedLinearMethod()
+    model.other = linear_module.Linear.__new__(linear_module.Linear)
+    nn.Module.__init__(model.other)
+    model.other.quant_method = other_method
+
+    def base_init(
+        self: SpecDecOneEngineForCausalLM, target: nn.Module, config: ModelConfig
+    ) -> None:
+        nn.Module.__init__(self)
+        self.model = target
+        self.draft_model = draft
+
+    monkeypatch.setattr(SpecDecOneEngineForCausalLM, "__init__", base_init)
+    constructor = create_autospec(MiniMaxM3Model, spec_set=True, return_value=model)
+    monkeypatch.setattr(modeling_minimaxm3, "MiniMaxM3Model", constructor)
+    config = ModelConfig(
+        pretrained_config=_make_text_config(), quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8)
+    )
+    target = MiniMaxM3ForCausalLM(config)
+    constructor.assert_called_once_with(config)
+    assert target.model is model and target.draft_model is draft
+    assert target_linear._use_ctx_clc_gemm
+    assert not draft_linear._use_ctx_clc_gemm
+    assert not unrelated_linear._use_ctx_clc_gemm
+    if deferred:
+        assert not hasattr(target_linear, "quant_method")
+        target_linear._weights_created = False
+        target_linear.quant_config = config.quant_config
+        target_linear.in_features, target_linear.out_features = 4096, 6144
+        target_linear.has_bias, target_linear.dtype = False, torch.bfloat16
+        create_weights = create_autospec(MXFP8LinearMethod.create_weights, spec_set=True)
+        monkeypatch.setattr(MXFP8LinearMethod, "create_weights", create_weights)
+        target_linear.create_weights_impl()
+        assert isinstance(target_linear.quant_method, MXFP8LinearMethod)
+        assert target_linear._use_ctx_clc_gemm
+        create_weights.assert_called_once_with(
+            target_linear.quant_method, target_linear, 4096, 6144, False, torch.bfloat16
+        )
+    assert model.other.quant_method is other_method
+    assert model.other._use_ctx_clc_gemm
+
+
+@pytest.mark.cpu_only
 def test_setup_aliases_preserves_one_engine_draft_weight_loading() -> None:
     loaded = []
 

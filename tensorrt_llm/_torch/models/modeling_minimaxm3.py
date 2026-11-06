@@ -3991,6 +3991,9 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
             # representation while the target remains NVFP4.
             model_config.extra_attrs["draft_kv_cache_quant_algo_override"] = QuantAlgo.FP8
         super().__init__(MiniMaxM3Model(model_config), model_config)
+        for module in self.model.modules():
+            if isinstance(module, Linear):
+                module._use_ctx_clc_gemm = True
         if (
             _SM107_DRAFTER_CTX_LAST_ROW
             and get_sm_version() == 107

@@ -3895,7 +3895,8 @@ class MXFP8LinearMethod(LinearMethodBase):
                     )
                 else:
                     output = None
-                    if ctx_eager_only() and ctx_clc_gemm_enabled():
+                    if (module._use_ctx_clc_gemm and ctx_eager_only()
+                            and ctx_clc_gemm_enabled()):
                         # SM107 CTX prefill shapes at >= 1024 rows (eager): see m3_ctx_clc_gemm.
                         output = try_ctx_clc_mxfp8_gemm(act_e4m3, act_sf,
                                                         module.weight,
@@ -4254,6 +4255,9 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
 
 
 class Linear(nn.Module):
+
+    # Model policy survives deferred creation or replacement of quant_method.
+    _use_ctx_clc_gemm: bool = False
 
     def __init__(
         self,

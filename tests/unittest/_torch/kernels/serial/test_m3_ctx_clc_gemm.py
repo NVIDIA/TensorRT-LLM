@@ -268,6 +268,7 @@ def dispatch(log=print, name="o_proj"):
         ]
     )
     assert isinstance(lin.quant_method, MXFP8LinearMethod) and lin.quant_method.use_cutlass
+    lin._use_ctx_clc_gemm = True
 
     def cutlass(act, act_sf):
         return torch.ops.trtllm.mxfp8_mxfp8_gemm(

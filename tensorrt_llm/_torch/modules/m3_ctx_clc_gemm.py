@@ -3,7 +3,7 @@
 """CTX prefill MXFP8 GEMM on the SM107 CuTe DSL persistent CLC mainloop (MiniMax-M3).
 
 For the (N, K) shapes in ``_CTX_CLC_GEMM_SHAPES`` at >= ``_CTX_CLC_GEMM_MIN_ROWS``
-rows on SM107, ``MXFP8LinearMethod.apply`` runs the GEMM on the m3_qkv_fusion
+rows on SM107, opted-in M3 ``MXFP8LinearMethod.apply`` runs the GEMM on the m3_qkv_fusion
 kernel's GEMM-only handle instead of the CUTLASS ``mxfp8_mxfp8_gemm``. It
 consumes the same E4M3 activation / swizzled UE8M0 scales and the module's
 weight / swizzled weight scales / alpha. The result is deterministic but not
