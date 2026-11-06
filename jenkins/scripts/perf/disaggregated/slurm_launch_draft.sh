@@ -148,12 +148,23 @@ sleep 5  # Wait for pyxis container namespace initialization to avoid race condi
 echo "Starting benchmark..."
 export DISAGG_SERVING_TYPE="BENCHMARK"
 export pytestCommand="$pytestCommandBenchmark"
-# Heartbeat: keep the job log growing so CI's no-output watchdog doesn't cancel long runs.
+# Heartbeat: forward new benchmark output, leaving stalled logs silent.
 (
     set +xeE +o pipefail
     trap - ERR
+    declare -A lastLogSnapshot=()
     while sleep 600; do
-        echo "[heartbeat $(date '+%F %T')] $(tail -c 200 "$testOutputDir"/trtllm-benchmark.*.log 2>/dev/null | tr '\r' '\n' | tail -n 1)"
+        for benchmarkLog in "$testOutputDir"/trtllm-benchmark.*.log; do
+            [ -s "$benchmarkLog" ] || continue
+            logSnapshot=$(stat -c '%i:%s' -- "$benchmarkLog" 2>/dev/null) || continue
+            logTail=$(tail -c 200 -- "$benchmarkLog" 2>/dev/null) || continue
+            [ -n "$logTail" ] || continue
+            logSnapshot="$logSnapshot:$logTail"
+            [ "$logSnapshot" != "${lastLogSnapshot[$benchmarkLog]-}" ] || continue
+            lastLogSnapshot["$benchmarkLog"]=$logSnapshot
+            progress=$(printf '%s' "$logTail" | tr '\r' '\n' | tail -n 1)
+            printf '[heartbeat %s] %s: %s\n' "$(date '+%F %T')" "${benchmarkLog##*/}" "$progress"
+        done
     done
 ) &
 heartbeatPid=$!
