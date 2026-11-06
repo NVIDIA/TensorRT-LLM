@@ -57,8 +57,8 @@ def policy(settings=ON, **knobs):
     return p
 
 
-def running(p, n=2):
-    reqs = [request(i) for i in range(n)]
+def running(p, n=2, start_id=0):
+    reqs = [request(i) for i in range(start_id, start_id + n)]
     p.observe(reqs, 90.0)
     for req in reqs:
         req.generated += 100
@@ -413,7 +413,8 @@ def test_forced_resume_accounting_and_drafter_lifecycle(kind, settings):
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import SchedulerOutput
 
     p = policy(settings)
-    reqs = running(p)
+    # Request ID 0 is reserved for the attention-DP dummy and gets no drafter slot.
+    reqs = running(p, start_id=1)
     p._pause(reqs[0])
     reqs[0].py_batch_idx = None
     assert p.step(reqs, 108.0, 1, 2, queue()) == 2  # forced resume blocks admission
@@ -435,32 +436,33 @@ def test_forced_resume_accounting_and_drafter_lifecycle(kind, settings):
         _maybe_record_hang_diagnostic_phase=Mock(),
     )
     worker, prepare = drafter(kind)
-    prepare([0, 1])
+    prepare([1, 2])
     slots = dict(worker._req_to_slot)
-    worker._ctx_len[slots[1]] = 77
-    for now, expected, paused in [(108.0, [0], {1}), (110.0, [0], {1}), (116.0, [1], {0})]:
+    assert set(slots) == {1, 2}
+    worker._ctx_len[slots[2]] = 77
+    for now, expected, paused in [(108.0, [1], {2}), (110.0, [1], {2}), (116.0, [2], {1})]:
         if now == 116.0:
             assert p.step(reqs, now, 1, 2, queue()) == 2
-            assert p.stats["forced"] == 2 and p._reqs[1].paused_total == 8.0
+            assert p.stats["forced"] == 2 and p._reqs[2].paused_total == 8.0
         else:
             p.observe(reqs, now)
         scheduled, _, _ = PyExecutor._schedule(ex)
         assert [req.py_request_id for req in scheduled.generation_requests] == expected
         assert scheduled.paused_in_place_ids == p.paused_ids == paused
-        assert reqs[next(iter(paused))].py_batch_idx is None
+        assert next(req for req in reqs if req.py_request_id in paused).py_batch_idx is None
         prepare(expected, paused)
-        assert worker._req_to_slot == slots and int(worker._ctx_len[slots[1]]) == 77
+        assert worker._req_to_slot == slots and int(worker._ctx_len[slots[2]]) == 77
         if now < 116.0:
-            assert p._reqs[1].paused_t == 108.0 and p._reqs[1].pauses == 1
-    assert p._reqs[1].paused_t is None
-    assert p._reqs[1].resumed_at_iter == reqs[1].py_decoding_iter
+            assert p._reqs[2].paused_t == 108.0 and p._reqs[2].pauses == 1
+    assert p._reqs[2].paused_t is None
+    assert p._reqs[2].resumed_at_iter == reqs[1].py_decoding_iter
     reqs[1].generated += 20
     p.observe(reqs, 117.0)
     p.observe(reqs[:1], 118.0, target_ready=True)
     assert p.mean_decode_s == pytest.approx(20.0)
     assert p.stats["scored"] == 1 and p.stats["infl"] > 0
-    prepare([1, 2, 3], paused={0})
+    prepare([2, 3, 4], paused={1})
     assert len(set(worker._req_to_slot.values())) == 4
-    prepare([0, 1, 2])
-    assert worker._req_to_slot[1] == slots[1] and int(worker._ctx_len[slots[1]]) == 77
-    assert 3 not in worker._req_to_slot and len(worker._free_slots) == 1
+    prepare([1, 2, 3])
+    assert worker._req_to_slot[2] == slots[2] and int(worker._ctx_len[slots[2]]) == 77
+    assert 4 not in worker._req_to_slot and len(worker._free_slots) == 1
