@@ -5,6 +5,7 @@
 Run this file explicitly on a machine with the packaged FMHA wheel and four
 supported GPUs. It uses the same benchmark case and default warmup as the
 production perf test, while checking that it never creates a JIT cache.
+Both checks use the perf harness's explicit MPI launcher.
 
 The optional A/B check compares the installed package with a private copy that
 omits only precompiled artifacts and bytecode. Both arms disable the perf
@@ -46,6 +47,7 @@ def test_minimax_uses_precompiled_fmha_with_cold_cache(
 
     cache = tmp_path / "cold-fmha-cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("TRTLLM_BENCH_USE_MPIRUN", "1")
 
     from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
         require_msa_module,
@@ -112,6 +114,7 @@ def test_minimax_precompiled_fmha_ab(
 
     cache = tmp_path / "cold-fmha-cache"
     monkeypatch.setenv("MINFER_FMHA_CACHE_DIR", str(cache))
+    monkeypatch.setenv("TRTLLM_BENCH_USE_MPIRUN", "1")
     monkeypatch.setenv("TRTLLM_PERF_WARMUP_PASS", "0")
     if kernel_mode == "jit":
         package = _copy_jit_control(Path(jit.__file__).parent, tmp_path / "control")
