@@ -348,7 +348,7 @@ def _gather_pinned_embedding_kernel(
 class Qwen4ExpPinnedHostEmbedding(nn.Module):
     """A row-sharded PLE table held in pinned host memory and read through UVA."""
 
-    _requires_standard_hf_loading = True
+    _requires_regular_checkpoint_loading = True
 
     def __init__(
         self,

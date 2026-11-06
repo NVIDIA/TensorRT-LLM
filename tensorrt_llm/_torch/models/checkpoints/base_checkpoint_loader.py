@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
-from contextlib import contextmanager
 from typing import Any
 
 from torch import nn
@@ -21,6 +19,7 @@ from tensorrt_llm._torch.models.checkpoints.checkpoint_catalog import \
     CheckpointCatalog
 from tensorrt_llm._torch.models.modeling_utils import \
     CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -56,7 +55,7 @@ class BaseCheckpointLoader(ABC):
 
     @property
     @abstractmethod
-    def checkpoint_format(self) -> str:
+    def checkpoint_format(self) -> CheckpointFormat | str:
         ...
 
     def load_config(self, checkpoint_dir: str, **kwargs) -> ModelConfig:
@@ -71,12 +70,6 @@ class BaseCheckpointLoader(ABC):
         return self.weight_loader.load_weights(checkpoint_dir,
                                                mapping=mapping,
                                                **kwargs)
-
-    @contextmanager
-    def open_weight_session(self, checkpoint_dir: str, mapping: Mapping,
-                            **kwargs) -> Iterator[dict[str, Any]]:
-        """Keep loader-specific work alive while weights are materialized."""
-        yield self.load_weights(checkpoint_dir, mapping=mapping, **kwargs)
 
     def is_weights_preloaded(self) -> bool:
         """Whether the last load wrote weights directly into the model."""
@@ -111,7 +104,8 @@ class BaseCheckpointLoader(ABC):
         """Publish format-specific loaded weights after the load path."""
 
     @classmethod
-    def get(cls, checkpoint_format: str, **kwargs) -> "BaseCheckpointLoader":
+    def get(cls, checkpoint_format: CheckpointFormat | str,
+            **kwargs) -> "BaseCheckpointLoader":
         try:
             return CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[checkpoint_format](
                 **kwargs)
@@ -139,3 +133,21 @@ class BaseCheckpointLoader(ABC):
             weight_mapper.init_model_and_config(model, config)
             self.weight_mapper = weight_mapper
             return weight_mapper
+
+    def get_initialized_draft_weight_mapper(
+        self, model: nn.Module, target_weight_mapper: BaseWeightMapper | None
+    ) -> BaseWeightMapper | None:
+        """Return the weight mapper for the separate draft checkpoint of ``model``.
+
+        Each draft config initializes its own architecture mapper so
+        replacement MTP weights use the draft's quantization and MoE backend.
+        """
+        if model.draft_config is None:
+            # Drafters without a separate config reuse the target mapper.
+            return target_weight_mapper
+        draft_model_arch = model.draft_config.pretrained_config.architectures[0]
+        draft_weight_mapper = AutoCheckpointMapper.get(self.checkpoint_format,
+                                                       draft_model_arch)
+        draft_weight_mapper.init_model_and_config(model.draft_model,
+                                                  model.draft_config)
+        return draft_weight_mapper

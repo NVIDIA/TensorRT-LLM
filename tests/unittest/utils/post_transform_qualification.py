@@ -24,10 +24,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from tensorrt_llm._torch.models.checkpoints import model_hooks
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_vanilla import VanillaMoE
 from tensorrt_llm._torch.moe.fused_moe.weight_owner import is_moe_weight_owner
-from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     PostTransformQualificationDecision,
     PostTransformQualificationReason,
@@ -292,7 +292,7 @@ def _holds_routed_experts(model: nn.Module) -> bool:
 
 
 def _runs_real_transform(module: nn.Module) -> bool:
-    """Whether `ModelLoader._walk_transform` would run a transform on `module`.
+    """Whether the full post-load walk would run a real transform on `module`.
 
     Reads the hook from the class, because the call recorders replace it on the
     instance; the no-op default of `DecoderModelForCausalLM` transforms nothing.
@@ -374,15 +374,15 @@ def assert_post_transform_lifecycle_equivalent(
     transform_calls = _install_transform_call_recorders(receiver)
     if case.prepare_producer is not None:
         case.prepare_producer(producer)
-    ModelLoader._walk_full_post_load(producer)
-    ModelLoader._setup_aliases(receiver)
+    model_hooks.walk_full_post_load(producer)
+    model_hooks.setup_aliases(receiver)
     case.prepare_receiver(producer, receiver)
 
     # Runtime finalization repeats setup_aliases(), whose contract is
     # idempotent, after the checkpoint loader's pre-transfer preparation.
-    ModelLoader._setup_aliases(receiver)
-    ModelLoader._mark_weights_transformed(receiver)
-    ModelLoader._walk_cache_state(receiver)
+    model_hooks.setup_aliases(receiver)
+    model_hooks.mark_weights_transformed(receiver)
+    model_hooks.walk_cache_state(receiver)
 
     assert transform_calls == [], f"Staged receiver invoked transform_weights(): {transform_calls}"
     # Staged finalization marks only modules that already carry the guard, and
