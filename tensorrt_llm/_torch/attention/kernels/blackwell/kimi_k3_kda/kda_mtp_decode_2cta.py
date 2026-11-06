@@ -17,7 +17,9 @@ Computes exactly what ``kda_mtp_decode_v2.kda_decode_mtp_v2_kernel`` computes on
 contract (packed rows, fused gated RMSNorm with a bf16 output, 3xTF32 chunk recurrence, fp32 or
 bf16 state, bf16 projections and conv caches, fp32 replay gates, one CTA per (head, request)
 tile, forget gate from the projection) with the same arithmetic in the same order, so outputs,
-committed state, conv windows and replay caches are bitwise identical. A tile still takes one
+committed state, conv windows and replay caches are bitwise identical. Like it, the kernel
+addresses the recurrent state by ``ssm_state_indices`` and the conv and replay caches and the
+accepted-draft counts by ``replay_state_indices``. A tile still takes one
 512-thread CTA; the footprint shrinks so that two tiles share an SM when the grid has more tiles
 than SMs:
 
@@ -246,6 +248,7 @@ def kda_decode_mtp_2cta_kernel(
     v_cache: cute.Tensor,
     beta_cache: cute.Tensor,
     ssm_state_indices: cute.Tensor,
+    replay_state_indices: cute.Tensor,
     num_accepted_tokens: cute.Tensor,
     o8: cute.Tensor,
     osf: cute.Tensor,
@@ -290,6 +293,7 @@ def kda_decode_mtp_2cta_kernel(
     i_hv, i_n, _ = cute.arch.block_idx()
     i_h = i_hv
     slot32 = ssm_state_indices[i_n]
+    replay_slot32 = replay_state_indices[i_n]
     hk_off = i_h * K
     hv_off = i_hv * V
     N1 = 3 * T_PAD
@@ -419,6 +423,7 @@ def kda_decode_mtp_2cta_kernel(
         cute.arch.mbarrier_init_fence()
         cute.arch.fence_view_async_shared()
     slot = Int64(slot32)
+    replay_slot = Int64(replay_slot32)
     h0_idx = slot * HV + i_hv
     # byte step between consecutive window positions (mode 2) of the conv states
     cs_step = [cute.crd2idx((0, 0, 1), t.layout) * 2 for t in (cs_q, cs_k, cs_v)]
@@ -426,28 +431,28 @@ def kda_decode_mtp_2cta_kernel(
     r_rep = cute.make_rmem_tensor(cute.make_layout((2 * 4,)), cutlass.Int32)
     r_repb = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Float32)
     if (warp_idx >= REPLAY_WARP0) & (rep < NUM_SPEC):
-        ld_row4(k_cache, (slot, rep, hk_off + k4), r_rep, 0)
-        ld_row4(v_cache, (slot, rep, hv_off + k4), r_rep, 4)
-        r_repb[0] = cutlass.Float32(beta_cache[slot, rep, i_hv])
+        ld_row4(k_cache, (replay_slot, rep, hk_off + k4), r_rep, 0)
+        ld_row4(v_cache, (replay_slot, rep, hv_off + k4), r_rep, 4)
+        r_repb[0] = cutlass.Float32(beta_cache[replay_slot, rep, i_hv])
         # every pending entry lands in its row; rows from the accepted count on are overwritten
         # by the new tokens' precompute before they are read
-        _cp_async_16(saddr(sG, rep * K + k4), gaddr(g_cache, (slot, rep, hk_off + k4)))
+        _cp_async_16(saddr(sG, rep * K + k4), gaddr(g_cache, (replay_slot, rep, hk_off + k4)))
         rr = KERNEL_WIDTH - 1 + rep
-        _cp_async_8(saddr(sXrq, rr * K + k4), gaddr(cs_q, (slot, hk_off + k4, rr)))
-        _cp_async_8(saddr(sXrk, rr * K + k4), gaddr(cs_k, (slot, hk_off + k4, rr)))
-        _cp_async_8(saddr(sXrv, rr * V + k4), gaddr(cs_v, (slot, hv_off + k4, rr)))
+        _cp_async_8(saddr(sXrq, rr * K + k4), gaddr(cs_q, (replay_slot, hk_off + k4, rr)))
+        _cp_async_8(saddr(sXrk, rr * K + k4), gaddr(cs_k, (replay_slot, hk_off + k4, rr)))
+        _cp_async_8(saddr(sXrv, rr * V + k4), gaddr(cs_v, (replay_slot, hv_off + k4, rr)))
         _cp_async_commit()
     if warp_idx == TMA_WARP:
         # committed window rows 0 .. KERNEL_WIDTH - 2: one base per conv state
-        wq_base = gaddr(cs_q, (slot, hk_off + k4, 0))
-        wk_base = gaddr(cs_k, (slot, hk_off + k4, 0))
-        wv_base = gaddr(cs_v, (slot, hv_off + k4, 0))
+        wq_base = gaddr(cs_q, (replay_slot, hk_off + k4, 0))
+        wk_base = gaddr(cs_k, (replay_slot, hk_off + k4, 0))
+        wv_base = gaddr(cs_v, (replay_slot, hv_off + k4, 0))
         for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
             _cp_async_8(saddr(sXrq, w * K + k4), wq_base + w * cs_step[0])
             _cp_async_8(saddr(sXrk, w * K + k4), wk_base + w * cs_step[1])
             _cp_async_8(saddr(sXrv, w * V + k4), wv_base + w * cs_step[2])
         _cp_async_commit()
-    commit_len = num_accepted_tokens[slot]
+    commit_len = num_accepted_tokens[replay_slot]
     # S0 into the region's boxes (consumed right after the precompute)
     if warp_idx == TMA_WARP:
         with cute.arch.elect_one():
@@ -892,18 +897,22 @@ def kda_decode_mtp_2cta_kernel(
     if (warp_idx >= 1) & (warp_idx <= NUM_SPEC):
         p = warp_idx - 1
         t_c = commit_len + 1 + p
-        st_row4(k_cache, (slot, p, hk_off + k4), _ld_shared_f32x4(saddr(sK, t_c * K + k4)))
-        st_row4(g_cache, (slot, p, hk_off + k4), _ld_shared_f32x4(saddr(sG, t_c * K + k4)))
-        st_row4(v_cache, (slot, p, hv_off + k4), _ld_shared_f32x4(saddr(sVall, t_c * V + k4)))
+        st_row4(k_cache, (replay_slot, p, hk_off + k4), _ld_shared_f32x4(saddr(sK, t_c * K + k4)))
+        st_row4(g_cache, (replay_slot, p, hk_off + k4), _ld_shared_f32x4(saddr(sG, t_c * K + k4)))
+        st_row4(
+            v_cache, (replay_slot, p, hv_off + k4), _ld_shared_f32x4(saddr(sVall, t_c * V + k4))
+        )
         # draft p is new token 1 + p
         wq = _ld_shared_b32x2(saddr(sXnq, (1 + p) * K + k4))
-        st_global_b32x2(gaddr(cs_q, (slot, hk_off + k4, KERNEL_WIDTH - 1 + p)), wq[0], wq[1])
+        st_global_b32x2(gaddr(cs_q, (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p)), wq[0], wq[1])
         wk = _ld_shared_b32x2(saddr(sXnk, (1 + p) * K + k4))
-        st_global_b32x2(gaddr(cs_k, (slot, hk_off + k4, KERNEL_WIDTH - 1 + p)), wk[0], wk[1])
+        st_global_b32x2(gaddr(cs_k, (replay_slot, hk_off + k4, KERNEL_WIDTH - 1 + p)), wk[0], wk[1])
         wvv = _ld_shared_b32x2(saddr(sXnv, (1 + p) * V + k4))
-        st_global_b32x2(gaddr(cs_v, (slot, hv_off + k4, KERNEL_WIDTH - 1 + p)), wvv[0], wvv[1])
+        st_global_b32x2(
+            gaddr(cs_v, (replay_slot, hv_off + k4, KERNEL_WIDTH - 1 + p)), wvv[0], wvv[1]
+        )
         if in_warp_tid == 0:
-            beta_cache[slot, p, i_hv] = sBeta[t_c].to(BETA_CACHE_DTYPE)
+            beta_cache[replay_slot, p, i_hv] = sBeta[t_c].to(BETA_CACHE_DTYPE)
     # committed window: raw rows commit_len + 1 + w (w = 2 is new token 0)
     for sec in cutlass.range_constexpr(3):
         if warp_idx == REPLAY_WARP0 + sec:
@@ -911,7 +920,7 @@ def kda_decode_mtp_2cta_kernel(
             old_sec = (sXrq, sXrk, sXrv)[sec]
             new_sec = (sXnq, sXnk, sXnv)[sec]
             off_sec = hv_off if sec == 2 else hk_off
-            sec_base = gaddr(cs_sec, (slot, off_sec + k4, 0))
+            sec_base = gaddr(cs_sec, (replay_slot, off_sec + k4, 0))
             for w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                 if cutlass.const_expr(w + 1 >= KERNEL_WIDTH - 1):
                     src = saddr(new_sec, (w + 1 - (KERNEL_WIDTH - 1)) * K + k4)

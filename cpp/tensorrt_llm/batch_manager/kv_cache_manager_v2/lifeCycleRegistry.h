@@ -164,7 +164,7 @@ inline HalfOpenRange<BlockOrdinal> computeScratchRange(
 // Factory: create the LifeCycle that holds one buffer of a layer, using the buffer's effective reuse policy.
 LifeCycle makeLifeCycle(LayerConfig const& layer, BufferConfig const& buffer, int tokensPerBlock);
 
-// Integer id assigned to each unique LifeCycle.
+// Integer id assigned to each unique LifeCycle, in LifeCycleRegistry's registration order (see below).
 using LifeCycleId = StrongIndex<int, struct LifeCycleIdTag>;
 
 // Public cache groups correspond one-to-one with lifecycles.
@@ -176,6 +176,12 @@ using LayerGroupId = LifeCycleId;
 // ---------------------------------------------------------------------------
 // LifeCycleRegistry — deduplicates LifeCycle objects and assigns integer ids.
 // Mirrors _life_cycle_registry.py::LifeCycleRegistry.
+//
+// Ids follow registration order in two passes over the layers and their buffers:
+// first every buffer that uses its layer's reuse policy (no BufferConfig::reusePolicy,
+// or one equal to the layer's), then every buffer whose override differs from it. A
+// lifecycle that only a buffer-level override creates is therefore numbered after all
+// layer lifecycles, and a config keeps its ids when such overrides are added.
 // ---------------------------------------------------------------------------
 class LifeCycleRegistry
 {
@@ -196,7 +202,7 @@ public:
         return mLifeCycleList.size();
     }
 
-    // Iteration over LifeCycles in registration order.
+    // Iteration over LifeCycles in registration (id) order.
     TypedVec<LifeCycleId, LifeCycle> const& getAll() const noexcept
     {
         return mLifeCycleList;

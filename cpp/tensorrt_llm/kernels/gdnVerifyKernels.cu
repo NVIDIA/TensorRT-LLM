@@ -175,9 +175,10 @@ template <int kTokens, bool kOutFp8>
 __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x, int64_t xStride, uint16_t const* z,
     int64_t zStride, uint16_t const* aIn, uint16_t const* bIn, int64_t abStride, float const* __restrict__ logA,
     float const* __restrict__ dtBias, uint16_t const* __restrict__ normWeight, float const* __restrict__ fp8Scale,
-    float eps, float qScale, uint16_t* state, int64_t stateSlotStride, int32_t const* stateIndices, uint16_t* oldU,
-    uint16_t* oldK, float* oldG, int32_t const* cacheBufIdx, int32_t const* prevNumAccepted, void* y, int64_t yStride,
-    int numKHeads, int numVHeads)
+    float eps, float qScale, uint16_t* state, int64_t stateSlotStride, int32_t const* stateIndices,
+    int32_t const* replayIndices, uint16_t* oldU, uint16_t* oldK, float* oldG, int32_t const* cacheBufIdx,
+    int32_t const* prevNumAccepted, int64_t oldUSlotStride, int64_t oldKSlotStride, int64_t oldGSlotStride,
+    int64_t cacheBufIdxStride, int64_t prevNumAcceptedStride, void* y, int64_t yStride, int numKHeads, int numVHeads)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     constexpr int kT = kTokens;
@@ -236,19 +237,22 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
     uint16_t const* pa = aIn + (row0 + (lane < kT ? lane : 0)) * abStride + hv;
     uint16_t const* pb = bIn + (row0 + (lane < kT ? lane : 0)) * abStride + hv;
 
-    // Data of earlier steps (slot, accepted count, history, state), which the producer does not write: read
-    // before the dependency wait so the loads overlap it (a padded slot reads slot 0 and returns below).
+    // Data of earlier steps (slots, accepted count, history, state), which the producer does not write: read
+    // before the dependency wait so the loads overlap it (a padded request reads slot and replay slot 0 and
+    // returns below). The history and its bookkeeping are rows of the request's replay slot.
     int const slotR = slot < 0 ? 0 : slot;
-    int const pn = prevNumAccepted[slotR];
-    int const buf = cacheBufIdx[slotR];
+    int64_t const replayR = slot < 0 ? 0 : replayIndices[n];
+    int const pn = prevNumAccepted[replayR * prevNumAcceptedStride];
+    int const buf = cacheBufIdx[replayR * cacheBufIdxStride];
     bool const isWrite = pn + kT > kHist;
     int const wBuf = isWrite ? 1 - buf : buf;
     int const wOff = isWrite ? 0 : pn;
-    int64_t const rb = static_cast<int64_t>(slotR) * 2 + buf;
-    int64_t const wb = static_cast<int64_t>(slotR) * 2 + wBuf;
-    uint16_t const* khp = oldK + rb * (kHist * kStrideK) + hk * kDim;
-    uint16_t const* uhp = oldU + rb * (kHist * kStrideU) + hv * kDim;
-    float const* ghp = oldG + (rb * hv_ + hv) * kHist;
+    uint16_t* const kSlot = oldK + replayR * oldKSlotStride;
+    uint16_t* const uSlot = oldU + replayR * oldUSlotStride;
+    float* const gSlot = oldG + replayR * oldGSlotStride;
+    uint16_t const* khp = kSlot + buf * (kHist * kStrideK) + hk * kDim;
+    uint16_t const* uhp = uSlot + buf * (kHist * kStrideU) + hv * kDim;
+    float const* ghp = gSlot + (static_cast<int64_t>(buf) * hv_ + hv) * kHist;
     uint16_t* sp = state + slotR * stateSlotStride + static_cast<int64_t>(hv) * kDim * kDim;
 
     uint4 H[2][2][4]; // checkpoint state rows (h^T) of this lane: [m-tile][half][chunk]
@@ -554,7 +558,7 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
     // History of this step's tokens: normalized keys (one value head per key head, warp 0) and G (warp 1).
     if (warp == 0 && (hv % group) == 0 && r < kT)
     {
-        uint16_t* wk = oldK + wb * (kHist * kStrideK) + (wOff + r) * kStrideK + hk * kDim + 8 * q;
+        uint16_t* wk = kSlot + wBuf * (kHist * kStrideK) + (wOff + r) * kStrideK + hk * kDim + 8 * q;
 #pragma unroll
         for (int c = 0; c < 4; ++c)
         {
@@ -568,7 +572,7 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
     }
     if (warp == 1 && lane < kT)
     {
-        oldG[(wb * hv_ + hv) * kHist + wOff + lane] = isWrite ? gl : gv;
+        gSlot[(static_cast<int64_t>(wBuf) * hv_ + hv) * kHist + wOff + lane] = isWrite ? gl : gv;
     }
 
     // History outputs: uh^T (16 x 16) x coeff^T (16 x 8), coefficient = raw x decay x (1 / |row t|) in bf16.
@@ -701,7 +705,7 @@ __global__ void __launch_bounds__(kThreads, 1) gdnVerifyKernel(uint16_t const* x
 
     // History of this step's tokens: U.
     {
-        uint16_t* wu = oldU + wb * (kHist * kStrideU) + hv * kDim + vb + r;
+        uint16_t* wu = uSlot + wBuf * (kHist * kStrideU) + hv * kDim + vb + r;
 #pragma unroll
         for (int col = 0; col < 4; ++col)
         {
@@ -789,8 +793,10 @@ void launchGdnVerify(GdnVerifyParams const& p, cudaStream_t stream)
         stream, static_cast<uint16_t const*>(p.qkv), p.qkvStride, static_cast<uint16_t const*>(p.z), p.zStride,
         static_cast<uint16_t const*>(p.a), static_cast<uint16_t const*>(p.b), p.abStride, p.logA, p.dtBias,
         static_cast<uint16_t const*>(p.normWeight), p.fp8Scale, p.normEps, kQScale, static_cast<uint16_t*>(p.ssmStates),
-        p.ssmSlotStride, p.stateIndices, static_cast<uint16_t*>(p.oldU), static_cast<uint16_t*>(p.oldK), p.oldG,
-        p.cacheBufIdx, p.prevNumAcceptedTokens, p.out, p.outStride, p.numKHeads, p.numVHeads);
+        p.ssmSlotStride, p.stateIndices, p.replayIndices, static_cast<uint16_t*>(p.oldU),
+        static_cast<uint16_t*>(p.oldK), p.oldG, p.cacheBufIdx, p.prevNumAcceptedTokens, p.oldUSlotStride,
+        p.oldKSlotStride, p.oldGSlotStride, p.cacheBufIdxStride, p.prevNumAcceptedTokensStride, p.out, p.outStride,
+        p.numKHeads, p.numVHeads);
 }
 
 template <bool kOutFp8>

@@ -139,6 +139,7 @@ class _KVCacheManagerConfigFieldSpec:
     pool_rebalance: object = None
     cold_tier_offload_min_priority: int = DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
     host_sparse_pool_quota: object = None
+    max_live_kv_caches: object = None
 
 
 KVCacheManagerConfig.__dataclass_fields__ = _KVCacheManagerConfigFieldSpec.__dataclass_fields__

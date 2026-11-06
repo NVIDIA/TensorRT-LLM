@@ -491,7 +491,8 @@ class KVCacheManagerConfig:
     constraints: list[BatchDesc] = ...
     typical_step: BatchDesc | None = None
     # One positive, normalized hot-tier byte-quota weight per layer group. Cold initialization preserves the implied
-    # layer-group slot-count proportions.
+    # layer-group slot-count proportions. The hot tier ignores the entry of a layer group with a fixed capacity
+    # (see max_live_kv_caches).
     initial_pool_ratio: list[float] | None = None
     swa_scratch_reuse: SwaScratchReuseConfig | None = None
     commit_min_snapshot: bool = False
@@ -510,6 +511,11 @@ class KVCacheManagerConfig:
     # gives way between them. The two can only conflict if the floors alone exceed this
     # budget, which construction rejects.
     host_sparse_pool_quota: int | None = None
+    # Positive upper bound on living (active or suspended) KV caches; None means unbounded. When set,
+    # create_kv_cache() raises LogicError beyond it, the PRIVATE SSM layer group gets a fixed GPU capacity
+    # of ceil(max_live_kv_caches / max_util_for_resume) slots in a pool group of its own that the other
+    # groups' ratio-based sizing leaves alone, and beam widths above 1 are rejected.
+    max_live_kv_caches: int | None = None
     @property
     def enable_swa_scratch_reuse(self) -> bool: ...
 

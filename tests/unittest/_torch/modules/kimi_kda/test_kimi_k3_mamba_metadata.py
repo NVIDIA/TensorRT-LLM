@@ -291,3 +291,76 @@ def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
     metadata.prepare(attn_metadata)
 
     assert metadata.generation_state_indices is None
+
+
+def test_k3_prepare_materializes_stable_aligned_generation_replay_indices() -> None:
+    """With replay slots of their own, the generation requests' replay slots get a stable,
+    16-byte-aligned copy like their state slots; without them the replay slots are the state
+    slots."""
+
+    class KdaCacheManager:
+        use_kda_replay_update = True
+        replay_layer_group_id = 1
+
+        def __init__(self) -> None:
+            self._state_indices_buffer = DeviceCopyBuffer(
+                torch.tensor([9, 4, 7], dtype=torch.int32, device="cuda")
+            )
+            self.replay_slots = {10: 3, 11: 0, 12: 5}
+
+        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> torch.Tensor:
+            return self._state_indices_buffer.tensor[: len(request_ids)]
+
+        def get_replay_state_indices(self, request_ids: list[int]) -> list[int]:
+            return [self.replay_slots[request_id] for request_id in request_ids]
+
+    manager = KdaCacheManager()
+    metadata = KimiK3MambaMetadata(max_batch_size=3, chunk_size=8, max_num_tokens=8)
+    seq_lens = torch.tensor([2, 1, 1], dtype=torch.int)
+    attn_metadata = SimpleNamespace(
+        seq_lens=seq_lens,
+        seq_lens_cuda=seq_lens.cuda(),
+        num_contexts=1,
+        num_ctx_tokens=2,
+        kv_cache_manager=manager,
+        request_ids=[10, 11, 12],
+        kv_cache_params=SimpleNamespace(
+            num_cached_tokens_per_seq=torch.tensor([0], dtype=torch.int),
+        ),
+    )
+
+    metadata.prepare(attn_metadata)
+
+    assert metadata.replay_state_indices is not metadata.state_indices
+    assert metadata.replay_state_indices[1:].data_ptr() % 16 != 0
+    aligned = metadata.generation_replay_state_indices
+    assert aligned is not None and aligned.data_ptr() % 16 == 0
+    torch.testing.assert_close(aligned, torch.tensor([0, 5], dtype=torch.int32, device="cuda"))
+    torch.testing.assert_close(
+        metadata.generation_state_indices,
+        torch.tensor([4, 7], dtype=torch.int32, device="cuda"),
+    )
+
+    manager.replay_slots = {10: 1, 11: 2, 12: 6}
+    metadata.prepare(attn_metadata)
+    assert metadata.generation_replay_state_indices.data_ptr() == aligned.data_ptr()
+    torch.testing.assert_close(aligned, torch.tensor([2, 6], dtype=torch.int32, device="cuda"))
+
+    # A generation-only batch starts at an aligned row and needs no copy.
+    attn_metadata.num_contexts = 0
+    attn_metadata.num_ctx_tokens = 0
+    attn_metadata.seq_lens = torch.tensor([1, 1, 1], dtype=torch.int)
+    attn_metadata.seq_lens_cuda = attn_metadata.seq_lens.cuda()
+    metadata.prepare(attn_metadata)
+    assert metadata.generation_replay_state_indices is None
+    torch.testing.assert_close(
+        metadata.replay_state_indices[:3], torch.tensor([1, 2, 6], dtype=torch.int32, device="cuda")
+    )
+
+    # Without replay slots of their own, the replay slots alias the state slots.
+    manager.replay_layer_group_id = None
+    attn_metadata.num_contexts = 1
+    attn_metadata.num_ctx_tokens = 1
+    metadata.prepare(attn_metadata)
+    assert metadata.replay_state_indices is metadata.state_indices
+    assert metadata.generation_replay_state_indices is metadata.generation_state_indices

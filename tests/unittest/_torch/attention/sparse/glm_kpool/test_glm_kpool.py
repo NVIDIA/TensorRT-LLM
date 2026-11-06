@@ -176,6 +176,8 @@ def test_indexer_runtime_cache_cost_matches_registered_buffers(fp8, snapshot_int
         enable_block_reuse=bool(snapshot_interval),
         mamba_state_config=MambaStateConfig(periodic_snapshot_interval=snapshot_interval),
     )
+    # What __init__ declares before costing: the recurrent-state region of the KDA layer.
+    manager._declare_regions()
 
     buffers = manager._extra_buffers_per_layer(tokens_per_block=32)
     assert set(buffers) == {1}
