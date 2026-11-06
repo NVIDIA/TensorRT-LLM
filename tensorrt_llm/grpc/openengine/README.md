@@ -350,6 +350,17 @@ limited to 64 MiB, with 256 MiB of registered storage per engine. Pending export
 expire after five minutes when the cache is collected. An uncertain WRITE stops
 admission and retains affected buffers until process exit.
 
+Each send and receive owns a temporary native agent so its metadata cannot contain
+another request's registrations. Peer metadata stays valid through completion;
+network waits do not hold the cache-state lock. Shutdown stops admission and
+drains active operations before closing healthy agents.
+
+`TransferEncoderCache` marks proven pre-WRITE rejections with `INVALID_ARGUMENT`
+and trailing metadata `trtllm-encoder-write: not-started`. Only that combination
+allows the receiver to release its buffers after an RPC failure. Unmarked errors,
+including errors from older peers, remain uncertain. Receiver setup failures
+preserve the source reference after imported peer metadata is invalidated.
+
 The optional safetensors backend uses a private shared directory on one host.
 It applies the same single-use and request-identity checks, with a 64 MiB tensor
 limit and a 256 MiB serialized-cache limit.

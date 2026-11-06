@@ -31,6 +31,7 @@ pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 from grpc_health.v1 import health_pb2, health_pb2_grpc  # noqa: E402
 
 from tensorrt_llm.grpc.openengine.bindings import (  # noqa: E402
+    SCHEMA_RELEASE,
     kv_pb2,
     openengine_pb2_grpc,
     server_pb2,
@@ -187,7 +188,7 @@ def test_openengine_server_serves_the_control_contract() -> None:
             assert error.value.code() == grpc.StatusCode.UNIMPLEMENTED
             assert info.schema_revision == 1
             assert info.minimum_client_revision == 1
-            assert info.schema_release == "9b6f34f9efb17aa2c6b7e0ad737b78106a8ecca3"
+            assert info.schema_release == SCHEMA_RELEASE
         finally:
             await channel.close()
             await server.stop(grace=0)
