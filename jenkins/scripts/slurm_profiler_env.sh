@@ -14,17 +14,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Chain the CI image's BASH_ENV (docker/Dockerfile.multi) before applying
-# overrides. Restore it while sourcing so nested initialization cannot recurse.
+# Chain the CI image's BASH_ENV (docker/Dockerfile.multi) before applying the
+# CI profiler policy. Restore it while sourcing so initialization cannot recurse.
 export BASH_ENV=/etc/bash.bashrc
 if [ -f "$BASH_ENV" ]; then
     source "$BASH_ENV"
 fi
 export BASH_ENV="${BASH_SOURCE[0]}"
 
-# Applied on every Bash startup, including the multi-node Python launcher.
-if [ "${NCCL_NET_PLUGIN:-}" = "gcp" ] || [ "${NCCL_ENV_PLUGIN:-}" = "gcp" ]; then
-    export NCCL_IB_DISABLE=0
-    export NCCL_NET=gIB
-    export NCCL_PROFILER_PLUGIN=none
-fi
+# Regular CI tests do not collect NCCL profiles. Apply this after every image
+# initialization, including the multi-node launcher, and retain network defaults.
+export NCCL_PROFILER_PLUGIN=none

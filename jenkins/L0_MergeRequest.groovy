@@ -2501,7 +2501,7 @@ def findCachedPLCSourceScanResult(commit) {
     return [result: buildInfo.result, url: buildInfo.url]
 }
 
-def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:], Closure onResult = null) {
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:], boolean propagateFailure = true) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
@@ -2541,7 +2541,6 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
 
     def logger = new Logger(pipeline)
     def (jenkinsURL, buildStatus) = JobBuilder.build(pipeline, logger, jobName, parameters, 1, false)
-    onResult?.call(buildStatus)
     // Infra-scoped fail-fast (parent half). A downstream sub-job returns UNSTABLE
     // when it saw only infra aborts and no genuine test/build failure (see
     // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
@@ -2555,7 +2554,7 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
         }
         return buildStatus
     }
-    if (buildStatus != "SUCCESS") {
+    if (buildStatus != "SUCCESS" && propagateFailure) {
         error "Downstream job did not succeed"
     }
     return buildStatus
@@ -3172,8 +3171,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
-                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters) { status ->
-                            imageBuildStatus = status
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters, false)
+                        if (!(imageBuildStatus in ["SUCCESS", "UNSTABLE"])) {
+                            error "Build-Docker-Images job returned ${imageBuildStatus}"
                         }
                     } catch (InterruptedException e) {
                         throw e
