@@ -3801,6 +3801,8 @@ class MXFP8LinearMethod(LinearMethodBase):
                 # Tune only in the warmup-only pass (flashinfer_mxfp8_autotune).
                 if quantized_input is not None:
                     input = quantized_input.unquantized()
+                    if input.dim() > 2:
+                        input = input.reshape(-1, input.shape[-1])
                 output = mxfp8_quantize_gemm_autotuned(
                     input,
                     module.weight,
@@ -3814,6 +3816,8 @@ class MXFP8LinearMethod(LinearMethodBase):
                 act_e4m3, act_sf = (
                     quantized_input.quantized() if quantized_input is not None
                     else torch.ops.trtllm.mxfp8_quantize(input, True))
+                if act_e4m3.dim() > 2:
+                    act_e4m3 = act_e4m3.reshape(-1, act_e4m3.shape[-1])
                 use_flashinfer = self.backend == "flashinfer" or (
                     self.backend == "auto" and not is_torch_compiling() and
                     (_FLASHINFER_MXFP8_AUTOTUNE_ACTIVE.get() or

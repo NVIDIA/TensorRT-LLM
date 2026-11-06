@@ -2789,27 +2789,26 @@ index 4719a48..65e51be 100644
  
  
 diff --git a/python/fmha_sm100/cute/src/common/aot_cache.py b/python/fmha_sm100/cute/src/common/aot_cache.py
-index 99fd0b4..8037d13 100644
 --- a/python/fmha_sm100/cute/src/common/aot_cache.py
 +++ b/python/fmha_sm100/cute/src/common/aot_cache.py
-@@ -6,6 +6,12 @@
+@@ -5,6 +5,12 @@
+ 
  Saves compiled TVM FFI kernels as .o files on first compile,
  loads them on subsequent runs to skip JIT compilation.
- 
++
 +Cached objects are keyed by the caller's kernel key *and* a build fingerprint
 +covering the target GPU architecture and the kernel sources. Without the
 +fingerprint a .o built for one architecture (or from an older revision of the
 +kernel) is silently reused on another, which both miscompiles across
 +SM100/SM103 and makes local kernel edits appear to have no effect.
-+
+ 
  Environment variables:
      MM_SPARSE_ATTN_AOT_CACHE: Override cache directory
-         (default: ~/.cache/minfer/mm_sparse_attn)
-@@ -25,10 +31,87 @@ _AOT_CACHE_DIR = os.environ.get(
+@@ -25,10 +31,87 @@
  _AOT_DISABLE = os.environ.get("MM_SPARSE_ATTN_AOT_DISABLE", "0") == "1"
  
  _loaded_modules: dict[str, object] = {}
-+_build_fingerprint_cache: str | None = None
++_build_fingerprint_cache: dict[str, str] = {}
 +
 +# .../cute/src/common/aot_cache.py -> .../cute
 +_PACKAGE_ROOT = os.path.dirname(
@@ -2848,29 +2847,29 @@ index 99fd0b4..8037d13 100644
 +        return "smunknown"
 +
 +
-+_r2_store_cache: bool | None = None
++_r2_store_cache: dict[tuple[int, int], bool] = {}
 +
 +
 +def r2_store_enabled() -> bool:
 +    """Whether the NVFP4-KV sparse prefill uses the R2 store warpgroup.
 +
-+    SM107 only (resolved once from the device capability); TRTLLM_MSA_DISABLE_R2STORE=1 restores the stock
++    SM107 only (resolved once per target architecture); TRTLLM_MSA_DISABLE_R2STORE=1 restores the stock
 +    in-softmax epilogue there too.
 +    """
-+    global _r2_store_cache
-+    if _r2_store_cache is None:
-+        import torch
++    import torch
 +
-+        _r2_store_cache = (
-+            torch.cuda.get_device_capability() == (10, 7)
++    target = torch.cuda.get_device_capability()
++    if target not in _r2_store_cache:
++        _r2_store_cache[target] = (
++            target == (10, 7)
 +            and os.environ.get("TRTLLM_MSA_DISABLE_R2STORE", "0") != "1"
 +        )
-+    return _r2_store_cache
++    return _r2_store_cache[target]
 +
 +
 +def _build_fingerprint() -> str:
-+    global _build_fingerprint_cache
-+    if _build_fingerprint_cache is None:
++    target = _target_arch()
++    if target not in _build_fingerprint_cache:
 +        try:
 +            import cutlass
 +
@@ -2880,10 +2879,10 @@ index 99fd0b4..8037d13 100644
 +        # Construction-time codegen knobs must be part of the key: the source hash
 +        # alone would hand one mode's cached .o to the other.
 +        r2store = "r2store" + ("0" if r2_store_enabled() else "1")
-+        _build_fingerprint_cache = "-".join(
-+            (_target_arch(), str(cutlass_version), _source_fingerprint(), r2store)
++        _build_fingerprint_cache[target] = "-".join(
++            (target, str(cutlass_version), _source_fingerprint(), r2store)
 +        )
-+    return _build_fingerprint_cache
++    return _build_fingerprint_cache[target]
  
  
  def _key_to_path(key: tuple) -> str:

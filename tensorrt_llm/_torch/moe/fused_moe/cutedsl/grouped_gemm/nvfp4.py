@@ -15,6 +15,7 @@
 """``TrtllmCutedslGroupedGemmNvfp4Impl``: ``trtllm.cutedsl.grouped_gemm.nvfp4``."""
 
 import os
+from contextvars import ContextVar
 
 import torch
 
@@ -74,7 +75,8 @@ class FinalizeResidual:
     finalize to add while it un-permutes: bitwise ``residual.add_(routed_output)``. ``event`` (recorded on the stream
     that produced it) is waited on right before the finalize; ``consumed`` tells the caller to skip its own add."""
 
-    def __init__(self, residual: torch.Tensor, event=None):
+    def __init__(self, residual: torch.Tensor, event: torch.cuda.Event | None = None) -> None:
+        self.previous: FinalizeResidual | None = None
         self.residual = residual
         self.event = event
         self.consumed = False
@@ -83,19 +85,25 @@ class FinalizeResidual:
         )
 
 
-_FINALIZE_RESIDUAL: list[FinalizeResidual] = []
+_FINALIZE_RESIDUAL: ContextVar[FinalizeResidual | None] = ContextVar(
+    "moe_finalize_residual", default=None
+)
 
 
-def offer_finalize_residual(residual: torch.Tensor, event=None) -> FinalizeResidual:
-    """Offer ``residual`` to the next deterministic Rubin FC2 finalize on this thread (cleared by the caller)."""
-    _FINALIZE_RESIDUAL.clear()
+def offer_finalize_residual(
+    residual: torch.Tensor, event: torch.cuda.Event | None = None
+) -> FinalizeResidual:
+    """Offer ``residual`` to the next deterministic Rubin FC2 finalize in this execution context."""
     holder = FinalizeResidual(residual, event)
-    _FINALIZE_RESIDUAL.append(holder)
+    holder.previous = _FINALIZE_RESIDUAL.get()
+    _FINALIZE_RESIDUAL.set(holder)
     return holder
 
 
 def clear_finalize_residual() -> None:
-    _FINALIZE_RESIDUAL.clear()
+    """Restore the offer that preceded the current execution context's innermost offer."""
+    holder = _FINALIZE_RESIDUAL.get()
+    _FINALIZE_RESIDUAL.set(holder.previous if holder is not None else None)
 
 
 @register_moe_impl
@@ -643,7 +651,7 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                 tile_size=tile_size,
                 output_dtype=output_dtype,
             )
-            holder = _FINALIZE_RESIDUAL[0] if _FINALIZE_RESIDUAL else None
+            holder = _FINALIZE_RESIDUAL.get()
             if holder is not None:
                 holder.calls += 1
             if (
@@ -669,7 +677,6 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
                     holder.residual.contiguous(),
                 )
                 holder.consumed = True
-                _FINALIZE_RESIDUAL.clear()
             else:
                 torch.ops.trtllm.moe_unpermute_inplace(
                     permuted_input=fc2_rows,

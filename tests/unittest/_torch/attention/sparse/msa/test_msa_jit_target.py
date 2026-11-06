@@ -7,6 +7,8 @@ Runs on CPU: torch.cuda is faked and nothing is compiled.
 
 import os
 import re
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -110,3 +112,31 @@ def test_a_shared_build_is_loaded_until_the_target_has_its_own(jit, monkeypatch)
     target_dir.mkdir(parents=True)
     (target_dir / so_name).touch()
     assert jit._built_dir("plan", so_name) == target_dir
+
+
+@pytest.mark.parametrize(
+    "targets", [((10, 0), (10, 7)), ((10, 7), (10, 0))], ids=["sm100_first", "sm107_first"]
+)
+@pytest.mark.parametrize("disable_r2", [False, True])
+def test_aot_cache_and_codegen_follow_each_target(
+    jit: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    targets: tuple[tuple[int, int], tuple[int, int]],
+    disable_r2: bool,
+) -> None:
+    # The optional MSA package and its import path are prepared by the jit fixture.
+    from src.common import aot_cache
+
+    monkeypatch.setattr(aot_cache, "_build_fingerprint_cache", {})
+    monkeypatch.setattr(aot_cache, "_r2_store_cache", {})
+    monkeypatch.setattr(aot_cache, "_AOT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("TRTLLM_MSA_DISABLE_R2STORE", "1" if disable_r2 else "0")
+    paths = []
+    for target in (*targets, targets[0]):
+        fake_gpus(monkeypatch, target)
+        assert aot_cache.r2_store_enabled() is (target == (10, 7) and not disable_r2)
+        assert aot_cache._build_fingerprint().startswith(f"sm{target[0]}{target[1]}-")
+        paths.append(aot_cache._key_to_path(("target_isolation", 128)))
+    assert paths[0] != paths[1]
+    assert paths[0] == paths[2]

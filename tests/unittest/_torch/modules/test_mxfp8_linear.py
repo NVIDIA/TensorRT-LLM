@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -216,6 +217,55 @@ def test_mxfp8_carrier_is_consumed_without_requantization(monkeypatch, retain_bf
     native.assert_called_once_with(
         act, sf, module.weight, module.weight_scale, module._mxfp8_alpha, module.dtype
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["cutlass", "flashinfer", "tuned"])
+def test_rank_three_mxfp8_carrier_matches_tensor_input(
+    monkeypatch: pytest.MonkeyPatch, backend: str
+) -> None:
+    flashinfer_gemm = Mock()
+    act, sf, quantize, native, expected, _, _ = _mock_mxfp8_ops(monkeypatch, flashinfer_gemm)
+    expected.copy_(torch.arange(6).reshape(2, 3))
+    flashinfer_gemm.return_value = expected
+    tuned_gemm = Mock(spec_set=linear_module.mxfp8_quantize_gemm_autotuned, return_value=expected)
+    monkeypatch.setattr(linear_module, "mxfp8_quantize_gemm_autotuned", tuned_gemm)
+    method = MXFP8LinearMethod.__new__(MXFP8LinearMethod)
+    method.use_cutlass = True
+    method.tune_decode_graph_backends = backend == "tuned"
+    method.backend = "flashinfer" if backend == "flashinfer" else "cutlass"
+    method._flashinfer_mxfp8 = flashinfer_gemm
+    method.use_native_autotuner = False
+    module = Mock(spec_set=["weight", "weight_scale", "_mxfp8_alpha", "dtype", "_use_ctx_clc_gemm"])
+    module.weight = torch.empty((3, 4), dtype=torch.float8_e4m3fn)
+    module.weight_scale = torch.empty(512, dtype=torch.uint8)
+    module._mxfp8_alpha = torch.ones(1)
+    module.dtype = torch.bfloat16
+    module._use_ctx_clc_gemm = False
+    hidden = torch.ones((1, 2, 4), dtype=torch.bfloat16)
+    carrier = MxFp8QuantizedTensor(act.reshape(1, 2, 4), sf, True, hidden)
+
+    with flashinfer_mxfp8_decode_graph_capture() if backend == "tuned" else nullcontext():
+        reference = method.apply(module, hidden, None)
+        quantize.reset_mock()
+        native.reset_mock()
+        flashinfer_gemm.reset_mock()
+        tuned_gemm.reset_mock()
+        actual = method.apply(module, carrier, None)
+
+    assert actual.shape == reference.shape == (1, 2, 3)
+    torch.testing.assert_close(actual, reference)
+    quantize.assert_not_called()
+    selected = {"cutlass": native, "flashinfer": flashinfer_gemm, "tuned": tuned_gemm}[backend]
+    selected.assert_called_once()
+    gemm_input = selected.call_args.args[0]
+    assert gemm_input.shape == (2, 4)
+    assert gemm_input.is_contiguous()
+    if backend == "tuned":
+        torch.testing.assert_close(gemm_input, hidden.reshape(2, 4))
+    else:
+        assert torch.equal(gemm_input.view(torch.uint8), act.view(torch.uint8))
+        assert selected.call_args.args[1] is sf
 
 
 @pytest.mark.cpu_only
