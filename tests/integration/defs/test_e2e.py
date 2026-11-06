@@ -1336,6 +1336,7 @@ def test_ptp_quickstart_bert(llm_root, llm_venv, model_name, model_path,
 @pytest.mark.timeout(5400)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_mpi_world_size(16)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
 @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
