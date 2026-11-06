@@ -318,8 +318,10 @@ def test_auto_gates_small_decode_batches() -> None:
     assert core("auto", 2, True) == "prims_ts"
     assert core("auto", 1, False) == "prims_ts"
     assert core("prims_ts", 1, True) == "prims_ts"
+    # Rubin keeps decode on Triton; other parts take PrimTS from 32 rows.
+    decode_wins = torch.cuda.get_device_capability(device) != (10, 7)
     assert not indexer("auto", 31, True)
-    assert indexer("auto", 32, True)
+    assert indexer("auto", 32, True) == decode_wins
     assert indexer("auto", 1, False)
     assert indexer("prims_ts", 1, True)
     assert not indexer("triton", 4096, False)
