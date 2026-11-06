@@ -1227,14 +1227,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -1270,14 +1268,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     // new request with same tokens and then remove it
     requestId = 1;
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1308,16 +1304,14 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     // reuse blocks 0, 1 and get recycled block 3
     GenerationRequest seq0_dup{10, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest0 = std::make_shared<LlmRequest>(seq0_dup.getRequestId(), maxNewTokens, inputTokens, samplingConfig,
-        isStreaming, /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        isStreaming, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
@@ -1340,16 +1334,14 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     inputTokenExtraIds1->push_back(0);
     GenerationRequest seq1_dup{11, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest1 = std::make_shared<LlmRequest>(seq1_dup.getRequestId(), maxNewTokens, inputTokens1, samplingConfig,
-        isStreaming, /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        isStreaming, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds1);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
@@ -1380,14 +1372,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     auto inputTokenExtraIds2 = std::make_shared<VecTokenExtraIds>(VecTokenExtraIds{4, 4, 5, 5, 6, 6, 0, 0, 0});
     requestId = 2;
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds2);
 
     numTokens = llmRequest2->getNumTokens(beamIdx);
@@ -1414,14 +1404,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdTest)
     auto inputTokenExtraIds3 = std::make_shared<VecTokenExtraIds>(VecTokenExtraIds{1, 1, 2, 2, 4, 4, 0, 0, 0});
     requestId = 3;
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds3);
 
     numTokens = llmRequest3->getNumTokens(beamIdx);
@@ -1496,15 +1484,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, multimodalHashes, multimodalPositions, multimodalLengths,
+        multimodalHashes, multimodalPositions, multimodalLengths,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
 
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -1545,15 +1531,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
     // new request with same tokens and same multimodal hash - should reuse
     requestId = 1;
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, multimodalHashes, multimodalPositions, multimodalLengths,
+        multimodalHashes, multimodalPositions, multimodalLengths,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1589,15 +1573,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2});                     // Start at token 2
     auto multimodalLengths2 = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{4}); // Length 4 tokens
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, multimodalHashes2, multimodalPositions2, multimodalLengths2,
+        multimodalHashes2, multimodalPositions2, multimodalLengths2,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
 
     GenerationRequest seq2{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -1632,15 +1614,13 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithMultimodalHashTest)
         = std::make_shared<std::vector<SizeType32>>(std::vector<SizeType32>{2, 2}); // Length 2 tokens
 
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, multimodalHashes3, multimodalPositions3, multimodalLengths3,
+        multimodalHashes3, multimodalPositions3, multimodalLengths3,
         /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
-        /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
-        /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt,
+        /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
+        /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt);
     GenerationRequest seq3{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     // reuse block 0, get new blocks 6 and 7
@@ -1711,8 +1691,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     auto const inputLength = static_cast<SizeType32>(inputTokens->size());
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId);
     GenerationRequest seq0{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1749,8 +1728,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // inputTokens = (0, 1, 2, 3, 4, 5, 6, 7, 8)
     requestId = 1;
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
 
@@ -1782,8 +1760,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     // reuse blocks 0, 1 and get recycled block 3
     GenerationRequest seq0_dup{10, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest0 = std::make_shared<LlmRequest>(seq0_dup.getRequestId(), maxNewTokens, inputTokens, samplingConfig,
-        isStreaming, /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        isStreaming, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt, loraTaskId);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
@@ -1809,8 +1786,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     auto inputTokens1 = std::make_shared<VecTokens>(llmRequest1->getTokens(0));
     GenerationRequest seq1_dup{11, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest1 = std::make_shared<LlmRequest>(seq1_dup.getRequestId(), maxNewTokens, inputTokens1, samplingConfig,
-        isStreaming, /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        isStreaming, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt, loraTaskId);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
@@ -1844,8 +1820,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     loraTaskId = static_cast<LlmRequest::LoraTaskIdType>(1);
     requestId = 2;
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId);
 
     numTokens = llmRequest2->getNumTokens(beamIdx);
@@ -1878,8 +1853,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     auto inputTokens3 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11});
     requestId = 3;
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens3, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId);
 
     numTokens = llmRequest3->getNumTokens(beamIdx);
@@ -1913,8 +1887,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
     auto inputTokens4 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4});
     requestId = 4;
     auto llmRequest4 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens4, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId);
 
     numTokens = llmRequest4->getNumTokens(beamIdx);
@@ -1943,9 +1916,7 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithLoraTaskIdTest)
 
     // add request with same tokens as request0 but without loraTaskId
     requestId = 5;
-    auto llmRequest5 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt);
+    auto llmRequest5 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
 
     numTokens = llmRequest5->getNumTokens(beamIdx);
     GenerationRequest seq5{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2014,14 +1985,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     LlmRequest::LoraTaskIdType loraTaskId1{1};
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds);
 
@@ -2059,14 +2027,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     requestId = 1;
     LlmRequest::LoraTaskIdType loraTaskId2 = static_cast<LlmRequest::LoraTaskIdType>(2);
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId2, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds);
     GenerationRequest seq1{requestId, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
@@ -2097,14 +2062,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     // add both requests again and then remove them
     GenerationRequest seq0_dup{10, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest0 = std::make_shared<LlmRequest>(seq0_dup.getRequestId(), maxNewTokens, inputTokens, samplingConfig,
-        isStreaming, /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        isStreaming, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds);
     promptLen0 = llmRequest0->getNumTokens(beamIdx);
     numContextBlocks0 = tc::ceilDiv(promptLen0, blockManager.getTokensPerBlock());
@@ -2128,14 +2091,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     inputTokenExtraIds1->push_back(0);
     GenerationRequest seq1_dup{11, inputLength, beamWidth, blockManager.getWindowSizesMetadata()};
     llmRequest1 = std::make_shared<LlmRequest>(seq1_dup.getRequestId(), maxNewTokens, inputTokens1, samplingConfig,
-        isStreaming, /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        isStreaming, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt,
         /*multimodalUuids=*/std::nullopt, loraTaskId2, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, inputTokenExtraIds1);
     promptLen1 = llmRequest1->getNumTokens(beamIdx);
     numContextBlocks1 = tc::ceilDiv(promptLen1, blockManager.getTokensPerBlock());
@@ -2165,14 +2126,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     auto inputTokenExtraIds2 = std::make_shared<VecTokenExtraIds>(VecTokenExtraIds{4, 4, 5, 5, 6, 6, 0, 0, 0});
     requestId = 2;
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds2);
 
@@ -2200,14 +2158,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     auto inputTokenExtraIds3 = std::make_shared<VecTokenExtraIds>(VecTokenExtraIds{1, 1, 2, 2, 4, 4, 0, 0, 0});
     requestId = 3;
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId1, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds3);
 
@@ -2234,14 +2189,11 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithExtraIdAndLoraTaskIdTest)
     // add request with partial different extra ids and loraTaskId 2
     requestId = 4;
     auto llmRequest4 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt, loraTaskId2, /*loraWeights=*/std::nullopt,
         /*loraConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-        /*returnLogProbs=*/false, /*returnContextLogits=*/false, /*returnGenerationLogits=*/false,
         /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false, /*encoderInputTokens=*/std::nullopt,
-        /*returnEncoderOutput=*/false,
-        /*priority=*/0.5, /*encoderInputFeatures=*/std::nullopt,
+        /*priority=*/0.5, /*encoderInputLength=*/std::nullopt,
         /*encoderOutputLength=*/std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
         inputTokenExtraIds3);
 
@@ -2317,14 +2269,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
     // Test Case 1: Request without cache_salt
     LlmRequest::RequestIdType requestId{0};
     auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt,
@@ -2365,14 +2315,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
     requestId = 1;
     std::string const cacheSalt1{"tenant-A"};
     auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
@@ -2409,14 +2357,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
     // Test Case 3: Request with same tokens and same cache_salt = "tenant-A"
     requestId = 2;
     auto llmRequest2 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
@@ -2454,14 +2400,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
     requestId = 3;
     std::string const cacheSalt2{"tenant-B"};
     auto llmRequest3 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt, /*agent_hierarchy=*/std::nullopt,
@@ -2492,14 +2436,12 @@ TEST_F(KVCacheManagerTest, BlockManagerReuseWithCacheSaltTest)
     // Test Case 5: Request without cache_salt again
     requestId = 4;
     auto llmRequest4 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming,
-        /*promptEmbeddingTable=*/std::nullopt,
-        /*promptVocabSize=*/std::nullopt, /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
+        /*multimodalHashes=*/std::nullopt, /*multimodalPositions=*/std::nullopt,
         /*multimodalLengths=*/std::nullopt, /*multimodalUuids=*/std::nullopt,
         /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt, /*loraConfig=*/std::nullopt,
-        /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false, /*returnContextLogits=*/false,
-        /*returnGenerationLogits=*/false, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
-        /*encoderInputTokens=*/std::nullopt, /*returnEncoderOutput=*/false, /*priority=*/0.5,
-        /*encoderInputFeatures=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
+        /*kvCacheRetentionConfig=*/std::nullopt, /*draftTokens=*/std::nullopt, /*excludeInputFromOutput=*/false,
+        /*encoderInputTokens=*/std::nullopt, /*priority=*/0.5,
+        /*encoderInputLength=*/std::nullopt, /*encoderOutputLength=*/std::nullopt,
         LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, /*inputTokenExtraIds=*/std::nullopt,
         /*returnPerfMetrics=*/false,
         /*contextPhaseParams=*/std::nullopt, /*arrivalTime=*/std::nullopt,
@@ -8569,43 +8511,6 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchPreservesDraftTokensOnFinalContextAft
     EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(requestId, req)));
 }
 
-TEST_F(KVCacheManagerTest, AddSequenceBatchPreservesContextLogitsAfterReuse)
-{
-    auto const stream = std::make_shared<tr::CudaStream>();
-    auto mgr = makeBatchTestKVCacheManager(stream);
-    auto constexpr promptLen = 9;
-    auto constexpr reusableLen = promptLen - 1;
-    auto constexpr beamWidth = 1;
-    auto const inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
-    tle::SamplingConfig const samplingConfig{beamWidth};
-
-    auto seedReq = std::make_shared<LlmRequest>(
-        LlmRequest::RequestIdType{0}, SizeType32{1}, inputTokens, samplingConfig, /*isStreaming=*/false);
-    mgr->addSequenceBatch({{{0, promptLen, beamWidth}}}, {std::ref(*seedReq)});
-    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*seedReq);
-    (void) mgr->removeSequence(0, seedReq);
-
-    tle::OutputConfig outputConfig;
-    outputConfig.returnContextLogits = true;
-    tle::Request executorRequest(
-        *inputTokens, /*maxTokens=*/1, /*streaming=*/false, tle::SamplingConfig{}, outputConfig);
-    auto req = std::make_shared<LlmRequest>(LlmRequest::RequestIdType{1}, executorRequest);
-    auto const semanticState = req->getState();
-    auto const semanticType = req->getLlmRequestType();
-
-    mgr->addSequenceBatch({{{1, promptLen, beamWidth}}}, {std::ref(*req)});
-
-    EXPECT_EQ(req->getContextCurrentPosition(), reusableLen);
-    EXPECT_EQ(req->getContextRemainingLength(), 1);
-    EXPECT_EQ(req->getContextChunkSize(), 1);
-    EXPECT_TRUE(req->getReturnContextLogits());
-    EXPECT_EQ(req->getState(), semanticState);
-    EXPECT_EQ(req->getLlmRequestType(), semanticType);
-
-    tensorrt_llm::testing::KvCacheManagerTestUtil::simulatePrefillCompletion(*req);
-    EXPECT_NO_THROW(static_cast<void>(mgr->removeSequence(1, req)));
-}
-
 TEST_F(KVCacheManagerTest, AddSequenceBatchOnboardsOffloadedPrefixForFinalContextToken)
 {
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -8716,8 +8621,7 @@ TEST_F(KVCacheManagerTest, AddSequenceBatchLeavesOneFinalMultimodalContextTokenA
     auto const makeRequest = [&](LlmRequest::RequestIdType reqId, SizeType32 maxNewTokens)
     {
         return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false,
-            /*promptEmbeddingTable=*/std::nullopt,
-            /*promptVocabSize=*/std::nullopt, multimodalHashes, multimodalPositions, multimodalLengths,
+            multimodalHashes, multimodalPositions, multimodalLengths,
             /*multimodalUuids=*/std::nullopt);
     };
 

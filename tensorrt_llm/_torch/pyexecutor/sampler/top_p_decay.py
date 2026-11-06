@@ -156,20 +156,15 @@ class TopPDecayHandler:
         # Eagle3 / MTP-Eagle, SA, draft-target-one-model) uses its own
         # SpecSampler and never reaches TorchSampler; the
         # drafter-based modes that DO flow draft tokens through TorchSampler
-        # (two-model draft-target, NGram, user-provided, two-model Eagle3 /
-        # MTP-Eagle) are what can make this length non-zero. top-p decay does not
-        # support these multi-token steps.
+        # (NGram, user-provided) are what can make this length non-zero. top-p
+        # decay does not support these multi-token steps.
         # NB: at admission time the draft tokens of drafter-based modes are
-        # usually not attached yet, so this check is best-effort. Two-model
-        # speculation (the only source of such requests in TorchSampler) is
-        # slated for removal, so in practice no speculative request reaches the
-        # decay path.
+        # usually not attached yet, so this check is best-effort.
         if get_draft_token_length(request) > 0:
             raise ValueError(
                 "top_p_decay is not supported for requests carrying speculative "
                 "draft tokens (req_num_steps > 1). This covers the drafter-based "
-                "modes routed through TorchSampler (two-model draft-target, NGram, "
-                "user-provided, two-model Eagle3 / MTP-Eagle); one-model "
+                "modes routed through TorchSampler (NGram, user-provided); one-model "
                 "speculation uses its own sampler and is unaffected."
             )
 

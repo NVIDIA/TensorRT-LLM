@@ -34,6 +34,7 @@ aux_stream_name_list = [
     'MlaIndexer',
     'MlaIndexerAux',
     'MlaCompressor',
+    'MoeSharedGate',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -49,6 +50,17 @@ EventType = Enum(
 def is_gdn_replay_enabled() -> bool:
     """Return whether GDN replay is enabled (default: enabled)."""
     return os.environ.get("TRTLLM_USE_GDN_REPLAY", "1") == "1"
+
+
+def is_gdn_flashinfer_replay_enabled() -> bool:
+    """Return whether GDN replay may use the FlashInfer ring kernel (default: disabled)."""
+    return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY",
+                          "0") in ("1", "force")
+
+
+def is_gdn_flashinfer_replay_required() -> bool:
+    """Return whether ineligible FlashInfer GDN replay must raise instead of falling back."""
+    return os.environ.get("TRTLLM_USE_GDN_FLASHINFER_REPLAY", "0") == "force"
 
 
 # IMPORTANT: Keep the same order of activation functions in this enum and the enum in
@@ -460,11 +472,13 @@ def deep_gemm_jit_warmup_buckets(max_m: int):
     return tuple(low) + tuple(dense) + (max_m, )
 
 
-def fp4_scale_infer_shape(input_shapes: List[List[int]]) -> int:
+def fp4_scale_infer_shape(input_shapes: List[List[int]],
+                          sf_vec_size: int = 16) -> int:
     """Calculate the swizzled scale size for a packed FP4 input tensor."""
     unpacked_shape = list(input_shapes[0])
     unpacked_shape[-1] *= 2
-    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape, sf_vec_size=16)
+    _, scale_shape = fp4_utils.get_fp4_shape(unpacked_shape,
+                                             sf_vec_size=sf_vec_size)
     return scale_shape
 
 

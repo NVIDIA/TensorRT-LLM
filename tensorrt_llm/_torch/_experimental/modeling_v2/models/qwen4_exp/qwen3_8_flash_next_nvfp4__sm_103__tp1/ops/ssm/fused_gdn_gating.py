@@ -51,90 +51,19 @@ class FusedGdnGating(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: rows (or num_decodes x draft); layout "contiguous" | "target_rows"
-    # (the decode rows of a contiguous [T, 48] `a` projection, past T - rows
-    # prefill rows) | "ba_column_half" (the stock mixer's [:, 48:] of [T, 96])
-    # | "ba_row_and_column" (a row slice of that); a_dtype, param_dtype,
-    # num_heads, beta, threshold, a_scale, fill (constant a), overlong.
+    # spec: rows; layout "contiguous" | "target_rows" (the decode rows of a
+    # contiguous [T, 48] `a` projection, past T - rows prefill rows); fill
+    # (constant a). `a` bf16, softplus beta 1.0, threshold 20 throughout.
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"target verify call: {b} seqs x {p} tokens, contiguous a",
-                spec=dict(rows=b * p),
-            )
-            for b, p in ((1, 2), (4, 2), (8, 2), (8, 4), (32, 2))
-        )
-        + (
-            Cell(
-                why="target mixed verify: decode rows of a [T, 48] projection",
-                spec=dict(rows=16, layout="target_rows"),
-            ),
-            Cell(
-                why="stock mixer: a = ba[:, 48:], row stride 96",
-                spec=dict(rows=16, layout="ba_column_half"),
-            ),
-            Cell(
-                why="stock mixer mixed batch: ba[48:, 48:], offset row slice",
-                spec=dict(rows=16, layout="ba_row_and_column"),
-            ),
-        )
-        + tuple(
-            Cell(why=f"{n} token rows{note}", spec=dict(rows=n))
-            for n, note in (
-                (1, ""),
-                (37, ""),
-                (512, ""),
-                (4096, ": prefill-sized"),
-            )
-        )
-        + tuple(
-            Cell(
-                why=f"a in {str(d).removeprefix('torch.')}",
-                spec=dict(rows=64, a_dtype=d),
-            )
-            for d in (torch.float16, torch.float32)
-        )
-        + tuple(
-            Cell(
-                why=f"A_log/dt_bias in {str(d).removeprefix('torch.')}",
-                spec=dict(rows=64, param_dtype=d),
-            )
-            for d in (torch.bfloat16, torch.float16)
-        )
-        + tuple(
-            Cell(
-                why=f"{h} heads: the 8-wide head block's masked tail",
-                spec=dict(rows=7, num_heads=h),
-            )
-            for h in (1, 5, 8, 12, 100)
-        )
-        + tuple(
-            Cell(
-                why=f"softplus beta {beta}, threshold {threshold:g}{note}",
-                spec=dict(rows=96, beta=beta, threshold=threshold, a_scale=4.0),
-            )
-            for beta, threshold, note in (
-                (1.0, 20.0, ""),
-                (0.5, 20.0, ""),
-                (2.0, 20.0, ""),
-                (1.0, 0.0, ": nearly all on the linear branch"),
-                (1.0, 1e9, ": all on the log branch"),
-            )
-        )
-        + tuple(
-            Cell(
-                why=f"a = {value:g}: linear branch; exp(x) is evaluated, inf never leaks",
-                spec=dict(rows=4, fill=value, a_dtype=torch.float32),
-            )
-            for value in (50.0, 88.0, 200.0, 1e4)
-        )
-        + (
-            Cell(
-                why="A_log/dt_bias longer than num_heads: tail never read",
-                spec=dict(rows=32, overlong=16),
-            ),
-            Cell(why="zero rows: an empty [0, 48] fp32 tensor", spec=dict(rows=0)),
-        )
+        Cell(why="target verify call: 32 seqs x 2 tokens, contiguous a", spec=dict(rows=64)),
+        Cell(
+            why="target mixed verify: decode rows of a [T, 48] projection",
+            spec=dict(rows=16, layout="target_rows"),
+        ),
+        Cell(
+            why="a = 200: linear branch; exp(x) is evaluated, inf never leaks",
+            spec=dict(rows=4, fill=200.0),
+        ),
     )
 
     note = """
@@ -143,15 +72,18 @@ class FusedGdnGating(OpWrapper):
     Call site (`_gdn_verify`): `(A_log, a_d, dt_bias, 1.0, 20.0)` with `a_d`
     the `[n * p, 48]` bf16 decode rows of the `a` projection (all of it on a
     pure verify step) and fp32 `A_log` / `dt_bias`; `g` is then reshaped to
-    `[n, p, 48]` for `fused_recurrent_gated_delta_rule_update`.
+    `[n, p, 48]` for `fused_recurrent_gated_delta_rule_update`. Certified at
+    that call: 32 sequences of 2 tokens, the 16 decode rows of a mixed step's
+    `[T, 48]` projection, and `a = 200` (the softplus's linear branch, where
+    `exp` overflows).
 
     Raise loudly, so not guarded: a non-2-D `a` (`ValueError` unpacking
     `a.shape`), CPU tensors (`ValueError: Pointer argument cannot be accessed
     from Triton`).
 
-    `a`'s row stride is free (consumed in place, bitwise equal to a packed
-    copy); everything else is addressed without strides. `is_valid` guards the
-    three violations measured to return a finite wrong `g`: a stride-2 A_log
+    `a`'s row stride is honoured (a row is read at `row * a.stride(0)`; the
+    target passes contiguous rows); everything else is addressed without
+    strides. `is_valid` guards the three violations measured to return a finite wrong `g`: a stride-2 A_log
     view moved g by 6.031e+01 and a stride-2 dt_bias by 3.832e-01; 40-element
     A_log / dt_bias against 48 heads moved it by 1.009e+02 / 1.010e+02 (the
     per-head load is masked against `a.shape[1]` only); an `a` with head

@@ -33,6 +33,11 @@ from cuda.bindings import driver
 
 import tensorrt_llm
 from tensorrt_llm._torch.distributed import Distributed
+from tensorrt_llm._torch.nccl_window_graph import (
+    abandon_nccl_window_graph_owner, nccl_window_allocation_suppressed,
+    nccl_window_graph_capture, release_nccl_window_graph_owner)
+from tensorrt_llm._torch.nccl_window_tensor_scope import \
+    nccl_window_tensor_scope
 from tensorrt_llm._utils import confidential_compute_enabled, nvtx_range
 from tensorrt_llm.bindings.internal.runtime import (delay_kernel,
                                                     record_global_timer)
@@ -965,6 +970,11 @@ class AutoTuner:
         # Last captured choose_one() contexts
         self._last_capture: Optional['AutoTuner.TacticsCapture'] = None
 
+        # CUDA graph memory pool shared by the profiling captures of one
+        # choose_one() tuning pass (see _shared_profile_graph_pool).
+        self._profile_graph_pool: Optional[torch.cuda.MemPool] = None
+        self._profile_graph_pool_depth = 0
+
         # Dsitributed tuning state
         self._dist: Optional[Distributed] = None
         self._has_received_cache: bool = False
@@ -1212,22 +1222,24 @@ class AutoTuner:
         # Synchronize ranks before profiling
         if self._should_current_rank_tune(
                 tuning_config.distributed_tuning_strategy):
-            for p in profiles:
-                tensors = self._prepare_input_tensors(p, inputs)
-                is_cache_hit, *_ = self.profiling_cache.search_cache(
-                    custom_op,
-                    runners,
-                    p.get_opt_shapes(),
-                    tuning_config,
-                    apply_map_to_tuning_buckets=False,
-                )
-                if not is_cache_hit:
-                    # Initialize runner and tactic as None in case of no valid tactic or runners are found
-                    with nvtx_range(f"{custom_op}, shape {p.get_opt_shapes()}"):
-                        best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
-                            custom_op, runners, tensors, p, tuning_config,
-                            **kwargs)
-                    new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
+            with self._shared_profile_graph_pool():
+                for p in profiles:
+                    tensors = self._prepare_input_tensors(p, inputs)
+                    is_cache_hit, *_ = self.profiling_cache.search_cache(
+                        custom_op,
+                        runners,
+                        p.get_opt_shapes(),
+                        tuning_config,
+                        apply_map_to_tuning_buckets=False,
+                    )
+                    if not is_cache_hit:
+                        # Initialize runner and tactic as None in case of no valid tactic or runners are found
+                        with nvtx_range(
+                                f"{custom_op}, shape {p.get_opt_shapes()}"):
+                            best_runner_id, best_tactic, min_time, has_tuning_failure_occurred = self._profile_runners(
+                                custom_op, runners, tensors, p, tuning_config,
+                                **kwargs)
+                        new_tuning_failure_occurred = new_tuning_failure_occurred or has_tuning_failure_occurred
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
@@ -1327,6 +1339,29 @@ class AutoTuner:
         tuning_config: TuningConfig,
         **kwargs,
     ) -> float:
+        # PARALLEL ranks profile different tactics, so window requests here would diverge the
+        # per-rank pools and let a later request register a window collectively on some ranks only.
+        window_guard = (nccl_window_allocation_suppressed()
+                        if tuning_config.distributed_tuning_strategy
+                        == DistributedTuningStrategy.PARALLEL
+                        and self._is_distributed() else
+                        contextlib.nullcontext())
+        with window_guard, nccl_window_tensor_scope(input_tensors) as scope:
+            scope.escape(input_tensors)
+            if tuning_config.inputs_pre_hook is not None:
+                input_tensors = tuning_config.inputs_pre_hook(input_tensors)
+            return self._profile_runners_impl(custom_op, runners, input_tensors,
+                                              profile, tuning_config, **kwargs)
+
+    def _profile_runners_impl(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        input_tensors: List[torch.Tensor],
+        profile: OptimizationProfile,
+        tuning_config: TuningConfig,
+        **kwargs,
+    ) -> float:
         """Profile runners and select the best tactic.
 
         For multi-rank profiling, only rank 0 performs the actual profiling
@@ -1337,10 +1372,6 @@ class AutoTuner:
         min_time = float('inf')
         has_tuning_failure_occurred = False
         best_runner_id, best_tactic = None, None
-        # If the inputs_pre_hook is provided, it will be called before profiling.
-        if tuning_config.inputs_pre_hook is not None:
-            input_tensors = tuning_config.inputs_pre_hook(input_tensors)
-
         # Pre-walk the runners so we know the total candidate (runner, tactic)
         # pair count before deciding whether to short-circuit profiling. The
         # count is taken BEFORE distributed-strategy splitting; the PARALLEL
@@ -1382,7 +1413,8 @@ class AutoTuner:
                 runner(input_tensors, tactic=-1, do_preparation=True, **kwargs)
             try:
                 with nvtx_range(f"r{runner_id}, tactic {tac} (single-pair)"):
-                    runner(input_tensors, tactic=tac, **kwargs)
+                    self._run_profile_runner(runner, input_tensors, tac,
+                                             **kwargs)
                 best_runner_id, best_tactic = runner_id, tac
                 # No comparable measurement exists; min_time stays 0.0 to
                 # distinguish "recorded without profiling" from a real
@@ -1511,6 +1543,17 @@ class AutoTuner:
 
         return best_runner_id, best_tactic, min_time, has_tuning_failure_occurred
 
+    @staticmethod
+    def _run_profile_runner(runner: TunableRunner, inputs: List[torch.Tensor],
+                            tactic: Any, **kwargs) -> None:
+        with nccl_window_tensor_scope(inputs) as scope:
+            try:
+                runner(inputs, tactic=tactic, **kwargs)
+            finally:
+                # Profiling inputs outlive each candidate run; everything newly
+                # allocated by the runner is an internal, discarded result.
+                scope.escape(inputs)
+
     def _get_input_sizes(self, inputs: List[torch.Tensor]) -> List[torch.Size]:
 
         # Handle None tensors for optional inputs and non-Tensor scalar values
@@ -1520,6 +1563,34 @@ class AutoTuner:
         ]
 
         return sizes
+
+    @contextlib.contextmanager
+    def _shared_profile_graph_pool(self):
+        """Let the profiling captures in this scope share one CUDA graph memory pool.
+
+        Every profiling capture is reset before the next one starts. With a pool
+        per capture, each reset drops that pool and the next capture maps its
+        memory again, which under expandable segments costs milliseconds per
+        capture. A shared pool keeps the freed blocks cached for the next
+        capture. The pool is dropped when the outermost scope exits, so its
+        memory is not held across forward passes.
+        """
+        self._profile_graph_pool_depth += 1
+        try:
+            yield
+        finally:
+            self._profile_graph_pool_depth -= 1
+            if self._profile_graph_pool_depth == 0:
+                self._profile_graph_pool = None
+
+    def _profile_graph_pool_handle(self) -> Tuple[int, int]:
+        """Pool handle for one profiling capture: the shared pool inside
+        _shared_profile_graph_pool, otherwise a new pool."""
+        if self._profile_graph_pool_depth == 0:
+            return torch.cuda.graph_pool_handle()
+        if self._profile_graph_pool is None:
+            self._profile_graph_pool = torch.cuda.MemPool()
+        return self._profile_graph_pool.id
 
     def _profile_single_kernel(
         self,
@@ -1558,6 +1629,29 @@ class AutoTuner:
         def pure_profile(stream: torch.cuda.Stream, repeat: int):
             graph = torch.cuda.CUDAGraph()
 
+            @contextlib.contextmanager
+            def graph_pool_lifetime():
+                if not use_cuda_graph:
+                    yield None
+                    return
+                graph_pool = self._profile_graph_pool_handle()
+                completed = False
+                try:
+                    yield graph_pool
+                    completed = True
+                finally:
+                    graph.reset()
+                    # The NCCL-window owner stays per capture even when the
+                    # memory pool is shared: a later capture of the same pool
+                    # gets a new owner.
+                    if completed:
+                        release_nccl_window_graph_owner(graph_pool)
+                    else:
+                        # Local profiling failures need not occur on every rank.
+                        abandon_nccl_window_graph_owner(graph_pool)
+                        # Do not capture into a pool a failed capture used.
+                        self._profile_graph_pool = None
+
             if self._use_global_timer:
                 start_ts = torch.empty(1, dtype=torch.int64, device='cuda')
                 end_ts = torch.empty(1, dtype=torch.int64, device='cuda')
@@ -1585,14 +1679,15 @@ class AutoTuner:
                 def elapsed_time():
                     return start_evt.elapsed_time(end_evt)
 
-            with torch.cuda.stream(stream):
+            with graph_pool_lifetime() as graph_pool, torch.cuda.stream(stream):
                 if use_cuda_graph:
-                    with torch.cuda.graph(graph):
+                    with nccl_window_graph_capture(graph, graph_pool):
                         for r in range(repeat):
-                            runner(
+                            self._run_profile_runner(
+                                runner,
                                 input_tensor_batches[r %
                                                      len(input_tensor_batches)],
-                                tactic=tactic,
+                                tactic,
                                 **kwargs,
                             )
 
@@ -1613,9 +1708,10 @@ class AutoTuner:
                     graph.replay()
                 else:
                     for r in range(repeat):
-                        runner(
+                        self._run_profile_runner(
+                            runner,
                             input_tensor_batches[r % len(input_tensor_batches)],
-                            tactic=tactic,
+                            tactic,
                             **kwargs,
                         )
 
@@ -1626,7 +1722,8 @@ class AutoTuner:
 
         # warm up, no timing
         for _ in range(self.warmup):
-            runner(input_tensor_batches[-1], tactic=tactic, **kwargs)
+            self._run_profile_runner(runner, input_tensor_batches[-1], tactic,
+                                     **kwargs)
 
         fewer_repeat_avg_time = pure_profile(stream, profile_fewer_repeat)
 
@@ -2163,8 +2260,8 @@ class AutoTuner:
             return True
 
         if strategy == DistributedTuningStrategy.BROADCAST:
-            # Only rank 0 tunes
-            return self.mapping.rank == 0
+            # Only the tuning group's root (the broadcast root) tunes
+            return self._tuning_group()[1] == 0
         elif strategy in {
                 DistributedTuningStrategy.INDEPENDENT,
                 DistributedTuningStrategy.MERGE,

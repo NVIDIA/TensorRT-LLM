@@ -20,24 +20,14 @@ from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import Arch, Cell
 #: bool and floating dtypes and answers wrongly with them.
 _INTEGER_DTYPES = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
 
-#: Batch shapes this checkpoint's serving path produces. ``p`` is the trunk's
-#: query rows per generation request: 1 unspeculated, ``1 + runtime_draft_len``
-#: under MTP (2 at this checkpoint's one MTP layer).
+#: Batch shapes this checkpoint's serving path produces where it calls this entry.
+#: ``p`` is the trunk's query rows per generation request, ``1 + runtime_draft_len``
+#: under MTP (2..8: `max_draft_len` 1..7); at ``p = 1`` the target reuses the
+#: recurrent metadata's vector instead.
 BATCHES = {
-    "single_prefill": (4096,),
-    "decode_p1": (1,) * 32,
-    "decode_p2": (2,) * 32,
-    "mixed_p1": (1024, 37, 1, 1, 1, 1),
     "mixed_p2": (1024, 37, 2, 2, 2, 2),
-    "chunked_prefill_p2": (512, 512, 96, 2, 2, 2, 2, 2, 2, 2),
     "padded_decode_p2": (2, 2, 2, 0, 0, 0),
-    "one_sequence": (7,),
-    "max_batch": (2,) * 256,
 }
-
-
-def _name(dtype: torch.dtype) -> str:
-    return str(dtype).removeprefix("torch.")
 
 
 class CuSeqlensFromSeqLens(OpWrapper):
@@ -52,54 +42,31 @@ class CuSeqlensFromSeqLens(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # spec: lengths, in_dtype, out_dtype; `layout` "contiguous" (default),
+    # spec: lengths, in_dtype, out_dtype; `layout` "contiguous" (default) or
     # "prefix" (the first len(lengths) of a longer buffer -- the call site's
-    # `split(seq_lens_cuda, [batch, ...])[0]`), or "strided" (a [::2] view).
+    # `seq_lens_cuda[:batch]`).
     CELLS: tuple[Cell, ...] = (
-        tuple(
-            Cell(
-                why=f"{name} {_name(i)}->{_name(o)}",
-                spec=dict(lengths=lengths, in_dtype=i, out_dtype=o),
-            )
-            for name, lengths in BATCHES.items()
-            for i in (torch.int32, torch.int64)
-            for o in (torch.int32, torch.int64)
-        )
-        + (
-            Cell(
-                why="call site: prefix of seq_lens_cuda, int32->int64",
-                spec=dict(
-                    lengths=BATCHES["mixed_p2"],
-                    in_dtype=torch.int32,
-                    out_dtype=torch.int64,
-                    layout="prefix",
-                ),
+        Cell(
+            why="call site: prefix of seq_lens_cuda, int32->int64",
+            spec=dict(
+                lengths=BATCHES["mixed_p2"],
+                in_dtype=torch.int32,
+                out_dtype=torch.int64,
+                layout="prefix",
             ),
-            Cell(
-                why="non-contiguous [::2] seq_lens view",
-                spec=dict(
-                    lengths=(7, 1, 13),
-                    in_dtype=torch.int32,
-                    out_dtype=torch.int32,
-                    layout="strided",
-                ),
+        ),
+        Cell(
+            why="MTP verify p=8, 32 requests: prefix int32->int64",
+            spec=dict(
+                lengths=(8,) * 32, in_dtype=torch.int32, out_dtype=torch.int64, layout="prefix"
             ),
-            Cell(
-                why="zero-length rows give repeated offsets",
-                spec=dict(lengths=(0, 5, 0, 0, 3, 0), in_dtype=torch.int32, out_dtype=torch.int32),
+        ),
+        Cell(
+            why="padded_decode_p2: zero-length padded rows, int32->int64",
+            spec=dict(
+                lengths=BATCHES["padded_decode_p2"], in_dtype=torch.int32, out_dtype=torch.int64
             ),
-            Cell(
-                why="empty batch returns [0]",
-                spec=dict(lengths=(), in_dtype=torch.int32, out_dtype=torch.int32),
-            ),
-        )
-        + tuple(
-            Cell(
-                why=f"narrow {_name(d)} input does not limit the accumulator",
-                spec=dict(lengths=(200, 200, 200), in_dtype=d, out_dtype=torch.int32),
-            )
-            for d in (torch.uint8, torch.int16)
-        )
+        ),
     )
 
     note = """
@@ -118,9 +85,15 @@ class CuSeqlensFromSeqLens(OpWrapper):
     `dtype` has no default: `causal_conv1d_fwd` requires int32 and
     `chunk_gated_delta_rule` keys its autotuner on `cu_seqlens`' dtype.
 
-    CUDA-graph capture is certified (only `seq_lens.shape[0]` reaches Python;
-    a captured graph follows lengths rewritten in place). Three launches, about
-    0.03 ms at batch 8..256 -- launch bound.
+    Certified bitwise at the call site's prefix view of `seq_lens_cuda` (a
+    mixed step at p 2, and the p 8 verify of 32 requests) and at a decode
+    batch padded with zero-length rows, int32 in and int64 out. CUDA-graph
+    capture is certified (only `seq_lens.shape[0]` reaches Python; a captured
+    graph follows lengths rewritten in place). Three launches, about 0.03 ms
+    at batch 8..256 -- launch bound.
+
+    Not certified: a `seq_lens` dtype other than int32 (the guard admits any
+    integer dtype), a non-contiguous `seq_lens` view.
 
     Hard limits
       out[-1]  accumulated in `dtype`  boundary 2^31 - 1 for int32

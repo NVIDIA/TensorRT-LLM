@@ -1,244 +1,152 @@
 # MoE Canonical Code Examples
 
-Use this reference to find concrete implementation patterns before designing,
-editing, or reviewing MoE code. Open only the section relevant to the change and
-then inspect the actual repository files.
+Where to look for each pattern before designing, editing, or reviewing MoE
+code. Open only the section relevant to the change, then read the actual files.
+The rules themselves live in `MOE_DEVELOPER_GUIDE.md` and the skill; this file
+only names the code that demonstrates them. Paths are relative to
+`tensorrt_llm/_torch/moe/fused_moe/` unless shown in full.
 
 ## ConfigurableMoE Assembler
 
-Use these examples to understand wrapper-level lifecycle and composition:
-
-- `tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py`
+- `configurable_moe.py`
   - `ConfigurableMoE.__init__`: backend construction, communication creation,
-    chunking-related wrapper state, validation, DWDP setup, and weight-removal
-    lifecycle.
+    chunking-related wrapper state, validation, DWDP setup, weight-removal
+    lifecycle, and the scheduler constructed last.
   - `_create_and_sync_backend`: backend construction and wrapper/backend attr
     synchronization.
-  - `_create_comm_strategy_auto`: communication strategy creation or bypass when
-    the backend owns cross-rank exchange.
-  - `forward_impl`: wrapper-level forward entry; should stay thin and delegate
-    to `self.scheduler.forward(...)`.
+  - `_create_comm_strategy_auto`: communication strategy creation, or `None`
+    when the backend owns cross-rank exchange.
+  - `forward_impl`: thin delegation to `self.scheduler.forward(...)`, then the
+    shared bookkeeping.
   - `validate_backend` / `validate_config`: capability and wrapper/backend
     compatibility checks.
-
-Good uses:
-
-- Add wrapper lifecycle once and delegate policy-heavy behavior out.
-- Keep backend-specific constraints in validation hooks or construction paths.
-
-Red flags:
-
-- New direct backend type checks in `forward_impl`.
-- Chunking, communication ordering, or EPLB hook sequencing added directly to
-  the wrapper instead of `moe_scheduler.py`.
-- Weight layout or communication protocol logic added directly to the wrapper.
+  - `determine_communication_method`: the one sanctioned way a scheduler
+    changes `moe.comm`.
 
 ## MoE Scheduler / Forward Execution
 
-Use these examples when changing forward policy, chunking, communication order,
-EPLB hook order, or fused-communication behavior:
-
-- `tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py`
+- `moe_scheduler.py`
   - `MoEScheduler`: abstract forward strategy.
-  - `ExternalCommMoEScheduler`: host-side communication path, chunking, adaptive
+  - `ExternalCommMoEScheduler`: host-side communication, chunking, adaptive
     quantize/dispatch ordering, communication fallback, multi-stream overlap,
     output truncation, and external-comm EPLB statistic paths.
-  - `FusedCommMoEScheduler`: MegaMoE-style fused-communication path, ADP
-    stripping, consistent per-rank chunk count, zero-token kernel launches,
-    no external `Communication`, `ignore_allreduce=False`, and backend
-    `run_moe` invocation.
+  - `FusedCommMoEScheduler`: fused-communication lockstep, ADP stripping,
+    consistent per-rank chunk count, zero-token kernel launches,
+    `ignore_allreduce=False`.
   - `create_moe_scheduler`: factory keyed by `backend.scheduler_kind`.
-- `tensorrt_llm/_torch/moe/fused_moe/interface.py`
-  - `MoESchedulerKind`: backend-declared selection axis for external vs fused
-    cross-rank exchange.
-- `tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py`
-  - Scheduler is constructed after backend/comm/chunking/DWDP state is ready;
-    wrapper `forward_impl` delegates and then runs shared lifecycle bookkeeping.
+- `interface.py`: `MoESchedulerKind`.
+- `tests/unittest/_torch/moe/test_moe_module.py`: module-level multi-GPU,
+  chunking, routing, and EPLB cases;
+  `tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py` for multi-GPU
+  all-to-all.
 
-Good uses:
+## Backend Selection And Identity
 
-- Put forward-time policy in `moe_scheduler.py`, leaving ConfigurableMoE as the
-  assembler and backends as compute/weight lifecycle owners.
-- Keep `repeat_idx` advancement and DWDP record in ConfigurableMoE, after the
-  scheduler returns.
-- Use `backend.scheduler_kind` to choose external-vs-fused communication path.
-- Call `backend.quantize_input(...)` and `backend.run_moe(...)`; keep
-  backend-specific kwargs centralized and narrow.
-- Preserve zero-token and per-chunk first/last semantics when changing chunking.
-
-Red flags:
-
-- Wrapper or backend reimplements chunk splitting, EPLB hook sequencing,
-  dispatch/combine ordering, or fused-communication lockstep.
-- Scheduler mutates `repeat_idx`, performs DWDP lifecycle work, calls weight
-  lifecycle hooks, or creates/destroys communication objects.
-- Fused-communication backend is forced through external `Communication` or a
-  normal backend bypasses communication factory selection.
-- Scheduler calls backend-specific compute helpers instead of `run_moe`.
+- `moe_resolution.py`: `resolve_moe_impl` builds `MoEProblem` and
+  `MoEDeployment`, walks `IMPL_PRIORITY` / `BACKEND_FAMILY` through
+  `_candidates_for`, and returns the report; `_UNRANKED` is the import-time
+  table check; `_reject_unsupported_activation` reads each candidate's
+  `activation_support`.
+- `impl_contract.py`: `MoEProblem` / `MoEDeployment` (everything a gate may
+  read, including `MoEProblem.routing`), `MoEEligibility`, `MoERejectReason`,
+  `MoEResolutionReport.degraded_from`, and the two halves of "a leaf is one
+  format": `check_quant_matches_identity` at selection,
+  `require_layer_quant_format` at `create_weights`.
+- `impl_environment.py`: `collect_moe_environment`, the one place that probes
+  SM, imports, and environment variables, and `override_moe_environment` for
+  tests.
+- `impl_identity.py`: `MoEImplId`, `MoEImplQuery`, `MOE_IMPL_REGISTRY`,
+  `register_moe_impl`.
+- `create_moe.py`: `create_moe_backend` matches with `issubclass`, so one
+  branch admits every leaf of a family (the CUTLASS branch also takes the B12x
+  leaves).
+- `tensorrt_llm/_torch/models/modeling_utils.py`:
+  `moe_experts_quant_config`, which every MoE model without a lookup of its own
+  (for example `Qwen3MoE` in `modeling_qwen3_moe.py`, `NemotronHMOE` in
+  `modeling_nemotron_h.py`) passes to `create_moe` as `override_quant_config`.
+- `tests/unittest/_torch/moe/test_moe_impl.py`: for example
+  `test_pinned_identity_fails_hard_where_the_backend_literal_degrades`,
+  `test_fp8_block_scales_leaves_admit_only_what_their_kernel_runs`,
+  `test_a_leaf_refuses_a_layer_whose_format_moved_after_it_was_picked`, and
+  the hand-listed `_SINGLE_FORMAT_IMPLS`.
 
 ## MoE Backend
 
-Use these examples to decide what belongs in a backend:
-
-- `tensorrt_llm/_torch/moe/fused_moe/interface.py`
-  - `MoE`: current transitional base contract shared by legacy standalone MoE
-    modules and newer ConfigurableMoE-compatible backends. A dedicated backend
-    interface is expected in the future; do not treat legacy `forward` methods
-    as the default pattern for new backend work.
-  - `can_implement`: capability gate returning `(bool, reason)`.
-  - `_supports_load_balancer`: backend EPLB capability.
-  - `validate_configurable_moe` when present: backend-specific wrapper
-    constraints.
-  - `create_weights`, `load_weights`, `post_load_weights`,
-    `process_weights_after_loading`, and `pre_reload_weights`:
-    backend-owned lifecycle entrypoints for module-level weight handling.
-  - `quant_method` and `_get_quant_method` in concrete backends: quantization
-    method selection and delegation.
-  - `quantize_input` and `run_moe`: backend-facing compute contract. For active
-    ConfigurableMoE-compatible backends, `run_moe` must be a concrete compute
-    entrypoint reached by the wrapper/scheduler. Alternate helpers such as
-    `run_with_prequant` should sit behind `run_moe`, not replace it.
-  - `forward` and `forward_impl`: legacy standalone-module entrypoints only;
-    avoid adding them to new ConfigurableMoE-compatible backends unless the user
-    explicitly requests that behavior.
-- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_cutlass.py`
-  - Reference backend for normal external communication and broad quant support.
-  - Inspect `_get_quant_method`, `create_weights`, `load_weights`, and
-    `post_load_weights` for the standard backend-to-quantization delegation
-    pattern.
-- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_trtllm_gen.py`
-  - Reference backend for TRTLLMGen-specific input/scale contracts.
-  - Inspect `_get_quant_method`, alignment validation, weight lifecycle
-    delegation, and quant scale usage.
-- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_deepgemm.py`
-  - Reference backend for DeepGEMM workspace and Blackwell FP8 block-scale path.
-- `tensorrt_llm/_torch/moe/fused_moe/fused_moe_densegemm.py` when present
-  - Reference for a direct `MoE` backend with dense GEMM constraints.
-  - Inspect backend-owned `create_weights`, `load_weights`, and
-    `post_load_weights` delegation.
-- `tensorrt_llm/_torch/moe/fused_moe/mega_moe/` when present
-  - Reference area for a backend whose kernel owns cross-rank exchange. Inspect
-    capability checks, load-balancer support, validation, weight lifecycle
-    delegation, `quantize_input`, and `run_moe`.
-
-Good uses:
-
-- Put kernel shape/dtype/quant constraints in `can_implement`.
-- Let the backend own the module-level weight lifecycle (`create_weights`,
-  `load_weights`, `post_load_weights`, `process_weights_after_loading`,
-  `pre_reload_weights`) and quantization-method selection, then delegate
-  quantization-specific tensor layout, loading details, post-load transforms,
-  and scale setup to `quant_method`.
-- Confirm `ConfigurableMoE` delegates wrapper weight lifecycle to the backend,
-  and the backend delegates tensor-layout details to the quantization method.
-- Implement backend compute through `quantize_input` and `run_moe`; read legacy
-  `forward` methods only as compatibility context unless the user explicitly
-  requests standalone module behavior. Treat an active backend with
-  `run_moe = NotImplementedError` plus wrapper calls to `run_with_prequant` as
-  a contract violation to fix or call out in the design.
-- Put backend-specific wrapper constraints in a narrow validation hook.
-- Keep host-side external communication out of backends unless the kernel truly
-  owns the exchange.
-
-Red flags:
-
-- New ConfigurableMoE-compatible backend implements `forward` or `forward_impl`
-  without explicit user request for legacy standalone behavior.
-- Wrapper or scheduler calls a backend-specific compute helper such as
-  `run_with_prequant` directly while the backend's `run_moe` is empty or unused.
-- Backend adds a new compute path but leaves `create_weights`, `load_weights`,
-  `post_load_weights`, `process_weights_after_loading`, `pre_reload_weights`,
-  or reload behavior inconsistent.
-- Backend bypasses an appropriate quantization method for layout-specific
-  weights, scales, or transformed-weight fixups.
-- Backend starts orchestrating external dispatch/combine or wrapper lifecycle.
-- Unsupported cases assert late in forward instead of returning clear skip/fall
-  back reasons through capability checks.
+- `impl_base.py`: `MoEImplBase` (four abstract methods, no `forward`) and
+  `apply_moe_impl_construction_state()`.
+- `impl_blocks.py`: `MoEExecutionContractMixin` (scheduler-facing
+  declarations, `validate_configurable_moe`, `forward_fake`),
+  `MoEWeightOwnerMixin` (the default lifecycle hooks, delegating to
+  `self.quant_method`), `MoEEplbWeightLayoutMixin`.
+- One class per identity: `fused_moe_deepgemm.py`
+  (`DeepgemmCudaFp8BlockScalesImpl`) and `cutedsl/dense_gemm.py`
+  (`TrtllmCutedslDenseGemmNvfp4Impl`).
+- Family root plus leaves:
+  - `cutlass/`: `CutlassFusedMoEBase` in `base.py` (construction, the
+    layer-format check in `create_weights`, the default `quantize_input` /
+    `run_moe`, `_run_fused_moe_op` configured per leaf by `FusedMoeOpFlags`,
+    and the `quantize_input` implementations several formats bind); one leaf
+    module per format, listed in `CUTLASS_LEAVES` in `__init__.py` next to
+    `find_cutlass_leaf` / `cutlass_leaf`; gates composed in `eligibility.py`.
+  - `trtllm_gen/`: per-kernel-ABI layers (`fp4_block_scale.py`,
+    `fp8_block_scale.py`) between `TrtllmGenFusedMoEBase` and the
+    `trtllm_<quant>.py` / `flashinfer_<quant>.py` leaves.
+  - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
+    four abstract methods and a leaf is an identity plus `can_implement`.
+  - `cutedsl/`: laid out like the id `trtllm.cutedsl.<kernel>.<quant>`.
+    `grouped_gemm/` holds `CuteDslFusedMoEBase` (construction, the
+    layer-format check in `create_weights`, the locality-domain plan, the
+    weight lifecycle) and its NVFP4 and BF16 leaves; the `_init_format_state`
+    and `_locality_domain_scale_shard` hooks and the leaf-declared
+    `_locality_domain_full_scale_params` carry what only one format needs.
+    The other kernels share only the package-level modules with it.
+- Inheriting another implementation: `fused_moe_cute_dsl_b12x.py`
+  (`CuteDslB12xNvfp4FusedMoE`, `CuteDslB12xFusedMoEBase`); the guide's B12x
+  note says what that inheritance costs.
+- `mega_moe/`: `FUSED_COMM` implementations; read capability checks,
+  validation, symmetric-memory allocation in `create_weights`,
+  `quantize_input`, and `run_moe`.
 
 ## Quantization And Weights
 
-Use these examples before adding any new weight handling. Pair this section with
-the backend section: backend owns the module-level lifecycle entrypoints and
-method selection; quantization owns the delegated tensor layout, loading
-details, transforms, and scale registration for a quantization layout:
-
-- `tensorrt_llm/_torch/moe/fused_moe/quantization.py`
-  - `FusedMoEMethodBase`: common weight create/load/post-load flow, shared weight
-    loading, EPLB hooks, and quant scale setup.
+- `quantization.py`
+  - `FusedMoEMethodBase`: common weight create/load/post-load flow, shared
+    weight loading, EPLB hooks, and quant scale setup.
   - `UnquantizedFusedMoEMethod`: simple supported-EPLB baseline.
-  - `FP8QDQFusedMoEMethod`: example of explicit unsupported-EPLB status and
-    scale setup.
+  - `FP8QDQFusedMoEMethod`: explicit unsupported-EPLB status and scale setup.
   - `DeepSeekFP8BlockScalesFusedMoEMethod`: FP8 block-scale loading and scale
     handling.
   - `NVFP4FusedMoEMethod`: NVFP4 weight layout, scale setup, and shared-weight
     registration patterns.
   - `MXFP4WeightFusedMoEMethod`: MXFP4 weight layout and online EPLB pattern.
-  - Backend-specific methods when present: reference for specialized transformed
-    weights.
-
-Good uses:
-
-- Backend lifecycle hooks surface the weight behavior; new quantization-specific
-  tensor layouts are represented as backend-selected quantization methods.
-- Existing method/base class is reused when tensor and scale semantics match.
-- `create_weights`, `load_weights`, `post_load_weights`, and
-  `setup_quant_scales` stay together for a quant layout.
-- Transformed weights needed by EPLB are registered through quantization-owned
-  fix-up hooks.
-
-Red flags:
-
-- Backend lifecycle hooks bypass an existing matching quantization abstraction
-  and hand-roll quantization-specific create/load/transform details inline.
-- Scales consumed by backend or communication are not registered in
-  `setup_quant_scales`.
+- Leaf `_get_quant_method`, for example `cutlass/nvfp4.py` and the three
+  overrides in `trtllm_gen/fp4_block_scale.py`: one leaf, one format, one
+  method.
 
 ## EPLB / Load Balancing
 
-Use these examples when touching dynamic expert migration or slot routing:
-
-- `tensorrt_llm/_torch/moe/fused_moe/interface.py`
-  - `_using_load_balancer`, `_using_dynamic_load_balancer`.
-  - `_load_balancer_update_statistic` and
-    `_load_balancer_update_statistic_with_gathered_statistic`.
-  - `_load_balancer_route` and slot/expert-ID conversion.
-  - `register_all_parameter_slot_and_to_fix_weight_fns`.
-- `tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py`
-  - Slot registration, expert migration, per-layer update flow, and iteration
-    context.
-- `tensorrt_llm/_torch/moe/fused_moe/quantization.py`
-  - `eplb_support_status`, `supports_online_eplb`,
-    `need_load_shared_weights`, shared-weight registration, and transformed
-    weight fix-up hooks.
-- Current forward-execution code
-  - EPLB wait/update/route hook order, per-chunk first/last behavior,
-    statistics gathering, and allreduce bypass semantics.
-- `tests/unittest/_torch/moe/test_moe_module.py`
-  - `_create_moe_load_balancer`, `_run_eplb_test`, `_should_skip_EPLB`,
-    `generate_eplb_test_params`, and backend-specific EPLB param generators
-    when present.
-
-Good uses:
-
-- Keep expert IDs and slot IDs explicit.
-- Preserve the two-layer EPLB registration split: common MoE FC weights and
-  biases are loaded/staged/registered by `FusedMoEMethodBase.load_weights()` and
-  `FusedMoEMethodBase.post_load_weights()` using `need_load_shared_weights(module)`;
-  concrete quantization methods add the same gate only for their own scales,
-  alphas, transformed weights, or layout-specific views.
-- Register all quantization-specific raw/transformed tensors required for slot
-  migration, without duplicating the base FC weight registration path.
-- Add module-level tests that force expert movement and validate output.
-
-Red flags:
-
-- EPLB support is declared only in backend without quantization/test updates.
-- Concrete quantization method duplicates common FC shared-weight registration
-  already handled by `FusedMoEMethodBase`, or forgets to add
-  `need_load_shared_weights(module)` gated registration for its own scale/layout
-  tensors.
-- Statistics are gathered through communication but never fed back to the load
-  balancer.
+- `impl_contract.py`: `MoEStaticCapability.supports_eplb`, the selection-time
+  answer; its comment explains why it is not `_supports_load_balancer()`.
+- `impl_blocks.py` (`MoEEplbWeightLayoutMixin`): `_supports_load_balancer`,
+  `_using_load_balancer`, `_using_dynamic_load_balancer`,
+  `_add_raw_shared_weights_for_unmap`,
+  `register_all_parameter_slot_and_to_fix_weight_fns`.
+- `trtllm_gen/base.py`: the `_supports_load_balancer` override that means
+  "routing is separated from the kernel".
+- `interface.py` (`MoE`): `_load_balancer_*` stage hooks,
+  `_load_balancer_update_statistic`,
+  `_load_balancer_update_statistic_with_gathered_statistic`, and
+  `_load_balancer_route` with slot/expert-ID conversion.
+- `fused_moe_cute_dsl_b12x.py`: a gate that declines `d.eplb_enabled` although
+  the inherited `_supports_load_balancer()` answers True.
+- `moe_load_balancer.py`: slot registration, expert migration, per-layer
+  update flow, and iteration context.
+- `quantization.py`: `eplb_support_status`, `supports_online_eplb`,
+  `need_load_shared_weights`, shared-weight registration, and transformed
+  weight fix-up hooks.
+- `tests/unittest/_torch/moe/test_moe_module.py`: `_create_moe_load_balancer`,
+  `_run_eplb_test`, `_should_skip_EPLB`, `generate_eplb_test_params`, and
+  backend-specific EPLB param generators when present.
 
 ### CPU shared-staging buffer family  --  concrete code pointers
 
@@ -283,7 +191,7 @@ must survive online EPLB migration.
     `module.fc31_weight_scale_2.data` directly.
 
 - Migration hook wiring:
-  - `interface.py::FusedMoE.register_all_parameter_slot_and_to_fix_weight_fns`
+  - `impl_blocks.py::MoEEplbWeightLayoutMixin.register_all_parameter_slot_and_to_fix_weight_fns`
     is what actually connects CPU staging buffers to the
     `MoeLoadBalancer.single_layer_load_balancers[...]` slot infrastructure.
   - `moe_load_balancer.py::SingleLayerMoeLoadBalancer.__init__` computes
@@ -327,113 +235,31 @@ routed/shared index spaces overlap on the same global expert IDs.
 
 ## Communication
 
-Use these examples when changing dispatch/combine behavior:
-
-- `tensorrt_llm/_torch/moe/fused_moe/communication/base.py`
-  - `Communication` ABC, `supports_post_quant_dispatch`, `prepare_dispatch`,
-    `dispatch`, and `combine`.
-- `communication/communication_factory.py`
-  - Strategy selection, forced-method behavior, feasibility checks, and fallback.
-- `communication/allgather_reducescatter.py`
-  - Baseline external communication strategy.
-- `communication/nvlink_two_sided.py`
-  - Pre-dispatch metadata/statistics pattern.
-- `communication/nvlink_one_sided.py`
-  - Dispatch-time statistics/workspace pattern.
-- `communication/deep_ep.py` and `communication/deep_ep_low_latency.py`
-  - DeepEP pre/post quant dispatch constraints.
-- `tests/unittest/_torch/moe/test_moe_comm.py`
-  - Focused communication behavior tests.
-
-Good uses:
-
-- External dispatch/combine state stays inside the communication strategy.
-- `supports_post_quant_dispatch` matches actual payload layout.
-- EPLB statistics collected by communication are returned to the forward path.
-
-Red flags:
-
-- Wrapper or backend duplicates communication state that belongs in a strategy.
-- New strategy lacks direct tests or module-level coverage.
-
-## Forward Execution And Chunking
-
-Use these examples when wrapper forward policy grows complicated:
-
-- `tensorrt_llm/_torch/moe/fused_moe/moe_scheduler.py`
-  - Scheduler forward entry, external/fused scheduler implementations, routing
-    order, dispatch order, EPLB hook order, zero-token behavior, output
-    truncation, and backend kwargs.
-- `tensorrt_llm/_torch/moe/fused_moe/configurable_moe.py`
-  - Wrapper entry and lifecycle boundary around scheduler execution.
-- Backend forward paths
-  - Useful only for legacy compatibility context or for identifying policy that
-    should move into the scheduler.
-- `tests/unittest/_torch/moe/test_moe_module.py`
-  - Module-level multi-GPU, chunking, routing, and EPLB cases.
-- `tests/unittest/_torch/moe/multi_gpu/test_nvlink_one_sided.py`
-  - Multi-GPU all-to-all behavior when relevant.
-
-Good uses:
-
-- Keep policy-heavy forward flow in `moe_scheduler.py` rather than adding wrapper
-  or backend branches.
-- Keep wrapper lifecycle state outside scheduler forward policy.
-- Preserve per-chunk first/last semantics and zero-token behavior.
-
-Red flags:
-
-- New backend-specific branch in wrapper forward flow.
-- Chunking, EPLB, and communication ordering spread across several owners.
-
-## Routing And Factory
-
-Use these examples when changing model-to-backend selection or routing output:
-
-- `tensorrt_llm/_torch/moe/fused_moe/routing.py`
-  - Routing method output shape/dtype and top-k behavior.
-- `tensorrt_llm/_torch/moe/fused_moe/create_moe.py`
-  - `get_moe_cls`, `create_moe_backend`, `create_moe`, backend fallback, and
-    quantization-specific selection.
-- `tests/unittest/_torch/moe/moe_test_utils.py`
-  - Backend enum, class map, quick skip reason, CI/local matrix generation.
-
-Good uses:
-
-- Keep unsupported combinations tied to production capability checks.
-- Make fallback and skip reasons precise.
-
-Red flags:
-
-- Test helper skips diverge from `can_implement` behavior.
-- Factory code silently falls back without a useful reason.
+- `communication/base.py`: `Communication` ABC, `supports_post_quant_dispatch`,
+  `prepare_dispatch`, `dispatch`, `combine`, `checkpoint_blocked_reason`
+  (default `None`), and the `CheckpointableCommunication` protocol.
+- `moe_comm_timeout_guard.py`: `MoECommTimeoutGuard` and the
+  `MoECommTimeoutProxy` a kernel registers at construction.
+- `communication/communication_factory.py`: strategy selection, forced-method
+  behavior, feasibility checks, and fallback.
+- `communication/allgather_reducescatter.py`: baseline external strategy.
+- `communication/nvlink_two_sided.py`: pre-dispatch metadata/statistics.
+- `communication/nvlink_one_sided.py`: dispatch-time statistics/workspace, and
+  a `checkpoint_blocked_reason` override.
+- `communication/deep_ep.py` and `communication/deep_ep_low_latency.py`:
+  DeepEP pre/post quant dispatch constraints.
+- `tests/unittest/_torch/moe/test_moe_comm.py`: focused communication tests.
 
 ## Test Matrix And Helpers
 
-Use these examples before adding backend, quantization, routing, or EPLB tests:
-
-- `tests/unittest/_torch/moe/moe_test_utils.py`
-  - `MoeBackendType`, `get_backend_class`, backend-specific `should_skip_*`,
-    `get_quick_skip_reason`, `supports_autotuner_capture`,
-    `iter_base_test_configs`, and CI acceleration logic.
-- `tests/unittest/_torch/moe/quantize_utils.py`
-  - Quantized test weight generation, reference module selection, backend-aware
-    weight preparation.
-- `tests/unittest/_torch/moe/test_moe_backend.py`
-  - Backend-level `quantize_input` and `run_moe` contracts.
-- `tests/unittest/_torch/moe/test_moe_module.py`
-  - ConfigurableMoE integration matrix, multi-GPU, and EPLB coverage.
-- `tests/unittest/_torch/moe/test_moe_comm.py`
-  - Communication strategy tests.
-
-Good uses:
-
-- Add new backend/quant support through shared helpers first.
-- Keep local CI subset and broader local matrix intentionally different.
-- Every skip reason should map to a real production capability or environment
-  constraint.
-
-Red flags:
-
-- One test file has a backend case but shared helper enum/skip matrix is stale.
-- Broad skips hide unsupported combinations instead of documenting them.
+- `tests/unittest/_torch/moe/moe_test_utils.py`: `MoeBackendType` (one value
+  per family), `get_backend_class`, `find_backend_class` /
+  `find_backend_classes` (a family resolves to the leaf for `quant_algo`;
+  absence returns `None` and `()` respectively), backend-specific `should_skip_*`,
+  `get_quick_skip_reason`, `supports_autotuner_capture`,
+  `iter_base_test_configs`, and CI acceleration logic.
+- `tests/unittest/_torch/moe/quantize_utils.py`: quantized test weight
+  generation, reference module selection, backend-aware weight preparation.
+- `tests/unittest/_torch/moe/test_moe_backend.py`: backend-level
+  `quantize_input` and `run_moe` contracts.
+- `tests/unittest/_torch/moe/test_moe_routing.py`: routing method tests.

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Parity tests for the fused Kimi K3 attention-residual + RMSNorm op."""
 
+from typing import Optional
 from unittest import mock
 
 import pytest
@@ -23,6 +24,8 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 HIDDEN_SIZE = 7168
 ATTN_RES_RMS_EPS = 1e-6
 OUTPUT_RMS_EPS = 1e-6
+# Largest token count trtllm::attn_res_fwd accepts (check_attn_res_contract in attnResOp.cpp).
+ATTN_RES_FWD_MAX_TOKENS = 16384
 
 
 def _has_supported_gpu() -> bool:
@@ -149,14 +152,33 @@ def _fused_add(
     )
 
 
-def _above_ceiling_tokens() -> int:
-    """One more token than the fused epilogue will take.
+def _persistent(
+    layer_residual: torch.Tensor,
+    layer_residual_add: Optional[torch.Tensor],
+    block_residual: torch.Tensor,
+    res_weight: torch.Tensor,
+    score_rms_weight: torch.Tensor,
+    output_rms_weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.ops.trtllm.attn_res_add_rmsnorm_persistent_fwd(
+        layer_residual,
+        layer_residual_add,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+        ATTN_RES_RMS_EPS,
+        OUTPUT_RMS_EPS,
+    )
 
-    Read from the module rather than hardcoded: the ceiling is configurable via
-    KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS, and a literal here would silently stop
-    testing the fallback branch the moment someone raised it.
-    """
-    return modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS + 1
+
+def _above_ceiling_tokens() -> int:
+    """One more token than the decode kernel takes; with the persistent kernel off (the default)
+    the model helpers fall back there."""
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_attn_res
+
+    assert not modeling_kimi_linear._PERSISTENT_ATTN_RES_ENABLED
+    return kimi_k3_attn_res.MAX_TOKENS + 1
 
 
 def _similarity(
@@ -324,6 +346,104 @@ def test_attn_res_add_rmsnorm_cuda_graph_replay(
     cosine, relative_l2 = _similarity(actual_output, expected_output)
     assert cosine > 0.9999
     assert relative_l2 < 5e-3
+
+
+def _assert_persistent_matches_unfused(
+    num_tokens: int,
+    num_candidates: int,
+    with_add: bool,
+) -> None:
+    """Compare the persistent op with the unfused reference slice by slice.
+
+    The reference takes at most ATTN_RES_FWD_MAX_TOKENS tokens per call, and
+    every output row depends only on its own token, so each token slice is
+    compared on its own; an error confined to late tokens is not averaged away.
+    """
+    (
+        layer_residual,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    ) = _make_inputs(num_tokens, num_candidates - 1)
+    layer_residual_add = (
+        (torch.randn_like(layer_residual) * 0.05).contiguous() if with_add else None
+    )
+
+    actual_updated, actual_output = _persistent(
+        layer_residual,
+        layer_residual_add,
+        block_residual,
+        res_weight,
+        score_rms_weight,
+        output_rms_weight,
+    )
+
+    expected_updated = layer_residual
+    if with_add:
+        expected_updated = layer_residual + layer_residual_add
+        assert torch.equal(actual_updated, expected_updated)
+    else:
+        assert actual_updated.data_ptr() == layer_residual.data_ptr()
+    for start in range(0, num_tokens, ATTN_RES_FWD_MAX_TOKENS):
+        tokens = slice(start, start + ATTN_RES_FWD_MAX_TOKENS)
+        expected_output = _unfused_reference(
+            expected_updated[tokens],
+            block_residual[:, tokens].contiguous(),
+            res_weight,
+            score_rms_weight,
+            output_rms_weight,
+        )
+        cosine, relative_l2 = _similarity(actual_output[tokens], expected_output)
+        assert cosine > 0.9999, f"tokens from {start}: cosine {cosine}"
+        assert relative_l2 < 5e-3, f"tokens from {start}: relative L2 {relative_l2}"
+
+
+@pytest.mark.parametrize("with_add", [False, True], ids=["no_add", "add"])
+@pytest.mark.parametrize("num_candidates", range(2, 10))
+@pytest.mark.parametrize("num_tokens", [1, 213])
+@torch.no_grad()
+def test_attn_res_persistent_matches_unfused(
+    num_tokens: int,
+    num_candidates: int,
+    with_add: bool,
+) -> None:
+    """Every supported N at T=1 and T=213.
+
+    T=1 leaves most CTAs without a token, and 213 is not a multiple of the CTA
+    count, so CTAs take different numbers of tokens.
+    """
+    _assert_persistent_matches_unfused(num_tokens, num_candidates, with_add)
+
+
+@pytest.mark.parametrize("with_add", [False, True], ids=["no_add", "add"])
+@pytest.mark.parametrize(
+    ("num_tokens", "num_candidates"),
+    [
+        (16384, 9),  # every candidate offset inside int32
+        (42799, 9),  # the largest T whose deepest candidate offset fits int32
+        (42800, 9),  # the smallest T whose deepest candidate offset does not
+        # The production max_num_tokens candidates; at 65536 the deepest
+        # candidate offset passes INT32_MAX for N=7 and N=8 as well.
+        (49152, 9),
+        (65536, 7),
+        (65536, 8),
+        (65536, 9),
+    ],
+)
+@torch.no_grad()
+def test_attn_res_persistent_matches_unfused_at_prefill_token_counts(
+    num_tokens: int,
+    num_candidates: int,
+    with_add: bool,
+) -> None:
+    """Prefill token counts on both sides of the int32 candidate offset.
+
+    The deepest snapshot, source N-2, starts (N-2) * T * H elements into
+    block_residual. That offset passes INT32_MAX at N=9 from T=42800, so the
+    kernel forms it in 64 bits.
+    """
+    _assert_persistent_matches_unfused(num_tokens, num_candidates, with_add)
 
 
 @torch.no_grad()
@@ -506,17 +626,6 @@ def test_model_helper_dispatches_fused_attn_res_rmsnorm(
         modeling_kimi_linear,
         "_apply_attn_res",
         unexpected_fallback,
-    )
-    # The shipped default ceiling is 1 (persistent port off means "behaviour
-    # unchanged", i.e. fused at the decode shape only), so the multi-token
-    # arms would legitimately fall back. Raise it for the dispatch assertion
-    # only -- after the reference above was computed under the default -- so
-    # this test keeps covering the multi-token fused kernel without changing
-    # what production does by default.
-    monkeypatch.setattr(
-        modeling_kimi_linear,
-        "_FUSED_ATTN_RES_MAX_TOKENS",
-        max(num_tokens, modeling_kimi_linear._FUSED_ATTN_RES_MAX_TOKENS),
     )
     actual = _apply_attn_res_and_rmsnorm(
         prefix_sum,

@@ -25,7 +25,6 @@ from cbts.coverage.selection.python_change_analysis import (
     ImportTarget,
     PythonChangeFacts,
     analyze_python_changes,
-    closure_attributed_qualnames,
     import_executed_qualnames,
     qualnames_for_lines,
 )
@@ -169,13 +168,25 @@ class CoverageSelector:
             if not lines:
                 continue  # selection diff has no remaining executable edits
             import_executed = import_executed_qualnames(source)
-            closures = closure_attributed_qualnames(source, lines)
             dependencies = analyze_python_changes(
                 source,
                 lines,
                 iter_diff_deleted_post_lines(selection_diff),
                 pre_source=reconstruct_diff_pre_image(source, diff),
             )
+            if dependencies.new_class_bindings:
+                # Every method of an added data class is reached through a
+                # consumer of that new class binding. Its declaration has no
+                # old rows; resolve the class and its methods through those
+                # consumers together with the other module-level changes.
+                qualnames = {
+                    qualname
+                    for qualname in qualnames
+                    if not any(
+                        qualname == name or qualname.startswith(name + ".")
+                        for name in dependencies.new_class_bindings
+                    )
+                } | {"<module>"}
             import_resolved = False
             for qualname in sorted(qualnames):  # sorted -> deterministic no_data order
                 if qualname in import_executed:
@@ -204,15 +215,16 @@ class CoverageSelector:
                                 why,
                             )
                         impacted |= target_tests
-                        # A binding that did not exist in the pre-image cannot
-                        # be an existing external dependency.  Keep the
-                        # repository-wide fail-closed check for every removed
-                        # or rebound name, while bounding pure imports and
-                        # declarations through their targets and consumers.
+                        # Bound new imports and functions through their targets
+                        # and consumers. New class names also retain the external
+                        # reference check, including reflective module consumers.
                         checked_bindings = (
                             dependencies.changed_bindings
                             - dependencies.new_import_bindings
-                            - dependencies.new_declaration_bindings
+                            - (
+                                dependencies.new_declaration_bindings
+                                - dependencies.new_class_bindings
+                            )
                         )
                         external_paths: dict[str, set[str]] = {}
                         if self._external_reference_paths is not None:
@@ -287,13 +299,6 @@ class CoverageSelector:
                                 if bounded:
                                     caller_bounded.add(f"{cf}::{consumer}")
                         import_resolved = True
-                    continue
-                if qualname in closures:
-                    tests = self._underrecorded_bound(cf, qualname)
-                    if tests is None:
-                        why = f"closure change, no wider row set: {path}::{qualname}"
-                        return impacted, sorted(no_data), sorted(caller_bounded), no_diff, why
-                    impacted |= tests
                     continue
                 tests, bounded, limitation = self._qualname_impact(
                     cf,
@@ -521,13 +526,6 @@ class CoverageSelector:
                 return None, limitation
             bound |= transitive
         return bound or None, None
-
-    def _underrecorded_bound(self, cf: str, qualname: str) -> set[str] | None:
-        """File row set when it is wider than a closure's enclosing qualname's, else None."""
-        file_tests = self.db.tests_touching_file(cf)
-        if len(file_tests) > len(self.db.tests_touching_func(cf, qualname)):
-            return file_tests
-        return None
 
     def _no_data_fallback(self, cf: str) -> set[str]:
         """Tests to force-run for a changed function the DB never captured."""
