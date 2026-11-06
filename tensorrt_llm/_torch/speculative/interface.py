@@ -2414,11 +2414,17 @@ class SpecWorkerBase(nn.Module, ABC):
             if self._rejection_buffers_valid(draft_tokens, draft_len,
                                              stored_vocab, num_contexts,
                                              batch_size, logits, spec_metadata):
-                if self._fast_rs_applies(spec_metadata, logits, stored_vocab):
+                # The fused verify assumes draft_len + 1 target rows per
+                # request, so ragged verification keeps the reference path.
+                if (not spec_metadata.is_ragged_verify
+                        and self._fast_rs_applies(spec_metadata, logits,
+                                                  stored_vocab)):
                     # Fused kernels read the slot rows in place (no gather).
-                    return self._sample_and_accept_draft_tokens_fast_rs(
+                    accepted = self._sample_and_accept_draft_tokens_fast_rs(
                         logits, draft_tokens, num_contexts, batch_size,
                         spec_metadata)
+                    return self._commit_occurrence_counts(
+                        accepted, batch_size, spec_metadata)
                 # Gather the gen subset's slot rows, filled at the previous draft
                 # step indexed by py_seq_slot.
                 gen_slot_ids = spec_metadata.batch_slot_ids[
