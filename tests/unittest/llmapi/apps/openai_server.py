@@ -6,7 +6,6 @@
 import os
 import shlex
 import subprocess
-import sys
 import tempfile
 import time
 from typing import List, Optional
@@ -122,7 +121,9 @@ class RemoteOpenAIServer:
             self.log_file = open(self.log_path, "w+")
             return self.log_file
         else:
-            return sys.stdout
+            # Inherit process descriptors; pytest's sys.stdout capture wrapper
+            # may not provide the fileno() required by subprocess.Popen.
+            return None
 
     def __enter__(self):
         return self
