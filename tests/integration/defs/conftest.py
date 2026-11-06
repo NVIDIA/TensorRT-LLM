@@ -1011,10 +1011,10 @@ def pytest_addoption(parser):
         action="store_true",
         default=False,
         help=
-        "Dump every thread's stack to hang_traceback.txt when a test overruns its "
-        "timeout or the process is signalled (default: False). This turns an empty "
-        "'Test terminated unexpectedly' record into a diagnosable hang stack. "
-        "Only used with --periodic-junit.",
+        "Dump every thread's stack to a case-named hang_traceback_*.txt file when "
+        "a test overruns its timeout or the process is signalled (default: False). "
+        "This turns an empty 'Test terminated unexpectedly' record into a "
+        "diagnosable hang stack. Only used with --periodic-junit.",
     )
 
 

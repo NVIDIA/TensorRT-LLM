@@ -15,7 +15,7 @@
 """Unit tests for the hang-traceback dumping in PeriodicJUnitXML.
 
 These exercise the pure-Python wiring only (timeout resolution and the watchdog
-that writes output-dir/hang_traceback.txt); they need no GPU or model access.
+that writes a case-named hang_traceback file); they need no GPU or model access.
 
 The module under test lives in the integration-test helper package, which is not
 importable as a package here (its ``__init__`` pulls in torch), so it is imported
@@ -108,9 +108,7 @@ def _close(reporter: PeriodicJUnitXML) -> None:
     reporter._cancel_hang_timer()
     if timer is not None:
         timer.join(_POLL_TIMEOUT)
-    if reporter._hang_file is not None:
-        reporter._hang_file.close()
-        reporter._hang_file = None
+    reporter._close_hang_file(remove_empty=True)
 
 
 ReporterFactory = Callable[..., PeriodicJUnitXML]
@@ -157,11 +155,23 @@ def test_effective_timeout_resolution(make_reporter: ReporterFactory) -> None:
 def test_hang_dumps_traceback(make_reporter: ReporterFactory) -> None:
     reporter = make_reporter(hang_dump_fraction=0.1)
     # timeout 2s * 0.1 -> dump after ~0.2s.
-    reporter.pytest_runtest_setup(_Item(timeout_opt=2.0))
+    nodeid = "pkg/test_x.py::test_y[param/value]"
+    reporter.pytest_runtest_setup(_Item(nodeid=nodeid, timeout_opt=2.0))
     path = reporter._hang_traceback_path()
-    assert _wait_until(lambda: "hang watchdog fired for pkg/test_x.py::test_y" in _read(path))
+    assert os.path.basename(path).startswith(
+        "hang_traceback_pkg_test_x.py_test_y_param_value_"
+    )
+    assert _wait_until(lambda: f"hang watchdog fired for {nodeid}" in _read(path))
     content = _read(path)
     assert "Thread" in content or 'File "' in content
+
+
+def test_hang_traceback_names_remain_unique(make_reporter: ReporterFactory) -> None:
+    reporter = make_reporter()
+    first = reporter._hang_traceback_path("pkg/test_x.py::test_y[param/value]")
+    second = reporter._hang_traceback_path("pkg/test_x.py::test_y[param:value]")
+    assert first != second
+    assert os.path.basename(first).startswith("hang_traceback_pkg_test_x.py_test_y_")
 
 
 def test_subsecond_timeout_arms_before_the_kill(make_reporter: ReporterFactory) -> None:
@@ -194,13 +204,14 @@ def test_completed_test_is_not_dumped(make_reporter: ReporterFactory) -> None:
     # cancel() is what actually prevents the dump, so assert the timer thread died
     # rather than waiting out the (deliberately long) interval.
     assert _wait_until(lambda: not timer.is_alive())
-    assert os.path.getsize(reporter._hang_traceback_path()) == 0
+    assert not os.path.exists(reporter._hang_traceback_path())
 
 
 def test_no_watchdog_without_timeout(make_reporter: ReporterFactory) -> None:
     reporter = make_reporter()
     reporter.pytest_runtest_setup(_Item())  # no timeout -> nothing armed
     assert reporter._hang_timer is None
+    assert reporter._hang_file is not None
 
 
 def test_hang_traceback_off_by_default(make_reporter: ReporterFactory) -> None:
