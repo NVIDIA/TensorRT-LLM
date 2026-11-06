@@ -140,13 +140,17 @@ from __future__ import annotations
 import math
 import os
 import re
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import step_contract_enabled
+from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
+    NoTarget,
+    engine_kv_cache_quant_algo,
+    step_contract_enabled,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.catalog.attention.fused_qk_norm_rope import (
     fused_qk_norm_rope,
 )
@@ -433,9 +437,10 @@ from tensorrt_llm._torch.modules.fla.flashinfer_cached_replay import (
     flashinfer_cached_replay_update,
 )
 from tensorrt_llm._torch.modules.logits_processor import LogitsProcessor
+from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
 from tensorrt_llm._torch.pyexecutor.runtime_hooks import RuntimeHooks
 from tensorrt_llm._torch.speculative import get_spec_worker, should_use_separate_draft_kv_cache
-from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm._torch.utils import ActivationType, is_gdn_replay_enabled
 from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.functional import AllReduceFusionOp
 from tensorrt_llm.logger import logger
@@ -453,6 +458,9 @@ from .ops.hc.qwen4_exp_hc_decode_tc_first__decode import qwen4_exp_hc_decode_tc_
 from .ops.hc.qwen4_exp_hc_up_gate_mean_fp4__moe import qwen4_exp_hc_up_gate_mean_fp4
 from .ops.ssm.gdn_cached_replay_cute__verify import gdn_cached_replay_cute
 from .ops.ssm.gdn_cached_replay_cute__verify import precompile as gdn_replay_precompile
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 # The GPU architecture this target is certified for; a direct instantiation could
 # bypass routing.
@@ -475,6 +483,48 @@ _MAX_VERIFY_WIDTH = _pool.MAX_VERIFY_WIDTH
 # fp32 too.
 _SSM_STATE_DTYPES = (torch.bfloat16,)
 _ONE_RANK_SSM_STATE_DTYPES = (torch.float32, torch.bfloat16)
+
+# The checkpoint this target is written for, read off the normalized composite's halves
+# (`check_deployment`): the text tower's (layers, hidden, experts, attention heads, linear value
+# heads, vocab) and the vision tower's (depth, hidden, heads, merge, out_hidden, num_pos,
+# deepstack_indexes, act). A deepstack vision sibling has a merger list this target lacks.
+_TEXT_SHAPE = (48, 2560, 512, 24, 48, 248320)
+_VISION_SHAPE = (27, 1152, 16, 2, 2560, 2304, (), "gelu_pytorch_tanh")
+
+# The checkpoint's settings that change what it computes without changing a weight's shape,
+# at the values the target implements: a fine-tune of the same shape that changed one would
+# load and run with wrong logits and no error. Read off the text config as the target reads
+# them (`_text_settings`).
+_TEXT_SETTINGS = {
+    # The routed experts: Renormalize routing over the top 10 and a SiLU activation.
+    "norm_topk_prob": True,
+    "num_experts_per_tok": 10,
+    "hidden_act": "silu",
+    # Attention: two KV heads of 256, no projection bias, a sigmoid output gate on every head
+    # (absent `attn_output_gate` reads as gated), and an output head of its own.
+    "num_key_value_heads": 2,
+    "head_dim": 256,
+    "attention_bias": False,
+    "output_gate_type": "sigmoid",
+    "attn_output_gate": True,
+    "tie_word_embeddings": False,
+    # Rope: a quarter of the head (64 dims), theta 1e7, interleaved mRoPE over sections
+    # 11 / 11 / 10, unscaled.
+    "rope_theta": 1e7,
+    "partial_rotary_factor": 0.25,
+    "mrope_section": (11, 11, 10),
+    "mrope_interleaved": True,
+    "rope_factor": None,
+    # The MTP module: one full-attention layer on the trunk's embedding that reads the end of
+    # the stack (`mtp_use_hidden_state_from_layer: null`). The `mtp.` fields are the `mtp`
+    # block's, a mapping or a config object; a field it omits reads as the value here. (Its
+    # own rope theta the target reads.)
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": False,
+    "mtp.num_hidden_layers": 1,
+    "mtp.layer_types": ("full_attention",),
+    "mtp.mtp_use_hidden_state_from_layer": None,
+}
 
 # QSA backend metadata buffers rebuilt every step. Their absence means the engine did not
 # select the QSA metadata and the index plane would never be written.
@@ -6671,6 +6721,42 @@ def _spec_argmax_only(spec_worker, spec_metadata) -> tuple[bool, bool]:
     return verify, draft
 
 
+def _field(block, name: str, default=None):
+    """`block`'s `name` -- a mapping's entry or an object's attribute -- or `default` where it
+    is absent or null."""
+    value = block.get(name) if isinstance(block, dict) else getattr(block, name, None)
+    return default if value is None else value
+
+
+def _text_settings(text) -> dict:
+    """`_TEXT_SETTINGS`' entries as `text` declares them. The rope fields are the target's
+    reading: the `rope_parameters` dict, or the flattened `rope_scaling` with the theta and
+    the partial factor at the top level."""
+    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
+    settings = {name: getattr(text, name, None) for name in _TEXT_SETTINGS}
+    settings.update(
+        rope_theta=rope.get("rope_theta", getattr(text, "rope_theta", None)),
+        partial_rotary_factor=rope.get(
+            "partial_rotary_factor", getattr(text, "partial_rotary_factor", None)
+        ),
+        mrope_section=tuple(rope.get("mrope_section") or ()),
+        mrope_interleaved=rope.get("mrope_interleaved"),
+        rope_factor=rope.get("factor"),
+        attn_output_gate=_field(text, "attn_output_gate", True),
+        mtp_num_hidden_layers=_field(text, "mtp_num_hidden_layers", 1),
+        mtp_use_dedicated_embeddings=_field(text, "mtp_use_dedicated_embeddings", False),
+    )
+    mtp = getattr(text, "mtp", None)
+    settings.update(
+        {
+            "mtp.num_hidden_layers": _field(mtp, "num_hidden_layers", 1),
+            "mtp.layer_types": tuple(_field(mtp, "layer_types", ("full_attention",))),
+            "mtp.mtp_use_hidden_state_from_layer": _field(mtp, "mtp_use_hidden_state_from_layer"),
+        }
+    )
+    return settings
+
+
 class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
     DecoderModelForCausalLM[Qwen4ExpDefaultModelingV2, PretrainedConfig]
 ):
@@ -6688,6 +6774,149 @@ class ModelingV2Qwen38FlashNextNvfp4Sm103Default(
         """Prefer KV cache manager V2: PLE state (`ple_layer_cache`) and QSA's index and
         position planes exist only there."""
         return "V2"
+
+    @staticmethod
+    def check_deployment(model_config: ModelConfig, llm_args: TorchLlmArgs, layout: str) -> None:
+        """Raise `NoTarget` for a checkpoint or an engine choice this target does not run.
+
+        `route` calls it once the GPU, the parallel layout (`layout`, a key of routing's
+        `_LAYOUTS`) and the draft path match, before it returns this class. Where the
+        constructor, the bind or the first forward would refuse the deployment, or a same-shape
+        checkpoint would compute something else, `auto` then falls back to the built-in
+        implementation.
+        """
+        cfg = model_config.pretrained_config
+        text = getattr(cfg, "text_config", None)
+        vision = getattr(cfg, "vision_config", None)
+        if text is None or vision is None:
+            raise NoTarget(
+                f"{type(cfg).__name__} carries no text_config/vision_config; the target reads "
+                "both halves of the normalized Qwen4-Exp composite"
+            )
+        shape = (
+            text.num_hidden_layers,
+            text.hidden_size,
+            text.num_experts,
+            text.num_attention_heads,
+            text.linear_num_value_heads,
+            text.vocab_size,
+        )
+        if shape != _TEXT_SHAPE:
+            raise NoTarget(f"text shape {shape}; the target is Qwen3.8-Flash-Next's {_TEXT_SHAPE}")
+        vshape = (
+            vision.depth,
+            vision.hidden_size,
+            vision.num_heads,
+            vision.spatial_merge_size,
+            vision.out_hidden_size,
+            vision.num_position_embeddings,
+            tuple(getattr(vision, "deepstack_visual_indexes", None) or ()),
+            vision.hidden_act,
+        )
+        if vshape != _VISION_SHAPE:
+            raise NoTarget(
+                f"vision shape {vshape}; the target is Qwen3.8-Flash-Next's {_VISION_SHAPE}"
+            )
+        differs = {k: v for k, v in _text_settings(text).items() if v != _TEXT_SETTINGS[k]}
+        if differs:
+            raise NoTarget(
+                f"the checkpoint has Qwen3.8-Flash-Next's shape but declares {differs}; the "
+                f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
+            )
+
+        mapping = model_config.mapping
+        one_rank = mapping.world_size == 1
+        spec = model_config.spec_config
+        prefill_graph = str(llm_args.prefill_cuda_graph_backend.value)
+        # The draft loop runs the checkpoint's single MTP module as one linear chain, verified
+        # at one width, `max_draft_len + 1` rows a request.
+        if spec is not None:
+            if (
+                getattr(spec, "num_nextn_predict_layers", None) not in (None, 1)
+                or getattr(spec, "use_dynamic_tree", False)
+                or getattr(spec, "eagle_choices", None) is not None
+                or spec.max_total_draft_tokens != spec.max_draft_len
+            ):
+                raise NoTarget(
+                    "an MTP draft other than one linear chain over the checkpoint's single MTP "
+                    "module"
+                )
+            if not 1 <= spec.max_draft_len < _MAX_VERIFY_WIDTH:
+                raise NoTarget(
+                    f"max_draft_len={spec.max_draft_len}; the verify step is certified at "
+                    f"max_draft_len 1..{_MAX_VERIFY_WIDTH - 1}"
+                )
+            if (
+                getattr(spec, "draft_len_schedule", None) is not None
+                or getattr(spec, "acceptance_rate_threshold", None) is not None
+            ):
+                raise NoTarget(
+                    "the draft length changes at runtime (draft_len_schedule, max_concurrency or "
+                    "acceptance_rate_threshold), but this target's verify step runs at the one "
+                    "width max_draft_len + 1"
+                )
+        if mapping.enable_attention_dp and prefill_graph == "breakable":
+            raise NoTarget(
+                f"prefill_cuda_graph_backend='breakable' with attention DP ({layout}): the engine "
+                "pads every rank to one prefill bucket, so a rank holding only generation "
+                "requests is handed more rows than its batch, which the target's decode step "
+                "refuses"
+            )
+        kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
+        if kv_cache_quant_algo not in (None, QuantAlgo.FP8, QuantAlgo.NVFP4):
+            raise NoTarget(
+                f"a {kv_cache_quant_algo} KV cache; the target stores K/V as the checkpoint's "
+                "bf16, as FP8 or as NVFP4"
+            )
+        if model_config.torch_dtype != torch.bfloat16:
+            raise NoTarget(
+                f"the engine runs the model in {model_config.torch_dtype}; the target is bf16"
+            )
+        # The CuteDSL expert pipeline runs every expert at once: one rank only.
+        requested = str(model_config.moe_backend_requested).upper()
+        moe_backends = [
+            name for name, runs in _TRUNK_MOE_BACKENDS.items() if one_rank or runs != "CUTEDSL"
+        ]
+        if requested not in moe_backends:
+            raise NoTarget(
+                f"moe_config.backend={model_config.moe_backend_requested!r}; at {layout} the "
+                f"target runs the trunk's routed experts on {', '.join(moe_backends)}"
+            )
+        state_dtype = effective_mamba_ssm_cache_dtype(
+            model_config, llm_args.kv_cache_config.mamba_ssm_cache_dtype
+        )
+        state_dtypes = _ONE_RANK_SSM_STATE_DTYPES if one_rank else _SSM_STATE_DTYPES
+        if state_dtype not in state_dtypes:
+            served = " or ".join(str(dtype).removeprefix("torch.") for dtype in state_dtypes)
+            raise NoTarget(
+                f"a {state_dtype} recurrent-state cache; at {layout} the target serves {served} "
+                "(kv_cache_config.mamba_ssm_cache_dtype)"
+            )
+        if llm_args.moe_config.load_balancer is not None and mapping.moe_ep_size > 1:
+            raise NoTarget(
+                f"moe_config.load_balancer (EPLB) at {layout}: the target runs fixed contiguous "
+                "expert windows and registers no layer with the balancer, so the placement "
+                "would do nothing"
+            )
+        if prefill_graph == "piecewise":
+            raise NoTarget(
+                "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
+                "which the target does not implement; 'breakable' runs the prefill step as a "
+                "breakable CUDA graph"
+            )
+        if spec is None:
+            return
+        if not is_gdn_replay_enabled():
+            raise NoTarget(
+                "MTP with TRTLLM_USE_GDN_REPLAY=0: the target verifies its Gated-DeltaNet rows "
+                "on the cached replay only, not on the legacy per-step recurrent states; leave "
+                "TRTLLM_USE_GDN_REPLAY unset"
+            )
+        if requested == "CUTEDSL" and spec.max_draft_len > _CUTEDSL_MAX_DRAFT_LEN:
+            raise NoTarget(
+                f"max_draft_len={spec.max_draft_len} with moe_config.backend=CUTEDSL: the CuteDSL "
+                f"expert pipeline is certified at max_draft_len up to {_CUTEDSL_MAX_DRAFT_LEN}"
+            )
 
     def __init__(self, model_config: ModelConfig):
         cfg = model_config.pretrained_config

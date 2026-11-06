@@ -2,28 +2,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Routing for Qwen4ExpForConditionalGeneration.
 
-`route` compares the facts that fix which code runs against the deployments the
-targets were written for, and raises `NoTarget` stating them otherwise (`auto` falls
-back to the built-in implementation; `require` raises). The checkpoint's published
-architecture name is kept by `load_pretrained_config`, so `route` registers under it.
-All criteria are read off `text_config` / `vision_config`; the composite parent's
-mirrored fields are unreliable.
-
-Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_103__default`
-at one of its parallel layouts (`layout`): tp1 on one rank, and tp4, tep4, dep4 or dep2 in
-one node.
+Qwen3.8-Flash-Next-NVFP4 on sm103 lands on `qwen3_8_flash_next_nvfp4__sm_103__default` at one
+of the layouts in `_LAYOUTS`, with one-model MTP-Eagle (not at dep2) or no speculative
+decoding. The target's `check_deployment` then declines the checkpoints and engine choices it
+does not run, so `auto` falls back to the built-in implementation instead of failing in the
+build.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple, Optional, Tuple
-
-import torch
+from typing import TYPE_CHECKING, Optional, Tuple
 
 from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
 
-from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
+from ..._router_index import NoTarget, routes
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.model_config import ModelConfig
@@ -33,72 +25,10 @@ if TYPE_CHECKING:
 # The GPU the target is certified on.
 _SM = (10, 3)
 
-# (layers, hidden, experts, attention heads, linear value heads, vocab). Shape-sniffing
-# also matches fine-tunes; the accuracy gate pins identity.
-_TEXT_SHAPE = (48, 2560, 512, 24, 48, 248320)
-
-# The checkpoint's settings that change what it computes without changing a weight's shape,
-# at the values the target implements: a fine-tune of the same shape that changed one would
-# load and run with wrong logits and no error. Read off the text config as the target reads
-# them (`_text_settings`).
-_TEXT_SETTINGS = {
-    # The routed experts: Renormalize routing over the top 10 and a SiLU activation.
-    "norm_topk_prob": True,
-    "num_experts_per_tok": 10,
-    "hidden_act": "silu",
-    # Attention: two KV heads of 256, no projection bias, a sigmoid output gate on every head
-    # (absent `attn_output_gate` reads as gated), and an output head of its own.
-    "num_key_value_heads": 2,
-    "head_dim": 256,
-    "attention_bias": False,
-    "output_gate_type": "sigmoid",
-    "attn_output_gate": True,
-    "tie_word_embeddings": False,
-    # Rope: a quarter of the head (64 dims), theta 1e7, interleaved mRoPE over sections
-    # 11 / 11 / 10, unscaled.
-    "rope_theta": 1e7,
-    "partial_rotary_factor": 0.25,
-    "mrope_section": (11, 11, 10),
-    "mrope_interleaved": True,
-    "rope_factor": None,
-    # The MTP module: one full-attention layer on the trunk's embedding that reads the end of
-    # the stack (`mtp_use_hidden_state_from_layer: null`). The `mtp.` fields are the `mtp`
-    # block's, a mapping or a config object; a field it omits reads as the value here. (Its
-    # own rope theta the target reads.)
-    "mtp_num_hidden_layers": 1,
-    "mtp_use_dedicated_embeddings": False,
-    "mtp.num_hidden_layers": 1,
-    "mtp.layer_types": ("full_attention",),
-    "mtp.mtp_use_hidden_state_from_layer": None,
-}
-
-# (depth, hidden, heads, merge, out_hidden, num_pos, deepstack_indexes, act).
-# `deepstack_visual_indexes == ()` is the key member: a deepstack sibling has a merger
-# list these targets lack.
-_VISION_SHAPE = (27, 1152, 16, 2, 2560, 2304, (), "gelu_pytorch_tanh")
-
-# The longest MTP draft the target runs (`_MAX_VERIFY_WIDTH - 1` in modeling.py).
-_MAX_DRAFT_LEN = 7
-
-# The engine choices the target implements at one rank (tp1), all in its modeling.py: the
-# `moe_config.backend` requests (`_TRUNK_MOE_BACKENDS`), the longest draft of the CUTEDSL
-# experts (`_CUTEDSL_MAX_DRAFT_LEN`) and the recurrent-state cache dtypes
-# (`_ONE_RANK_SSM_STATE_DTYPES`).
-_ONE_RANK_MOE_BACKENDS = ("AUTO", "TRTLLM", "CUTEDSL")
-_MAX_CUTEDSL_DRAFT_LEN = 3
-_ONE_RANK_SSM_STATE_DTYPES = (torch.float32, torch.bfloat16)
-
-# Their counterparts at every other layout: no CUTEDSL experts (`_TRUNK_MOE_BACKENDS` less
-# CUTEDSL) and a bf16 recurrent state (`_SSM_STATE_DTYPES`).
-_MOE_BACKENDS = ("AUTO", "TRTLLM")
-_SSM_STATE_DTYPES = (torch.bfloat16,)
-
-# (world size, attention DP, MoE TP, MoE EP) -> the target's layout. Every layout spans its
-# whole world in one node, attention TP over all of it unless attention DP replicates
-# attention. One rank (tp1) holds everything. At four ranks the routed experts are split by
-# intermediate (tp4) or by expert (tep4, dep4). At two ranks only attention DP with two
-# 256-expert windows (dep2), where each rank's attention, Gated-DeltaNet and PLE geometry is
-# dep4's.
+# (world size, attention DP, MoE TP, MoE EP) -> the target's layout, each in one node. tp1 holds
+# everything on one rank; tp4 splits the routed experts by intermediate, tep4 and dep4 by
+# expert; dep2 is attention DP with two 256-expert windows. MTP runs at every layout but dep2,
+# where no draft acceptance was measured.
 _LAYOUTS = {
     (1, False, 1, 1): "tp1",
     (4, False, 4, 1): "tp4",
@@ -107,208 +37,27 @@ _LAYOUTS = {
     (2, True, 1, 2): "dep2",
 }
 
-# The attention-DP layouts MTP is admitted at: those its draft acceptance was measured at.
-_ATTENTION_DP_MTP_LAYOUTS = ("dep4",)
-
-# The layouts with expert parallelism, where the engine builds an EPLB balancer for
-# `moe_config.load_balancer`; the target cuts fixed contiguous expert windows.
-_EXPERT_PARALLEL_LAYOUTS = tuple(member for key, member in _LAYOUTS.items() if key[3] > 1)
-
-
-class EngineChoices(NamedTuple):
-    """Engine choices that fix which code a target runs but are not in the checkpoint's
-    config, as the engine will resolve them."""
-
-    torch_dtype: torch.dtype  # the dtype the engine runs the model in
-    moe_backend: str  # `moe_config.backend` as requested, before AUTO resolves
-    mamba_ssm_cache_dtype: torch.dtype  # the recurrent-state cache's dtype
-    gdn_replay: bool  # TRTLLM_USE_GDN_REPLAY, which the engine reads for eligible MTP workloads
-    prefill_cuda_graph_backend: str  # `prefill_cuda_graph_backend`: disabled, piecewise, breakable
-    load_balancer: bool  # `moe_config.load_balancer` is set (EPLB)
-
-
-def engine_choices(model_config: ModelConfig, llm_args: TorchLlmArgs) -> EngineChoices:
-    # Imported on a claimed branch only, as the targets are.
-    from tensorrt_llm._torch.pyexecutor.model_loader import effective_mamba_ssm_cache_dtype
-    from tensorrt_llm._torch.utils import is_gdn_replay_enabled
-
-    kv_cache_config = llm_args.kv_cache_config
-    return EngineChoices(
-        torch_dtype=model_config.torch_dtype,
-        moe_backend=model_config.moe_backend_requested,
-        mamba_ssm_cache_dtype=effective_mamba_ssm_cache_dtype(
-            model_config, kv_cache_config.mamba_ssm_cache_dtype
-        ),
-        gdn_replay=is_gdn_replay_enabled(),
-        prefill_cuda_graph_backend=str(llm_args.prefill_cuda_graph_backend.value),
-        load_balancer=llm_args.moe_config.load_balancer is not None,
-    )
-
-
-def _field(block, name: str, default=None):
-    """`block`'s `name` -- a mapping's entry or an object's attribute -- or `default` where it
-    is absent or null."""
-    value = block.get(name) if isinstance(block, dict) else getattr(block, name, None)
-    return default if value is None else value
-
-
-def _text_settings(text) -> dict:
-    """`_TEXT_SETTINGS`' entries as `text` declares them. The rope fields are the target's
-    reading: the `rope_parameters` dict, or the flattened `rope_scaling` with the theta and
-    the partial factor at the top level."""
-    rope = getattr(text, "rope_parameters", None) or getattr(text, "rope_scaling", None) or {}
-    settings = {name: getattr(text, name, None) for name in _TEXT_SETTINGS}
-    settings.update(
-        rope_theta=rope.get("rope_theta", getattr(text, "rope_theta", None)),
-        partial_rotary_factor=rope.get(
-            "partial_rotary_factor", getattr(text, "partial_rotary_factor", None)
-        ),
-        mrope_section=tuple(rope.get("mrope_section") or ()),
-        mrope_interleaved=rope.get("mrope_interleaved"),
-        rope_factor=rope.get("factor"),
-        attn_output_gate=_field(text, "attn_output_gate", True),
-        mtp_num_hidden_layers=_field(text, "mtp_num_hidden_layers", 1),
-        mtp_use_dedicated_embeddings=_field(text, "mtp_use_dedicated_embeddings", False),
-    )
-    mtp = getattr(text, "mtp", None)
-    settings.update(
-        {
-            "mtp.num_hidden_layers": _field(mtp, "num_hidden_layers", 1),
-            "mtp.layer_types": tuple(_field(mtp, "layer_types", ("full_attention",))),
-            "mtp.mtp_use_hidden_state_from_layer": _field(mtp, "mtp_use_hidden_state_from_layer"),
-        }
-    )
-    return settings
-
 
 def layout(mapping: Mapping) -> Optional[str]:
-    """The target's layout ``mapping`` describes (``tp1``, ``tp4``, ``tep4``, ``dep4``,
-    ``dep2``), or None.
+    """The layout ``mapping`` describes, or None.
 
-    Pipeline and context parallelism, an attention TP narrower than the TP group, MoE
-    clusters, lm_head TP under attention DP and a group spanning nodes are other
-    forwards.
+    Attention runs TP over the whole world, or DP with the LM head whole. Pipeline and context
+    parallelism, MoE clusters and a world spanning nodes are other forwards.
     """
-    if mapping.tp_size != mapping.world_size or (mapping.pp_size, mapping.cp_size) != (1, 1):
-        return None
-    if mapping.is_multi_node() or mapping.moe_cluster_size != 1:
-        return None
     if mapping.enable_attention_dp:
-        if mapping.enable_lm_head_tp_in_adp:
-            return None
-    elif mapping.attn_tp_size != mapping.tp_size:
+        attention_as_built = not mapping.enable_lm_head_tp_in_adp
+    else:
+        attention_as_built = mapping.attn_tp_size == mapping.tp_size
+    if (
+        not attention_as_built
+        or mapping.tp_size != mapping.world_size
+        or (mapping.pp_size, mapping.cp_size, mapping.moe_cluster_size) != (1, 1, 1)
+        or mapping.is_multi_node()
+    ):
         return None
     return _LAYOUTS.get(
-        (
-            mapping.world_size,
-            mapping.enable_attention_dp,
-            mapping.moe_tp_size,
-            mapping.moe_ep_size,
-        )
+        (mapping.world_size, mapping.enable_attention_dp, mapping.moe_tp_size, mapping.moe_ep_size)
     )
-
-
-def _describe(mapping: Mapping) -> str:
-    return (
-        f"world_size={mapping.world_size} (tp={mapping.tp_size}, pp={mapping.pp_size}, "
-        f"cp={mapping.cp_size}, attention_dp={mapping.enable_attention_dp}, "
-        f"moe_tp={mapping.moe_tp_size}, moe_ep={mapping.moe_ep_size})"
-    )
-
-
-def _check_engine(
-    spec_config: Optional[MTPDecodingConfig],
-    kv_cache_quant_algo: Optional[QuantAlgo],
-    engine: EngineChoices,
-    member: str,
-) -> None:
-    """Decline what the target's constructor or first forward would refuse at layout
-    `member`: at tp1 the CuteDSL experts and the fp32 recurrent state are served too.
-
-    Without this ``auto`` claims the deployment and then fails mid-build instead of
-    falling back to the built-in implementation.
-    """
-    if member == "tp1":
-        moe_backends, ssm_state_dtypes = _ONE_RANK_MOE_BACKENDS, _ONE_RANK_SSM_STATE_DTYPES
-    else:
-        moe_backends, ssm_state_dtypes = _MOE_BACKENDS, _SSM_STATE_DTYPES
-    if spec_config is not None and (
-        getattr(spec_config, "draft_len_schedule", None) is not None
-        or getattr(spec_config, "acceptance_rate_threshold", None) is not None
-    ):
-        raise NoTarget(
-            "the draft length changes at runtime (draft_len_schedule, max_concurrency or "
-            "acceptance_rate_threshold), but this target's verify step runs at the one "
-            "width max_draft_len + 1"
-        )
-    if kv_cache_quant_algo not in (None, QuantAlgo.FP8, QuantAlgo.NVFP4):
-        raise NoTarget(
-            f"a {kv_cache_quant_algo} KV cache; the target stores K/V as the checkpoint's bf16, "
-            "as FP8 or as NVFP4"
-        )
-    if engine.torch_dtype != torch.bfloat16:
-        raise NoTarget(f"the engine runs the model in {engine.torch_dtype}; the target is bf16")
-    if str(engine.moe_backend).upper() not in moe_backends:
-        raise NoTarget(
-            f"moe_config.backend={engine.moe_backend!r}; at {member} the target runs the "
-            f"trunk's routed experts on {', '.join(moe_backends)}"
-        )
-    if engine.mamba_ssm_cache_dtype not in ssm_state_dtypes:
-        served = " or ".join(str(dtype).removeprefix("torch.") for dtype in ssm_state_dtypes)
-        raise NoTarget(
-            f"a {engine.mamba_ssm_cache_dtype} recurrent-state cache; at {member} the target "
-            f"serves {served} (kv_cache_config.mamba_ssm_cache_dtype)"
-        )
-    if engine.load_balancer and member in _EXPERT_PARALLEL_LAYOUTS:
-        raise NoTarget(
-            f"moe_config.load_balancer (EPLB) at {member}: the target runs fixed contiguous "
-            "expert windows and registers no layer with the balancer, so the placement would "
-            "do nothing"
-        )
-    if engine.prefill_cuda_graph_backend == "piecewise":
-        raise NoTarget(
-            "prefill_cuda_graph_backend='piecewise' makes the engine torch.compile the model, "
-            "which the target does not implement; 'breakable' runs the prefill step as a "
-            "breakable CUDA graph"
-        )
-    if spec_config is None:
-        return
-    draft = spec_config.max_draft_len
-    if not engine.gdn_replay:
-        raise NoTarget(
-            "MTP with TRTLLM_USE_GDN_REPLAY=0: the target verifies its Gated-DeltaNet rows on "
-            "the cached replay only, not on the legacy per-step recurrent states; leave "
-            "TRTLLM_USE_GDN_REPLAY unset"
-        )
-    if str(engine.moe_backend).upper() == "CUTEDSL" and draft > _MAX_CUTEDSL_DRAFT_LEN:
-        raise NoTarget(
-            f"max_draft_len={draft} with moe_config.backend=CUTEDSL: the CuteDSL expert "
-            f"pipeline is certified at max_draft_len up to {_MAX_CUTEDSL_DRAFT_LEN}"
-        )
-
-
-def _check_attention_dp(
-    member: str, spec_config: Optional[MTPDecodingConfig], engine: EngineChoices
-) -> None:
-    """Decline what the target does not run under attention DP (dep4, dep2), where
-    each rank serves its own requests and only the routed experts cross ranks.
-
-    MTP is admitted at dep4, where each rank drafts for its own requests and the draft layer's
-    FP8 expert window runs the trunk's attention-DP round trip. Routing admits both MTP and
-    the breakable prefill graph at the attention-TP layouts (tp4, tep4).
-    """
-    if spec_config is not None and member not in _ATTENTION_DP_MTP_LAYOUTS:
-        raise NoTarget(
-            f"speculative decoding with attention DP ({member}): no draft acceptance was "
-            "measured at this layout; MTP under attention DP is admitted at "
-            f"{', '.join(_ATTENTION_DP_MTP_LAYOUTS)}"
-        )
-    if engine.prefill_cuda_graph_backend == "breakable":
-        raise NoTarget(
-            f"prefill_cuda_graph_backend='breakable' with attention DP ({member}): the engine "
-            "pads every rank to one prefill bucket, so a rank holding only generation requests "
-            "is handed more rows than its batch, which the target's decode step refuses"
-        )
 
 
 # Qwen3.8-Flash-Next publishes ``Qwen4ExpForConditionalGeneration``, and the
@@ -317,97 +66,37 @@ def _check_attention_dp(
 def route(
     model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
 ) -> type:
-    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
-
-    A target is imported where it is returned, so declining costs no import of
-    modeling code. Routing also declines the engine choices (`EngineChoices`) the
-    target's constructor would refuse.
-    """
-    pretrained_config = model_config.pretrained_config
-    mapping = model_config.mapping
-    spec_config = model_config.spec_config
-    kv_cache_quant_algo = engine_kv_cache_quant_algo(model_config, llm_args)
-    text = getattr(pretrained_config, "text_config", None)
-    vision = getattr(pretrained_config, "vision_config", None)
-    # Absent means this is not the normalized Qwen4-Exp composite at all, and
-    # nothing below would be readable.
-    if text is None or vision is None:
-        raise NoTarget(
-            f"{type(pretrained_config).__name__} carries no text_config/vision_config; "
-            "the qwen4_exp target reads both halves of the normalized composite"
-        )
-
-    shape = (
-        text.num_hidden_layers,
-        text.hidden_size,
-        text.num_experts,
-        text.num_attention_heads,
-        text.linear_num_value_heads,
-        text.vocab_size,
-    )
-    vshape = (
-        vision.depth,
-        vision.hidden_size,
-        vision.num_heads,
-        vision.spatial_merge_size,
-        vision.out_hidden_size,
-        vision.num_position_embeddings,
-        tuple(getattr(vision, "deepstack_visual_indexes", None) or ()),
-        vision.hidden_act,
-    )
-
-    # The target implements the one-model MTP-Eagle loop over the checkpoint's
-    # single MTP module, and no other draft path. A draft longer than seven needs
-    # more verify rows per request than the GDN cached replay and thop_attention
-    # are certified at. The draft must also be a linear chain over that one
-    # module. The target's constructor relies on each of these, so declining here
-    # is what lets ``auto`` fall back to the built-in model.
-    mtp_eagle_or_none = spec_config is None or (
-        isinstance(spec_config, MTPDecodingConfig)
-        and spec_config.spec_dec_mode.is_mtp_eagle_one_model()
-        and getattr(spec_config, "num_nextn_predict_layers", None) in (None, 1)
-        and 1 <= spec_config.max_draft_len <= _MAX_DRAFT_LEN
-        and not getattr(spec_config, "use_dynamic_tree", False)
-        and getattr(spec_config, "eagle_choices", None) is None
-        and spec_config.max_total_draft_tokens == spec_config.max_draft_len
-    )
-
-    checkpoint = compute_capability == _SM and shape == _TEXT_SHAPE and vshape == _VISION_SHAPE
-    if checkpoint:
-        settings = _text_settings(text)
-        differs = {k: v for k, v in settings.items() if v != _TEXT_SETTINGS[k]}
-        if differs:
-            raise NoTarget(
-                f"the checkpoint has Qwen3.8-Flash-Next's shape but declares {differs}; the "
-                f"target implements { ({k: _TEXT_SETTINGS[k] for k in differs}) }"
-            )
-    # Qwen3.8-Flash-Next-NVFP4 on GB300s (sm103): on one at tp1, on four at tp4, tep4 or dep4,
-    # MTP-Eagle or no speculation; on two at dep2, without speculation.
+    """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits."""
+    mapping, spec = model_config.mapping, model_config.spec_config
     member = layout(mapping)
-    if checkpoint and member is not None and mtp_eagle_or_none:
-        engine = engine_choices(model_config, llm_args)
-        if mapping.enable_attention_dp:
-            _check_attention_dp(member, spec_config, engine)
-        _check_engine(spec_config, kv_cache_quant_algo, engine, member)
-        # One line on purpose: the claims suite reads the routed target off the
-        # `from .<target>.modeling import <Class>` line.
-        # fmt: off
-        # isort: off
-        from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import ModelingV2Qwen38FlashNextNvfp4Sm103Default
-        # isort: on
-        # fmt: on
+    if compute_capability != _SM or member is None:
+        raise NoTarget(
+            f"compute capability {compute_capability}, world_size={mapping.world_size} "
+            f"(tp={mapping.tp_size}, pp={mapping.pp_size}, cp={mapping.cp_size}, "
+            f"attention_dp={mapping.enable_attention_dp}, moe_tp={mapping.moe_tp_size}, "
+            f"moe_ep={mapping.moe_ep_size}); the qwen4_exp target is Qwen3.8-Flash-Next-NVFP4 "
+            "on sm103 in one node: tp1, tp4 (experts split by intermediate), tep4, dep4 "
+            "(attention DP) or dep2 (attention DP, experts EP2)"
+        )
+    if spec is not None and not (
+        isinstance(spec, MTPDecodingConfig) and spec.spec_dec_mode.is_mtp_eagle_one_model()
+    ):
+        raise NoTarget(
+            f"speculative decoding {spec.spec_dec_mode.name}; the target runs one-model "
+            "MTP-Eagle or no speculative decoding"
+        )
+    if spec is not None and member == "dep2":
+        raise NoTarget(
+            "speculative decoding with attention DP (dep2): no draft acceptance was measured at "
+            "this layout; MTP under attention DP is admitted at dep4"
+        )
+    # One line on purpose: the claims suite reads the routed target off the
+    # `from .<target>.modeling import <Class>` line.
+    # fmt: off
+    # isort: off
+    from .qwen3_8_flash_next_nvfp4__sm_103__default.modeling import ModelingV2Qwen38FlashNextNvfp4Sm103Default
+    # isort: on
+    # fmt: on
 
-        return ModelingV2Qwen38FlashNextNvfp4Sm103Default
-
-    raise NoTarget(
-        f"compute capability {compute_capability}, text shape {shape}, vision shape "
-        f"{vshape}, {_describe(mapping)}, speculative decoding "
-        f"{spec_config.spec_dec_mode.name if spec_config is not None else 'off'}"
-        f"{f' max_draft_len={spec_config.max_draft_len}' if spec_config is not None else ''}, "
-        f"KV cache {kv_cache_quant_algo or 'bf16'}; the qwen4_exp target is "
-        "Qwen3.8-Flash-Next-NVFP4 on sm103 in one node: at 1 rank (tp1), and at 4 ranks tp4 "
-        "(attention TP4, experts split by intermediate), tep4 (attention TP4, experts EP4) or "
-        f"dep4 (attention DP, experts EP4), with one-model MTP-Eagle (max_draft_len "
-        f"1..{_MAX_DRAFT_LEN}) or no speculative decoding; at 2 ranks dep2 (attention DP, "
-        "experts EP2) without speculative decoding"
-    )
+    ModelingV2Qwen38FlashNextNvfp4Sm103Default.check_deployment(model_config, llm_args, member)
+    return ModelingV2Qwen38FlashNextNvfp4Sm103Default

@@ -318,7 +318,7 @@ class VisionTower:
 
     def __init__(self, w: dict, vision_config) -> None:
         """`w` is the core's weight table after load; `vision_config` the composite
-        config's vision half, which `routing.py` matched against this checkpoint's."""
+        config's vision half, which `check_deployment` matched against this checkpoint's."""
         vcfg = vision_config
         self.depth = vcfg.depth
         self.hidden = vcfg.hidden_size

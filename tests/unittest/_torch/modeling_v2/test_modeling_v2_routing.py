@@ -38,9 +38,6 @@ from tensorrt_llm._torch._experimental.modeling_v2._router_index import (
     modeling_v2_resolve,
     resolved_mode,
 )
-from tensorrt_llm._torch._experimental.modeling_v2.models.qwen4_exp import (
-    routing as qwen4_exp_routing,
-)
 from tensorrt_llm._torch.configs.kimi_k3 import KimiK3Config
 from tensorrt_llm._torch.distributed.ops import MNNVLAllReduce
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -181,7 +178,7 @@ def _qwen4_exp_config(**vision_overrides):
         num_attention_heads=24,
         linear_num_value_heads=48,
         vocab_size=248320,
-        # The settings the target pins (`routing._TEXT_SETTINGS`), as the normalized config
+        # The settings the target pins (`modeling._TEXT_SETTINGS`), as the normalized config
         # carries them: rope theta and partial factor flattened to the top level.
         norm_topk_prob=True,
         num_experts_per_tok=10,
@@ -1279,11 +1276,8 @@ def test_qwen4_exp_quantized_kv_cache_dtypes_match(algo):
 @pytest.mark.usefixtures("_qwen4_exp_sm")
 @pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
 def test_qwen4_exp_other_kv_cache_algorithms_are_declined(algo):
-    choices = qwen4_exp_routing.engine_choices(
-        _model_config(_qwen4_exp_config()), _llm_args("auto")
-    )
-    with pytest.raises(NoTarget, match="KV cache"):
-        qwen4_exp_routing._check_engine(None, algo, choices, "tp1")
+    """`kv_cache_config.dtype: auto` keeps the checkpoint's own KV-cache algorithm."""
+    _declined(_model_config(_qwen4_exp_config(), kv_cache_quant_algo=algo), match="KV cache")
 
 
 @pytest.mark.usefixtures("_qwen4_exp_sm")

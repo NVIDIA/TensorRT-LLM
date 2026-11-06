@@ -99,7 +99,7 @@ def _qwen4_exp_config(text_overrides=None, **vision_overrides):
         num_attention_heads=24,
         linear_num_value_heads=48,
         vocab_size=248320,
-        # The settings the target pins (`routing._TEXT_SETTINGS`), as the normalized config
+        # The settings the target pins (`modeling._TEXT_SETTINGS`), as the normalized config
         # carries them: rope theta and partial factor flattened to the top level.
         norm_topk_prob=True,
         num_experts_per_tok=10,
@@ -158,16 +158,9 @@ def _declined(config, match=None, **llm_args_kwargs) -> None:
         modeling_v2_resolve(config, _llm_args("require", **llm_args_kwargs))
 
 
-def test_routing_admits_exactly_what_the_target_implements():
-    """`route` declines a MoE backend, a draft length or a recurrent-state dtype the
-    target does not run; this keeps routing's constants and the target's together."""
-    # At tp1 the CuteDSL backend and the fp32 state too; at the other layouts neither.
-    assert set(routing._ONE_RANK_MOE_BACKENDS) == set(M._TRUNK_MOE_BACKENDS)
-    assert set(routing._MOE_BACKENDS) == set(M._TRUNK_MOE_BACKENDS) - {"CUTEDSL"}
-    assert routing._MAX_CUTEDSL_DRAFT_LEN == M._CUTEDSL_MAX_DRAFT_LEN
-    assert routing._MAX_DRAFT_LEN == M._MAX_VERIFY_WIDTH - 1
-    assert routing._SSM_STATE_DTYPES == M._SSM_STATE_DTYPES
-    assert routing._ONE_RANK_SSM_STATE_DTYPES == M._ONE_RANK_SSM_STATE_DTYPES
+def test_routing_and_the_target_agree_on_the_gpu():
+    """`route` gates on the GPU before it imports the target, whose constructor asserts the
+    same one; the target's `check_deployment` holds every other admission fact."""
     assert routing._SM == M._SM
 
 
@@ -467,11 +460,15 @@ def test_mtp_matches_with_the_flashinfer_ring_replay(monkeypatch, max_draft_len,
     _claimed(_model_config(MTPDecodingConfig(max_draft_len=max_draft_len), **_LAYOUTS["tep4"]))
 
 
-def test_other_kv_cache_algorithms_decline():
-    choices = routing.engine_choices(_model_config(**_LAYOUTS["tep4"]), _llm_args())
-    for algo in (QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES):
-        with pytest.raises(routing.NoTarget, match="KV cache"):
-            routing._check_engine(None, algo, choices, "tep4")
+@pytest.mark.parametrize("algo", [QuantAlgo.INT8, QuantAlgo.FP8_BLOCK_SCALES])
+def test_another_checkpoint_kv_cache_algorithm_declines(algo):
+    """`kv_cache_config.dtype: auto` keeps the checkpoint's own KV-cache algorithm."""
+    config = _model_config(**_LAYOUTS["tep4"])
+    config.quant_config.kv_cache_quant_algo = algo
+    _declined(config, match="KV cache")
+
+
+def test_the_fp8_ds_mla_kv_cache_declines():
     _declined(
         _model_config(**_LAYOUTS["tep4"]),
         match="KV cache",
