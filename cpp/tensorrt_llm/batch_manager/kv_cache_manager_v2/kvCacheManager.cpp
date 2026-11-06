@@ -189,8 +189,9 @@ KvCacheManager::~KvCacheManager()
         {
             // A failed nothrow allocation leaves its argument unmoved, so that member is destroyed
             // below after all; its destructor then fails for want of a context and poisons KVCM2.
-            TLLM_LOG_ERROR("KVCacheManagerV2 could not even leak its memory (allocation failed); its destructors "
-                           "run without a CUDA context and may poison KVCacheManagerV2.");
+            TLLM_LOG_ERROR(
+                "KVCacheManagerV2 could not even leak its memory (allocation failed); its destructors "
+                "run without a CUDA context and may poison KVCacheManagerV2.");
         }
         return;
     }
