@@ -25,13 +25,13 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.cache_manager impo
     MiniMaxM3KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
-from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_CONTEXT_LOWERING
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     KVCacheLayerOwner,
     KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
 )
+from tensorrt_llm._torch.speculative.dflash_attention import DFLASH_CONTEXT_LOWERING
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, MiniMaxM3SparseAttentionConfig
@@ -478,6 +478,7 @@ def _dspark_creator(*, is_disagg: bool, context_kernel: bool = False) -> KvCache
         ),
     )
     creator._kv_cache_manager_cls = MiniMaxM3KVCacheManagerV2
+    creator._sparse_attention_config = SimpleNamespace(implementation="msa")
     creator._kv_cache_config = SimpleNamespace(max_attention_window=None)
     creator._tokens_per_block = 128
     creator._unification_max_seq_len = 8192
@@ -546,3 +547,34 @@ def test_m3_shares_draft_kv_by_default(monkeypatch, is_disagg: bool) -> None:
     )
     assert creator._dflash_unify_blocker() is None
     assert creator._should_unify_dflash_kv_cache() is not is_disagg
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_gate_keeps_layouts_the_hosting_manager_refuses(monkeypatch, is_disagg: bool) -> None:
+    """Layouts MiniMax-M3's manager refuses at construction keep the separate draft KV cache."""
+    monkeypatch.setenv("TRTLLM_DISAGG_SHARED_DRAFT_KV", "1")
+    creator = _dspark_creator(is_disagg=is_disagg)
+    assert creator._dflash_unify_blocker() is None
+
+    # NVFP4 draft layers.
+    creator = _dspark_creator(is_disagg=is_disagg)
+    draft = creator._get_draft_kv_model_config()
+    draft.quant_config = SimpleNamespace(
+        quant_mode=QuantMode.from_quant_algo(kv_cache_quant_algo=QuantAlgo.NVFP4)
+    )
+    assert "NVFP4 draft layers" in creator._dflash_unify_blocker()
+
+    # A draft window that resolves to a target layer's window: one lifecycle for both.
+    creator = _dspark_creator(is_disagg=is_disagg)
+    creator._get_draft_max_attention_window = lambda *_: [creator._unification_max_seq_len]
+    assert "share a KV cache lifecycle" in creator._dflash_unify_blocker()
+
+    # The Triton implementation keeps an NVFP4 cache NHD, which transfer cannot pair with draft layers.
+    creator = _dspark_creator(is_disagg=is_disagg)
+    creator._sparse_attention_config = SimpleNamespace(implementation="triton")
+    blocker = creator._dflash_unify_blocker()
+    if is_disagg:
+        assert "HND K/V layout" in blocker
+    else:
+        assert blocker is None

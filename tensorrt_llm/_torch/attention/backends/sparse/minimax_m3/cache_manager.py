@@ -382,7 +382,7 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
         implementation = getattr(sparse_attention_config, "implementation", "triton")
         self._main_kv_view_layout = "HND" if implementation == "msa" else "NHD"
         native_dense_cache = kwargs.get("dtype") not in (DataType.FP8, DataType.NVFP4)
-        if implementation == "triton" and not native_dense_cache:
+        if not self.main_kv_is_head_major(sparse_attention_config, kwargs.get("dtype")):
             self._main_kv_mapper_kind = MapperKind.NHD
 
         if sparse_index_dim is None:
@@ -571,6 +571,15 @@ class MiniMaxM3KVCacheManagerV2(KVCacheManagerV2):
             ):
                 if view is not None:
                     view.zero_()
+
+    @staticmethod
+    def main_kv_is_head_major(sparse_attention_config: Any, dtype: Optional[DataType]) -> bool:
+        """Whether the main K/V buffers use the HND mapper.
+
+        The Triton implementation keeps an FP8 or NVFP4 cache NHD.
+        """
+        implementation = getattr(sparse_attention_config, "implementation", "triton")
+        return not (implementation == "triton" and dtype in (DataType.FP8, DataType.NVFP4))
 
     def _validate_speculative_config(self, spec_config: DecodingBaseConfig | None) -> None:
         # Dynamic-tree relocation moves packed K/V bytes without their NVFP4

@@ -2452,6 +2452,11 @@ class KvCacheCreator:
                 "effective attention windows; keeping a separate draft KV cache.",
                 key="dflash_mixed_draft_windows_fallback")
             return "the draft layers use different attention windows"
+        if hosts_draft_layers:
+            blocker = self._hosting_manager_blocker(target_layout, draft_layout,
+                                                    draft_windows)
+            if blocker is not None:
+                return blocker
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout,
                 draft_layout,
@@ -2466,6 +2471,39 @@ class KvCacheCreator:
             return (f"the draft KV layout {draft_layout} cannot be transferred "
                     f"with the target's {target_layout} "
                     "(kv_heads, head_dim, dtype, k_only)")
+        return None
+
+    def _hosting_manager_blocker(
+            self, target_layout: tuple[int, int, object,
+                                       bool], draft_layout: tuple[int, int,
+                                                                  object, bool],
+            draft_windows: List[Optional[int]]) -> Optional[str]:
+        """Why a manager hosting draft layer specs would refuse this layout, or None."""
+        if draft_layout[2] == tensorrt_llm.bindings.DataType.NVFP4:
+            return "the target's KV cache manager does not host NVFP4 draft layers"
+        target_model_config = self._model_engine.model.model_config
+        target_window_config = self._kv_cache_config.max_attention_window
+        if target_window_config is None:
+            target_window_config = _derive_v2_layer_type_attention_windows(
+                self._kv_cache_config, self._kv_cache_manager_cls,
+                target_model_config, self._unification_max_seq_len)
+        target_windows = _resolve_v2_max_attention_window_vec(
+            target_window_config, self._unification_max_seq_len,
+            list(
+                self._mapping.pp_layers(
+                    int(target_model_config.pretrained_config.num_hidden_layers)
+                )))
+        # Layer specs carry no sinks and share one reuse policy, so equal
+        # windows put draft and target layers in one lifecycle.
+        if set(draft_windows) & set(target_windows):
+            return ("the draft layers would share a KV cache lifecycle with "
+                    "target layers")
+        head_major = getattr(self._kv_cache_manager_cls,
+                             "main_kv_is_head_major", None)
+        if (self._is_disagg and head_major is not None and not head_major(
+                self._sparse_attention_config, target_layout[2])):
+            return ("the target's KV cache manager transfers draft layers "
+                    "only with the HND K/V layout")
         return None
 
     @staticmethod
