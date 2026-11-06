@@ -200,9 +200,11 @@ def test_virtual_layer_manager_names_mixed_precision_layers_as_its_hooks_do():
     layer_grouping = [[LayerId(0)], [LayerId(1)], [LayerId(2)]]
     manager = _stub(
         DeepseekV4CacheManager,
+        dtype=DataType.BF16,
         kv_factor=1,
         _disagg_ignored_roles=frozenset(),
         use_fp8_ds_mla=False,
+        _use_nvfp4_compress=False,
         pp_layers=[3],
         _layer_attn_to_layer_id={(3, swa): 0, (3, compress): 1},
         mixed_precision_low_dtype=DataType.NVFP4,
@@ -228,13 +230,58 @@ def test_virtual_layer_manager_names_mixed_precision_layers_as_its_hooks_do():
     assert spec.quant_mode is None
 
 
-def test_dsa_index_keys_are_alike_on_every_rank():
-    manager = _stub(DSACacheManagerV2, kv_factor=1)
+class _SplitLayerStorage:
+    """Storage over model layers 4 and 5 whose layer 0 the reuse policies split over two cache
+    groups, its high layer internal layer 2; like the runtime's, its deprecated layer grouping
+    refuses to list a split layer."""
+
+    buffer_grouping = [
+        [SimpleNamespace(layer_id=LayerId(layer), role=Role.KEY) for layer in (0, 1)],
+        [SimpleNamespace(layer_id=LayerId(2), role=Role.KEY)],
+        [SimpleNamespace(layer_id=LayerId(0), role=Role.INDEX_KEY)],
+    ]
+
+    @property
+    def layer_grouping(self):
+        raise RuntimeError("layer 0 is split over cache groups")
+
+
+def test_mixed_precision_layer_ids_follow_the_buffers_of_a_split_layer():
+    manager = _stub(
+        DSACacheManagerV2,
+        dtype=DataType.BF16,
+        kv_factor=1,
+        use_fp8_ds_mla=False,
+        pp_layers=[4, 5],
+        mixed_precision_low_dtype=DataType.NVFP4,
+        mixed_precision_high_dtype=DataType.BF16,
+        mixed_precision_high_layers={0: 2},
+        impl=_SplitLayerStorage(),
+    )
+
+    spec = manager.page_table_spec()
+
+    # A layer's global layer is its own, whichever cache groups hold its buffers.
+    assert dict(spec.layer_ids) == {0: (8, 4), 1: (10, 5), 2: (9, 4)}
+
+
+@pytest.mark.parametrize(
+    "dtype, fp8_ds_mla, quant_mode",
+    [
+        (DataType.BF16, False, None),
+        (DataType.FP8, False, "fp8"),
+        (DataType.FP8, True, "fp8_ds_mla"),
+    ],
+)
+def test_dsa_index_keys_are_alike_on_every_rank(dtype, fp8_ds_mla, quant_mode):
+    manager = _stub(DSACacheManagerV2, dtype=dtype, kv_factor=1, use_fp8_ds_mla=fp8_ds_mla)
 
     spec = assert_spec_matches_disagg_hooks(manager, (Role.KEY, Role.INDEX_KEY))
 
     assert spec.layout_of(str(Role.KEY)) == ByHead(total=1)
     assert spec.layout_of(str(Role.INDEX_KEY)) == Replicated()
+    # Pages carrying their own scales are not plain FP8.
+    assert spec.quant_mode == quant_mode
 
 
 @pytest.mark.parametrize("storage, token_major", [(MapperKind.HND, False), (MapperKind.NHD, True)])
@@ -262,14 +309,27 @@ def test_csa2_caches_are_alike_on_every_rank(bounded_replay):
         assert (str(role) in spec.request_rebuilt_roles) == partitioned
 
 
-@pytest.mark.parametrize("fp8_ds_mla", [False, True])
-def test_deepseek_v4_splits_its_attention_caches_by_head(fp8_ds_mla):
+@pytest.mark.parametrize(
+    "dtype, fp8_ds_mla, nvfp4_compress, quant_mode",
+    [
+        (DataType.BF16, False, False, None),
+        (DataType.FP8, False, False, "fp8"),
+        (DataType.FP8, True, False, "fp8_ds_mla"),
+        # NVFP4 KV compresses the compressed cache and keeps the others in FP8.
+        (DataType.FP8, False, True, "nvfp4"),
+    ],
+)
+def test_deepseek_v4_splits_its_attention_caches_by_head(
+    dtype, fp8_ds_mla, nvfp4_compress, quant_mode
+):
     padding = DataRole("deepseek_v4_test_alignment_padding")
     manager = _stub(
         DeepseekV4CacheManager,
+        dtype=dtype,
         kv_factor=1,
         _disagg_ignored_roles=frozenset({padding}),
         use_fp8_ds_mla=fp8_ds_mla,
+        _use_nvfp4_compress=nvfp4_compress,
     )
     head_split = (COMPRESS_BLOCK_SCALE_ROLE, *(t.role for t in DeepseekV4AttentionType))
 
@@ -278,7 +338,7 @@ def test_deepseek_v4_splits_its_attention_caches_by_head(fp8_ds_mla):
     # Each holds MLA latents of one head, which every tensor rank holds whole.
     assert all(spec.layout_of(str(role)) == ByHead(total=1) for role in head_split)
     assert spec.untransferred_roles == frozenset({str(padding)})
-    assert spec.quant_mode == ("fp8_ds_mla" if fp8_ds_mla else None)
+    assert spec.quant_mode == quant_mode
 
 
 def test_hybrid_manager_sections_conv_state_and_splits_ssm_state_by_head():
