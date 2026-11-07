@@ -352,8 +352,9 @@ def test_worker_unpacks_batched_requests_in_order():
 
 
 @pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
 @pytest.mark.parametrize("push", [False, True])
-def test_initial_connection_timeout_fails_accepted_work(tmp_path, push):
+def test_initial_connection_timeout_fails_accepted_work(tmp_path, push, direct_send):
     if push:
         commands = IpcQueue(
             (f"ipc://{tmp_path}/absent", b"k" * 32),
@@ -363,7 +364,9 @@ def test_initial_connection_timeout_fails_accepted_work(tmp_path, push):
     else:
         commands = IpcQueue(is_server=True)
     errors = queue.Queue()
-    sender = _RequestSender(commands, errors, connect_timeout=0.15)
+    sender = _RequestSender(
+        commands, errors, batching=not direct_send, connect_timeout=0.15, direct_send=direct_send
+    )
     try:
         sender.send(pickle.dumps("accepted"))
         assert isinstance(errors.get(timeout=2), TimeoutError)
@@ -375,14 +378,15 @@ def test_initial_connection_timeout_fails_accepted_work(tmp_path, push):
 
 
 @pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
 @pytest.mark.parametrize("transport", ["tcp", "ipc"])
-def test_established_disconnect_fails_while_idle_without_replay(tmp_path, transport):
+def test_established_disconnect_fails_while_idle_without_replay(tmp_path, transport, direct_send):
     address = (f"ipc://{tmp_path}/commands", b"k" * 32) if transport == "ipc" else None
     peer = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
     address = peer.address
     commands = IpcQueue(address, is_server=False, socket_type=zmq.PUSH)
     errors = queue.Queue()
-    sender = _RequestSender(commands, errors, batching=False)
+    sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
     replacement = None
     try:
         sender.send(pickle.dumps("accepted"))
@@ -617,22 +621,44 @@ def test_unbatched_production_sender_writes_on_the_submitting_thread(
         commands.close()
 
 
-class _OwnerStalledQueue(IpcQueue):
-    """Real command socket whose sender thread cannot write until released.
-
-    This stands in for a sender thread that CPython does not schedule.
-    """
+class _ObservedQueue(IpcQueue):
+    """Real command socket that records writers and the sender thread's waits."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.release = threading.Event()
         self.writers = set()
+        self.owner_blocked = threading.Event()
 
     def put(self, message, **kwargs):
-        if threading.current_thread().name == "proxy_request_sender":
-            assert self.release.wait(10)
+        try:
+            super().put(message, **kwargs)
+        except zmq.Again:
+            if threading.current_thread().name == "proxy_request_sender":
+                self.owner_blocked.set()
+            raise
         self.writers.add(threading.current_thread().name)
-        return super().put(message, **kwargs)
+
+
+def _deschedule_owner(sender):
+    """Stop the sender thread's progress, like a thread that is denied the GIL.
+
+    The thread keeps releasing the condition lock while it is held back, so
+    callers still run. Setting the returned event lets it continue.
+    """
+    resume = threading.Event()
+    wait = sender._cond.wait
+
+    def descheduled_wait(timeout=None):
+        if threading.current_thread() is not sender._thread:
+            return wait(timeout)
+        while not resume.is_set():
+            wait(0.01)
+        return True
+
+    sender._cond.wait = descheduled_wait
+    # Let a wait already in progress reach the replacement.
+    time.sleep(0.2)
+    return resume
 
 
 def _command_peer(commands):
@@ -658,11 +684,12 @@ def test_unbatched_admission_does_not_wait_for_the_sender_thread():
     # Regression: unbatched commands could only be written by the sender
     # thread. A busy event loop starved it of the GIL, so a connected and idle
     # worker received nothing while admission filled and rejected requests.
-    commands = _OwnerStalledQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     sender.MAX_PENDING_REQUESTS = 4
     peer = _command_peer(commands)
+    resume = _deschedule_owner(sender)
     count = 4 * sender.MAX_PENDING_REQUESTS
     try:
         for item in range(count):
@@ -672,10 +699,98 @@ def test_unbatched_admission_does_not_wait_for_the_sender_thread():
         assert sender._pending_requests == 0
         assert errors.empty()
     finally:
-        commands.release.set()
+        resume.set()
         sender.close(timeout=2)
         _close_quietly(peer)
     assert not sender._thread.is_alive()
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_admission_after_an_unwritable_socket_does_not_wait_for_the_sender_thread():
+    # Regression: after one write found the socket unwritable, the sender
+    # thread kept the queue across its retry wait. Callers then only queued
+    # commands, so a descheduled sender thread starved a connected worker.
+    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    sender.MAX_PENDING_REQUESTS = 16
+    peer = None
+    resume = None
+    try:
+        # The worker has not connected yet, so the sender thread must retry.
+        sender.send(pickle.dumps(0))
+        assert commands.owner_blocked.wait(5)
+        resume = _deschedule_owner(sender)
+        peer = _command_peer(commands)
+        count = 4 * sender.MAX_PENDING_REQUESTS
+        for item in range(1, count):
+            sender.send(pickle.dumps(item))
+        assert [pickle.loads(peer.get(timeout=2)[0]) for _ in range(count)] == list(range(count))
+        assert errors.empty()
+    finally:
+        if resume is not None:
+            resume.set()
+        sender.close(timeout=2)
+        if peer is not None:
+            _close_quietly(peer)
+
+
+@pytest.mark.timeout(15, method="thread")
+def test_peer_loss_seen_by_a_caller_stops_admission_without_the_sender_thread():
+    # Regression: a caller that observed the command peer's loss kept
+    # admitting requests, and health stayed green, until the possibly
+    # descheduled sender thread recorded the failure.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    resume = None
+    try:
+        sender.send(pickle.dumps("before"))
+        assert peer.get(timeout=2) == _payloads("before")
+        resume = _deschedule_owner(sender)
+        _close_quietly(peer)
+        accepted = 0
+        deadline = time.monotonic() + 5
+        with pytest.raises(EngineDeadError):
+            while time.monotonic() < deadline:
+                sender.send(pickle.dumps("after-loss"))
+                accepted += 1
+                time.sleep(0.01)
+        assert accepted < 50, "admission continued long after the loss was observed"
+        assert not sender.available
+        assert errors.empty(), "the descheduled sender thread recorded the loss"
+        resume.set()
+        assert isinstance(errors.get(timeout=2), ConnectionError)
+    finally:
+        if resume is not None:
+            resume.set()
+        sender.close(timeout=2)
+        _close_quietly(peer)
+
+
+@pytest.mark.timeout(10, method="thread")
+def test_direct_transport_error_is_recorded_by_the_sender_thread():
+    class _FailingQueue(IpcQueue):
+        def put(self, message, **kwargs):
+            if message is not None:
+                raise RuntimeError("socket closed")
+            return super().put(message, **kwargs)
+
+    commands = _FailingQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=True)
+    peer = _command_peer(commands)
+    try:
+        # The caller's failed write is retried and reported by the sender thread.
+        sender.send(pickle.dumps("rejected"))
+        error = errors.get(timeout=2)
+        assert isinstance(error, RuntimeError) and str(error) == "socket closed"
+        with pytest.raises(EngineDeadError):
+            sender.send(pickle.dumps("after-failure"))
+    finally:
+        sender.close(timeout=2)
+        _close_quietly(peer)
 
 
 @pytest.mark.timeout(30, method="thread")
@@ -755,6 +870,40 @@ def test_unrelated_connection_to_command_port_does_not_fail_the_engine(kind, dir
         _close_quietly(peer)
 
 
+@pytest.mark.timeout(15, method="thread")
+@pytest.mark.parametrize("direct_send", [False, True])
+def test_probe_overlapping_the_worker_handshake_does_not_fail_the_engine(direct_send):
+    # Regression: a TLS probe produces no handshake failure event. If it was
+    # still open when the worker's handshake completed, its close was taken
+    # for the command peer's loss.
+    commands = IpcQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    errors = queue.Queue()
+    sender = _RequestSender(commands, errors, batching=False, direct_send=direct_send)
+    port = int(commands.address[0].rsplit(":", 1)[1])
+    probe = socket.create_connection(("127.0.0.1", port))
+    peer = None
+    try:
+        time.sleep(0.2)
+        peer = _command_peer(commands)
+        sender.send(pickle.dumps("before"))
+        assert peer.get(timeout=2) == _payloads("before")
+        probe.sendall(bytes.fromhex("16030100c4010000c00303") + b"\x00" * 190)
+        time.sleep(0.05)
+        probe.close()
+        time.sleep(0.5)
+        assert errors.empty()
+        assert sender.available
+        sender.send(pickle.dumps("after"))
+        assert peer.get(timeout=2) == _payloads("after")
+        _close_quietly(peer)
+        assert isinstance(errors.get(timeout=2), ConnectionError)
+    finally:
+        probe.close()
+        sender.close(timeout=2)
+        if peer is not None:
+            _close_quietly(peer)
+
+
 def test_command_connection_identifies_the_command_peer():
     from tensorrt_llm.executor.request_sender import _CommandConnection
 
@@ -778,6 +927,12 @@ def test_command_connection_identifies_the_command_peer():
     ) == [False, False, False, False, False, True]
     # Without a failure event, either concurrent candidate may be the peer.
     assert lost((accepted, 7), (accepted, 8), (succeeded, 0), (disconnected, 8))[-1] is True
+    # A peer that is still attached shows the disconnected candidate was not the peer.
+    connection = _CommandConnection()
+    for event, value in ((accepted, 7), (accepted, 8), (succeeded, 0)):
+        assert connection.observe(event, value) is False
+    assert connection.observe(disconnected, 8, lambda: True) is False
+    assert connection.observe(disconnected, 7, lambda: True) is True
     # A connection that disconnects before any handshake carried no commands.
     assert lost((connected, 9), (disconnected, 9)) == [False, False]
     # A completed handshake for an unobserved connection keeps every loss terminal.

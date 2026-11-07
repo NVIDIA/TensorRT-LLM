@@ -58,6 +58,9 @@ class _CommandConnection:
     concurrent handshakes therefore marks every candidate as the possible peer.
     IpcQueue uses one libzmq I/O thread, so a handshake failure and the
     disconnect it causes are adjacent events; that pair clears one candidate.
+    Some rejected connections, such as a TLS probe or a ZMTP peer of another
+    socket type, disconnect without a handshake failure. For such a candidate,
+    the caller reports whether the socket still has an attached, writable peer.
     """
 
     def __init__(self) -> None:
@@ -66,8 +69,15 @@ class _CommandConnection:
         self._peer: set[int] | None = set()
         self._handshake_failed = False
 
-    def observe(self, event: int, value: int) -> bool:
-        """Record one monitor event; return whether the command peer was lost."""
+    def observe(self, event: int, value: int, peer_attached=lambda: False) -> bool:
+        """Record one monitor event; return whether the command peer was lost.
+
+        Args:
+            event: Socket monitor event.
+            value: Event value; the file descriptor for connection events.
+            peer_attached: Whether the socket still has a writable peer. It is
+                consulted only for an ambiguous candidate's disconnect.
+        """
         handshake_failed, self._handshake_failed = (
             self._handshake_failed,
             bool(event & _HANDSHAKE_FAILED_EVENTS),
@@ -84,7 +94,7 @@ class _CommandConnection:
             if self._peer is None:
                 return True
             if value in self._peer:
-                if handshake_failed and len(self._peer) > 1:
+                if len(self._peer) > 1 and (handshake_failed or peer_attached()):
                     self._peer.discard(value)
                     return False
                 return True
@@ -98,13 +108,14 @@ class _RequestSender:
     dead. Losing an established direct connection makes delivery uncertain, so
     pending requests fail rather than replaying commands after reconnection.
 
-    With ``direct_send``, a caller writes queued commands itself while the owner
-    thread is idle. CPython can deny a waiting thread the GIL for as long as
-    another thread keeps briefly releasing it, as a busy asyncio loop does, so
-    unbatched admission must not depend on scheduling the owner thread. The
-    condition lock serializes every socket use, which provides the memory
-    barrier libzmq requires when a socket changes threads. The owner still
-    handles backpressure, connection setup and shutdown.
+    With ``direct_send``, callers write queued commands themselves. CPython can
+    deny a waiting thread the GIL for as long as another thread keeps briefly
+    releasing it, as a busy asyncio loop does, so unbatched admission and loss
+    detection must not depend on scheduling the owner thread. Every socket and
+    monitor use then happens under the condition lock, without waiting while
+    holding it, which provides the memory barrier libzmq requires when a socket
+    changes threads. The owner retries non-blocking writes during backpressure
+    and connection setup, enforces their deadlines, and performs shutdown.
     """
 
     MAX_BATCH_SIZE = 1024
@@ -144,11 +155,9 @@ class _RequestSender:
         self._is_finalizing = sys.is_finalizing
         self._monitor: zmq.Socket | None = None
         self._connection = _CommandConnection()
-        self._connection_lost = False
+        self._connection_lost: ConnectionError | None = None
         self._connected = False
         self._direct_send = direct_send and not batching
-        # The owner thread has taken a batch and may be writing the socket.
-        self._sending = False
         self._close_deadline = float("inf")
         self._ready = threading.Event()
         with self._cond:
@@ -161,7 +170,9 @@ class _RequestSender:
     def available(self) -> bool:
         """Whether the sender is operational, independent of queue congestion."""
         with self._cond:
-            return self._terminal_error is None and not self._closed
+            return (
+                self._terminal_error is None and self._connection_lost is None and not self._closed
+            )
 
     def _start(self) -> None:
         if self._thread is None:
@@ -205,29 +216,29 @@ class _RequestSender:
             self._write_pending_locked()
             self._cond.notify_all()
 
-    def _write_pending_locked(self) -> None:
-        """Write queued commands on the calling thread while the owner is idle."""
-        if (
-            not self._direct_send
-            or self._sending
-            or self._closed
-            or self._terminal_error is not None
-        ):
+    def _write_pending_locked(self, *, owner: bool = False) -> None:
+        """Write queued commands in order without waiting for the socket."""
+        if not self._direct_send or self._terminal_error is not None:
+            return
+        if self._closed and not owner:
             return
         self._poll_connection_locked()
-        if self._connection_lost:
+        if self._connection_lost is not None:
             # The owner fails accepted work; nothing may follow a lost peer.
+            self._cond.notify_all()
             return
         while self._pending:
             item = self._pending[0]
             try:
                 self._request_queue.put([item[0]], timeout=0)
             except zmq.Again:
-                # Backpressure and connection setup belong to the owner.
+                # The owner retries during backpressure or connection setup.
                 return
             except Exception:
-                # Leave the command to the owner, which records the failure.
-                self._direct_send = False
+                if owner:
+                    raise
+                # The owner retries the same command and records the failure.
+                self._cond.notify_all()
                 return
             self._pending.popleft()
             self._connected = True
@@ -251,6 +262,8 @@ class _RequestSender:
     def _check_admission(self) -> None:
         if self._terminal_error is not None:
             raise EngineDeadError(self._terminal_error)
+        if self._connection_lost is not None:
+            raise EngineDeadError(self._connection_lost)
         if self._closed:
             raise EngineUnavailableError("Executor command sender is stopping")
 
@@ -292,24 +305,28 @@ class _RequestSender:
             if thread.is_alive():
                 self._record_failure(TimeoutError("Executor command sender shutdown timed out"))
 
+    def _peer_attached(self) -> bool:
+        return bool(self._request_queue.socket.poll(0, zmq.POLLOUT))
+
     def _poll_connection_locked(self) -> None:
         while self._monitor.poll(0):
             message = recv_monitor_message(self._monitor)
             event = message["event"]
             if event == zmq.EVENT_HANDSHAKE_SUCCEEDED:
                 self._connected = True
-            if self._connection.observe(event, message["value"]) and not self._closed:
-                self._connection_lost = True
+            lost = self._connection.observe(event, message["value"], self._peer_attached)
+            if lost and not self._closed and self._connection_lost is None:
+                self._connection_lost = ConnectionError(
+                    "Executor command connection was lost; request delivery is uncertain"
+                )
 
     def _check_terminal(self) -> None:
         with self._cond:
             self._poll_connection_locked()
             if self._terminal_error is not None:
                 raise EngineDeadError(self._terminal_error)
-            if self._connection_lost:
-                raise ConnectionError(
-                    "Executor command connection was lost; request delivery is uncertain"
-                )
+            if self._connection_lost is not None:
+                raise self._connection_lost
 
     def _record_failure(self, error: BaseException) -> None:
         with self._cond:
@@ -356,9 +373,30 @@ class _RequestSender:
             size = self.MAX_BATCH_SIZE if self._batching else 1
             items = [self._pending.popleft() for _ in range(min(size, len(self._pending)))]
             self._mark_taken(items)
-            self._sending = True
             self._cond.notify_all()
             return items
+
+    def _run_direct(self) -> None:
+        """Retry queued writes, leaving the socket to callers between attempts."""
+        connect_deadline = None
+        with self._cond:
+            while True:
+                self._check_terminal()
+                self._write_pending_locked(owner=True)
+                if not self._pending:
+                    if self._closed:
+                        return
+                    connect_deadline = None
+                else:
+                    now = time.monotonic()
+                    if not self._connected:
+                        if connect_deadline is None:
+                            connect_deadline = now + self._connect_timeout
+                        if now >= connect_deadline:
+                            raise TimeoutError("Executor command connection timed out")
+                    if now >= self._close_deadline:
+                        raise TimeoutError("Executor command sender shutdown timed out")
+                self._cond.wait(self.SEND_TIMEOUT)
 
     def _run(self) -> None:
         try:
@@ -368,11 +406,12 @@ class _RequestSender:
             self._monitor = self._request_queue.socket.get_monitor_socket(events=_MONITOR_EVENTS)
             self._request_queue.setup_lazily()
             self._ready.set()
+            if self._direct_send:
+                self._run_direct()
             while (batch := self._take_batch()) is not None:
                 self._put_until([payload for payload, _, _ in batch])
                 with self._cond:
                     self._mark_sent(batch)
-                    self._sending = False
                     self._cond.notify_all()
         except Exception as error:
             self._record_failure(error)

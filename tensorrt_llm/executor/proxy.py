@@ -306,9 +306,21 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return True
         return False
 
-    def _check_mpi_workers(self) -> bool:
-        """Check OS process handles and MPI futures for worker death."""
-        dead_worker = self._worker_process_monitor.find_dead_worker()
+    def _check_mpi_workers(self, *, include_remote: bool = False) -> bool:
+        """Check MPI futures, then OS process handles and remote supervision.
+
+        A worker's MPI future carries its actual failure, so it takes
+        precedence over a liveness loss reported at the same time. Only the
+        error monitor consumes remote supervision, after forwarded worker
+        errors, so a health check cannot record the generic loss first.
+
+        Args:
+            include_remote: Whether to check remote process supervision.
+        """
+        if self._check_mpi_futures():
+            return True
+        dead_worker = self._worker_process_monitor.find_dead_worker(
+            include_remote=include_remote)
         if dead_worker is not None:
             self._set_fatal_error(
                 RuntimeError("MPI worker rank "
@@ -317,7 +329,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             if not self.doing_shutdown:
                 self.pre_shutdown()
             return True
-        return self._check_mpi_futures()
+        return False
 
     def _drain_error_queue(self) -> bool:
         """Drain all queued errors, skipping per-request errors.
@@ -465,9 +477,9 @@ class GenerationExecutorProxy(GenerationExecutor):
     def _error_monitor_loop(self) -> None:
         """Background thread that reaps a dead engine and drives pre_shutdown.
 
-        Checks local MPI worker process handles and futures, remote-session
-        worker-death notifications, and the error queue using the shared
-        ``_check_mpi_workers()``, ``_check_remote_worker_death()`` and
+        Checks forwarded remote-session worker deaths, MPI worker futures,
+        process handles, remote supervision, and the error queue using the
+        shared ``_check_remote_worker_death()``, ``_check_mpi_workers()`` and
         ``_drain_error_queue()`` helpers.
 
         Propagation to pending requests is event-driven via
@@ -478,15 +490,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         """
         while not self.doing_shutdown and self._fatal_error is None:
             try:
-                if self._check_mpi_workers():
-                    logger.error("Error monitor: MPI worker crash detected, "
+                # Forwarded worker errors precede liveness loss; see
+                # _check_mpi_workers.
+                if self._check_remote_worker_death() or self._check_mpi_workers(
+                        include_remote=True):
+                    logger.error("Error monitor: MPI worker failure detected, "
                                  "shutting down")
-                    return
-
-                if self._check_remote_worker_death():
-                    logger.error(
-                        "Error monitor: remote MPI worker death detected, "
-                        "shutting down")
                     return
 
                 self._drain_error_queue()
@@ -914,15 +923,11 @@ class GenerationExecutorProxy(GenerationExecutor):
         mark the engine dead as a side effect of detection, and marking
         before the abort would defang it (see _fail_initialization), so the
         init wait loop needs detection kept separate from handling.
+
+        A worker's own outcome, from its MPI future or a forwarded error, takes
+        precedence over transport and liveness loss, which only say that the
+        worker is gone and would hide its classified startup error.
         """
-        if self._command_failure is not None:
-            return self._command_failure
-        dead_worker = self._worker_process_monitor.find_dead_worker()
-        if dead_worker is not None:
-            return RuntimeInitError(
-                f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
-                "lost process liveness",
-                reason="worker_died")
         for fut in self.mpi_futures:
             if fut.done():
                 # exception() raises CancelledError on a cancelled future,
@@ -933,13 +938,23 @@ class GenerationExecutorProxy(GenerationExecutor):
                 return exc or RuntimeInitError("MPI worker exited unexpectedly",
                                                reason="worker_died")
         check = getattr(self.mpi_session, "check_worker_error", None)
-        if check is None:
-            return None
-        try:
-            return check()
-        except Exception as exc:  # noqa: BLE001 - detection must not die
-            logger.debug(f"check_worker_error failed (ignored): {exc!r}")
-            return None
+        if check is not None:
+            try:
+                error = check()
+            except Exception as exc:  # noqa: BLE001 - detection must not die
+                logger.debug(f"check_worker_error failed (ignored): {exc!r}")
+                error = None
+            if error is not None:
+                return error
+        if self._command_failure is not None:
+            return self._command_failure
+        dead_worker = self._worker_process_monitor.find_dead_worker()
+        if dead_worker is not None:
+            return RuntimeInitError(
+                f"MPI worker rank {dead_worker.rank} (pid {dead_worker.pid}) "
+                "lost process liveness",
+                reason="worker_died")
+        return None
 
     def _start_executor_workers(self, worker_kwargs):
 

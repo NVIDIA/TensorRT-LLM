@@ -960,6 +960,8 @@ def _proxy_awaiting_worker_init(
 
     proxy.mpi_session = _Mock()
     proxy.mpi_session.submit.return_value = [worker_future]
+    # No worker error was forwarded unless a test sets one.
+    proxy.mpi_session.check_worker_error.return_value = None
     proxy._worker_process_monitor = _Mock()
     proxy._worker_process_monitor.find_dead_worker.return_value = None
 
@@ -1282,3 +1284,29 @@ def test_cancellation_tolerates_concurrent_terminal_failure():
     proxy._request_sender.send.side_effect = EngineDeadError(RuntimeError("worker exited"))
     proxy.abort_request(42)
     proxy._request_sender.send.assert_called_once()
+
+
+@pytest.mark.parametrize("remote_loss", [False, True])
+def test_classified_worker_error_precedes_remote_liveness_loss_during_init(remote_loss):
+    # Regression: a non-leader's helper reports its call's end before MPI
+    # delivers the classified startup error. The generic liveness loss must not
+    # replace that error once both are known.
+    from tensorrt_llm._errors import ConfigInputError
+
+    try:
+        raise ConfigInputError("bad max_seq_len")
+    except ConfigInputError as error:
+        info = classify_startup_error(error, rank=1)
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=True,
+        future_exception=wrap_worker_startup_error("Executor worker returned error", info),
+    )
+    proxy.mpi_futures = proxy.mpi_session.submit.return_value
+    if remote_loss:
+        proxy._worker_process_monitor.find_dead_worker.return_value = WorkerProcessIdentity(
+            1, 4321, None, "follower", None
+        )
+    with pytest.raises(RuntimeError) as error:
+        proxy._wait_for_executor_workers_ready()
+    assert is_worker_startup_error(error.value)
+    assert classify_startup_error(error.value).category == "config_input"

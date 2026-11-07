@@ -410,3 +410,90 @@ def test_worker_call_outcome_precedes_a_returned_report(monkeypatch):
             worker.wait(timeout=3)
         worker.stdin.close()
         worker.stdout.close()
+
+
+@pytest.mark.timeout(20, method="thread")
+def test_forwarded_worker_error_precedes_a_returned_call_report(monkeypatch):
+    # Regression: under trtllm-llmapi-launch the forwarded worker exception
+    # waited for the error monitor's poll, while the returned call's report
+    # woke it first and recorded a generic liveness loss.
+    import queue as queue_module
+    import time
+
+    from tensorrt_llm.llmapi.mpi_session import RemoteMpiCommSessionClient, RemoteWorkerDeath
+
+    class _Forwarded:
+        def __init__(self):
+            self.messages = []
+            self.lock = threading.Lock()
+
+        def poll(self, _timeout):
+            with self.lock:
+                return bool(self.messages)
+
+        def get(self):
+            with self.lock:
+                return self.messages.pop(0)
+
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setattr(remote, "_RETURN_GRACE", 0.5)
+    proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy.doing_shutdown = False
+    proxy._multi_frontend_ipc_dir = None
+    proxy._owns_mpi_session = False
+    proxy._engine_dead = False
+    proxy._fatal_error = None
+    proxy._results = {}
+    proxy._error_queue = queue_module.Queue()
+    proxy._request_sender = None
+    proxy.mpi_futures = []
+    shutdowns = []
+    proxy.pre_shutdown = lambda: shutdowns.append(True)
+    proxy._shutdown_event = threading.Event()
+    proxy._worker_process_monitor = WorkerProcessMonitor()
+    endpoint = proxy._worker_process_monitor.start_remote(1, proxy._shutdown_event)
+    client = object.__new__(RemoteMpiCommSessionClient)
+    client._is_shutdown = False
+    client._pending_responses = []
+    client.queue = _Forwarded()
+    proxy.mpi_session = client
+    worker = subprocess.Popen(
+        [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        worker.stdin.write(
+            json.dumps(
+                {"module": remote.__file__, "address": endpoint.address, "key": endpoint.key.hex()}
+            )
+            + "\n"
+        )
+        worker.stdin.flush()
+        worker.stdout.readline()
+        assert proxy._worker_process_monitor.wait_remote_ready()
+        monitor_thread = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+        monitor_thread.start()
+        time.sleep(0.2)
+        # The worker call raises: its helper reports the return, and the
+        # launcher forwards the actual exception shortly afterward.
+        worker.stdin.write("stop\n")
+        worker.stdin.flush()
+        assert worker.wait(timeout=3) == 0
+        time.sleep(0.1)
+        client.queue.messages.append(
+            RemoteWorkerDeath.from_exception(ValueError("actual rank failure"))
+        )
+        # A health check while both are pending must not record the generic loss.
+        time.sleep(remote._RETURN_GRACE + 0.2)
+        proxy.check_health()
+        monitor_thread.join(timeout=8)
+        assert not monitor_thread.is_alive()
+        assert "actual rank failure" in str(proxy._fatal_error)
+        assert shutdowns
+    finally:
+        proxy._worker_process_monitor.close()
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=3)
+        worker.stdin.close()
+        worker.stdout.close()

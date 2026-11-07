@@ -177,9 +177,13 @@ class WorkerProcessMonitor:
                 if identity.start_time is not None:
                     self._procfs_identities.append(identity)
 
-    def find_dead_worker(self) -> Optional[WorkerProcessIdentity]:
-        """Return the first worker known to have exited, if any."""
-        remote = self._remote
+    def find_dead_worker(self, include_remote: bool = True) -> Optional[WorkerProcessIdentity]:
+        """Return the first worker known to have exited, if any.
+
+        Args:
+            include_remote: Whether to report remote process supervision loss.
+        """
+        remote = self._remote if include_remote else None
         if remote is not None and (failure := remote.failure) is not None:
             return WorkerProcessIdentity(
                 failure["rank"], failure["pid"], None, failure["host"], None
