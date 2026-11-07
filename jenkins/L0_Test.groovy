@@ -526,10 +526,10 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
-            sh """
+            sh(label: "Run pytest (isolated_${i})", script: """
                 cd ${llmSrc}/tests/integration/defs && \
                 ${isolateTestCmdLine.join(" ")}
-            """
+            """)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -549,8 +549,14 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                 def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
                 // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
                 // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
+                // A unittest entry is recorded as its wrapper,
+                // "${stageName}/test_unittests.py::test_unittests_v2[unittest/...]".
+                def unfinishedNames = [
+                    "${stageName}/${bareTestName}".toString(),
+                    "${stageName}/test_unittests.py::test_unittests_v2[${bareTestName}]".toString(),
+                ]
                 def isTestUnfinished = fileExists(unfinishedTestFile) &&
-                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.contains("${stageName}/${bareTestName}".toString())
+                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.any { it in unfinishedNames }
                 if (isTestUnfinished) {
                     // Record this crash as a JUnit <testcase> like the regular-test
                     // path does. hasUnrerunFailure stays untouched here: it drives
@@ -565,12 +571,12 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
                     if (classified instanceof InfraFailure) {
                         unrerunInfraFailure = classified
                     }
-                    // Same duration/no-signature gap as the regular-test path: this
-                    // finished but failed, and was never actually rerun, so
+                    // Same gap as the regular-test path: this finished but failed, and
+                    // the stage's rerun policy did not rerun it, so
                     // results_isolated_${i}.xml still carries the original
                     // <failure> with nothing here to flag it.
                     catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun under this stage's rerun policy (the rerun list log says why)"
                     }
                     hasUnrerunFailure = true
                 }
@@ -5158,33 +5164,44 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
     def rerunDir = "${WORKSPACE}/${stageName}/rerun/${testType}"
     sh "mkdir -p ${rerunDir}"
 
-    // Generate rerun test lists
+    // Generate rerun test lists. The stage's rule in jenkins/config/rerun_policy.yml
+    // decides which tests are rerun and how often; tests it does not rerun go to
+    // rerun_0.txt, and the log above says why for each.
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     def testListCmd = testCmdLine.find { it.contains("--test-list=") }
     def testListArg = testListCmd ? "--test-list=${testListCmd.split('=', 2)[1]}" : ""
     def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
     def unfinishedTestArg = fileExists(unfinishedTestFile) ? "--unfinished-test-file=${unfinishedTestFile}" : ""
-    sh """
+    // ${llmSrc} comes from the build artifact, so with reuse_build its test_rerun.py can
+    // be older than this pipeline and not accept --stage-name. Pass it only when the
+    // script does; an older script then applies its own built-in rerun rules.
+    def stageNameSupported = sh(
+        script: "python3 ${llmSrc}/jenkins/scripts/test_rerun.py generate_rerun_tests_list --help 2>/dev/null | grep -q -- '--stage-name'",
+        returnStatus: true
+    ) == 0
+    if (!stageNameSupported) {
+        echo "test_rerun.py in ${llmSrc} does not support --stage-name; generating rerun lists without the stage's rerun policy"
+    }
+    def stageNameArg = stageNameSupported ? "--stage-name='${stageName}'" : ""
+    sh(label: "Generate rerun test lists (${testType})", script: """
         python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${rerunDir}/ \
         --input-file=${WORKSPACE}/${stageName}/${resultFileName} \
         --fail-signatures='${failSignaturesList}' \
+        ${stageNameArg} \
         ${testListArg} \
         ${unfinishedTestArg}
-    """
+    """)
 
-    // If the stage has more than 5 failed tests, skip the rerun step
-    def validLineCount = 0
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (fileExists(currentRerunTestList)) {
-            count = sh(
+            def count = sh(
                 script: "grep -v '^[[:space:]]*\$' ${currentRerunTestList} | wc -l",
                 returnStdout: true
             ).trim().toInteger()
             echo "Found ${count} ${testType} tests to rerun ${times} time(s)"
-            validLineCount += count
         }
     }
 
@@ -5220,7 +5237,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                     credentialsId: 'urm-artifactory-creds',
                     usernameVariable: 'ART_USER',
                     passwordVariable: 'ART_PASS')]) {
-                sh """
+                sh(label: "Rerun pytest (${testType}, rerun ${times})", script: """
                     set +e
                     export STAGE_NAME='${stageName}'
                     export PROGRESS_TAR='${rerunProgressTar}'
@@ -5247,7 +5264,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
                     bash '${llmSrc}/jenkins/scripts/progress_upload_snapshot.sh' || true
 
                     exit \$rc
-                """
+                """)
             }
         } catch(InterruptedException e) {
             throw e
@@ -5982,7 +5999,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     credentialsId: 'urm-artifactory-creds',
                                     usernameVariable: 'ART_USER',
                                     passwordVariable: 'ART_PASS')]) {
-                                sh """
+                                sh(label: "Run pytest (regular)", script: """
                                     set +e
                                     export STAGE_NAME='${stageName}'
                                     export PROGRESS_TAR='${progressTar}'
@@ -6013,7 +6030,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                                     fi
 
                                     exit \$rc
-                                """
+                                """)
                             }
                         } else {
                             echo "No regular tests to run for stage ${stageName}"
@@ -6058,13 +6075,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                             if (classified instanceof InfraFailure) {
                                 unrerunInfraFailure = classified
                             }
-                            // Failures that finished (not a timeout) but were never
-                            // rerun because duration > 10 min and no known failure
-                            // signature matched: results.xml still carries their
-                            // original <failure>, but neither branch above fires for
-                            // them, so without this the stage silently reports green.
+                            // Failures that finished (not a timeout) but that the stage's
+                            // rerun policy did not rerun (for example duration over its
+                            // limit with no known failure signature, or too many
+                            // failures): results.xml still carries their original
+                            // <failure>, but neither branch above fires for them, so
+                            // without this the stage silently reports green.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+                                error "Some tests failed and were not eligible for rerun under this stage's rerun policy (the rerun list log says why), please check the test report."
                             }
                             hasUnrerunFailure = true
                         }
@@ -6134,7 +6152,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (unrerunInfraFailure != null) {
                 throw unrerunInfraFailure
             }
-            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+            error "Some tests failed and were not eligible for rerun under this stage's rerun policy (the rerun list log says why), please check the test report."
         }
     }
 
