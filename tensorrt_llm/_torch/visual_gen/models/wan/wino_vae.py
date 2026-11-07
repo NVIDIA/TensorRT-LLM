@@ -1,0 +1,2291 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""WinoVae: optimized Wan VAE.
+
+``WinoVae`` mirrors ``WanVAE`` module for module and loads the same state dict. On CUDA it
+runs the fused norm kernels, temporal and spatial Winograd convolutions, frame buffers for
+the causal history and the fused frame operations, in bf16 on CUDA; where a kernel cannot
+run (no CuTe DSL for the norm kernels, an unsupported shape or batch) the
+module falls back to the eager computation of ``WanVAE``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, fields, replace
+from typing import Any, Callable, Literal, TypeAlias
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKLOutput
+from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
+
+from .cudnn_conv import conv_frontend, cudnn_frontend_available
+from .jit_norm import FrameGeometry
+from .kernels.blackwell import spatial as sm100_spatial
+from .kernels.blackwell.spatial import sm100_wino_available
+from .wan_vae import (
+    CACHE_T,
+    DupUp3D,
+    WanAttentionBlock,
+    WanCausalConv3d,
+    WanDecoder3d,
+    WanEncoder3d,
+    WanMidBlock,
+    WanResample,
+    WanResidualBlock,
+    WanResidualDownBlock,
+    WanResidualUpBlock,
+    WanRMSNorm,
+    WanUpBlock,
+    WanVAE,
+    WanVAEConfig,
+    _causal_conv_with_cache,
+    _channels_last_2d_if_needed,
+    _channels_last_3d_if_needed,
+    _decode_chunk_slices,
+    _to_channels_last,
+    _to_device_if_needed,
+    unpatchify,
+)
+from .wino_vae_kernels import (
+    add_bias_and_residual,
+    add_rms_norm_silu,
+    apply_in_bias,
+    frames_to_video,
+    frames_view,
+    images_to_pairs,
+    kernels_available,
+    pack_upsample_weights,
+    pairs_to_images,
+    rms_norm_silu,
+    rms_norm_silu_supported,
+    upsample_gather,
+    upsample_gather_supported,
+    wino_norm_silu,
+    wino_spatial_conv_cublas,
+    wino_spatial_conv_taps,
+    winograd_spatial_taps_weights,
+    winograd_spatial_weights,
+    winograd_weights,
+)
+from .wino_vae_shard import DirectFrames, Shard, push_border
+
+# One slot of the causal-conv cache list threaded through a chunked encode / decode: the
+# conv's history frames ``[B, C, 0..2, H, W]``; the conv itself when it keeps them in its
+# frame buffer (``_FrameBuffer.history`` hands them over); ``"Rep"`` (the native Wan marker,
+# kept as is): the upsample time conv's first chunk passed through unconvolved, so its next
+# chunk starts from zero history; None before the first chunk.
+CacheEntry: TypeAlias = "torch.Tensor | WinoVaeCausalConv3d | Literal['Rep'] | None"
+
+
+@dataclass(frozen=True)
+class WinoVaeOptions:
+    """Run-time settings of a WinoVae model.
+
+    Frozen: the options are fixed for the model's lifetime. Build another model (with
+    ``dataclasses.replace`` for a variant) to run with different ones."""
+
+    # Pixel frames per encoder pass after the first one-frame pass. Must be a multiple of 4
+    # so every pass ends at the same temporal-downsampler parity. Larger passes give the
+    # convs more rows and fewer launches at the price of peak memory; from 8 frames up the
+    # deepest levels see frame pairs and take the Winograd pair path.
+    encoder_chunk_frames: int = 24
+    # Chunks a conv's frame buffer holds after its two causal-history frames before it wraps
+    # (the history moves to the front: a copy of two frames). Fewer chunks: less memory, more
+    # wraps. ``decode``'s ``temporal_chunk_size`` and ``encoder_chunk_frames`` move peak
+    # memory further.
+    frame_buffer_chunks: int = 4
+    # Spatially sharded runs: how the halo lines reach the neighbouring ranks. "direct": the
+    # norm kernels store the border lines straight into the neighbours' buffers (symmetric
+    # memory over NVLink) and one barrier per exchange replaces the pack copy, the NCCL
+    # send/receive and the unpack copy; "nccl": batched point-to-point sends; "auto":
+    # "direct" where the ranks can map each other's memory, else "nccl".
+    halo_exchange: Literal["auto", "nccl", "direct"] = "auto"
+
+    def __post_init__(self) -> None:
+        for name in ("encoder_chunk_frames", "frame_buffer_chunks"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an int, got {value!r}")
+        if self.halo_exchange not in ("auto", "nccl", "direct"):
+            raise ValueError(
+                f"halo_exchange must be 'auto', 'nccl' or 'direct', got {self.halo_exchange!r}"
+            )
+        if self.frame_buffer_chunks < 1:
+            raise ValueError(
+                f"frame_buffer_chunks must be at least 1, got {self.frame_buffer_chunks!r}"
+            )
+        if self.encoder_chunk_frames < 4 or self.encoder_chunk_frames % 4:
+            raise ValueError(
+                f"encoder_chunk_frames must be a positive multiple of 4, got {self.encoder_chunk_frames!r}"
+            )
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "WinoVaeOptions":
+        valid = {field.name for field in fields(cls)}
+        unknown = set(values) - valid
+        if unknown:
+            raise ValueError(f"Unknown WinoVaeOptions: {sorted(unknown)}; valid: {sorted(valid)}")
+        return cls(**values)
+
+
+# The decoder's narrow conv_out (256 -> 12 channels): beyond this many input frames torch's
+# cuDNN path picks a much slower kernel for that shape, so longer calls go through the cuDNN
+# graph API (its fastest plan for the shape, the bias inside), or in pieces of at most this
+# many input frames without the frontend.
+_CONV_OUT_MAX_IN_FRAMES = 3
+# Storage type of the temporal Winograd inputs and conv products between the norm kernels:
+# three more mantissa bits than bf16 for the transformed values (required by F(4,3)).
+_WINOGRAD_DTYPE = torch.float16
+# m of the portable spatial Winograd F(m x m, 3x3).
+# Layers with 2 or 4 frames per chunk (up1, up2), after the temporal Winograd: one input frame
+# per GEMM.
+_SPATIAL_TILE = 4
+# Layers with 1 frame per chunk (mid, up0), from the second chunk on: the new frame and its two
+# history frames stacked along the GEMM's K axis, so one GEMM sums the causal 3x3x3 conv.
+_SPATIAL_TILE_STACKED_K = 2
+
+
+def _stamp(*tensors: torch.Tensor | None) -> tuple:
+    """What a value derived from ``tensors`` depends on: each tensor's identity, storage,
+    version counter and dtype. A cache keyed on it is rebuilt when any of them is replaced or
+    modified in place."""
+    return tuple(None if t is None else (id(t), t.data_ptr(), t._version, t.dtype) for t in tensors)
+
+
+def temporal_order_for(frames: int) -> int:
+    """The temporal Winograd order of a call with ``frames`` output frames: F(4,3) on the
+    points (0, 1, -1, 2, -1/2, inf) for a multiple of four frames, else F(2,3)."""
+    return 4 if frames % 4 == 0 else 2
+
+
+def _benchmark_convs(*, encoder: bool, frames: int) -> bool:
+    """cuDNN autotuning for the encoder and single-frame (image) decodes; video decodes keep
+    cuDNN's heuristics."""
+    return encoder or frames == 1
+
+
+@dataclass(frozen=True)
+class WinogradProducts:
+    """The ``order + 2`` conv products of a temporal Winograd conv, each ``[groups, C, H, W]``
+    channels-last (bf16 or fp16). They stand for the output frames ``g*order + j = sum_k
+    AT[j][k] products[k]`` (:data:`TEMPORAL_WINO`); the consumer kernel does that output
+    transform.
+    ``geometry``: the frame layout when the products carry halo lines (sharded decode)."""
+
+    products: list[torch.Tensor]
+    geometry: FrameGeometry | None = None
+
+    @property
+    def frames(self) -> int:
+        return (len(self.products) - 2) * self.products[0].shape[0]
+
+    @property
+    def spatial(self) -> tuple[int, int]:
+        """The logical frame size (H, W)."""
+        if self.geometry is not None:
+            return self.geometry.height, self.geometry.width
+        return self.products[0].shape[-2], self.products[0].shape[-1]
+
+
+@dataclass(frozen=True)
+class DeferredSum:
+    """``source + bias + residual``, not added yet: the next fused norm kernel adds it while
+    reading its input, so the sum never goes through memory. Where the consumer is not a
+    fused norm, :func:`materialize` adds it up.
+
+    ``source`` is a conv output computed without its bias, ``[B, C, T, H, W]``, or the
+    products of a temporal Winograd conv. ``bias`` is that conv's per-channel bias;
+    ``residual`` is the block's shortcut. Either may be absent.
+    """
+
+    source: torch.Tensor | WinogradProducts
+    residual: torch.Tensor | None = None
+    bias: torch.Tensor | None = None
+
+    @property
+    def shape(self) -> torch.Size:
+        """The ``[B, C, T, H, W]`` of the frames once added."""
+        src = self.source
+        if isinstance(src, torch.Tensor):
+            return src.shape
+        batch = self.residual.shape[0] if self.residual is not None else 1
+        return torch.Size((batch, src.products[0].shape[1], src.frames, *src.spatial))
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The dtype of the frames once added (the add_bias_and_residual kernel writes bf16)."""
+        if isinstance(self.source, torch.Tensor):
+            return self.source.dtype
+        return self.residual.dtype if self.residual is not None else torch.bfloat16
+
+    @property
+    def device(self) -> torch.device:
+        src = self.source
+        return src.device if isinstance(src, torch.Tensor) else src.products[0].device
+
+
+def _can_fuse(s: DeferredSum) -> bool:
+    """Whether the kernels can take ``s`` as it is (batch 1, the kernels available): a fused
+    norm adds it while reading and :func:`materialize` uses the add_bias_and_residual kernel."""
+    return (
+        kernels_available() and s.shape[0] == 1 and (s.residual is None or s.residual.shape[0] == 1)
+    )
+
+
+def _add_bias_and_residual(
+    s: DeferredSum, pad_h: int, pad_w: int, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """``s`` added up by the add_bias_and_residual kernel, ``[T, (H+pad_h)*(W+pad_w), C]``,
+    the padding rows and columns zero; into ``out`` when given."""
+    src = s.source
+    h, w = s.shape[-2:]
+    if isinstance(src, torch.Tensor):
+        x_f, m_f, geometry = frames_view(_channels_last_3d_if_needed(src)), None, None
+    else:
+        x_f, m_f, geometry = None, [images_to_pairs(mk) for mk in src.products], src.geometry
+    r = s.residual
+    r_f = frames_view(_channels_last_3d_if_needed(r)) if r is not None else None
+    return add_bias_and_residual(
+        x=x_f,
+        m=m_f,
+        bias=s.bias,
+        residual=r_f,
+        frames=s.shape[2],
+        height=h,
+        width=w,
+        pad_h=pad_h,
+        pad_w=pad_w,
+        products_geometry=geometry,
+        out=out,
+    )
+
+
+def _patchify_channels_last(x: torch.Tensor, patch_size: int) -> torch.Tensor:
+    """:func:`patchify` written straight into the channels-last layout (one copy instead of a
+    copy to the default layout and a second one to channels-last)."""
+    if patch_size == 1:
+        return x
+    if x.dim() != 5:
+        raise ValueError(f"Invalid input shape: {x.shape}")
+    b, c, t, h, w = x.shape
+    if h % patch_size or w % patch_size:
+        raise ValueError(
+            f"Height ({h}) and width ({w}) must be divisible by patch_size ({patch_size})"
+        )
+    p = patch_size
+    hp, wp = h // p, w // p
+    # patchify's channel index is (c, pw, ph) with ph fastest; channels-last bytes run
+    # (b, t, h', w', channel).
+    y = x.reshape(b, c, t, hp, p, wp, p).permute(0, 2, 3, 5, 1, 6, 4).contiguous()
+    return y.view(b, t, hp, wp, c * p * p).permute(0, 4, 1, 2, 3)
+
+
+def materialize(x: "torch.Tensor | DeferredSum", out: torch.Tensor | None = None) -> torch.Tensor:
+    """``x`` as a tensor. A :class:`DeferredSum` is added up here: one add_bias_and_residual
+    kernel pass, or eager adds where the kernel does not apply (batched input, kernels
+    unavailable). Winograd products only exist when the kernels ran, so they always take the
+    kernel.
+
+    ``out``: a channels-last destination of ``x``'s shape (e.g. a conv's frame-buffer window),
+    written and returned. The kernel writes the sum there directly; a plain tensor, or the
+    eager fallback's sum, is copied in."""
+    if not isinstance(x, DeferredSum):
+        return x if out is None else out.copy_(x)
+    if _can_fuse(x):
+        h, w = x.shape[-2:]
+        y = _add_bias_and_residual(x, 0, 0, out=frames_view(out) if out is not None else None)
+        return out if out is not None else frames_to_video(y, h, w)
+    s = apply_in_bias(x.source, x.bias)
+    if x.residual is not None:
+        s = s + x.residual
+    s = _channels_last_3d_if_needed(s)
+    return s if out is None else out.copy_(s)
+
+
+def materialize_padded_2d(x: DeferredSum) -> torch.Tensor:
+    """``x`` added up with one zero row and column appended, as ``[T, C, H+1, W+1]``
+    channels-last (the downsampler's input), in one add_bias_and_residual kernel pass."""
+    _, c, t, h, w = x.shape
+    y = _add_bias_and_residual(x, 1, 1)  # [T, (H+1)*(W+1), C]
+    return y.view(t, h + 1, w + 1, c).permute(0, 3, 1, 2)
+
+
+# Logical vs physical frames. Logical is what the model computes on: a video
+# [B, C, T, H, W] whose frames are exactly H x W. Physical is how it sits in memory:
+#   - axis order: channels-last, so the bytes run [B, T, H, W, C] (C fastest);
+#   - frame size: under spatial sharding each frame is stored as rows x cols with halo
+#     lines (border lines copied from the neighbouring ranks) around the H x W logical part,
+#     which starts at (row0, col0) (FrameGeometry). Without sharding rows = H, cols = W.
+# The "physical" views below expose that stored layout so the halo exchange can address
+# rows and columns directly.
+
+
+@dataclass
+class WinogradInputs:
+    """The ``order + 2`` transformed inputs of a temporal Winograd conv, each
+    ``[groups, C, H, W]`` channels-last (bf16 or fp16), plus the buffer they are views of as
+    ``[order + 2, groups, H*W, C]``. With ``geometry`` the frames carry halo lines (physical
+    ``rows x cols``; the logical ``H x W`` sits inside)."""
+
+    d: list[torch.Tensor]
+    stacked: torch.Tensor
+    geometry: FrameGeometry | None = None
+
+    def physical(self) -> torch.Tensor:
+        """The buffer in its physical layout, ``[comps, groups, rows, cols, C]``: halo lines
+        included, channels last."""
+        comps, groups, _, c = self.stacked.shape
+        if self.geometry is None:
+            _, _, h, w = self.d[0].shape
+            return self.stacked.view(comps, groups, h, w, c)
+        return self.stacked.view(comps, groups, self.geometry.rows, self.geometry.cols, c)
+
+
+def _history_frames(entry: CacheEntry) -> torch.Tensor | Literal["Rep"] | None:
+    """A ``feat_cache`` entry as the history-frame tensor the eager and Winograd paths read:
+    a conv that left itself there (frame-buffer path) hands over its two history frames; the
+    ``"Rep"`` marker (zero history next) and None pass through."""
+    return entry.frame_buffer.history() if isinstance(entry, WinoVaeCausalConv3d) else entry
+
+
+def _frames_physical(window: torch.Tensor) -> torch.Tensor:
+    """A channels-last ``[1, C, T, rows, cols]`` window (logical axis order) in its physical
+    axis order ``[T, rows, cols, C]``, halo lines included; a view, no copy."""
+    return window.permute(0, 2, 3, 4, 1)[0]
+
+
+def _copy_into(
+    out: torch.Tensor | None, value: torch.Tensor, geometry: FrameGeometry | None = None
+) -> torch.Tensor:
+    """Copy ``value`` into ``out`` when a destination was requested (into the logical
+    positions when ``out`` carries halo lines)."""
+    if out is not None and geometry is not None:
+        g = geometry
+        out[..., g.row0 : g.row0 + g.height, g.col0 : g.col0 + g.width].copy_(value)
+        if g.push is not None:
+            push_border(g.push, _frames_physical(out), g)
+        return out
+    if out is None:
+        return value
+    out.copy_(value)
+    return out
+
+
+class WinoVaeRMSNorm(WanRMSNorm):
+    """``WanRMSNorm`` with the fused norm kernels as entry points: ``norm_silu`` (rows) and
+    ``norm_silu_winograd`` (the temporal Winograd inputs of the conv that follows)."""
+
+    def __init__(
+        self, dim: int, channel_first: bool = True, images: bool = True, bias: bool = False
+    ) -> None:
+        super().__init__(dim, channel_first, images, bias)
+        self.shard: Shard | None = None
+
+    def norm_silu(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        *,
+        out: torch.Tensor | None = None,
+        out_geometry: FrameGeometry | None = None,
+        return_sum: bool = False,
+    ) -> "torch.Tensor | tuple[torch.Tensor, torch.Tensor]":
+        """``SiLU(norm(s))`` with ``s`` = ``x`` (a tensor, or a deferred sum added while
+        reading where the kernel supports it). ``out``: optional channels-last destination (a
+        conv frame-buffer window; with ``out_geometry`` its frames carry halo lines and the
+        logical positions are written). ``return_sum``: return ``(s, SiLU(norm(s)))``."""
+        bias = self.bias if isinstance(self.bias, torch.Tensor) else None
+        if isinstance(x, DeferredSum) and self._fuses_residual(x):
+            s, y = add_rms_norm_silu(
+                x.source,
+                x.residual,
+                self.gamma,
+                bias,
+                self.scale,
+                in_bias=x.bias,
+                out=out,
+                out_geometry=out_geometry,
+                return_sum=return_sum,
+            )
+            return (s, y) if return_sum else y
+        x, in_bias = self._plain_input(x, return_sum)
+        if self.channel_first and rms_norm_silu_supported(x):
+            y = rms_norm_silu(
+                x,
+                self.gamma,
+                bias,
+                self.scale,
+                in_bias=in_bias,
+                out=out,
+                out_geometry=out_geometry,
+            )
+        else:
+            y = _copy_into(out, F.silu(self.forward(apply_in_bias(x, in_bias))), out_geometry)
+        return (x, y) if return_sum else y
+
+    def _fuses_residual(self, x: DeferredSum) -> bool:
+        """Whether one add_rms_norm_silu pass takes ``x`` (a tensor source plus a residual)."""
+        return (
+            isinstance(x.source, torch.Tensor)
+            and x.residual is not None
+            and self.channel_first
+            and rms_norm_silu_supported(x.source)
+            and rms_norm_silu_supported(x.residual)
+        )
+
+    @staticmethod
+    def _plain_input(
+        x: "torch.Tensor | DeferredSum", return_sum: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``(tensor, deferred bias or None)`` for the plain norm: a deferred sum that is only
+        a tensor plus a bias keeps the bias for the kernel to add while reading (when the sum
+        itself is not needed); anything else is added up first."""
+        if not isinstance(x, DeferredSum):
+            return x, None
+        if isinstance(x.source, torch.Tensor) and x.residual is None and not return_sum:
+            return x.source, x.bias
+        return materialize(x), None
+
+    def norm_silu_winograd(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        cache: torch.Tensor | None,
+        frames: int,
+        inputs_geometry: FrameGeometry | None = None,
+        inputs: torch.Tensor | None = None,
+        *,
+        return_sum: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, WinogradInputs]:
+        """Norm + SiLU that writes the Winograd inputs for the conv that follows.
+
+        ``cache`` holds the last 0..2 normalized frames of the previous chunk as
+        ``[1, C, n, H, W]``. Returns ``(sum or None, new cache [1, C, 2, H, W], inputs)``; the
+        sum (the pre-norm input, when it was formed by the kernel) only with ``return_sum``.
+        ``inputs_geometry``: write the Winograd inputs into frames with halo lines (sharded decode);
+        ``inputs``: a preallocated destination for them."""
+        x = x if isinstance(x, DeferredSum) else DeferredSum(x)
+        h, w = x.shape[-2:]
+        bias = self.bias if isinstance(self.bias, torch.Tensor) else None
+        src = x.source
+        products = src if isinstance(src, WinogradProducts) else None
+        s, y_tail, d = wino_norm_silu(
+            x=frames_view(src) if products is None else None,
+            m=[images_to_pairs(mk) for mk in products.products] if products is not None else None,
+            residual=frames_view(x.residual) if x.residual is not None else None,
+            in_bias=x.bias,
+            cache=frames_view(cache) if cache is not None and cache.shape[2] > 0 else None,
+            gamma=self.gamma,
+            bias=bias,
+            scale=self.scale,
+            frames=frames,
+            return_sum=return_sum,
+            order=temporal_order_for(frames),
+            fp16_inputs=_WINOGRAD_DTYPE == torch.float16,
+            products_geometry=products.geometry if products is not None else None,
+            inputs_geometry=inputs_geometry,
+            inputs=inputs,
+        )
+        if inputs_geometry is None:
+            inputs = WinogradInputs([pairs_to_images(dk, h, w) for dk in d], d)
+        else:
+            g = inputs_geometry
+            inputs = WinogradInputs([pairs_to_images(dk, g.rows, g.cols) for dk in d], d, g)
+        return (
+            (frames_to_video(s, h, w) if s is not None else None),
+            frames_to_video(y_tail, h, w),
+            inputs,
+        )
+
+
+# Spatial Winograd for the temporal Winograd components, by kernel: the filter transform of a
+# conv (built once per weight version) and the conv of the stacked components.
+_SPATIAL_KERNELS = {
+    # Blackwell: the fused F(2,3)-horizontal / direct-vertical 256-output-channel conv.
+    "fused": (
+        lambda conv, order: sm100_spatial.fused_filters(conv._winograd_weights(order)),
+        lambda conv, d, u, h, w: sm100_spatial.wino_spatial_conv_fused(d, u, h, w, pdl=conv.pdl),
+    ),
+    # Blackwell: the F(4x4, 3x3) CuTe DSL pipeline.
+    "sm100": (
+        lambda conv, order: sm100_spatial.spatial_filters(conv._winograd_weights(order)),
+        lambda conv, d, u, h, w: sm100_spatial.wino_spatial_conv(d, u, h, w),
+    ),
+    # Any GPU: CuTe DSL transform kernels and cuBLAS batched GEMMs.
+    "cublas": (
+        lambda conv, order: winograd_spatial_weights(conv.weight, _SPATIAL_TILE, order),
+        lambda conv, d, u, h, w: wino_spatial_conv_cublas(d, u, h, w),
+    ),
+}
+
+
+class _FrameBuffer:
+    """A conv's frame buffer for the causal history: channels-last ``[1, C, depth, rows, cols]``
+    frames (``rows x cols`` = the logical frame plus the halo lines under sharding). Frames
+    ``[pos-2, pos)`` are the history (zeros before a clip's first chunk); the producer writes
+    a chunk at ``[pos, pos+T)`` and the conv reads ``[pos-2, pos+T)`` with no copy. When a
+    chunk would run off the end, the two history frames move to the front (one copy). The
+    buffer outlives a clip: a new clip starts at the front over zeroed history. ``depth`` is
+    ``2 + chunks * T`` for the chunk length the buffer was allocated for. A window on another
+    device than the buffer's allocates a new buffer there (a new clip); sharded buffers belong
+    to the process group and do not move."""
+
+    def __init__(self, channels: int, chunks: int = 4) -> None:
+        self.channels = channels
+        self.chunks = chunks
+        self.shard: Shard | None = None
+        self.tensor: torch.Tensor | None = None
+        self.pos = 0  # 0: a new clip, no history yet
+        # Frame layout of the current window (halo lines and the direct push under sharding).
+        self.geometry: FrameGeometry | None = None
+        self._key: tuple | None = None
+        # The buffer as a symmetric-memory allocation (direct halo exchange).
+        self._direct: DirectFrames | None = None
+
+    def new_clip(self) -> None:
+        self.pos = 0
+
+    def window(
+        self, frames: int, dtype: torch.dtype, device: torch.device, spatial: tuple[int, int]
+    ) -> torch.Tensor:
+        """The writable ``[1, C, frames, rows, cols]`` view for the next chunk of a logical
+        ``spatial`` = (H, W) frame size."""
+        h, w = spatial
+        shard = self.shard
+        geo = shard.geometry(h, w) if shard is not None else None
+        size = (geo.rows, geo.cols) if geo is not None else (h, w)
+        # The layout in terms every rank agrees on (an unequal split can change one rank's
+        # extent and not another's, and the direct allocation is collective).
+        device = torch.device(device)
+        key = (dtype, device, shard.frame_key(h, w) if shard is not None else (h, w))
+        if self.tensor is not None and self.tensor.device != device and shard is not None:
+            raise ValueError(
+                "a spatially sharded WinoVae cannot move to another device after its first call"
+            )
+        if self.tensor is None or self._key != key:
+            self._replace(frames, dtype, device, size, geo, keep_history=False)
+            self._key = key
+        elif self.pos == 0:
+            if self.tensor.shape[2] < 2 + frames:
+                self._replace(frames, dtype, device, size, geo, keep_history=False)
+            else:
+                self.tensor[:, :, :2].zero_()
+                self.pos = 2
+        elif self.pos + frames > self.tensor.shape[2]:
+            self._wrap(frames, dtype, device, size, geo)
+        if self._direct is not None:
+            geo = replace(geo, push=self._direct.push(self.pos, frames))
+        self.geometry = geo
+        return self.tensor[:, :, self.pos : self.pos + frames]
+
+    def _wrap(
+        self,
+        frames: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        size: tuple[int, int],
+        geo: FrameGeometry | None,
+    ) -> None:
+        """Move the two history frames to the front. Into a new buffer when this chunk is
+        longer than the buffer holds, or when the neighbours push into this one: they run up
+        to one exchange ahead and store their border lines into the new window ``[2, 2 +
+        frames)`` as soon as they reach it, which must not overtake the history copy."""
+        too_short = self.tensor.shape[2] < 2 + frames
+        pushed_into = self._direct is not None and self.pos - 2 < 2 + frames
+        if too_short or pushed_into:
+            self._replace(frames, dtype, device, size, geo, keep_history=True)
+            return
+        hist = self.tensor[:, :, self.pos - 2 : self.pos]
+        if self.pos < 4:  # source and destination overlap (one frame per chunk)
+            hist = hist.clone()
+        self.tensor[:, :, :2].copy_(hist)
+        self.pos = 2
+
+    def _replace(
+        self,
+        frames: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        size: tuple[int, int],
+        geo: FrameGeometry | None,
+        *,
+        keep_history: bool,
+    ) -> None:
+        """A new zeroed buffer for ``frames``-frame chunks (zeros: the history of a new clip
+        and, sharded, the outer halo of the edge ranks); with ``keep_history`` the current
+        two history frames are copied over first and the old buffer is released after it."""
+        depth = 2 + self.chunks * frames
+        old, old_direct = self.tensor, self._direct
+        if self.shard is not None and self.shard.direct:
+            self._direct = self.shard.direct_frames(1, depth, geo, 1, self.channels, dtype)
+            tensor = self._direct.frames[0].unsqueeze(0).permute(0, 4, 1, 2, 3)
+        else:
+            self._direct = None
+            tensor = torch.empty(
+                1,
+                self.channels,
+                depth,
+                *size,
+                dtype=dtype,
+                device=device,
+                memory_format=torch.channels_last_3d,
+            ).zero_()
+        if keep_history:
+            tensor[:, :, :2].copy_(old[:, :, self.pos - 2 : self.pos])
+        if old_direct is not None:
+            self.shard.retire(old_direct)
+        self.tensor, self.pos = tensor, 2
+
+    def history(self) -> torch.Tensor | None:
+        """The two history frames as a logical channels-last ``[1, C, 2, H, W]`` tensor (the
+        cache entry the other conv paths read), or ``None`` before the first chunk."""
+        if self.tensor is None or self.pos < 2:
+            return None
+        hist = self.tensor[:, :, self.pos - 2 : self.pos]
+        geo = self.geometry
+        if geo is not None:
+            hist = hist[:, :, :, geo.row0 : geo.row0 + geo.height, geo.col0 : geo.col0 + geo.width]
+        return hist.contiguous(memory_format=torch.channels_last_3d)
+
+    def exchange(self, window: torch.Tensor) -> None:
+        """Complete the halo lines of a just-written window: wait for the neighbours' direct
+        stores, or trade the border lines over NCCL."""
+        if self.shard is None:
+            return
+        if self._direct is not None:
+            self._direct.barrier()
+        else:
+            self.shard.exchange(_frames_physical(window), self.geometry)
+
+
+class WinoVaeCausalConv3d(WanCausalConv3d):
+    """``WanCausalConv3d`` with the frame-buffer, temporal and spatial Winograd paths."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        # (T, H, W); an int applies to all three axes (nn.Conv3d normalizes to a 3-tuple).
+        kernel_size: int | tuple[int, int, int],
+        stride: int | tuple[int, int, int] = 1,
+        padding: int | tuple[int, int, int] = 0,
+    ) -> None:
+        super().__init__(in_channels, out_channels, kernel_size, stride, padding)
+        # Stride 1 and no dilation on every axis, one group: the only convs the Winograd,
+        # frame-buffer and single-frame paths take.
+        self._dense_unit_stride = (
+            self.stride == (1, 1, 1) and self.dilation == (1, 1, 1) and self.groups == 1
+        )
+        # When set, forward() leaves the bias out; the caller hands it to the consumer kernel.
+        self.defer_bias = False
+        # When set, a stride-1 temporal conv call of more input frames than this does not go
+        # through torch's cuDNN path in one piece (see _conv3d).
+        self.max_in_frames: int | None = None
+        # Tensors derived from the weight (transformed filters, the current-frame slice).
+        self._derived: dict[tuple, tuple[tuple, Any]] = {}  # key -> (_stamp of the weight, value)
+        # Set by the residual block for its two convs: spatial Winograd where selected, and
+        # the cuDNN graph API (per-shape plan choice) for the convs that stay direct. Every
+        # other conv runs through torch's cuDNN path.
+        self.spatial_winograd = False
+        self.cudnn_frontend = False
+        # Launch the fused spatial conv with programmatic dependent launch (see
+        # WinoVae.set_pdl).
+        self.pdl = True
+        # The causal history of the frame-buffer path (see _FrameBuffer).
+        self.frame_buffer = _FrameBuffer(in_channels)
+        # Spatial sharding: this rank's slice and the halo exchanges (None: whole frames).
+        self.shard = None
+
+    def buffer_begin(
+        self,
+        cache_entry: CacheEntry,
+        frames: int,
+        like: "torch.Tensor | DeferredSum",
+        spatial: tuple[int, int],
+    ) -> torch.Tensor:
+        """Start a frame-buffer chunk: a new clip on the first chunk, adopting a cache tensor
+        left by the eager first-chunk path as the history, and return the writable window of
+        a logical ``spatial`` = (H, W) frame."""
+        buf = self.frame_buffer
+        adopt = cache_entry if isinstance(cache_entry, torch.Tensor) else None
+        if cache_entry is None or adopt is not None:
+            buf.new_clip()
+        window = buf.window(frames, like.dtype, like.device, spatial)
+        if adopt is not None:
+            n = adopt.shape[2]
+            if self.shard is not None:
+                adopt = self.shard.pad_frames(_channels_last_3d_if_needed(adopt))
+            buf.tensor[:, :, 2 - n : 2].copy_(adopt)
+        return window
+
+    @property
+    def shard(self) -> Shard | None:
+        return self._shard
+
+    @shard.setter
+    def shard(self, shard: Shard | None) -> None:
+        self._shard = shard
+        self.frame_buffer.shard = shard
+
+    def buffer_conv(self, frames: int) -> torch.Tensor:
+        """Run the conv on the frame buffer's ``[pos-2, pos+frames)`` and advance; the next two
+        history frames stay in place."""
+        buf = self.frame_buffer.tensor
+        pos = self.frame_buffer.pos
+        bias = None if self.defer_bias else self.bias
+        padding = self.padding if self.shard is None else self.shard.conv_padding(self.padding)
+        if (
+            frames == 1
+            and self.shard is None
+            and self.spatial_eligible(buf.shape[3], buf.shape[4], _SPATIAL_TILE_STACKED_K)
+        ):
+            y = self._forward_spatial_taps(
+                [frames_view(buf[:, :, pos - 2 : pos + 1])], 0, buf.shape[3], buf.shape[4], bias
+            )
+            self.frame_buffer.pos = pos + 1
+            return y
+        y = self._conv3d(buf[:, :, pos - 2 : pos + frames], bias, padding)
+        self.frame_buffer.pos = pos + frames
+        return _channels_last_3d_if_needed(y)
+
+    def _conv3d(
+        self, x: torch.Tensor, bias: torch.Tensor | None, padding: tuple[int, int, int]
+    ) -> torch.Tensor:
+        """The 3D conv of an already causally padded ``x``. A call of more than
+        ``max_in_frames`` input frames (when set) goes through the cuDNN graph API in one call
+        when the frontend is installed and the call is unbatched, else in calls of at most
+        ``max_in_frames`` input frames (concatenated). Otherwise: the cuDNN graph API with the
+        plan selected for this shape when ``cudnn_frontend`` is set (frontend installed, call
+        unbatched), else torch's cuDNN path."""
+        kt = self.kernel_size[0]
+        frontend_ok = self.groups == 1 and x.shape[0] == 1 and cudnn_frontend_available()
+        if (
+            self.max_in_frames is not None
+            and self.stride[0] == 1
+            and x.shape[2] > self.max_in_frames >= kt
+        ):
+            if frontend_ok:
+                return self._conv_frontend(x, bias, padding)
+            per_call = self.max_in_frames - kt + 1
+            parts = [
+                F.conv3d(
+                    x[:, :, t : t + per_call + kt - 1],
+                    self.weight,
+                    bias,
+                    self.stride,
+                    padding,
+                    self.dilation,
+                    self.groups,
+                )
+                for t in range(0, x.shape[2] - kt + 1, per_call)
+            ]
+            return _channels_last_3d_if_needed(torch.cat(parts, dim=2))
+        if self.cudnn_frontend and frontend_ok:
+            return self._conv_frontend(x, bias, padding)
+        return F.conv3d(x, self.weight, bias, self.stride, padding, self.dilation, self.groups)
+
+    def _conv_frontend(
+        self, x: torch.Tensor, bias: torch.Tensor | None, padding: tuple[int, int, int]
+    ) -> torch.Tensor:
+        """The conv through the cuDNN graph API, the bias inside the graph."""
+        w = self.weight.detach()
+        if not w.is_contiguous(memory_format=torch.channels_last_3d):
+            w = w.contiguous(memory_format=torch.channels_last_3d)
+        return conv_frontend(
+            x.contiguous(memory_format=torch.channels_last_3d),
+            w,
+            bias,
+            tuple(self.stride),
+            tuple(padding),
+            tuple(self.dilation),
+        )
+
+    def buffer_eligible(self, x: "torch.Tensor | DeferredSum") -> bool:
+        return x.shape[0] == 1 and self.kernel_size[0] == 3 and self._dense_unit_stride
+
+    def _derived_weight(self, key: tuple, build: Callable[[], Any]) -> Any:
+        """A tensor derived from the weight, built on first use and rebuilt when the weight
+        changes (see :func:`_stamp`)."""
+        stamp = _stamp(self.weight)
+        cached = self._derived.get(key)
+        if cached is None or cached[0] != stamp:
+            cached = (stamp, build())
+            self._derived[key] = cached
+        return cached[1]
+
+    def _spatial_winograd(
+        self, kernel: str, order: int, stacked: torch.Tensor, h: int, w: int
+    ) -> torch.Tensor:
+        """The ``order + 2`` components' 3x3 convs by spatial Winograd with ``kernel`` (see
+        ``_SPATIAL_KERNELS``): ``[comps, pairs, h*w, Cin]`` -> ``[comps, pairs, h*w, Cout]``."""
+        filters, conv = _SPATIAL_KERNELS[kernel]
+        u = self._derived_weight((kernel, order), lambda: filters(self, order))
+        return conv(self, stacked, u, h, w)
+
+    def _winograd_weights(self, order: int) -> list[torch.Tensor]:
+        """The ``order + 2`` temporal component filters, in the Winograd dtype."""
+        return self._derived_weight(
+            ("temporal", order), lambda: winograd_weights(self.weight, order, _WINOGRAD_DTYPE)
+        )
+
+    def winograd_eligible(self, frames: int, batch: int) -> bool:
+        return (
+            batch == 1
+            and frames >= 2
+            and frames % 2 == 0
+            and self.kernel_size == (3, 3, 3)
+            and self._dense_unit_stride
+        )
+
+    def spatial_eligible(
+        self, height: int, width: int, tile: int = _SPATIAL_TILE, kernel: str = "cublas"
+    ) -> bool:
+        """Whether spatial Winograd runs this conv on ``height x width`` frames with ``kernel``
+        ("sm100" or the portable "cublas") and ``tile``."""
+        if (
+            not self.spatial_winograd
+            or self.padding[1:] != (1, 1)
+            or self.in_channels % 8
+            or self.out_channels % 8
+        ):
+            return False
+        return self._spatial_selected(height, width, tile, kernel)
+
+    def _spatial_selected(self, height: int, width: int, tile: int, kernel: str) -> bool:
+        """The layers spatial Winograd is used on: the sm100 F(4x4, 3x3) pipeline on convs with
+        at least 512 input channels up to 360x640; the portable path with F(4x4, 3x3) from 512
+        input channels up to 180x320, with F(2x2, 3x3) from 1024 input channels up to 90x160."""
+        if kernel == "sm100":
+            return self.in_channels >= 512 and height * width <= 360 * 640
+        if tile == 4:
+            return self.in_channels >= 512 and height * width <= 180 * 320
+        return self.in_channels >= 1024 and height * width <= 90 * 160
+
+    def _forward_spatial_taps(
+        self,
+        taps: list[torch.Tensor],
+        zero_front: int,
+        h: int,
+        w: int,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """One output frame by spatial Winograd alone from three input frames in their own
+        buffers (``[n, H*W, C]`` each, oldest first, ``zero_front`` zero frames before them):
+        the causal history and the new frame, stacked along the GEMM's K axis."""
+        n_taps = zero_front + sum(t.shape[0] for t in taps)
+        tile = _SPATIAL_TILE_STACKED_K
+        u = self._derived_weight(
+            ("taps", n_taps, tile),
+            lambda: winograd_spatial_taps_weights(self.weight, tile, n_taps),
+        )
+        y = wino_spatial_conv_taps(taps, zero_front, u, h, w, bias)
+        return frames_to_video(y.unsqueeze(0), h, w)
+
+    def _spatial_kernel(self, h: int, w: int) -> str:
+        """Which conv runs the Winograd inputs of a logical ``h x w`` frame: "fused" (the
+        fused F(2,3)-horizontal / direct-vertical 256-channel conv), "sm100" (the Blackwell
+        F(4x4) pipeline), "cublas" (the portable spatial Winograd) or "cudnn" (conv2d per
+        Winograd input). On a shard the
+        choice is made for the largest shard's frame, so every rank picks the same kernel and
+        the same Winograd-input layout."""
+        if self.shard is not None:
+            if self.shard.axis == "h":
+                h = max(self.shard.output_extents(h))
+            else:
+                w = max(self.shard.output_extents(w))
+        sm100 = sm100_wino_available()
+        cin, cout = self.in_channels, self.out_channels
+        if self.spatial_winograd and sm100 and sm100_spatial.fused_eligible(cin, cout, h, w):
+            return "fused"
+        if (
+            sm100
+            and sm100_spatial.spatial_eligible(cin, cout, w)
+            and self.spatial_eligible(h, w, kernel="sm100")
+        ):
+            return "sm100"
+        if self.spatial_eligible(h, w):
+            return "cublas"
+        return "cudnn"
+
+    def winograd_inputs_align(self, h: int, w: int, order: int) -> int:
+        """Lines the physical extent of this conv's Winograd-input frames is a multiple of: the tile of
+        the kernel that will read them (the fused 256-channel conv takes 8-row x 32-column
+        tiles, the sm100 pipeline 4-wide columns), 1 otherwise."""
+        kernel = self._spatial_kernel(h, w)
+        if kernel == "fused":
+            return 8 if self.shard.axis == "h" else 32
+        if kernel == "sm100" and self.shard.axis == "w":
+            return 4
+        return 1
+
+    def winograd_inputs(
+        self, h: int, w: int, order: int, frames: int
+    ) -> tuple[FrameGeometry | None, torch.Tensor | None, DirectFrames | None]:
+        """What the norm kernel that feeds this conv writes its Winograd inputs into for a logical
+        ``h x w`` frame: the Winograd-input layout (None without sharding) and, with direct halo
+        exchange, the symmetric buffer ``[order + 2, frames / order, positions, C]`` to fill
+        (the layout then carries the neighbours' halo lines as its push) and that buffer's
+        handle for the barrier."""
+        if self.shard is None:
+            return None, None, None
+        align = self.winograd_inputs_align(h, w, order)
+        geo = self.shard.geometry(h, w, align)
+        if not self.shard.direct:
+            return geo, None, None
+        comps, groups = order + 2, frames // order
+        buf = self.shard.direct_inputs(comps, groups, geo, align, self.in_channels, _WINOGRAD_DTYPE)
+        inputs = buf.frames.view(comps, groups, geo.frame, self.in_channels)
+        return replace(geo, push=buf.push()), inputs, buf
+
+    def forward_winograd(
+        self, inputs: WinogradInputs
+    ) -> tuple[list[torch.Tensor], FrameGeometry | None]:
+        """The ``order + 2`` 3x3 convs of the transformed inputs (bias left to the consumer):
+        cuDNN conv2d per input, or spatial Winograd on all of them at once where that is faster.
+        Returns the products and their frame layout: the spatial Winograd kernels work on the
+        physical frames (halo lines included), cuDNN emits the logical frame."""
+        comps = len(inputs.d)
+        order = comps - 2
+        geo = inputs.geometry
+        if geo is None:
+            _, _, h, w = inputs.d[0].shape
+            ph, pw = h, w
+        else:
+            h, w = geo.height, geo.width
+            ph, pw = geo.rows, geo.cols
+        kernel = self._spatial_kernel(h, w)
+        if kernel in _SPATIAL_KERNELS:
+            m = self._spatial_winograd(kernel, order, inputs.stacked, ph, pw)
+            return [pairs_to_images(m[k], ph, pw) for k in range(comps)], geo
+        g = self._winograd_weights(order)
+        pad = (self.padding[1], self.padding[2])
+        if geo is not None:
+            # The halo lines supply the context on the split axis: no padding there, and the
+            # conv emits the logical frame.
+            pad = self.shard.conv_padding(pad)
+        if self.cudnn_frontend and cudnn_frontend_available():
+            # One stacked product buffer [comps, groups, H, W, Cout]: the consumer norm kernel
+            # reads the components at one stride, and the graph API writes into the slices.
+            groups = inputs.d[0].shape[0]
+            out = torch.empty(
+                (comps, groups, h, w, self.out_channels),
+                dtype=inputs.d[0].dtype,
+                device=inputs.d[0].device,
+            )
+            views = [
+                out[k].permute(0, 3, 1, 2) for k in range(comps)
+            ]  # [groups, Cout, H, W] channels-last
+            for k in range(comps):
+                conv_frontend(inputs.d[k], g[k], None, (1, 1), pad, (1, 1), out=views[k])
+            return views, None
+        return [F.conv2d(inputs.d[k], g[k], None, 1, pad) for k in range(comps)], None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache_x: torch.Tensor | None = None,
+        *,
+        spatial_padding: tuple[int, int] | None = None,
+    ) -> torch.Tensor:
+        """The causal conv of ``x`` after its cached history ``cache_x`` (None: zero history).
+        A single frame takes a shortcut: a 2D conv on the current-frame taps when there is no
+        history, spatial Winograd with the three taps summed in the GEMM when there is."""
+        x = _channels_last_3d_if_needed(x)
+        bias = None if self.defer_bias else self.bias
+        if self.shard is not None and self.kernel_size[1:] != (1, 1) and spatial_padding is None:
+            # The neighbours' border lines replace the zero padding on the split axis.
+            x = self.shard.pad_frames(x)
+            if cache_x is not None:
+                cache_x = self.shard.pad_frames(
+                    _channels_last_3d_if_needed(_to_device_if_needed(cache_x, x.device))
+                )
+            spatial_padding = self.shard.conv_padding(self.padding[1:])
+        if x.shape[2] == 1:
+            if cache_x is None and self._padding[4] > 0 and self.stride[0] == 1:
+                return self._first_frame(x, bias, spatial_padding)
+            if spatial_padding is None and self._single_frame_spatial_eligible(x, cache_x):
+                return self._single_frame_spatial(x, cache_x, bias)
+        # The history goes in front through a copy (torch.cat, as in WanCausalConv3d). The
+        # large convs never come here: they read their history in place from a frame buffer
+        # or take the temporal Winograd path. What does is small: the conv_in layers on the
+        # model's input, the resamplers' time convs, and the eager path of batched calls. A
+        # frame buffer would not save the copy there, writing the input into it is the copy.
+        x = self._causal_input(x, cache_x)
+        return self._conv3d(
+            x, bias, self.padding if spatial_padding is None else (0, *spatial_padding)
+        )
+
+    def _first_frame(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        spatial_padding: tuple[int, int] | None,
+    ) -> torch.Tensor:
+        """One frame with zero history: only the current-frame taps contribute (a 2D conv)."""
+        w2 = self._derived_weight(
+            ("current_frame",),
+            lambda: self.weight[:, :, -1].contiguous(memory_format=torch.channels_last),
+        )
+        y = F.conv2d(
+            x[:, :, 0],
+            w2,
+            bias,
+            self.stride[1:],
+            self.padding[1:] if spatial_padding is None else spatial_padding,
+            self.dilation[1:],
+            self.groups,
+        )
+        return _channels_last_3d_if_needed(y.unsqueeze(2))
+
+    def _single_frame_spatial_eligible(self, x: torch.Tensor, cache_x: torch.Tensor | None) -> bool:
+        return (
+            self.kernel_size[0] == 3
+            and self._padding[4] == 2
+            and x.shape[0] == 1
+            and self._dense_unit_stride
+            and (cache_x is None or cache_x.shape[2] <= 2)
+            and self.spatial_eligible(x.shape[3], x.shape[4], _SPATIAL_TILE_STACKED_K)
+        )
+
+    def _single_frame_spatial(
+        self, x: torch.Tensor, cache_x: torch.Tensor | None, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        """One frame after its history by spatial Winograd alone, the three taps summed inside
+        the GEMM and the history read where the cache holds it."""
+        taps = []
+        if cache_x is not None:
+            cache_x = _channels_last_3d_if_needed(_to_device_if_needed(cache_x, x.device))
+            taps.append(frames_view(cache_x))
+        taps.append(frames_view(x))
+        history = 0 if cache_x is None else cache_x.shape[2]
+        return self._forward_spatial_taps(taps, 2 - history, x.shape[3], x.shape[4], bias)
+
+
+def _video_to_frames_2d(x: torch.Tensor) -> torch.Tensor:
+    """Video ``[B, C, T, H, W]`` as the frames ``[B*T, C, H, W]`` channels-last."""
+    batch_size, channels, frames, height, width = x.shape
+    x_4d = x.permute(0, 2, 1, 3, 4).reshape(batch_size * frames, channels, height, width)
+    return _channels_last_2d_if_needed(x_4d)
+
+
+class WinoVaeResample(WanResample):
+    """``WanResample`` with the fused upsample (2x2 conv on the low-res grid plus a phase
+    gather), the deferred downsample bias and sharding."""
+
+    _conv_cls = WinoVaeCausalConv3d
+
+    def __init__(self, dim: int, mode: str, upsample_out_dim: int | None = None) -> None:
+        super().__init__(dim, mode, upsample_out_dim)
+        self._packed: tuple[tuple, torch.Tensor, torch.Tensor | None] | None = None
+        # When set, the downsample modes run their convs bias-free and return a DeferredSum
+        # carrying the bias for the caller to add (the owning block's shortcut-add kernel).
+        self.defer_bias_to_consumer = False
+        self._time_bias: tuple[tuple, torch.Tensor] | None = None
+        self.shard: Shard | None = None
+        if mode == "upsample3d":
+            # The cuDNN graph API's plan beats torch's cuDNN path on the 3x1x1 time conv,
+            # most of all on a frame-buffer window (torch picks a slower kernel there).
+            self.time_conv.cudnn_frontend = True
+
+    def _packed_weights(self) -> tuple[torch.Tensor, torch.Tensor | None]:
+        conv = self.resample[1]
+        key = _stamp(conv.weight, conv.bias)
+        if self._packed is None or self._packed[0] != key:
+            self._packed = (key, *pack_upsample_weights(conv.weight, conv.bias))
+        return self._packed[1], self._packed[2]
+
+    def forward(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+        shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None = None,
+        *,
+        prepadded: bool = False,
+    ) -> torch.Tensor:
+        """Resample ``x`` ``[B, C, T, H, W]`` (a tensor, or a :class:`DeferredSum` added up here):
+        upsampling runs the time step, then the space step; downsampling runs the space step,
+        then the time step. The time steps run only in the 3d modes under a causal cache.
+
+        ``shortcut`` = (residual, DupUp3D module, first_chunk), upsample modes only: the space
+        step adds the expanded shortcut while writing and the caller skips its add.
+        ``prepadded``, downsample modes only: ``x`` already carries the zero row and column of
+        the downsample pad, as ``[T, C, H+1, W+1]`` channels-last frames of batch 1."""
+        if feat_cache is not None and feat_idx is None:
+            raise ValueError("feat_idx is required when feat_cache is provided")
+        upsample = self.mode.startswith("upsample")
+        if shortcut is not None and not upsample:
+            raise ValueError("shortcut is only consumed by the upsample modes")
+        if prepadded and upsample:
+            raise ValueError("prepadded input is only taken by the downsample modes")
+
+        if upsample:
+            return self._upsample_space(self._upsample_time(x, feat_cache, feat_idx), shortcut)
+        x = materialize(x)
+        if prepadded:
+            batch_size, frames = 1, x.shape[0]
+            y, bias = self._downsample_space(x, batch_size, prepadded=True)
+        else:
+            batch_size, frames = x.shape[0], x.shape[2]
+            y, bias = self._downsample_space(_video_to_frames_2d(x), batch_size)
+        y, bias = self._downsample_time(y, bias, batch_size, frames, feat_cache, feat_idx)
+        return DeferredSum(y, bias=bias) if bias is not None else y
+
+    def _upsample_space(
+        self, x: torch.Tensor, shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None
+    ) -> torch.Tensor:
+        """2x2 conv on the low-res grid, then the phase gather (+ DupUp3D shortcut):
+        ``[B, C, T, H, W] -> [B, Cout, T, 2H, 2W]``. Shapes the gather kernel does not take run
+        the inherited nearest upsample and 3x3 conv, then add the shortcut."""
+        factor_t, repeats = (
+            (1, 1) if shortcut is None else (shortcut[1].factor_t, shortcut[1].repeats)
+        )
+        if not upsample_gather_supported(self.resample[1].out_channels, factor_t, repeats):
+            return self._upsample_space_eager(x, shortcut)
+        batch_size, frames = x.shape[0], x.shape[2]
+        x_4d = _video_to_frames_2d(x)
+        packed, packed_bias = self._packed_weights()
+        defer_bias = packed_bias is not None
+        if self.shard is not None:
+            # One low-res line from each neighbour; the 2x2 conv then emits the H+1 (or W+1)
+            # temp lines this rank's output rows read.
+            temp = F.conv2d(
+                self.shard.pad_frames(x_4d),
+                packed,
+                None if defer_bias else packed_bias,
+                padding=self.shard.conv_padding((1, 1)),
+            )
+        else:
+            temp = F.conv2d(x_4d, packed, None if defer_bias else packed_bias, padding=1)
+        temp = _channels_last_2d_if_needed(temp)
+        gather_bias = self.resample[1].bias if defer_bias else None
+        if shortcut is None:
+            return upsample_gather(temp, None, batch_size, frames, bias=gather_bias)
+        residual, dup, first_chunk = shortcut
+        residual = _channels_last_3d_if_needed(residual)
+        crop = dup.factor_t - 1 if first_chunk else 0
+        return upsample_gather(
+            temp, residual, batch_size, frames, dup.factor_t, dup.repeats, crop, bias=gather_bias
+        )
+
+    def _upsample_space_eager(
+        self, x: torch.Tensor, shortcut: tuple[torch.Tensor, "DupUp3D", bool] | None
+    ) -> torch.Tensor:
+        """``_upsample_space`` as ``WanVAE`` computes it (whole frames only)."""
+        if self.shard is not None:
+            raise ValueError("a spatially sharded WinoVae upsamples through the gather kernel")
+        batch_size, frames = x.shape[0], x.shape[2]
+        y = self.resample(_video_to_frames_2d(x))  # [B*T, Cout, 2H, 2W]
+        y = y.view(batch_size, frames, *y.shape[1:]).permute(0, 2, 1, 3, 4)
+        if shortcut is not None:
+            residual, dup, first_chunk = shortcut
+            y = y + dup(residual, first_chunk=first_chunk)
+        return _channels_last_3d_if_needed(y)
+
+    def _upsample_time(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry] | None,
+        feat_idx: list[int] | None,
+    ) -> torch.Tensor:
+        """The upsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one);
+        ``x`` unchanged (added up) in upsample2d or without a cache. First chunk: records the
+        ``"Rep"`` sentinel and returns ``x`` (its frames are repeated by the caller's layout).
+        Later chunks: the time conv runs against the history (zero right after the sentinel),
+        and the two channel halves are interleaved along time with the conv bias:
+        ``[B, C, T, H, W] -> [B, C, 2T, H, W]``. Unsharded batch-1 chunks run the time conv on
+        its frame buffer, ``x`` added up straight into the buffer window; otherwise the history
+        is prepended by copy."""
+        if self.mode != "upsample3d" or feat_cache is None:
+            return materialize(x)
+        batch_size, channels, frames, height, width = x.shape
+        idx = feat_idx[0]
+        if feat_cache[idx] is None:
+            # "Rep": the first chunk passes through unconvolved; the next one starts from zero
+            # history.
+            feat_cache[idx] = "Rep"
+            feat_idx[0] += 1
+            return materialize(x)
+        # The time conv makes 2C channels per input frame: the two output frames of each input
+        # frame, side by side. The interleave kernel puts them in time order and adds the conv's
+        # bias in the same pass (batch 1, kernels available); the conv then runs bias-free.
+        fused = kernels_available() and batch_size == 1
+        self.time_conv.defer_bias = fused
+        if fused and self.shard is None:
+            y = self._time_conv_buffered(x, feat_cache, idx, (height, width))
+        else:
+            y = self._time_conv_eager(materialize(x), feat_cache, idx)
+        feat_idx[0] += 1
+        return self._interleave_time(y, fused, channels, frames, height, width)
+
+    def _interleave_time(
+        self, y: torch.Tensor, fused: bool, channels: int, frames: int, height: int, width: int
+    ) -> torch.Tensor:
+        """The time conv output ``[B, 2C, T, H, W]`` as ``[B, C, 2T, H, W]``: channel half ``k``
+        of input frame ``t`` becomes output frame ``2t + k``. One copy either way: the
+        interleave kernel (which also adds the deferred bias), or ``torch.stack`` (the bias
+        already in ``y``)."""
+        if fused:
+            from .kernels.frame_ops import interleave_bias
+
+            u = frames_view(_channels_last_3d_if_needed(y))
+            return frames_to_video(interleave_bias(u, self.time_conv.bias), height, width)
+        batch_size = y.shape[0]
+        halves = y.reshape(batch_size, 2, channels, frames, height, width)  # a view
+        y = torch.stack((halves[:, 0], halves[:, 1]), 3)  # the copy
+        return y.reshape(batch_size, channels, frames * 2, height, width)
+
+    def _time_conv_buffered(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry],
+        idx: int,
+        spatial: tuple[int, int],
+    ) -> torch.Tensor:
+        """The time conv of a chunk on its frame buffer: ``x`` is added up (or copied) into the
+        buffer window, the conv reads the history in place, and the cache entry becomes the
+        conv. After the ``"Rep"`` marker the buffer starts a clip (zero history)."""
+        tc = self.time_conv
+        entry = feat_cache[idx]
+        # "Rep" (the previous chunk passed through unconvolved): start a clip, zero history.
+        window = tc.buffer_begin(None if entry == "Rep" else entry, x.shape[2], x, spatial)
+        materialize(x, out=window)
+        feat_cache[idx] = tc
+        return tc.buffer_conv(x.shape[2])
+
+    def _time_conv_eager(
+        self, x: torch.Tensor, feat_cache: list[CacheEntry], idx: int
+    ) -> torch.Tensor:
+        """The time conv of a chunk with its history prepended by copy; the chunk's last frames
+        become the cache entry."""
+        entry = _history_frames(feat_cache[idx])
+        # "Rep": the previous chunk passed through unconvolved, so this one has zero history.
+        zero_history = isinstance(entry, str) and entry == "Rep"
+        cache_x = x[:, :, -CACHE_T:, :, :]
+        if cache_x.shape[2] < 2:
+            prev = torch.zeros_like(cache_x) if zero_history else entry[:, :, -1:, :, :]
+            cache_x = torch.cat([_to_device_if_needed(prev, cache_x.device), cache_x], dim=2)
+        y = self.time_conv(x) if zero_history else self.time_conv(x, entry)
+        feat_cache[idx] = cache_x
+        return y
+
+    def _downsample_space(
+        self, x_4d: torch.Tensor, batch_size: int, *, prepadded: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The stride-2 3x3 conv of the downsample modes on frames ``[B*T, C, H, W]``, after its
+        zero pad (the shard's pad under sharding), or on an input that already carries the zero
+        row and column (``prepadded``). Returns ``(frames, bias not yet added or None)``: with
+        ``defer_bias_to_consumer`` the conv runs bias-free and hands its bias back."""
+        if prepadded:
+            x_4d = _channels_last_2d_if_needed(x_4d)
+            if self.shard is not None:
+                self.shard.fill_pad_line(x_4d)
+        elif self.shard is None:
+            x_4d = self.resample[0](x_4d)
+        else:
+            x_4d = self.shard.pad_for_downsample(_channels_last_2d_if_needed(x_4d))
+        conv = self.resample[1]
+        defer = (
+            self.defer_bias_to_consumer
+            and conv.bias is not None
+            and kernels_available()
+            and batch_size == 1
+        )
+        if defer:
+            return F.conv2d(x_4d, conv.weight, None, conv.stride, conv.padding), conv.bias
+        return conv(x_4d), None
+
+    def _time_conv_bias(self, bias: torch.Tensor) -> torch.Tensor:
+        """``time_conv``'s bias with the downsample conv's bias folded through its taps:
+        every input frame of the stride-2 time conv carries ``bias``, so
+        ``b' = b_t + sum_k W_t[:, :, k] @ bias`` (composed in fp32, rounded once)."""
+        tc = self.time_conv
+        key = _stamp(tc.weight, tc.bias, bias)
+        if self._time_bias is None or self._time_bias[0] != key:
+            with torch.inference_mode(False), torch.no_grad():
+                w = tc.weight.detach().float()[:, :, :, 0, 0]  # [Cout, Cin, taps]
+                b = bias.detach().float()
+                bt = tc.bias.detach().float() if tc.bias is not None else torch.zeros_like(b)
+                folded = (bt + torch.einsum("oik,i->o", w, b)).to(tc.weight.dtype)
+            self._time_bias = (key, folded)
+        return self._time_bias[1]
+
+    def _downsample_time(
+        self,
+        x: torch.Tensor,
+        bias: torch.Tensor | None,
+        batch_size: int,
+        frames: int,
+        feat_cache: list[CacheEntry] | None,
+        feat_idx: list[int] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The space step's frames ``[B*T, C, H, W]`` back as video ``[B, C, T, H, W]``, then
+        the downsample3d time step under the causal cache at ``feat_idx[0]`` (advanced by one):
+        the first chunk is cached as is, later chunks run the stride-2 time conv against the
+        cached last frame. ``bias``: the space conv's bias not yet added (or None). Returns
+        ``(video, bias not yet added)``: with a deferred space-conv bias the time conv runs
+        bias-free too and hands back its own bias with the space conv's folded in."""
+        x_5d = x.reshape(batch_size, frames, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
+        x = _channels_last_3d_if_needed(x_5d)
+
+        if self.mode == "downsample3d" and feat_cache is not None and feat_idx is not None:
+            idx = feat_idx[0]
+            if feat_cache[idx] is None:
+                feat_cache[idx] = x
+                feat_idx[0] += 1
+            else:
+                cache_x = x[:, :, -1:, :, :]
+                x_in = torch.cat([feat_cache[idx][:, :, -1:, :, :], x], dim=2)
+                if bias is not None:
+                    tc = self.time_conv
+                    x = F.conv3d(x_in, tc.weight, None, tc.stride)
+                    bias = self._time_conv_bias(bias)
+                else:
+                    x = self.time_conv(x_in)
+                feat_cache[idx] = cache_x
+                feat_idx[0] += 1
+        return x, bias
+
+
+def _norm_into_buffer(
+    norm: WinoVaeRMSNorm,
+    conv: WinoVaeCausalConv3d,
+    x: "torch.Tensor | DeferredSum",
+    feat_cache: list[CacheEntry],
+    feat_idx: list[int],
+    spatial: tuple[int, int],
+    return_sum: bool = False,
+) -> torch.Tensor | None:
+    """Start ``conv``'s next frame-buffer chunk (a logical ``spatial`` frame) and have ``norm``
+    write ``SiLU(norm(x))`` into its window, halo lines completed; ``conv.buffer_conv`` then
+    reads it. With ``return_sum``, returns ``x`` as a tensor (formed by the norm kernel)."""
+    idx = feat_idx[0]
+    window = conv.buffer_begin(feat_cache[idx], x.shape[2], x, spatial)
+    feat_cache[idx] = conv
+    feat_idx[0] += 1
+    out = norm.norm_silu(
+        x, out=window, out_geometry=conv.frame_buffer.geometry, return_sum=return_sum
+    )
+    conv.frame_buffer.exchange(window)
+    return out[0] if return_sum else None
+
+
+class WinoVaeResidualBlock(WanResidualBlock):
+    """``WanResidualBlock`` on the fused paths: the frame-buffer convs, the temporal Winograd
+    convs, or the eager convs with deferred biases."""
+
+    _norm_cls = WinoVaeRMSNorm
+    _conv_cls = WinoVaeCausalConv3d
+
+    def __init__(
+        self, in_dim: int, out_dim: int, dropout: float = 0.0, non_linearity: str = "silu"
+    ) -> None:
+        super().__init__(in_dim, out_dim, dropout, non_linearity)
+        self._merged_bias: tuple[tuple, torch.Tensor] | None = None
+        # Spatial Winograd applies to both convs on every path (frame pairs, cached single
+        # frames), so it is fixed here, not when a path first runs.
+        spatial = kernels_available()
+        for conv in (self.conv1, self.conv2):
+            conv.spatial_winograd = spatial
+            conv.cudnn_frontend = True
+
+    def _output_bias(self, with_shortcut: bool) -> torch.Tensor:
+        """conv2's bias, plus the shortcut conv's when that one was deferred too."""
+        if not with_shortcut:
+            return self.conv2.bias
+        b2, bs = self.conv2.bias, self.conv_shortcut.bias
+        key = _stamp(b2, bs)
+        if self._merged_bias is None or self._merged_bias[0] != key:
+            self._merged_bias = (key, (b2.detach().float() + bs.detach().float()).to(b2.dtype))
+        return self._merged_bias[1]
+
+    def forward(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+        *,
+        defer_output_bias: bool = False,
+        return_input: bool = False,
+    ) -> "DeferredSum | tuple[DeferredSum, torch.Tensor]":
+        """The block on the fastest path its input allows: both convs as temporal Winograd
+        (an even number of frames), as frame-buffer convs (the norm kernels write into the
+        buffers), or eagerly. Returns ``conv2(...) + shortcut`` as a DeferredSum the next norm
+        adds while reading; ``defer_output_bias``: the consumer is a fused norm, so conv2's
+        bias (and a shortcut conv's) ride on it too. ``return_input``: also return the
+        materialized block input."""
+        if feat_cache is not None and feat_idx is None:
+            raise ValueError("feat_idx is required when feat_cache is provided")
+        batch, _, frames = x.shape[:3]
+        cached = feat_cache is not None and kernels_available()
+        if (
+            cached
+            and self.conv1.winograd_eligible(frames, batch)
+            and self.conv2.winograd_eligible(frames, batch)
+        ):
+            out, x = self._forward_winograd(x, feat_cache, feat_idx, frames)
+        elif (
+            cached
+            and self.conv1.buffer_eligible(x)
+            and self.conv2.buffer_eligible(x)
+            and not (frames == 1 and feat_cache[feat_idx[0]] is None)
+        ):
+            out, x = self._forward_buffered(x, feat_cache, feat_idx, defer_output_bias)
+        else:
+            out, x = self._forward_eager(x, feat_cache, feat_idx, defer_output_bias)
+        return (out, x) if return_input else out
+
+    def _shortcut(
+        self, x: torch.Tensor, defer_out: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """The shortcut branch and the bias the block output carries: with ``defer_out``,
+        conv2's bias plus a shortcut conv's (whose own bias is then left out)."""
+        has_conv = isinstance(self.conv_shortcut, WinoVaeCausalConv3d)
+        if has_conv:
+            self.conv_shortcut.defer_bias = defer_out
+        residual = self.conv_shortcut(x)
+        return residual, (self._output_bias(has_conv) if defer_out else None)
+
+    def _forward_eager(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry] | None,
+        feat_idx: list[int] | None,
+        defer_out: bool,
+    ) -> tuple[DeferredSum, torch.Tensor]:
+        """The convs through torch (the history prepended by copy); biases still deferred."""
+        if feat_cache is not None:
+            for i in (feat_idx[0], feat_idx[0] + 1):
+                feat_cache[i] = _history_frames(feat_cache[i])
+        x, h = self.norm1.norm_silu(x, return_sum=True)
+        residual, out_bias = self._shortcut(x, defer_out)
+        self.conv1.defer_bias = True
+        if feat_cache is not None:
+            h = _causal_conv_with_cache(self.conv1, h, feat_cache, feat_idx)
+        else:
+            h = self.conv1(h)
+        h = self.norm2.norm_silu(DeferredSum(h, bias=self.conv1.bias))
+        h = self.dropout(h)
+        self.conv2.defer_bias = defer_out
+        if feat_cache is not None:
+            h = _causal_conv_with_cache(self.conv2, h, feat_cache, feat_idx)
+        else:
+            h = self.conv2(h)
+        return DeferredSum(h, residual=residual, bias=out_bias), x
+
+    def _forward_buffered(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry],
+        feat_idx: list[int],
+        defer_out: bool,
+    ) -> tuple[DeferredSum, torch.Tensor]:
+        """Plain 3D convs reading their frame buffers; the norm kernels write into them."""
+        frames = x.shape[2]
+        spatial = tuple(x.shape[-2:])
+        x = _norm_into_buffer(self.norm1, self.conv1, x, feat_cache, feat_idx, spatial, True)
+        residual, out_bias = self._shortcut(x, defer_out)
+        self.conv1.defer_bias = True
+        h = self.conv1.buffer_conv(frames)
+        _norm_into_buffer(
+            self.norm2,
+            self.conv2,
+            DeferredSum(h, bias=self.conv1.bias),
+            feat_cache,
+            feat_idx,
+            spatial,
+        )
+        self.conv2.defer_bias = defer_out
+        h = self.conv2.buffer_conv(frames)
+        return DeferredSum(h, residual=residual, bias=out_bias), x
+
+    def _forward_winograd(
+        self,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry],
+        feat_idx: list[int],
+        frames: int,
+    ) -> tuple[DeferredSum, torch.Tensor]:
+        """Both convs as temporal Winograd. The caches hold the last two normalized frames
+        exactly as the eager path stores them (a frame-buffer conv left by an odd-length
+        chunk hands over its history frames); conv biases ride on the DeferredSum and are added
+        by the consumer kernel (free there)."""
+        h, w = x.shape[-2:]
+        order = temporal_order_for(frames)
+        # norm1 -> inputs for conv1; the sum it writes is the block input (residual source).
+        s, inputs = self._norm_winograd(
+            self.norm1, self.conv1, x, feat_cache, feat_idx, order, return_sum=True
+        )
+        if isinstance(x, DeferredSum):
+            x = s if s is not None else materialize(x)
+        residual, out_bias = self._shortcut(x, True)
+        m1, geo_m1 = self.conv1.forward_winograd(inputs)
+        products = DeferredSum(WinogradProducts(m1, geo_m1), bias=self.conv1.bias)
+        _, inputs2 = self._norm_winograd(
+            self.norm2, self.conv2, products, feat_cache, feat_idx, order, return_sum=False
+        )
+        m2, geo_m2 = self.conv2.forward_winograd(inputs2)
+        return DeferredSum(WinogradProducts(m2, geo_m2), residual=residual, bias=out_bias), x
+
+    @staticmethod
+    def _norm_winograd(
+        norm: WinoVaeRMSNorm,
+        conv: WinoVaeCausalConv3d,
+        x: "torch.Tensor | DeferredSum",
+        feat_cache: list[CacheEntry],
+        feat_idx: list[int],
+        order: int,
+        *,
+        return_sum: bool,
+    ) -> tuple[torch.Tensor | None, WinogradInputs]:
+        """``norm`` writes the Winograd inputs of ``conv`` (halo lines completed) and the next
+        cache entry; returns the sum it formed (with ``return_sum``; None for a plain tensor
+        input) and the inputs."""
+        h, w = x.shape[-2:]
+        frames = x.shape[2]
+        idx = feat_idx[0]
+        geo, into, direct = conv.winograd_inputs(h, w, order, frames)
+        s, cache, inputs = norm.norm_silu_winograd(
+            x, _history_frames(feat_cache[idx]), frames, geo, inputs=into, return_sum=return_sum
+        )
+        feat_cache[idx] = cache
+        feat_idx[0] += 1
+        if direct is not None:
+            direct.barrier()
+        elif conv.shard is not None:
+            conv.shard.zero_outside(inputs.physical(), inputs.geometry)
+            conv.shard.exchange(inputs.physical(), inputs.geometry)
+        return s, inputs
+
+
+class WinoVaeAttentionBlock(WanAttentionBlock):
+    """The mid-block attention with the norm, projections and residual add fused."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__(dim)
+        self.shard: Shard | None = None
+
+    def _forward_gathered(self, x: torch.Tensor) -> torch.Tensor:
+        """The eager attention on the whole frame: gather the ranks' slices, run, keep ours."""
+        shard = self.shard
+        dim = 3 if shard.axis == "h" else 4
+        extents = shard.output_extents(x.shape[dim])
+        widest = max(extents)
+        send = x.contiguous()
+        if x.shape[dim] != widest:
+            shape = list(x.shape)
+            shape[dim] = widest
+            send = x.new_zeros(shape)
+            send.narrow(dim, 0, x.shape[dim]).copy_(x)
+        parts = [torch.empty_like(send) for _ in range(shard.world_size)]
+        torch.distributed.all_gather(parts, send, group=shard.pg)
+        full = super().forward(
+            torch.cat([p.narrow(dim, 0, e) for p, e in zip(parts, extents)], dim=dim)
+        )
+        return torch.narrow(full, dim, sum(extents[: shard.rank]), x.shape[dim])
+
+    def forward(self, x: "torch.Tensor | DeferredSum") -> "torch.Tensor | DeferredSum":  # type: ignore[override]
+        x = materialize(x)
+        if not (kernels_available() and x.shape[0] == 1 and rms_norm_silu_supported(x)):
+            return super().forward(x) if self.shard is None else self._forward_gathered(x)
+        residual = _channels_last_3d_if_needed(x)
+        _, channels, frames, height, width = residual.shape
+        positions = height * width
+        # The GEMMs run on the channels-last row view [T*H*W, C], which is also SDPA's layout.
+        normed = rms_norm_silu(
+            residual,
+            self.norm.gamma,
+            None,
+            self.norm.scale,
+            silu=False,
+        )
+        normed_rows = frames_view(normed).reshape(frames * positions, channels)
+        if self.shard is None:
+            q, k, v = self._qkv(normed_rows, frames, positions)
+        else:
+            q, k, v = self._qkv_sharded(normed_rows, frames, positions)
+        attn = F.scaled_dot_product_attention(q, k, v)  # [T, 1, HW, C]
+        attn_rows = attn.reshape(frames * positions, channels)
+        w_proj = self.proj.weight.reshape(channels, channels)
+        proj_rows = torch.mm(attn_rows, w_proj.t())
+        proj = frames_to_video(proj_rows.view(frames, positions, channels), height, width)
+        # x + residual (+ the proj bias) is added by the consumer's norm kernel.
+        return DeferredSum(proj, residual=residual, bias=self.proj.bias)
+
+    def _qkv(
+        self, normed_rows: torch.Tensor, frames: int, positions: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q, K, V ``[T, 1, HW, C]`` of whole frames from the normalized rows ``[T*HW, C]``:
+        one GEMM, the bias in its epilogue."""
+        channels = normed_rows.shape[1]
+        w_qkv = self.to_qkv.weight.reshape(3 * channels, channels)
+        qkv = torch.addmm(self.to_qkv.bias, normed_rows, w_qkv.t())
+        qkv = qkv.view(frames, 1, positions, 3 * channels)
+        return qkv.chunk(3, dim=-1)
+
+    def _qkv_sharded(
+        self, normed_rows: torch.Tensor, frames: int, positions: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Q of this rank's rows and K, V of the whole frame: attention spans the frame, so
+        the keys and values come from every rank's rows (their order does not matter)."""
+        channels = normed_rows.shape[1]
+        w_qkv = self.to_qkv.weight.reshape(3 * channels, channels)
+        q = torch.addmm(self.to_qkv.bias[:channels], normed_rows, w_qkv[:channels].t()).view(
+            frames, 1, positions, channels
+        )
+        all_rows = self.shard.gather_rows(normed_rows)
+        kv = torch.addmm(self.to_qkv.bias[channels:], all_rows, w_qkv[channels:].t())
+        if self.shard.uneven:
+            # Rank-major rows of unequal counts: per rank [T, P_r, 2C], joined along P.
+            counts = self.shard.row_counts(normed_rows.shape[0])
+            per_rank = [
+                part.view(frames, n // frames, 2 * channels)
+                for part, n in zip(kv.split(counts), counts)
+            ]
+            kv = torch.cat(per_rank, dim=1).unsqueeze(1)
+        else:
+            # Rank-major rows [W, T, P, 2C] repacked into per-frame sequences [T, W * P, 2C]:
+            # for T > 1 and W > 1 the reshape is a copy of K and V.
+            kv = kv.view(self.shard.world_size, frames, positions, 2 * channels)
+            kv = kv.permute(1, 0, 2, 3).reshape(frames, 1, -1, 2 * channels)
+        k, v = kv.chunk(2, dim=-1)
+        return q, k, v
+
+
+def _run_resnets(
+    resnets: nn.ModuleList,
+    x: "torch.Tensor | DeferredSum",
+    feat_cache: list[CacheEntry] | None,
+    feat_idx: list[int] | None,
+    *,
+    defer_last_bias: bool,
+    defer_first_bias: bool = True,
+) -> tuple["torch.Tensor | DeferredSum", torch.Tensor]:
+    """Run a chain of residual blocks; returns ``(output, materialized input)``.
+
+    The first block consumes a DeferredSum input inside its norm kernel and hands back
+    the sum, so the caller gets the block input without a separate add. Every block
+    but the last defers its conv2 bias to the next block's norm; the last one does so
+    only when ``defer_last_bias`` (its consumer is a fused norm)."""
+    last = len(resnets) - 1
+    entry: torch.Tensor | None = None
+    for i, resnet in enumerate(resnets):
+        defer = (defer_last_bias if i == last else True) and (defer_first_bias or i > 0)
+        if i == 0:
+            x, entry = resnet(
+                x,
+                feat_cache=feat_cache,
+                feat_idx=feat_idx,
+                defer_output_bias=defer,
+                return_input=True,
+            )
+        else:
+            x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=defer)
+    assert entry is not None
+    return x, entry
+
+
+class WinoVaeMidBlock(WanMidBlock):
+    _resblock_cls = WinoVaeResidualBlock
+    _attention_cls = WinoVaeAttentionBlock
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+    ) -> torch.Tensor:
+        # The fused attention block returns its residual add as a DeferredSum for the next
+        # norm; the plain one needs a materialized tensor.
+        x = self.resnets[0](x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=False)
+        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+            x = attn(x)
+            x = resnet(x, feat_cache=feat_cache, feat_idx=feat_idx, defer_output_bias=True)
+        return x
+
+
+class WinoVaeResidualDownBlock(WanResidualDownBlock):
+    _resblock_cls = WinoVaeResidualBlock
+    _resample_cls = WinoVaeResample
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        if self.downsampler is not None:
+            self.downsampler.defer_bias_to_consumer = True
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+    ) -> torch.Tensor:
+        # The last block feeds the downsampler or the shortcut add, never a norm.
+        x, residual = _run_resnets(self.resnets, x, feat_cache, feat_idx, defer_last_bias=False)
+        if self.downsampler is not None:
+            if isinstance(x, DeferredSum) and _can_fuse(x):
+                # One pass writes the downsampler's zero-padded input directly.
+                x = self.downsampler(materialize_padded_2d(x), feat_cache, feat_idx, prepadded=True)
+            else:
+                x = self.downsampler(materialize(x), feat_cache=feat_cache, feat_idx=feat_idx)
+        else:
+            x = materialize(x)
+        # The downsampler hands back its convs' bias when they ran without it.
+        bias = None
+        if isinstance(x, DeferredSum):
+            x, bias = x.source, x.bias
+        return self._add_shortcut(_channels_last_3d_if_needed(x), residual, bias)
+
+    def _add_shortcut(
+        self, x: torch.Tensor, residual: torch.Tensor, bias: torch.Tensor | None
+    ) -> torch.Tensor:
+        """``x (+ bias) + AvgDown3D(residual)``: one avg_down_add kernel pass (batch 1, kernels
+        available), else eager adds."""
+        dup = self.avg_shortcut
+        if not (kernels_available() and x.shape[0] == 1):
+            if bias is not None:
+                x = x + bias.view(1, -1, 1, 1, 1)
+            return _channels_last_3d_if_needed(x + dup(residual))
+        from .kernels.frame_ops import avg_down_add
+
+        residual = _channels_last_3d_if_needed(residual)
+        pad_t = (dup.factor_t - residual.shape[2] % dup.factor_t) % dup.factor_t
+        h_out, w_out = x.shape[-2:]
+        y = avg_down_add(
+            frames_view(x),
+            frames_view(residual),
+            h_out,
+            w_out,
+            residual.shape[-1],
+            dup.factor_t,
+            dup.factor_s,
+            dup.group_size,
+            pad_t,
+            bias,
+        )
+        return frames_to_video(y, h_out, w_out)
+
+
+def _conv_in(
+    conv: WinoVaeCausalConv3d,
+    x: torch.Tensor,
+    feat_cache: list[CacheEntry] | None,
+    feat_idx: list[int] | None,
+) -> DeferredSum:
+    """The model's first conv, its bias left for the next norm kernel to add while reading."""
+    conv.defer_bias = True
+    if feat_cache is not None:
+        x = _causal_conv_with_cache(conv, x, feat_cache, feat_idx)
+    else:
+        x = conv(x)
+    return DeferredSum(x, bias=conv.bias)
+
+
+def _norm_silu_conv(
+    norm: WinoVaeRMSNorm,
+    conv: WinoVaeCausalConv3d,
+    x: "torch.Tensor | DeferredSum",
+    feat_cache: list[CacheEntry] | None,
+    feat_idx: list[int] | None,
+) -> torch.Tensor:
+    """``conv(SiLU(norm(x)))`` with the causal cache: the norm kernel writes straight into the
+    conv's frame buffer where it can, else the eager norm and conv."""
+    frames = x.shape[2]
+    if (
+        kernels_available()
+        and feat_cache is not None
+        and conv.buffer_eligible(x)
+        and not (frames == 1 and feat_cache[feat_idx[0]] is None)
+    ):
+        _norm_into_buffer(norm, conv, x, feat_cache, feat_idx, tuple(x.shape[-2:]))
+        return conv.buffer_conv(frames)
+    x = norm.norm_silu(x)
+    if feat_cache is not None:
+        x = _causal_conv_with_cache(conv, x, feat_cache, feat_idx)
+    else:
+        x = conv(x)
+    return _channels_last_3d_if_needed(x)
+
+
+class WinoVaeEncoder3d(WanEncoder3d):
+    _conv_cls = WinoVaeCausalConv3d
+    _down_block_cls = WinoVaeResidualDownBlock
+    _resblock_cls = WinoVaeResidualBlock
+    _resample_cls = WinoVaeResample
+    _mid_block_cls = WinoVaeMidBlock
+    _norm_cls = WinoVaeRMSNorm
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Temporary folded-tail submodule for one encode; assigned by WinoVae._encode_impl and
+        # cleared in its finally. It contributes no state-dict entries after that encode returns.
+        self.conv_out_override: WinoVaeCausalConv3d | None = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+    ) -> torch.Tensor:
+        if feat_cache is not None and feat_idx is None:
+            raise ValueError("feat_idx is required when feat_cache is provided")
+
+        x = _conv_in(self.conv_in, x, feat_cache, feat_idx)
+
+        for layer in self.down_blocks:
+            if not isinstance(layer, (WinoVaeResidualBlock, WinoVaeResidualDownBlock)):
+                x = materialize(x)
+            if feat_cache is not None:
+                x = layer(x, feat_cache=feat_cache, feat_idx=feat_idx)
+            else:
+                x = layer(x)
+
+        x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        conv_out = self.conv_out_override or self.conv_out
+        return _norm_silu_conv(self.norm_out, conv_out, x, feat_cache, feat_idx)
+
+
+class WinoVaeResidualUpBlock(WanResidualUpBlock):
+    _resblock_cls = WinoVaeResidualBlock
+    _resample_cls = WinoVaeResample
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+        first_chunk: bool = False,
+    ) -> torch.Tensor:
+        # With an upsampler the last block feeds a conv, so its bias stays in eager; the
+        # final up block (no upsampler) hands its output to norm_out.
+        x, residual = _run_resnets(
+            self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsampler is None
+        )
+        if self.upsampler is not None:
+            fuse_shortcut = self.avg_shortcut is not None
+            # The upsampler adds x up itself (into its time conv's frame buffer where it can).
+            x = self.upsampler(
+                x,
+                feat_cache=feat_cache,
+                feat_idx=feat_idx,
+                shortcut=(residual, self.avg_shortcut, first_chunk) if fuse_shortcut else None,
+            )
+            if fuse_shortcut:
+                return x
+        if self.avg_shortcut is not None:
+            x = materialize(x) + self.avg_shortcut(residual, first_chunk=first_chunk)
+        return x if isinstance(x, DeferredSum) else _channels_last_3d_if_needed(x)
+
+
+class WinoVaeUpBlock(WanUpBlock):
+    _resblock_cls = WinoVaeResidualBlock
+    _resample_cls = WinoVaeResample
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+        first_chunk: bool | None = None,
+    ) -> torch.Tensor:
+        del first_chunk
+        x, _ = _run_resnets(
+            self.resnets, x, feat_cache, feat_idx, defer_last_bias=self.upsamplers is None
+        )
+        if self.upsamplers is not None:
+            x = self.upsamplers[0](x, feat_cache=feat_cache, feat_idx=feat_idx)
+        return x if isinstance(x, DeferredSum) else _channels_last_3d_if_needed(x)
+
+
+class WinoVaeDecoder3d(WanDecoder3d):
+    _conv_cls = WinoVaeCausalConv3d
+    _mid_block_cls = WinoVaeMidBlock
+    _res_up_block_cls = WinoVaeResidualUpBlock
+    _up_block_cls = WinoVaeUpBlock
+    _norm_cls = WinoVaeRMSNorm
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        feat_cache: list[CacheEntry] | None = None,
+        feat_idx: list[int] | None = None,
+        first_chunk: bool = False,
+    ) -> torch.Tensor:
+        if feat_cache is not None and feat_idx is None:
+            raise ValueError("feat_idx is required when feat_cache is provided")
+
+        x = _conv_in(self.conv_in, x, feat_cache, feat_idx)
+
+        x = self.mid_block(x, feat_cache=feat_cache, feat_idx=feat_idx)
+        for up_block in self.up_blocks:
+            x = up_block(x, feat_cache=feat_cache, feat_idx=feat_idx, first_chunk=first_chunk)
+
+        return _norm_silu_conv(self.norm_out, self.conv_out, x, feat_cache, feat_idx)
+
+
+class LazyDiagonalGaussianDistribution(DiagonalGaussianDistribution):
+    """``DiagonalGaussianDistribution`` whose ``std``/``var``/clamped ``logvar`` are computed
+    on first use: ``mode()`` launches nothing beyond the view split."""
+
+    def __init__(self, parameters: torch.Tensor, deterministic: bool = False) -> None:
+        self.parameters = parameters
+        self.mean, self._logvar_raw = torch.chunk(parameters, 2, dim=1)
+        self.deterministic = deterministic
+        self._logvar: torch.Tensor | None = None
+        self._std: torch.Tensor | None = None
+        self._var: torch.Tensor | None = None
+
+    @property
+    def logvar(self) -> torch.Tensor:
+        if self._logvar is None:
+            self._logvar = torch.clamp(self._logvar_raw, -30.0, 20.0)
+        return self._logvar
+
+    @property
+    def std(self) -> torch.Tensor:
+        if self._std is None:
+            self._std = (
+                torch.zeros_like(self.mean) if self.deterministic else torch.exp(0.5 * self.logvar)
+            )
+        return self._std
+
+    @property
+    def var(self) -> torch.Tensor:
+        if self._var is None:
+            self._var = (
+                torch.zeros_like(self.mean) if self.deterministic else torch.exp(self.logvar)
+            )
+        return self._var
+
+
+class WinoVae(WanVAE):
+    """Optimized Wan VAE; state-dict compatible with ``WanVAE`` and ``AutoencoderKLWan``.
+
+    The model and its inputs must be bf16 on CUDA (the fused kernels read and write bf16;
+    ``encode`` / ``decode`` raise ``TypeError`` otherwise).
+
+    Beyond the ``AutoencoderKLWan`` interface: ``encode_mode(x)`` returns the posterior mean
+    directly, and ``fold_latent_affine(mean, std)`` folds the
+    latent de-normalization into ``post_quant_conv`` so ``decode`` takes the model's raw
+    latents.
+    """
+
+    _encoder_cls = WinoVaeEncoder3d
+    _decoder_cls = WinoVaeDecoder3d
+    _conv_cls = WinoVaeCausalConv3d
+    # Spatial sharding (set_shard); a class default so the base constructor's clear_cache sees it.
+    shard: Shard | None = None
+
+    def __init__(
+        self,
+        config: WanVAEConfig | dict[str, Any] | None = None,
+        options: WinoVaeOptions | dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(config)
+        if options is None:
+            options = WinoVaeOptions()
+        if isinstance(options, dict):
+            options = WinoVaeOptions.from_dict(options)
+        self.options = options
+        time_stages = sum(bool(s) for s in self.config.temperal_downsample)
+        if (
+            self.config.scale_factor_temporal is not None
+            and self.config.scale_factor_temporal != 2**time_stages
+        ):
+            raise ValueError(
+                f"scale_factor_temporal={self.config.scale_factor_temporal} does not match "
+                f"temperal_downsample={self.config.temperal_downsample}, which compresses time "
+                f"by {2**time_stages}."
+            )
+        self.decoder.conv_out.max_in_frames = _CONV_OUT_MAX_IN_FRAMES
+        for module in self.modules():
+            if isinstance(module, WinoVaeCausalConv3d):
+                module.frame_buffer.chunks = options.frame_buffer_chunks
+        self._folded_tail: dict[int | None, tuple[tuple, WinoVaeCausalConv3d]] = {}
+        self._post_quant_folded: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _benchmark_convs(self, *, frames: int, encoder: bool) -> bool:
+        """cuDNN autotuning for the encoder and image decodes, except on a spatial shard, where the heuristics'
+        choice is the same in every process (autotuning could pick different engines per rank)."""
+        return self.shard is None and _benchmark_convs(encoder=encoder, frames=frames)
+
+    def set_shard(self, shard: Shard | None) -> None:
+        """Run on one spatial slice of the frames, exchanging border lines with the
+        neighbouring ranks (see :mod:`wino_vae_shard`); ``None`` returns to whole frames. The
+        caller passes this rank's slice of the latents / pixels along the shard's axis and
+        gathers the outputs. Requires the CuTe DSL kernels."""
+        if shard is not None and not kernels_available():
+            raise ValueError("a spatially sharded WinoVae needs the CuTe DSL kernels")
+        self.shard = shard
+        for module in self.modules():
+            if isinstance(
+                module,
+                (WinoVaeCausalConv3d, WinoVaeRMSNorm, WinoVaeResample, WinoVaeAttentionBlock),
+            ):
+                module.shard = shard
+        self._folded_tail.clear()
+
+    def set_pdl(self, enabled: bool) -> None:
+        """Launch the kernels that support it with programmatic dependent launch (their
+        prologue overlaps the previous kernel's tail), or without it. A compile-time choice per
+        kernel: switching compiles the other variant on its next use."""
+        for module in self.modules():
+            if isinstance(module, WinoVaeCausalConv3d):
+                module.pdl = enabled
+
+    def clear_cache(self) -> None:
+        if self.shard is not None:
+            self.shard.begin_call()
+        super().clear_cache()
+
+    def _check_dtype(self, x: torch.Tensor) -> None:
+        """The kernels read and write bf16 CUDA tensors."""
+        if not x.is_cuda or x.dtype is not torch.bfloat16 or self.dtype is not torch.bfloat16:
+            raise TypeError(
+                "WinoVae needs bf16 CUDA inputs and weights; got input "
+                f"{x.dtype} on {x.device} and weights {self.dtype}"
+            )
+
+    def _encode(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
+        self._check_dtype(x)
+        prev_benchmark = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.benchmark = self._benchmark_convs(encoder=True, frames=x.shape[2])
+        try:
+            return self._encode_impl(x, mode_only=mode_only)
+        finally:
+            torch.backends.cudnn.benchmark = prev_benchmark
+
+    def _folded_tail_conv(self, rows: int | None) -> WinoVaeCausalConv3d:
+        """conv_out with quant_conv folded in: ``W' = Q A``, ``b' = Q a + q`` (composed in
+        fp32, rounded once to the model dtype); ``rows`` keeps only the first output
+        channels (the posterior mean) or all of them."""
+        conv_out, quant = self.encoder.conv_out, self.quant_conv
+        key = (_stamp(conv_out.weight, conv_out.bias, quant.weight, quant.bias), rows)
+        cached = self._folded_tail.get(rows)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        # Built outside inference mode even when called from it: the folded conv's weight
+        # caches key on the tensor version counter, which inference tensors do not carry.
+        with torch.inference_mode(False), torch.no_grad():
+            folded = self._build_folded_tail(conv_out, quant, rows)
+        self._folded_tail[rows] = (key, folded)
+        return folded
+
+    @staticmethod
+    def _build_folded_tail(
+        conv_out: WinoVaeCausalConv3d, quant: WinoVaeCausalConv3d, rows: int | None
+    ) -> WinoVaeCausalConv3d:
+        q = quant.weight.detach().float().flatten(1)  # [2z, 2z]
+        qb = quant.bias.detach().float() if quant.bias is not None else torch.zeros_like(q[:, 0])
+        a = conv_out.weight.detach().float()  # [2z, Cin, 3, 3, 3]
+        ab = (
+            conv_out.bias.detach().float()
+            if conv_out.bias is not None
+            else torch.zeros_like(q[:, 0])
+        )
+        if rows is not None:
+            q, qb = q[:rows], qb[:rows]
+        w = torch.einsum("om,mikhw->oikhw", q, a)
+        b = q @ ab + qb
+        folded = WinoVaeCausalConv3d(
+            conv_out.in_channels, w.shape[0], conv_out.kernel_size, padding=conv_out.padding[1]
+        ).to(device=a.device, dtype=conv_out.weight.dtype)
+        folded.weight.copy_(w)
+        folded.bias.copy_(b)
+        # The model's conv weights are channels-last (WanVAE builds them so); a default-layout
+        # weight would be converted by every conv call.
+        _to_channels_last(folded)
+        folded.weight.requires_grad_(False)
+        folded.bias.requires_grad_(False)
+        folded.max_in_frames = conv_out.max_in_frames
+        folded.frame_buffer.chunks = conv_out.frame_buffer.chunks
+        folded.shard = conv_out.shard
+        return folded
+
+    def _video_for(self, chunk: torch.Tensor, latent_frames: int) -> torch.Tensor:
+        """The uninitialized channels-last output video ``[1, C, T, H, W]`` of a decode of
+        ``latent_frames`` latents, shaped from its first decoded (patchified) chunk."""
+        patch = self.config.patch_size
+        frames = (latent_frames - 1) * self.config.scale_factor_temporal + 1
+        return torch.empty(
+            (
+                1,
+                chunk.shape[1] // (patch * patch),
+                frames,
+                chunk.shape[3] * patch,
+                chunk.shape[4] * patch,
+            ),
+            dtype=chunk.dtype,
+            device=chunk.device,
+            memory_format=torch.channels_last_3d,
+        )
+
+    def _encode_impl(self, x: torch.Tensor, *, mode_only: bool = False) -> torch.Tensor:
+        _, _, num_frame, _, _ = x.shape
+
+        self.clear_cache()
+        if self.config.patch_size is not None:
+            x = _patchify_channels_last(x, self.config.patch_size)
+        x = _channels_last_3d_if_needed(x)
+
+        self.encoder.conv_out_override = self._folded_tail_conv(self.z_dim if mode_only else None)
+        # The first pass is one frame; every later pass is a multiple of four frames so the
+        # stride-2 temporal downsamplers see chunk boundaries at the same parity each time.
+        step = self.options.encoder_chunk_frames
+        bounds = [(0, 1)] + [
+            (start, min(start + step, num_frame)) for start in range(1, num_frame, step)
+        ]
+        out_chunks: list[torch.Tensor] = []
+        try:
+            for start, end in bounds:
+                self._enc_conv_idx = [0]
+                out_chunks.append(
+                    self.encoder(
+                        x[:, :, start:end, :, :],
+                        feat_cache=self._enc_feat_map,
+                        feat_idx=self._enc_conv_idx,
+                    )
+                )
+        finally:
+            self.encoder.conv_out_override = None
+
+        if len(out_chunks) == 1:
+            out = out_chunks[0]
+        else:
+            out = torch.cat(out_chunks, dim=2)
+
+        enc = _channels_last_3d_if_needed(out)
+        self.clear_cache()
+        return enc
+
+    def encode(
+        self,
+        x: torch.Tensor,
+        return_dict: bool = True,
+    ) -> AutoencoderKLOutput | tuple[DiagonalGaussianDistribution]:
+        h = self._encode(x)
+        posterior = LazyDiagonalGaussianDistribution(h)
+        if not return_dict:
+            return (posterior,)
+        return AutoencoderKLOutput(latent_dist=posterior)
+
+    def encode_mode(self, x: torch.Tensor) -> torch.Tensor:
+        """The posterior mean ``[B, z, T', H', W']`` of ``x`` without computing the
+        log-variance half (the same values as ``encode(x).latent_dist.mode()``)."""
+        return self._encode(x, mode_only=True)
+
+    def _decode(
+        self,
+        z: torch.Tensor,
+        return_dict: bool = True,
+        *,
+        temporal_chunk_size: int = 1,
+    ) -> DecoderOutput | tuple[torch.Tensor]:
+        self._check_dtype(z)
+        _, _, num_frame, _, _ = z.shape
+
+        self.clear_cache()
+        prev_benchmark = torch.backends.cudnn.benchmark
+        torch.backends.cudnn.benchmark = self._benchmark_convs(encoder=False, frames=num_frame)
+        try:
+            return self._decode_impl(z, return_dict, temporal_chunk_size)
+        finally:
+            torch.backends.cudnn.benchmark = prev_benchmark
+
+    def _assemble_video(self, chunks: list[torch.Tensor]) -> torch.Tensor:
+        """The eager path's video from its decoded chunks: concatenated along time,
+        unpatchified, channels-last, clamped to [-1, 1]."""
+        out = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=2)
+        if self.config.patch_size is not None:
+            out = unpatchify(out, patch_size=self.config.patch_size)
+        return torch.clamp(_channels_last_3d_if_needed(out), min=-1.0, max=1.0)
+
+    def fold_latent_affine(self, latents_mean: torch.Tensor, latents_std: torch.Tensor) -> None:
+        """Fold the latent de-normalization into ``decode``: ``latents_mean`` and
+        ``latents_std`` are per-channel (``z_dim`` elements each); afterwards ``decode(z)``
+        behaves as ``decode(std * z + mean)`` until ``clear_latent_affine``. The registered
+        weights are unchanged (the folded tensors are plain attributes, not buffers), so call
+        this after loading, moving or casting the weights, and again after any such change."""
+        # P' = P diag(std), b' = P mean + b, composed in fp32 and rounded once to the weight dtype.
+        conv = self.post_quant_conv
+        with torch.inference_mode(False), torch.no_grad():
+            w = conv.weight.detach().float()  # [z, z, 1, 1, 1]
+            z = w.shape[0]
+            mean = latents_mean.detach().to(w.device, torch.float32).reshape(z)
+            std = latents_std.detach().to(w.device, torch.float32).reshape(z)
+            b = (
+                conv.bias.detach().float()
+                if conv.bias is not None
+                else torch.zeros(z, device=w.device)
+            )
+            folded_w = (w * std.view(1, z, 1, 1, 1)).to(conv.weight.dtype)
+            folded_b = (w.view(z, z) @ mean + b).to(conv.weight.dtype)
+        self._post_quant_folded = (folded_w, folded_b)
+
+    def clear_latent_affine(self) -> None:
+        self._post_quant_folded = None
+
+    def _post_quant(self, z: torch.Tensor) -> torch.Tensor:
+        if self._post_quant_folded is None:
+            return self.post_quant_conv(z)
+        w, b = self._post_quant_folded
+        return _channels_last_3d_if_needed(F.conv3d(z, w, b))
+
+    def _use_fused_output(self, x: torch.Tensor) -> bool:
+        return self.config.patch_size is not None and x.shape[0] == 1 and kernels_available()
+
+    def _decode_impl(
+        self, z: torch.Tensor, return_dict: bool, temporal_chunk_size: int
+    ) -> DecoderOutput | tuple[torch.Tensor]:
+        _, _, num_frame, _, _ = z.shape
+        z = _channels_last_3d_if_needed(z)
+        x = self._post_quant(z)
+        fused = self._use_fused_output(x)
+        out: torch.Tensor | None = None
+        frames_done = 0
+        out_chunks: list[torch.Tensor] = []
+        for index, frame_slice in enumerate(_decode_chunk_slices(num_frame, temporal_chunk_size)):
+            self._conv_idx = [0]
+            out_chunk = self.decoder(
+                x[:, :, frame_slice, :, :],
+                feat_cache=self._feat_map,
+                feat_idx=self._conv_idx,
+                first_chunk=index == 0,
+            )
+            if fused:
+                # Unpatchify + clamp of this chunk straight into the preallocated video.
+                out_chunk = _channels_last_3d_if_needed(out_chunk)
+                if out is None:
+                    out = self._video_for(out_chunk, num_frame)
+                from .kernels.frame_ops import unpatchify_clamp_into
+
+                unpatchify_clamp_into(out_chunk, out, frames_done, self.config.patch_size)
+                frames_done += out_chunk.shape[2]
+            else:
+                out_chunks.append(out_chunk)
+
+        if fused:
+            assert out is not None
+            if frames_done != out.shape[2]:
+                raise RuntimeError(
+                    f"decoder produced {frames_done} frames for a {out.shape[2]}-frame output"
+                )
+        else:
+            out = self._assemble_video(out_chunks)
+
+        self.clear_cache()
+        if not return_dict:
+            return (out,)
+        return DecoderOutput(sample=out)
