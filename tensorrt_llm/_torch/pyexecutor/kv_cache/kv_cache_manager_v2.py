@@ -4770,6 +4770,7 @@ class KVCacheManagerV2(BaseResourceManager):
             and self.mapping.cp_size == 1
             and not self.kv_compression_manages_history
             and self.sparse_metadata_batch is None
+            and self.mixed_precision_low_dtype is None
             and all(window is None for window in self.max_attention_window_vec)
         )
 
@@ -5492,7 +5493,12 @@ class KVCacheManagerV2(BaseResourceManager):
             else None
         )
         history = reservation.end if reservation is not None else None
-        success = (
+        # External page-index spans are fixed at construction. Refuse growth
+        # beyond their aligned ledger width before the native resize mutates KV.
+        required_blocks = (
+            capacity + self._ledger_tokens_per_block - 1
+        ) // self._ledger_tokens_per_block
+        success = required_blocks <= self.max_blocks_per_seq and (
             kv_cache.resize(capacity, history) if history is not None else kv_cache.resize(capacity)
         )
         if not success:
