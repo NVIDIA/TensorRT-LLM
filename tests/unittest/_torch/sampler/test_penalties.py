@@ -19,7 +19,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.pyexecutor.sampler.ops.vanilla import Fusions
-from tensorrt_llm._torch.pyexecutor.sampler.penalties import PenaltyHandler
+from tensorrt_llm._torch.pyexecutor.sampler.penalties import (
+    PenaltyHandler,
+    PenaltyState,
+    _unpack_prompt_mask,
+    seed_prompt,
+)
 
 apply_batched_occurrence_penalties = Fusions.apply_batched_occurrence_penalties
 update_occurrence_workspace = Fusions.update_occurrence_workspace
@@ -486,6 +491,60 @@ def test_regular_handler_slot_reuse_does_not_leak_penalties() -> None:
         torch.ones(1, 1, device="cuda"),
     )
     torch.testing.assert_close(logits, expected, rtol=1e-4, atol=1e-4)
+
+
+def test_initialize_workspace_drops_out_of_vocab_prompt_ids_without_sync() -> None:
+    vocab = 16
+    slot = 1
+    handler = PenaltyHandler(max_num_sequences=2, max_beam_width=1, device="cuda")
+    # -1, 16 and 20 stand for multimodal placeholder ids outside the vocab.
+    prompt = [3, -1, 7, 3, 16, 5, 5, 20]
+    request = _make_handler_request(slot=slot, tokens=prompt, prompt_ignore_length=4)
+    _admit(handler, request, slot)
+    handler.store.ensure_workspace(vocab_size=vocab, needs_prefix=True)
+    state = handler._slots[slot]
+    assert state is not None
+
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        handler._initialize_workspace(request, state, vocab)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    expected_counts = torch.zeros(2, vocab, dtype=torch.int32, device="cuda")
+    expected_counts[slot, 5] = 2
+    expected_prefix = torch.zeros(2, vocab, dtype=torch.bool, device="cuda")
+    expected_prefix[slot, [3, 7]] = True
+    torch.testing.assert_close(handler.store.counts_cuda, expected_counts, rtol=0, atol=0)
+    torch.testing.assert_close(handler.store.presence_prefix_cuda, expected_prefix, rtol=0, atol=0)
+
+
+def test_seed_prompt_drops_out_of_vocab_prompt_ids_without_sync() -> None:
+    vocab = 70
+    slot = 1
+    state = PenaltyState.create(slot_capacity=2, vocab_size=vocab, device="cuda")
+    spec_metadata = SimpleNamespace(enable_penalty=True, vocab_size=vocab, penalty_state=state)
+    # The ignored prefix repeats ids and spans two 32-id words; -1 and 70 are out of the vocab.
+    prompt_tokens = torch.tensor([0, 31, 31, -1, 33, 69, 70, 5, 5, 40, -1], dtype=torch.int32)
+
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        seed_prompt(spec_metadata, slot, prompt_tokens, prompt_ignore_length=7)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+    expected_prompt_mask = torch.zeros(3, vocab, dtype=torch.bool, device="cuda")
+    expected_prompt_mask[slot, [0, 31, 33, 69]] = True
+    expected_counts = torch.zeros(3, vocab, dtype=torch.int32, device="cuda")
+    expected_counts[slot, 5] = 2
+    expected_counts[slot, 40] = 1
+    rows = torch.arange(3, device="cuda")
+    torch.testing.assert_close(
+        _unpack_prompt_mask(state.prompt_mask, rows, vocab), expected_prompt_mask, rtol=0, atol=0
+    )
+    torch.testing.assert_close(state.counts, expected_counts, rtol=0, atol=0)
 
 
 BEAM_PAD = -1
