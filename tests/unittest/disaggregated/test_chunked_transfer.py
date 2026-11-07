@@ -48,6 +48,15 @@ pytestmark = pytest.mark.cpu_only
 # ---------------------------------------------------------------------------
 
 
+_KV_RESULT_REPORT_TOKEN = b"report-token-123"
+
+
+def _publish_report_tokens(session, ranks=range(16)):
+    """Publish the per-writer report tokens that Receiver.dispatch_task mints."""
+    for task in getattr(session, "_kv_tasks", []):
+        task._kv_result_report_tokens = {int(r): _KV_RESULT_REPORT_TOKEN for r in ranks}
+
+
 def _make_params(rid: int = 42) -> DisaggregatedParams:
     return DisaggregatedParams(disagg_request_id=rid)
 
@@ -326,13 +335,14 @@ def test_process_kv_agent_result_resolves_task_by_receiver_slice_id():
     """The receiver resolves the task using its own slice id."""
     session = _make_rx_session(1)
     session._kv_tasks[0].expected_transfers = 1
-    session._receiver._bounce.is_bounced.return_value = False
+    _publish_report_tokens(session)
 
     session.process_kv_agent_result(
         peer_rank=0,
         receiver_slice_id=0,
         is_last_slice=True,
         status=AgentResult.SUCCESS,
+        kv_result_report_token=_KV_RESULT_REPORT_TOKEN,
     )
 
     assert session._kv_tasks[0].status == TaskStatus.TRANSFERRED
@@ -342,7 +352,7 @@ def test_process_kv_agent_result_rejects_unknown_receiver_slice_id():
     """Indexing is bounded by the receiver's own task count."""
     session = _make_rx_session(1)
 
-    with pytest.raises(AssertionError, match=r"receiver_slice_id=2"):
+    with pytest.raises(ValueError, match=r"receiver_slice_id=2"):
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=2,
@@ -454,6 +464,7 @@ def _make_respond_transceiver(session, chunk, *, pipelined=True):
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     transceiver = object.__new__(KvCacheTransceiverV2)
+    session._enforce_physical_ownership = False
     # A send session appends one task per chunk and the caller reads the new one back by
     # position, so a double whose send() leaves the list empty has nothing at that position.
     session.kv_tasks = []
@@ -496,31 +507,11 @@ def test_pipelined_transfer_allows_pipeline_parallelism_at_initialization():
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
 
 
-def test_pipelined_transfer_rejects_bounce_buffer():
-    """The Python bounce buffer stages whole requests rather than individual chunks."""
-    from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
+def test_pipelined_transfer_allows_bounce_buffer():
+    """The transfer-agent bounce buffer is compatible with per-chunk pipelined transfer.
 
-    transceiver = object.__new__(KvCacheTransceiverV2)
-    transceiver._mapping = SimpleNamespace(pp_size=1, cp_size=1)
-    transceiver._kv_cache_manager = MagicMock(enable_block_reuse=False)
-    cache_transceiver_config = CacheTransceiverConfig(
-        backend="NIXL",
-        enable_pipelined_transfer=True,
-        kv_cache_bounce_size_mb=1,
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="not supported with the Python bounce buffer \\(kv_cache_bounce_size_mb=1",
-    ):
-        KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
-
-
-def test_pipelined_transfer_allows_agent_bounce_buffer():
-    """The C++ transfer-agent bounce is compatible with per-chunk pipelined transfer.
-
-    It stages each transfer request on its own below the Python layer, so a pipelined
-    chunk is just another request.
+    The C++ agent stages each transfer request on its own below the Python layer, so a
+    pipelined chunk is just another request.
     """
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
@@ -531,7 +522,6 @@ def test_pipelined_transfer_allows_agent_bounce_buffer():
         backend="NIXL",
         enable_pipelined_transfer=True,
         kv_cache_bounce_size_mb=1,
-        agent_bounce_buffer_enable=True,
     )
 
     assert KvCacheTransceiverV2._resolve_pipelined_transfer(transceiver, cache_transceiver_config)
@@ -636,6 +626,7 @@ def test_pipelined_transfer_requires_gen_first_flow():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
@@ -686,6 +677,7 @@ def test_pipelined_transfer_rejects_pipeline_parallelism_for_context_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
     executor.dist.pp_size = 2
@@ -720,6 +712,7 @@ def test_pipelined_transfer_requires_single_beam_for_context_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
     executor.model_engine.attn_runtime_features.chunked_prefill = True
 
@@ -740,6 +733,7 @@ def test_pipelined_transfer_allows_non_disaggregated_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 1
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True
@@ -763,6 +757,7 @@ def test_pipelined_transfer_allows_generation_only_request():
     from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
 
     executor = MagicMock(_is_kv_manager_v2=True)
+    executor.model_engine._dspark_confidence_enabled = False
     executor.is_warmup = False
     executor.max_beam_width = 2
     executor.kv_cache_transceiver.pipeline_transfer_enabled = True

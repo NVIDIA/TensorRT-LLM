@@ -361,10 +361,22 @@ class GenerationResultBase:
                          sequence_index,
                          logprobs_result=None,
                          req_perf_metrics_dict: Optional[dict[str,
-                                                              float]] = None):
-        """Handle a single sequence in the response."""
+                                                              float]] = None,
+                         *,
+                         output_token_ids=None,
+                         request_perf_metrics=None):
+        """Handle a single sequence in the response.
+
+        ``output_token_ids`` and ``request_perf_metrics`` are the
+        corresponding ``response_tensors`` attributes, pre-read by the caller
+        so a per-beam loop does not re-read (and re-convert) them per beam.
+        """
         seq_idx = sequence_index
         src_idx = sequence_index if self.sampling_params.use_beam_search else 0
+        if output_token_ids is None:
+            output_token_ids = response_tensors.output_token_ids
+        if request_perf_metrics is None:
+            request_perf_metrics = response_tensors.request_perf_metrics
 
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
@@ -380,21 +392,26 @@ class GenerationResultBase:
             # Beam search enforces returning all generated tokens
             output.token_ids = [
                 *decoder_output_prefix,
-                *response_tensors.output_token_ids[src_idx],
+                *output_token_ids[src_idx],
             ]
         else:
             if decoder_output_prefix and not output.token_ids:
                 output.token_ids.extend(decoder_output_prefix)
-            output.token_ids.extend(response_tensors.output_token_ids[src_idx])
+            output.token_ids.extend(output_token_ids[src_idx])
 
-        if (cum_log_probs := response_tensors.cum_log_probs) is not None:
+        # Sampler logprobs belong to the Python result. Native results carry
+        # token/lifecycle metadata and can also reach this response handler.
+        has_sampler_outputs = not isinstance(response_tensors, tllm.Result)
+        if has_sampler_outputs and (cum_log_probs :=
+                                    response_tensors.cum_log_probs) is not None:
             output.cumulative_logprob = cum_log_probs[src_idx]
 
         # prompt logprobs handling
         if logprobs_result and logprobs_result.prompt is not None:
             output.prompt_logprobs = logprobs_result.prompt
         # Generation logprobs are computed by the sampler.
-        if (log_probs := response_tensors.log_probs) is not None:
+        if has_sampler_outputs and (log_probs :=
+                                    response_tensors.log_probs) is not None:
             # handle logprobs directly from response tensors given by sampler
             if decoder_output_prefix and self.sampling_params.use_beam_search:
                 output.logprobs = [
@@ -474,8 +491,7 @@ class GenerationResultBase:
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
 
-        if (request_perf_metrics :=
-                response_tensors.request_perf_metrics) is not None:
+        if request_perf_metrics is not None:
             output.request_perf_metrics = request_perf_metrics
             self._maybe_fill_spec_dec_perf_metrics(output.request_perf_metrics)
 
@@ -684,16 +700,30 @@ class GenerationResultBase:
                 )
 
             finish_reasons = response_result.finish_reasons
-            # output_token_ids = (beams, tokens)
+            # output_token_ids = (beams, tokens). Read the attribute once: on
+            # the C++-backed result every access converts the whole
+            # per-beam vector of vectors, which the per-beam loop below would
+            # otherwise repeat beam_width times.
+            output_token_ids = response_result.output_token_ids
+            request_perf_metrics = response_result.request_perf_metrics
             if self.sampling_params.use_beam_search:
-                for beam_idx, _ in enumerate(response_result.output_token_ids):
-                    self._handle_sequence(finish_reasons, response_result,
-                                          beam_idx, logprobs_result,
-                                          req_perf_metrics_dict)
+                for beam_idx in range(len(output_token_ids)):
+                    self._handle_sequence(
+                        finish_reasons,
+                        response_result,
+                        beam_idx,
+                        logprobs_result,
+                        req_perf_metrics_dict,
+                        output_token_ids=output_token_ids,
+                        request_perf_metrics=request_perf_metrics)
             else:
-                self._handle_sequence(finish_reasons, response_result,
+                self._handle_sequence(finish_reasons,
+                                      response_result,
                                       response_result.sequence_index,
-                                      logprobs_result, req_perf_metrics_dict)
+                                      logprobs_result,
+                                      req_perf_metrics_dict,
+                                      output_token_ids=output_token_ids,
+                                      request_perf_metrics=request_perf_metrics)
 
             # For context_only responses, carry the first gen token's
             # logprobs and generation logits so the generation_only side
@@ -1023,9 +1053,19 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 is not None) and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
-                if hasattr(
-                        self.tokenizer, 'decode_incrementally'
-                ) and self._streaming and not self.sampling_params.use_beam_search:
+                # A stop word matched by token id is trimmed from token_ids in
+                # _handle_sequence. If some of its ids came in earlier streamed
+                # responses, the incremental decoder has already turned them
+                # into text, or holds the lead bytes of a character that the
+                # final flush would emit as U+FFFD. Decode the kept ids afresh
+                # instead, as the non-streaming path does.
+                trimmed_streamed_ids = (len(beam_output.token_ids)
+                                        < beam_output._last_token_ids_len)
+                use_incremental = (self._streaming
+                                   and not self.sampling_params.use_beam_search
+                                   and not trimmed_streamed_ids and hasattr(
+                                       self.tokenizer, 'decode_incrementally'))
+                if use_incremental:
                     beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
                         beam_output.token_ids_diff,
                         prev_text=beam_output.text,
@@ -1036,6 +1076,13 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
+                    if trimmed_streamed_ids:
+                        # Drop the pending flush, and move the watermark to the
+                        # kept ids so that later responses for sibling
+                        # candidates (n > 1) do not decode this output again.
+                        beam_output._incremental_states = None
+                        beam_output._last_token_ids_len = len(
+                            beam_output.token_ids)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
