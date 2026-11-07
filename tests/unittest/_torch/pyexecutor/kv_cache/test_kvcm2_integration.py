@@ -853,6 +853,47 @@ def test_dflash_block_tables_with_fp8_target_and_bf16_draft() -> None:
         manager.shutdown()
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "layer_specs,kv_factor,index_scale,num_local_layers,expected_rows",
+    [
+        # Explicit layer specs read raw slot IDs.
+        pytest.param(["spec"], 2, 6, 3, [[2, 0, 5], [7, 0, 0], [0, 0, 0]], id="layer-specs"),
+        pytest.param(None, 1, 1, 2, [[1, 0, 2], [3, 0, 0], [0, 0, 0]], id="kv1-truncating"),
+        pytest.param(None, 1, 4, 2, [[4, 0, 10], [14, 0, 0], [0, 0, 0]], id="kv1-scaled"),
+        pytest.param(None, 2, 12, 2, [[6, 0, 15], [21, 0, 0], [0, 0, 0]], id="kv2-divisible"),
+        # A scale that kv_factor does not divide keeps the layer count out.
+        pytest.param(None, 2, 3, 4, [[2, 0, 5], [7, 0, 0], [0, 0, 0]], id="kv2-nondivisible"),
+    ],
+)
+def test_block_ids_per_seq_converts_and_masks_page_indices(
+    layer_specs, kv_factor, index_scale, num_local_layers, expected_rows
+) -> None:
+    """Block IDs apply the pool-0 conversion, zero BAD_PAGE_INDEX, and pad ragged rows."""
+
+    def cache(indices: list[int], num_blocks: int) -> SimpleNamespace:
+        padded = np.array(indices + [BAD_PAGE_INDEX] * (5 - len(indices)), dtype=np.int32)
+        padded.flags.writeable = False
+        return SimpleNamespace(num_blocks=num_blocks, get_base_page_indices=lambda _: padded)
+
+    manager = object.__new__(KVCacheManagerV2)
+    manager.layer_specs = layer_specs
+    manager.kv_factor = kv_factor
+    manager._index_scale_ints = [index_scale]
+    manager.num_local_layers = num_local_layers
+    manager.kv_cache_map = {
+        11: cache([2, BAD_PAGE_INDEX, 5], 3),
+        12: cache([7, BAD_PAGE_INDEX], 1),
+        13: cache([], 0),
+    }
+
+    block_ids = manager.get_block_ids_per_seq([11, 12, 13])
+
+    torch.testing.assert_close(
+        block_ids, torch.tensor(expected_rows, dtype=torch.int32), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("kv_cache_type", [CacheType.SELF, CacheType.SELFKONLY])
 def test_block_ids_per_seq_matches_batch_cache_indices(kv_cache_type: CacheType) -> None:
     if not torch.cuda.is_available():
