@@ -55,13 +55,13 @@ class OutputMode(enum.Enum):
 class ServingExtension:
     """Per-model serving behavior consulted by the OpenAI-compatible server.
 
-    Subclasses override the hooks they need; the defaults are no-ops that
-    match the generic serving path.
+    Subclasses override the hooks they need; the defaults match the generic
+    serving path.
     """
 
     # Part of the rendering fingerprint: bump it when a revision of the extension changes
     # the prompt it renders, so prepared requests from the older revision are refused.
-    render_version: int = 1
+    render_version: int = 2
 
     def render_prompt(
         self, request: "ChatCompletionRequest", res: Any = None
@@ -118,10 +118,33 @@ class ServingExtension:
     def apply_chat_extensions(self, request) -> None:
         """Preprocess a ``ChatCompletionRequest`` before template rendering.
 
-        Mutates ``request`` in place (typically deriving chat-template kwargs
-        from request-level fields). Called only for requests whose resolved
-        ``model_type`` this extension is registered for.
+        Mutates ``request`` in place, deriving chat-template kwargs from
+        request-level fields. The default passes a ``reasoning_effort`` the
+        client set to the renderer as ``chat_template_kwargs["reasoning_effort"]``,
+        the key chat templates and custom tokenizers read an effort from
+        (Responses and Messages pass theirs the same way). One already in
+        ``chat_template_kwargs`` wins; ``"none"``, which asks for no reasoning
+        rather than for a level, is not passed. An extension that maps the
+        field onto its model's own controls overrides this without calling it;
+        other overrides call it.
         """
+        # The field defaults to Harmony's LOW, so only an effort the client set counts.
+        if "reasoning_effort" not in request.model_fields_set:
+            return
+        effort = getattr(request.reasoning_effort, "value", request.reasoning_effort)
+        if not isinstance(effort, str):
+            return
+        # Harmony's ReasoningEffort values are capitalized; templates compare lower-case names.
+        effort = effort.lower()
+        kwargs = request.chat_template_kwargs or {}
+        if effort == "none" or "reasoning_effort" in kwargs:
+            return
+        request.chat_template_kwargs = {**kwargs, "reasoning_effort": effort}
+        # Derived from an API field, so the unused-kwargs guard must not reject it
+        # for a template that does not read it.
+        request.injected_chat_template_kwargs = sorted(
+            {*(request.injected_chat_template_kwargs or ()), "reasoning_effort"}
+        )
 
     def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
         """Return the required-tool policy; boolean permission selects template enforcement."""
