@@ -107,6 +107,21 @@ def _randomize_xielu(hf_model: HFApertusForCausalLM, generator: torch.Generator)
             param.data.copy_(values.to(param.device, param.dtype))
 
 
+def _randomize_norms(hf_model: HFApertusForCausalLM, generator: torch.Generator) -> None:
+    """Give every norm weight distinct values, so a skipped or swapped copy shows up."""
+    for layer in hf_model.model.layers:
+        for norm in (
+            layer.attention_layernorm,
+            layer.feedforward_layernorm,
+            layer.self_attn.q_norm,
+            layer.self_attn.k_norm,
+        ):
+            values = torch.empty(norm.weight.shape, dtype=torch.float32, device="cpu").uniform_(
+                0.5, 1.5, generator=generator
+            )
+            norm.weight.data.copy_(values.to(norm.weight.device, norm.weight.dtype))
+
+
 def _xielu_float64(x: torch.Tensor, a_p: float, a_n: float, beta: float, eps: float):
     xd = x.double()
     pos = a_p * xd * xd + beta * xd
@@ -210,7 +225,7 @@ class TestApertus(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("needs CUDA")
 
-    def _build_models(self, backend: str):
+    def _build_models(self, backend: str, randomize_norms: bool = False):
         torch.random.manual_seed(0)
         generator = torch.Generator().manual_seed(1234)
         config = ApertusConfig.from_dict(deepcopy(APERTUS_TINY_CONFIG))
@@ -220,6 +235,8 @@ class TestApertus(unittest.TestCase):
         with torch.device(device), default_dtype(dtype):
             hf_model = HFApertusForCausalLM(config).eval()
             _randomize_xielu(hf_model, generator)
+            if randomize_norms:
+                _randomize_norms(hf_model, generator)
 
             model_config = ModelConfig(pretrained_config=config, attn_backend=backend)
             model = ApertusForCausalLM(model_config).to(dtype).to(device)
@@ -254,7 +271,7 @@ class TestApertus(unittest.TestCase):
         self.assertIs(mlp.call_args.kwargs["lora_params"], lora_params)
 
     def test_weights_loaded(self):
-        _, hf_model, model = self._build_models("TRTLLM")
+        _, hf_model, model = self._build_models("TRTLLM", randomize_norms=True)
         for hf_layer, layer in zip(hf_model.model.layers, model.model.layers):
             act = layer.mlp.activation
             self.assertIsInstance(act, XIELU)
@@ -266,16 +283,22 @@ class TestApertus(unittest.TestCase):
                 places=5,
             )
             torch.testing.assert_close(
-                layer.attention_layernorm.weight, hf_layer.attention_layernorm.weight
+                layer.attention_layernorm.weight,
+                hf_layer.attention_layernorm.weight,
+                atol=0,
+                rtol=0,
             )
             torch.testing.assert_close(
-                layer.feedforward_layernorm.weight, hf_layer.feedforward_layernorm.weight
+                layer.feedforward_layernorm.weight,
+                hf_layer.feedforward_layernorm.weight,
+                atol=0,
+                rtol=0,
             )
             torch.testing.assert_close(
-                layer.self_attn.q_norm.weight, hf_layer.self_attn.q_norm.weight
+                layer.self_attn.q_norm.weight, hf_layer.self_attn.q_norm.weight, atol=0, rtol=0
             )
             torch.testing.assert_close(
-                layer.self_attn.k_norm.weight, hf_layer.self_attn.k_norm.weight
+                layer.self_attn.k_norm.weight, hf_layer.self_attn.k_norm.weight, atol=0, rtol=0
             )
 
     @parameterized.expand(
