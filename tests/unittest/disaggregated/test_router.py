@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import copy
+import math
 import os
 import random
 import threading
@@ -2132,6 +2133,91 @@ def test_conversation_router_rejects_a_negative_min_match():
         ConversationRouter(server_role=None,
                            servers=["s"],
                            new_conversation_min_match_blocks=-1)
+
+
+@pytest.mark.parametrize("factor", [-1.0, float("nan")])
+def test_conversation_router_rejects_an_invalid_follow_load_factor(factor):
+    with pytest.raises(ValueError):
+        ConversationRouter(server_role=None,
+                           servers=["s"],
+                           new_conversation_follow_load_factor=factor)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("factor", "follows"), [(1.0, False), (2.0, True),
+                                                 (float("inf"), True)])
+async def test_conversation_router_follow_load_factor(factor, follows):
+    """A match is followed only within ``factor * matched tokens`` of backlog.
+
+    The backlog is the uncached prompt tokens in flight: a new unmatched
+    conversation counts its prompt, a follower its unmatched tail, and a
+    pinned conversation the growth of its prompt (at least one block).
+    """
+    router = create_router(
+        RouterConfig(
+            type="conversation",
+            args={
+                **_NEW_CONV_ARGS, "new_conversation_follow_load_factor": factor
+            }), ["server1", "server2"])
+    sibling_a = _conv_token_request("t::sa:a", _SHARED_PREFIX + [1] * 40)
+    server_a, _ = await router.get_next_server(sibling_a)
+    other = _conv_token_request("t2", list(range(5000, 5016)))
+    server_other, _ = await router.get_next_server(other)
+    assert server_other != server_a
+    assert router._get_server_load(server_a) == 296
+    assert router._get_server_load(server_other) == 16
+
+    # Backlog gap 280 vs 256 matched tokens.
+    sibling_b = _conv_token_request("t::sa:b", _SHARED_PREFIX + [2] * 40)
+    server_b, _ = await router.get_next_server(sibling_b)
+    assert (server_b == server_a) is follows
+    if follows:
+        assert router._get_server_load(server_a) == 296 + 40
+    else:
+        assert router._get_server_load(server_other) == 16 + 296
+
+    grown = _conv_token_request("t2", list(range(5000, 5040)))
+    tiny_growth = _conv_token_request("t2", list(range(5000, 5045)))
+    before = router._get_server_load(server_other)
+    await router.get_next_server(grown)
+    assert router._get_server_load(server_other) == before + 24
+    await router.get_next_server(tiny_growth)
+    assert router._get_server_load(server_other) == before + 24 + 16
+
+    for request in (sibling_a, other, sibling_b, grown, tiny_growth):
+        await router.finish_request(request)
+    assert sum(router._server_content_load.values()) == 0
+
+
+@pytest.mark.asyncio
+async def test_conversation_router_by_key_counts_backlog_tokens():
+    """Coordinator path: keys carry token counts, load is the backlog."""
+    router = ConversationRouter(server_role=None,
+                                servers=["server1", "server2"],
+                                new_conversation_follow_load_factor=math.inf,
+                                **_NEW_CONV_ARGS)
+    request = _conv_token_request("conv-a", _SHARED_PREFIX + [1] * 40)
+    key = router.routing_key(request)
+    assert key == {"conversation_id": "conv-a", "num_tokens": 296}
+    server, info, _ = await router.get_next_server_by_key(key, req_id=1)
+    assert server is None and info == {ROUTING_CONTENT_REQUIRED: True}
+
+    content_key = router.content_routing_key(request)
+    assert content_key["num_tokens"] == 296
+    assert content_key["block_tokens"] == 16.0
+    server, _, _ = await router.get_next_server_by_key(content_key, req_id=1)
+    assert router._get_server_load(server) == 296
+
+    turn_2 = _conv_token_request("conv-a", _SHARED_PREFIX + [1] * 100)
+    again, _, _ = await router.get_next_server_by_key(
+        router.routing_key(turn_2), req_id=2)
+    assert again == server
+    assert router._get_server_load(server) == 296 + 60
+
+    await router.finish_request_by_id(1)
+    assert router._get_server_load(server) == 60
+    await router.finish_request_by_id(2)
+    assert router._get_server_load(server) == 0
 
 
 def _conv_text_request(conversation_id, text):
