@@ -217,7 +217,7 @@ def CBTS_COVERAGE = "cbts_coverage"
 def DISABLE_CBTS = "disable_cbts"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Kill switch for CBTS per-test coverage; official post-merge pipeline only, single-GPU stages only in Phase 1.
+// CBTS per-test coverage is limited to post-merge test runs.
 @Field
 def ENABLE_CBTS_COVERAGE = true
 // Version-controlled Tier 2 application policy. Coverage decisions are evaluated
@@ -585,8 +585,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
         testFilter[(CBTS_RESULT)] = getCbtsResult(pipeline, testFilter, globalVars)
-        // Decide CBTS coverage eligibility here so L0_Test only consumes the propagated flag.
-        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && (env.JOB_NAME ==~ /.*PostMerge.*/)
+        // L0_Test applies stage eligibility after the pipeline-level gate.
+        testFilter[(CBTS_COVERAGE)] = ENABLE_CBTS_COVERAGE && testFilter[(IS_POST_MERGE)]
     }
     pipeline.echo("CBTS coverage eligible: ${testFilter[(CBTS_COVERAGE)]}")
     testFilter[(OSS_COMPLIANCE_FILE_CHANGED)] = getOssComplianceFileChanged(pipeline, globalVars)
@@ -2107,20 +2107,26 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-// Upload sqlite-only early coverage after single-GPU finishes, before multi-GPU starts; non-fatal.
-def uploadArchCoverage(String arch, pipeline, testFilter) {
-    if (!testFilter[(CBTS_COVERAGE)]) {
+// Upload sqlite-only post-merge coverage by architecture and test group; non-fatal.
+def uploadArchCoverage(String arch, pipeline, testFilter, boolean multiGpu = false) {
+    if (!testFilter[(CBTS_COVERAGE)] || !testFilter[(IS_POST_MERGE)]) {
         return
     }
     def sbsaPrefixPattern = "^results-(GH200|GB10|GB200|GB300|CPU-Generic-arm)-"
     def archGrepCmd = (arch == "SBSA")
         ? "grep -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
         : "grep -v -E '${sbsaPrefixPattern}' result_file_names.txt > arch_file_names.txt || true"
+    def group = multiGpu ? "Multi-GPU" : "Single-GPU"
+    def artifactSuffix = multiGpu ? "_multi_gpu" : ""
     try {
         timeout(time: 15, unit: 'MINUTES') {
             def podSpec = createKubernetesPodConfig("", "agent")
             trtllm_utils.launchKubernetesPod(pipeline, podSpec, "alpine", {
-                stage("Upload Single-GPU Coverage (${arch})") {
+                stage("Upload ${group} Coverage (${arch})") {
+                  dir(multiGpu ? "cbts-multi-${arch}" : ".") {
+                    if (multiGpu) {
+                        deleteDir()
+                    }
                     def testResultLink = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results"
                     sh "rm -rf cov && mkdir -p cov"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add --no-cache curl python3 py3-pip")
@@ -2128,7 +2134,12 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget ${testResultLink}/", allowStepFailed: true)
                     sh "cat index.html | grep \"tar.gz\" | cut -d \"\\\"\" -f 2 > result_file_names.txt"
                     sh archGrepCmd
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat arch_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
+                    if (multiGpu) {
+                        sh "grep -E -- '-[0-9]+_GPUs' arch_file_names.txt | grep -vE -- '_Nodes|-Ray-|Perf|TensorRT|CPP' > group_file_names.txt || true"
+                    } else {
+                        sh "cp arch_file_names.txt group_file_names.txt"
+                    }
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cat group_file_names.txt | xargs -n1 -I {} wget -c -nv ${testResultLink}/{}", allowStepFailed: true)
                     sh "find . -name 'results-*.tar.gz' -type f -exec tar -zxvf {} \\; || true"
                     sh "find . -type f -name '.cbtscov.*.sqlite' -exec mv -t cov/ {} + || true"
                     def fileCount = sh(returnStdout: true, script: 'find cov -name ".cbtscov.*.sqlite" | wc -l').replaceAll("\\s","").toInteger()
@@ -2142,12 +2153,13 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
                                 --glob 'cov/.cbtscov.*.sqlite' \
                                 --out-sqlite cov/cbts_touchmap.sqlite
                         """
-                        sh "cd cov && tar czf cbts_pystart_report_${arch}.tar.gz cbts_touchmap.sqlite"
-                        trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
-                        echo "CBTS early coverage (${arch}): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}.tar.gz"
+                        sh "cd cov && tar czf cbts_pystart_report_${arch}${artifactSuffix}.tar.gz cbts_touchmap.sqlite"
+                        trtllm_utils.uploadArtifacts("cov/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz", "${UPLOAD_PATH}/cbts-coverage/")
+                        echo "CBTS ${group} coverage (${arch}): https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/cbts-coverage/cbts_pystart_report_${arch}${artifactSuffix}.tar.gz"
                     } else {
-                        echo "CBTS early coverage (${arch}): no data files found, skipping."
+                        echo "CBTS ${group} coverage (${arch}): no data files found, skipping."
                     }
+                  }
                 }
             })
         }
@@ -2155,14 +2167,14 @@ def uploadArchCoverage(String arch, pipeline, testFilter) {
         // The 15-minute timeout above is non-fatal; user aborts and upstream
         // pipeline interruptions must keep propagating.
         if (e.causes.any { it.class.simpleName == 'ExceededTimeout' }) {
-            echo "CBTS early coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
+            echo "CBTS ${group} coverage upload (${arch}) timed out after 15 min (non-fatal): skipping."
         } else {
             throw e
         }
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "CBTS early coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
+        echo "CBTS ${group} coverage upload (${arch}) failed (non-fatal): ${e.toString()}"
     }
 }
 
@@ -2860,10 +2872,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         ]
 
                         launchJob(pipeline, "L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
+                        uploadArchCoverage("x86_64", pipeline, testFilter, true)
 
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
+                        uploadArchCoverage("x86_64", pipeline, testFilter, true)
                         if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
                             catchError(
                                 buildResult: 'SUCCESS',
@@ -3078,10 +3092,12 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         ]
 
                         launchJob(pipeline, "L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, additionalParameters)
+                        uploadArchCoverage("SBSA", pipeline, testFilter, true)
 
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
+                        uploadArchCoverage("SBSA", pipeline, testFilter, true)
                         if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
                             catchError(
                                 buildResult: 'SUCCESS',
