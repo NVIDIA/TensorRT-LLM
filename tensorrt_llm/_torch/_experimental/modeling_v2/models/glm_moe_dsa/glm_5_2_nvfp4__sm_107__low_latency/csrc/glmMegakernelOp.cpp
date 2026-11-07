@@ -67,7 +67,7 @@ at::Tensor glmMegakernelIndexerTmap(at::Tensor const& pool, int64_t rows)
         "glm_megakernel_indexer_tmap: pool storage must contain rows of 128 bytes");
     c10::cuda::CUDAGuard const deviceGuard(pool.device());
     auto out = at::empty({128}, at::TensorOptions().dtype(at::kByte).device(at::kCPU));
-    alignas(64) CUtensorMap tensorMap{};
+    CUtensorMap tensorMap{};
     auto const result = mega::glm52PlainLayerIdxTmap(&tensorMap, pool.data_ptr(), rows);
     TORCH_CHECK(result == CUDA_SUCCESS, "glm_megakernel_indexer_tmap: CUDA driver error ", result);
     std::copy_n(reinterpret_cast<uint8_t const*>(&tensorMap), sizeof(tensorMap), out.data_ptr<uint8_t>());
