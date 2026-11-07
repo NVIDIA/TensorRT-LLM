@@ -1136,8 +1136,9 @@ def main():
     script_prefix_lines = remove_whitespace_lines(script_prefix_lines)
     script_prefix = "\n".join(script_prefix_lines)
 
-    # Role variables inherit their exported job values. Appending --container-env
-    # would replace the caller's BASH_ENV override when Slurm forwards the option.
+    # Role variables inherit their exported job values. Any required image overrides
+    # belong in the caller's single comma-separated --container-env option;
+    # Repeating --container-env forwards only the last value.
     srun_args_lines = remove_whitespace_lines(srun_args_lines)
     srun_args_lines = ["srunArgs=("] + [f'  "{line}"' for line in srun_args_lines] + [")"]
     srun_args = "\n".join(srun_args_lines)

@@ -14,8 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Chain the CI image's BASH_ENV (docker/Dockerfile.multi) before applying the
-# CI profiler policy. Restore it while sourcing so initialization cannot recurse.
+# Run the CI image's BASH_ENV (docker/Dockerfile.multi) before applying the policy.
+# Temporarily restore the image hook so child Bash processes started during
+# initialization do not re-enter this wrapper. Restore this wrapper afterward.
 export BASH_ENV=/etc/bash.bashrc
 if [ -f "$BASH_ENV" ]; then
     source "$BASH_ENV"
