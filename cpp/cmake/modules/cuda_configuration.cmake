@@ -390,6 +390,10 @@ function(setup_cuda_architectures)
   # CMAKE_CUDA_ARCHITECTURES_ORIG contains all architectures enabled, without
   # automatically added -real or -a suffix.
   set(CMAKE_CUDA_ARCHITECTURES_ORIG "${CMAKE_CUDA_ARCHITECTURES_RAW}")
+  # Wheel-time FMHA compilation must use the same resolved list, including the
+  # GPU detected for `native`, even if a build directory is reused later.
+  file(WRITE "${CMAKE_BINARY_DIR}/trtllm_cuda_architectures.txt"
+       "${CMAKE_CUDA_ARCHITECTURES_ORIG}")
   message(STATUS "GPU architectures: ${CMAKE_CUDA_ARCHITECTURES_ORIG}")
   set(CMAKE_CUDA_ARCHITECTURES_ORIG
       ${CMAKE_CUDA_ARCHITECTURES_ORIG}

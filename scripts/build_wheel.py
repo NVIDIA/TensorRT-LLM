@@ -1635,6 +1635,28 @@ def main(*,
         )
     install_file(cutlass_src / "LICENSE.txt", msa_dst / "cutlass")
 
+    if not on_windows and not skip_building_wheel:
+        # Build into the staged package, using the same nvcc as CMake. The
+        # helper skips architectures that cannot use the SM100 kernels.
+        env = os.environ.copy()
+        cmake_cache = build_dir / "CMakeCache.txt"
+        if cmake_cache.is_file():
+            compiler = re.search(r"(?m)^CMAKE_CUDA_COMPILER:[A-Z_]+=(.+)$",
+                                 cmake_cache.read_text())
+            if compiler:
+                env["CMAKE_CUDA_COMPILER"] = compiler.group(1).strip()
+        run([
+            str(venv_python),
+            str(project_dir / "scripts/build_msa_aot.py"),
+            str(msa_dst),
+            str(build_dir / "_deps/msa-src/scripts/warmup_fmha_sm100.py"),
+            cuda_architectures,
+            str(max(1, min(job_count, 8))), "--build-dir",
+            str(build_dir)
+        ],
+            env=env,
+            check=True)
+
     if not skip_stubs:
         with working_directory(pkg_dir):
             if on_windows:
@@ -1784,6 +1806,7 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument(
         "--job_count",
         "-j",
+        type=int,
         const=get_available_cpu_count(),
         nargs="?",
         help=
