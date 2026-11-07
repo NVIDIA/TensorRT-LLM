@@ -5567,8 +5567,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
         # prompt_len is the full incoming prompt length, robust to block
         # reuse (which may leave a non-zero context_current_position).
-        # Helix requests carry the rank-local strided slice in prompt_len;
-        # the global ledger sizes off the full prompt instead.
+        # Disaggregated helix requests carry the rank-local strided slice in
+        # prompt_len; total_input_len_cp holds the full prompt under both
+        # helix modes, so the global ledger sizes off it.
         remote_tail_start = getattr(req, "py_csa2_remote_tail_start", None)
         history_len = (
             remote_tail_start
@@ -7199,7 +7200,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
             token_num = token_nums[i] if token_nums is not None else 1 + max_num_draft_tokens
-            if self._has_cp_helix:
+            if self._has_cp_helix and is_gen:
                 # Keep the frozen dummy fields self-consistent (the active
                 # rank's past_seen = seqlen - 1 must stay >= 1).
                 token_num = max(token_num, 2)
@@ -8378,8 +8379,9 @@ class KVCacheManagerV2(BaseResourceManager):
             )
             history_length = (
                 None
-                # Reuse (history's consumer) is disabled under helix, and
-                # max_beam_num_tokens mixes rank-local and global counts.
+                # Reuse (history's consumer) is disabled under helix, and under
+                # disaggregated helix max_beam_num_tokens mixes rank-local and
+                # global counts.
                 if self.kv_compression_manages_history or self._has_cp_helix
                 else req.max_beam_num_tokens - 1
             )
