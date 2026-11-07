@@ -237,8 +237,10 @@ class MarlinFusedMoEBase(MoEImplBase):
         """
         inter_size = self.intermediate_size_per_partition
         if is_gated_activation(self.activation_type):
-            gate = gemm1_out[:, :inter_size]
-            up = gemm1_out[:, inter_size : 2 * inter_size]
+            # w3_w1_weight keeps the CUTLASS layout it is loaded in, [w3; w1]:
+            # the up projection first, the gate second.
+            up = gemm1_out[:, :inter_size]
+            gate = gemm1_out[:, inter_size : 2 * inter_size]
             if self.activation_type == ActivationType.Geglu:
                 return F.gelu(gate) * up
             else:
