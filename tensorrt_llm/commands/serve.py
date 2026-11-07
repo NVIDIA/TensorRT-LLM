@@ -2581,6 +2581,30 @@ def _serve_disagg_fleet(disagg_cfg, config_file, metadata_server_config_file,
                 process.terminate()
 
 
+_COORDINATOR_UDS_NAME = "coordinator.sock"
+# Linux's sun_path holds 108 bytes, including the terminating NUL.
+_MAX_UDS_PATH_BYTES = 107
+
+
+def _make_coordinator_uds_dir(public_port: int) -> tempfile.TemporaryDirectory:
+    """Create a new directory for the coordinator's Unix socket.
+
+    The directory is created with mode 0o700, so only this user can reach the
+    socket inside it. It is made in the temporary directory, or in /tmp when
+    the socket path there would not fit in a Unix socket address.
+    """
+    prefix = f"trtllm_disagg_coord_{public_port}_"
+    uds_dir = tempfile.TemporaryDirectory(prefix=prefix)
+    uds_path = os.path.join(uds_dir.name, _COORDINATOR_UDS_NAME)
+    if len(os.fsencode(uds_path)) <= _MAX_UDS_PATH_BYTES:
+        return uds_dir
+    uds_dir.cleanup()
+    logger.warning(f"Coordinator socket path {uds_path} is longer than "
+                   f"{_MAX_UDS_PATH_BYTES} bytes; creating its directory in "
+                   f"/tmp instead.")
+    return tempfile.TemporaryDirectory(prefix=prefix, dir="/tmp")  # nosec B108
+
+
 def _serve_coordinator_and_fleet(disagg_cfg, config_file,
                                  metadata_server_config_file,
                                  metadata_server_cfg, request_timeout,
@@ -2603,97 +2627,109 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
     # that dominated per-request latency). Opt-out via the UDS env = "0".
     use_uds = os.environ.get(DisaggWorkerEnvs.TLLM_DISAGG_COORDINATOR_UDS,
                              "1") == "1"
-    coord_uds = (
-        f"/tmp/trtllm_disagg_coord_{public_port}.sock"  # nosec B108
-        if use_uds else None)
-    # Fleet points at the UDS when enabled; the TCP port stays up for health.
-    coord_url = f"unix:{coord_uds}" if coord_uds else \
-        f"http://{public_host}:{coord_port}"
-
-    # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
-    # hostname, so this listener starts the same way as the standalone server and
-    # the fleet workers. uvicorn would resolve the name itself, and a hostname
-    # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
-    # the kernel always rejects with "invalid argument", because the scope id can
-    # only be derived from an interface name. Binding AF_INET here also surfaces a
-    # port conflict with the same diagnostics as the other two listeners.
-    coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    # Set before the try so that its finally also cleans up after a failed
+    # startup.
+    coord_socket = None
+    fleet = []
+    # The socket lives in a new directory that only this user can enter; the
+    # permissions uvicorn sets on the socket file itself do not widen that.
+    coord_uds_dir = _make_coordinator_uds_dir(public_port) if use_uds else None
     try:
-        coord_socket.bind((public_host, coord_port))
-    except OSError as e:
-        coord_socket.close()
-        raise _bind_failure("coordinator", public_host, coord_port, e) from e
+        coord_uds = (os.path.join(coord_uds_dir.name, _COORDINATOR_UDS_NAME)
+                     if coord_uds_dir is not None else None)
+        # Fleet points at the UDS when enabled; the TCP port stays up for health.
+        coord_url = f"unix:{coord_uds}" if coord_uds else \
+            f"http://{public_host}:{coord_port}"
 
-    # 1. Launch the delegating fleet pointed at the implicit coordinator we start
-    #    below (port-1 for TCP; UDS for the hot path). Workers hold
-    #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
-    fleet = _launch_disagg_fleet(disagg_cfg, config_file,
-                                 metadata_server_config_file, request_timeout,
-                                 server_start_timeout, num_workers, coord_url)
+        # Bind the coordinator's TCP socket here rather than letting uvicorn bind the
+        # hostname, so this listener starts the same way as the standalone server and
+        # the fleet workers. uvicorn would resolve the name itself, and a hostname
+        # whose AAAA record is link-local resolves to fe80:: with scope id 0 -- which
+        # the kernel always rejects with "invalid argument", because the scope id can
+        # only be derived from an interface name. Binding AF_INET here also surfaces a
+        # port conflict with the same diagnostics as the other two listeners.
+        coord_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        coord_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            coord_socket.bind((public_host, coord_port))
+        except OSError as e:
+            coord_socket.close()
+            raise _bind_failure("coordinator", public_host, coord_port,
+                                e) from e
 
-    # 2. Build + serve the coordinator in this process. It OWNS routing state and
-    #    builds the owner routers itself (single shared namespace-aware core + ONE
-    #    ZMQ ingest server, started once here).
-    def _client_factory(router, role, max_retries=1):
-        from tensorrt_llm.serve.openai_client import OpenAIHttpClient
-        return OpenAIHttpClient(
-            router,
-            role,
-            request_timeout,
-            max_retries,
-            internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
-            frontend_affinity=disagg_cfg.ctx_frontend_affinity)
+        # 1. Launch the delegating fleet pointed at the implicit coordinator we start
+        #    below (port-1 for TCP; UDS for the hot path). Workers hold
+        #    CoordinatorClients (no core), so they can't race the ZMQ ingest bind.
+        fleet = _launch_disagg_fleet(disagg_cfg, config_file,
+                                     metadata_server_config_file,
+                                     request_timeout, server_start_timeout,
+                                     num_workers, coord_url)
 
-    coordinator = DisaggCoordinatorService(
-        disagg_cfg,
-        _client_factory,
-        metadata_config=metadata_server_cfg,
-        server_start_timeout_secs=server_start_timeout,
-        request_timeout_secs=request_timeout)
-    logger.info(f"Coordinator serving on {public_host}:{coord_port} "
-                f"(uds={coord_uds}) (fleet on public port {public_port})")
-    set_lifecycle_phase("serving")
+        # 2. Build + serve the coordinator in this process. It OWNS routing state and
+        #    builds the owner routers itself (single shared namespace-aware core + ONE
+        #    ZMQ ingest server, started once here).
+        def _client_factory(router, role, max_retries=1):
+            from tensorrt_llm.serve.openai_client import OpenAIHttpClient
+            return OpenAIHttpClient(
+                router,
+                role,
+                request_timeout,
+                max_retries,
+                internal_disagg_auth_key=disagg_cfg.internal_request_auth_key,
+                frontend_affinity=disagg_cfg.ctx_frontend_affinity)
 
-    async def _serve_and_monitor():
-        server_task = asyncio.create_task(
-            CoordinatorServer(coordinator)(
-                public_host,
-                coord_port,
-                uds=coord_uds,
-                keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
-                sockets=[coord_socket]))
+        coordinator = DisaggCoordinatorService(
+            disagg_cfg,
+            _client_factory,
+            metadata_config=metadata_server_cfg,
+            server_start_timeout_secs=server_start_timeout,
+            request_timeout_secs=request_timeout)
+        logger.info(f"Coordinator serving on {public_host}:{coord_port} "
+                    f"(uds={coord_uds}) (fleet on public port {public_port})")
+        set_lifecycle_phase("serving")
 
-        async def _monitor_fleet():
-            while True:
-                for i, process in enumerate(fleet):
-                    return_code = process.poll()
-                    if return_code is not None:
-                        if return_code != 0:
-                            _report_observed_child_failure(
-                                return_code, "disagg_worker", "serving")
-                            raise RuntimeError(
-                                f"Disagg fleet worker {i} (pid={process.pid}) "
-                                f"exited with code {return_code}")
-                        return
-                await asyncio.sleep(1)
+        async def _serve_and_monitor():
+            server_task = asyncio.create_task(
+                CoordinatorServer(coordinator)(
+                    public_host,
+                    coord_port,
+                    uds=coord_uds,
+                    keep_alive_timeout=disagg_cfg.server_keep_alive_timeout,
+                    sockets=[coord_socket]))
 
-        monitor_task = asyncio.create_task(_monitor_fleet())
-        done, pending = await asyncio.wait((server_task, monitor_task),
-                                           return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            task.result()
+            async def _monitor_fleet():
+                while True:
+                    for i, process in enumerate(fleet):
+                        return_code = process.poll()
+                        if return_code is not None:
+                            if return_code != 0:
+                                _report_observed_child_failure(
+                                    return_code, "disagg_worker", "serving")
+                                raise RuntimeError(
+                                    f"Disagg fleet worker {i} (pid={process.pid}) "
+                                    f"exited with code {return_code}")
+                            return
+                    await asyncio.sleep(1)
 
-    try:
+            monitor_task = asyncio.create_task(_monitor_fleet())
+            done, pending = await asyncio.wait(
+                (server_task, monitor_task),
+                return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                task.result()
+
         asyncio.run(_serve_and_monitor())
     finally:
-        coord_socket.close()
+        if coord_socket is not None:
+            coord_socket.close()
         for process in fleet:
             if process.poll() is None:
                 process.terminate()
+        if coord_uds_dir is not None:
+            coord_uds_dir.cleanup()
 
 
 def _init_fleet_worker_process():
