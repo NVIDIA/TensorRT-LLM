@@ -67,6 +67,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
                            resolve_auto_ssm_cache_dtype,
                            supports_fp4_mla_attention, uses_fp4_mla_attention,
                            validate_kimi_kda_state_dtype)
+from .warmup_overlap import warmup_overlap
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -1375,13 +1376,14 @@ class ModelLoader:
 
                 weights_checkpoint_dir = (model.llm_checkpoint_dir if hasattr(
                     model, 'llm_checkpoint_dir') else checkpoint_dir)
-                weights_preloaded = self._materialize_checkpoint_weights(
-                    checkpoint_loader, weights_checkpoint_dir, model, config,
-                    load_weights_kwargs)
+                with warmup_overlap(model, config, self.llm_args, self.mapping):
+                    weights_preloaded = self._materialize_checkpoint_weights(
+                        checkpoint_loader, weights_checkpoint_dir, model,
+                        config, load_weights_kwargs)
 
-                if loads_draft_weights:
-                    self._materialize_draft_checkpoint_weights(
-                        checkpoint_loader, model)
+                    if loads_draft_weights:
+                        self._materialize_draft_checkpoint_weights(
+                            checkpoint_loader, model)
 
             elif load_format == LoadFormat.GMS:
                 # GPU Memory Service path: weight tensors live in a

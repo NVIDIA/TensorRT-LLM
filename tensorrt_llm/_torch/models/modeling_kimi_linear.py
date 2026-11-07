@@ -1433,19 +1433,11 @@ def _has_weights(module: nn.Module) -> bool:
     return not getattr(module, "_weights_removed", False)
 
 
-def _convert_moe_mlps_to_fp8_weight_read(
+def _moe_mlp_fp8_weight_read_targets(
     model: nn.Module, include_fused_gate_up: bool = True
-) -> int:
-    """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
-
-    Targets the shared-expert MLP (gate/up/down) and the latent up/down
-    projection on every MoE layer — the bias-free BF16 projections that
-    attention data-parallelism re-reads in full each decode step. Attention
-    follows checkpoint quantization separately. Routed experts and the dense
-    layer-0 MLP are not converted. Returns the number of projections converted.
-    """
-    count = 0
-
+) -> Iterator[Tuple[nn.Module, str, Tuple[type, ...]]]:
+    """``(parent, attr, linear_types)`` of the projections that
+    ``_convert_moe_mlps_to_fp8_weight_read`` swaps where they are of ``linear_types``."""
     for layer in model.layers:
         if not _has_weights(layer):
             continue
@@ -1468,11 +1460,28 @@ def _convert_moe_mlps_to_fp8_weight_read(
                 child = getattr(shared, attr, None)
                 if isinstance(child, TrtllmLinear) and child.tp_size != 1:
                     continue
-                count += _swap_linear_to_fp8_weight_read(
-                    shared, attr, linear_types=(nn.Linear, TrtllmLinear)
-                )
+                yield shared, attr, (nn.Linear, TrtllmLinear)
         for attr in ("routed_expert_down_proj", "routed_expert_up_proj"):
-            count += _swap_linear_to_fp8_weight_read(moe, attr)
+            yield moe, attr, (nn.Linear,)
+
+
+def _convert_moe_mlps_to_fp8_weight_read(
+    model: nn.Module, include_fused_gate_up: bool = True
+) -> int:
+    """Swap the replicated MoE-layer MLP projections to an FP8 weight read.
+
+    Targets the shared-expert MLP (gate/up/down) and the latent up/down
+    projection on every MoE layer — the bias-free BF16 projections that
+    attention data-parallelism re-reads in full each decode step. Attention
+    follows checkpoint quantization separately. Routed experts and the dense
+    layer-0 MLP are not converted. Returns the number of projections converted.
+    """
+    count = sum(
+        _swap_linear_to_fp8_weight_read(parent, attr, linear_types)
+        for parent, attr, linear_types in _moe_mlp_fp8_weight_read_targets(
+            model, include_fused_gate_up
+        )
+    )
 
     # Return the freed BF16 blocks to the driver so the raw (non-caching-
     # allocator) allocations made during executor creation succeed on the

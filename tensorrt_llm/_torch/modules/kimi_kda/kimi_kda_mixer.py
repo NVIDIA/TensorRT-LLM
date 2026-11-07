@@ -391,14 +391,20 @@ class KimiKDALinearAttention(nn.Module):
                 self._gate_b_t = gate_b.view(2, self.proj_size, self.head_dim).transpose(1, 2)
             if all(isinstance(module, nn.Linear) for module in qkvg_modules):
                 self._qkvg_proj_weight = self._merge_projection_weights(qkvg_modules)
-            elif self.use_full_rank_gate and all(
-                isinstance(module, Linear) and module.has_fp8_block_scales
-                for module in qkvg_modules
-            ):
-                self.qkvg_proj = self._fuse_checkpoint_projections(qkvg_modules)
-                self.qkvg_split_sizes = [module.out_features for module in qkvg_modules]
+            elif (fp8_modules := self._fp8_qkvg_modules()) is not None:
+                self.qkvg_proj = self._fuse_checkpoint_projections(fp8_modules)
+                self.qkvg_split_sizes = [module.out_features for module in fp8_modules]
             self._bfa_proj_weight = self._merge_projection_weights(bfa_modules, pad_rows_to=8)
             self._build_decode_kernel_constants()
+
+    def _fp8_qkvg_modules(self) -> Optional[Tuple[Linear, ...]]:
+        """The FP8 projections ``finalize_decode_weights`` fuses into ``qkvg_proj``."""
+        if self._dispatch.decode_kernel_path != "optimized" or not self.use_full_rank_gate:
+            return None
+        modules = (self.q_proj, self.k_proj, self.v_proj, self.g_proj)
+        if all(isinstance(module, Linear) and module.has_fp8_block_scales for module in modules):
+            return modules
+        return None
 
     @staticmethod
     def _fuse_checkpoint_projections(modules: tuple[Linear, ...]) -> Linear:

@@ -203,6 +203,19 @@ curl http://localhost:8000/server_info
 }
 ```
 
+### Kernel builds during weight loading
+
+While the main weights load, background threads build kernels that the model-engine warmup would
+otherwise build after them: the sampling modules, MiniMax-M3's MSA indexer variants, and the GEMM
+kernels of the Linear layers. The warmup then finds them built. The loader waits for these builds
+before post-load processing, so the wait counts in `total_model_loading_seconds`.
+
+| Environment variable | Default | Effect |
+|----------------------|---------|--------|
+| `TLLM_OVERLAP_PREWARM` | `1` | `0` leaves all of these builds to the warmup. |
+| `TLLM_OVERLAP_PREWARM_LINEAR` | `1` | `0` leaves the Linear layers' GEMM kernels to the warmup. |
+| `TLLM_OVERLAP_PREWARM_DEEP_GEMM_THREADS` | `4` | Threads that build DeepGEMM kernels. A sweep starts only if its dummy operands leave at least 8 GiB of device memory free. |
+
 ## Unified Cache for Compiled Artifacts
 
 Set `TRTLLM_CACHE_DIR` before importing TensorRT-LLM to place its compiled
