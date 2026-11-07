@@ -33,13 +33,10 @@ struct Task
     SrcAddr src;
 };
 
-//! Process-wide: run host <-> disk copies on a pool of \p numThreads worker threads instead of a blocking
-//! pread/pwrite loop inside a CUDA host callback. 0 is a no-op. The first nonzero value sizes the pool; the
-//! pool cannot be resized later. Must be called before the first disk copy that should use the pool.
+//! Process-wide: run host <-> disk copies on a pool of \p numThreads threads. The first nonzero call sizes it.
 void configureAsyncDiskIo(size_t numThreads) noexcept;
 
-//! Call before closing a disk pool file: waits for asynchronous I/O still in flight and closes the O_DIRECT
-//! descriptor cached for \p fd, which would otherwise keep the (unlinked) file and its disk space alive.
+//! Call before closing a disk pool file: waits for in-flight I/O and closes its cached O_DIRECT descriptor.
 void releaseDiskFile(int fd) noexcept;
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;

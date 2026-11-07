@@ -342,19 +342,15 @@ public:
         return mSlotUtilFracMax.at(lcId);
     }
 
-    // ---- Keep-disk-copy ----------------------------------------------------
-    //
-    // With DiskCacheTierConfig::keepCopyAfterRestore, a committed page restored from a disk level keeps its disk slot
-    // as a "retained copy" instead of releasing it: committed pages are immutable, so the disk data stays valid. When
-    // the page later falls back to that level, it takes the retained slot back and the write is skipped.
-    // Retained copies are duplicates, so a level reclaims them (oldest first) before it evicts any real page.
+    // Keep-disk-copy: a committed page restored from disk keeps its (immutable) disk slot as a retained copy and
+    // takes it back on its next eviction there, skipping the write. Retained copies are reclaimed oldest first,
+    // before any real page is evicted.
 
     [[nodiscard]] bool keepDiskCopyEnabled() const noexcept;
 
     // Called from Page::~Page: releases the page's retained copy, if any.
     void onPageDestroyed(Page const& page) noexcept;
 
-    // Number of retained copies at a level (all pool groups when pgIdx is omitted).
     [[nodiscard]] SlotCount numRetainedCopies(
         CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
 
@@ -547,7 +543,6 @@ private:
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
 
-    // ---- Keep-disk-copy state (see keepDiskCopyEnabled). Appended last so existing member offsets are unchanged.
     struct RetainedCopy
     {
         Page const* page;
@@ -586,9 +581,7 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
     KeepCopyStats mKeepCopyStats;
 
-    // ---- Disk write-through (DiskCacheTierConfig::writeThrough, needs keep-copy). When committed pages are evicted
-    // from GPU to host, also copy them to free disk slots in the background and keep those as retained copies, so a
-    // later host -> disk eviction reuses the copy instead of writing on the restore's critical path. Appended last.
+    // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies.
     void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
     // Completion event of a write-through still reading this host page, or a null event.
     [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;

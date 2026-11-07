@@ -143,27 +143,11 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Asynchronous disk I/O for host <-> disk migrations (opt-in: DiskCacheTierConfig::numIoThreads > 0).
-//
-// The synchronous path above runs a blocking pread/pwrite loop inside a cuLaunchHostFunc callback. CUDA runs
-// all host functions of a process on one driver thread, even across independent streams, so every disk
-// transfer queues behind every other one, and a large eviction write holds up the next restore read.
-//
-// The asynchronous path keeps the same stream semantics with two stream operations per transfer:
-//   cuLaunchHostFunc(submit)               runs in stream order and only hands the transfer to a worker pool
-//   cuStreamWaitValue64(flag >= ticket)    the stream continues once the pool has finished every byte
-// Nothing enqueued after the transfer on that stream can run before the data has landed, so readyEvent and
-// buffer lifetimes are unchanged. The driver callback thread never blocks on I/O, transfers on different
-// streams proceed concurrently, each transfer is split into chunks served by several threads, and reads
-// (restores, on the critical path) are served before writes (evictions).
-//
-// Enabled by DiskCacheTierConfig::numIoThreads > 0 (configureAsyncDiskIo). Tuning knobs, read from the environment:
-//   TLLM_KVCM2_DISK_IO_CHUNK         max bytes per work item (default 4 MiB)
-//   TLLM_KVCM2_DISK_IO_DIRECT_WRITE  1: write 4 KiB-aligned pieces with O_DIRECT (default 1)
-//   TLLM_KVCM2_DISK_IO_DIRECT_READ   1: read 4 KiB-aligned pieces with O_DIRECT (default 0)
-//   TLLM_KVCM2_DISK_IO_STATS_SEC     print read/write queue and service times every N seconds (default 0 = off)
-// ---------------------------------------------------------------------------------------------------------------
+// Asynchronous disk I/O. CUDA runs all host functions of a process on one thread, so with the synchronous path
+// every disk transfer waits for every other one. Here the host function only hands the transfer to a worker pool,
+// and the stream waits on a completion flag (cuStreamWaitValue64), so stream ordering is unchanged.
+// Tuning: TLLM_KVCM2_DISK_IO_CHUNK (bytes per work item, default 4 MiB), TLLM_KVCM2_DISK_IO_DIRECT_WRITE /
+// _DIRECT_READ (O_DIRECT, default 1 / 0), TLLM_KVCM2_DISK_IO_STATS_SEC (stats interval, default 0 = off).
 namespace
 {
 
@@ -179,7 +163,6 @@ size_t diskIoEnv(char const* name, size_t fallback) noexcept
     return end == value ? fallback : static_cast<size_t>(parsed);
 }
 
-// Worker threads for asynchronous disk I/O; 0 keeps the synchronous path. Set by configureAsyncDiskIo().
 std::atomic<size_t> gAsyncDiskIoThreads{0};
 
 struct DiskIoConfig
@@ -205,11 +188,8 @@ int64_t currentNs() noexcept
         .count();
 }
 
-// --- O_DIRECT descriptors -----------------------------------------------------------------------------------
-// One O_DIRECT descriptor per buffered descriptor, opened through /proc/self/fd. The cache is keyed by fd
-// number AND inode: a pool file can be closed and its fd number reused for a different file, and a stale
-// direct descriptor would then write to the old (deleted) file. The kernel flushes and invalidates cached
-// pages of a range written with O_DIRECT, so buffered reads of the same file stay coherent.
+// O_DIRECT descriptors, reopened via /proc/self/fd and keyed by fd and inode, since a closed pool file's fd
+// number can be reused for another file.
 struct DirectFdEntry
 {
     int direct = 0; // direct fd + 1; 0 = not opened, -1 = open failed
@@ -301,7 +281,6 @@ bool writePiece(int fd, ssize_t pos, void const* data, ssize_t size) noexcept
     return writeAll(fd, pos, data, size);
 }
 
-// --- Statistics (aggregate only) ----------------------------------------------------------------------------
 struct DiskIoStats
 {
     std::atomic<uint64_t> calls{0};
@@ -367,10 +346,8 @@ void startDiskIoStatsThread()
         });
 }
 
-// --- Completion flags ---------------------------------------------------------------------------------------
-// A ring of 64-bit words in pinned, device-mapped host memory. Transfer number t uses word t % kFlagSlots and
-// is complete once that word is >= t. A word is reused only after its previous transfer (t - kFlagSlots) has
-// completed, so a later transfer can never release an earlier waiter.
+// Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kFlagSlots
+// and is complete once the word is >= t.
 constexpr uint64_t kFlagSlots = uint64_t{1} << 16;
 
 struct CompletionFlags
@@ -424,7 +401,6 @@ CompletionFlags* completionFlags() noexcept
     return instance;
 }
 
-// --- Transfers and the worker pool --------------------------------------------------------------------------
 struct DiskTransfer
 {
     bool isRead = false;
@@ -489,7 +465,6 @@ public:
         }
     }
 
-    // Blocks until every piece submitted so far has finished.
     void waitIdle()
     {
         std::unique_lock<std::mutex> lock(mMutex);
@@ -544,7 +519,7 @@ private:
             {
                 std::unique_lock<std::mutex> lock(mMutex);
                 mCv.wait(lock, [this] { return !mReads.empty() || !mWrites.empty(); });
-                // Restores sit on the critical path; evictions only have to finish before their slot is reused.
+                // Reads (restores) first: they are on the critical path.
                 auto& queue = !mReads.empty() ? mReads : mWrites;
                 piece = std::move(queue.front());
                 queue.pop_front();

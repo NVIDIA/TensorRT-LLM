@@ -5748,7 +5748,6 @@ class TestKVCacheManagerV2(unittest.TestCase):
     cfg: KVCacheManagerConfig
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
-    # Extra DiskCacheTierConfig options for tests that configure a disk tier.
     disk_tier_options: dict = {}
 
     def setUp(self) -> None:
@@ -11393,9 +11392,7 @@ class TestPoison(TestKVCacheManagerV2):
         self.assertIsNone(poison_reason())
 
 
-# The disk-tier tests again with every SSD offload option on: retained disk copies, write-through, and the
-# asynchronous I/O pool. The pool is process-wide and stays on once enabled, so later tests in the same process
-# also run with it.
+# Disk-tier tests rerun with every SSD offload option on.
 _ALL_DISK_OPTIONS = {"num_io_threads": 4, "keep_copy_after_restore": True, "write_through": True}
 
 
