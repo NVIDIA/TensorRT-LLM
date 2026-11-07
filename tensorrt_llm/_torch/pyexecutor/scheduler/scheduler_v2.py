@@ -342,7 +342,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
-        self._has_retiring_gen_receives: Callable[[], bool] = lambda: False
+        self._retiring_gen_receives_probe: Callable[[], bool] = lambda: False
         # Registered by PyExecutor; see set_disagg_transfer_admission_controller.
         self._disagg_transfer_controller = None
 
@@ -391,13 +391,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         self._async_transfer_manager = mgr
 
     def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
-        """Expose off-list receive ownership to the deadlock detector.
+        """Expose current rank-local receive ownership to the deadlock detector.
 
         Args:
-            probe: Whether logically cancelled receives still retain resources.
+            probe: Whether logically cancelled receives still retain local resources.
+                Read current ownership, not the previous iteration's fleet-wide
+                snapshot: remote retention cannot explain this rank's allocation stall.
                 Retirement and its deadline remain the transfer layer's responsibility.
         """
-        self._has_retiring_gen_receives = probe
+        self._retiring_gen_receives_probe = probe
 
     @property
     def ctx_demote_uncached_tokens(self) -> int:
@@ -2330,7 +2332,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 self._async_transfer_manager is not None
                 and self._async_transfer_manager.has_any_inflight_requests()
             )
-            or self._has_retiring_gen_receives()
+            or self._retiring_gen_receives_probe()
         )
         if transfer_holding:
             if self._stalled_schedules:
@@ -2446,7 +2448,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"kv_connector={has_connector}; "
             f"cache_tier_below_gpu={self.kv_cache_manager.has_cache_tier_below_gpu}; "
             f"transfers_in_flight={transfers_in_flight}; "
-            f"retiring_gen_receives={self._has_retiring_gen_receives()}"
+            f"local_retiring_gen_receives={self._retiring_gen_receives_probe()}"
         )
 
     def _free_kv_caches(self, req: LlmRequest) -> None:

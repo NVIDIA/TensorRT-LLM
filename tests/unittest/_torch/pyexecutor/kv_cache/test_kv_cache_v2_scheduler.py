@@ -2673,36 +2673,44 @@ class TestDeadlockDetection:
 
     @pytest.mark.parametrize("pages_available_after_retirement", [False, True])
     def test_cancelled_receive_holds_pages_only_until_retirement(
-        self, pages_available_after_retirement
-    ):
+        self, pages_available_after_retirement: bool
+    ) -> None:
         """Off-list receive retirement defers deadlock detection, not future stalls."""
-        retiring = [True]
+        retiring = [False]
+        retirement_finished = [False]
         mgr = make_kv_cache_manager(
-            resize_context_fn=lambda req, n: (not retiring[0] and pages_available_after_retirement),
+            resize_context_fn=lambda req, n: (
+                retirement_finished[0] and pages_available_after_retirement
+            ),
             has_cache_tier_below_gpu=False,
         )
         sched = make_scheduler(mgr, max_num_tokens=1000)
         sched._DEADLOCK_STALL_ITERS = 3
         sched.set_retiring_gen_receives_probe(lambda: retiring[0])
         blocked = make_ctx_request(0, 100, is_first_context_chunk=False)
-        sched._stalled_schedules = sched._DEADLOCK_STALL_ITERS - 1
+        for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
+            sched.schedule_request([blocked], set())
+        assert sched._stalled_schedules == sched._DEADLOCK_STALL_ITERS - 1
 
+        retiring[0] = True
         for _ in range(sched._DEADLOCK_STALL_ITERS + 2):
             out = sched.schedule_request([blocked], set())
             assert not out.context_requests
             assert sched._stalled_schedules == 0
-        assert "retiring_gen_receives=True" in sched._summarize_stall(
-            [blocked], [blocked], set(), set()
-        )
-
         retiring[0] = False
+        retirement_finished[0] = True
         if pages_available_after_retirement:
             assert ids(sched.schedule_request([blocked], set()).context_requests) == [0]
         else:
             for _ in range(sched._DEADLOCK_STALL_ITERS - 1):
                 sched.schedule_request([blocked], set())
-            with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
-                sched.schedule_request([blocked], set())
+            with patch(
+                "tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2.logger.warning"
+            ) as warning:
+                with pytest.raises(RuntimeError, match="V2 scheduler deadlock"):
+                    sched.schedule_request([blocked], set())
+            warning.assert_called_once()
+            assert "local_retiring_gen_receives=False" in warning.call_args.args[0]
 
 
 # ===========================================================================

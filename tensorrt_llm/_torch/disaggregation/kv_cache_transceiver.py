@@ -445,6 +445,10 @@ class KvCacheTransceiver(ABC):
         Returns:
             Whether cancellation was accepted under a qualified retirement policy.
             The caller must still use cancel_request to establish safe retirement.
+            Under that policy, the transceiver retains a passed ready fence until
+            cancel_request returns True, even if an earlier failure makes this
+            method return False. Unsupported implementations return False without
+            taking ownership of ready.
         """
         return False
 

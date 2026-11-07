@@ -4618,7 +4618,9 @@ class TransferWorker:
             request_id: Executor-local identity of the retained destination.
 
         Returns:
-            An owner using the existing receive grace and containment watchdog.
+            A fresh owner using the configured receive grace and containment
+            watchdog. Its caller starts grace with retain_unproven at cancellation;
+            this does not reuse or extend an existing session's deadline.
 
         Raises:
             RuntimeError: Physical retirement enforcement is not configured.
