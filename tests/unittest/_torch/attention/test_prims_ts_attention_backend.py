@@ -1447,6 +1447,20 @@ def test_prims_ts_cache_free_fp8_recipes(
     )
     plans: list[dict] = []
     runs: list[dict] = []
+    check_graph = not vc_attention and qk_dtype == "fp8" and outlier == 1.0
+    forward_calls: list[tuple] = []
+    if check_graph:
+        from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
+
+        forward = PrimsTSFmha._forward_without_kv_cache
+
+        def recording_forward(self, *args, **kwargs):
+            # The library keeps only a weak reference to its owning attention.
+            forward_calls.append((self.attn, self, args, kwargs))
+            return forward(self, *args, **kwargs)
+
+        monkeypatch.setattr(PrimsTSFmha, "_forward_without_kv_cache", recording_forward)
+
     plan, run = BatchPrefillTSWrapper.plan, BatchPrefillTSWrapper.run
 
     def recording_plan(self, *args, **kwargs):
@@ -1528,6 +1542,33 @@ def test_prims_ts_cache_free_fp8_recipes(
         atol=FP8_ATOL + BF16_ATOL,
         rtol=BF16_RTOL,
     )
+
+    if check_graph:
+        ((_owner, library, args, kwargs),) = forward_calls
+        q_input, k_input, v_input = args[:3]
+        original_q, original_v = q_input.clone(), v_input.clone()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            forward(library, *args, **kwargs)
+        # Replay the warmed adapter, including quantization and its live scales.
+        for q_gain, v_gain in ((2.0, 4.0), (0.25, 0.5)):
+            q_input.copy_(original_q * q_gain)
+            v_input.copy_(original_v * v_gain)
+            graph.replay()
+            expected = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    bhsd(q_input), bhsd(k_input), bhsd(v_input)
+                )
+                .transpose(1, 2)
+                .reshape_as(out)
+            )
+            torch.testing.assert_close(
+                out.float() / v_gain,
+                expected / v_gain,
+                atol=FP8_ATOL + BF16_ATOL,
+                rtol=BF16_RTOL,
+            )
+        assert len(plans) == 1
 
 
 def test_prims_ts_recipe_requires_prims_ts_library(monkeypatch: pytest.MonkeyPatch) -> None:
