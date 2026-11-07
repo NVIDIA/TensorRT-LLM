@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_scaled_dot_kkt.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk_scaled_dot_kkt.py
 # -*- coding: utf-8 -*-
@@ -42,47 +44,42 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
 ):
-    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_t, i_bh = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
     if IS_VARLEN:
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
-            tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+            tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
-    o_t = tl.arange(0, BT)
+    o_i = tl.arange(0, BT)
+    o_t = i_t * BT + o_i
+    m_t = o_t < T
 
-    p_beta = tl.make_block_ptr(beta + bos * H + i_h, (T, ), (H, ), (i_t * BT, ),
-                               (BT, ), (0, ))
-    b_beta = tl.load(p_beta, boundary_check=(0, ))
+    p_beta = beta + bos * H + i_h + o_t * H
+    b_beta = tl.load(p_beta, mask=m_t, other=0.0)
 
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
     for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
+        o_k = i_k * BK + tl.arange(0, BK)
+        p_k = (k + (bos * Hg + i_h // (H // Hg)) * K + o_t[:, None] * (Hg * K) +
+               o_k[None, :])
+        b_k = tl.load(p_k, mask=m_t[:, None] & (o_k < K)[None, :], other=0.0)
         b_kb = b_k * b_beta[:, None]
         b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
 
     if USE_G:
-        p_g = tl.make_block_ptr(g_cumsum + bos * H + i_h, (T, ), (H, ),
-                                (i_t * BT, ), (BT, ), (0, ))
-        b_g = tl.load(p_g, boundary_check=(0, ))
+        p_g = g_cumsum + bos * H + i_h + o_t * H
+        b_g = tl.load(p_g, mask=m_t, other=0.0)
         b_g_diff = b_g[:, None] - b_g[None, :]
         b_A = b_A * safe_exp(b_g_diff)
 
-    b_A = tl.where(o_t[:, None] > o_t[None, :], b_A, 0)
-    p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1),
-                            (i_t * BT, 0), (BT, BT), (1, 0))
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    b_A = tl.where(o_i[:, None] > o_i[None, :], b_A, 0)
+    p_A = A + (bos * H + i_h) * BT + o_t[:, None] * (BT * H) + o_i[None, :]
+    # The columns span exactly the BT-wide row, so only rows need masking.
+    tl.store(p_A, b_A.to(p_A.dtype.element_ty), mask=m_t[:, None])
 
 
 def chunk_scaled_dot_kkt_fwd(

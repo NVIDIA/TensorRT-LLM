@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/l2norm.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/l2norm.py
 # -*- coding: utf-8 -*-
@@ -28,7 +30,7 @@ def l2norm_fwd_kernel1(
     BD: tl.constexpr,
     eps,
 ):
-    i_t = tl.program_id(0)
+    i_t = tl.program_id(0).to(tl.int64)
     x += i_t * D
     y += i_t * D
     # Compute mean and variance
@@ -61,13 +63,16 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    i_t = tl.program_id(0).to(tl.int64)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_x = (o_t < T)[:, None] & (o_d < D)[None, :]
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 def l2norm_fwd(x: torch.Tensor,
