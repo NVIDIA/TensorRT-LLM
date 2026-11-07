@@ -301,7 +301,6 @@ def _host_query(qualname: str):
 _host_query(f"{_NS}::glm_dense_mlp_small_m_supported")
 _host_query(f"{_NS}::glm_intra_node_reduce_supported")
 _host_query(f"{_NS}::glm_mnnvl_hop_supported")
-_host_query(f"{_NS}::glm_megakernel_info")
 
 
 @torch.library.register_fake(f"{_NS}::glm_megakernel_indexer_tmap")
