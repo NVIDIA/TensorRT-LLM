@@ -94,12 +94,16 @@ only names the code that demonstrates them. Paths are relative to
   - `marlin/`: one kernel ABI, so `MarlinFusedMoEBase` implements three of the
     four abstract methods and a leaf is an identity plus `can_implement`.
   - `cutedsl/`: laid out like the id `trtllm.cutedsl.<kernel>.<quant>`.
-    `grouped_gemm/` holds `CuteDslFusedMoEBase` (construction, the
-    layer-format check in `create_weights`, the locality-domain plan, the
-    weight lifecycle) and its NVFP4 and BF16 leaves; the `_init_format_state`
-    and `_locality_domain_scale_shard` hooks and the leaf-declared
-    `_locality_domain_full_scale_params` carry what only one format needs.
-    The other kernels share only the package-level modules with it.
+    `grouped_gemm/` holds `CuteDslFusedMoEBase` (construction and the
+    layer-format check in `create_weights`) and its NVFP4, NVFP4_PLUS and
+    BF16 leaves. The output-memset stream, the locality-domain plan and its
+    shards, and the weight lifecycle live in the package-level
+    `CuteDslLocalityDomainMixin` (`locality_domain.py`), which the base and
+    leaves of other kernels take. The `_init_format_state` hook, the mixin's
+    `_locality_domain_scale_shard` / `_adjust_locality_domain_plan` hooks and
+    the leaf-declared `_locality_domain_full_scale_params` carry what only one
+    format needs. The other kernels share only the package-level modules with
+    it.
 - Inheriting another implementation: `fused_moe_cute_dsl_b12x.py`
   (`CuteDslB12xNvfp4FusedMoE`, `CuteDslB12xFusedMoEBase`); the guide's B12x
   note says what that inheritance costs.

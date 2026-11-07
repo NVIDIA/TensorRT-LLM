@@ -30,6 +30,7 @@ from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
 )
 from tensorrt_llm._torch.cute_dsl_utils import (
     IS_CUTLASS_DSL_AVAILABLE,
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
     IS_CUTLASS_DSL_RUBIN_AVAILABLE,
 )
 from tensorrt_llm._torch.locality_domain.autotune import LocalityDomainConcurrentTunableRunner
@@ -41,12 +42,14 @@ from tensorrt_llm._torch.locality_domain_utils import (
     start_for_all_locality_domain,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import _runner_tactics_match_tile_size
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
+    MXFP8CutlassFusedMoEMethod,
     interleave_gate_and_linear,
     interleave_linear_and_gate,
 )
@@ -2792,7 +2795,7 @@ def test_locality_domain_outer_preparation_disables_memset_overlap(
         ("cutedsl.runners", "CuteDslFusedMoEBF16Runner", 4, 3),
         # The subclass production instantiates for CUTEDSL_FC12. It overrides
         # _tile_sizes, so a green result on the parent is not evidence about it.
-        ("cutedsl.fused_fc12", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
+        ("cutedsl.fused_fc12.nvfp4", "CuteDslFc12FusedMoENvfp4Runner", 5, 4),
     ],
 )
 def test_workload_identity_alone_does_not_prime_inner_tactics(
@@ -2954,7 +2957,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
     """
     import inspect
 
-    from tensorrt_llm._torch.moe.fused_moe.cutedsl import fused_fc12 as fc12
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import nvfp4 as fc12
 
     captured = {}
 
@@ -3061,6 +3064,82 @@ def _cute_dsl_eligibility(activation: str = "Swiglu", **deployment_kwargs):
         **deployment_kwargs,
     )
     return TrtllmCutedslGroupedGemmNvfp4Impl.can_implement(problem, deployment)
+
+
+@pytest.mark.parametrize(
+    ("intermediate_size_per_partition", "hidden_size", "enabled"),
+    [
+        pytest.param(768, 2048, True, id="halves-are-128-multiples"),
+        # Qwen3-235B-A22B / GLM-4.5 at moe_tp_size=8: 2 * 192 = 384 splits into 192.
+        pytest.param(192, 4096, False, id="fc1-half-not-128-multiple"),
+        # GPT-OSS-120B hidden size: FC2 halves of 1440.
+        pytest.param(2880, 2880, False, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_plan_vetoes_shards_the_kernels_cannot_tile(
+    intermediate_size_per_partition, hidden_size, enabled
+):
+    """The default split halves FC1 N and FC2 N; a half that is not a 128-row
+    multiple falls back to the full-GPU kernels instead of failing at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        intermediate_size_per_partition=intermediate_size_per_partition,
+        hidden_size=hidden_size,
+    )
+    plan = PartitionPlan(enabled=True, num_partitions=2)
+    adjusted = CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, plan)
+    assert adjusted.enabled is enabled
+    if enabled:
+        assert adjusted is plan
+    else:
+        assert "multiple of 128" in adjusted.reason_if_disabled
+    disabled = PartitionPlan(enabled=False, reason_if_disabled="policy off")
+    assert CuteDslLocalityDomainMixin._adjust_locality_domain_plan(host, disabled) is disabled
+
+
+@pytest.mark.parametrize(
+    ("fc1_n", "fc2_n"),
+    [
+        pytest.param(384, 4096, id="fc1-half-odd-multiple-of-64"),
+        pytest.param(1536, 2880, id="fc2-half-not-128-multiple"),
+    ],
+)
+def test_locality_domain_split_rejects_shards_the_kernels_cannot_tile(fc1_n, fc2_n):
+    """The split checks the stored widths itself, so a weight padded past what
+    the plan veto saw fails at load instead of at warmup."""
+    from tensorrt_llm._torch.locality_domain.policy import PartitionPlan
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+
+    host = SimpleNamespace(
+        _locality_domain_plan=PartitionPlan(enabled=True, num_partitions=2),
+        w3_w1_weight=torch.empty(1, fc1_n, 8),
+        w2_weight=torch.empty(1, fc2_n, 8),
+    )
+    with pytest.raises(ValueError, match="multiple of 128"):
+        CuteDslLocalityDomainMixin._split_weights_for_locality_domain(host)
+
+
+def test_locality_domain_mixin_precedes_moe_impl_base():
+    """The mixin's lifecycle overrides chain to super(), so with the bases
+    swapped MoEImplBase's defaults would silently win; every host must list
+    the mixin first."""
+    import tensorrt_llm._torch.moe.fused_moe  # noqa: F401  (registers every leaf)
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.locality_domain import CuteDslLocalityDomainMixin
+    from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+
+    hosts = []
+    pending = list(CuteDslLocalityDomainMixin.__subclasses__())
+    while pending:
+        cls = pending.pop()
+        hosts.append(cls)
+        pending.extend(cls.__subclasses__())
+    assert hosts
+    for cls in hosts:
+        mro = cls.__mro__
+        if MoEImplBase in mro:
+            assert mro.index(CuteDslLocalityDomainMixin) < mro.index(MoEImplBase), cls
 
 
 def test_cute_dsl_locality_domain_rejects_eplb():
@@ -5219,3 +5298,738 @@ def test_bf16_grouped_gemm_finalize_rubin(
         f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
         + "\n  ".join(failed)
     )
+
+
+# ============================================================================
+# Rubin MXFP8 fused FC12 MoE (gather + FC1 + SwiGLU + requant + FC2 + finalize)
+# ============================================================================
+
+
+def _mxfp8_dequant(w_e4m3: torch.Tensor, sf_ue8m0: torch.Tensor) -> torch.Tensor:
+    """[O, K] e4m3 + [O, K/32] UE8M0 -> [O, K] float32."""
+    from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+
+    return dequant_mxfp8_weight(w_e4m3, sf_ue8m0, block_size=32)
+
+
+def _mxfp8_quant_weights(w: torch.Tensor):
+    """[L, N, K] bf16 -> ([L, N, K] e4m3, [L, N, K/32] UE8M0) with 1x32 blocks."""
+    from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
+
+    num_groups, n, k = w.shape
+    w_q, w_sf = quant_bf16_to_mxfp8(w.reshape(num_groups * n, k), 32)
+    return w_q.view(num_groups, n, k), w_sf.view(num_groups, n, k // 32)
+
+
+def _mxfp8_fused_fc12_reference(
+    a_deq: torch.Tensor,
+    w31_q: torch.Tensor,
+    w31_sf: torch.Tensor,
+    w2_q: torch.Tensor,
+    w2_sf: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    tile_idx_to_group_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    permuted_idx_to_expanded_idx: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    tile_size: int,
+    top_k: int,
+    swiglu_limit: float,
+) -> torch.Tensor:
+    """Float32 oracle following the kernel's data flow, expert by expert.
+
+    The FC1 intermediate is requantized to MXFP8 (1x32 UE8M0 blocks) before FC2
+    exactly like the fused kernel does; the reference uses the power-of-two
+    scale picked by ``quant_bf16_to_mxfp8`` (ceil), so blocks whose scale the
+    kernel rounds differently contribute a small per-element mismatch.
+    """
+    from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
+
+    num_tokens, hidden = a_deq.shape
+    out = torch.zeros(num_tokens, hidden, dtype=torch.float32, device=a_deq.device)
+
+    num_valid_tiles = num_non_exiting_tiles.item()
+    groups = tile_idx_to_group_idx[:num_valid_tiles].cpu().tolist()
+    limits = tile_idx_to_mn_limit[:num_valid_tiles].cpu().tolist()
+    permuted = permuted_idx_to_expanded_idx.cpu()
+    rows_per_expert = {}
+    for tile_idx, (group, limit) in enumerate(zip(groups, limits)):
+        start = tile_idx * tile_size
+        if limit > start:
+            rows_per_expert.setdefault(group, []).append(permuted[start:limit])
+
+    for expert, chunks in rows_per_expert.items():
+        expanded = torch.cat(chunks).to(torch.long)
+        tokens = expanded // top_k
+        slots = expanded % top_k
+        w31 = _mxfp8_dequant(w31_q[expert], w31_sf[expert])  # [2I, H]
+        w2 = _mxfp8_dequant(w2_q[expert], w2_sf[expert])  # [H, I]
+        h = a_deq[tokens.to(a_deq.device)] @ w31.t()  # [n, 2I]
+        act = swiglu_ref(h, swiglu_limit)  # up * silu(gate)
+        act_q, act_sf = quant_bf16_to_mxfp8(act, 32)
+        act_deq = _mxfp8_dequant(act_q, act_sf)
+        y = act_deq @ w2.t()  # [n, H]
+        scale = token_final_scales[tokens.to(a_deq.device), slots.to(a_deq.device)]
+        out.index_add_(0, tokens.to(a_deq.device), y * scale[:, None])
+    return out
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_moe_module_mxfp8_chunked_forward_with_aux_stream():
+    """A layer whose ``moe_max_num_tokens`` is below the batch gets an aux
+    stream for chunk overlap. The persistent MXFP8 fused FC12 grid needs all
+    its CTAs resident, so the scheduler must run the chunks one after another
+    on the main stream; the chunked forward then finishes and matches an
+    unchunked one."""
+    from _torch.moe.quantize_utils import get_test_quant_params
+    from transformers.configuration_utils import PretrainedConfig
+
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.moe.fused_moe import RenormalizeMoeRoutingMethod
+    from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
+    from tensorrt_llm._utils import mpi_rank
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantAlgo
+
+    num_tokens, chunk_tokens, top_k = 1024, 256, 8
+    hidden_size, intermediate_size, num_experts = 2048, 1536, 64
+    dtype = torch.bfloat16
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        input_tensor = torch.randn((num_tokens, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((num_tokens, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, input_tensor, "CUTEDSL"
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        weights = quantize_util.create_weights(**quant_kwargs)
+
+        pretrained_config = PretrainedConfig()
+        pretrained_config.num_experts = num_experts
+        pretrained_config.hidden_size = hidden_size
+        pretrained_config.intermediate_size = intermediate_size
+        pretrained_config.torch_dtype = dtype
+
+        def create_module(moe_max_num_tokens: int):
+            model_config = ModelConfig(
+                pretrained_config=pretrained_config,
+                quant_config=quant_config,
+                mapping=mapping,
+                moe_backend="CUTEDSL",
+                max_num_tokens=num_tokens,
+                moe_max_num_tokens=moe_max_num_tokens,
+            )
+            moe = create_moe(
+                routing_method=routing_method,
+                num_experts=num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                dtype=dtype,
+                reduce_results=True,
+                model_config=model_config,
+                allow_backend_degradation=False,
+            )
+            assert type(moe.backend).__name__ == "TrtllmCutedslFusedFc12Mxfp8Impl"
+            moe.create_weights()
+            moe.load_weights([weights])
+            moe.post_load_weights()
+            moe.cuda()
+            return moe
+
+        full_moe = create_module(num_tokens)
+        chunked_moe = create_module(chunk_tokens)
+        assert full_moe.aux_stream is None
+        assert chunked_moe.aux_stream is not None
+
+        with torch.inference_mode():
+            full_output = full_moe.forward(input_tensor, router_logits)
+            chunked_output = chunked_moe.forward(input_tensor, router_logits)
+            torch.cuda.synchronize()
+
+        # Each token's routing and MXFP8 input quantization do not depend on
+        # the other tokens. The finalize scatter-adds the top-k contributions
+        # in no fixed order, so two unchunked runs already differ by about
+        # 0.25% RMS (0.45% on the worst row) at outputs of order 1e5; compare
+        # relative errors, not elements.
+        diff = (chunked_output.float() - full_output.float()).norm(dim=1)
+        row_rel = diff / full_output.float().norm(dim=1).clamp_min(1e-6)
+        rms_rel = (diff.norm() / full_output.float().norm()).item()
+        cos = torch.nn.functional.cosine_similarity(
+            chunked_output.float().flatten(), full_output.float().flatten(), dim=0
+        ).item()
+        assert rms_rel < 1e-2, f"chunked vs unchunked RMS error {rms_rel:.4%}"
+        assert row_rel.max().item() < 2e-2, (
+            f"worst row error {row_rel.max().item():.4%} at row {row_rel.argmax().item()}"
+        )
+        assert cos > 0.9999, f"cosine {cos}"
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+@pytest.mark.parametrize("swiglu_limit", [float("inf"), 0.5], ids=["nolimit", "limit0.5"])
+@pytest.mark.parametrize("tile_size", [128, 256])
+@pytest.mark.parametrize(
+    "num_tokens,top_k,ep_size,hidden_size,interm_size,num_experts",
+    [
+        (128, 2, 1, 1024, 512, 16),
+        (515, 8, 8, 1024, 512, 64),
+        # Qwen3.5-397B expert geometry: hidden 4096, inner 1024, 512 experts,
+        # top-k 10; EP4 large batch and EP16 decode-shaped.
+        (1024, 10, 4, 4096, 1024, 512),
+        (32, 10, 16, 4096, 1024, 512),
+    ],
+)
+def test_mxfp8_fused_fc12_moe_rubin(
+    num_tokens: int,
+    top_k: int,
+    ep_size: int,
+    hidden_size: int,
+    interm_size: int,
+    num_experts: int,
+    tile_size: int,
+    swiglu_limit: float,
+):
+    """End-to-end check of the fused MXFP8 FC1+FC2 MoE op against a float oracle.
+
+    Exercises the full adapter contract: linear per-token activation scales,
+    swizzled + gate/up-interleaved FC1 weights and scales, swizzled FC2 scales,
+    unit alphas / norm const, moe_sort metadata, and the scatter-add finalize
+    into a pre-zeroed output. The small shapes additionally run every tactic
+    the runner enumerates for the routing tile. A finite ``swiglu_limit``
+    (smallest shape only) clamps a large share of the FC1 gate and up values,
+    which are O(1) here.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    if swiglu_limit != float("inf") and num_experts != 16:
+        pytest.skip("The clamp runs on the smallest shape only")
+    torch.manual_seed(0)
+    sf_vec_size = 32
+    num_local_experts = num_experts // ep_size
+
+    routing_logits = torch.randn(num_tokens, num_experts, device="cuda")
+    token_final_scales, token_selected_experts = routing_logits.topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    # Ensure at least one route lands on a local expert.
+    token_selected_experts[0, 0] = 0
+
+    (
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        expanded_idx_to_permuted_idx,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_local_experts,
+        tile_tokens_dim=tile_size,
+    )
+
+    # Activations: dynamic MXFP8 with LINEAR per-token scales (what the backend
+    # produces in quantize_input for this path).
+    a = torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    a_q, a_sf = torch.ops.trtllm.mxfp8_quantize(a, False, alignment=128)
+    a_sf = a_sf.view(num_tokens, hidden_size // sf_vec_size)
+    a_deq = _mxfp8_dequant(a_q, a_sf)
+
+    # Weights: [up(w3); gate(w1)] stacked along N for FC1, plain for FC2. Scale
+    # to keep the MoE output O(1) so absolute tolerances are meaningful.
+    w31 = torch.randn(
+        num_local_experts, 2 * interm_size, hidden_size, dtype=torch.bfloat16, device="cuda"
+    ) / (hidden_size**0.5)
+    w2 = torch.randn(
+        num_local_experts, hidden_size, interm_size, dtype=torch.bfloat16, device="cuda"
+    ) / (interm_size**0.5)
+    w31_q, w31_sf = _mxfp8_quant_weights(w31)
+    w2_q, w2_sf = _mxfp8_quant_weights(w2)
+
+    # Kernel-side layouts: gate/up interleave (granularity 64) of the FC1
+    # weight and scales, then the 128x4 block-scale swizzle for both GEMMs.
+    w31_kernel = interleave_linear_and_gate(w31_q.view(torch.uint8), group_size=64, dim=1).view(
+        torch.float8_e4m3fn
+    )
+    w31_sf_interleaved = interleave_linear_and_gate(w31_sf, group_size=64, dim=1)
+    w31_sf_kernel = swizzle_sf(w31_sf_interleaved, 2 * interm_size, hidden_size, sf_vec_size).view(
+        num_local_experts, 2 * interm_size, hidden_size // sf_vec_size
+    )
+    w2_sf_kernel = swizzle_sf(w2_sf, hidden_size, interm_size, sf_vec_size).view(
+        num_local_experts, hidden_size, interm_size // sf_vec_size
+    )
+    unit_alpha = torch.ones(num_local_experts, dtype=torch.float32, device="cuda")
+    unit_norm_const = torch.ones(1, dtype=torch.float32, device="cuda")
+
+    out_ref = _mxfp8_fused_fc12_reference(
+        a_deq,
+        w31_q,
+        w31_sf,
+        w2_q,
+        w2_sf,
+        token_final_scales,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        tile_size,
+        top_k,
+        swiglu_limit,
+    )
+
+    def check(out: torch.Tensor, label: str):
+        out_f32 = out.float()
+        match = torch.isclose(out_f32, out_ref, rtol=1e-1, atol=1e-1).sum().item() / out_ref.numel()
+        cos = torch.nn.functional.cosine_similarity(
+            out_f32.flatten(), out_ref.flatten(), dim=0
+        ).item()
+        assert match >= 0.95 and cos >= 0.99, (
+            f"{label}: match={match:.4f} cosine={cos:.5f} (tile_size={tile_size}, "
+            f"tokens={num_tokens}, top_k={top_k}, ep={ep_size})"
+        )
+
+    common_kwargs = dict(
+        input=a_q,
+        fc1_weight=w31_kernel,
+        input_scale=a_sf,
+        fc1_weight_scale=w31_sf_kernel,
+        fc1_alpha=unit_alpha,
+        tile_idx_to_group_idx=tile_idx_to_group_idx,
+        tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles=num_non_exiting_tiles,
+        fc1_norm_const=unit_norm_const,
+        fc2_weight=w2_q,
+        fc2_weight_scale=w2_sf_kernel,
+        fc2_alpha=unit_alpha,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        # A negative limit disables the clamp.
+        swiglu_limit=swiglu_limit if swiglu_limit != float("inf") else -1.0,
+    )
+
+    # 1. Public op with the default tactic; the output must be pre-zeroed.
+    output = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(output=output, **common_kwargs)
+    torch.cuda.synchronize()
+    check(output, "default tactic")
+
+    # 1b. zero_output=True: the op clears the output inside its workspace
+    #     reset launch, so a garbage-filled buffer must give the same result.
+    output_dirty = torch.full(
+        (num_tokens, hidden_size), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            output=output_dirty, zero_output=True, **common_kwargs
+        )
+    torch.cuda.synchronize()
+    assert not torch.isnan(output_dirty).any(), "zero_output left rows uncleared"
+    check(output_dirty, "default tactic, zero_output=True")
+    # The finalize's atomic scatter-add order differs between runs, so allow
+    # bf16 rounding noise between the two launches.
+    torch.testing.assert_close(output_dirty.float(), output.float(), rtol=2e-2, atol=2e-2)
+
+    # Raw BF16 input quantizes in the workspace reset. A poisoned scale
+    # placeholder must stay unread and unmodified by the custom op.
+    raw_kwargs = dict(common_kwargs, input=a, input_scale=torch.full_like(a_sf, 255))
+    raw_output = torch.empty_like(output)
+    with torch.inference_mode():
+        torch.ops.trtllm.cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin(
+            output=raw_output, zero_output=True, **raw_kwargs
+        )
+    torch.cuda.synchronize()
+    check(raw_output, "raw BF16 input, quantize/reset fusion")
+    assert (raw_kwargs["input_scale"] == 255).all()
+    torch.testing.assert_close(raw_output.float(), output.float(), rtol=2e-2, atol=2e-2)
+
+    # 2. Every tactic the runner enumerates (small shapes only: each distinct
+    #    geometry is a DSL compile).
+    if num_experts > 64 or swiglu_limit != float("inf"):
+        return
+    runner = Sm107Mxfp8FusedFc12MoeRunner(
+        num_experts, top_k, num_local_experts, 0, tile_size, swiglu_limit=swiglu_limit
+    )
+    inputs = [
+        a_q,
+        w31_kernel,
+        a_sf,
+        w31_sf_kernel,
+        unit_alpha,
+        tile_idx_to_group_idx,
+        tile_idx_to_mn_limit,
+        permuted_idx_to_expanded_idx,
+        num_non_exiting_tiles,
+        unit_norm_const,
+        w2_q,
+        w2_sf_kernel,
+        unit_alpha,
+        output,
+        token_final_scales,
+    ]
+    tactics = runner.get_valid_tactics(inputs, OptimizationProfile())
+    assert len(tactics) > 0, f"No valid tactics for tile_size={tile_size}"
+    assert all(t[0][0] == tile_size for t in tactics), "mma_tiler_m must equal the routing tile"
+    # The FC2 cache policy follows stream_weights.
+    assert all(t[4] == t[5] for t in tactics), "tactics must not decouple FC2"
+    failed = []
+    for tactic in tactics:
+        mma_tiler, mma_inst, cluster, scheduler, stream_weights, fc2_stream_weights = tactic
+        label = (
+            f"mma_tiler={mma_tiler} inst={mma_inst} cluster={cluster} sched={scheduler} "
+            f"stream_weights={stream_weights} fc2_stream_weights={fc2_stream_weights}"
+        )
+        output.zero_()
+        with torch.inference_mode():
+            runner.forward(inputs, tactic=tactic)
+        torch.cuda.synchronize()
+        try:
+            check(output, label)
+        except AssertionError as e:  # collect every failing geometry
+            failed.append(str(e))
+    assert not failed, (
+        f"tile_size={tile_size}: {len(failed)}/{len(tactics)} tactics failed:\n  "
+        + "\n  ".join(failed)
+    )
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="MXFP8 fused FC12 MoE requires Rubin (SM107) with a CuTe DSL build that supports the fused FC12 kernel",
+)
+def test_mxfp8_fused_fc12_tactic_roundtrips_through_autotuner_cache():
+    """Tactics must survive the AutoTuner's JSON/repr round trip."""
+    import ast
+    import json
+
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    runner = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 128)
+    tactic = runner._default_tactic()
+    assert tactic == ((128, 128, 128), (128, 128, 64), (1, 1), "l2_atomic", False, False)
+    assert ast.literal_eval(repr(tactic)) == tactic
+    assert runner._normalize_tactic(json.loads(json.dumps(tactic))) == tactic
+    runner_2cta = Sm107Mxfp8FusedFc12MoeRunner(64, 8, 8, 0, 256)
+    assert runner_2cta._default_tactic() == (
+        (256, 128, 128),
+        (256, 128, 64),
+        (2, 1),
+        "l2_atomic",
+        False,
+        False,
+    )
+    # Both cache policies survive the round trip. Shorter tactics from caches
+    # or precomputed strings normalize: four elements keep the default
+    # policy, five let the FC2 loads follow stream_weights.
+    decoupled = ((128, 256, 256), (128, 256, 64), (1, 1), "static", True, False)
+    assert runner._normalize_tactic(json.loads(json.dumps(decoupled))) == decoupled
+    streamed = ((128, 256, 256), (128, 256, 64), (1, 1), "static", True)
+    assert runner._normalize_tactic(json.loads(json.dumps(streamed))) == streamed + (True,)
+    legacy = ((128, 256, 256), (128, 256, 64), (1, 1), "static")
+    assert runner._normalize_tactic(ast.literal_eval(repr(legacy))) == legacy + (False, False)
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107 or not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    reason="Sm107Mxfp8FusedFc12MoeRunner constructs on Rubin (SM107) only, with a CuTe DSL build "
+    "that supports the fused FC12 kernel",
+)
+def test_mxfp8_fused_fc12_sparse_gather_selection() -> None:
+    """The gather variant is chosen from static shapes, scaled by the rank's expert share.
+
+    Qwen3.5-397B geometry: 512 experts, top-k 10. ``padded_routes`` is the
+    static ``permuted_idx_to_expanded_idx`` length the backend hands the op.
+    """
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import Sm107Mxfp8FusedFc12MoeRunner
+
+    def runner(num_local_experts):
+        return Sm107Mxfp8FusedFc12MoeRunner(512, 10, num_local_experts, 0, 128)
+
+    # EP16 decode: 32 tokens, ~20 local routes spread over ~20 tiles -> sparse.
+    assert runner(32)._use_sparse_gather(num_rows=32, padded_routes=20 * 128)
+    # EP16 mid range, 2048 tokens: ~1280 local routes but heavy per-expert
+    # padding (32 experts x 127 rows) -> still sparse, because the estimate
+    # counts only this rank's share of the routes.
+    assert runner(32)._use_sparse_gather(num_rows=2048, padded_routes=1280 + 32 * 127)
+    # EP4 prefill, 16384 tokens: routes dominate the padding -> static.
+    assert not runner(128)._use_sparse_gather(
+        num_rows=16384, padded_routes=16384 * 10 // 4 + 128 * 127
+    )
+    # No EP: a single 128-row tile per expert, all full -> static.
+    assert not runner(512)._use_sparse_gather(num_rows=8192, padded_routes=8192 * 10)
+    # The estimate never drops below one route per arriving row (alltoall).
+    assert runner(1)._use_sparse_gather(num_rows=4, padded_routes=128)
+    assert not runner(1)._use_sparse_gather(num_rows=100, padded_routes=128)
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_moe_tuning_buckets_cover_decode_shapes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The MXFP8 MoE tuning buckets must not depend on the warmup forward's token count.
+
+    The engine's autotuner warmup runs one forward at whatever token count the
+    KV cache allows. With ``tune_max_num_tokens`` the module anchors its
+    power-of-two token buckets to the saturation token count, so decode shapes
+    (a few tokens per DP rank) are profiled regardless of that warmup shape.
+    Profile generation only reads tensor shapes, so this runs on CPU tensors,
+    with a tuner of its own: the profiling cache reads the device name and
+    capability at construction, which a GPU-less node cannot answer.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoEMxfp8Runner
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *args, **kwargs: "cpu")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *args, **kwargs: (0, 0))
+    tuner = AutoTuner()
+
+    num_experts, top_k, hidden = 128, 10, 4096
+    warmup_tokens = 3  # an odd shape: last_positive_power_of_2(3) == 2
+
+    def profiled_token_counts(tune_max_num_tokens):
+        runner = CuteDslFusedMoEMxfp8Runner(
+            forward_impl=None,
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            local_expert_offset=0,
+            tune_max_num_tokens=tune_max_num_tokens,
+        )
+        inputs = [
+            torch.empty(warmup_tokens, hidden, dtype=torch.float8_e4m3fn),
+            torch.empty(warmup_tokens, top_k, dtype=torch.int32),
+            torch.empty(warmup_tokens, top_k, dtype=torch.float32),
+            torch.empty(warmup_tokens, hidden // 32, dtype=torch.uint8),
+            torch.empty(warmup_tokens, hidden, dtype=torch.bfloat16),
+        ]
+        profiles = tuner._optimization_profiles(runner.get_tuning_config(), inputs)
+        return {p.get_opt_shapes()[0][0] for p in profiles}
+
+    anchored = profiled_token_counts(tune_max_num_tokens=8192)
+    assert {1, 2, 4, 8, 32, 128, 1024, 8192} <= anchored, anchored
+
+    # Without the anchor only the warmup shape's buckets exist; keep this as
+    # documentation of the failure mode the anchor prevents.
+    unanchored = profiled_token_counts(tune_max_num_tokens=None)
+    assert 4 not in unanchored and 8 not in unanchored, unanchored
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("hidden", [2048, 4096, 7168])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mxfp8_local_input_quantization_deferred(monkeypatch, hidden, dtype) -> None:
+    """Only local computation may defer quantization; communication needs bytes.
+
+    The cutoff is an element count, so the largest deferred row count follows
+    from the hidden size rather than being tied to one model.
+    """
+    impl = TrtllmCutedslFusedFc12Mxfp8Impl
+    backend = SimpleNamespace(
+        hidden_size=hidden,
+        quant_method=SimpleNamespace(
+            BLOCK_SIZE=32, weight_alignment=MXFP8CutlassFusedMoEMethod.weight_alignment
+        ),
+        FUSED_INPUT_QUANT_MAX_ELEMENTS=impl.FUSED_INPUT_QUANT_MAX_ELEMENTS,
+    )
+    backend._fuses_input_quant = impl._fuses_input_quant.__get__(backend)
+    max_rows = impl.FUSED_INPUT_QUANT_MAX_ELEMENTS // hidden
+    scale_cols = hidden // 32
+    calls = []
+
+    def native_quantize(tensor, swizzled, alignment):
+        calls.append((tensor, swizzled, alignment))
+        return (
+            torch.empty_like(tensor, dtype=torch.float8_e4m3fn),
+            torch.empty((tensor.size(0), scale_cols), dtype=torch.uint8),
+        )
+
+    monkeypatch.setattr(torch.ops.trtllm, "mxfp8_quantize", native_quantize)
+    for rows in (0, 1, max_rows):
+        x = torch.empty((rows, hidden), dtype=dtype)
+        raw, sf = impl.quantize_input(backend, x, post_quant_comm=False)
+        assert raw is x and sf.shape == (rows, scale_cols) and sf.dtype == torch.uint8
+    assert not calls
+    x = torch.empty((max_rows, hidden), dtype=dtype)
+    quantized, sf = impl.quantize_input(backend, x, post_quant_comm=True)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 1
+    assert calls[0][0] is x and calls[0][1:] == (
+        False,
+        MXFP8CutlassFusedMoEMethod.weight_alignment,
+    )
+    assert sf.shape == (max_rows, scale_cols)
+    larger = torch.empty((max_rows + 1, hidden), dtype=dtype)
+    quantized, _ = impl.quantize_input(backend, larger, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 2
+    # Non-contiguous rows cannot be vector-loaded by the reset kernel.
+    strided = torch.empty((2, hidden * 2), dtype=dtype)[:, :hidden]
+    quantized, _ = impl.quantize_input(backend, strided, post_quant_comm=False)
+    assert quantized.dtype == torch.float8_e4m3fn and len(calls) == 3
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("over_limit", [False, True])
+def test_mxfp8_output_past_int32_falls_back_to_memset(monkeypatch, over_limit) -> None:
+    """The Rubin workspace reset indexes the output with Int32, so an output
+    past that extent is cleared by the memset rather than inside the op."""
+    impl = TrtllmCutedslFusedFc12Mxfp8Impl
+    leaf = impl.__new__(impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.expert_size_per_partition = 4
+    leaf.slot_start = 0
+    leaf.num_slots = 4
+    leaf.mapping = SimpleNamespace(moe_ep_size=1)
+    leaf.act_clamp = float("inf")
+    leaf.w3_w1_weight = torch.empty(0)
+    leaf.w2_weight = torch.empty(0)
+    leaf.quant_scales = SimpleNamespace(
+        fc31_weight_block_scale=torch.empty(0, dtype=torch.int32),
+        fc2_weight_block_scale=torch.empty(0, dtype=torch.int32),
+    )
+    memsets = []
+    leaf._memset_moe_output = lambda *args: memsets.append(args)
+    op_calls = []
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "moe_sort",
+        lambda **kwargs: tuple(torch.empty(1, dtype=torch.int32) for _ in range(6)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        torch.ops.trtllm,
+        "cute_dsl_mxfp8_fused_fc12_moe_inplace_rubin",
+        lambda **kwargs: op_calls.append(kwargs),
+        raising=False,
+    )
+    num_tokens, hidden = 8, 64
+    moe_output = torch.empty((num_tokens, hidden), dtype=torch.bfloat16)
+    limit = moe_output.numel() - 1 if over_limit else moe_output.numel()
+    monkeypatch.setattr(impl, "_ZERO_OUTPUT_MAX_ELEMENTS", limit)
+
+    impl.run_moe_mxfp8_impl(
+        leaf,
+        x=torch.empty((num_tokens, hidden), dtype=torch.float8_e4m3fn),
+        token_selected_experts=torch.zeros((num_tokens, 2), dtype=torch.int32),
+        token_final_scales=torch.ones((num_tokens, 2)),
+        x_sf=torch.empty((num_tokens, hidden // 32), dtype=torch.uint8),
+        moe_output=moe_output,
+    )
+
+    assert len(op_calls) == 1
+    assert op_calls[0]["zero_output"] is (not over_limit)
+    assert len(memsets) == (1 if over_limit else 0)
+
+
+def _mxfp8_fused_fc12_op_tensors(tokens: int = 4, hidden: int = 512, top_k: int = 2) -> dict:
+    """The tensors the MXFP8 fused FC12 ops take, on the CPU, valid by default.
+
+    The intermediate size 1408 makes the FC2 scale rows 44 bytes wide, which
+    the swizzled scale layout allows."""
+    experts, intermediate, rows = 2, 1408, 128
+    return {
+        "input": torch.zeros(tokens, hidden, dtype=torch.uint8),
+        "input_scale": torch.zeros(tokens, hidden // 32, dtype=torch.uint8),
+        "fc1_weight": torch.zeros(experts, 2 * intermediate, hidden, dtype=torch.uint8),
+        "fc1_weight_scale": torch.zeros(experts, 2 * intermediate, hidden // 32, dtype=torch.uint8),
+        "fc2_weight": torch.zeros(experts, hidden, intermediate, dtype=torch.uint8),
+        "fc2_weight_scale": torch.zeros(experts, hidden, intermediate // 32, dtype=torch.uint8),
+        "output": torch.zeros(tokens, hidden, dtype=torch.bfloat16),
+        "fc1_alpha": torch.ones(experts),
+        "fc2_alpha": torch.ones(experts),
+        "fc1_norm_const": torch.ones(1),
+        "tile_idx_to_group_idx": torch.zeros(1, dtype=torch.int32),
+        "tile_idx_to_mn_limit": torch.zeros(1, dtype=torch.int32),
+        "permuted_idx_to_expanded_idx": torch.zeros(rows, dtype=torch.int32),
+        "num_non_exiting_tiles": torch.zeros(1, dtype=torch.int32),
+        "token_final_scales": torch.zeros(tokens, top_k),
+    }
+
+
+def _validate_mxfp8_fused_fc12_op_tensors(tensors: dict, top_k: int = 2) -> None:
+    aligned_names = (
+        "input",
+        "input_scale",
+        "fc1_weight",
+        "fc1_weight_scale",
+        "fc2_weight",
+        "fc2_weight_scale",
+        "output",
+    )
+    cute_dsl_custom_ops._validate_mxfp8_fused_fc12_op_inputs(
+        {name: tensors[name] for name in aligned_names},
+        {name: t for name, t in tensors.items() if name not in aligned_names},
+        tensors["input"],
+        tensors["fc1_weight"],
+        tensors["output"],
+        tensors["token_final_scales"],
+        top_k,
+        512,
+    )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "case, message",
+    [
+        ("strided_routing_scales", "token_final_scales must be contiguous"),
+        ("misaligned_input", "input data pointer must be 16-byte aligned"),
+        ("strided_output", "output must be contiguous"),
+        ("hidden_not_multiple", "hidden size 256 must be a multiple of 512"),
+        ("fp32_output", "output must be bfloat16"),
+        ("routing_scales_shape", "token_final_scales must be float32"),
+    ],
+)
+def test_mxfp8_fused_fc12_op_rejects_inputs_the_kernel_misreads(case: str, message: str) -> None:
+    """The MXFP8 fused FC12 ops build dense layouts from raw pointers, so a
+    strided view, a misaligned slice or a shape mismatch must raise
+    ``ValueError`` (not an ``assert`` that ``python -O`` drops) before any
+    launch. A valid set passes."""
+    _validate_mxfp8_fused_fc12_op_tensors(_mxfp8_fused_fc12_op_tensors())
+    tensors = _mxfp8_fused_fc12_op_tensors()
+    if case == "strided_routing_scales":
+        tensors["token_final_scales"] = torch.zeros(2, 4).t()
+    elif case == "misaligned_input":
+        tensors["input"] = torch.zeros(4 * 512 + 1, dtype=torch.uint8)[1:].view(4, 512)
+    elif case == "strided_output":
+        tensors["output"] = torch.zeros(4, 1024, dtype=torch.bfloat16)[:, :512]
+    elif case == "hidden_not_multiple":
+        tensors = _mxfp8_fused_fc12_op_tensors(hidden=256)
+    elif case == "fp32_output":
+        tensors["output"] = torch.zeros(4, 512)
+    elif case == "routing_scales_shape":
+        tensors["token_final_scales"] = torch.zeros(4, 3)
+    with pytest.raises(ValueError, match=message):
+        _validate_mxfp8_fused_fc12_op_tensors(tensors)
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_input_quantization_tuning_cache_isolation() -> None:
+    """Changing activation dtype must not reuse prequantized timing decisions."""
+    keys = {
+        TrtllmCutedslFusedFc12Mxfp8Impl._tuner_key(dtype)
+        for dtype in (torch.float8_e4m3fn, torch.bfloat16, torch.float16)
+    }
+    assert len(keys) == 3

@@ -89,6 +89,11 @@ class MoEInputRequirement:
     # output before the next chunk runs. ``FusedCommMoEScheduler`` copies no
     # chunk output, so it refuses a backend that declares this.
     run_moe_reuses_buffers: bool = False
+    # ``run_moe`` launches a persistent grid that needs all its CTAs resident
+    # at once and waits on its own progress counters. Two calls in flight on
+    # different streams can each hold part of the GPU and wait forever, so a
+    # multi-chunk forward runs every chunk on one stream.
+    run_moe_requires_coresident_grid: bool = False
 
     # No sentinel for invalid_token_expert_id: every Communication uses -1.
 
