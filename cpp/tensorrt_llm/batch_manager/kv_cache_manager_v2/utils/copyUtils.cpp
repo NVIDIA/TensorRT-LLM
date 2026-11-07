@@ -25,7 +25,6 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -147,48 +146,14 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 
 // Asynchronous disk I/O. CUDA runs all host functions of a process on one thread, so with the synchronous path
 // every disk transfer waits for every other one. Here the host function only hands the transfer to a worker pool,
-// and the stream waits on a completion flag (cuStreamWaitValue64), so stream ordering is unchanged.
-// Tuning: TLLM_KVCM2_DISK_IO_CHUNK (bytes per work item, default 4 MiB), TLLM_KVCM2_DISK_IO_DIRECT_WRITE /
-// _DIRECT_READ (O_DIRECT, default 1 / 0), TLLM_KVCM2_DISK_IO_STATS_SEC (stats interval, default 0 = off).
+// and the stream waits on a completion flag (cuStreamWaitValue64), so stream ordering is unchanged. Each transfer
+// is split into kDiskIoChunkBytes pieces; aligned writes use O_DIRECT so eviction writes skip the page cache.
 namespace
 {
 
-size_t diskIoEnv(char const* name, size_t fallback) noexcept
-{
-    char const* value = std::getenv(name);
-    if (value == nullptr || *value == '\0')
-    {
-        return fallback;
-    }
-    char* end = nullptr;
-    unsigned long long const parsed = std::strtoull(value, &end, 10);
-    return end == value ? fallback : static_cast<size_t>(parsed);
-}
+constexpr ssize_t kDiskIoChunkBytes = ssize_t{4} << 20;
 
 std::atomic<size_t> gAsyncDiskIoThreads{0};
-
-struct DiskIoConfig
-{
-    size_t chunkBytes;
-    size_t statsSec;
-    bool directWrite;
-    bool directRead;
-};
-
-DiskIoConfig const& diskIoConfig() noexcept
-{
-    static DiskIoConfig const config{
-        std::max<size_t>(diskIoEnv("TLLM_KVCM2_DISK_IO_CHUNK", size_t{4} << 20), size_t{64} << 10),
-        diskIoEnv("TLLM_KVCM2_DISK_IO_STATS_SEC", 0), diskIoEnv("TLLM_KVCM2_DISK_IO_DIRECT_WRITE", 1) != 0,
-        diskIoEnv("TLLM_KVCM2_DISK_IO_DIRECT_READ", 0) != 0};
-    return config;
-}
-
-int64_t currentNs() noexcept
-{
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
 
 // O_DIRECT descriptors, reopened via /proc/self/fd and keyed by fd and inode, since a closed pool file's fd
 // number can be reused for another file.
@@ -259,21 +224,9 @@ bool isDirectAligned(ssize_t pos, ssize_t size, void const* data) noexcept
         && static_cast<uintptr_t>(size) % kDirectAlign == 0 && reinterpret_cast<uintptr_t>(data) % kDirectAlign == 0;
 }
 
-bool readPiece(int fd, ssize_t pos, void* data, ssize_t size) noexcept
-{
-    if (diskIoConfig().directRead && isDirectAligned(pos, size, data))
-    {
-        if (int const direct = directFd(fd); direct >= 0)
-        {
-            return readAll(direct, pos, data, size);
-        }
-    }
-    return readAll(fd, pos, data, size);
-}
-
 bool writePiece(int fd, ssize_t pos, void const* data, ssize_t size) noexcept
 {
-    if (diskIoConfig().directWrite && isDirectAligned(pos, size, data))
+    if (isDirectAligned(pos, size, data))
     {
         if (int const direct = directFd(fd); direct >= 0)
         {
@@ -281,71 +234,6 @@ bool writePiece(int fd, ssize_t pos, void const* data, ssize_t size) noexcept
         }
     }
     return writeAll(fd, pos, data, size);
-}
-
-struct DiskIoStats
-{
-    std::atomic<uint64_t> calls{0};
-    std::atomic<uint64_t> bytes{0};
-    std::atomic<uint64_t> queueNs{0};
-    std::atomic<uint64_t> serviceNs{0};
-};
-
-DiskIoStats gReadStats;
-DiskIoStats gWriteStats;
-
-void startDiskIoStatsThread()
-{
-    static std::once_flag once;
-    std::call_once(once,
-        []
-        {
-            size_t const interval = diskIoConfig().statsSec;
-            if (interval == 0)
-            {
-                return;
-            }
-            std::thread(
-                [interval]
-                {
-                    struct Last
-                    {
-                        uint64_t calls = 0, bytes = 0, queueNs = 0, serviceNs = 0;
-                    };
-                    Last last[2];
-                    int64_t lastNs = currentNs();
-                    for (;;)
-                    {
-                        std::this_thread::sleep_for(std::chrono::seconds(interval));
-                        int64_t const t = currentNs();
-                        double const windowS = static_cast<double>(t - lastNs) / 1e9;
-                        DiskIoStats const* stats[2] = {&gReadStats, &gWriteStats};
-                        char const* names[2] = {"disk_to_host", "host_to_disk"};
-                        for (int i = 0; i < 2; ++i)
-                        {
-                            Last const now{stats[i]->calls.load(), stats[i]->bytes.load(), stats[i]->queueNs.load(),
-                                stats[i]->serviceNs.load()};
-                            uint64_t const calls = now.calls - last[i].calls;
-                            if (calls != 0)
-                            {
-                                double const gib = static_cast<double>(now.bytes - last[i].bytes) / (1ull << 30);
-                                std::fprintf(stderr,
-                                    "[kvCacheManagerV2] disk I/O stats: pid=%d dir=%s window_s=%.1f calls=%llu "
-                                    "GiB=%.3f GiB_per_s=%.3f "
-                                    "queue_ms_mean=%.3f service_ms_mean=%.3f busy_frac=%.3f\n",
-                                    static_cast<int>(::getpid()), names[i], windowS,
-                                    static_cast<unsigned long long>(calls), gib, gib / windowS,
-                                    (now.queueNs - last[i].queueNs) / static_cast<double>(calls) / 1e6,
-                                    (now.serviceNs - last[i].serviceNs) / static_cast<double>(calls) / 1e6,
-                                    (now.serviceNs - last[i].serviceNs) / 1e9 / windowS);
-                            }
-                            last[i] = now;
-                        }
-                        lastNs = t;
-                    }
-                })
-                .detach();
-        });
 }
 
 // Completion flags: a ring of words in pinned, device-mapped host memory. Transfer t uses word t % kFlagSlots
@@ -409,8 +297,6 @@ struct DiskTransfer
     std::vector<Task<MemAddress, DiskAddress>> reads;
     std::vector<Task<DiskAddress, MemAddress>> writes;
     ssize_t numBytes = 0;
-    int64_t enqueueNs = 0;
-    std::atomic<int64_t> startNs{0};
     uint64_t ticket = 0; // 0: no completion flag (synchronous fallback)
     std::atomic<size_t> remaining{0};
     std::atomic<bool> ok{true};
@@ -425,7 +311,7 @@ struct DiskTransfer
         if (isRead)
         {
             auto const& t = reads[task];
-            return readPiece(t.src.fd, t.src.pos + offset, reinterpret_cast<std::byte*>(t.dst) + offset, length);
+            return readAll(t.src.fd, t.src.pos + offset, reinterpret_cast<std::byte*>(t.dst) + offset, length);
         }
         auto const& t = writes[task];
         return writePiece(t.dst.fd, t.dst.pos + offset, reinterpret_cast<std::byte const*>(t.src) + offset, length);
@@ -433,15 +319,6 @@ struct DiskTransfer
 
     void finish() noexcept
     {
-        auto& stats = isRead ? gReadStats : gWriteStats;
-        int64_t const end = currentNs();
-        int64_t const start = startNs.load();
-        stats.calls.fetch_add(1, std::memory_order_relaxed);
-        stats.bytes.fetch_add(
-            static_cast<uint64_t>(numTasks()) * static_cast<uint64_t>(numBytes), std::memory_order_relaxed);
-        stats.queueNs.fetch_add(
-            static_cast<uint64_t>(std::max<int64_t>(start - enqueueNs, 0)), std::memory_order_relaxed);
-        stats.serviceNs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(end - start, 0)), std::memory_order_relaxed);
         if (!ok.load())
         {
             TLLM_LOG_ERROR(isRead ? "[kvCacheManagerV2Utils] async disk-to-host copy failed.\n"
@@ -487,7 +364,7 @@ public:
     // Called from a stream callback: must not call CUDA APIs or block on I/O.
     void submit(std::shared_ptr<DiskTransfer> const& transfer)
     {
-        auto const chunk = static_cast<ssize_t>(diskIoConfig().chunkBytes);
+        auto const chunk = kDiskIoChunkBytes;
         size_t numPieces = 0;
         for (size_t task = 0; task < transfer->numTasks(); ++task)
         {
@@ -496,7 +373,6 @@ public:
         transfer->remaining.store(numPieces);
         if (numPieces == 0)
         {
-            transfer->startNs.store(currentNs());
             transfer->finish();
             return;
         }
@@ -538,8 +414,6 @@ private:
                 queue.pop_front();
             }
             DiskTransfer& transfer = *piece.transfer;
-            int64_t expected = 0;
-            transfer.startNs.compare_exchange_strong(expected, currentNs());
             if (!transfer.runPiece(piece.task, piece.offset, piece.length))
             {
                 transfer.ok.store(false);
@@ -600,8 +474,6 @@ CUDA_CB void hostFnRunDiskTransfer(void* userData) noexcept
 
 CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream stream) noexcept
 {
-    startDiskIoStatsThread();
-    transfer->enqueueNs = currentNs();
     CompletionFlags* const flags = completionFlags();
     if (flags == nullptr)
     {
@@ -702,9 +574,7 @@ void configureAsyncDiskIo(size_t numThreads) noexcept
         return;
     }
     gAsyncDiskIoThreads.store(started, std::memory_order_release);
-    auto const& config = diskIoConfig();
-    TLLM_LOG_INFO("[kvCacheManagerV2Utils] async disk I/O: threads=%zu chunk_bytes=%zu direct_write=%d direct_read=%d",
-        started, config.chunkBytes, static_cast<int>(config.directWrite), static_cast<int>(config.directRead));
+    TLLM_LOG_INFO("[kvCacheManagerV2Utils] async disk I/O: threads=%zu", started);
 }
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept

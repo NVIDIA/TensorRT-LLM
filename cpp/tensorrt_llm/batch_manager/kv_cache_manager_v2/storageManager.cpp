@@ -31,10 +31,8 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -551,10 +549,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     }
     if (mKeepDiskCopy)
     {
-        if (char const* sec = std::getenv("TLLM_KVCM2_DISK_KEEP_COPY_STATS_SEC"); sec != nullptr)
-        {
-            mKeepCopyStats.statsSec = std::atoi(sec);
-        }
         TLLM_LOG_INFO("[kvCacheManagerV2] disk tier: keep_copy_after_restore=1 write_through=%d",
             static_cast<int>(mDiskWriteThrough));
     }
@@ -896,7 +890,6 @@ void StorageManager::addRetainedCopy(Page const& page, CacheLevel level, PoolGro
     mRetainedByPage.emplace(&page, std::prev(mRetainedCopies.end()));
     ++mNumRetainedCopies.at(level).at(pgIdx);
     ++mKeepCopyStats.created;
-    maybePrintKeepCopyStats();
 }
 
 std::optional<Slot> StorageManager::takeRetainedCopy(Page const& page, CacheLevel level)
@@ -994,35 +987,6 @@ void StorageManager::onPageDestroyed(Page const& page) noexcept
         });
 }
 
-void StorageManager::maybePrintKeepCopyStats()
-{
-    if (mKeepCopyStats.statsSec <= 0)
-    {
-        return;
-    }
-    int64_t const now
-        = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-              .count();
-    if (mKeepCopyStats.lastPrintNs == 0)
-    {
-        mKeepCopyStats.lastPrintNs = now;
-        return;
-    }
-    if (now - mKeepCopyStats.lastPrintNs < int64_t{mKeepCopyStats.statsSec} * 1000000000LL)
-    {
-        return;
-    }
-    mKeepCopyStats.lastPrintNs = now;
-    TLLM_LOG_INFO(
-        "[kvCacheManagerV2] disk keep-copy stats: retained=%zu created=%llu reused=%llu reused_GiB=%.3f "
-        "reclaimed=%llu dropped=%llu wt_pages=%llu wt_GiB=%.3f wt_skipped=%llu",
-        mRetainedCopies.size(), static_cast<unsigned long long>(mKeepCopyStats.created),
-        static_cast<unsigned long long>(mKeepCopyStats.reused), mKeepCopyStats.reusedBytes / double(1ull << 30),
-        static_cast<unsigned long long>(mKeepCopyStats.reclaimed),
-        static_cast<unsigned long long>(mKeepCopyStats.dropped), static_cast<unsigned long long>(mWriteThroughPages),
-        mWriteThroughBytes / double(1ull << 30), static_cast<unsigned long long>(mWriteThroughSkipped));
-}
-
 CachedCudaEvent StorageManager::pendingDiskWrite(Page const& page) const
 {
     auto it = mRetainedByPage.find(&page);
@@ -1063,7 +1027,6 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
             free = poolGroup(diskLevel, pgIdx).numFreeSlots();
         }
         size_t const take = std::min(batch.size(), static_cast<size_t>(std::max<SlotCount>(free, 0)));
-        mWriteThroughSkipped += batch.size() - take;
         if (take == 0)
         {
             continue;
@@ -1083,17 +1046,11 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
             batch[i]->readyEvent = std::move(previousEvents[i]);
         }
         TLLM_CHECK(slots.has_value() && slots->size() == take);
-        size_t pageBytes = 0;
-        for (auto const bytes : slotSize(diskLevel, pgIdx))
-        {
-            pageBytes += bytes;
-        }
         for (size_t i = 0; i < take; ++i)
         {
             addRetainedCopy(*batch[i], diskLevel, pgIdx, std::move(slots->at(i)));
         }
         mWriteThroughPages += take;
-        mWriteThroughBytes += take * pageBytes;
     }
 }
 
@@ -1742,17 +1699,7 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
             pageIndices.push_back(PageIndexPair{
                 slotIdToPageIndexValue(dstSlots.at(i).slotId()), slotIdToPageIndexValue(srcPages.at(i)->slotId())});
         }
-        if (numReused > 0)
-        {
-            size_t pageBytes = 0;
-            for (auto const bytes : slotSize(dstLevel, dstPgIdx))
-            {
-                pageBytes += bytes;
-            }
-            mKeepCopyStats.reused += numReused;
-            mKeepCopyStats.reusedBytes += numReused * pageBytes;
-            maybePrintKeepCopyStats();
-        }
+        mKeepCopyStats.reused += numReused;
 
         std::vector<CUevent> priorEvents;
         priorEvents.reserve(2 * srcPages.size());
