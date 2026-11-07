@@ -62,8 +62,16 @@ def _ptr(t, dtype):
     return make_ptr(dtype, t.data_ptr(), cutlass.AddressSpace.gmem, assumed_align=16)
 
 
+def _rows_per_tile(rows: int, num_requests: int) -> int:
+    """Decode-shaped batches (at most 4 rows per request on average) take the
+    narrow tile; a one-row request then pads 3 MMA rows instead of 31."""
+    if rows <= _k.DECODE_ROWS_PER_TILE * num_requests:
+        return _k.DECODE_ROWS_PER_TILE
+    return _k.PREFILL_ROWS_PER_TILE
+
+
 @functools.cache
-def _compiled(blocks_per_page: int, compress_ratio: int):
+def _compiled(blocks_per_page: int, compress_ratio: int, rows_per_tile: int, one_row_tiles: bool):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import make_fake_stream
@@ -92,6 +100,8 @@ def _compiled(blocks_per_page: int, compress_ratio: int):
         cutlass.Int32(1),
         blocks_per_page,
         compress_ratio,
+        rows_per_tile,
+        one_row_tiles,
         make_fake_stream(),
         options=_COMPILE_OPTIONS,
     )
@@ -142,7 +152,10 @@ def prepare_qsa_index_scores(
     max_blocks = block_table.shape[1] * blocks_per_page
     tile_meta = torch.empty(2 * num_requests, dtype=torch.int32, device=device)
     request_indices = _aligned(request_indices)
-    tiles_bound = (rows + _k.QUERY_ROWS_PER_TILE - 1) // _k.QUERY_ROWS_PER_TILE + num_requests
+    rows_per_tile = _rows_per_tile(rows, num_requests)
+    # A batch with one row per request needs no tile metadata: tile t is row t.
+    one_row_tiles = rows == num_requests
+    tiles_bound = max(1, min(rows, (rows + rows_per_tile - 1) // rows_per_tile + num_requests))
     n_max = max(1, (max_blocks + _k.TILE_N - 1) // _k.TILE_N)
     pages_per_tile = _k.TILE_N // blocks_per_page
     min_splits = (n_max * pages_per_tile + _k.PAGE_ID_CAPACITY - 1) // _k.PAGE_ID_CAPACITY
@@ -153,7 +166,7 @@ def prepare_qsa_index_scores(
     positions = _aligned(
         query_positions if query_positions.dtype == torch.int32 else query_positions.to(torch.int32)
     )
-    fn = _compiled(blocks_per_page, compress_ratio)
+    fn = _compiled(blocks_per_page, compress_ratio, rows_per_tile, one_row_tiles)
     import cuda.bindings.driver as cuda_driver
 
     block_table = _aligned(block_table)
