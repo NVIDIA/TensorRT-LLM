@@ -25,3 +25,10 @@ add_modeling_v2_target(
   glm_moe_dsa glm_5_2_nvfp4__sm_103__tp8
   ARCHS 100f
   SOURCES *.cu *.cpp)
+
+add_modeling_v2_target(
+  glm_moe_dsa glm_5_2_nvfp4__sm_107__low_latency
+  ARCHS 100f
+  SOURCES *.cu *.cpp
+  DEPS internal_cutlass trtllm_gen_fmha_interface
+  REQUIRES MULTI_DEVICE)

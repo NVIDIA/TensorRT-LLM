@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import torch
 
-import tensorrt_llm._torch.custom_ops  # noqa: F401 — registers torch.ops.trtllm.*
 from tensorrt_llm._torch._experimental.modeling_v2.catalog._op import (
     Arch,
     Cell,
     OpWrapper,
     true_fp32_matmul,
 )
+
+from ... import native_ops
 
 
 class GlmLowmBf16Moe(OpWrapper):
@@ -96,7 +97,7 @@ class GlmLowmBf16Moe(OpWrapper):
         top_k: int,
         routed_scaling_factor: float,
     ) -> torch.Tensor:
-        return torch.ops.trtllm.glm_lowm_bf16_moe(
+        return native_ops.glm_lowm_bf16_moe(
             x, router_logits, e_score_correction_bias, w3_w1, w2, top_k, routed_scaling_factor
         )
 
