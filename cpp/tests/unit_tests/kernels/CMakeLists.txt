@@ -24,8 +24,27 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;logits;gpu")
-add_gtest(cascadeAttentionKernelTest cascadeAttentionKernelTest.cpp)
-add_gtest(cascadeAttentionNumericsTest cascadeAttentionNumericsTest.cu)
+add_tllm_gtest(
+  cascadeAttentionKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  LABELS
+  "unit;kernels;cascade-attention;gpu")
+add_tllm_gtest(
+  cascadeAttentionNumericsTest
+  OWNER
+  kernel
+  SOURCES
+  cascadeAttentionNumericsTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_cascade_attention
+  tllm::kernel_attention_decode
+  LABELS
+  "unit;kernels;cascade-attention;gpu")
 
 macro(remove_compile_definition TARGET_NAME DEFINITION)
   get_target_property(DEFS ${TARGET_NAME} COMPILE_DEFINITIONS)
@@ -94,7 +113,17 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;sparse-attention;gpu")
 
-add_gtest(cudaCoreGemmKernelTest cudaCoreGemm/cudaCoreGemmKernelTest.cpp)
+add_tllm_gtest(
+  cudaCoreGemmKernelTest
+  OWNER
+  kernel
+  SOURCES
+  cudaCoreGemm/cudaCoreGemmKernelTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_cuda_core_gemm
+  ${CUBLASLT_LIB}
+  LABELS
+  "unit;kernels;cuda-core-gemm;gpu")
 
 add_tllm_gtest(
   mlaChunkedPrefillTest
@@ -120,14 +149,44 @@ add_tllm_gtest(
   LABELS
   "unit;kernels;moe-communication;gpu")
 
-set(ROUTING_KERNEL_TEST_SRC
-    moe/routing/routingTest.cpp moe/routing/routingLlama4Test.cpp
-    moe/routing/routingCustomTest.cpp moe/routing/routingDeepSeekTest.cpp)
-add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
-target_link_libraries(routingKernelsTest PRIVATE Python3::Python)
+add_tllm_gtest(
+  routingKernelsTest
+  OWNER
+  kernel
+  SOURCES
+  moe/routing/routingTest.cpp
+  moe/routing/routingLlama4Test.cpp
+  moe/routing/routingCustomTest.cpp
+  moe/routing/routingDeepSeekTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_moe_routing
+  tllm::runtime_buffers
+  Python3::Python
+  LABELS
+  "unit;kernels;moe-routing;gpu")
 
-add_gtest(blockScaleMoeActivationTest moe/blockScaleMoeActivationTest.cu)
-add_gtest(blockScaleMoeFinalizeTest moe/blockScaleMoeFinalizeTest.cu)
+add_tllm_gtest(
+  blockScaleMoeActivationTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeActivationTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
+add_tllm_gtest(
+  blockScaleMoeFinalizeTest
+  OWNER
+  kernel
+  SOURCES
+  moe/blockScaleMoeFinalizeTest.cu
+  LINK_LIBRARIES
+  tllm::kernel_moe_block_scale
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;moe-block-scale;gpu")
 
 add_tllm_gtest(
   moeLoadBalanceKernelTest
@@ -196,7 +255,17 @@ add_tllm_gtest(
   tllm::runtime_buffers
   LABELS
   "unit;kernels;attention-mask;gpu")
-add_gtest(fmhaDsv4EpilogueFusionTest fmhaDsv4EpilogueFusionTest.cpp)
+add_tllm_gtest(
+  fmhaDsv4EpilogueFusionTest
+  OWNER
+  kernel
+  SOURCES
+  fmhaDsv4EpilogueFusionTest.cpp
+  LINK_LIBRARIES
+  tllm::kernel_trtllm_gen_fmha
+  tllm::runtime_buffers
+  LABELS
+  "unit;kernels;fmha;gpu")
 add_tllm_gtest(
   fmhaHead104Test
   OWNER
