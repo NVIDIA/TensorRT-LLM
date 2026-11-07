@@ -162,7 +162,6 @@ perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_
 perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_8_flash_next_fp4_blackwell-qwen3_8_flash_next_fp4_tp1_mtp3_8k1k] SKIP (https://nvbugs/7028057)
 perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwell-flux2_fp8_cfg1_ulysses4_teacache_on] SKIP (https://nvbugs/6759009)
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
-test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/6891165)
 test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity SKIP (https://nvbugs/7016339)
 unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm SKIP (https://nvbugs/7011673)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_allgather_op_matrix SKIP (https://nvbugs/6843474)
