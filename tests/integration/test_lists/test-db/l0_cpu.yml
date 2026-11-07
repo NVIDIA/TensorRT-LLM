@@ -12,6 +12,7 @@ l0_cpu:
       backend: generic
       orchestrator: mpi
   tests:
+  - unittest/_torch/modeling/test_qwen4_exp_support.py::test_fp8_config_preserves_mtp_exclusions
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
   - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_eagle3_worker_api.py

@@ -265,14 +265,14 @@ class Qwen35ConfigCompat:
         """Translate HF quantization exclude-module paths to TRT-LLM names.
 
         - Strip model.language_model. prefix -> model.
-        - Drop model.visual.* and mtp.* entries
+        - Drop model.visual.* entries
         - Map split projection names to packed TRT-LLM names
         """
         normalized = set()
         for name in modules:
             if name.startswith("model.language_model."):
                 name = "model." + name[len("model.language_model.") :]
-            if name.startswith("model.visual.") or name.startswith("mtp."):
+            if name.startswith("model.visual."):
                 continue
             name = re.sub(r"\.in_proj_[ab]$", ".in_proj_ba", name)
             name = re.sub(r"\.in_proj_(q|k|v|z|qkv)$", ".in_proj_qkvz", name)
