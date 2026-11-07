@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Multi-process test for KvCacheTransceiverV2 (V2 backend).
 
 This test uses torch.multiprocessing to spawn multiple processes simulating
@@ -9,6 +12,7 @@ import signal
 import sys
 import time
 import uuid
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -20,16 +24,44 @@ import torch.multiprocessing as mp
 os.environ["UCX_TLS"] = "^ib,gdr_copy"
 os.environ["TRTLLM_NIXL_NUM_THREADS"] = "1"
 
+from kv_cache_manager_v2_test_utils import allocate_request, initialize_cache, request_block_data
+
 import tensorrt_llm
 import tensorrt_llm.bindings
-import tensorrt_llm.bindings.executor as trtllm
-from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
+from tensorrt_llm import DisaggregatedParams, SamplingParams
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import DataType, LlmRequestState
-from tensorrt_llm.bindings.internal.testing import simulate_prefill_completion_only_use_for_testing
 from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
-from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
+from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.mapping import MpiTopology as Mapping
+
+
+class _GlooQuotaSync:
+    def __init__(self, group: dist.ProcessGroup) -> None:
+        self.group = group
+
+    def allreduce(self, value: float, op: object) -> float:
+        del op
+        tensor = torch.tensor(value, dtype=torch.float64)
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN, group=self.group)
+        return tensor.item()
+
+
+def _create_cache_manager(group: dist.ProcessGroup, *args, **kwargs) -> KVCacheManagerV2:
+    """Synchronize the V2 constructor's capacity within this instance's Gloo group."""
+    with patch(
+        "tensorrt_llm._torch.distributed.communicator.Distributed.get",
+        return_value=_GlooQuotaSync(group),
+    ):
+        return KVCacheManagerV2(*args, **kwargs)
+
+
+def _instance_mapping(**kwargs) -> Mapping:
+    """Use explicit instance-local ranks for the ctx/gen Gloo process groups."""
+    mapping = object.__new__(Mapping)
+    Mapping.__init__(mapping, **kwargs)
+    return mapping
 
 
 def broadcast_string(s: str | None, src: int, group: dist.ProcessGroup | None = None) -> str:
@@ -332,7 +364,7 @@ def worker_fn(
         # Create ctx mapping
         pp_rank = local_rank // ctx_tp
         tp_rank = local_rank % ctx_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=ctx_instance_num,
             rank=local_rank,
             tp_size=ctx_tp,
@@ -347,8 +379,9 @@ def worker_fn(
         ctx_pp_ranks_local = [i * ctx_tp + tp_rank for i in range(ctx_pp)]
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManager(
-            trtllm.KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             cache_type,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -358,23 +391,12 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Initialize with random data
         # For MLA without DP, all TP ranks within ctx/gen must have the same data (use fixed seed)
-        block_data_pool = kv_cache_manager.get_unique_primary_pool()
-        if is_mla and not ctx_enable_dp:
-            # Use seed=42 for ctx ranks to ensure they have identical data
-            generator = torch.Generator(device=block_data_pool.device).manual_seed(42)
-        else:
-            generator = None
-        random_values = torch.rand(
-            block_data_pool.shape,
-            dtype=torch.float32,
-            device=block_data_pool.device,
-            generator=generator,
-        )
-        block_data_pool.copy_(random_values)
+        initialize_cache(kv_cache_manager, seed=42 if is_mla and not ctx_enable_dp else None)
 
         # Create Distributed wrapper (ctx_group contains all ctx ranks)
         dist_wrapper = TorchDistributedWrapper(
@@ -408,7 +430,7 @@ def worker_fn(
         # Create gen mapping
         pp_rank = local_rank // gen_tp
         tp_rank = local_rank % gen_tp
-        mapping = Mapping(
+        mapping = _instance_mapping(
             world_size=gen_instance_num,
             rank=local_rank,
             tp_size=gen_tp,
@@ -423,8 +445,9 @@ def worker_fn(
         gen_pp_ranks_local = [ctx_instance_num + i * gen_tp + tp_rank for i in range(gen_pp)]
 
         # Create KVCacheManager
-        kv_cache_manager = KVCacheManager(
-            trtllm.KvCacheConfig(max_tokens=2048, enable_block_reuse=False),
+        kv_cache_manager = _create_cache_manager(
+            ctx_group if is_ctx else gen_group,
+            KvCacheConfig(max_tokens=2048, enable_block_reuse=False, host_cache_size=0),
             cache_type,
             num_layers=num_layers,
             num_kv_heads=num_kv_heads,
@@ -434,14 +457,11 @@ def worker_fn(
             max_batch_size=max_batch_size,
             mapping=mapping,
             dtype=dtype,
+            vocab_size=32000,
         )
 
         # Initialize gen with random data (to verify transfer overwrites it)
-        block_data_pool = kv_cache_manager.get_unique_primary_pool()
-        random_values = torch.rand(
-            block_data_pool.shape, dtype=torch.float32, device=block_data_pool.device
-        )
-        block_data_pool.copy_(random_values)
+        initialize_cache(kv_cache_manager)
 
         # Create Distributed wrapper (gen_group contains all gen ranks)
         dist_wrapper = TorchDistributedWrapper(
@@ -593,11 +613,10 @@ def worker_fn(
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """Gather block data from all ranks to local_rank 0, then verify on world rank 0.
 
-        All ranks have all requests' block data (via add_sequence_batch), so gather is simple.
+        All ranks have all requests' block data (via V2 allocation), so gather is simple.
         In DP mode, merge_block_data knows which ranks have valid (transferred) data.
         """
-        blocks = kv_cache_manager.get_batch_cache_indices([request.py_request_id])[0]
-        block_data = kv_cache_manager.get_unique_primary_pool()[blocks]
+        block_data = request_block_data(kv_cache_manager, request)
         block_data_cpu = block_data.cpu()
 
         ctx_block_datas = None
@@ -687,11 +706,9 @@ def worker_fn(
             # Generation DP: only handle if request_index % gen_tp == tp_rank
             should_handle = i % gen_tp == tp_rank
 
-        # All ranks add_sequence_batch so they have block data for verification
+        # All ranks allocate KV pages so they have block data for verification
         # But only ranks that should_handle will submit to transceiver
-        kv_cache_manager.impl.add_sequence_batch(
-            [(request.py_request_id, request.prompt_len, 1)], [request]
-        )
+        allocate_request(kv_cache_manager, request)
 
         if should_handle:
             my_requests.append((i, request))  # Store index and request for transfer
@@ -810,14 +827,14 @@ def worker_fn(
     # ===== Phase 5: Cleanup requests =====
     # All ranks added all requests, so all need to remove them
     for request in all_requests:
-        # remove_sequence(request_id, llm_request, release_blocks)
-        simulate_prefill_completion_only_use_for_testing(request)
-        kv_cache_manager.impl.remove_sequence(request.py_request_id, request, True)
+        kv_cache_manager.free_resources(request)
 
     if rank == 0:
         print(f"[Rank {rank}] Cleanup completed ({mode_str})")
 
     # Cleanup
+    transceiver.shutdown()
+    kv_cache_manager.shutdown()
     dist.destroy_process_group()
 
 
@@ -1138,9 +1155,14 @@ MP_TEST_CONFIGS = [
     ["ctx_first", "ctx_first_sync", "gen_first1", "gen_first2"],
 )
 def test_v2_transceiver_mp(
-    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow
+    ctx_tp, ctx_pp, gen_tp, gen_pp, ctx_enable_dp, gen_enable_dp, is_mla, workflow, monkeypatch
 ):
     """Test KvCacheTransceiverV2 with context-first multi-process configurations."""
+    # Gloo workers own their rank identities and must not inherit the enclosing MPI job.
+    monkeypatch.setenv("TLLM_DISABLE_MPI", "1")
+    for name in list(os.environ):
+        if name.startswith(("SLURM_", "PMIX_", "PMI_", "OMPI_", "I_MPI_", "HYDRA_", "MPI_")):
+            monkeypatch.delenv(name)
     try:
         mp.set_start_method("spawn", force=True)
     except RuntimeError:

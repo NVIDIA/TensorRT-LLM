@@ -14,9 +14,9 @@
 # limitations under the License.
 
 import atexit
-import json
 import os
 import socket
+import threading
 import time
 import weakref
 from collections.abc import Mapping
@@ -31,9 +31,10 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
-from tensorrt_llm.inputs.multimodal import (DisaggPrefillMultimodalInputs,
-                                            MultimodalParams)
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.kv_hints import KvHintsInput
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -56,15 +57,24 @@ from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
 from ..logger import logger
 from ..sampling_params import LogitsProcessor, SamplingParams
 from ..scheduling_params import SchedulingParams
-from .llm_args import TORCH_LLMARGS_EXPLICIT_DOCSTRING, TorchLlmArgs
-from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
-                        LlmBuildStats, ModelLoader)
+from ._load_balance_env import LAUNCH_QUEUES_ENV, configure_moe_launch_queues
+from .llm_args import (ENCODER_RUNNER_MANAGED_INPUTS,
+                       TORCH_LLMARGS_EXPLICIT_DOCSTRING,
+                       TORCH_LLMARGS_REMOVED_ARGS, ExecutorMemoryType,
+                       MoeConfig, RuntimeMemoryStatus, TorchLlmArgs,
+                       validate_token_encoder_bucket_config)
+from .llm_utils import CachedModelLoader, KvCacheRetentionConfig, ModelLoader
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
 from .thinking_budget import add_thinking_budget_logits_processor
 from .tokenizer import TokenizerBase
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
                     logger_debug, set_api_status)
+
+_RUNTIME_MEMORY_TYPES = tuple(
+    memory_type for memory_type in ExecutorMemoryType
+    if memory_type not in (ExecutorMemoryType.INIT_KV_CACHE,
+                           ExecutorMemoryType.INIT_EXTRA_RESOURCES))
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -364,6 +374,8 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        enable_routing_load = kwargs.pop("_enable_routing_load", False)
+        openengine_discovery = kwargs.pop("_openengine_discovery", None)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
         self._disaggregated_params: dict | None = None
@@ -375,7 +387,21 @@ class BaseLLM:
 
         try:
             env_overrides = kwargs.get("env_overrides", None)
+            launch_queues = os.environ.get(LAUNCH_QUEUES_ENV)
+            # Rebalance validation and launch-queue setup read process state.
+            # Apply caller overrides before either one observes that state.
             self._process_env_overrides(env_overrides)
+            if kwargs.get("backend") == "pytorch":
+                # This must precede TorchLlmArgs validators and GPU probes.
+                moe_config = kwargs.get("moe_config")
+                if isinstance(moe_config, dict):
+                    moe_config = MoeConfig(**moe_config)
+                    kwargs["moe_config"] = moe_config
+                queue_overrides = configure_moe_launch_queues(
+                    moe_config, env_overrides, initial_setting=launch_queues)
+                if queue_overrides is not env_overrides:
+                    kwargs["env_overrides"] = queue_overrides
+                    env_overrides = queue_overrides
 
             backend = kwargs.get('backend', None)
             if backend == "pytorch":
@@ -387,20 +413,18 @@ class BaseLLM:
                     # Propagate to args construction
                     kwargs["orchestrator_type"] = "ray"
 
-            elif backend == '_autodeploy':
-                logger.info("Using LLM with AutoDeploy backend")
-                from .._torch.auto_deploy.llm_args import \
-                    LlmArgs as AutoDeployLlmArgs
-                llm_args_cls = AutoDeployLlmArgs
             else:
                 raise ValueError(
                     f"Unknown backend: {backend!r}. Supported backends are "
-                    "'pytorch' and '_autodeploy'.")
+                    "'pytorch'.")
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
                 ['_mpi_session', 'backend'])
+            if issubclass(llm_args_cls, TorchLlmArgs):
+                # Values are vetted by TorchLlmArgs._drop_removed_args.
+                valid_keys |= TORCH_LLMARGS_REMOVED_ARGS
             for key in kwargs:
                 if key not in valid_keys:
                     raise ValueError(
@@ -417,6 +441,10 @@ class BaseLLM:
                                      revision=revision,
                                      tokenizer_revision=tokenizer_revision,
                                      **kwargs)
+            self.args._enable_routing_load = enable_routing_load
+            self.args._openengine_discovery = openengine_discovery
+
+            self._capture_usage_startup(llm_args=self.args)
 
         except Exception as e:
             logger.error(
@@ -425,6 +453,18 @@ class BaseLLM:
 
         finally:
             logger.set_level(log_level)  # restore the log level
+
+        # Before the ranks these args go to are spawned and before the usage
+        # report reads them, so that one description of the deployment reaches
+        # both. Imported behind the check so that no other deployment loads
+        # this connector's package, which pulls in its worker and scheduler.
+        # The registry names every preset's module without importing any of
+        # them, and tolerates an absent connector config.
+        from .._torch.pyexecutor.connectors.registry import uses_connector
+        if uses_connector(self.args.kv_connector_config, "mooncake-store"):
+            from .._torch.pyexecutor.connectors.mooncake_store.settings import \
+                apply_effective_settings
+            apply_effective_settings(self.args)
 
         logger_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                      "yellow")
@@ -444,9 +484,9 @@ class BaseLLM:
 
         # Attached serving frontends connect to an already-running worker:
         # they must not spawn an MPI session (see GenerationExecutor.create).
-        is_attached_frontend = os.getenv(
+        self._is_attached_frontend = os.getenv(
             "TLLM_EXECUTOR_ATTACH_INFO") is not None
-        if self.args.parallel_config.is_multi_gpu and not is_attached_frontend:
+        if self.args.parallel_config.is_multi_gpu and not self._is_attached_frontend:
             if os.getenv("RAY_LOCAL_WORLD_SIZE") is None and get_device_count(
             ) < self.args.parallel_config.world_size_per_node:
                 raise RuntimeError(
@@ -470,12 +510,9 @@ class BaseLLM:
                         self.args.parallel_config.world_size)
 
         try:
-            # Due to the Executor can only accept a engine path, we need to save the engine to a directory
-            self._engine_dir: Optional[Path] = None
             self._executor: Optional[GenerationExecutor] = None
             self._encode_only: bool = False
             self._encoder_executor = None
-            self._workspace = None
 
             self._hf_model_dir: Optional[Path] = None
             self._hf_model_config = None
@@ -483,7 +520,6 @@ class BaseLLM:
             # Raw JSON preserves explicit keys; GenerationConfig fills defaults.
             self._generation_config_explicit_values: dict[str, Any] = {}
 
-            self.llm_build_stats = LlmBuildStats()
             self._build_model()
 
         except Exception:
@@ -492,25 +528,6 @@ class BaseLLM:
             if self.mpi_session is not None and self._owns_mpi_session:
                 self.mpi_session.shutdown()
             raise
-
-        # --- Usage telemetry (fail-silent) ---
-        try:
-            import tensorrt_llm.usage as _usage
-            telemetry_config = getattr(self.args, 'telemetry_config', None)
-            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
-            # CLI commands set their specific context before LLM construction,
-            # so this only fires for users calling LLM() directly.
-            if telemetry_config is not None:
-                if telemetry_config.usage_context == _usage.UsageContext.UNKNOWN:
-                    telemetry_config = telemetry_config.model_copy(
-                        update={"usage_context": _usage.UsageContext.LLM_CLASS})
-            _usage.report_usage(
-                llm_args=self.args,
-                pretrained_config=self._hf_model_config,
-                telemetry_config=telemetry_config,
-            )
-        except Exception as exc:
-            logger.debug("Usage telemetry setup failed: %s", exc)
 
         try:
             if self.args.otlp_traces_endpoint:
@@ -523,6 +540,52 @@ class BaseLLM:
 
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
+
+    def _capture_usage_startup(self, **context: Any) -> None:
+        """Capture optional startup context without affecting model construction."""
+        try:
+            from tensorrt_llm.usage import record_llm_initialization_attempt
+            from tensorrt_llm.usage.usage_lib import _capture_startup_context
+
+            args = context.get("llm_args")
+            if (args is not None and hasattr(self, "_usage_attempt_tracked")
+                    and not self._usage_attempt_tracked):
+                self._usage_attempt_tracked = record_llm_initialization_attempt(
+                    args.telemetry_config)
+            _capture_startup_context(**context)
+        except Exception as exc:
+            logger.debug("Usage telemetry startup capture failed: %s", exc)
+
+    def _start_usage_reporting(self) -> None:
+        """Start the success-only initial report and heartbeat stream."""
+        try:
+            import tensorrt_llm.usage as _usage
+
+            telemetry_config = getattr(self.args, 'telemetry_config', None)
+            # Promote UNKNOWN -> LLM_CLASS for direct Python API usage.
+            # CLI commands set their specific context before LLM construction,
+            # so this only fires for users calling LLM() directly.
+            if (telemetry_config is not None and telemetry_config.usage_context
+                    == _usage.UsageContext.UNKNOWN):
+                telemetry_config = telemetry_config.model_copy(
+                    update={"usage_context": _usage.UsageContext.LLM_CLASS})
+            pretrained_config = self._hf_model_config
+            if getattr(self, "_encoder_executor", None) is not None:
+                try:
+                    runtime_pretrained_config = (
+                        self._encoder_executor.pretrained_config)
+                    if runtime_pretrained_config is not None:
+                        pretrained_config = runtime_pretrained_config
+                except AttributeError:
+                    # Missing runtime metadata must not suppress usage reporting.
+                    pass
+            _usage.report_usage(
+                llm_args=self.args,
+                pretrained_config=pretrained_config,
+                telemetry_config=telemetry_config,
+            )
+        except Exception as exc:
+            logger.debug("Usage telemetry setup failed: %s", exc)
 
     @property
     @set_api_status("beta")
@@ -660,6 +723,8 @@ class BaseLLM:
                                             List[ConversationParams]]] = None,
         cache_salt: Optional[Union[str, Sequence[str]]] = None,
         priority: Union[float, List[float]] = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[Union[KvHintsInput,
+                                 List[Optional[KvHintsInput]]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -673,7 +738,7 @@ class BaseLLM:
             lora_request (tensorrt_llm.executor.request.LoRARequest, Sequence[tensorrt_llm.executor.request.LoRARequest], optional):
                 LoRA request to use for generation, if any. Defaults to None.
             prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, Sequence[tensorrt_llm.executor.request.PromptAdapterRequest], optional):
-                Prompt Adapter request to use for generation, if any. Defaults to None.
+                Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], optional):
                 Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
@@ -684,6 +749,7 @@ class BaseLLM:
                 Conversation parameters. Defaults to None.
             cache_salt (str, Sequence[str], optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float, List[float]): The scheduling priority for the request(s), in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            kv_hints (tensorrt_llm.kv_hints.protocol.KvHintsInput, List[Optional[tensorrt_llm.kv_hints.protocol.KvHintsInput]], optional): Prototype typed or raw JSON KV hint metadata. A scalar repeats the same envelope and message_id for every prompt; an aligned list supplies per-prompt hints. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Transporting hints does not execute actions. Defaults to None.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]: The output data of the completion request to the LLM.
@@ -700,6 +766,11 @@ class BaseLLM:
             request_inputs_list = [None]
         else:
             request_inputs_list = [prompt_inputs(i) for i in inputs]
+
+        if isinstance(kv_hints,
+                      list) and len(kv_hints) != len(request_inputs_list):
+            raise ValueError(
+                "kv_hints list length must match the number of prompts")
 
         if isinstance(priority, list):
             if len(priority) != len(request_inputs_list):
@@ -729,6 +800,7 @@ class BaseLLM:
                 conversation_params=self._item_at(conversation_params, i),
                 cache_salt=self._item_at(cache_salt, i),
                 priority=self._item_at(priority, i),
+                kv_hints=self._item_at(kv_hints, i),
                 streaming=False,
             )
             futures.append(future)
@@ -760,6 +832,7 @@ class BaseLLM:
         conversation_params: Optional[ConversationParams] = None,
         cache_salt: Optional[str] = None,
         priority: float = DEFAULT_REQUEST_PRIORITY,
+        kv_hints: Optional[KvHintsInput] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -769,7 +842,7 @@ class BaseLLM:
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
-            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Prompt Adapter request to use for generation, if any. Defaults to None.
+            prompt_adapter_request (tensorrt_llm.executor.request.PromptAdapterRequest, optional): Deprecated and scheduled for removal. Prompt adapters are unsupported by the PyTorch executor; omit this argument or pass None.
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
@@ -778,6 +851,7 @@ class BaseLLM:
             conversation_params (tensorrt_llm.conversation_params.ConversationParams, optional): Conversation parameters. Defaults to None.
             cache_salt (str, optional): If specified, KV cache will be salted with the provided string to limit the kv cache reuse to the requests with the same string. Defaults to None.
             priority (float): The scheduling priority for the request, in the range [0, 1]. Higher values indicate higher priority. Defaults to 0.5.
+            kv_hints (tensorrt_llm.kv_hints.protocol.KvHintsInput, optional): Prototype typed or raw JSON KV hint metadata from a trusted caller. Unknown versions, oversized envelopes and malformed hints are ignored at admission. Payloads are transported without executing actions or selecting a source. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.llm.RequestOutput: The output data of the completion request to the LLM.
@@ -850,6 +924,7 @@ class BaseLLM:
             arrival_time=arrival_time,
             encoder_input_token_ids=encoder_input_token_ids,
             priority=priority,
+            kv_hints=kv_hints,
         )
 
         if sampling_params.return_perf_metrics:
@@ -922,13 +997,6 @@ class BaseLLM:
         # This branch is applicable for Encode --> Prefill handoff scenario,
         # in E/P/D/ and E/PD settings. Prefill worker executes this code path.
         if is_mm_disagg:
-            if self.args.backend == "_autodeploy":
-                raise ValueError(
-                    "Multimodal disaggregated inference (encode -> prefill "
-                    "embedding handoff) is not supported with the AutoDeploy "
-                    "backend. AutoDeploy runs the multimodal encoder in-prefill "
-                    "on raw inputs and does not consume precomputed multimodal "
-                    "embeddings.")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
@@ -937,42 +1005,25 @@ class BaseLLM:
             # TODO(TRTLLM-12869): Pass encoder-side MM layout through
             # DisaggregatedParams so prefill does not rebuild prompt tokens,
             # positions, lengths, runs, special offsets, and cumsum here.
-            disagg_mm_inputs = (
+            prompt_token_ids, multimodal_params = (
                 self.input_processor.build_disagg_prefill_multimodal_inputs(
-                    inputs, mm_handles))
-            if not isinstance(disagg_mm_inputs, DisaggPrefillMultimodalInputs):
+                    inputs,
+                    mm_handles,
+                    mm_hashes=disaggregated_params.multimodal_hashes))
+            if not isinstance(multimodal_params, MultimodalParams):
                 raise TypeError(
                     "build_disagg_prefill_multimodal_inputs must return "
-                    "DisaggPrefillMultimodalInputs")
-            prompt_token_ids = disagg_mm_inputs.prompt_token_ids
+                    "(prompt_token_ids, MultimodalParams)")
             prompt = inputs.get("prompt", None)
             if is_gen_only:
                 raise ValueError(
                     "Generation-only mode should not need multimodal parameters"
                 )
             else:
-                mm_hashes = disaggregated_params.multimodal_hashes
-                multimodal_input = disagg_mm_inputs.to_multimodal_input(
-                    mm_hashes)
-                # E/P handoff carries SharedTensorContainer dicts. Park them under the
-                # embedding key so BaseWorker's recursive to_tensor("multimodal_data")
-                # restores local tensor views before PyTorch forward. Until then this
-                # key holds handles, not tensors.
-                multimodal_data = {
-                    "multimodal_embedding":
-                    mm_handles,
-                    "multimodal_embedding_lengths":
-                    (disagg_mm_inputs.multimodal_embedding_lengths),
-                }
-                if disagg_mm_inputs.special_token_offsets is not None:
-                    multimodal_data["special_token_offsets"] = (
-                        disagg_mm_inputs.special_token_offsets)
-                if disagg_mm_inputs.item_types is not None:
-                    multimodal_data["layout_metadata"] = {
-                        "item_types": disagg_mm_inputs.item_types
-                    }
+                # BaseWorker resolves embedding handles to local tensor views.
+                multimodal_data = multimodal_params.multimodal_data
                 if disaggregated_params.mrope_position_ids_handle is not None:
-                    # NOTE: `PyTorchModelEngine` assumes both are present when using mrope.
+                    # NOTE: `ModelEngine` assumes both are present when using mrope.
                     assert disaggregated_params.mrope_position_deltas_handle is not None
                     mrope_config = {}
                     mrope_config[
@@ -985,10 +1036,6 @@ class BaseLLM:
                 maybe_compute_mm_embed_cumsum(
                     prompt_token_ids, {"multimodal_data": multimodal_data},
                     cast(BaseMultimodalInputProcessor, self.input_processor))
-                multimodal_params = MultimodalParams(
-                    multimodal_input=multimodal_input,
-                    multimodal_data=multimodal_data,
-                )
         # This condition is to ensure that this branch is not hit for models that expand
         # placeholder token IDs with MM data.
         elif ("prompt_token_ids" in inputs
@@ -998,7 +1045,7 @@ class BaseLLM:
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
-                # PyTorchModelEngine assumes both are present when using mrope.
+                # ModelEngine assumes both are present when using mrope.
                 if disaggregated_params.mrope_position_deltas_handle is None:
                     raise RuntimeError(
                         "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
@@ -1055,7 +1102,7 @@ class BaseLLM:
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'),
-                    mm_item_order=inputs.get("mm_item_order"))
+                )
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
@@ -1165,8 +1212,11 @@ class BaseLLM:
             batch_indexed_model_output (bool): If specified, assume batched model output indexed by request index, as opposed to token index. Defaults to True.
             copy_logits_to_host (bool): If set, copy logits from device to host. Otherwise, return a view into the on-device logits tensor. Defaults to True.
             return_raw_logits (bool): Whether to return the raw CPU logits tensor for the whole input batch. Defaults to False.
-            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples: token_type_ids (BERT),
-                inputs_embeds (reward models).
+            model_kwargs (Any): Model-specific inputs passed through to the model's forward(). Examples:
+                token_type_ids (BERT), inputs_embeds (reward models). Pass tensors where they already live (host or device).
+                With encoder CUDA graphs enabled, every tensor kwarg must be declared in
+                `cuda_graph_config.extra_model_inputs`: an undeclared tensor raises, and a non-tensor
+                value runs that call eagerly.
 
         Returns:
             Union[tensorrt_llm.llmapi.llm.EncoderOutput, List[tensorrt_llm.llmapi.llm.EncoderOutput], torch.Tensor]:
@@ -1192,10 +1242,10 @@ class BaseLLM:
         if unbatched:
             inputs = [inputs]
 
-        engine = self._encoder_executor.model_engine
-        max_seq_len = engine.max_seq_len
-        max_num_tokens = engine.max_num_tokens
-        max_batch_size = engine.batch_size
+        executor = self._encoder_executor
+        max_seq_len = executor.max_seq_len
+        max_num_tokens = executor.max_num_tokens
+        max_batch_size = executor.max_batch_size
 
         if len(inputs) > max_batch_size:
             raise ValueError(
@@ -1253,24 +1303,13 @@ class BaseLLM:
         flat_token_ids = [tid for tids in token_ids_list for tid in tids]
 
         # Build inputs dict — common + model-specific kwargs.
-        # Filter keys that are set internally by _prepare_encoder_inputs or
-        # _forward_step to avoid "multiple values for keyword argument" errors.
-        _RESERVED_KEYS = {
-            'input_ids',
-            'seq_lens',
-            'attn_metadata',
-            'return_context_logits',
-        }
+        # Filter keys that are supplied by EncoderRunner itself to avoid
+        # "multiple values for keyword argument" errors.
         filtered_kwargs = {
             k: v
-            for k, v in model_kwargs.items() if k not in _RESERVED_KEYS
+            for k, v in model_kwargs.items()
+            if k not in ENCODER_RUNNER_MANAGED_INPUTS
         }
-
-        if filtered_kwargs and engine.encoder_cuda_graph_runner.enabled:
-            raise NotImplementedError(
-                "LLM.encode(..., **model_kwargs) is not supported when encoder CUDA "
-                "graphs are enabled. Disable encoder CUDA graphs or omit model_kwargs. "
-                f"Unsupported keys: {sorted(filtered_kwargs)}")
 
         forward_inputs = {
             'input_ids': flat_token_ids,
@@ -1485,15 +1524,6 @@ class BaseLLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-        # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
-        if self.args.backend not in ["pytorch", "_autodeploy"]:
-            if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
-                sampling_params.return_context_logits = True
-                sampling_params._context_logits_auto_enabled = True
-            if sampling_params.logprobs is not None and not sampling_params.return_generation_logits:
-                sampling_params.return_generation_logits = True
-                sampling_params._generation_logits_auto_enabled = True
-
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
@@ -1558,78 +1588,65 @@ class BaseLLM:
         )
         _append_logits_processor(sampling_params, processor)
 
+    def _check_one_model_speculative_sampling(
+            self, sampling_params: SamplingParams) -> None:
+        """Reject one-model-speculative-unsupported sampling before submission.
+
+        SpecSampler.validate_request rejects these too, but it runs on the
+        executor's admission path -- after the OpenAI frontend has answered 200
+        and opened the response stream. The client then sees a broken stream
+        instead of a status code, which it cannot tell apart from a network
+        fault. Raising here, while generate_async is still synchronous, gets the
+        request a structured 4xx with the same message.
+        """
+        spec_dec_mode = getattr(self.args.speculative_config, "spec_dec_mode",
+                                None)
+        # use_one_engine() is exactly the set of modes get_spec_decoder hands to
+        # SpecSampler; the drafter-based modes keep TorchSampler, which
+        # implements all of these.
+        if spec_dec_mode is None or not spec_dec_mode.use_one_engine():
+            return
+        # The module rather than the symbol: the fully-qualified import runs to
+        # 94 columns here, which isort (line_length 80) wraps with a backslash
+        # and ruff (line-length 100) then reports as I001. Importing the module
+        # is short enough that both leave it alone.
+        from .._torch.speculative import spec_sampler_base
+
+        mode = getattr(self.args.speculative_config, "advanced_sampling_mode",
+                       None)
+        reason = spec_sampler_base.one_model_sampling_rejection_reason(
+            sampling_params,
+            fused_sampling=bool(mode is not None and mode.is_fused))
+        if reason is not None:
+            raise RequestError(reason)
+
     def _check_arguments(self, prompt_len: int, sampling_params: SamplingParams,
                          is_gen_only: bool) -> None:
 
-        if self.args.backend in ["pytorch", "_autodeploy"]:
-            # Check prompt length against max_num_tokens to filter illegal requests.
-            # Skip check for gen-only requests
-            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
-                max_num_tokens = self.args.max_num_tokens
-                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
-                    raise RequestError(
-                        f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
-                        f"max_num_tokens ({max_num_tokens})")
-            return
+        # Check prompt length against max_num_tokens to filter illegal requests.
+        # Skip check for gen-only requests.
+        if not self.args.enable_chunked_prefill and not is_gen_only:
+            max_num_tokens = self.args.max_num_tokens
+            if max_num_tokens and prompt_len / self.args.parallel_config.cp_size > max_num_tokens:
+                raise RequestError(
+                    f"The prompt length ({prompt_len/self.args.parallel_config.cp_size}) should not exceed "
+                    f"max_num_tokens ({max_num_tokens})")
+        self._check_one_model_speculative_sampling(sampling_params)
 
-        build_config = self.args.build_config
-
-        built_engine_cfg_file = Path(self.args.model) / 'config.json'
-        with open(built_engine_cfg_file) as f:
-            built_engine_cfg = json.load(f)
-        max_seq_len = built_engine_cfg['build_config'][
-            'max_seq_len'] if 'build_config' in built_engine_cfg else build_config.max_seq_len
-        # TODO: Remove this check and left the request verification to cpp runtime
-
-        if (not self.args.enable_chunked_prefill) and (
-                prompt_len / self.args.parallel_config.cp_size +
-            (sampling_params.max_tokens or 0) > max_seq_len):
+        if sampling_params.return_routed_experts and not (
+                self.args.backend == "pytorch"
+                and getattr(self.args, "enable_return_routed_experts", False)):
             raise ValueError(
-                f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and max_tokens ({sampling_params.max_tokens}) should not exceed "
-                f"max_seq_len ({max_seq_len})")
-
-        if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
-            if sampling_params.n == sampling_params.best_of:
-                raise ValueError(
-                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-                )
-            else:
-                raise ValueError(
-                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_beam_width ({build_config.max_beam_width}) when use_beam_search is True"
-                )
-
-        max_batch_size = self.args.max_batch_size
-        if max_batch_size is None:
-            max_batch_size = build_config.max_batch_size
-        if not sampling_params.use_beam_search and sampling_params.best_of > max_batch_size:
-            if sampling_params.n == sampling_params.best_of:
-                raise ValueError(
-                    f"sampling_params.n ({sampling_params.n}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
-                )
-            else:
-                raise ValueError(
-                    f"sampling_params.best_of ({sampling_params.best_of}) cannot exceed max_batch_size ({max_batch_size}) when use_beam_search is False"
-                )
-
-        if sampling_params.prompt_logprobs and not build_config.gather_context_logits:
-            raise ValueError(
-                f"`sampling_params's prompt_logprobs={sampling_params.prompt_logprobs}` requires `gather_context_logits=True` "
-                f"in the `BuildConfig` when constructing the LLM. "
-                f"Example: LLM(..., build_config=BuildConfig(gather_context_logits=True))."
-            )
-
-        if sampling_params.logprobs is not None and not self.args.gather_generation_logits:
-            raise ValueError(
-                f"`sampling_params.logprobs={sampling_params.logprobs}` requires `gather_generation_logits=True` "
-                f"to be passed explicitly to the `LLM()` constructor.")
+                "`sampling_params.return_routed_experts=True` requires "
+                "`LLM(enable_return_routed_experts=True)` on the PyTorch backend "
+                "(Router Replay): routes are not captured otherwise.")
 
     def _build_model(self):
-        model_loader = CachedModelLoader(self.args,
-                                         mpi_session=self.mpi_session,
-                                         workspace=self._workspace,
-                                         llm_build_stats=weakref.proxy(
-                                             self.llm_build_stats))
-        self._engine_dir, self._hf_model_dir = model_loader()
+        model_loader = CachedModelLoader(
+            self.args,
+            mpi_session=self.mpi_session,
+            is_attached_frontend=self._is_attached_frontend)
+        self._hf_model_dir = model_loader()
 
     def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
         if self.args.skip_tokenizer_init:
@@ -1641,9 +1658,8 @@ class BaseLLM:
 
         # TODO smor- need to refine what is the desired behavior if lora is enabled
         # in terms of the tokenizer initialization process
-        if hasattr(self.args, "backend") and self.args.backend in [
-                "pytorch", "_autodeploy"
-        ] and self.args.lora_config is not None:
+        if (hasattr(self.args, "backend") and self.args.backend == "pytorch"
+                and self.args.lora_config is not None):
             num_lora_dirs = len(self.args.lora_config.lora_dir)
             if num_lora_dirs == 1:
                 tokenizer_path = self.args.lora_config.lora_dir[0]
@@ -1693,8 +1709,64 @@ class BaseLLM:
         return ModelLoader.load_hf_model_config(
             self.args.model, trust_remote_code=self.args.trust_remote_code)
 
+    @set_api_status("prototype")
+    def start_profile(self,
+                      output_dir: Optional[str] = None,
+                      num_steps: Optional[int] = None,
+                      start_step: int = 0,
+                      activities: Optional[List[str]] = None) -> None:
+        """Start iteration-scoped profiling of the backend engine.
+
+        Mirrors the ``TLLM_PROFILE_START_STOP`` / ``TLLM_TORCH_PROFILE_TRACE``
+        environment-variable behaviour but can be triggered at runtime (for
+        example via the ``trtllm-serve`` ``/start_profile`` HTTP endpoint).
+
+        See ``PyExecutor.start_profile`` for full argument semantics.
+
+        Args:
+            output_dir (str, optional): Directory where chrome traces are
+                written. If ``None``, falls back to the
+                ``TLLM_TORCH_PROFILER_DIR`` environment variable and finally
+                to ``/tmp``. Defaults to None.
+            num_steps (int, optional): Number of engine iterations to
+                capture. When set, the engine stops the window automatically
+                and ``stop_profile`` does not need to be called. When
+                ``None``, profiling runs until ``stop_profile`` is called.
+                Defaults to None.
+            start_step (int): Additional iterations to skip before profiling actually begins, relative to the current iteration counter. Defaults to 0.
+            activities (List[str], optional): Subset of
+                ``["CPU", "GPU", "CUDA_PROFILER"]`` selecting which profiler
+                activities to record. When ``CUDA_PROFILER`` is the only
+                entry, ``torch.profiler`` is not started so only
+                ``cudaProfilerStart``/``cudaProfilerStop`` brackets run,
+                which is suitable for nsys capture. Defaults to None, which
+                resolves to ``["CPU", "GPU"]``.
+        """
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot start profiling.")
+        return self._executor.start_profile(output_dir=output_dir,
+                                            num_steps=num_steps,
+                                            start_step=start_step,
+                                            activities=activities)
+
+    @set_api_status("prototype")
+    def stop_profile(self) -> None:
+        """Stop any in-progress runtime profiling."""
+        if not hasattr(self, "_executor") or self._executor is None:
+            raise RuntimeError(
+                "LLM executor is not initialized; cannot stop profiling.")
+        return self._executor.stop_profile()
+
     @set_api_status("beta")
     def shutdown(self) -> None:
+        try:
+            self._shutdown_resources()
+        finally:
+            self._record_usage_shutdown()
+
+    def _shutdown_resources(self) -> None:
+        """Release executors and any LLM-owned MPI session."""
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
             self._executor = None
@@ -1708,6 +1780,23 @@ class BaseLLM:
                 and getattr(self, "_owns_mpi_session", True)):
             self.mpi_session.shutdown()
             self.mpi_session = None
+
+    def _record_usage_shutdown(self) -> None:
+        """Update the process counter at most once for this LLM object."""
+        lifecycle_lock = getattr(self, "_usage_lifecycle_lock", None)
+        if lifecycle_lock is None:
+            return
+        with lifecycle_lock:
+            if not getattr(self, "_usage_lifecycle_active", False):
+                return
+            self._usage_lifecycle_active = False
+
+        try:
+            import tensorrt_llm.usage as _usage
+
+            _usage.record_llm_shutdown()
+        except Exception as exc:
+            logger.debug(f"Usage telemetry shutdown tracking failed: {exc}")
 
     def _check_health(self) -> bool:
         """Check if the LLM is healthy.
@@ -1768,22 +1857,65 @@ class _TorchLLM(BaseLLM):
                  tokenizer_revision: Optional[str] = None,
                  **kwargs: Any) -> None:
 
+        self._usage_lifecycle_active = False
+        self._usage_lifecycle_lock = threading.Lock()
+        telemetry_config = kwargs.get("telemetry_config")
+        self._usage_attempt_tracked = False
+        _usage = None
+        # Telemetry: Track before construction so initialization failures are visible.
+        try:
+            import tensorrt_llm.usage as _usage
+
+            self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                telemetry_config,
+                default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+            )
+        except Exception as exc:
+            logger.debug(
+                f"Usage telemetry initialization tracking failed: {exc}")
+
         backend = kwargs.pop("backend", "pytorch")
 
-        # Validate that only arguments supported by the PyTorch backend are passed.
-        self._validate_args_for_torch_backend(kwargs)
+        if self._usage_attempt_tracked:
+            self._capture_usage_startup(
+                requested=dict(kwargs,
+                               backend=backend,
+                               tensor_parallel_size=tensor_parallel_size,
+                               dtype=dtype))
 
-        super().__init__(model,
-                         tokenizer,
-                         tokenizer_mode,
-                         skip_tokenizer_init,
-                         trust_remote_code,
-                         tensor_parallel_size,
-                         dtype,
-                         revision,
-                         tokenizer_revision,
-                         backend=backend,
-                         **kwargs)
+        try:
+            # Validate that only arguments supported by the PyTorch backend are passed.
+            self._validate_args_for_torch_backend(kwargs)
+
+            super().__init__(model,
+                             tokenizer,
+                             tokenizer_mode,
+                             skip_tokenizer_init,
+                             trust_remote_code,
+                             tensor_parallel_size,
+                             dtype,
+                             revision,
+                             tokenizer_revision,
+                             backend=backend,
+                             **kwargs)
+        except Exception:
+            if self._usage_attempt_tracked and _usage is not None:
+                _usage.record_llm_initialization_failure()
+            raise
+
+        try:
+            if not self._usage_attempt_tracked and _usage is not None:
+                self._usage_attempt_tracked = _usage.record_llm_initialization_attempt(
+                    getattr(self.args, 'telemetry_config', None),
+                    default_usage_context=_usage.UsageContext.LLM_CLASS.value,
+                )
+
+            if self._usage_attempt_tracked:
+                self._usage_lifecycle_active = _usage.record_llm_initialized()
+        except Exception as exc:
+            logger.debug(f"Usage telemetry completion tracking failed: {exc}")
+
+        self._start_usage_reporting()
 
     @set_api_status("prototype")
     def _collective_rpc(
@@ -1821,14 +1953,160 @@ class _TorchLLM(BaseLLM):
                 f"Executor type {type(self._executor)} does not support collective RPC."
             )
 
+    def _check_runtime_memory_enabled(self) -> None:
+        if self.args.sleep_config is None:
+            raise ValueError(
+                "Runtime memory checkpointing is not enabled. Set sleep_config "
+                "when constructing the LLM.")
+
+    @staticmethod
+    def _normalize_runtime_memory_tags(
+        tags: Sequence[ExecutorMemoryType | str] | None,
+        *,
+        default_tags: Sequence[ExecutorMemoryType],
+    ) -> list[ExecutorMemoryType]:
+        if tags is None:
+            return list(default_tags)
+        if not tags:
+            raise ValueError("Runtime memory tags must not be empty.")
+
+        normalized = []
+        seen = set()
+        for tag in tags:
+            try:
+                memory_type = (tag if isinstance(tag, ExecutorMemoryType) else
+                               ExecutorMemoryType(tag))
+            except (TypeError, ValueError) as error:
+                valid = ", ".join(item.value for item in _RUNTIME_MEMORY_TYPES)
+                raise ValueError(
+                    f"Invalid runtime memory tag {tag!r}. Expected one of: {valid}"
+                ) from error
+            if memory_type in (ExecutorMemoryType.INIT_KV_CACHE,
+                               ExecutorMemoryType.INIT_EXTRA_RESOURCES):
+                raise ValueError(
+                    f"Runtime memory tag {memory_type.value!r} is an "
+                    "initialization-only tag and cannot be released.")
+            if memory_type not in seen:
+                normalized.append(memory_type)
+                seen.add(memory_type)
+        return normalized
+
+    @set_api_status("prototype")
+    def get_memory_status(self) -> RuntimeMemoryStatus:
+        """Return the authoritative runtime-memory checkpoint status.
+
+        Returns:
+            tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus: The reconciled
+            state reported by the runtime workers.
+        """
+        self._check_runtime_memory_enabled()
+        replies = self._collective_rpc("get_memory_status")
+        statuses = [
+            RuntimeMemoryStatus.model_validate(reply) for reply in replies
+        ]
+        if not statuses:
+            raise RuntimeError("No worker returned runtime-memory status.")
+        expected = statuses[0]
+        if any(status != expected for status in statuses[1:]):
+            raise RuntimeError(
+                "Runtime-memory state diverged across workers: "
+                f"{[status.model_dump(mode='json') for status in statuses]}")
+        return expected
+
+    @set_api_status("prototype")
+    def release(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
+        """Checkpoint and release selected GPU runtime memory.
+
+        Args:
+            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):
+                Memory types to release. When omitted, release every
+                sleep-managed runtime memory type.
+
+        Returns:
+            None: The call returns after all selected memory has been released.
+        """
+        self._check_runtime_memory_enabled()
+        normalized = self._normalize_runtime_memory_tags(
+            tags, default_tags=_RUNTIME_MEMORY_TYPES)
+        self._collective_rpc("sleep", ([tag.value for tag in normalized], ))
+
+    @set_api_status("prototype")
+    def resume(
+        self,
+        tags: Sequence[ExecutorMemoryType | str] | None = None,
+    ) -> None:
+        """Restore selected GPU runtime memory.
+
+        Args:
+            tags (Sequence[tensorrt_llm.llmapi.ExecutorMemoryType | str], optional):
+                Memory types to restore. When omitted, restore every currently
+                parked memory type.
+
+        Returns:
+            None: The call returns after all selected memory has been restored.
+        """
+        self._check_runtime_memory_enabled()
+        status = self.get_memory_status()
+        if status.state not in ("running", "parked"):
+            raise RuntimeError(
+                f"Cannot resume runtime memory while state is '{status.state}'."
+            )
+        normalized = self._normalize_runtime_memory_tags(
+            tags, default_tags=status.parked_tags)
+        if normalized:
+            self._collective_rpc("wakeup",
+                                 ([tag.value for tag in normalized], ))
+
+    def _reject_token_encoder_config_without_buckets(self) -> None:
+        """Reject a bucket-less token-encoder config before weights load.
+
+        `ModelEngine.__init__` asks the instantiated model and keeps the
+        last word; this asks the class its architecture resolves to. It defers
+        wherever that class might not be the one the engine builds, so it can
+        only reject earlier, never differently. A model that installs
+        `encoder_graph_spec` at construction instead of declaring it on the
+        class would be misjudged here; no in-tree model does.
+        """
+        config = self.args.encoder_cuda_graph_config
+        # `checkpoint_loader`, a non-HF `checkpoint_format` and `model_kwargs`
+        # all feed `checkpoint_loader.load_config()`, which is where the engine
+        # gets its class from, so the on-disk architecture may not be the one
+        # it builds. Decoder-only models are left to the engine too: its
+        # "consumes packed tokens" wording would only confuse there.
+        if (config is None or not self._is_encoder_decoder_model()
+                or self.args.model_kwargs is not None
+                or self.args.checkpoint_loader is not None or
+                self.args.checkpoint_format not in (None, CheckpointFormat.HF)):
+            return
+        bucket_config_error = validate_token_encoder_bucket_config(
+            config.num_tokens, config.seq_lens)
+        if bucket_config_error is None:
+            return
+        architectures = getattr(self._hf_model_config, "architectures",
+                                None) if self._hf_model_config else None
+        if not architectures:
+            return
+        # Local: resolving an architecture imports its model module, which the
+        # client process otherwise never loads.
+        from tensorrt_llm._torch.models.modeling_utils import \
+            get_registered_model_class
+        model_cls = get_registered_model_class(architectures[0])
+        # Unresolved, or a feature encoder that derives both dimensions itself.
+        if model_cls is None or hasattr(model_cls, "encoder_graph_spec"):
+            return
+        raise ValueError(bucket_config_error)
+
     def _build_model(self):
         super()._build_model()
-        assert self._engine_dir is None
-
         # Tokenizer and config loading should be after calling model_loader(), since model_loader() may download the model from HF hub.
         # It should also be before bindings ExecutorConfig, which may depend on tokenizer info.
         self._tokenizer = self._try_load_tokenizer()
         self._hf_model_config = self._try_load_hf_model_config()
+        self._capture_usage_startup(pretrained_config=self._hf_model_config)
+        self._reject_token_encoder_config_without_buckets()
         self._generation_config = self._try_load_generation_config()
         self._generation_config_explicit_values = self._try_load_generation_config_explicit_values(
         )
@@ -1841,11 +2119,14 @@ class _TorchLLM(BaseLLM):
         video_pruning_rate = self.args.multimodal_config.video_pruning_rate
         if video_pruning_rate is not None:
             input_processor_kwargs['video_pruning_rate'] = video_pruning_rate
+        if self.args.multimodal_config.vision_gpu_normalize:
+            input_processor_kwargs['vision_gpu_normalize'] = True
         self.input_processor = create_input_processor(
             self._hf_model_dir,
             self.tokenizer,
             checkpoint_format,
             trust_remote_code=self.args.trust_remote_code,
+            enable_tokenization_cache=self.args.enable_tokenization_cache,
             **input_processor_kwargs)
         self._tokenizer = self.input_processor.tokenizer
 
@@ -1867,7 +2148,7 @@ class _TorchLLM(BaseLLM):
             return  # Skip _executor creation
 
         # Hint: if this looks like an encoder model, suggest encode()
-        if self.args.encode_only is None and not self.args.mm_encoder_only:
+        if not self.args.encode_only and not self.args.mm_encoder_only:
             from tensorrt_llm._torch.model_config import ModelConfig
             architectures = getattr(self._hf_model_config, 'architectures',
                                     None) if self._hf_model_config else None
@@ -1883,9 +2164,6 @@ class _TorchLLM(BaseLLM):
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
         self._executor = self._executor_cls.create(
-            self._engine_dir,
-            executor_config=None,
-            batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
@@ -1904,14 +2182,16 @@ class _TorchLLM(BaseLLM):
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that only arguments supported by the PyTorch backend are passed.
         """
-        torchllm_fields = set(TorchLlmArgs.model_fields.keys())
+        # Values of removed args are vetted by TorchLlmArgs._drop_removed_args.
+        accepted_keys = (set(TorchLlmArgs.model_fields.keys())
+                         | TORCH_LLMARGS_REMOVED_ARGS
+                         | {
+                             '_mpi_session', '_enable_routing_load',
+                             '_openengine_discovery', 'backend'
+                         })
 
         # Check if any arguments not supported by the PyTorch backend are passed.
-        unsupported_args = [
-            key for key in kwargs
-            if key not in torchllm_fields and key not in ('_mpi_session',
-                                                          'backend')
-        ]
+        unsupported_args = [key for key in kwargs if key not in accepted_keys]
 
         if unsupported_args:
             raise ValueError(

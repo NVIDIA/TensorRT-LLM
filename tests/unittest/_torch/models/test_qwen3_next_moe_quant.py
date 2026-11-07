@@ -255,7 +255,7 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
     )
 
     assert captured["moe_backend"] == "CUTLASS"
-    assert captured["moe_cls"] == "CutlassFusedMoE"
+    assert captured["moe_cls"] == "TrtllmCutlassUnquantizedImpl"
     assert captured["override"] is not per_layer_quant_config
     assert not captured["override"].layer_quant_mode.has_any_quant(exclude_kv_cache=True)
     assert captured["override"].kv_cache_quant_algo == QuantAlgo.FP8
@@ -265,14 +265,14 @@ def test_excluded_layer_builds_bf16_on_cutlass(backend, layer_idx):
 # layer, so each row pairs the request with an environment and an algorithm that
 # make its family eligible. A single (algorithm, SM) shared by all four does not
 # exist: FP8 block scales is Cutlass on SM90 and DeepGemm / TRTLLM-Gen on SM100,
-# and CuteDSL only claims NVFP4.
+# and CuteDSL serves no FP8 block scales.
 @pytest.mark.parametrize(
     "backend,sm,quant_algo,expected_moe_cls",
     [
-        ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "CutlassFusedMoE"),
-        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TRTLLMGenFusedMoE"),
-        ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepGemmFusedMoE"),
-        ("CUTEDSL", 100, QuantAlgo.NVFP4, "CuteDslFusedMoE"),
+        ("CUTLASS", 90, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaHopperFp8BlockScalesImpl"),
+        ("TRTLLM", 100, QuantAlgo.FP8_BLOCK_SCALES, "TrtllmTrtllmGenFp8BlockScalesImpl"),
+        ("DEEPGEMM", 100, QuantAlgo.FP8_BLOCK_SCALES, "DeepgemmCudaFp8BlockScalesImpl"),
+        ("CUTEDSL", 100, QuantAlgo.NVFP4, "TrtllmCutedslGroupedGemmNvfp4Impl"),
     ],
     ids=[
         "cutlass_sm90_fp8_block",
@@ -298,3 +298,22 @@ def test_unexcluded_layer_keeps_configured_backend_and_layer_quant_config(
     assert captured["moe_backend"] == backend
     assert captured["moe_cls"] == expected_moe_cls
     assert captured["override"] is per_layer_quant_config
+
+
+# The MegaMoE families are the two that refuse to degrade: a request neither can
+# serve raises with the rejection trail rather than quietly running
+# CutlassFusedMoE, which would then be measured as MegaMoE. The (SM90, FP8 block
+# scales) pair is chosen because Cutlass *is* eligible there -- the case above
+# resolves it -- so the raise can only come from the strict request.
+@pytest.mark.parametrize("backend", ["MEGAMOE_CUTEDSL", "MEGAMOE_DEEPGEMM"])
+def test_megamoe_request_raises_instead_of_degrading(backend):
+    with pytest.raises(ValueError, match="degradation disallowed"):
+        _build_moe_block(
+            backend,
+            ["model.layers.7*"],
+            5,
+            sm=90,
+            quant_config_dict={
+                "model.layers.5.mlp.experts": QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES),
+            },
+        )

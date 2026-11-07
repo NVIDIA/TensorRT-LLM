@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager as KVCacheManagerV1
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -44,24 +44,27 @@ class _StatsRequest:
     tokens: list[int]
     context_remaining_length: int
     py_request_id: int = field(init=False)
+    py_beam_width: int = 1
     lora_task_id: int | None = None
     cache_salt: str | None = None
-    cache_salt_id: int | None = None
     is_first_context_chunk: bool = True
     is_last_context_chunk: bool = True
     is_encoder_init_state: bool = False
     is_dummy_request: bool = False
+    is_context_only_request: bool = False
     is_attention_dp_dummy: bool = False
     is_cuda_graph_dummy: bool = False
     is_disagg_generation_init_state: bool = False
     is_disagg_generation_transmission_complete: bool = False
     is_finished_due_to_cancellation: bool = False
     context_phase_params: None = None
+    kv_cache_retention_config: None = None
     return_perf_metrics: bool = False
     py_draft_tokens: list[int] = field(default_factory=list)
     draft_tokens: list[int] = field(default_factory=list)
     state: LlmRequestState = LlmRequestState.GENERATION_IN_PROGRESS
     context_current_position: int = 0
+    py_served_prefix_end: int = 0
     context_chunk_size: int = 0
     expect_snapshot_points: list[int] = field(default_factory=list)
     prepopulated_prompt: tuple[int, int] | None = None
@@ -97,6 +100,7 @@ class _StatsRequest:
 
     def set_prepopulated_prompt_len(self, length: int, tokens_per_block: int) -> None:
         self.prepopulated_prompt = (length, tokens_per_block)
+        self.context_current_position = length
 
     @property
     def prepopulated_prompt_len(self) -> int:
@@ -315,6 +319,7 @@ def test_v2_resume_restores_offsets_only_after_execution_stream_ready(
     manager = object.__new__(KVCacheManagerV2)
     execution_stream = object()
     manager._stream = SimpleNamespace(cuda_stream=execution_stream)
+    manager._on_allocation_stream = set()
     calls: list[str] = []
 
     def resume(actual_stream: object) -> bool:

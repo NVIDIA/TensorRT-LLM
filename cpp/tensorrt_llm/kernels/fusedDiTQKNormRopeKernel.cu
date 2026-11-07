@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/mathUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -208,6 +209,147 @@ __global__ void fusedDiTQKNormRopeKernel(__nv_bfloat16* qkv, // [num_tokens, tot
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+//
+// Per-head QK Norm + RoPE + static E4M3 quantization kernel (FLUX)
+//
+// Each warp processes one Q, K, or V head of one token.
+//
+template <int head_dim, bool interleave>
+__global__ void fusedDiTQKNormRopeQuantFp8Kernel(__nv_bfloat16 const* qkv, __nv_fp8_e4m3* q_out, __nv_fp8_e4m3* k_out,
+    __nv_fp8_e4m3* v_out, int const num_heads_q, int const num_heads_k, int const num_heads_v, float const eps,
+    __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight, __nv_bfloat16 const* q_add_weight,
+    __nv_bfloat16 const* k_add_weight, float const* q_dequant_scale, float const* k_dequant_scale,
+    float const* v_dequant_scale, float const* cos_emb, float const* sin_emb, int const num_tokens,
+    int const num_txt_tokens, int const tokens_per_batch, int const cos_seq_per_batch)
+{
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+
+    int const total_heads = num_heads_q + num_heads_k + num_heads_v;
+    int const tokenIdx = globalWarpIdx / total_heads;
+    int const localHeadIdx = globalWarpIdx % total_heads;
+    if (tokenIdx >= num_tokens)
+    {
+        return;
+    }
+
+    bool const isQ = localHeadIdx < num_heads_q;
+    bool const isK = !isQ && localHeadIdx < num_heads_q + num_heads_k;
+    bool const isV = !isQ && !isK;
+    int const headIdx
+        = isQ ? localHeadIdx : (isK ? localHeadIdx - num_heads_q : localHeadIdx - num_heads_q - num_heads_k);
+
+    static_assert(head_dim % (32 * 2) == 0, "head_dim must be divisible by 64 (each warp thread gets even elements)");
+    constexpr int numElemsPerThread = head_dim / 32;
+    constexpr int elemSizeBytes = numElemsPerThread * sizeof(__nv_bfloat16);
+    static_assert(elemSizeBytes % 4 == 0, "elemSizeBytes must be a multiple of 4");
+    constexpr int vecSize = elemSizeBytes / 4;
+    using vec_T = typename tensorrt_llm::common::packed_as<uint, vecSize>::type;
+
+    int64_t const inputHeadOffset
+        = static_cast<int64_t>(tokenIdx) * total_heads * head_dim + static_cast<int64_t>(localHeadIdx) * head_dim;
+    int64_t const inputThreadOffset = inputHeadOffset + laneId * numElemsPerThread;
+
+    float elements[numElemsPerThread];
+    float sumOfSquares = 0.0f;
+    {
+        vec_T vec = *reinterpret_cast<vec_T const*>(&qkv[inputThreadOffset]);
+#pragma unroll
+        for (int i = 0; i < vecSize; i++)
+        {
+            float2 vals = __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
+            elements[2 * i] = vals.x;
+            elements[2 * i + 1] = vals.y;
+            if (!isV)
+            {
+                sumOfSquares += vals.x * vals.x;
+                sumOfSquares += vals.y * vals.y;
+            }
+        }
+    }
+
+    if (!isV)
+    {
+        sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
+        float const rms_rcp = rsqrtf(sumOfSquares / static_cast<float>(head_dim) + eps);
+
+        int const localTokenIdx = (tokens_per_batch > 0) ? (tokenIdx % tokens_per_batch) : tokenIdx;
+        bool const useAddWeight = (num_txt_tokens > 0) && (localTokenIdx < num_txt_tokens);
+        __nv_bfloat16 const* weight_ptr = isQ ? ((useAddWeight && q_add_weight != nullptr) ? q_add_weight : q_weight)
+                                              : ((useAddWeight && k_add_weight != nullptr) ? k_add_weight : k_weight);
+
+#pragma unroll
+        for (int i = 0; i < numElemsPerThread; i++)
+        {
+            int const dim = laneId * numElemsPerThread + i;
+            elements[i] *= rms_rcp * __bfloat162float(weight_ptr[dim]);
+        }
+
+        int const cos_tokenIdx = (cos_seq_per_batch > 0) ? (tokenIdx % cos_seq_per_batch) : tokenIdx;
+        int64_t const embOffset = static_cast<int64_t>(cos_tokenIdx) * head_dim;
+        if constexpr (interleave)
+        {
+#pragma unroll
+            for (int i = 0; i < numElemsPerThread; i += 2)
+            {
+                int const dim = laneId * numElemsPerThread + i;
+                float const x = elements[i];
+                float const y = elements[i + 1];
+                elements[i] = x * cos_emb[embOffset + dim] - y * sin_emb[embOffset + dim];
+                elements[i + 1] = y * cos_emb[embOffset + dim + 1] + x * sin_emb[embOffset + dim + 1];
+            }
+        }
+        else
+        {
+            __syncwarp();
+            constexpr int pairOffset = 16;
+            float partner[numElemsPerThread];
+#pragma unroll
+            for (int i = 0; i < numElemsPerThread; i++)
+            {
+                partner[i] = __shfl_xor_sync(0xffffffff, elements[i], pairOffset);
+                if (laneId < pairOffset)
+                {
+                    partner[i] = -partner[i];
+                }
+            }
+            __syncwarp();
+#pragma unroll
+            for (int i = 0; i < numElemsPerThread; i++)
+            {
+                int const dim = laneId * numElemsPerThread + i;
+                elements[i] = elements[i] * cos_emb[embOffset + dim] + partner[i] * sin_emb[embOffset + dim];
+            }
+        }
+    }
+
+    __nv_fp8_e4m3* output = isQ ? q_out : (isK ? k_out : v_out);
+    int const outputHeads = isQ ? num_heads_q : (isK ? num_heads_k : num_heads_v);
+    int64_t const outputThreadOffset = static_cast<int64_t>(tokenIdx) * outputHeads * head_dim
+        + static_cast<int64_t>(headIdx) * head_dim + laneId * numElemsPerThread;
+    float const factor = 1.0f / (isQ ? q_dequant_scale[0] : (isK ? k_dequant_scale[0] : v_dequant_scale[0]));
+
+    // The reference path stores Q/K to BF16 before the generic static quantizer.
+    // Preserve that exact rounding boundary before applying the scale.
+#pragma unroll
+    for (int i = 0; i < numElemsPerThread; i += 2)
+    {
+        float2 vals = make_float2(elements[i], elements[i + 1]);
+        if (!isV)
+        {
+            vals = __bfloat1622float2(__float22bfloat162_rn(vals));
+        }
+        vals.x *= factor;
+        vals.y *= factor;
+        reinterpret_cast<__nv_fp8x2_storage_t*>(&output[outputThreadOffset])[i / 2]
+            = __nv_cvt_float2_to_fp8x2(vals, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int num_heads_k, int num_heads_v,
     int head_dim, float eps, void const* q_weight, void const* k_weight, void const* q_add_weight,
     void const* k_add_weight, float const* cos_emb, float const* sin_emb, int num_txt_tokens, bool interleave,
@@ -253,6 +395,51 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
 #undef LAUNCH_PER_HEAD_KERNEL
 }
 
+void launchFusedDiTQKNormRopeQuantFp8(void const* qkv, void* q_out, void* k_out, void* v_out, int num_tokens,
+    int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float eps, void const* q_weight,
+    void const* k_weight, void const* q_add_weight, void const* k_add_weight, float const* q_dequant_scale,
+    float const* k_dequant_scale, float const* v_dequant_scale, float const* cos_emb, float const* sin_emb,
+    int num_txt_tokens, bool interleave, int tokens_per_batch, int cos_seq_per_batch, cudaStream_t stream)
+{
+    constexpr int blockSize = 256;
+    int const warpsPerBlock = blockSize / 32;
+    int const totalHeads = num_heads_q + num_heads_k + num_heads_v;
+    int const totalWarps = num_tokens * totalHeads;
+    dim3 gridDim(common::divUp(totalWarps, warpsPerBlock));
+    dim3 blockDim(blockSize);
+
+#define LAUNCH_QUANT_KERNEL(HEAD_DIM, INTERLEAVE)                                                                      \
+    fusedDiTQKNormRopeQuantFp8Kernel<HEAD_DIM, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(                          \
+        reinterpret_cast<__nv_bfloat16 const*>(qkv), reinterpret_cast<__nv_fp8_e4m3*>(q_out),                          \
+        reinterpret_cast<__nv_fp8_e4m3*>(k_out), reinterpret_cast<__nv_fp8_e4m3*>(v_out), num_heads_q, num_heads_k,    \
+        num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),                                            \
+        reinterpret_cast<__nv_bfloat16 const*>(k_weight), reinterpret_cast<__nv_bfloat16 const*>(q_add_weight),        \
+        reinterpret_cast<__nv_bfloat16 const*>(k_add_weight), q_dequant_scale, k_dequant_scale, v_dequant_scale,       \
+        cos_emb, sin_emb, num_tokens, num_txt_tokens, tokens_per_batch, cos_seq_per_batch)
+
+    if (interleave)
+    {
+        switch (head_dim)
+        {
+        case 64: LAUNCH_QUANT_KERNEL(64, true); break;
+        case 128: LAUNCH_QUANT_KERNEL(128, true); break;
+        case 256: LAUNCH_QUANT_KERNEL(256, true); break;
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: %d", head_dim);
+        }
+    }
+    else
+    {
+        switch (head_dim)
+        {
+        case 64: LAUNCH_QUANT_KERNEL(64, false); break;
+        case 128: LAUNCH_QUANT_KERNEL(128, false); break;
+        case 256: LAUNCH_QUANT_KERNEL(256, false); break;
+        default: TLLM_THROW("Unsupported head dimension for fusedDiTQKNormRopeQuantFp8: %d", head_dim);
+        }
+    }
+#undef LAUNCH_QUANT_KERNEL
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Fused full-dim RMSNorm + RoPE on packed QKV; Q and K share a single cos/sin pair.
 // Strategy:
@@ -261,6 +448,9 @@ void launchFusedDiTQKNormRope(void* qkv, int num_tokens, int num_heads_q, int nu
 //   - Phase 0b: sync load q_weight + k_weight -> regs (overlaps the cp.async transfers).
 //   - Phase 1: sum^2_Q and sum^2_K together from SMEM, per-row reduce with packed (Q, K) warp slots.
 //   - Phase 2: applies norm + RoPE to Q and K via shared cos/sin SMEM stage; writes HBM in place.
+//
+// When PER_HEAD_COS is false and CosT is float, each head consumes the same HEAD_DIM-wide cos/sin row. Stage that
+// row once per token instead of replicating it for every head in SMEM. Keep the existing bf16 staging unchanged.
 template <int HEAD_DIM, bool INTERLEAVE, bool PER_HEAD_COS, typename CosT>
 __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, float const eps, __nv_bfloat16 const* q_weight, __nv_bfloat16 const* k_weight,
@@ -271,6 +461,7 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
     constexpr int THREADS_PER_ROW = BLOCK_SIZE / ROWS_PER_BLOCK; // 128
     constexpr int WARPS_PER_ROW = THREADS_PER_ROW / 32;          // 4
     constexpr int CHUNK_ELEMS = 8;                               // uint4 = 8 bf16
+    static_assert(HEAD_DIM % CHUNK_ELEMS == 0, "HEAD_DIM must be divisible by the vector width");
     // MAX_N = max(num_heads_q) * HEAD_DIM. 64 covers WAN-14B (40 heads) and
     // future ≤64-head models. SMEM budget at 64h × 128 = 128 KB (bf16 cos) / 192 KB
     // (fp32 cos), both within B200's 227 KB dynamic SMEM cap.
@@ -301,13 +492,16 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
                                          : static_cast<int64_t>(cos_tokenIdx) * HEAD_DIM;
 
     // SMEM layout: [Q row0][Q row1][K row0][K row1] bf16, [cos row0..1][sin row0..1] CosT, warp_sums.
+    // Only the shared fp32 path is deduplicated. The bf16 and per-head paths keep their existing layout.
+    constexpr bool kDeduplicateSharedCos = !PER_HEAD_COS && std::is_same_v<CosT, float>;
+    int const cosStride = kDeduplicateSharedCos ? HEAD_DIM : N;
     extern __shared__ __align__(16) unsigned char smem_raw[];
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw);
     __nv_bfloat16* smem_k = smem_q + ROWS_PER_BLOCK * N;
     CosT* smem_cos = reinterpret_cast<CosT*>(smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16));
-    CosT* smem_sin = smem_cos + ROWS_PER_BLOCK * N;
+    CosT* smem_sin = smem_cos + ROWS_PER_BLOCK * cosStride;
     float* warp_sums = reinterpret_cast<float*>(
-        smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * N * sizeof(CosT));
+        smem_raw + 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * cosStride * sizeof(CosT));
 
     // Phase 0a: cp.async Q + K + cos + sin -> SMEM (all in one commit group).
 #pragma unroll
@@ -323,7 +517,22 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         int const headIdx = elemBase / HEAD_DIM;
         int const baseDim = elemBase - headIdx * HEAD_DIM;
         int const cosHeadOff = PER_HEAD_COS ? headIdx * HEAD_DIM : 0;
-        if constexpr (std::is_same_v<CosT, float>)
+        if constexpr (kDeduplicateSharedCos)
+        {
+            // Only the threads assigned to the first head stage the shared row.
+            if (elemBase < HEAD_DIM)
+            {
+                __pipeline_memcpy_async(
+                    smem_cos + row_in_block * HEAD_DIM + elemBase, cos_emb + embBase + elemBase, 16);
+                __pipeline_memcpy_async(
+                    smem_cos + row_in_block * HEAD_DIM + elemBase + 4, cos_emb + embBase + elemBase + 4, 16);
+                __pipeline_memcpy_async(
+                    smem_sin + row_in_block * HEAD_DIM + elemBase, sin_emb + embBase + elemBase, 16);
+                __pipeline_memcpy_async(
+                    smem_sin + row_in_block * HEAD_DIM + elemBase + 4, sin_emb + embBase + elemBase + 4, 16);
+            }
+        }
+        else if constexpr (std::is_same_v<CosT, float>)
         {
             __pipeline_memcpy_async(
                 smem_cos + row_in_block * N + elemBase, cos_emb + embBase + cosHeadOff + baseDim, 16);
@@ -360,7 +569,7 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         k_w_cache[chunk] = *reinterpret_cast<uint4 const*>(&k_weight[headIdx * HEAD_DIM + baseDim]);
     }
 
-    // Phase 0c: wait + sync.
+    // Phase 0c: wait + sync. The barrier makes the shared row visible to threads assigned to every head.
     __pipeline_wait_prior(0);
     __syncthreads();
 
@@ -419,12 +628,16 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         uint4 const in_vec = *reinterpret_cast<uint4 const*>(&smem_input[row_in_block * N + elemBase]);
         uint4 const w_vec = w_cache[chunk];
 
+        // CHUNK_ELEMS divides HEAD_DIM, so a vector never crosses a head boundary.
+        int const cosIdx
+            = kDeduplicateSharedCos ? (row_in_block * HEAD_DIM + elemBase % HEAD_DIM) : (row_in_block * N + elemBase);
+
         float cos_vals[CHUNK_ELEMS];
         float sin_vals[CHUNK_ELEMS];
         if constexpr (std::is_same_v<CosT, float>)
         {
-            float4 const* cs = reinterpret_cast<float4 const*>(&smem_cos[row_in_block * N + elemBase]);
-            float4 const* ss = reinterpret_cast<float4 const*>(&smem_sin[row_in_block * N + elemBase]);
+            float4 const* cs = reinterpret_cast<float4 const*>(&smem_cos[cosIdx]);
+            float4 const* ss = reinterpret_cast<float4 const*>(&smem_sin[cosIdx]);
             float4 c0 = cs[0], c1 = cs[1];
             float4 s0 = ss[0], s1 = ss[1];
             cos_vals[0] = c0.x;
@@ -446,8 +659,8 @@ __global__ void fusedDiTQKNormFullDimRopeKernel(__nv_bfloat16* qkv, int const nu
         }
         else
         {
-            uint4 const cp = *reinterpret_cast<uint4 const*>(&smem_cos[row_in_block * N + elemBase]);
-            uint4 const sp = *reinterpret_cast<uint4 const*>(&smem_sin[row_in_block * N + elemBase]);
+            uint4 const cp = *reinterpret_cast<uint4 const*>(&smem_cos[cosIdx]);
+            uint4 const sp = *reinterpret_cast<uint4 const*>(&smem_sin[cosIdx]);
             uint const* cu = reinterpret_cast<uint const*>(&cp);
             uint const* su = reinterpret_cast<uint const*>(&sp);
 #pragma unroll
@@ -557,8 +770,10 @@ void launchFusedDiTQKNormRopeFullDim(void* qkv, int num_tokens, int num_heads_q,
     cfg.blockDim = dim3(256);
     // SMEM = Q+K stage (bf16) + cos+sin stage (CosT) + warp_sums.
     size_t const cos_elem_size = cos_is_bf16 ? sizeof(__nv_bfloat16) : sizeof(float);
-    cfg.dynamicSmemBytes = 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16) + 2 * ROWS_PER_BLOCK * N * cos_elem_size
-        + ROWS_PER_BLOCK * 2 * 4 /*WARPS_PER_ROW*/ * sizeof(float);
+    bool const deduplicateSharedCos = !per_head_cos && !cos_is_bf16;
+    int const cosStride = deduplicateSharedCos ? head_dim : N;
+    cfg.dynamicSmemBytes = 2 * ROWS_PER_BLOCK * N * sizeof(__nv_bfloat16)
+        + 2 * ROWS_PER_BLOCK * cosStride * cos_elem_size + ROWS_PER_BLOCK * 2 * 4 /*WARPS_PER_ROW*/ * sizeof(float);
     cfg.stream = stream;
     cfg.attrs = attrs;
     cfg.numAttrs = 1;

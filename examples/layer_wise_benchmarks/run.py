@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import argparse
 import itertools
 import json
@@ -11,6 +14,10 @@ import yaml
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+from tensorrt_llm._torch.nccl_window_graph import (
+    nccl_window_graph_capture,
+    release_nccl_window_graph_owner,
+)
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
 from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
@@ -41,6 +48,9 @@ parser.add_argument("--scaled-from", type=int)
 parser.add_argument("--max-batch-size", type=int)
 parser.add_argument("--tokens-per-block", type=int)
 parser.add_argument("--max-seq-len", type=int)
+parser.add_argument(
+    "--use-kv-cache-manager-v2", action=argparse.BooleanOptionalAction, default="auto"
+)
 group = parser.add_mutually_exclusive_group()
 group.add_argument("--enable-attention-dp", action="store_true", dest="enable_attention_dp")
 group.add_argument("--no-enable-attention-dp", action="store_false", dest="enable_attention_dp")
@@ -66,6 +76,14 @@ parser.add_argument("--moe-backend", type=str)
 # whose Literal is the authoritative list. A second list here can only drift.
 parser.add_argument("--moe-backend-for-prefill", type=str)
 parser.add_argument("--moe-max-num-tokens", type=int)
+parser.add_argument(
+    "--moe-load-balancer",
+    type=str,
+    help="MoeConfig.load_balancer: a YAML file path, or a mapping when set in the config"
+    " file, e.g. {mode: per_layer_dynamic, num_slots: 408}. Supports per_layer_dynamic"
+    " without CUDA graphs, and static standard EPLB (layer_updates_per_iter 0)."
+    " Default: no load balancer.",
+)
 parser.add_argument(
     "--spec-max-draft-len",
     type=int,
@@ -158,7 +176,9 @@ if args.load_format is None:
 if args.max_num_tokens is None:
     args.max_num_tokens = args.max_batch_size * max(args.seq_len_q_list)
 if args.moe_backend_for_prefill is None:
-    args.moe_backend_for_prefill = "CUTLASS"
+    # Prefill only fills the KV cache for the GEN measurement, so it just needs a backend
+    # that can serve this checkpoint on this GPU, which AUTO resolves.
+    args.moe_backend_for_prefill = "AUTO"
 if args.use_low_precision_moe_combine is None:
     args.use_low_precision_moe_combine = False
 if args.enable_autotuner is None:
@@ -167,6 +187,11 @@ if args.use_cuda_graph is None:
     args.use_cuda_graph = False
 if (args.replay_start_iter is None) != (args.replay_stop_iter is None):
     parser.error("Both --replay-start-iter and --replay-stop-iter must be provided or none")
+if args.replay_file_path and os.environ.get("ENABLE_PERFECT_ROUTER") == "expert_ids":
+    parser.error(
+        "--replay-file-path replays the recorded expert IDs over the ones that"
+        " ENABLE_PERFECT_ROUTER=expert_ids substitutes; run the perfect-router arm without it"
+    )
 if args.replay_verify_metadata is None:
     args.replay_verify_metadata = True
 if args.spec_max_draft_len is not None:
@@ -212,6 +237,7 @@ kv_cache_manager = Runner.create_kv_cache_manager(
     enable_swa_scratch_reuse=args.enable_swa_scratch_reuse,
     spec_config=spec_config,
     vision_config=args.vision_config,
+    use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
 )
 attn_workspace = torch.empty((0,), device="cuda", dtype=torch.int8)
 logger.info("Layer-wise benchmarks: Create KV cache manager  ... Done")
@@ -239,6 +265,7 @@ runner = Runner(
     use_cuda_graph=args.use_cuda_graph,
     spec_config=spec_config,
     vision_config=args.vision_config,
+    moe_load_balancer=args.moe_load_balancer,
 )
 logger.info("Layer-wise benchmarks: Create runner  ... Done")
 
@@ -255,9 +282,59 @@ if args.replay_file_path:
         replay_start_iter, replay_stop_iter = calibrator.get_replay_iteration_range()
     else:
         replay_start_iter, replay_stop_iter = args.replay_start_iter, args.replay_stop_iter
+        # An inverted window is empty, so the membership check below reports nothing
+        # missing and lets it through -- and the replay index at the bottom of this
+        # file then divides by (stop - start + 1), which is zero or negative.
+        if replay_start_iter > replay_stop_iter:
+            parser.error(
+                f"--replay-start-iter {replay_start_iter} is past --replay-stop-iter "
+                f"{replay_stop_iter}; the window is inclusive on both ends."
+            )
+        # Check the window before pre_step() indexes into it: a missing iteration
+        # otherwise surfaces as a KeyError thousands of lines into an interleaved
+        # multi-rank log. Membership, not bounds -- a calibration with a hole
+        # satisfies a first/last comparison and still dies at that KeyError.
+        missing_count, missing = calibrator.get_missing_replay_iterations(
+            replay_start_iter, replay_stop_iter
+        )
+        if missing_count:
+            shown = ", ".join(str(i) for i in missing)
+            if missing_count > len(missing):
+                shown += f", ... ({missing_count:d} in total)"
+            parser.error(
+                f"--replay-start-iter/--replay-stop-iter ask for iterations "
+                f"[{replay_start_iter}, {replay_stop_iter}], but "
+                f"{args.replay_file_path} does not hold {shown}. Pick a window it "
+                f"does hold, or drop both flags to take the recorded range, which "
+                f"has to be contiguous."
+            )
     logger.info(
         f"Layer-wise benchmarks: Replay iteration range [{replay_start_iter}, {replay_stop_iter}]"
     )
+    # The replay has to put the same number of tokens through MoE that the calibration
+    # recorded, or it profiles different routing and still reports a number. Scoped to
+    # the window being replayed: iterations outside it may hold another shape, and
+    # those are none of this run's business.
+    try:
+        recorded_tokens = calibrator.get_replay_token_count(replay_start_iter, replay_stop_iter)
+    except ValueError as e:
+        # Report it the way the rest of this block does rather than as a traceback:
+        # the message names the shapes and the iterations that carry them, which is
+        # what the caller has to act on.
+        parser.error(f"{args.replay_file_path}: {e}")
+    mismatched = [
+        (b, s)
+        for b in args.batch_size_list
+        for s in args.seq_len_q_list
+        if b * s != recorded_tokens
+    ]
+    if mismatched:
+        parser.error(
+            f"{args.replay_file_path} recorded {recorded_tokens} tokens per "
+            f"iteration, but --batch-size/--seq-len-q ask for "
+            f"{', '.join(f'{b}x{s}={b * s}' for b, s in mismatched)}. "
+            f"seq_len_q > 1 is MTP and also needs --spec-max-draft-len seq_len_q-1."
+        )
 else:
     calibrator.init("NONE", None, None)
     replay_start_iter, replay_stop_iter = 1, 1  # To avoid None in mathematics
@@ -357,10 +434,15 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in [
     with runner.replace_routing_method_ctx(
         balance_method=BalanceMethod[args.balance_method], balance_ratio=balance_ratio
     ):
-        capture_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(capture_stream):
+        if args.use_cuda_graph:
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                run_pack(check=True)
+            torch.cuda.current_stream().wait_stream(capture_stream)
+        else:
+            # Eager runs warm up on the stream they are timed on: per-layer
+            # dynamic EPLB binds its submission stream on first use.
             run_pack(check=True)
-        torch.cuda.current_stream().wait_stream(capture_stream)
 torch.cuda.synchronize()
 logger.info("Layer-wise benchmarks: Warmup  ... Done")
 
@@ -400,7 +482,11 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         if args.use_cuda_graph:
             with with_multi_stream(True):
                 g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, stream=capture_stream, capture_error_mode="global"):
+                # Bind NCCL-window buffers requested during capture to this graph's pool.
+                graph_pool = torch.cuda.graph_pool_handle()
+                with nccl_window_graph_capture(
+                    g, graph_pool, stream=capture_stream, capture_error_mode="global"
+                ):
                     run_pack()
 
         balance_ratio_str = "" if balance_ratio is None else f" balance={balance_ratio:.2g}"
@@ -419,6 +505,10 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         events[-1].record()
         calibrator.stop()
     torch.cuda.synchronize()
+    if args.use_cuda_graph:
+        # Hand the pool's NCCL-window buffers back only after the graph is gone.
+        g.reset()
+        release_nccl_window_graph_owner(graph_pool)
 
     # Print statistics
     #   Print before `cudaProfilerStop` to ensure messages are included in the profile
@@ -438,3 +528,4 @@ for batch_size, seq_len_q, seq_len_kv_cache, balance_ratio in itertools.product(
         f"  (us)"
     )
 torch.cuda.cudart().cudaProfilerStop()
+runner.shutdown_moe_load_balancer()

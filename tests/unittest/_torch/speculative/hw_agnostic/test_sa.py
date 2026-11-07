@@ -1,17 +1,15 @@
-import os
-import sys
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import unittest
 
 import pytest
 import torch
+from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.suffix_automaton import SAConfig, SuffixAutomatonManager
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, SADecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from utils.llm_data import llm_models_root
 
 
 def get_perf_metrics(result):
@@ -238,6 +236,30 @@ def test_sa_config_invalid_zero():
         )
 
 
+@pytest.mark.cpu_only
+def test_sa_never_gets_a_separate_draft_kv_cache():
+    """SA is one-engine but weight-free: no draft model, no draft KV cache.
+
+    Without the SA exemption the executor builds a zero-layer draft KV cache
+    manager for it and splits the KV budget with that manager.
+    """
+    from tensorrt_llm._torch.speculative.interface import should_use_separate_draft_kv_cache
+    from tensorrt_llm._torch.speculative.sa_worker import SAWorker
+    from tensorrt_llm._torch.speculative.utils import (
+        get_num_extra_kv_tokens,
+        get_num_spec_layers,
+        get_spec_worker,
+    )
+
+    config = SADecodingConfig(max_draft_len=4)
+    assert config.spec_dec_mode.use_one_engine()
+    assert should_use_separate_draft_kv_cache(config) is False
+    assert get_num_spec_layers(config) == 0
+    # The extra tokens are the target's own reservation for the draft window.
+    assert get_num_extra_kv_tokens(config) == 3
+    assert isinstance(get_spec_worker(config, model_config=None, mapping=None), SAWorker)
+
+
 class _FakeSARequest:
     """Minimal request stand-in for SuffixAutomatonManager.prepare_resources.
 
@@ -267,6 +289,7 @@ class _FakeSARequest:
         assert beam == 0
         return list(self._tokens)
 
+    @property
     def is_generation_only_request(self) -> bool:
         return self._generation_only
 
@@ -386,9 +409,9 @@ class TestSADisaggGenInit:
             manager.shutdown()
 
     def test_disagg_gen_init_defers_to_generation_schedule(self):
-        """Ctx/gen spec split: init must NOT happen at _prepare_disagg_gen_init.
+        """Ctx/gen spec split: init must NOT happen at _prepare_disagg_gen_resources.
 
-        The executor's _prepare_disagg_gen_init routes DISAGG_GENERATION_INIT
+        The executor's _prepare_disagg_gen_resources routes DISAGG_GENERATION_INIT
         requests through prepare_resources as context_requests_last_chunk
         BEFORE the ctx server's first generated token has been appended
         (that happens later, in _prepare_disagg_gen_transmission_complete).
@@ -403,7 +426,7 @@ class TestSADisaggGenInit:
             prompt = [1, 2, 3, 4, 5]
             req = _FakeSARequest(11, prompt, generation_only=True)
 
-            # Phase 1: _prepare_disagg_gen_init — request arrives as a
+            # Phase 1: _prepare_disagg_gen_resources — request arrives as a
             # context_requests_last_chunk entry with prompt-only tokens.
             init_batch = ScheduledRequests()
             init_batch.context_requests_last_chunk = [req]
@@ -449,7 +472,9 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
     L, SLOTS, D, W, M, NHEADS = 2, 4, 6, 4, 2, 3
 
     def _make_manager(self, use_kda_replay=True):
-        from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import PythonMambaCacheManager
+        from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+            PythonMambaCacheManager,
+        )
 
         L, SLOTS, D, W, M, NH = (self.L, self.SLOTS, self.D, self.W, self.M, self.NHEADS)
         committed = W - 1
@@ -463,7 +488,8 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         cache.kda_conv_q = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_k = torch.full((L, SLOTS, D, committed + M), 7.0)
         cache.kda_conv_v = torch.full((L, SLOTS, D, committed + M), 7.0)
-        cache.kda_qkg_cache = torch.full((L, SLOTS, M, 3, D), 7.0)
+        cache.kda_k_cache = torch.full((L, SLOTS, M, D), 7.0)
+        cache.kda_g_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_v_cache = torch.full((L, SLOTS, M, D), 7.0)
         cache.kda_beta_cache = torch.full((L, SLOTS, M, NH), 7.0)
         cache.prev_num_accepted_tokens = torch.full((SLOTS,), 5, dtype=torch.int32)
@@ -491,7 +517,8 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
                     kda[:, slot, :, :committed], conv_before[:, slot, lo:hi].to(kda.dtype)
                 )
                 assert (kda[:, slot, :, committed:] == 0).all()
-            assert (cache.kda_qkg_cache[:, slot] == 0).all()
+            assert (cache.kda_k_cache[:, slot] == 0).all()
+            assert (cache.kda_g_cache[:, slot] == 0).all()
             assert (cache.kda_v_cache[:, slot] == 0).all()
             assert (cache.kda_beta_cache[:, slot] == 0).all()
             assert cache.prev_num_accepted_tokens[slot] == 0
@@ -500,7 +527,8 @@ class TestKdaReplaySeedOnDisaggTransfer(unittest.TestCase):
         # Untouched slots keep their contents.
         for slot in (0, 2):
             assert (cache.kda_conv_q[:, slot] == 7.0).all()
-            assert (cache.kda_qkg_cache[:, slot] == 7.0).all()
+            assert (cache.kda_k_cache[:, slot] == 7.0).all()
+            assert (cache.kda_g_cache[:, slot] == 7.0).all()
             assert cache.prev_num_accepted_tokens[slot] == 5
 
     def test_noop_without_kda_replay_or_unknown_ids(self):

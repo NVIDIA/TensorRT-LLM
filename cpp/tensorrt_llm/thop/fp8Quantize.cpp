@@ -70,7 +70,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128(at::Tensor const& self, bo
     mGemmRunner.fp8CS1x128(
         act_buffer, act_scale_buffer, reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), n, m, stream, use_ue8m0);
 
-    // Post-process the scale tensor for sm100 gemm/moe kernel
+    // Post-process the scale tensor for the sm100-family gemm/moe kernels
     if (tensorrt_llm::common::isSM100Family())
     {
         auto const num_n_blocks = (n + 127) / 128;
@@ -144,13 +144,15 @@ std::tuple<at::Tensor, at::Tensor> fp8_batched_quantize_1x128_permute102(at::Ten
     return {valueE4M3.slice(0, 0, b * m * n).view({b, m, n}), scaleFP8SF};
 }
 
-// Fused 1x128 FP8 quantize + UE8M0 packing (SM100 only).
+// Fused 1x128 FP8 quantize + UE8M0 packing (SM100 family only: SM100/SM103/SM107).
 //
-// Returns the legacy deep_gemm MN-major packed int32 scales (K % 16 == 0) by
-// default. useR128c4Layout opts into K32-addressable slots in the standard
-// R128c4 layout (K % 128 == 0); quantization stays K128, so each UE8M0 scale is
-// replicated into four adjacent K32 slots.
-std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self, bool useR128c4Layout)
+// By default, returns K32-addressable scale slots in the standard R128c4
+// layout: [ceil(M/128), ceil(K/128), 32, 4, 4]. Quantization remains K128,
+// so each UE8M0 scale is replicated into four adjacent K32 slots. The legacy
+// deep_gemm MN-major packed layout remains available while that consumer still
+// requires it.
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0_sm_budget(
+    at::Tensor const& self, bool useR128c4Layout, int64_t reservedSms)
 {
     CHECK_TH_CUDA(self);
     CHECK_CONTIGUOUS(self);
@@ -158,7 +160,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
     TORCH_CHECK(self.dim() == 2, "input must be a matrix");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
-        "fp8_quantize_1x128_packed_ue8m0 currently only supports SM100 (Blackwell).");
+        "fp8_quantize_1x128_packed_ue8m0 currently only supports SM100-family GPUs (SM100/SM103/SM107).");
 
     auto const m = self.sizes()[0];
     auto const n = self.sizes()[1];
@@ -167,6 +169,8 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
     auto const num_n_blocks = (n + 127) / 128;
     auto const num_packed_sf_k = (num_n_blocks + 3) / 4;
+    TORCH_CHECK(reservedSms >= 0, "reserved_sms must be nonnegative");
+    TORCH_CHECK(reservedSms == 0 || useR128c4Layout, "reserved_sms requires the R128c4 scale layout");
     auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
 
     if (useR128c4Layout)
@@ -187,11 +191,13 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
         {
 #ifdef ENABLE_BF16
             const thread_local int multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
+            TORCH_CHECK(reservedSms < multiProcessorCount, "reserved_sms must be smaller than the device SM count");
+            int const availableSms = multiProcessorCount - static_cast<int>(reservedSms);
             tensorrt_llm::kernels::invokeMxFP8Quantization<__nv_bfloat16, kQuantSfVecSize, kOutputSfVecSize>(1,
                 static_cast<int>(m), static_cast<int>(n), static_cast<int>(n),
                 reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()),
                 reinterpret_cast<int64_t*>(valueE4M3.data_ptr()), reinterpret_cast<int32_t*>(scaleFP8SF.data_ptr()),
-                tensorrt_llm::QuantizationSFLayout::SWIZZLED, multiProcessorCount, stream);
+                tensorrt_llm::QuantizationSFLayout::SWIZZLED, availableSms, stream);
 #else
             C10_THROW_ERROR(NotImplementedError, "BFloat16 must be enabled to quantize a BF16 tensor to MXFP8.");
 #endif
@@ -231,6 +237,11 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor co
     return {valueE4M3.slice(0, 0, m), packedScale};
 }
 
+std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_packed_ue8m0(at::Tensor const& self, bool useR128c4Layout)
+{
+    return fp8_quantize_1x128_packed_ue8m0_sm_budget(self, useR128c4Layout, 0);
+}
+
 std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor const& self)
 {
     CHECK_TH_CUDA(self);
@@ -239,7 +250,7 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor c
     TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
     TORCH_CHECK(self.dim() == 2, "input must be a matrix");
     TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
-        "fp8_quantize_1x128_cutedsl_ue8m0 currently only supports SM100 (Blackwell).");
+        "fp8_quantize_1x128_cutedsl_ue8m0 currently only supports SM100-family GPUs (SM100/SM103/SM107).");
 
     auto const m = self.sizes()[0];
     auto const k = self.sizes()[1];
@@ -262,6 +273,70 @@ std::tuple<at::Tensor, at::Tensor> fp8_quantize_1x128_cutedsl_ue8m0(at::Tensor c
 
     return {valueE4M3, scaleE8M0};
 }
+
+std::tuple<at::Tensor, at::Tensor> silu_and_mul_fp8_quantize_1x128_packed_ue8m0(
+    at::Tensor const& self, std::optional<double> const swigluLimit, bool useR128c4Layout)
+{
+    CHECK_TH_CUDA(self);
+    CHECK_CONTIGUOUS(self);
+
+    TORCH_CHECK(self.scalar_type() == at::ScalarType::BFloat16, "Input matrix dtype must be BF16.");
+    TORCH_CHECK(self.dim() == 2, "input must be a matrix");
+    TORCH_CHECK(tensorrt_llm::common::isSM100Family(),
+        "silu_and_mul_fp8_quantize_1x128_packed_ue8m0 currently only supports SM100-family GPUs.");
+
+    auto const m = self.sizes()[0];
+    auto const gateUpN = self.sizes()[1];
+    TORCH_CHECK(gateUpN % 2 == 0, "self.sizes()[1] must be even, but got ", gateUpN);
+    auto const n = gateUpN / 2;
+
+    TORCH_CHECK(m <= std::numeric_limits<int32_t>::max(), "M must be within int32");
+    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "N must be within int32");
+    TORCH_CHECK(n % (useR128c4Layout ? 128 : 16) == 0,
+        "SwiGLU output width must satisfy the selected scale layout, but got ", n);
+
+    at::Tensor valueE4M3
+        = at::detail::empty_cuda({m, n}, at::ScalarType::Float8_e4m3fn, self.device(), /* stride */ std::nullopt);
+    at::Tensor scaleStorage;
+    int64_t scaleLeadingDim = 0;
+    if (useR128c4Layout)
+    {
+        auto const numOutputSf = n / 32;
+        auto const sfSize
+            = tensorrt_llm::computeSwizzledLayoutSFSize(static_cast<int>(m), static_cast<int>(numOutputSf));
+        scaleStorage = at::detail::empty_cuda({sfSize}, at::ScalarType::Byte, self.device(), /* stride */ std::nullopt);
+    }
+    else
+    {
+        auto const numNBlocks = (n + 127) / 128;
+        auto const numPackedSfK = (numNBlocks + 3) / 4;
+        scaleLeadingDim = (m + 3) / 4 * 4;
+        scaleStorage = at::detail::empty_cuda(
+            {numPackedSfK, scaleLeadingDim}, at::ScalarType::Int, self.device(), /* stride */ std::nullopt);
+    }
+
+    auto stream = at::cuda::getCurrentCUDAStream(self.get_device());
+    bool const hasSwigluLimit = swigluLimit.has_value() && swigluLimit.value() > 0.0;
+    float const limit = hasSwigluLimit ? static_cast<float>(swigluLimit.value()) : 0.0F;
+
+    tensorrt_llm::kernels::fp8_blockscale_gemm::launch_silu_and_mul_fp8_quantize_1x128_packed_bf16_e4m3(
+        reinterpret_cast<__nv_fp8_e4m3*>(valueE4M3.data_ptr()), scaleStorage.data_ptr(),
+        reinterpret_cast<__nv_bfloat16 const*>(self.data_ptr()), static_cast<int>(m), static_cast<int>(n),
+        static_cast<int>(scaleLeadingDim), useR128c4Layout, limit, hasSwigluLimit, stream);
+
+    if (useR128c4Layout)
+    {
+        return {valueE4M3, scaleStorage};
+    }
+
+    auto const numPackedSfK = scaleStorage.sizes()[0];
+    at::Tensor packedScale = at::from_blob(
+        scaleStorage.data_ptr(),
+        /* sizes   */ {m, numPackedSfK},
+        /* strides */ {1, scaleLeadingDim},
+        /* deleter */ [keep = scaleStorage](void*) mutable {}, scaleStorage.options());
+    return {valueE4M3, packedScale};
+}
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -270,8 +345,14 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def("fp8_quantize_1x128(Tensor input, bool use_ue8m0=False) -> (Tensor, Tensor)");
     m.def("fp8_batched_quantize_1x128_permute102(Tensor input) -> (Tensor, Tensor)");
-    m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input, bool use_r128c4_layout=False) -> (Tensor, Tensor)");
+    m.def("fp8_quantize_1x128_packed_ue8m0(Tensor input, bool use_r128c4_layout=True) -> (Tensor, Tensor)");
+    m.def(
+        "fp8_quantize_1x128_packed_ue8m0.sm_budget(Tensor input, bool use_r128c4_layout=True, "
+        "int reserved_sms=0) -> (Tensor, Tensor)");
     m.def("fp8_quantize_1x128_cutedsl_ue8m0(Tensor input) -> (Tensor, Tensor)");
+    m.def(
+        "silu_and_mul_fp8_quantize_1x128_packed_ue8m0(Tensor input, float? swiglu_limit=None, bool "
+        "use_r128c4_layout=True) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -279,5 +360,9 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
     m.impl("fp8_quantize_1x128", &tensorrt_llm::torch_ext::fp8_quantize_1x128);
     m.impl("fp8_batched_quantize_1x128_permute102", &tensorrt_llm::torch_ext::fp8_batched_quantize_1x128_permute102);
     m.impl("fp8_quantize_1x128_packed_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0);
+    m.impl("fp8_quantize_1x128_packed_ue8m0.sm_budget",
+        &tensorrt_llm::torch_ext::fp8_quantize_1x128_packed_ue8m0_sm_budget);
     m.impl("fp8_quantize_1x128_cutedsl_ue8m0", &tensorrt_llm::torch_ext::fp8_quantize_1x128_cutedsl_ue8m0);
+    m.impl("silu_and_mul_fp8_quantize_1x128_packed_ue8m0",
+        &tensorrt_llm::torch_ext::silu_and_mul_fp8_quantize_1x128_packed_ue8m0);
 }

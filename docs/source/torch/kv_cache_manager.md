@@ -37,13 +37,13 @@ There are also two interfaces designed for `CapacityScheduler`:
   `CapacityScheduler` uses this to sum up the total resources needed and determine if new requests can be accommodated.
 
 In addition to the `BaseResourceManager` interfaces, `KVCacheManager` has interfaces related to the `ModelEngine` in use.
-For `PyTorchModelEngine`, common interfaces include:
+For `ModelEngine`, common interfaces include:
 
 - **get_batch_cache_indices**: Takes a list of `LlmRequest` and returns a `Dict[List[int]]`, indicating the block IDs for each request.
 - **get_buffers**: Returns the buffer of the KV Cache pool for a given layer, used by the attention backend. The shape might be [`num_blocks`, 2, `num_tokens_per_block`, `num_kv_heads`, `head_dim`].
 - **get_num_free_blocks**: Returns the number of free blocks available for allocation.
 
-There are also interfaces for warming up `PyTorchModelEngine`, especially when using CUDA graphs:
+There are also interfaces for warming up `ModelEngine`, especially when using CUDA graphs:
 
 - **add_padding_request**: Adds a sequence of context length 1 to KV Cache as a warmup request.
   This is optional if CUDA Graph is not used in your proof of concept.
@@ -51,8 +51,8 @@ There are also interfaces for warming up `PyTorchModelEngine`, especially when u
 ## Customize KV Cache Manager
 
 To customize `KVCacheManager`, implement all the necessary interfaces.
-Then, integrate it into the `PyExecutor`. For the PyTorch backend, the relevant code is in [pytorch_model_registry.py](../../../tensorrt_llm/_torch/pyexecutor/backend_registries/pytorch_model_registry.py).
-In the `create_pytorch_model_based_executor` function, the `KVCacheManager` is instantiated as follows:
+Then, integrate it into the `PyExecutor`. For the PyTorch backend, the relevant code is in [_util.py](../../../tensorrt_llm/_torch/pyexecutor/_util.py).
+In `KvCacheCreator._create_kv_cache_manager`, the `KVCacheManager` is instantiated along these lines:
 
 ```python
     kv_cache_manager = KVCacheManager(

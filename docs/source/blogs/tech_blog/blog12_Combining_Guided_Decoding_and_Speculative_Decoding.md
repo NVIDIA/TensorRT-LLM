@@ -181,7 +181,7 @@ print(x)
 
 The output would look like:
 
-```txt
+```text
 tensor([20, 20, 20, 20, 20, 20, 20, 20, 20, 20], dtype=torch.int32)
 ```
 

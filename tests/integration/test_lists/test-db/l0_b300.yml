@@ -1,3 +1,6 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 version: 0.0.1
 l0_b300:
 - condition:
@@ -15,24 +18,62 @@ l0_b300:
       stage: pre_merge
       backend: pytorch
   tests:
-  # ------------- PyTorch tests ---------------
-  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
-  - unittest/_torch/attention/sparse/test_cute_dsl_fp8_paged_mqa_logits.py
-  - unittest/_torch/attention/sparse/test_cute_dsl_fp4_paged_mqa_logits.py
-  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py
+  # ------------- DeepSeek-V4.1 model, Engram and DSpark ---------------
+  - unittest/_torch/modeling/test_modeling_deepseekv41.py
+  - unittest/_torch/modules/test_engram_decode_hash.py
+  - unittest/_torch/modules/test_engram_history_uploads.py
+  - unittest/_torch/modules/test_engram_replay.py
+  - unittest/_torch/speculative/hw_agnostic/test_dspark_v41.py
+  - unittest/_torch/modules/test_mhc.py::test_fused_hc_lagged_matches_eager_composition
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_mma_split_k_deterministic
+  - unittest/_torch/modules/test_mhc.py::test_mhc_fused_hc_small_m_fma_candidates_agree
+  # Covers the GPU cases of tests/unittest/_torch/attention/ on B300, except the paths
+  # ignored below; its cpu_only cases run on CPU (l0_cpu). kernels/ has no entry of its own
+  # on any list, so apart from kernels/parallel_hw_agnostic/ this entry is what runs it
+  # here. multi_gpu/ cases need >= 2 GPUs, so they skip here and run on multi-GPU stages:
+  # l0_gb300_multi_gpus (post_merge) and l0_dgx_b300, which runs test_helix_zero_kv.py in
+  # its pre_merge block and the rest in post_merge. Collecting them still runs their helix
+  # files' import-time rebinding of mpi4py's serializer, which applies to the whole pytest
+  # process.
+  # - kernels/parallel_hw_agnostic/ is ignored: its cases do not depend on the GPU
+  #   architecture, so its GPU cases run on H100 (l0_h100) and its cpu_only ones on CPU
+  #   (l0_cpu). GB300 (l0_gb300_multi_gpus, post_merge) also runs the GPU cases; it is
+  #   the only Blackwell stage that does.
+  # - The other files ignored here have their own entries below.
+  - unittest/_torch/attention --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py --ignore=unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py --ignore=unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py --ignore=unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py --ignore=unittest/_torch/attention/kernels/parallel_hw_agnostic TIMEOUT (90)
+  # Run cold-JIT MSA coverage separately from the attention aggregate.
+  # Cold-JIT runs take about 25 minutes; allow a 45-minute budget.
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py TIMEOUT (45)
+  - unittest/_torch/attention/sparse/msa/test_msa_proxy_split.py
+  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp8_paged_mqa_logits.py
+  - unittest/_torch/attention/sparse/dsa/test_cute_dsl_fp4_paged_mqa_logits.py
+  - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_decode.py TIMEOUT (120)
   - unittest/_torch/attention/sparse/test_cute_dsl_gvr_topk_tiers.py
-  - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/modeling/test_qsa_runtime_wiring.py
+  - unittest/_torch/modeling/test_qwen4_exp_support.py
+  - unittest/_torch/moe/kernels/parallel
+  - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel
-  - unittest/_torch/thop/serial
-  - unittest/_torch/executor # 250s
+  - unittest/_torch/visual_gen/test_attention_flashinfer.py
+  # ------------- Visual Gen sparse attention (sm103) ---------------
+  - unittest/_torch/visual_gen/sparse_attention/sol/test_sol_attention.py
+  - unittest/_torch/moe/kernels/serial
+  - unittest/_torch/kernels/serial
+  - unittest/_torch/pyexecutor # 250s
+  - unittest/_torch/disaggregation
   # ------------- modules (non-MoE) ---------------
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/test_awq_quantization.py
   - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_mxfp8_linear.py
   - unittest/_torch/modules/test_group_rmn_norm.py
-  - unittest/_torch/modules/test_rotary_embedding.py
   - unittest/_torch/modules/test_low_m_gemm.py
+  - unittest/_torch/modules/test_top_k.py
+  - unittest/_torch/modules/test_qwen4_exp_hyper_connection.py
+  - unittest/_torch/modules/test_qwen4_exp_ple.py
+  - unittest/_torch/modules/test_qwen4_exp_ple_kernels.py
+  - unittest/_torch/modules/test_qwen4_exp_ple_offload.py
   - unittest/_torch/modules/mamba
   - unittest/_torch/modules/tests_lora_modules
   # ------------- MoE components tests ---------------
@@ -55,8 +96,19 @@ l0_b300:
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streaming_drains_staging_per_expert
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_streamed_experts_forward_runs
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutlass_situ_bf16_matches_reference
-  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTLASS]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[CUTEDSL]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_kernel_actually_applies_situ[TRTLLM]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_kimi_k3_allow_list_matches_what_the_backends_declare
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_explicit_cutedsl_fails_instead_of_degrading_to_cutlass
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_situ_betas_reach_the_kernel_cache_key
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[nan_beta]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[nan_linear]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[inf_beta]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[inf_linear]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[zero]
+  - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_cutedsl_kernel_rejects_unusable_situ_betas[negative]
+  - unittest/_torch/moe/test_moe_backend.py::test_situ_survives_resolution_not_just_construction[cutlass]
+  - unittest/_torch/moe/test_moe_backend.py::test_situ_survives_resolution_not_just_construction[cutedsl]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[CUTLASS-static_1.0]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_nvfp4_experts_match_situ_reference[TRTLLM-static_1.0]
   - unittest/_torch/moe/test_kimi_k3_situ_moe.py::test_megamoe_streamed_coverage_survives_per_expert_drain
@@ -68,7 +120,6 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_fp8_block_scales_fuse_shared_expert_layout
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_selects_padded_quant_method
   - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_nvfp4_situ_fc31_scale_c_drops_dequant_scale
-  - unittest/_torch/moe/test_moe_backend.py::test_trtllm_gen_situ_rejects_quant_algos_without_fused_cubins
   # ------------- MoE: test_single_gpu (specific quant per backend) ---------------
   # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]
@@ -85,12 +136,83 @@ l0_b300:
   # DEEPGEMM backend: FP8_BLOCK_SCALES
   - unittest/_torch/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
   # ---- end MoE tests ----
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_chunked_prefill[quant_dtype=fp8-kv_cache_reuse=True-fp8kv=True-overlap_scheduler=True] # Cover nvbugs 6084445
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16_flashinfer[enable_chunked_prefill=True]
+  # TIMEOUT measured: 3122 cases in 13m54s on one GB300 (the cpu_only files run on the CPU
+  # stage instead), so 30 is 2.2x headroom.
+  - unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm --ignore=unittest/_torch/modeling_v2/models/kimi_k3_vl --ignore=unittest/_torch/modeling_v2/models/minimax_m3 TIMEOUT (30)
+  - unittest/_torch/modeling_v2/models/minimax_m3 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__* TIMEOUT (30)
+  # K3 single-GPU kernel and wrapper checks.
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_cluster_waits.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctm_gemv_wide.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_ctx_kv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_drafter_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_embed.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_fused_moe.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_head_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_decode_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_pools_past_2g.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_kda_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_mla_q.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_front_geometry.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_m1.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_m2.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_moe_wide.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_route_quant.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_spec_accept.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_tcgen05_fences.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_attn_res_fwd.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_attn_res_rmsnorm_fwd.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_causal_conv1d_fwd.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_chunk_kda.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv_long.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv_swiglu.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_ctm_gemv_wide.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_decode_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_drafter_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_drafter_attn_qknorm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_embed_norm.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_head_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_kda_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_kda_decode_attn.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_kda_verify.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mla_attn_vb_out.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mla_qkv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe_m1.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_moe_m2.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_native.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_route_quant.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_situ_mul.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kda_decode.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kda_post_conv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kda_prefill.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_construction.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_gemv.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drafter.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drift.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_moe_routing.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_route_b_moe.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_rms_norm_gated_token_major.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_situ_and_mul.py
+  - accuracy/modeling_v2/test_gpt_oss.py::TestModelingV2GptOss120bSm10xDefault::test_gsm8k[tp1]
+  # qwen4_exp target at tp1, pre-merge: gsm8k without speculation; one MTP engine for gsm8k
+  # with its acceptance-length floor, mmmu (the vision tower) and synthetic videos; and one
+  # engine with three drafts and IndexShare over bf16 KV, gsm8k and then 3k-6k-token pass
+  # keys, the only prompts long enough to run the sparse attention path. The other engines
+  # run post-merge (below).
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_gsm8k
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp1_gsm8k_mmmu_and_video
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_gsm8k_and_long_context
 - condition:
     ranges:
       system_gpu_count:
@@ -111,3 +233,12 @@ l0_b300:
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  # qwen4_exp target at tp1, post-merge: three drafts over CuteDSL experts, fp8 KV and a bf16
+  # recurrent state (gsm8k and the pass keys); seven drafts over 3k-12k-token pass keys on
+  # NVFP4 KV and a bf16 state (the verify step's eight rows per request); and the breakable
+  # prefill CUDA graph replayed against eager greedy continuations at the bucket edges and
+  # with context and generation rows in one batch. Its disaggregated engines run in
+  # l0_gb300_multi_gpus.
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp3_cutedsl_fp8_kv_bf16_state
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_mtp7_long_context_passkey
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_breakable_prefill_matches_eager

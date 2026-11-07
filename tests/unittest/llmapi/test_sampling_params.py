@@ -13,13 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import copy
 import json
-from types import SimpleNamespace
+import pickle
+from dataclasses import fields
+from typing import Any
 
 import pytest
 import torch
 
 from tensorrt_llm.llmapi.llm import BaseLLM
+from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 from tensorrt_llm.llmapi.thinking_budget import (
     ThinkingBudgetLogitsProcessor,
     add_thinking_budget_logits_processor,
@@ -37,16 +41,25 @@ from tensorrt_llm.serve.resource_governor import ResourceGovernor
 pytestmark = pytest.mark.cpu_only
 
 
+# BaseLLM.__init__ builds a model and executor. This lightweight subclass keeps
+# these method-level tests CPU-only while using the production argument types.
+class _TestLLM(BaseLLM):
+    def __init__(self, **args_overrides: Any) -> None:
+        self.args = TorchLlmArgs(
+            model="dummy",
+            skip_tokenizer_init=True,
+            **args_overrides,
+        )
+
+
 def _apply_generation_config_sampling_defaults(
     mode: str,
     sampling_params: SamplingParams,
     generation_config_explicit_values: dict,
 ) -> SamplingParams:
-    llm = SimpleNamespace(
-        args=SimpleNamespace(backend="pytorch", generation_config=mode),
-        _generation_config_explicit_values=generation_config_explicit_values,
-    )
-    BaseLLM._apply_generation_config_sampling_defaults(llm, sampling_params)
+    llm = _TestLLM(generation_config=mode)
+    llm._generation_config_explicit_values = generation_config_explicit_values
+    llm._apply_generation_config_sampling_defaults(sampling_params)
     return sampling_params
 
 
@@ -289,6 +302,21 @@ def test_sampling_params_rejects_out_of_range(field, value):
 )
 def test_sampling_params_accepts_in_range_values(field, value):
     assert getattr(SamplingParams(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize(
+    "round_trip",
+    [lambda params: pickle.loads(pickle.dumps(params)), copy.copy, copy.deepcopy],
+)
+def test_sampling_params_copy_round_trip_keeps_every_field(round_trip):
+    # A distinct value in every field, so a field the pickling misses fails.
+    params = SamplingParams()
+    for f in fields(SamplingParams):
+        object.__setattr__(params, f.name, f"value of {f.name}")
+    restored = round_trip(params)
+    assert type(restored) is SamplingParams
+    for f in fields(SamplingParams):
+        assert getattr(restored, f.name) == getattr(params, f.name), f.name
 
 
 @pytest.mark.parametrize("value", [None, -1])

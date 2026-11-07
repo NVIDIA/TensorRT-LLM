@@ -23,9 +23,11 @@ from transformers import PretrainedConfig
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_100f, is_sm_120f
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.quantization.utils.fp4_utils import NVFP4_SF_VEC_SIZE, nvfp4_scaling_vector_size
 
 from ...inputs import (
     ContentFormat,
@@ -59,25 +61,28 @@ _MTP_TOP_TO_TRTLLM = {
 }
 
 
-def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
-    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
-    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+def _use_nvfp4_marlin(llm_args: "TorchLlmArgs") -> bool:
     quant_config = getattr(llm_args, "quant_config", None)
-    if getattr(quant_config, "quant_algo", None) in (
+    return getattr(quant_config, "quant_algo", None) in (
         QuantAlgo.NVFP4,
         QuantAlgo.MIXED_PRECISION,
-    ) and is_nvfp4_marlin_supported_sm(get_sm_version()):
+    ) and is_nvfp4_marlin_supported_sm(get_sm_version())
+
+
+def _get_qwen35_dense_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for dense Qwen3.5 with NVFP4 linears on Ada/Hopper."""
+    defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+    if _use_nvfp4_marlin(llm_args):
         # CUTLASS W4A4 requires Blackwell; use Marlin's W4A16 path instead.
-        defaults.update(
-            {
-                "moe_config": {
-                    "backend": "MARLIN",
-                },
-                "nvfp4_gemm_config": {
-                    "allowed_backends": ["marlin"],
-                },
-            }
-        )
+        defaults["nvfp4_gemm_config"] = {"allowed_backends": ["marlin"]}
+    return defaults
+
+
+def _get_qwen35_moe_model_defaults(llm_args: "TorchLlmArgs") -> dict:
+    """Return Marlin defaults for Qwen3.5 MoE with NVFP4 experts on Ada/Hopper."""
+    defaults = _get_qwen35_dense_model_defaults(llm_args)
+    if _use_nvfp4_marlin(llm_args):
+        defaults["moe_config"] = {"backend": "MARLIN"}
     return defaults
 
 
@@ -169,10 +174,10 @@ class Qwen35ConfigCompat:
     def normalize(config_dict: dict, require_text_config: bool = False) -> dict:
         """Entry point: raw config.json dict -> flat Qwen3NextConfig-compatible dict.
 
-        `require_text_config=True` is used by the Qwen-Image-Bench composite
-        checkpoint, which always nests its language model under `text_config`;
-        it forces extraction of that nested config rather than falling back to
-        treating the top-level dict as the text config.
+        `require_text_config=True` is used by composite checkpoints such as
+        MiniCPM-V 4.6, which always nest their language model under
+        `text_config`; it forces extraction of that nested config rather than
+        falling back to treating the top-level dict as the text config.
         """
         text_config = Qwen35ConfigCompat._extract_text_config(
             config_dict, require_text_config=require_text_config
@@ -204,7 +209,7 @@ class Qwen35ConfigCompat:
         """Pull nested text_config from VLM checkpoints, or use dict as-is.
 
         `require_text_config=True` forces extraction of the nested `text_config`
-        (used by the Qwen-Image-Bench composite checkpoint) and raises if it is
+        (used by composite checkpoints such as MiniCPM-V 4.6) and raises if it is
         missing, instead of falling back to the top-level dict.
         """
         if require_text_config:
@@ -426,7 +431,7 @@ def _normalize_qwen35_moe_vl_config(model_config) -> None:
     _normalize_qwen35_vl_config(model_config, inner_arch="Qwen3_5MoeForCausalLM")
 
 
-def _lm_head_nvfp4_enabled(model_config):
+def _lm_head_nvfp4_enabled(model_config: ModelConfig) -> bool:
     """Whether the checkpoint's quantized lm_head should stay quantized.
 
     ModelOpt MIXED_PRECISION exports for Qwen3.5/3.6 quantize lm_head to
@@ -437,6 +442,8 @@ def _lm_head_nvfp4_enabled(model_config):
     Conditions mirror what the quantized LMHead supports (see LMHead.__init__
     guards) plus the paths that bypass the Linear machinery entirely:
 
+    - 32-element scale blocks need software dequantization, so dequantize
+      lm_head once at load time instead of materializing it every decode step;
     - tie_word_embeddings shares the weight with the embedding lookup, which
       needs a dense bf16 weight;
     - ADP builds a TP-less LMHead (or slices the raw weight for the
@@ -451,14 +458,26 @@ def _lm_head_nvfp4_enabled(model_config):
     cfg = qcd.get("lm_head")
     pretrained = model_config.pretrained_config
     mapping = model_config.mapping
+    sm = get_sm_version()
     return (
         cfg is not None
         and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
-        and get_sm_version() in (100, 103, 120)
+        and _has_nvfp4_gemm_block_width(cfg)
+        and (is_sm_100f(sm) or is_sm_120f(sm))
         and not getattr(pretrained, "tie_word_embeddings", False)
         and not mapping.enable_attention_dp
         and getattr(pretrained, "vocab_size", 0) % mapping.tp_size == 0
     )
+
+
+def _has_nvfp4_gemm_block_width(cfg: QuantConfig | None) -> bool:
+    """Whether a W4A16_NVFP4 entry can be promoted to the W4A4 NVFP4 GEMMs.
+
+    The GEMMs are hardware-bound to 16-element scale blocks; ModelOpt's
+    ``nvfp4_*_weight_only`` recipes may export 32-element blocks, which must
+    stay on the W4A16 dequantization path.
+    """
+    return nvfp4_scaling_vector_size(cfg) == NVFP4_SF_VEC_SIZE
 
 
 def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
@@ -518,7 +537,9 @@ def _normalize_qwen35_exclude_modules(model_config, keep_lm_head_quant=False):
     qc.exclude_modules = sorted(normalized)
 
 
-def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
+def _normalize_qwen35_quant_config_dict(
+    model_config: ModelConfig, keep_lm_head_quant: bool = False
+) -> None:
     """Normalize MIXED_PRECISION per-layer quant config keys from HF naming.
 
     ModelOpt MIXED_PRECISION checkpoints key ``quant_config_dict`` by HF names
@@ -532,9 +553,13 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     On SM100/SM103, W4A16_NVFP4 routed experts AND dense MLP projections
     (gate_proj/up_proj/down_proj) are promoted to NVFP4 so the CuteDSL/TRTLLM
     GEMM path can consume the checkpoint's packed FP4 weights and static input
-    scales. Dense MLP keys are additionally re-pathed to the doubled
-    ``.mlp.mlp.`` form to match the ``_DenseMlpAdapter`` runtime module tree.
-    Other W4A16_NVFP4 modules retain their original algorithm.
+    scales -- provided the checkpoint uses 16-element scale blocks. 32-element
+    dense weight-only exports (``group_size=32``) stay on the W4A16
+    dequantization path because the W4A4 GEMMs cannot consume them. MoE expert
+    entries with 32-element blocks are rejected before promotion. Dense MLP keys are
+    additionally re-pathed to the doubled ``.mlp.mlp.`` form to match the
+    ``_DenseMlpAdapter`` runtime module tree. Other W4A16_NVFP4 modules retain
+    their original algorithm.
 
     Mutates ``quant_config_dict`` in place (model_config is frozen).
 
@@ -547,8 +572,9 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
     sets get no fused entry, and the mapper dequantizes them to bf16 instead.
 
     The ``lm_head`` entry is kept when ``keep_lm_head_quant`` (see
-    _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103, left
-    W4A16_NVFP4 on SM120 -- and dropped otherwise:
+    _lm_head_nvfp4_enabled) -- promoted to NVFP4 on SM100/103 for 16-element
+    blocks, left W4A16_NVFP4 on SM120 -- and dropped otherwise, including
+    32-element blocks which the mapper dequantizes once at load time:
     a leftover entry would make DecoderModelForCausalLM build a quantized
     LMHead whose weights the mapper had already dequantized to bf16.
     """
@@ -568,8 +594,9 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             continue
         if name == "lm_head":
             if keep_lm_head_quant:
-                # SM120 keeps W4A16_NVFP4 (Marlin); SM100/103 promotes to W4A4.
-                if convert_to_nvfp4:
+                # _lm_head_nvfp4_enabled only keeps native 16-element paths.
+                # SM120 uses Marlin; SM100/103 promotes to W4A4.
+                if convert_to_nvfp4 and _has_nvfp4_gemm_block_width(cfg):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 normalized[name] = cfg
             else:
@@ -600,6 +627,8 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
         if in_proj_match and not from_mtp and cfg.quant_algo == QuantAlgo.FP8:
             in_proj_fp8.setdefault(in_proj_match.group(1), {})[in_proj_match.group(2)] = cfg
             continue
+        if name.endswith(".mlp.experts"):
+            ModelConfig._validate_nvfp4_group_size(cfg, name)
         if (
             convert_to_nvfp4
             and name.endswith(".mlp.experts")
@@ -618,8 +647,15 @@ def _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=False):
             # promote W4A16_NVFP4 -> NVFP4 so the CuteDSL/TRTLLM GEMM path can
             # consume the checkpoint's packed FP4 weights and static input scales.
             dense_mlp_match = re.search(r"\.mlp\.(gate_proj|up_proj|down_proj)$", name)
-            if dense_mlp_match and cfg.quant_algo == QuantAlgo.W4A16_NVFP4:
-                if convert_to_nvfp4:
+            if dense_mlp_match and cfg.quant_algo in (
+                QuantAlgo.W4A16_NVFP4,
+                QuantAlgo.NVFP4,
+            ):
+                if (
+                    convert_to_nvfp4
+                    and cfg.quant_algo == QuantAlgo.W4A16_NVFP4
+                    and _has_nvfp4_gemm_block_width(cfg)
+                ):
                     cfg = cfg.model_copy(update={"quant_algo": QuantAlgo.NVFP4})
                 proj = dense_mlp_match.group(1)
                 name = name[: -len(dense_mlp_match.group(0))] + f".mlp.mlp.{proj}"
@@ -684,6 +720,10 @@ class Qwen3_5ForCausalLM(Qwen3NextForCausalLM):
         _normalize_qwen35_quant_config_dict(model_config, keep_lm_head_quant=keep_lm_head_quant)
         super().__init__(model_config)
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        return _get_qwen35_dense_model_defaults(llm_args)
+
 
 # Shared placeholder metadata for both Qwen3.5 VLM variants. The image/video
 # placeholder layout is identical for MoE and dense; only the registration
@@ -711,16 +751,14 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
     """
 
     supports_encoder_cache = True
+    # The inner Qwen3.5 decoder implements them (see Qwen3NextForCausalLM).
+    model_specific_llm_args = Qwen3NextForCausalLM.model_specific_llm_args
 
     @classmethod
     def get_model_defaults(cls, llm_args):
         # `ModelLoader` applies `get_model_defaults()` on the resolved outer
-        # model class (this VLM wrapper), not on the inner decoder. Both
-        # inner LMs (`Qwen3_5MoeForCausalLM` / `Qwen3_5ForCausalLM`) inherit
-        # `Qwen3NextForCausalLM`'s defaults unchanged, so delegate to it to
-        # keep block reuse disabled until a recurrent-state snapshot policy is
-        # configured.
-        return Qwen3NextForCausalLM.get_model_defaults(llm_args)
+        # model class (this VLM wrapper), not on the inner decoder.
+        return _get_qwen35_dense_model_defaults(llm_args)
 
     @classmethod
     def get_preferred_kv_cache_manager_version(
@@ -750,6 +788,15 @@ class _Qwen3_5VLModel(Qwen3VLModelBase):
             "mrope_config.mrope_position_ids",
             "mrope_config.mrope_position_deltas",
         ]
+
+    def prepare_mrope_config(
+        self, multimodal_params, num_generation_requests, position_ids, **kwargs
+    ):
+        # No packed mrope cos/sin table (position_ids None skips only that): the decoder's attention applies RoPE
+        # itself (rope_fusion off) and never reads it. The position deltas are still kept.
+        return super().prepare_mrope_config(
+            multimodal_params, num_generation_requests, None, **kwargs
+        )
 
     def load_weights(
         self,

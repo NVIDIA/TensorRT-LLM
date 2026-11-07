@@ -17,8 +17,8 @@ from typing import Any, cast
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
-from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
-from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
+from tensorrt_llm._torch.attention.backends import TrtllmAttentionMetadata
+from tensorrt_llm._torch.attention.backends.interface import AttentionMetadata
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader

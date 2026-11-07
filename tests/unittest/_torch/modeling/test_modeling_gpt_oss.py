@@ -14,13 +14,12 @@ from utils.util import skip_no_hopper
 
 import tensorrt_llm
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
+from tensorrt_llm._torch.attention.backends.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_gpt_oss import GptOssForCausalLM
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings.executor import \
-    KvCacheConfig as BindingsKvCacheConfig
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import \
+    KVCacheManagerV2
 from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  KvCacheConfig, MoeConfig)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
@@ -63,9 +62,10 @@ def _resolve_gpt_oss_kv_cache_manager_v2(**llm_args_kwargs) -> bool:
     return _resolve_kv_cache_manager_v2_auto(llm_args, GptOssForCausalLM)
 
 
-def test_gpt_oss_model_preference_selects_v2():
+def test_gpt_oss_auto_selects_model_preference():
     """GPT-OSS is VSWA, so "auto" resolves to KVCacheManagerV2."""
-    assert _resolve_gpt_oss_kv_cache_manager_v2() is True
+    assert _resolve_gpt_oss_kv_cache_manager_v2(kv_cache_config=KvCacheConfig(
+        use_kv_cache_manager_v2="auto")) is True
 
 
 @pytest.mark.parametrize("user_setting", [False, True])
@@ -80,8 +80,7 @@ def test_gpt_oss_one_model_eagle3_keeps_v2():
     assert _resolve_gpt_oss_kv_cache_manager_v2(
         speculative_config=Eagle3DecodingConfig(
             max_draft_len=3,
-            speculative_model="/tmp/dummy_eagle_model",
-            eagle3_one_model=True)) is True
+            speculative_model="/tmp/dummy_eagle_model")) is True
 
 
 def dump_config_json(dst_dir):
@@ -193,9 +192,8 @@ def test_gpt_oss_xqa_kernel_selection():
 
     kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
     mapping = Mapping(world_size=1, tp_size=1, rank=0)
-    kv_cache_config = BindingsKvCacheConfig(max_tokens=num_blocks *
-                                            tokens_per_block)
-    kv_cache_manager = KVCacheManager(
+    kv_cache_config = KvCacheConfig(max_tokens=num_blocks * tokens_per_block)
+    kv_cache_manager = KVCacheManagerV2(
         kv_cache_config,
         tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
         num_layers=num_layers,

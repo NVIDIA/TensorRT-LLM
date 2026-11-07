@@ -60,7 +60,6 @@ worker_config:
     moe_config:
       backend: TRTLLM
     cache_transceiver_config:
-      max_tokens_in_buffer: 32768
       backend: NIXL
     disable_overlap_scheduler: false
     num_postprocess_workers: 4
@@ -83,6 +82,5 @@ worker_config:
       backend: CUTEDSL
       use_low_precision_moe_combine: true
     cache_transceiver_config:
-      max_tokens_in_buffer: 32768
       backend: NIXL
     disable_overlap_scheduler: false

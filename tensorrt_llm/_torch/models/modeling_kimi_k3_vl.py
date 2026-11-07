@@ -49,8 +49,8 @@ from ...inputs import (
     register_input_processor,
 )
 from ...logger import logger  # noqa: E402
-from ..attention_backend import AttentionMetadata
-from ..attention_backend.utils import get_attention_backend
+from ..attention.backends import AttentionMetadata
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mlp import MLP
@@ -317,8 +317,9 @@ class KimiK3VisionModel(KimiK25VisionModel):
         # head count is not divisible by the attention-TP degree (e.g. Kimi K3's
         # 12 heads under TP16); run the whole tower replicated (tp=1) in that
         # case so module construction and weight loading agree. Attention-DP
-        # already replicates the vision tower via its own path, so leave it be.
-        if not model_config.mapping.enable_attention_dp:
+        # already replicates the vision tower via its own path, except under
+        # helix: the mapping still carries cp, which Attention would shard by.
+        if not model_config.mapping.enable_attention_dp or model_config.mapping.cp_size > 1:
             self.model_config.mapping = _get_vision_tp_mapping(model_config, num_heads)
         pretrained_config = self.model_config.pretrained_config
         # Normalize the checkpoint dtype once (covers both the modern `dtype`
@@ -458,6 +459,7 @@ class KimiK3ForConditionalGeneration(KimiK25ForConditionalGeneration):
     """
 
     _VISION_MODEL_CLS = KimiK3VisionModel
+    mamba_metadata_cls = KimiLinearForCausalLM.mamba_metadata_cls
 
     def __init__(
         self,

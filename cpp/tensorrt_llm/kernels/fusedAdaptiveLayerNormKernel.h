@@ -49,12 +49,12 @@ struct AdaptiveLayerNormParams
     __nv_bfloat16 const* x = nullptr; // [M, D] bf16
 
     // Affine LN params (HAS_LN_AFFINE only)
-    __nv_bfloat16 const* ln_weight = nullptr; // [D] bf16
-    __nv_bfloat16 const* ln_bias = nullptr;   // [D] bf16
+    float const* ln_weight = nullptr; // [D] fp32
+    float const* ln_bias = nullptr;   // [D] fp32
 
     // AdaLN modulation params (HAS_MODULATION only)
-    __nv_bfloat16 const* scale_msa = nullptr; // [B, D] bf16
-    __nv_bfloat16 const* shift_msa = nullptr; // [B, D] bf16
+    float const* scale_msa = nullptr; // [B, D] fp32
+    float const* shift_msa = nullptr; // [B, D] fp32
 
     // bf16 output path (HAS_QUANT=false)
     __nv_bfloat16* out_bf16 = nullptr; // [M, D] bf16

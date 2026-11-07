@@ -208,6 +208,9 @@ def key_time():
 
 class HttpClusterStorageServer(ClusterStorage):
 
+    # Granularity at which the expiry sweep samples the event loop.
+    _OUTAGE_SAMPLE_SEC = 0.1
+
     def __init__(self,
                  cluster_uri,
                  cluster_name,
@@ -219,8 +222,47 @@ class HttpClusterStorageServer(ClusterStorage):
         self._watch_lock = asyncio.Lock()
         self._check_expired_task = None
         self._check_expired_interval = 1  # in seconds
+        # Total time this event loop was unable to serve requests, excluded
+        # from the clock TTLs are measured on (see _service_now).
+        self._unserviceable_sec = 0.0
+        self._outage_sample_deadline: Optional[float] = None
         if server:
             self.add_routes(server)
+
+    def _settle_outage_sample(self, now: float) -> None:
+        """Account for an overdue event-loop probe exactly once.
+
+        Re-arm rather than disarm: the sampling task cannot re-arm until the
+        loop gives it a turn, and everything else already queued runs first.
+        Clearing the deadline here would leave that window unmeasured, so a
+        second handler blocking back-to-back with the first is charged to TTL
+        and expires a live worker. Arming the next sample from ``now`` keeps
+        the accounting continuous; ``_sleep_counting_outage`` overwrites this
+        deadline with its own the moment it does get a turn.
+        """
+        deadline = self._outage_sample_deadline
+        if deadline is None or now < deadline:
+            return
+        self._unserviceable_sec += now - deadline
+        self._outage_sample_deadline = now + self._OUTAGE_SAMPLE_SEC
+
+    def _service_now(self) -> float:
+        """Monotonic time minus however long this loop could not serve requests.
+
+        Workers refresh their TTL over ``/expire`` on this very event loop, so
+        while the loop is blocked their refreshes sit unread rather than
+        arriving late. Charging that time to a key expires a live worker for
+        the storage's own outage: the coordinator evicts it from the routers
+        and requests routed there fail. A worker that really stopped refreshing
+        still expires, because the clock only pauses while nobody could have
+        been served.
+        """
+        now = key_time()
+        # A queued request may run before the sleeping expiry task resumes.
+        # Settle its overdue probe here so no TTL operation can observe the
+        # stale service clock in that scheduling window.
+        self._settle_outage_sample(now)
+        return now - self._unserviceable_sec
 
     def add_routes(self, server: FastAPI):
         server.add_api_route("/set", jsonify(self._set), methods=["POST"])
@@ -242,6 +284,7 @@ class HttpClusterStorageServer(ClusterStorage):
         if self._check_expired_task:
             self._check_expired_task.cancel()
             self._check_expired_task = None
+            self._outage_sample_deadline = None
 
     async def set(self,
                   key: str,
@@ -259,7 +302,8 @@ class HttpClusterStorageServer(ClusterStorage):
             if storage_item.key in self._storage and not storage_item.overwrite_if_exists:
                 return False
             if storage_item.expire_time < 0 and storage_item.ttl and storage_item.ttl > 0:
-                storage_item.expire_time = key_time() + storage_item.ttl
+                storage_item.expire_time = (self._service_now() +
+                                            storage_item.ttl)
             self._storage[storage_item.key] = storage_item
             await self._notify_watch_event(storage_item.key, storage_item,
                                            WatchEventType.SET)
@@ -269,7 +313,8 @@ class HttpClusterStorageServer(ClusterStorage):
         async with self._lock:
             if key in self._storage:
                 item = self._storage[key]
-                if item.expire_time < 0 or item.expire_time > key_time():
+                now = self._service_now()
+                if item.expire_time < 0 or item.expire_time > now:
                     return item.value
                 else:
                     await self._notify_watch_event(key, item,
@@ -280,7 +325,7 @@ class HttpClusterStorageServer(ClusterStorage):
     async def expire(self, key: str, ttl: int) -> bool:
         async with self._lock:
             if key in self._storage:
-                self._storage[key].expire_time = key_time() + int(ttl)
+                self._storage[key].expire_time = self._service_now() + int(ttl)
                 return True
             return False
 
@@ -339,12 +384,30 @@ class HttpClusterStorageServer(ClusterStorage):
         logger.info(
             f"Notified watch event for key {key} with type {event_type}")
 
+    async def _sleep_counting_outage(self, duration: float) -> None:
+        """Sleep, accumulating however long the loop overran its own timers.
+
+        Sliced rather than one long sleep: a single sleep only reveals lateness
+        after its own deadline, so a block that started mid-sleep is credited
+        short by however far in it began. Crediting happens here, in the sweep's
+        own task, because a separate prober and the sweep would both be ready
+        when the loop resumes and the sweep could reap first.
+        """
+        remaining = duration
+        while remaining > 0:
+            slice_sec = min(self._OUTAGE_SAMPLE_SEC, remaining)
+            before = key_time()
+            self._outage_sample_deadline = before + slice_sec
+            await asyncio.sleep(slice_sec)
+            self._settle_outage_sample(key_time())
+            remaining -= slice_sec
+
     async def _check_expired(self):
         while True:
-            await asyncio.sleep(self._check_expired_interval)
+            await self._sleep_counting_outage(self._check_expired_interval)
             try:
                 before_len = len(self._storage)
-                current_time = key_time()
+                current_time = self._service_now()
                 async with self._lock:
                     kv_to_delete = {
                         k: v

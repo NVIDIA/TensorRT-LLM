@@ -9,11 +9,11 @@ from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..attention_backend.interface import (AttentionMetadata,
-                                           PredefinedAttentionMask)
-from ..attention_backend.utils import get_attention_backend
+from ..attention.attention import Attention
+from ..attention.backends.interface import (AttentionMetadata,
+                                            PredefinedAttentionMask)
+from ..attention.backends.utils import get_attention_backend
 from ..model_config import ModelConfig
-from ..modules.attention import Attention
 from ..modules.mlp import MLP
 from .hf_parameter_utils import get_parameter_device, get_parameter_dtype
 from .modeling_multimodal_encoder import MultimodalEncoderMixin

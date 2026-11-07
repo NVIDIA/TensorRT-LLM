@@ -28,8 +28,9 @@ architecturally required to fit on one GPU for these tests.
 import pytest
 import torch
 
-from tensorrt_llm import LLM
-from tensorrt_llm.llmapi import EncodeCudaGraphConfig
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import EncoderCUDAGraphRunner
+from tensorrt_llm.llmapi import EncodeCudaGraphConfig, EncodeExtraInputSpec
 
 from ..conftest import llm_models_root
 from .accuracy_core import LlmapiAccuracyTestHarness
@@ -112,6 +113,20 @@ ENCODER_CUDA_GRAPH_CONFIGS = [
 ]
 
 
+@pytest.fixture
+def graph_replays(monkeypatch):
+    """Keys of the encoder CUDA graph replays this process makes during the test."""
+    replays = []
+    replay = EncoderCUDAGraphRunner.replay
+
+    def counted_replay(runner, key, inputs):
+        replays.append(key)
+        return replay(runner, key, inputs)
+
+    monkeypatch.setattr(EncoderCUDAGraphRunner, "replay", counted_replay)
+    return replays
+
+
 class TestEncoderEncode(LlmapiAccuracyTestHarness):
     """HF logits-level accuracy for encoder-only (non-MM) architectures.
 
@@ -168,6 +183,95 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             torch.testing.assert_close(raw.cpu().float(), hf_logits, rtol=1.5e-2, atol=1.5e-2)
 
     @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
+    def test_encoder_encode_with_token_type_ids_matches_huggingface(self, model_name, model_path):
+        """Verify token_type_ids propagate through encoder CUDA graph replay.
+
+        All-zero token_type_ids equal BERT's internal default (`forward`
+        fills `token_type_ids=None` with zeros), so an all-zero check alone
+        cannot tell "kwarg copied into the static CUDA-graph buffer and
+        replayed" apart from "kwarg silently dropped". This test uses a
+        non-trivial segment pattern and asserts two things:
+
+        1. Propagation: non-zero token_type_ids change the logits vs. all-zero
+           on the same graph-enabled LLM. A dropped kwarg would make both
+           calls collapse to the zeros default and be bit-identical.
+        2. Correctness: the non-zero result matches HF given the *same*
+           token_type_ids, within the existing packed-vs-padded tolerance.
+        """
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        torch_dtype, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+            extra_model_inputs=[
+                EncodeExtraInputSpec(
+                    name="token_type_ids",
+                    shape=("num_tokens",),
+                    dtype="int32",
+                ),
+            ],
+        )
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        encoded = tokenizer(PROMPTS, padding=False, truncation=True, max_length=512)
+        per_prompt_lens = [len(t) for t in encoded["input_ids"]]
+
+        # Non-trivial segment pattern: mark the second half of each prompt's
+        # real tokens as segment 1 (valid: BERT type_vocab_size == 2). The
+        # packed order (prompt-by-prompt concatenation) matches encode()'s flat
+        # input_ids, and a position-dependent pattern makes the HF comparison
+        # sensitive to buffer ordering, not just a global shift.
+        per_prompt_tt = [[0] * (L - L // 2) + [1] * (L // 2) for L in per_prompt_lens]
+        packed_nonzero = torch.tensor(
+            [tt for row in per_prompt_tt for tt in row],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        packed_zero = torch.zeros_like(packed_nonzero)
+
+        with LLM(model_path, encode_only=True, dtype=llm_dtype, cuda_graph_config=cgc) as llm:
+            outs_nonzero = llm.encode(PROMPTS, token_type_ids=packed_nonzero)
+            outs_zero = llm.encode(PROMPTS, token_type_ids=packed_zero)
+
+        tllm_nonzero = torch.stack([o.logits.cpu().float() for o in outs_nonzero])
+        tllm_zero = torch.stack([o.logits.cpu().float() for o in outs_zero])
+
+        # (1) Propagation: two calls on the same graph-enabled LLM with
+        # different token_type_ids must differ. If the kwarg were dropped, both
+        # would collapse to the zeros default and be bit-identical.
+        max_abs_diff = (tllm_nonzero - tllm_zero).abs().max().item()
+        assert max_abs_diff > 1e-3, (
+            f"[{model_name}] non-zero token_type_ids produced logits identical "
+            f"to all-zero (max|delta|={max_abs_diff:.3e}); the kwarg is not "
+            f"propagating through the encoder CUDA-graph static buffer."
+        )
+
+        hf_model = (
+            AutoModelForSequenceClassification.from_pretrained(model_path, torch_dtype=torch_dtype)
+            .cuda()
+            .eval()
+        )
+        with torch.inference_mode():
+            hf_inputs = tokenizer(PROMPTS, return_tensors="pt", padding="longest").to(
+                hf_model.device
+            )
+            # Apply the same segment pattern HF-side. HF pads on the right, so
+            # each prompt's real tokens occupy [0:len]; padded positions stay 0
+            # (attention-masked, and BERT pools [CLS] at position 0, so they do
+            # not affect the classification logits).
+            hf_token_type_ids = torch.zeros_like(hf_inputs["input_ids"])
+            for i, row in enumerate(per_prompt_tt):
+                hf_token_type_ids[i, : len(row)] = torch.tensor(row, device=hf_model.device)
+            hf_inputs["token_type_ids"] = hf_token_type_ids
+            hf_logits = hf_model(**hf_inputs).logits.float().cpu()
+
+        # (2) Correctness: match HF given the same token_type_ids.
+        torch.testing.assert_close(tllm_nonzero, hf_logits, rtol=1.5e-2, atol=1.5e-2)
+
+    @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
     def test_encoder_encode_cuda_graph_matches_eager_logits(self, model_name, model_path):
         """Tight numerical bound: graph replay must reproduce eager logits.
 
@@ -192,6 +296,38 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 
         torch.testing.assert_close(graph, eager, rtol=1e-3, atol=1e-3)
 
+    @pytest.mark.parametrize("model_name,model_path", CLASSIFICATION_MODELS)
+    def test_encoder_scheduled_cuda_graph_matches_eager(
+        self, model_name, model_path, monkeypatch, graph_replays
+    ):
+        """LLM.generate() on an encoder-only model applies EncodeCudaGraphConfig.
+
+        The scheduler may split the prompts into different batches in the two
+        runs, and mixed-length outputs depend on batch composition, so the bound
+        is looser than the encode() comparison.
+        """
+        # Keep the executor in-process so graph_replays sees the scheduled replays.
+        monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        params = SamplingParams(max_tokens=1, return_context_logits=True)
+
+        with LLM(model_path, dtype=llm_dtype) as llm_eager:
+            eager_outs = llm_eager.generate(PROMPTS, sampling_params=params)
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        )
+        with LLM(model_path, dtype=llm_dtype, cuda_graph_config=cgc) as llm_graph:
+            replays_before = len(graph_replays)
+            graph_outs = llm_graph.generate(PROMPTS, sampling_params=params)
+            assert len(graph_replays) > replays_before, f"[{model_name}] generate() did not replay"
+
+        eager = torch.stack([o.context_logits.cpu().float() for o in eager_outs])
+        graph = torch.stack([o.context_logits.cpu().float() for o in graph_outs])
+        torch.testing.assert_close(graph, eager, rtol=1e-2, atol=1e-2)
+
     @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
     def test_qwen3_text_embedding_matches_huggingface(self, model_name, model_path):
         """Decoder text-embedding: L2-normalized last-token hidden state vs HF."""
@@ -208,6 +344,8 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             dtype=llm_dtype,
             model_kwargs={"architectures": ["Qwen3ForTextEmbedding"]},
         ) as llm:
+            runtime_config = llm._encoder_executor.pretrained_config
+            assert runtime_config.architectures[0] == "Qwen3ForTextEmbedding"
             outs = llm.encode(PROMPTS)
 
         tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -229,6 +367,49 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
             # Embeddings must be unit-norm.
             assert abs(tllm_emb.norm().item() - 1.0) < 1e-2
 
+    @pytest.mark.parametrize("model_name,model_path", TEXT_EMBEDDING_MODELS)
+    def test_qwen3_text_embedding_cuda_graph_matches_eager(
+        self, model_name, model_path, graph_replays
+    ):
+        """Graph replay must pool each prompt's own last token.
+
+        The prompts have different lengths and are packed into one batch; the
+        reversed three-prompt call replays a padded bucket with other lengths.
+        """
+        _, llm_dtype = _resolve_checkpoint_dtype(model_path)
+        batches = [PROMPTS, PROMPTS[:0:-1]]
+        model_kwargs = {"architectures": ["Qwen3ForTextEmbedding"]}
+
+        with LLM(
+            model_path, encode_only=True, dtype=llm_dtype, model_kwargs=model_kwargs
+        ) as llm_eager:
+            eager = [
+                torch.stack([o.logits.cpu() for o in llm_eager.encode(batch)]) for batch in batches
+            ]
+        cgc = EncodeCudaGraphConfig(
+            batch_sizes=[1, 4],
+            num_tokens=[32, 64],
+            seq_lens=[16, 32],
+            enable_padding=True,
+        )
+        with LLM(
+            model_path,
+            encode_only=True,
+            dtype=llm_dtype,
+            model_kwargs=model_kwargs,
+            cuda_graph_config=cgc,
+        ) as llm_graph:
+            graph = []
+            for batch in batches:
+                replays_before = len(graph_replays)
+                graph.append(torch.stack([o.logits.cpu() for o in llm_graph.encode(batch)]))
+                assert len(graph_replays) > replays_before, (
+                    f"[{model_name}] encode() did not replay"
+                )
+
+        for graph_out, eager_out in zip(graph, eager):
+            torch.testing.assert_close(graph_out, eager_out, rtol=1e-3, atol=1e-3)
+
 
 # --------------------------------------------------------------------------- #
 # Decoder models used in single-prefill mode
@@ -240,7 +421,6 @@ class TestEncoderEncode(LlmapiAccuracyTestHarness):
 #
 # One representative per distinct TRT-LLM architecture class:
 #   LlamaForCausalLM   — TinyLlama (also covers Mistral, which aliases LlamaModel)
-#   Gemma3ForCausalLM  — Gemma-3-1B (sliding window + global alternation)
 #   Qwen3ForCausalLM   — Qwen3-0.6B (QKNorm)
 DECODER_MODELS = [
     # -- LlamaForCausalLM (covers Llama + Mistral family) --
@@ -248,12 +428,6 @@ DECODER_MODELS = [
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
         f"{llm_models_root()}/llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
         id="tinyllama-1.1b",
-    ),
-    # -- Gemma3ForCausalLM --
-    pytest.param(
-        "google/gemma-3-1b-it",
-        f"{llm_models_root()}/gemma/gemma-3-1b-it/",
-        id="gemma-3-1b",
     ),
     # -- Qwen3ForCausalLM --
     pytest.param(
@@ -274,8 +448,7 @@ class TestDecoderEncode(LlmapiAccuracyTestHarness):
     ]
 
     # Top-K size used for the argmax-in-top-K containment / overlap checks.
-    # Chosen to be robust to near-tie argmax flips under FP16/BF16 rounding
-    # on very large vocabularies (Gemma-3 has 262K tokens).
+    # This is robust to near-tie argmax flips under FP16/BF16 rounding.
     TOPK = 5
     TOPK_MIN_OVERLAP = 3
 

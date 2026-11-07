@@ -29,13 +29,20 @@ from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.mxfp8_utils import quant_bf16_to_mxfp8
 from tensorrt_llm._torch.moe.fused_moe import BaseMoeRoutingMethod
 from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
-from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm._utils import get_sm_version, is_sm_120f
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    NVFP4_PLUS_SF_VEC_SIZE,
+    e8m0_to_ue5m3,
+    nvfp4_plus_dequantize_ref,
+    nvfp4_plus_quantize_ref,
+)
 
 
 def round_up(x, alignment):
@@ -131,10 +138,8 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
             quantize_util_cls = NVFP4QuantizeUtil
             x_sf_global = (448 * 6) / x.abs().max().float()
             quant_kwargs["x_sf_global"] = x_sf_global
-            # MegaMoE CuteDSL runs the deepgemm graph (routing weight folded into
-            # the SwiGLU output before the fc1-output NVFP4 quant), so it needs a
-            # graph-matched reference; the generic transformers-graph NVFP4
-            # reference mismatches systematically. See NVFP4RefMegaMoECuteDsl.
+            # Preserve MegaMoE-specific tolerances with post-FC2 routing weights
+            # for these synthetic model configurations.
             if backend_name == "MEGAMOE_CUTEDSL":
                 quant_kwargs["ref_cls"] = NVFP4RefMegaMoECuteDsl
     elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
@@ -148,7 +153,7 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
             if backend_name == "DEEPGEMM":
                 # Use DEEPGEMM-specific util with E8M0 scales and manual grouped_gemm reference
                 quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
-            elif backend_name == "CUTLASS" and get_sm_version() == 120:
+            elif backend_name == "CUTLASS" and is_sm_120f():
                 # SM120 CUTLASS uses E8M0 scale format (same as DEEPGEMM)
                 quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
             elif backend_name == "TRTLLM":
@@ -206,6 +211,11 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
     elif quant_algo == QuantAlgo.W4A16_MXFP4:
         quantize_util_cls = WFP4A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_MXFP4)
+    elif quant_algo == QuantAlgo.NVFP4_PLUS:
+        quantize_util_cls = NVFP4PlusQuantizeUtil
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.NVFP4_PLUS, group_size=NVFP4_PLUS_SF_VEC_SIZE
+        )
     elif quant_algo == QuantAlgo.W8A16:
         quantize_util_cls = W8A16QuantizeUtil
         quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
@@ -390,6 +400,14 @@ class RefMLPFusedMoE(nn.Module):
 
         for expert in range(self.num_experts):
             self._load_expert_weights_with_scales(weights, expert)
+
+        # Match production (pyexecutor/model_loader.py): finalize quant-method
+        # scale layouts after load. Without this the FP8BlockScales ref keeps
+        # raw float32 scales and fp8_swap_ab_gemm on sm107 explodes to inf.
+        # No-op for methods without a post_load_weights override.
+        for m in self.modules():
+            if isinstance(m, Linear):
+                m.post_load_weights()
 
     def check_accuracy(self, output, ref_output):
         # Relaxed percent from 0.984 to 0.96 to handle small tensor statistical variance.
@@ -655,19 +673,13 @@ class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
         self.swiglu_gptoss_style = swiglu_gptoss_style
 
     def check_accuracy(self, output, ref_output):
-        # The CuteDSL fused kernel introduces three precision error sources
-        # vs the reference implementation:
-        #   1. Fused SwiGLU uses fastmath sigmoid (rcp_approx + exp2 fastmath)
-        #      — per-element error in the intermediate activation tensor.
-        #   2. Inter-GEMM FP4 requantization uses rcp_approx vs exact division
-        #      — per-block scaling error in the intermediate FP4 tensor.
-        #   3. Fused finalize accumulates top-k expert outputs via bf16
-        #      atomic-add (vectorized_atomic_add_bf16x8 / blk_reduce_bf16)
-        #      vs fp32 accumulation in the reference.
-        #
-        # Errors (1) and (2) compound through GEMM2's K dimension
-        # (= intermediate_size), while error (3) scales with top_k.
-        # Total error variance ∝ intermediate_size × top_k.
+        # The reference GatedMLP rounds the FC1 GEMM output and the SwiGLU
+        # result to bf16 before quantizing the FC2 input to NVFP4. Backends
+        # that quantize from the fp32 accumulator instead (CuteDSL,
+        # TRTLLM-Gen) put a fraction of those values on a neighbouring FP4
+        # code, and FC2 sums every such difference over K = intermediate_size.
+        # Backends that finalize with bf16 atomic adds also round each top-k
+        # contribution, so the mismatch grows with intermediate_size × top_k.
         #
         # With intermediate_size=2048 and top_k=8 (e.g. e256/e384 configs
         # for Kimi-K2 / DeepSeek-V3 class models), mismatch reaches ~3-5%
@@ -686,21 +698,10 @@ class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
 
 
 class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
-    """Reference matching MegaMoE CuteDSL's deepgemm-graph routing-weight placement.
+    """Post-FC2 reference for synthetic MegaMoE configurations.
 
-    The MegaMoE CuteDSL fused kernel runs the "deepgemm graph"
-    (``apply_topk_in_fc1=True``): it folds the per-token routing weight into the
-    SwiGLU output BEFORE the fc1-output NVFP4 quantization, then reduces the
-    already-weighted per-topk terms with a plain sum.
-
-    The generic :class:`NVFP4RefMLPFusedMoE` applies the routing weight AFTER the
-    full expert (the "transformers graph"), so the fc1-output NVFP4 block scales
-    see the *unweighted* SwiGLU output -- a different RTNE rounding than the
-    kernel and a large systematic mismatch (the weight is a per-token scalar that
-    shifts each block's absmax / scale factor). This override moves the weight
-    fold before ``down_proj`` -- whose internal per-expert NVFP4 activation quant
-    (``w2.input_scale`` == the kernel's per-expert ``fc1_norm_const``) is exactly
-    the fc1-output round-trip -- and reduces unweighted, matching the kernel.
+    Only DeepSeek V4 opts into pre-FC2 routing weights in the production backend;
+    these tests retain the generic reference and MegaMoE-specific tolerances.
     """
 
     def check_accuracy(self, output, ref_output):
@@ -722,7 +723,8 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         # The 9% / 8% tiers replace the old single ">10000 -> 7%" bucket (the
         # 28672 / 65536 cases exceeded 7%); the 5% tier replaces the old
         # "<=10000 -> 3%" bucket (the 8448 case exceeded 3%). swiglu_gptoss_style
-        # keeps its own 5% / atol=0.1 band when error_accumulation stays <=10000.
+        # keeps its own 6% / atol=0.1 band when error_accumulation stays <=10000,
+        # matching the dedicated clamp-heavy MiniMax-M3 numerical test.
         top_k = getattr(self.routing_method, "top_k", 1)
         error_accumulation = self.intermediate_size * top_k
         if error_accumulation > 20000:
@@ -730,37 +732,11 @@ class NVFP4RefMegaMoECuteDsl(NVFP4RefMLPFusedMoE):
         elif error_accumulation > 10000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.92)
         elif self.swiglu_gptoss_style:
-            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.95)
+            check_accuracy(output, ref_output, rtol=0.1, atol=0.1, percent=0.94)
         elif error_accumulation > 5000:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.95)
         else:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.97)
-
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.shape[-1] == self.hidden_size
-        hidden_states = hidden_states.view(-1, self.hidden_size)
-        selected_experts, routing_weights = self.routing_method.apply(router_logits)
-        final_hidden_states = torch.zeros(
-            hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        for expert_id in range(self.num_experts):
-            if not torch.any(selected_experts == expert_id):
-                continue
-            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
-            expert_inputs = hidden_states[batch_idx]
-            expert = self.experts[expert_id]
-            l1_output = expert.gate_up_proj(expert_inputs)
-            act_output = expert._apply_activation(l1_output)
-            # deepgemm graph: fold the per-token routing weight into the SwiGLU
-            # output BEFORE down_proj's fc1-output NVFP4 requant, then reduce
-            # unweighted (matches MegaMoECuteDsl apply_topk_in_fc1=True).
-            act_output = act_output * routing_weights[batch_idx, nth_expert, None].to(
-                act_output.dtype
-            )
-            output = expert.down_proj(act_output)
-            final_hidden_states[batch_idx] += output.float()
-        final_hidden_states = final_hidden_states.reshape(hidden_states.shape)
-        return final_hidden_states
 
 
 class NVFP4QuantizeUtil(BaseQuantizeUtil):
@@ -1750,6 +1726,13 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
         return output
 
     def check_accuracy(self, output, ref_output):
+        # sm107 only: backend fuses gemm1->activation->gemm2 with an FP8
+        # intermediate while the GatedMLP ref requantizes via bf16 between
+        # the two gemms. Both kernels are deterministic (identical mismatch
+        # across all 192 tactics), but Rubin rounding adds ~1% extra
+        # sign-flips on near-zero entries, pushing h=512 from <15% to ~16%.
+        # Widen percent by 2% on sm107; B200/H100/sm120 unchanged.
+        sm107_relax = get_sm_version() == 107
         if self.swiglu_gptoss_style:
             check_accuracy(output, ref_output, rtol=0.1, atol=0.2, percent=0.8)
         elif self.hidden_size >= 4096:
@@ -1757,9 +1740,11 @@ class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # MXFP4 (4-bit) weights + MXFP8 (8-bit) activations accumulate more
             # quantization error in large GEMM reduction dimensions: error ~ sqrt(K).
             # Observed mismatch: ~17-19% for h=7168 vs <15% for h=512.
-            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=0.85)
+            percent = 0.83 if sm107_relax else 0.85
+            check_accuracy(output, ref_output, rtol=0.15, atol=0.3, percent=percent)
         else:
-            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=0.85)
+            percent = 0.83 if sm107_relax else 0.85
+            check_accuracy(output, ref_output, rtol=0.10, atol=0.2, percent=percent)
 
 
 class MXFP4MXFP8RefMegaMoEDeepGemm(MXFP4MXFP8RefGatedMLPFusedMoE):
@@ -2570,6 +2555,143 @@ class WFP4A16QuantizeUtil(BaseQuantizeUtil):
         """
         Create a reference module for correctness testing with swiglu_gptoss_style support.
         """
+        return super().create_ref_module(routing_method, ref_cls)
+
+
+def _nvfp4_plus_round_trip(x: torch.Tensor) -> torch.Tensor:
+    """Round ``x`` through NVFP4_PLUS quantization, in float32."""
+    return nvfp4_plus_dequantize_ref(*nvfp4_plus_quantize_ref(x))
+
+
+class NVFP4PlusRefGatedMLPFusedMoE(RefMLPFusedMoE):
+    """Reference NVFP4_PLUS MoE for correctness testing.
+
+    The weights come from an MXFP4 checkpoint and are dequantized to float32;
+    the FC1 input and the SwiGLU output are rounded through NVFP4_PLUS, the way
+    the kernels quantize the inputs of FC1 and FC2.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        routing_method: BaseMoeRoutingMethod,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: Optional[torch.dtype] = None,
+        model_config: Optional[ModelConfig] = None,
+        bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
+        swiglu_alpha: Optional[float] = None,
+        swiglu_beta: Optional[float] = None,
+        swiglu_limit: Optional[float] = None,
+    ):
+        assert activation_type == ActivationType.Swiglu and not bias, (
+            "NVFP4PlusRefGatedMLPFusedMoE covers SwiGLU without bias"
+        )
+        self._original_quant_config = model_config.quant_config if model_config else None
+        super().__init__(
+            num_experts=num_experts,
+            routing_method=routing_method,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            model_config=ModelConfig(),  # The weights are dequantized below.
+            bias=bias,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+        )
+        self.swiglu_limit = swiglu_limit
+        self.w1, self.w3, self.w2 = [], [], []
+
+    def load_weights(self, weights_list: List[Dict]):
+        assert len(weights_list) == 1
+        weights = weights_list[0]
+        assert (
+            self._original_quant_config
+            and self._original_quant_config.quant_algo == QuantAlgo.NVFP4_PLUS
+        ), "expect quant_algo to be NVFP4_PLUS"
+
+        def dequantize(name: str) -> torch.Tensor:
+            fp4 = weights[f"{name}.weight"].view(torch.uint8).cuda()
+            sf = e8m0_to_ue5m3(weights[f"{name}.weight_scale"]).cuda()
+            # E2M1 times a power of two is exact in bf16.
+            return nvfp4_plus_dequantize_ref(fp4, sf).to(torch.bfloat16)
+
+        for expert in range(self.num_experts):
+            self.w1.append(dequantize(f"{expert}.w1"))
+            self.w3.append(dequantize(f"{expert}.w3"))
+            self.w2.append(dequantize(f"{expert}.w2"))
+
+    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+        hidden_states = hidden_states.view(-1, self.hidden_size)
+        selected_experts, routing_weights = self.routing_method.apply(router_logits)
+        x = _nvfp4_plus_round_trip(hidden_states)
+        final_hidden_states = torch.zeros(
+            hidden_states.shape, dtype=torch.float32, device=hidden_states.device
+        )
+        limit = self.swiglu_limit
+        for expert_id in range(self.num_experts):
+            if not torch.any(selected_experts == expert_id):
+                continue
+            batch_idx, nth_expert = torch.where(selected_experts == expert_id)
+            gate = x[batch_idx] @ self.w1[expert_id].float().T
+            up = x[batch_idx] @ self.w3[expert_id].float().T
+            if limit is not None and limit != float("inf"):
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            act = _nvfp4_plus_round_trip(F.silu(gate) * up)
+            output = act @ self.w2[expert_id].float().T
+            final_hidden_states[batch_idx] += routing_weights[batch_idx, nth_expert, None] * output
+        return final_hidden_states.to(hidden_states.dtype)
+
+    def check_accuracy(self, output, ref_output):
+        # The kernels quantize the FC2 input from the fp32 accumulator with an
+        # approximate reciprocal and finalize with bf16 adds, so a fraction of
+        # the FC2 inputs land on a neighbouring FP4 code.
+        check_accuracy(output, ref_output, rtol=0.1, atol=0.15, percent=0.95)
+
+
+class NVFP4PlusQuantizeUtil(BaseQuantizeUtil):
+    """Correctness testing for NVFP4_PLUS MoE, loaded from an MXFP4 checkpoint.
+
+    The weights are random E2M1 values with random E8M0 block scales per 32
+    values, under the checkpoint's ``weight_scale`` keys.
+    """
+
+    def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
+        assert (
+            self.quant_config is not None and self.quant_config.quant_algo == QuantAlgo.NVFP4_PLUS
+        ), "expect quant_algo to be NVFP4_PLUS"
+        assert self._is_gated and not self.bias, "NVFP4_PLUS MoE tests cover SwiGLU without bias"
+
+        def packed(rows: int, cols: int) -> torch.Tensor:
+            return torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8, device="cuda")
+
+        def e8m0(rows: int, cols: int) -> torch.Tensor:
+            # 2**-9 .. 2**-5, the range DeepSeek-V4 routed experts use.
+            return torch.randint(
+                118,
+                123,
+                (rows, cols // NVFP4_PLUS_SF_VEC_SIZE),
+                dtype=torch.uint8,
+                device="cuda",
+            )
+
+        weights = {}
+        hidden, inter = self.hidden_size, self.intermediate_size
+        for expert_id in range(self.num_experts):
+            weights[f"{expert_id}.w1.weight"] = packed(inter, hidden)
+            weights[f"{expert_id}.w3.weight"] = packed(inter, hidden)
+            weights[f"{expert_id}.w2.weight"] = packed(hidden, inter)
+            weights[f"{expert_id}.w1.weight_scale"] = e8m0(inter, hidden)
+            weights[f"{expert_id}.w3.weight_scale"] = e8m0(inter, hidden)
+            weights[f"{expert_id}.w2.weight_scale"] = e8m0(hidden, inter)
+        return weights
+
+    def create_ref_module(
+        self, routing_method, ref_cls=NVFP4PlusRefGatedMLPFusedMoE
+    ) -> torch.nn.Module:
         return super().create_ref_module(routing_method, ref_cls)
 
 

@@ -30,7 +30,7 @@ Factory:
 """
 
 from .allgather_reducescatter import AllGatherReduceScatter
-from .base import Communication
+from .base import CheckpointableCommunication, Communication
 from .communication_factory import CommunicationFactory
 from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
@@ -40,6 +40,7 @@ from .nvlink_two_sided import NVLinkTwoSided
 
 __all__ = [
     # Base classes and types
+    "CheckpointableCommunication",
     "Communication",
     # Communication strategies
     "AllGatherReduceScatter",

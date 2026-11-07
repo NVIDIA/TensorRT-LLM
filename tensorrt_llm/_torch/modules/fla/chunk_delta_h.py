@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_delta_h.py
 # Adapted from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/chunk_delta_h.py
 # -*- coding: utf-8 -*-
@@ -16,6 +18,30 @@ from tensorrt_llm._torch.modules.fla.utils import is_nvidia_hopper
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 
 
+def _save_autotune_state(args: dict, reset_only: bool = False) -> None:
+    """Snapshot the indexed state slots mutated by each autotune trial."""
+    if reset_only or args["h0"] is None or args["h0_i"] is None:
+        return
+    # Match N in chunk_gated_delta_rule_fwd_h and the kernel's
+    # state_index = tl.load(h0_i + i_n) for i_n < N.
+    cu_seqlens = args["cu_seqlens"]
+    num_seqs = (len(cu_seqlens) -
+                1 if cu_seqlens is not None else args["k"].shape[0])
+    indices = args["h0_i"][:num_seqs].to(torch.long)
+    # Only these slots are updated by the indexed kernel. The pool may be
+    # much larger than the active batch, so never clone the whole pool.
+    saved_state = args["h0"].index_select(0, indices)
+    args["_gdn_autotune_state"] = indices, saved_state
+
+
+def _restore_autotune_state(args: dict, exception: Exception | None) -> None:
+    """Restore the trial's indexed slots, including after a kernel exception."""
+    saved = args.pop("_gdn_autotune_state", None)
+    if saved is not None:
+        indices, state = saved
+        args["h0"].index_copy_(0, indices, state)
+
+
 @triton.heuristics({
     "USE_G": lambda args: args["g"] is not None,
     "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -30,6 +56,10 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
         for nw in NUM_WARPS for ns in [2, 3, 4] for BV in [32, 64]
     ],
     key=["H", "K", "V", "BT", "USE_G"],
+    # Custom hooks replace Triton's reset_to_zero/restore_value handling.
+    # Back up active slots only: h0 can be much larger than the batch.
+    pre_hook=_save_autotune_state,
+    post_hook=_restore_autotune_state,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
@@ -59,6 +89,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
+    """Compute chunk boundary states and optional final state updates."""
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:

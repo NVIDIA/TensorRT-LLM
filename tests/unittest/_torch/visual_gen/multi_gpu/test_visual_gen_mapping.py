@@ -1,6 +1,6 @@
 """Tests for VisualGenMapping — the unified multi-dimensional communicator mesh.
 
-Single-GPU tests run without dist. Multi-GPU tests use mp.spawn with NCCL.
+Single-GPU tests run without dist. Multi-GPU tests run on the NCCL rank pool.
 """
 
 import os
@@ -10,22 +10,10 @@ os.environ["TLLM_DISABLE_MPI"] = "1"
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 
-try:
-    import sys
-    from pathlib import Path
+from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 
-    from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
-
-    # Spawn distributed workers via a helper that retries with a fresh master
-    # port when the c10d rendezvous TCPStore loses the bind race (EADDRINUSE).
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from _visual_gen_dist_utils import spawn_with_retry
-
-    MODULES_AVAILABLE = True
-except ImportError:
-    MODULES_AVAILABLE = False
+from ._worker_pool import run_distributed
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -39,37 +27,10 @@ def _cleanup_mpi_env():
 # =============================================================================
 
 
-def _init_dist(rank, world_size, port):
-    os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = str(port)
-    os.environ["RANK"] = str(rank)
-    os.environ["WORLD_SIZE"] = str(world_size)
-    torch.cuda.set_device(rank % torch.cuda.device_count())
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
-
-def _worker(rank, world_size, test_fn, port):
-    try:
-        _init_dist(rank, world_size, port)
-        test_fn(rank, world_size)
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
-
-
 def _run_multi_gpu(world_size, test_fn):
-    if not MODULES_AVAILABLE:
-        pytest.skip("Required modules not available")
     if not torch.cuda.is_available() or torch.cuda.device_count() < world_size:
         pytest.skip(f"Requires {world_size} GPUs, have {torch.cuda.device_count()}")
-    spawn_with_retry(
-        lambda port: mp.spawn(
-            _worker,
-            args=(world_size, test_fn, port),
-            nprocs=world_size,
-            join=True,
-        )
-    )
+    run_distributed(world_size, test_fn, preload=("tensorrt_llm",))
 
 
 # =============================================================================
@@ -600,7 +561,6 @@ def _logic_tp2_attn2d_2x1_groups(rank, world_size):
     assert x.item() == 2.0, f"Rank {rank}: attn2d_col all_reduce expected 2, got {x.item()}"
 
 
-@pytest.mark.skipif(not MODULES_AVAILABLE, reason="Modules not available")
 class TestMultiGPU:
     def test_default_order_cfg2_ulysses2(self):
         _run_multi_gpu(4, _logic_default_order_cfg2_ulysses2)

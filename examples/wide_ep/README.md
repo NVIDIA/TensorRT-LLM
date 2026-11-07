@@ -37,7 +37,7 @@ Starting from R580 Driver, [Coherent Driver-Based Memory Management (CDMM)](http
 
 When CDMM mode is off, GPU memory is exposed as NUMA nodes, so no additional prerequisites are required.
 
-When CDMM mode is on, GPU memory doesn't exist in NUMA nodes. In that case, if online EPLB is needed, [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) needs to be installed.
+When CDMM mode is on, GPU memory doesn't exist in NUMA nodes. In that case, online EPLB uses [GDRCopy](https://github.com/NVIDIA/gdrcopy?tab=readme-ov-file#build-and-installation) when it is installed. Without GDRCopy, online EPLB falls back to CUDA managed memory that the host accesses directly over the coherent NVLink-C2C link; this works on hardware-coherent platforms such as GB200/GB300, while other platforms still require GDRCopy.
 
 When GDRCopy is installed and the kernel module is loaded, you should be able to see the device file `/dev/gdrdrv` and kernel module `gdrdrv` by `lsmod`. The device file needs to be mapped into the container.
 
@@ -58,8 +58,8 @@ moe_config:
 
 #### `backend`
 
- - MoE backend type, defaults to `CUTLASS`.
- - TensorRT LLM has multiple MoE backends that support wide EP, including `CUTEDSL`, `CUTLASS` and `TRTLLM`. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
+ - MoE backend type, defaults to `AUTO`, which selects a backend based on the model.
+ - TensorRT LLM has multiple MoE backends that support wide EP: `CUTEDSL`, `CUTLASS`, `TRTLLM`, `DEEPGEMM`, `DENSEGEMM`, `MEGAMOE_CUTEDSL` and `MEGAMOE_DEEPGEMM`. The remaining backends (`VANILLA`, `TRITON`, `MARLIN`) do not support the load balancer. The dedicated `WIDEEP` backend is deprecated and can no longer be selected; use `CUTEDSL` for large-EP NVFP4 deployments, or `DEEPGEMM` for FP8 block-scale checkpoints on Blackwell.
 
 #### `max_num_tokens`
 
@@ -67,26 +67,52 @@ If set, at most `max_num_tokens` tokens will be sent to `torch.ops.trtllm.fused_
 
 #### `load_balancer`
 
-Configuration for MoE load balancing, users can directly set `num_slots` and `layer_updates_per_iter` as online EPLB settings, while set path to a YAML file that also includes `initial_global_assignments` for offline EPLB.
+Configuration for MoE load balancing, users can directly set `num_slots` and `layer_updates_per_iter` as online EPLB settings, while set path to a YAML file that also includes `initial_global_assignments` for offline EPLB. The [`mode`](#mode) field selects between this standard EPLB and per-layer dynamic EPLB.
+
+EPLB is only set up when all of the following hold. Otherwise a `standard` `load_balancer` section is silently ignored, while `mode: per_layer_dynamic` raises an error:
+
+* The model architecture is listed in `moe_model_arch_list` in [`moe_load_balancer.py`](../../tensorrt_llm/_torch/moe/fused_moe/moe_load_balancer.py) — DeepSeek-V3/V3.2/V4, GLM MoE DSA, GPT-OSS, Kimi K2.5, Mixtral, Llama 4, Nemotron-H, Qwen2/Qwen3/Qwen3.5 MoE, and the Qwen3-VL / Qwen3.5 MoE conditional-generation wrappers.
+* Expert parallelism is enabled (`moe_expert_parallel_size` greater than 1).
+* The MoE smart router is not in use (`moe_cluster_size` equal to 1).
+
+Attention DP (`enable_attention_dp: true`) is not part of this gate, so EPLB is also set up without it. It is nonetheless the configuration wide-EP deployments normally use, and it is enabled throughout the [EP Load Balancer examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer).
+
+#### `mode`
+
+Load-balancing mode, `standard` or `per_layer_dynamic`. Configs without `mode` are treated as `standard`.
+
+* `standard`: offline or online EPLB, selected by [`layer_updates_per_iter`](#layer_updates_per_iter).
+* `per_layer_dynamic`: per-layer dynamic EPLB, which re-plans the expert replicas of every MoE layer on every forward pass from that pass's routing. It requires the `MEGAMOE_CUTEDSL` backend (`AUTO` resolves to it) and accepts only `num_slots`, `auxiliary_sms` and `helper_slot_mode` besides `mode`. See [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) for an example and its constraints.
 
 #### `num_slots`
 
-Total number of expert slots, must be ≥ total experts. Three typical settings:
+Total number of expert slots. It must be ≥ total experts, and divisible by the EP size so that every rank holds the same number of slots. Two typical settings:
 
-1. Set to 0. MoE load balancing is disabled.
-2. Set to number of total experts, such as 256 for DeepSeek R1.
-3. Set to number of total experts + EP size, such as 288 for DeepSeek R1, 32-way EP.
+1. Set to number of total experts, such as 256 for DeepSeek R1.
+2. Set to number of total experts + EP size, such as 288 for DeepSeek R1, 32-way EP.
    * This means there is 1 extra expert on each EP rank, so that there is more room for the per-rank token distribution to be more balanced.
+
+With `mode: per_layer_dynamic`, `num_slots` is required and must be greater than the total expert count, which must itself be divisible by the EP size. Each rank keeps its `num_experts / ep_size` experts and gets `(num_slots - num_experts) / ep_size` extra slots. Unlike `standard` mode, the extra slots are helper slots rather than static replicas: each layer refills them with copies of its hot experts on every forward pass. By default (`helper_slot_mode: per_layer_resident`) each layer has its own helper slots and skips experts they already hold; `shared_banks` has all MoE layers alternate between two shared helper banks. For example, 384 experts with `num_slots: 416` on 8 EP ranks give each rank 48 experts and 4 helper slots.
+
+To disable MoE load balancing, omit the whole `load_balancer` section. EPLB is enabled by the presence of `load_balancer`, so setting `num_slots` to 0 does not disable it.
 
 #### `layer_updates_per_iter`
 
 Number of layers updated per iteration, defaults to `0`. `0` means offline, while `>0` means online EPLB.
+
+`layer_updates_per_iter` and `initial_global_assignments` apply only to `standard` mode; a `per_layer_dynamic` configuration that sets either of them is rejected.
+
+This is the number of layers refreshed per iteration, not how often a given layer is refreshed. Layers take turns over `ceil(num_moe_layers / layer_updates_per_iter)` iterations before the plan repeats, so with `layer_updates_per_iter: 1` a DeepSeek-R1 layer (58 MoE layers) is refreshed once every 59 iterations. See [Update Strategy](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#update-strategy) for the statistics, the replication and placement rules, and a worked example.
 
 ### Offline Load Balancer Configuration
 
 Refer to the [Offline EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer) documentation.
 
 *Note: Online EP Load Balancer is more suitable for production deployments that need to react timely to online traffic changes.*
+
+### Per-Layer Dynamic Load Balancer Configuration
+
+Refer to the [Per-Layer Dynamic EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#per-layer-dynamic-ep-load-balancer) documentation.
 
 ### Execute Wide-EP on SLURM Clusters
 
@@ -166,8 +192,8 @@ Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/bl
 ## References
 
 To understand more details on wide EP and the optimizations we've added, refer to the technical blog series: Scaling Expert Parallelism in TensorRT-LLM
-  - [Part 1: Design and Implementation of Large-scale EP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
-  - [Part 2: Performance Status and Optimization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
+  - [Part 1: Design and Implementation of Large-scale EP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog04_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+  - [Part 2: Performance Status and Optimization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog08_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
   - [Part 3: Pushing the Performance Boundary](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md)
 
 To review how wide EP helps with Blackwell's leading inference benchmarks, also read these recent blog posts:

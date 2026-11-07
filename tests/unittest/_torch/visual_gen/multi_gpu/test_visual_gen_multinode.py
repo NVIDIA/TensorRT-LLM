@@ -133,6 +133,7 @@ class TestRunDiffusionWorkerDeviceAssignment:
             patch("torch.cuda.set_device", mock_set_device),
             patch("torch.distributed.init_process_group"),
             patch("torch.distributed.destroy_process_group"),
+            patch("tensorrt_llm._torch.visual_gen.executor.check_cuda_architecture_supported"),
             patch.object(DiffusionExecutor, "__new__", return_value=mock_exec),
             patch.object(DiffusionExecutor, "__init__", return_value=None),
         ):
@@ -229,11 +230,9 @@ class TestSingleNodeSpawnLocalRank:
             patch(
                 "tensorrt_llm._torch.visual_gen.executor._detect_external_launch", return_value=None
             ),
-            patch("tensorrt_llm._torch.visual_gen.executor.mp.get_context", return_value=mock_ctx),
-            patch("tensorrt_llm._torch.visual_gen.executor.threading.Thread") as mock_thread_cls,
-            patch(
-                "tensorrt_llm._torch.visual_gen.executor.threading.Event", side_effect=pre_set_event
-            ),
+            patch("tensorrt_llm._torch.visual_gen.executor._get_mp_context", return_value=mock_ctx),
+            patch("tensorrt_llm._torch.visual_gen.executor._Thread") as mock_thread_cls,
+            patch("tensorrt_llm._torch.visual_gen.executor._Event", side_effect=pre_set_event),
             patch.object(DiffusionRemoteClient, "_wait_ready"),
         ):
             mock_thread_cls.return_value = MagicMock()  # thread.start() is a no-op

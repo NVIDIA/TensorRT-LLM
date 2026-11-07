@@ -27,6 +27,7 @@ import com.nvidia.bloom.SlurmCluster
 import com.nvidia.bloom.SlurmPartition
 import com.nvidia.bloom.Utils
 import com.nvidia.bloom.ContainerRuntime
+import com.nvidia.bloom.FailureEvidenceCollector
 import com.nvidia.bloom.SshAuthMethod
 import org.jenkinsci.plugins.workflow.cps.CpsThread
 import org.jsoup.Jsoup
@@ -49,6 +50,32 @@ UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifac
 URM_ARTIFACTORY_BASE = "https://urm.nvidia.com/artifactory"
 ENABLE_UPLOAD_TEST_RESULTS = params.enableUploadTestResults != null ? params.enableUploadTestResults : true
 
+// The primary location a parent pipeline passed in globalVars, which this job uses instead of its
+// own controller's LLM_ARTIFACTS_PRIMARY. Empty when the job was started on its own.
+LLM_ARTIFACTS_PRIMARY_FROM_PARENT = ""
+
+// Build artifacts (build_info.txt, packaged builds, waive_list/) are published to the
+// primary location and read from it first; LLM_ARTIFACTS_PRIMARY ("aws", the default, or "urm")
+// selects it. Reads fall back to the other location only when a file is absent.
+def llmArtifactsPrimary()
+{
+    def primary = LLM_ARTIFACTS_PRIMARY_FROM_PARENT ?: env.LLM_ARTIFACTS_PRIMARY ?: "aws"
+    if (!(primary in ["aws", "urm"])) {
+        error("LLM_ARTIFACTS_PRIMARY must be 'aws' or 'urm', not '${primary}'")
+    }
+    return primary
+}
+
+// "Setup Environment" stashes jenkins/scripts/fetch_build_artifact.sh from the run's commit under
+// this name, because test stages read build artifacts before they have a source tree.
+FETCH_BUILD_ARTIFACT_STASH = "fetch-build-artifact"
+
+// Exit codes of jenkins/scripts/fetch_build_artifact.sh that this pipeline acts on, by the
+// names the helper gives them. tests/unittest/scripts/test_fetch_build_artifact.py checks
+// that they match.
+FETCH_ABSENT = 2
+FETCH_TRANSFER_FAILED = 4
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -69,18 +96,20 @@ ARTIFACTORY_IMAGE_PULL_SECRET = "trtllm-artifactory"
 ARTIFACTORY_DOCKER_HOST = "artifactory.nvidia.com"
 // Read-only artifactory pull credentials
 ARTIFACTORY_CREDENTIALS_ID = "trtllm-artifactory-credentials"
+// Credential with which the read helper reads build artifacts on artifactory.nvidia.com: the
+// publishing credential, the one the pipelines publish build artifacts with.
+LLM_ARTIFACTS_CREDENTIALS_ID = "aws-artifactory-credentials"
 
 // DLFW torch image
-DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.05-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:26.09-py3"
 
-MODEL_EXPRESS_VERSION = "0.4.1"
-MODEL_EXPRESS_NIXL_VERSION = "1.4.0"
+MODEL_EXPRESS_VERSION = "0.5.1"
 MODEL_EXPRESS_SERVER_IMAGE = "urm.nvidia.com/docker/nvidia/ai-dynamo/modelexpress-server:${MODEL_EXPRESS_VERSION}"
-MODEL_EXPRESS_REDIS_IMAGE = "urm.nvidia.com/docker/redis:7-alpine"
+MODEL_EXPRESS_REDIS_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/redis:7-alpine"
 
 //Ubuntu base image
-UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
-UBUNTU_24_04_IMAGE = "urm.nvidia.com/docker/ubuntu:24.04"
+UBUNTU_22_04_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:22.04"
+UBUNTU_24_04_IMAGE = "artifactory.pdx.nvidia.com/docker-remote/ubuntu:24.04"
 
 POD_TIMEOUT_SECONDS_TEST = env.podTimeoutSeconds ? env.podTimeoutSeconds : "21600"
 POD_TIMEOUT_SECONDS_BUILD = env.podTimeoutSeconds ? env.podTimeoutSeconds : "43200"
@@ -138,8 +167,6 @@ MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
 KITMAKER_DRY_RUN_PIC_EMAIL = env.kitmakerDryRunPicEmail ? env.kitmakerDryRunPicEmail : "kefu@nvidia.com"
 KITMAKER_PUBLISH_TO = env.kitmakerPublishTo ? env.kitmakerPublishTo : "both_devzone_pypi"
-RELEASE_SCRIPT_REPO = env.releaseScriptRepo ? env.releaseScriptRepo.trim() : ""
-RELEASE_SCRIPT_COMMIT = env.releaseScriptCommit ? env.releaseScriptCommit.trim() : ""
 
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
@@ -158,6 +185,18 @@ REQUIRED_NO_DRIVER_TYPES = ["dgx-h100", "dgx-h200", "gh200", "gb10x"]
 // capped at 2: SLURM dispatcher pods pass singleAttempt:true to the outer
 // K8s pod retry, so 1 pod × 2 SLURM attempts = 2 total.
 SLURM_INFRA_RETRY_MAX = 1
+
+// Only source-specific signatures are safe to match against arbitrary test
+// stdout/stderr in the SLURM job log. Keep the concrete terms and their retry
+// policy owned by FailureClassifier.
+SLURM_JOB_LOG_EVIDENCE_QUERY_IDS = [
+    "cuda-device-unavailable",
+    "cuda-buffer-mapping",
+    "nvidia-driver-unavailable",
+    "gpu-lost",
+    "gpu-ecc-uncorrectable",
+    "nvlink-fabric-failure",
+]
 
 // Maximum K8s infra-failure retries (total attempts = K8S_INFRA_RETRY_MAX + 1).
 // Kept distinct from SLURM_INFRA_RETRY_MAX so the two paths can be tuned
@@ -244,17 +283,21 @@ def isInfraDryRun() {
     return testFilter[(INFRA_DRY_RUN)] ?: false
 }
 
+def getShortenedJenkinsInstanceName() {
+    return trtllm_utils.getShortenedInstanceName(env.JENKINS_URL ?: Jenkins.instance.rootUrl)
+}
+
 def isCbtsStage(String stageName) {
     // Pipeline-level eligibility (post-merge gate + kill switch) is decided in L0_MergeRequest.groovy and propagated via testFilter.
     if (!(testFilter[(CBTS_COVERAGE)] ?: false)) {
         return false
     }
-    // Perf stages skip coverage to avoid skewing measurements (perfMode == stageName.contains("Perf")).
+    // PerfSanity stages skip coverage to avoid skewing measurements.
     if (stageName.contains("Perf")) {
         return false
     }
-    // Skip stages with no product Python coverage: TensorRT (legacy), CPP (gtest), AutoDeploy (leaving L0).
-    if (stageName.contains("TensorRT") || stageName.contains("CPP") || stageName.contains("AutoDeploy")) {
+    // Skip stages with no product Python coverage: TensorRT (legacy) and CPP (gtest).
+    if (stageName.contains("TensorRT") || stageName.contains("CPP")) {
         return false
     }
     // Phase 1: single-GPU only; multi-GPU / multi-node stages carry the "_GPUs" / "_Nodes" token.
@@ -265,12 +308,12 @@ def isCbtsStage(String stageName) {
 }
 
 def freezeCbtsCoverage(String stageDir) {
-    // Stop .cbtscov writes and wait for the dir to settle before the results tar reads it.
+    // pytest_sessionfinish already waited for every subscriber to save and leave, so this only
+    // settles the directory against a writer CBTS never knew about.
     sh(
         returnStatus: true,
         script: """
             mkdir -p ${stageDir}
-            touch ${stageDir}/${CBTS_STOP_FILE_NAME}
             prev=\$(stat -c %y ${stageDir} 2>/dev/null || echo unknown)
             for i in \$(seq 1 15); do
                 sleep 1
@@ -311,87 +354,46 @@ def echoRemoteLogTail(def pipeline, Map remote, String remotePath, int lines = 2
     }
 }
 
-// Scrape the SLURM job output log for a device / driver / interconnect fault
-// signature and return the matched signature itself, or "" for no match.
-//
-// Device faults (CUDA/NVLink/ECC/driver) print into job-output.log but never
-// reach the stage exception chain -- the tracker squashes a failed job to
-// `exit 1` -- so classify() otherwise sees only a generic failure and cannot
-// steer the retry off the bad node. This is a GATE only: the returned signature
-// is folded into a fresh exception so FailureClassifier.PATTERN_CATALOG (the
-// authoritative list) makes the real retry/severity decision. A signature the
-// catalog does not recognize simply falls through to a normal rethrow.
-// App-induced CUDA errors (illegal memory access, unspecified launch failure,
-// OOM) are deliberately excluded -- the OpenSearch stage data shows those are
-// overwhelmingly code regressions, not node faults, and must not trigger a
-// node-avoiding retry.
-//
-// grep -o returns only the matched signature (not the whole line), so a long
-// log line cannot truncate the signature out of the result before it reaches
-// classify(). Each alternative must therefore be catalog-exact: it must match
-// (via `.` wildcards for shell-hostile chars) the full catalog substring, so
-// grep -o emits text that still contains the catalog pattern.
-def scrapeSlurmLogForDeviceFault(def pipeline, Map remote, String remoteLogPath) {
-    def deviceFaultRegex = "cudaErrorMapBufferObjectFailed|mapping of buffer object failed|" +
-        "uncorrectable NVLink error|cudaErrorNvlinkUncorrectable|CUDA_ERROR_SYSTEM_NOT_READY|" +
-        "uncorrectable ECC error|CUDA_ERROR_ECC_UNCORRECTABLE|has fallen off the bus|GPU is lost|" +
-        "Unable to determine the device handle for GPU|RmInitAdapter failed|Failed to initialize NVML|" +
-        "could... communicate with the NVIDIA driver|CUDA_ERROR_DEVICE_UNAVAILABLE|" +
-        "no CUDA-capable device is detected|CUDA_ERROR_UNKNOWN: 999|CUDA unknown error|" +
-        "CUDA-capable device.s. is/are busy or unavailable"
-    try {
-        // Wrap the body in `bash -c` so it is shell-agnostic: cluster login shells
-        // are often csh/tcsh, which can't parse this bash test/pipe/redirection
-        // syntax. The login shell only has to run `bash -c '<single-quoted body>'`.
-        return Utils.exec(
-            pipeline,
-            script: Utils.sshUserCmd(remote,
-                "\"bash -c 'if [ -f \\\"${remoteLogPath}\\\" ]; then grep -aioE \\\"${deviceFaultRegex}\\\" \\\"${remoteLogPath}\\\" 2>/dev/null | tail -n 1 | cut -c1-500; fi'\""),
-            returnStdout: true,
-            numRetries: 1,
-        )?.trim()
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception scrapeEx) {
-        pipeline.echo("Ignorable warning: could not scrape ${remoteLogPath} for device faults on ${remote.host}: ${scrapeEx.message}")
-        return ""
+// Stream-scan the complete remote job log for the source-safe catalog subset,
+// returning at most one occurrence of each signature. Matching policy and
+// query precedence remain in the shared libraries.
+def collectSlurmJobLogEvidence(def pipeline, Map remote, String remoteLogPath) {
+    def queries = FailureClassifier.failureEvidenceQueries(InfraFailure.SLURM).findAll {
+        SLURM_JOB_LOG_EVIDENCE_QUERY_IDS.contains(it.id)
     }
-}
-
-// Read back the sbatch output the submit script captured to sbatch_output.txt
-// in the job workspace. A failed sh step surfaces only the exit code ("script
-// returned exit code 1"), so sbatch's stderr -- e.g. "Slurm backup controller
-// in standby mode" during a slurmctld failover -- never reaches
-// FailureClassifier.classify(), which matches the exception chain only. Like
-// scrapeSlurmLogForDeviceFault above, this is a GATE only: the caller folds
-// the returned text into a fresh exception and the shared-lib PATTERN_CATALOG
-// (the authoritative list) makes the real retry/severity decision. Returns ""
-// when the file is missing or unreadable, so the caller can rethrow the
-// original exception unchanged.
-def readSlurmSubmitOutput(def pipeline, Map remote, String jobWorkspace, String stageName) {
-    def outputPath = "${jobWorkspace}/sbatch_output.txt"
+    def queryTerms = queries.collectMany { it.anyOf ?: (it.allOf ?: []) }.unique()
+    if (!queryTerms) return [source: "SLURM_JOB_LOG", collectionStatus: "NO_MATCH"]
+    def grepPatterns = queryTerms.collect {
+        "-e '" + it.replace("'", "'\"'\"'") + "'"
+    }.join(" ")
     try {
-        return Utils.exec(
+        def scanLog = "if [ -f '${remoteLogPath}' ]; then " +
+            "grep -aFi ${grepPatterns} -- '${remoteLogPath}' 2>/dev/null " +
+            '''| awk 'index($0, ".py::") == 0' ''' +
+            "| grep -aFio ${grepPatterns} " +
+            '''| awk '{ key=tolower($0); if (seen[key]++ == 0) print }'; fi'''
+        def candidateText = Utils.exec(
             pipeline,
-            script: Utils.sshUserCmd(remote,
-                "\"bash -c 'if [ -f \\\"${outputPath}\\\" ]; then head -c 1000 -- \\\"${outputPath}\\\"; fi'\""),
+            script: "timeout 300s " + Utils.sshUserCmd(remote, Utils.bashWrappedRemoteCmd(scanLog)),
             returnStdout: true,
-            numRetries: 1,
+            retryOnFail: false,
+            noNVDFEvent: true,
+            timeout: false,
         )?.trim()
-    } catch (InterruptedException e) {
-        throw e
-    } catch (Exception readEx) {
-        // A dead frontend must propagate so the enclosing withSlurmFrontendFailover
-        // fails over to another remote; swallowing it as "" would return an empty
-        // read to the caller, which then rethrows the original (generic) submit
-        // exception and strands the stage on the unreachable frontend. Any other
-        // read failure (missing file, transient) is non-fatal -- the caller
-        // rethrows the original exception unchanged.
-        if (CloudManager.isSlurmFrontendConnectionFailure(readEx)) {
-            throw readEx
-        }
-        pipeline.echo("Ignorable warning: could not read ${outputPath} on ${remote.host}: ${readEx.message}")
-        return ""
+        def match = FailureEvidenceCollector.matchQueries(candidateText, queries)
+        return [
+            source: "SLURM_JOB_LOG",
+            collectionStatus: match.matchedQueryId == null ? "NO_MATCH" : "MATCHED",
+            matchedQueryId: match.matchedQueryId,
+            matchedTerms: match.matchedTerms,
+            matchedMessage: match.matchedMessage,
+        ]
+    } catch (InterruptedException interruptedError) {
+        throw interruptedError
+    } catch (Exception collectionError) {
+        pipeline.echo("Ignorable warning: could not collect failure evidence from ${remoteLogPath} on " +
+            "${remote.host}: ${collectionError.message}")
+        return [source: "SLURM_JOB_LOG", collectionStatus: "COLLECTION_ERROR"]
     }
 }
 
@@ -401,6 +403,10 @@ def readSlurmSubmitOutput(def pipeline, Map remote, String jobWorkspace, String 
 def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String nodeName, String stageName, String postTag="", boolean suppressTestReporting=false) {
     pipeline.stage('Submit Test Result') {
         sh "ls -al ${stageName}/ || true"
+        if (!fileExists(stageName)) {
+            echo "No local test-result directory for ${stageName}; skipping upload."
+            return
+        }
 
         if (suppressTestReporting) {
             // This attempt is superseded by a planned retry. Rename its XMLs so
@@ -414,31 +420,20 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
             """
         }
 
-        // Promote progress tar to final path, or fall back to direct upload.
-        // progress_upload_snapshot.sh writes the sentinel on each successful PUT.
+        // Always re-tar the local stage directory and upload it directly, rather
+        // than trusting the last progress snapshot uploaded by
+        // progress_upload_snapshot.sh to still match it (the superseded-file
+        // rename above, or other post-snapshot writes, can leave it stale). Use
+        // --transform so tar contents carry the postTag filename without
+        // touching on-disk results*.xml files.
         ensureStageResultNotUploaded("${stageName}${postTag}")
-        if (suppressTestReporting || !promoteProgressTar(stageName, postTag)) {
-            if (suppressTestReporting) {
-                echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
-            } else {
-                // Progress upload never succeeded (Artifactory unreachable, watcher not started, etc.).
-                echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
-            }
-            // Fall back to the original approach: tar the local stage directory
-            // and upload it directly. Use --transform so tar contents carry the
-            // postTag filename without touching on-disk results*.xml files.
-            def xmlCount = sh(script: "ls ${stageName}/results*.xml 2>/dev/null | wc -l", returnStdout: true).trim().toInteger()
-            if (suppressTestReporting || xmlCount > 0) {
-                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            } else {
-                println("No results xml to submit")
-            }
-        }
+        def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+        sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+        trtllm_utils.uploadArtifacts(
+            "results-${stageName}${postTag}.tar.gz",
+            "${UPLOAD_PATH}/test-results/"
+        )
+        deleteProgressArtifact(stageName, postTag)
 
         // Pull this stage's per-process .cbtscov files as one archive into ${stageName}/cbts/; bounded and non-fatal.
         if (isCbtsStage(stageName)) {
@@ -454,7 +449,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
                             pipeline,
                             script: Utils.sshUserCmd(
                                 remote,
-                                "\"cd '${remoteWs}' && touch '${CBTS_STOP_FILE_NAME}' && sleep 2 && " +
+                                "\"cd '${remoteWs}' && sleep 2 && " +
                                 "tar czf '${cbtsArchive}' .cbtscov.${stageName}* 2>/dev/null; " +
                                 "tar tzf '${cbtsArchive}' 2>/dev/null | grep -q . || rm -f '${cbtsArchive}'\""
                             ),
@@ -503,11 +498,14 @@ def uploadResults(def pipeline, SlurmCluster cluster, String clusterName, String
     }
 }
 
-def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag="") {
+def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName, postTag="", Map retryContext=null) {
     // Run the isolated tests one by one to avoid any potential conflicts
     def isolateTestList = preprocessedLists.isolate
     def isolateTestLines = readFile(file: isolateTestList).readLines()
     def rerunFailed = false
+    def rerunInfraFailure = null
+    def unrerunInfraFailure = null
+    def hasUnrerunFailure = false
 
     for (int i = 0; i < isolateTestLines.size(); i++) {
         def isolateTestName = isolateTestLines[i].trim()
@@ -535,14 +533,47 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            def isRerunFailed = rerunFailedTests(
-                stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag)
-            if (isRerunFailed) {
+            def rerunResult = rerunFailedTests(
+                pipeline, stageName, llmSrc, isolateTestCmdLine, "results_isolated_${i}.xml", "isolated_${i}", postTag, retryContext)
+            if (rerunResult.failed) {
                 catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                     error "Isolated test ${i} (${isolateTestName}) failed after rerun attempt"
                 }
                 // Mark that at least one isolated test failed, but continue processing other tests
                 rerunFailed = true
+                rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
+            } else {
+                // Strip trailing " TIMEOUT (N)" / "TIMEOUT(N)" / " ISOLATION" turtle
+                // directives the same way generate_duration.py's _TURTLE_DIRECTIVE_RE does.
+                def bareTestName = isolateTestName.replaceAll(/(?:\s+(?:TIMEOUT\s*\(\d+\)|ISOLATION))+\s*$/, '').trim()
+                def unfinishedTestFile = "${WORKSPACE}/${stageName}/unfinished_test.txt"
+                // conftest.py prefixes nodeids with --test-prefix=${stageName}; match in
+                // Groovy, not a shell grep, so a quote in a parametrized id can't break it.
+                def isTestUnfinished = fileExists(unfinishedTestFile) &&
+                    readFile(unfinishedTestFile).readLines().collect { it.trim() }.contains("${stageName}/${bareTestName}".toString())
+                if (isTestUnfinished) {
+                    // Record this crash as a JUnit <testcase> like the regular-test
+                    // path does. hasUnrerunFailure stays untouched here: it drives
+                    // the duration/no-signature message below, which doesn't apply.
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) terminated unexpectedly, please check the test report."
+                    }
+                } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/isolated_${i}/rerun_0.txt")) {
+                    String scope = retryContext?.scope ?: InfraFailure.K8S
+                    def classified = classifyFailure(pipeline, e, scope, retryContext)
+                    if (classified instanceof InfraFailure) {
+                        unrerunInfraFailure = classified
+                    }
+                    // Same duration/no-signature gap as the regular-test path: this
+                    // finished but failed, and was never actually rerun, so
+                    // results_isolated_${i}.xml still carries the original
+                    // <failure> with nothing here to flag it.
+                    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                        error "Isolated test ${i} (${isolateTestName}) failed and was not eligible for rerun (duration > 10 min, no matching failure signature)"
+                    }
+                    hasUnrerunFailure = true
+                }
             }
         } finally {
             // Clean up the temporary test file
@@ -556,8 +587,18 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName, postTag=
             error "One or more isolated tests failed after rerun attempts"
         }
     }
+    if (hasUnrerunFailure) {
+        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            error "One or more isolated tests failed and were not eligible for rerun, please check the test report."
+        }
+    }
 
-    return rerunFailed  // Return the updated value
+    return [
+        rerunFailed: rerunFailed,
+        rerunInfraFailure: rerunInfraFailure,
+        unrerunInfraFailure: unrerunInfraFailure,
+        hasUnrerunFailure: hasUnrerunFailure,
+    ]
 }
 
 def getInfraDryRunPytestTargets(testListPath) {
@@ -578,7 +619,7 @@ def getInfraDryRunPytestTargets(testListPath) {
     return targets
 }
 
-def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, durationsPath="") {
+def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") {
     // Preprocess testDBList to extract ISOLATION markers
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
@@ -631,99 +672,87 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false, du
 
     def shardTestList = []
 
-    if (perfMode) {
-        // In perfMode, skip pytest collection as it may cause errors with automatically generated testcases
-        // Instead, use all tests from the original testDBList
-        echo "Performance mode enabled - skipping pytest collection, using all tests from testDBList"
-    } else {
-        def testListCmd = [
-            "LLM_ROOT=${llmSrc}",
-            "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
-            "pytest",
-            "--collect-only",
-            "--splitting-algorithm least_duration",
-            "--test-list=${cleanedTestDBList}",
-            "--quiet",
-            "--splits ${splits}",
-            "--group ${splitId}",
-        ]
-        if (durationsPath) {
-            testListCmd += ["--durations-path ${durationsPath}"]
-        }
-        testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
+    def testListCmd = [
+        "LLM_ROOT=${llmSrc}",
+        "LLM_BACKEND_ROOT=${llmSrc}/triton_backend",
+        "pytest",
+        "--collect-only",
+        "--splitting-algorithm least_duration",
+        "--test-list=${cleanedTestDBList}",
+        "--quiet",
+        "--splits ${splits}",
+        "--group ${splitId}",
+    ]
+    if (durationsPath) {
+        testListCmd += ["--durations-path ${durationsPath}"]
+    }
+    testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
-        try {
-            // First execute the pytest command and check if it succeeds
-            def pytestOutput = sh(
-                script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
-                returnStdout: true
-            ).trim()
+    try {
+        // First execute the pytest command and check if it succeeds
+        def pytestOutput = sh(
+            script: "cd ${llmSrc}/tests/integration/defs && ${testListCmd.join(' ')}",
+            returnStdout: true
+        ).trim()
 
-            // Debug: Show the raw pytest output
-            echo "<<<START_PYTEST_OUTPUT>>>"
-            echo "${pytestOutput}"
-            echo "<<<END_PYTEST_OUTPUT>>>"
+        // Debug: Show the raw pytest output
+        echo "<<<START_PYTEST_OUTPUT>>>"
+        echo "${pytestOutput}"
+        echo "<<<END_PYTEST_OUTPUT>>>"
 
-            // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
-            def lines = pytestOutput.split('\n')
-            def foundRunningLine = false
-            def lineIndex = 0
-            shardTestList = lines.findAll { line ->
-                lineIndex++
+        // Filter the output to get only test lines with '::' that occur after "Running X items in this shard"
+        def lines = pytestOutput.split('\n')
+        def foundRunningLine = false
+        def lineIndex = 0
+        shardTestList = lines.findAll { line ->
+            lineIndex++
 
-                if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
-                    foundRunningLine = true
-                    return false  // Don't include the "Running" line itself
-                }
-                // Stop collecting when we hit the warnings/errors summary separator
-                if (foundRunningLine && line.contains('======================')) {
-                    foundRunningLine = false  // Stop collecting
-                    return false
-                }
-
-                def hasDoubleColon = line.contains('::')
-                def shouldInclude = foundRunningLine && hasDoubleColon
-                return shouldInclude
+            if (line.matches(/.*Running \d+ items in this shard.*/) || line.matches(/.*\[pytest-split\] Running group.*/)) {
+                foundRunningLine = true
+                return false  // Don't include the "Running" line itself
             }
-            echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
-        } catch (Exception e) {
-            echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
-            error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
+            // Stop collecting when we hit the warnings/errors summary separator
+            if (foundRunningLine && line.contains('======================')) {
+                foundRunningLine = false  // Stop collecting
+                return false
+            }
+
+            def hasDoubleColon = line.contains('::')
+            def shouldInclude = foundRunningLine && hasDoubleColon
+            return shouldInclude
         }
+        echo "Filtering complete. shardTestList size: ${shardTestList.size()}"
+    } catch (Exception e) {
+        echo "Error: Failed to execute pytest command for test collection: ${e.getMessage()}"
+        error "Test collection failed for shard ${splitId}/${splits}. Cannot proceed without valid test list."
     }
 
-    if (shardTestList || perfMode) {
+    if (shardTestList) {
         // Split the shard test list into regular and isolate tests
         def shardRegularTests = []
         def shardIsolateTests = []
 
-        if (perfMode) {
-            // In perfMode, put all tests in regular and skip isolation
-            echo "Performance mode enabled - all tests will run as regular tests (no isolation)"
-            shardRegularTests = cleanedTestLines.findAll { it.trim() }
-        } else {
-            // Process each test from shardTestList
-            shardTestList.each { test ->
-                def trimmedTest = test.trim()
-                if (trimmedTest) {
-                    // Process test_unittests.py::test_unittests_v2[xxxx] pattern
-                    if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
-                        // Extract content between [ and ]
-                        def startIndex = trimmedTest.indexOf('[') + 1
-                        def endIndex = trimmedTest.lastIndexOf(']')
-                        trimmedTest = trimmedTest.substring(startIndex, endIndex)
-                    }
+        // Process each test from shardTestList
+        shardTestList.each { test ->
+            def trimmedTest = test.trim()
+            if (trimmedTest) {
+                // Process test_unittests.py::test_unittests_v2[xxxx] pattern
+                if (trimmedTest.startsWith('test_unittests.py::test_unittests_v2[') && trimmedTest.endsWith(']')) {
+                    // Extract content between [ and ]
+                    def startIndex = trimmedTest.indexOf('[') + 1
+                    def endIndex = trimmedTest.lastIndexOf(']')
+                    trimmedTest = trimmedTest.substring(startIndex, endIndex)
+                }
 
-                    // Check if this test is in the isolation list
-                    def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
-                    if (isolationTestLine) {
-                        // This test needs isolation
-                        shardIsolateTests.add(isolationTestLine)
-                    } else {
-                        // This test is a regular test - find the actual line from cleanedTestLines
-                        def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
-                        shardRegularTests.add(cleanedTestLine)
-                    }
+                // Check if this test is in the isolation list
+                def isolationTestLine = isolationTestLines.find { it.contains(trimmedTest) }
+                if (isolationTestLine) {
+                    // This test needs isolation
+                    shardIsolateTests.add(isolationTestLine)
+                } else {
+                    // This test is a regular test - find the actual line from cleanedTestLines
+                    def cleanedTestLine = cleanedTestLines.find { it.contains(trimmedTest) }
+                    shardRegularTests.add(cleanedTestLine)
                 }
             }
         }
@@ -784,11 +813,71 @@ def isValidSlurmJobId(def slurmJobID) {
     return slurmJobID && slurmJobID.toString() ==~ /\d+/
 }
 
+// Cache key formula is mirrored in fat_build_sbatch_body.sh (the only writer) and
+// prepare_container.sh; a divergent key misses the cache silently forever.
+// Hashed on the Jenkins controller so no $()/\${} has to survive SSH quoting.
+def computeFatSqshPath(String fatSqshDir, String llmTarArtifactPath, String fatBuildScriptLocalPath) {
+    def scriptHash = sh(returnStdout: true, script: "sha256sum ${fatBuildScriptLocalPath} | cut -d' ' -f1 | head -c 8").trim()
+    def hash = sh(returnStdout: true, script: "printf '%s' '${llmTarArtifactPath}|${LLM_DOCKER_IMAGE}|${scriptHash}' | sha256sum | cut -d' ' -f1 | head -c 16").trim()
+    return [scriptHash: scriptHash, hash: hash, path: "${fatSqshDir}/fat-${hash}.sqsh"]
+}
+
+// Shared by the SLURM agent and sbatch flows.
+def generateFatBuildSbatchScript(Map args) {
+    return """\
+#!/bin/bash
+#SBATCH --output=${args.fatBuildLogPath}
+#SBATCH ${args.fatBuilderArgs}
+export FAT_CONTAINER_DIR="${args.containerDir}"
+export FAT_CONTAINER="${args.container}"
+export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
+export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
+export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_TAR_NAME="${args.tarName}"
+export FAT_FETCH_HELPER_PATH="${args.fetchHelperPathNode}"
+export LLM_ARTIFACTS_PRIMARY="${llmArtifactsPrimary()}"
+export ARTIFACTORY_NETRC="${args.artifactoryNetrcPathNode}"
+export ARTIFACTORY_CREDENTIAL_ID="${LLM_ARTIFACTS_CREDENTIALS_ID}"
+bash "${args.fatBuildBodyPathNode}"
+""".stripIndent()
+}
+
+def generateFatPrepareScript(Map args) {
+    return """\
+#!/bin/bash
+export FAT_SQSH_DIR="${args.fatSqshDir}"
+export FAT_LLM_TAR_ARTIFACT_PATH="${args.llmTarArtifactPath}"
+export FAT_LLM_DOCKER_IMAGE="${args.llmDockerImage}"
+export FAT_BUILD_SCRIPT_PATH="${args.fatBuildScriptPathNode}"
+export FAT_BUILD_SBATCH_PATH="${args.fatBuildSbatchPathNode}"
+export FAT_BUILD_LOG_TEMPLATE="${args.fatBuildLogPath}"
+export FAT_ARTIFACTORY_NETRC="${args.artifactoryNetrcPathNode}"
+bash "${args.prepareBodyPathNode}"
+""".stripIndent()
+}
+
+// Delivers the netrc with which the fat sqsh builder reads the packaged build. It is separate from
+// the GPU job's netrc, which slurm_install.sh deletes after its own download while a builder that
+// is still queued has yet to read the package. The builder deletes it once its download is done,
+// and prepare_container.sh deletes it when this stage submits no builder.
+def deliverFatBuilderNetrc(pipeline, def remote, String netrcPathNode) {
+    def netrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(pipeline, netrcPathLocal)
+        // scp -p keeps the netrc's 600 mode on the node.
+        Utils.copyFileToRemoteHost(pipeline, remote, netrcPathLocal, netrcPathNode)
+    } finally {
+        sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPathLocal}'")
+    }
+}
+
 def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName, String jobUID){
     CloudManager.withSlurmFrontendFailover(pipeline, clusterName, cluster) { remote ->
         def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
         def s3SpoolRoot = "/home/svc_tensorrt/bloom/scripts/.s3-spool-${jobUID}"
 
+        Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] START: \$(date '+%Y-%m-%d %H:%M:%S') jobUID=${jobUID} ===\"")
         Utils.exec(pipeline, script: "echo Sleeping to allow Slurm job completion; sleep 30")
 
         def slurmJobID = Utils.exec(
@@ -805,7 +894,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
         if (!isValidSlurmJobId(slurmJobID)) {
             echo "Slurm job may not submit successfully. No job ID found."
         } else {
-            Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID}")
+            Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] gpu_job_id=${slurmJobID} ===\"")
 
             Utils.exec(
                 pipeline,
@@ -821,9 +910,18 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
         def cleanupCommands = [
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
-            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
-            "rm -rf ${jobWorkspace} ${s3SpoolRoot} || true",
+            // Fat sqsh files are shared across jobs (keyed by package, image and builder script),
+            // so age-prune rather than delete per job; reused ones keep a refreshed mtime.
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
+            // Keep the job workspace (job-output.log etc.) for debugging; the
+            // PruneSlurmOutputs job removes it after the retention period. Drop the
+            // S3 spool and anything holding credentials right away: the launch
+            // script embeds HF/GitHub tokens and OpenSearch credentials, and the
+            // netrc files hold the Artifactory credentials.
+            "rm -rf ${s3SpoolRoot} ${jobWorkspace}/s3_secret_key ${jobWorkspace}/enroot-config ${jobWorkspace}/${jobUID}-slurm_launch.sh ${jobWorkspace}/artifactory-netrc ${jobWorkspace}/fat-artifactory-netrc || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -833,7 +931,7 @@ def cleanUpSlurmResources(def pipeline, SlurmCluster cluster, String clusterName
             )
         )
 
-        Utils.exec(pipeline, script: "echo Slurm job ID: ${slurmJobID} cleaned up")
+        Utils.exec(pipeline, script: "echo \"=== [Clean Up Slurm Resource] END: \$(date '+%Y-%m-%d %H:%M:%S') gpu_job_id=${slurmJobID} jobUID=${jobUID} cleaned up ===\"")
     }
 }
 
@@ -870,10 +968,15 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
         def cleanupCommands = [
             "rm -rf /home/svc_tensorrt/bloom/scripts/agent-${nodeName}.jar /home/svc_tensorrt/bloom/scripts/${nodeName}-${entrypoint} || true",
             "rm -rf ${cluster.scratchPath}/users/svc_tensorrt/enroot-config-${nodeName} || true",
+            // The fat sqsh builder's netrc, in case neither the builder nor Prepare Container
+            // removed it.
+            "rm -f /home/svc_tensorrt/bloom/scripts/${nodeName}/fat-artifactory-netrc || true",
             // .sqsh is shared across jobs (named by image digest), so age-prune
             // instead of deleting per job; reused images keep a refreshed mtime.
-            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +3 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 -name 'container-*.sqsh' -mtime +10 -delete 2>/dev/null || true",
             "find ${cluster.scratchPath}/users/svc_tensorrt/containers -maxdepth 1 \\( -name 'container-*.tmp' -o -name 'container-*.lock' \\) -mtime +1 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh' -mtime +7 -delete 2>/dev/null || true",
+            "find ${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh -maxdepth 1 -name 'fat-*.sqsh.*.tmp' -mtime +1 -delete 2>/dev/null || true",
         ].join(" ; ")
         Utils.exec(
             pipeline,
@@ -892,15 +995,17 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 // login node. If that pod dies mid-run (eviction, container error, agent
 // offline), the in-pod cleanup can no longer reach the controller, so the SLURM
 // job and any Jenkins agent node leak. State + reconciliation live in the shared
-// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers two
+// `resourceLedger` (trtllm-jenkins-shared-lib). Each SLURM stage registers
 // sibling entries -- "<stage>/dispatcher-pod" (the pod spec, from the pod
-// wrapper) and "<stage>/slurm" (the per-attempt SLURM job / Jenkins node, from
-// the stage body) -- so freeing the job/node after a successful in-pod cleanup
-// (markReclaimed) never disturbs the pod spec a *later* attempt's off-pod
-// reconciliation needs. The ledger stores only serializable primitives (it
-// rejects anything else) so pipeline persistence is unaffected; the SlurmCluster
-// is rebuilt from clusterName at reconcile time. The functions below are thin
-// SLURM-specific adapters over that generic ledger.
+// wrapper) and one "<stage>/slurm/<job UID or node name>" per attempt (that
+// attempt's SLURM job / Jenkins node, from the stage body) -- so freeing the
+// job/node after a successful in-pod cleanup (markReclaimed) never disturbs the
+// pod spec a *later* attempt's off-pod reconciliation needs, and an attempt
+// whose cleanup failed stays registered beside the next one. The ledger stores
+// only serializable primitives (it rejects anything else) so pipeline
+// persistence is unaffected; the SlurmCluster is rebuilt from clusterName at
+// reconcile time. The functions below are thin SLURM-specific adapters over
+// that generic ledger.
 //
 // Shared-library contract used below (trtllm-jenkins-shared-lib), documented here
 // for equivalence with the pre-shared inlined finalizer this replaced:
@@ -922,8 +1027,9 @@ def cleanUpNodeResources(def pipeline, SlurmCluster cluster, String clusterName,
 
 // Register a live SLURM resource. The pod wrapper passes a podSpec (recorded
 // under "<stage>/dispatcher-pod"); the stage body passes the SLURM job / Jenkins
-// node identity (recorded under "<stage>/slurm"). Keyed separately so they are
-// reclaimed independently. Absent fields are skipped by the ledger.
+// node identity (recorded under "<stage>/slurm/<jobUID or nodeName>", one entry
+// per attempt). Keyed separately so they are reclaimed independently. Absent
+// fields are skipped by the ledger.
 void registerSlurmResource(String stageName, Map fields) {
     if (!stageName) {
         return
@@ -933,7 +1039,7 @@ void registerSlurmResource(String stageName, Map fields) {
             fields: [podSpec: fields.podSpec, containerName: fields.containerName],
             ownerBuildTag: env.BUILD_TAG)
     } else {
-        resourceLedger.register(id: "${stageName}/slurm",
+        resourceLedger.register(id: "${stageName}/slurm/${fields.jobUID ?: fields.nodeName}",
             type: fields.usedSbatch ? 'slurmJob' : 'slurmNode',
             fields: [clusterName: fields.clusterName, nodeName: fields.nodeName,
                      jobUID: fields.jobUID, slurmJobId: fields.slurmJobId, usedSbatch: fields.usedSbatch],
@@ -941,14 +1047,15 @@ void registerSlurmResource(String stageName, Map fields) {
     }
 }
 
-// Called once an attempt's resources are actually torn down: drop the per-attempt
-// SLURM job/node entry. The stage's dispatcher-pod entry is a separate id and is
-// left intact (a later attempt's off-pod reconciliation still needs its pod spec).
-void deregisterSlurmResource(String stageName) {
+// Called once an attempt's resources are actually torn down: drop that attempt's
+// SLURM job/node entry (`attempt` is its jobUID or nodeName). The stage's
+// dispatcher-pod entry is a separate id and is left intact (a later attempt's
+// off-pod reconciliation still needs its pod spec).
+void deregisterSlurmResource(String stageName, String attempt) {
     if (!stageName) {
         return
     }
-    resourceLedger.markReclaimed("${stageName}/slurm")
+    resourceLedger.markReclaimed("${stageName}/slurm/${attempt}")
 }
 
 // Reclaim one orphaned SLURM entry off the (dead) dispatcher pod: launch a fresh
@@ -972,7 +1079,7 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     if (!entry.jobUID && !entry.nodeName) {
         return true
     }
-    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm$/, "/dispatcher-pod"))
+    def podEntry = resourceLedger.get(((entry.id ?: "") as String).replaceFirst(/\/slurm\/[^\/]+$/, "/dispatcher-pod"))
     def podSpec = podSpecOverride ?: podEntry?.podSpec
     def containerName = podEntry?.containerName ?: "trt-llm"
     def cluster = entry.clusterName ? SlurmConfig.clusterConfig[entry.clusterName] : null
@@ -1000,15 +1107,15 @@ def reconcileSlurmResource(pipeline, def entry, def podSpecOverride = null) {
     }
 }
 
-// Reconcile this stage's orphaned SLURM job/node off-pod (in-catch, on a detected
-// dispatcher-pod death). podSpecOverride is the failing attempt's pod spec so
-// reconciliation never depends on the sibling entry surviving.
+// Reconcile this stage's orphaned SLURM jobs/nodes off-pod, every attempt's (in-catch,
+// on a detected dispatcher-pod death). podSpecOverride is the failing attempt's pod
+// spec so reconciliation never depends on the sibling entry surviving.
 def finalizeOrphanedSlurmResource(pipeline, String stageName, def podSpecOverride = null) {
     if (!stageName) {
         return
     }
     resourceLedger.reconcile(pipeline,
-        { it.id == "${stageName}/slurm" },
+        { (it.id as String).startsWith("${stageName}/slurm/") },
         { p, entry -> reconcileSlurmResource(p, entry, podSpecOverride) })
 }
 
@@ -1062,7 +1169,7 @@ boolean isNonTerminalSlurmState(String state) {
     return state != null && SLURM_NON_TERMINAL_STATES.contains(state.toUpperCase(java.util.Locale.ROOT))
 }
 
-def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, gpuCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1075,21 +1182,130 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
 
     def entrypoint = SlurmConfig.containerRuntimeToEntrypoint[cluster.containerRuntime]
 
-    // Create a unique suffix for the node name and workspace
-    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    // Create a unique suffix for the instance, node name and workspace
+    String customSuffix = "${getShortenedJenkinsInstanceName()}-${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def nodeName = "${cluster.host}-test-${customSuffix}"
     def customWorkspace = "/tmp/${nodeName}"
     def nodeSecret = CloudManager.createNode(nodeName, customWorkspace)
 
     def slurmJobID = null
     def dockerArgs = null
+    Throwable primaryError = null
 
     try {
-        // Run ssh command to start node in desired cluster via SLURM
+        // Run ssh command to start node in desired cluster via SLURM.
+        // Prepare Container runs first (inside the same SSH session) so that the fat sqsh
+        // is on disk before the GPU agent job starts and slurm_install.sh checks for it.
         CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
-            stage('Request Node Via Slurm') {
-                println("Selected Cluster: ${cluster.name}")
 
+            def tarName = BUILD_CONFIGS[config][TARNAME]
+            // The fat sqsh replaces the download in runLLMTestlistOnPlatformImpl, so it
+            // must bake the same build that function would have fetched.
+            def llmTarArtifactPath = cluster.fatBuilderArgs != null ? boltedTarArtifactPath(pipeline, config, tarName) : null
+            def llmPath = sh(script: "realpath .", returnStdout: true).trim()
+            def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
+            def agentJobWorkspace = "/home/svc_tensorrt/bloom/scripts/${nodeName}"
+            def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
+            def scriptFatBuildPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_inline.sh"
+            def scriptFatBuildSbatchPathLocal = Utils.createTempLocation(pipeline, "./fat_build_sbatch.sh")
+            def scriptFatBuildSbatchPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_sbatch.sh"
+            def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
+            def scriptPreparePathNode = "${agentJobWorkspace}/${nodeName}-prepare_container.sh"
+            def scriptFatBuildBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_sbatch_body.sh"
+            def scriptFatBuildBodyPathNode = "${agentJobWorkspace}/${nodeName}-fat_build_sbatch_body.sh"
+            def scriptPrepareBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/prepare_container.sh"
+            def scriptPrepareBodyPathNode = "${agentJobWorkspace}/${nodeName}-prepare_container_body.sh"
+            def scriptFetchHelperPathNode = "${agentJobWorkspace}/${nodeName}-fetch_build_artifact.sh"
+            def fatArtifactoryNetrcPathNode = "${agentJobWorkspace}/fat-artifactory-netrc"
+
+            stage("Initialize Test") {
+                println("Selected Cluster: ${cluster.name}")
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${agentJobWorkspace}\""), numRetries: 3)
+
+                if (cluster.fatBuilderArgs != null) {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
+                    }
+                    sh "cd ${llmPath} && tar -zxf ${tarName}"
+
+                    Utils.exec(pipeline, script: "echo 'Script to build fat sqsh inline:' && cat ${scriptFatBuildLocalPath}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildLocalPath, scriptFatBuildPathNode, true)
+
+                    // Must match the agent's enroot form, or the two import separate
+                    // copies of the same base sqsh.
+                    def container = LLM_DOCKER_IMAGE
+                    if (cluster.containerRuntime.toString() == "ENROOT") {
+                        container = LLM_DOCKER_IMAGE
+                            .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                    }
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${nodeName}-fat_build")
+
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, readHelperPath(pipeline), scriptFetchHelperPathNode, true)
+                    deliverFatBuilderNetrc(pipeline, remote, fatArtifactoryNetrcPathNode)
+
+                    def scriptFatBuildSbatchContent = generateFatBuildSbatchScript(
+                        fatBuildLogPath: fatBuildLogPath,
+                        fatBuilderArgs: cluster.fatBuilderArgs,
+                        containerDir: containerDir,
+                        container: container,
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        tarName: tarName,
+                        fetchHelperPathNode: scriptFetchHelperPathNode,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        fatBuildBodyPathNode: scriptFatBuildBodyPathNode
+                    )
+                    pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
+                    Utils.exec(pipeline, script: "echo 'Fat builder sbatch script:' && cat ${scriptFatBuildSbatchPathLocal}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildSbatchPathLocal, scriptFatBuildSbatchPathNode, true)
+
+                    def scriptPrepareContent = generateFatPrepareScript(
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
+                        fatBuildLogPath: fatBuildLogPath,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        prepareBodyPathNode: scriptPrepareBodyPathNode
+                    )
+                    pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
+                    Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPreparePathLocal, scriptPreparePathNode, true)
+                } else {
+                    echo "No fat sqsh builder configured for cluster ${cluster.name}; skipping fat sqsh script preparation."
+                }
+            }
+
+            // Runs on every attempt: prepare_container.sh exits immediately if the fat
+            // sqsh already exists, and a retry whose attempt 1 died before the build
+            // still needs one.
+            stage("[${stageName}] Prepare Container") {
+                if (cluster.fatBuilderArgs != null) {
+                    try {
+                        Utils.exec(
+                            pipeline,
+                            timeout: false,
+                            script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                            numRetries: 3
+                        )
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU agent job will fall back to base sqsh + full install."
+                    }
+                } else {
+                    echo "No fat sqsh builder configured; skipping Prepare Container."
+                }
+            }
+
+            stage('Request Node Via Slurm') {
                 def jenkinsSetupPath = Utils.copyLibraryResource(pipeline, entrypoint)
 
                 Utils.exec(pipeline, script: "cat ${jenkinsSetupPath}")
@@ -1134,12 +1350,38 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 }
 
                 def mounts = getMountListForSlurmTest(cluster, false).join(",")
-                def imageForSlurm = LLM_DOCKER_IMAGE
+
+                def containerImageForAgent = LLM_DOCKER_IMAGE
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    imageForSlurm = LLM_DOCKER_IMAGE
+                    containerImageForAgent = LLM_DOCKER_IMAGE
                         .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
                 }
-                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, imageForSlurm, mounts)
+                // Run the agent inside the pre-built fat sqsh (TRT-LLM + pip deps baked in).
+                // ENROOT only: a .sqsh path is not a valid image for a Docker runtime.
+                if (cluster.fatBuilderArgs != null && cluster.containerRuntime.toString() == "ENROOT") {
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
+                    def fatHash = fatSqsh.hash
+                    def fatSqshPath = fatSqsh.path
+                    echo "Fat sqsh check: hash=${fatHash} path=${fatSqshPath}"
+                    // Simple SSH check: just test the pre-computed literal path.
+                    def fatCheckResult = Utils.exec(
+                        pipeline,
+                        returnStdout: true,
+                        script: Utils.sshUserCmd(
+                            remote,
+                            "\"test -f '${fatSqshPath}' && echo '${fatSqshPath}' || echo MISSING\""
+                        )
+                    ).trim()
+                    if (fatCheckResult != "MISSING" && fatCheckResult) {
+                        echo "Fat sqsh ready; using it as agent container image: ${fatCheckResult}"
+                        containerImageForAgent = fatCheckResult
+                    } else {
+                        echo "Fat sqsh not ready; falling back to base image."
+                    }
+                }
+
+                def slurmCommand = SlurmConfig.generateCommand(cluster, partition, nodeSecret, nodeName, Jenkins.instance.rootUrl, containerImageForAgent, mounts)
                 def clusterExcludes = placementContext?.excludedSlurmNodeListsByCluster?.get(partition.clusterName)
                 def slurmCommandWithExclusion = trtllm_utils.addSlurmExcludeToCommand(slurmCommand, clusterExcludes)
                 def slurmExcludeArg = trtllm_utils.buildSlurmExcludeArg(clusterExcludes)
@@ -1155,6 +1397,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
                 if (enrootConfigDir) {
                     slurmSubmitCommand = "export ENROOT_CONFIG_PATH='${enrootConfigDir}'; ${slurmCommandWithExclusion}"
                 }
+                slurmSubmitCommand = SlurmConfig.withGpuBudget(pipeline, partition.clusterName, slurmSubmitCommand, gpuCount)
 
                 def slurmSubmitOutput = Utils.exec(
                     pipeline,
@@ -1481,7 +1724,7 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             return err
         }
         try {
-            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, slurmRunner, postTag, useClusterDurations, retryContext, classifySlurmFailure)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
@@ -1490,37 +1733,53 @@ def runLLMTestlistWithAgent(pipeline, platform, testList, config=VANILLA_CONFIG,
             // failure -- just propagate it. Failures raised outside the task runner
             // (image pull, node/agent bring-up, etc.) were never labeled, so classify
             // them here on the agent.
-            throw (slurmFailureClassified || e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
+            Throwable classified = (slurmFailureClassified || e instanceof TrtllmCiException ? e : classifySlurmFailure(e))
+            throw classified
         }
+    } catch (InterruptedException e) {
+        primaryError = e
+        throw e
+    } catch (Exception e) {
+        primaryError = e
+        throw e
     } finally {
+        preservePrimaryFailure(primaryError) {
         // Resource cleanup must run even if SLURM metadata capture is interrupted.
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, slurmJobID, placementContext, stageName)
         } finally {
             stage("Clean Up Slurm Resource") {
-                // Workaround to handle the interruption during clean up SLURM resources
+                // Retry transient cleanup failures before leaving recovery to the sweep.
                 retry(3) {
                     try {
                         cleanUpNodeResources(pipeline, cluster, partition.clusterName, nodeName, slurmJobID)
+                    } catch (InterruptedException e) {
+                        throw e
                     } catch (Exception e) {
-                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                        // retry(3) retries any exception. Keep the cleanup failure typed
+                        // so its cause and scope survive if all attempts fail; the outer
+                        // preservePrimaryFailure then retains any original stage failure.
+                        throw new InfraFailure(
+                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
             }
-            // Cleanup ran on the live pod; drop the registry entry so the off-pod
-            // finalizer/sweep does not reconcile already-freed resources.
-            deregisterSlurmResource(stageName)
+            // Reaching here means cleanup succeeded within its retry budget. If all
+            // attempts fail, the throw skips deregistration and leaves the entry for sweep.
+            deregisterSlurmResource(stageName, nodeName)
+        }
         }
     }
 }
 
-def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
+def executeLLMTestOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, runner, String postTag="", boolean useClusterDurations=false, Map retryContext=null, Closure classifySlurmFailure=null)
 {
     runner {
         // TODO: refactor the finallyRunner to reuse within slurm or nonslurm job.
-        cacheErrorAndUploadResult(stageName, {
+        cacheErrorAndUploadResult(pipeline, stageName, {
             try {
-                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+                runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
@@ -1581,13 +1840,13 @@ def getPytestBaseCommandLine(
     String llmSrc,
     String stageName,
     String waivesFilePath,
-    Boolean perfMode,
     String outputPath,
     String coverageConfigFile,
     String pytestUtil = "",
     List<String> extraArgs = [],
     int containerPortStart = 0,
-    int containerPortNum = 0
+    int containerPortNum = 0,
+    String clusterName = ""
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -1599,8 +1858,14 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
+    // GB200 stages run on multiple clusters; only gcp-iad needs the gIB NCCL network plugin over IB.
+    if (stageName.startsWith("GB200") && clusterName == "gcp-iad") {
+        extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
+    }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
+    // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
+    extraInternalEnv += " TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1"
     // Persist the AutoTuner profiling cache to a CONTAINER-LOCAL, volatile path so
     // that repeated tactic profiling is reused across testcases within one stage.
     // /tmp lives on the container overlay (srun --no-container-mount-home / fresh
@@ -1608,13 +1873,20 @@ def getPytestBaseCommandLine(
     // container is destroyed. Never point this at a bind-mounted / shared path:
     // the AutoTuner cache uses fcntl.lockf, which is unreliable over NFS.
     extraInternalEnv += " TLLM_AUTOTUNER_CACHE_PATH=/tmp/trtllm_autotuner_cache/autotuner_cache.json"
-    // CBTS stages put cbts_plugin on PYTHONPATH (via ${VAR:-} for set -u safety) plus the marker/config env vars sitecustomize.py reads in subprocesses.
+    // CBTS stages put cbts_plugin/sitecustomize (bare-importable guest hooks) plus the cbts
+    // package itself on PYTHONPATH (via ${VAR:-} for set -u safety), plus the config env vars
+    // sitecustomize.py reads in subprocesses. The context channel's address is created and
+    // exported by the plugin itself.
     if (cbtsMode) {
-        def cbtsScriptDir = "${llmSrc}/jenkins/scripts/cbts/coverage_utils"
-        extraInternalEnv += " PYTHONPATH=${cbtsScriptDir}:\${PYTHONPATH:-}"
+        def cbtsDir = "${llmSrc}/jenkins/scripts/cbts"
+        def cbtsInjectorsDir = "${cbtsDir}/cbts_injectors"
+        extraInternalEnv += " PYTHONPATH=${cbtsInjectorsDir}:${cbtsDir}:\${PYTHONPATH:-}"
         extraInternalEnv += " CBTS_COVERAGE_CONFIG=${coverageConfigFile}"
-        extraInternalEnv += " CBTS_MARKER_FILE=${outputPath}/cbts_current_test.txt"
-        extraInternalEnv += " CBTS_STOP_FILE=${outputPath}/${CBTS_STOP_FILE_NAME}"
+        // Names the stage the coverage is attributed to, and tells sitecustomize.py what this
+        // process is. sitecustomize.py consumes the role, so the pool workers and servers this
+        // pytest spawns start unlabelled and are treated as product processes.
+        extraInternalEnv += " CBTS_STAGE=${stageName}"
+        extraInternalEnv += " CBTS_PROCESS_ROLE=outer_pytest"
     }
 
     // Container port allocation environment variables for avoiding port conflicts
@@ -1655,21 +1927,19 @@ def getPytestBaseCommandLine(
         "--periodic-junit-xmlpath ${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        // Reruns redirect --periodic-junit-xmlpath elsewhere but inherit this
+        // flag unchanged, so every attempt shares one unfinished_test.txt.
+        "--periodic-unfinished-test-path=${outputPath}/unfinished_test.txt",
         "--periodic-hang-traceback",
     ]
 
-    if (perfMode) {
-        testCmdLine += [
-            "--perf",
-            "--perf-log-formats csv",
-            "--perf-log-formats yaml",
-            "--enable-gpu-clock-lock"
-        ]
-    }
     if (stageName.contains("-Ray-")) {
         testCmdLine += ["--run-ray"]
     }
-    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" : "not cpu_only"
+    // PackageSanityCheck and the NGC image sanity tests validate an alternative environment against
+    // basic cases, so the normal cpu_only / not-cpu_only split does not apply.
+    def unittestMarkExpr = (stageName.startsWith("CPU-")) ? "cpu_only" :
+        (stageName =~ /PackageSanityCheck|-Sanity-Test/) ? "" : "not cpu_only"
     testCmdLine += ["--unittest-markexpr='${unittestMarkExpr}'"]
     if (extraArgs) {
         testCmdLine += extraArgs
@@ -1714,7 +1984,154 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
     return mounts
 }
 
-def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
+// Writes a netrc for artifactory.nvidia.com with LLM_ARTIFACTS_CREDENTIALS_ID, readable only by its
+// owner. The shell's printf builtin moves the secret from the bound variables into the file, so it
+// never appears on a command line or in the trace. Callers remove the file in a finally block.
+def writeArtifactoryNetrc(pipeline, String netrcPath)
+{
+    pipeline.withCredentials([pipeline.usernamePassword(credentialsId: LLM_ARTIFACTS_CREDENTIALS_ID,
+            usernameVariable: 'ARTIFACTORY_USER', passwordVariable: 'ARTIFACTORY_PASSWORD')]) {
+        pipeline.withEnv(["ARTIFACTORY_NETRC=${netrcPath}"]) {
+            pipeline.sh(label: "Write Artifactory netrc", script: '''
+                set +x
+                umask 077
+                printf 'machine artifactory.nvidia.com login %s password %s\\n' "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD" > "$ARTIFACTORY_NETRC"
+            ''')
+        }
+    }
+}
+
+// Returns the path of the read helper, jenkins/scripts/fetch_build_artifact.sh from the run's
+// commit, in the node's temporary directory, which workspace resets and package extraction leave
+// alone. Unstashes it there the first time.
+def readHelperPath(pipeline)
+{
+    def helperDir = "${pipeline.pwd(tmp: true)}/fetch-build-artifact"
+    def helper = "${helperDir}/fetch_build_artifact.sh"
+    if (!pipeline.fileExists(helper)) {
+        pipeline.dir(helperDir) {
+            pipeline.unstash(FETCH_BUILD_ARTIFACT_STASH)
+        }
+    }
+    return helper
+}
+
+// Reads one in-scope build artifact with the read helper, which tries the primary location first
+// and the other one only when the file is absent there, and checks each download against the
+// SHA-1 that the serving location reports. The helper's netrc lives in the node's temporary
+// directory beside the helper, and is removed before this returns.
+//
+// "download" writes dest and returns null. "exists" writes nothing and returns "<url> <sha1>" of
+// the location that holds the file. Both fail the step at once on a final failure of the helper,
+// such as FETCH_ABSENT or a rejected credential, and on FETCH_TRANSFER_FAILED once the helper's
+// and llmExecStepWithRetry's retries are spent. "properties" writes the properties JSON to dest and
+// returns the helper's exit status instead of failing: 0 when found, otherwise one of the exit
+// codes the helper names, such as FETCH_ABSENT when neither location has properties for it.
+def fetchBuildArtifact(pipeline, String artifactPath, String dest, String mode = "download")
+{
+    if (!(mode in ["download", "exists", "properties"])) {
+        pipeline.error("fetchBuildArtifact: unknown mode '${mode}'")
+    }
+    def primary = llmArtifactsPrimary()
+    def helper = readHelperPath(pipeline)
+    def command = "bash '${helper}'" + (mode == "download" ? "" : " --${mode}") + " '${artifactPath}'" +
+        (mode == "exists" ? "" : " '${dest}'")
+    def netrcPath = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+    def statusPath = "${pipeline.pwd(tmp: true)}/fetch-status-${UUID.randomUUID().toString()}"
+    try {
+        writeArtifactoryNetrc(pipeline, netrcPath)
+        return pipeline.withEnv([
+            "LLM_ARTIFACTS_PRIMARY=${primary}",
+            "ARTIFACTORY_NETRC=${netrcPath}",
+            "ARTIFACTORY_CREDENTIAL_ID=${LLM_ARTIFACTS_CREDENTIALS_ID}",
+        ]) {
+            if (mode == "properties") {
+                // The helper retries transient errors itself.
+                return pipeline.sh(label: "Fetch properties of ${artifactPath}", script: command, returnStatus: true)
+            }
+            // The helper retries transient errors itself, so only FETCH_TRANSFER_FAILED fails the
+            // script and lets llmExecStepWithRetry repeat it. Any other status is final: the script
+            // records it and succeeds, and the step fails on it below without a retry.
+            def script = "status=0; ${command} || status=\$?; " +
+                "if [ \"\$status\" -eq ${FETCH_TRANSFER_FAILED} ]; then exit \"\$status\"; fi; " +
+                "echo \"\$status\" > '${statusPath}'"
+            def stdout = trtllm_utils.llmExecStepWithRetry(pipeline, label: "Fetch ${artifactPath}", script: script,
+                returnStdout: mode == "exists")
+            def status = pipeline.readFile(statusPath).trim()
+            if (status != "0") {
+                pipeline.error("fetch_build_artifact.sh could not read ${artifactPath} (exit status ${status}); " +
+                    "its message above says why.")
+            }
+            if (mode == "download") {
+                return null
+            }
+            def location = stdout.trim()
+            if (!(location ==~ /\S+ [0-9a-f]{40}/)) {
+                pipeline.error("fetchBuildArtifact: unexpected location '${location}' for ${artifactPath}")
+            }
+            return location
+        }
+    } finally {
+        pipeline.sh(label: "Remove Artifactory netrc", script: "rm -f '${netrcPath}' '${statusPath}'")
+    }
+}
+
+// Which build of <tarName> this stage tests, as the artifact path to read it
+// from with fetchBuildArtifact.
+//
+// Deterministic, not discovered. The pipeline already decided whether the build
+// published a BOLTed variant, so there is nothing to probe for: fetch
+// bolted-<tarName> and let a missing object fail the stage. A probe-and-fall-back
+// shape cannot distinguish "no BOLTed build was published" from "the probe
+// itself failed", and both outcomes produce a normal-looking log while the stage
+// quietly tests un-BOLTed binaries.
+//
+// Also asserts the artifact carries the bundle this pipeline pinned. Addressing
+// by name proves only that something is there; the property proves it is the
+// right something, which is what keeps the tested build and the released wheel
+// on one profile set. Absent property means an artifact predating the label:
+// reported and allowed rather than failed, as is a property lookup that keeps
+// failing. A rejected credential fails the stage.
+def boltedTarArtifactPath(pipeline, String config, String tarName)
+{
+    // Only the SBSA build is BOLTed, so only its tarball has a bolted- variant.
+    // Asking for one on any other config would 404 the stage rather than fail
+    // honestly, so the arch gate has to match the build's exactly.
+    if (!BOLT_TEST_BOLTED_TARBALL || config != LINUX_AARCH64_CONFIG) {
+        return "${ARTIFACT_PATH}/${tarName}"
+    }
+    if (BOLT_PINNED_REF) {
+        def propsFile = "${pipeline.pwd(tmp: true)}/bolted-${tarName}.properties.json"
+        def propsStatus = fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/bolted-${tarName}", propsFile, "properties")
+        // FETCH_ABSENT: no properties on either location. FETCH_TRANSFER_FAILED: the lookup kept
+        // failing.
+        if (!(propsStatus in [0, FETCH_ABSENT, FETCH_TRANSFER_FAILED])) {
+            error("[BOLT] Could not read the properties of bolted-${tarName}: " +
+                  "fetch_build_artifact.sh exited ${propsStatus} (see its message above).")
+        }
+        def got = ""
+        if (propsStatus == 0) {
+            got = sh(returnStdout: true, script: """
+                tr -d ' \\n' < '${propsFile}' \\
+                  | sed -n 's/.*"bolt\\.ref":\\["\\([^"]*\\)"\\].*/\\1/p'
+                rm -f '${propsFile}'
+            """).trim()
+        }
+        if (got && got != BOLT_PINNED_REF) {
+            error("[BOLT] bolted-${tarName} carries bolt.ref=${got}, but this pipeline pinned ${BOLT_PINNED_REF}. " +
+                  "Refusing to test a build optimized with a different profile bundle than the release artifacts use.")
+        }
+        if (propsStatus == FETCH_TRANSFER_FAILED) {
+            echo "[BOLT] the bolt.ref lookup for bolted-${tarName} failed (fetch_build_artifact.sh exited ${propsStatus}, see its message above); proceeding on pin ${BOLT_PINNED_REF}"
+        } else if (!got) {
+            echo "[BOLT] bolted-${tarName} carries no bolt.ref (artifact predates the label); proceeding on pin ${BOLT_PINNED_REF}"
+        }
+    }
+    echo "[BOLT] testing the BOLTed build: bolted-${tarName}"
+    return "${ARTIFACT_PATH}/bolted-${tarName}"
+}
+
+def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map placementContext=null, Map retryContext=null)
 {
     SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
@@ -1726,36 +2143,37 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
     }
 
     // Create a unique suffix for the job name
-    String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
+    String customSuffix = "${getShortenedJenkinsInstanceName()}-${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
     def jobWorkspace = "/home/svc_tensorrt/bloom/scripts/${jobUID}"
     def disaggMultiNodeMode = stageName.contains("Disagg-PerfSanity")
     def aggMultiNodeMode = !disaggMultiNodeMode && nodeCount > 1 && stageName.contains("PerfSanity")
+    def singleNvlinkDomainMode = stageName.contains("SingleNvlinkDomain")
     def infraDryRun = isInfraDryRun()
     if (infraDryRun) {
         testList = INFRA_DRY_RUN_TEST_CONTEXT
         splitId = 1
         splits = 1
-        perfMode = false
     }
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
-    def stageIsInterrupted = false
     // Captured so the finally can suppress this attempt's junit when the failure is
     // a retryable infra failure (a retry follows) -- otherwise a stage that fails
     // an intermediate attempt and passes on retry leaves the build UNSTABLE.
     def caughtStageError = null
+    Throwable primaryError = null
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
             string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             string(credentialsId: 'svc_tensorrt-swift-stack-key', variable: 'S3_SECRET_KEY'),
+            string(credentialsId: 'github_read_public_only_token', variable: 'GITHUB_CLONE_TOKEN'),
         ]) {
             CloudManager.withSlurmFrontendFailover(pipeline, partition.clusterName, cluster) { remote ->
             def tarName = BUILD_CONFIGS[config][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
+            def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
             def llmPath = sh (script: "realpath .", returnStdout: true).trim()
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
@@ -1764,8 +2182,14 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
             def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
             def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
+            def scriptFatBuildLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_inline.sh"
+            def scriptFatBuildPathNode = "${jobWorkspace}/${jobUID}-fat_build_inline.sh"
+            // Fat builder sbatch wrapper: generated inline by Groovy (not a static file).
+            def scriptFatBuildSbatchPathLocal = Utils.createTempLocation(pipeline, "./fat_build_sbatch.sh")
+            def scriptFatBuildSbatchPathNode = "${jobWorkspace}/${jobUID}-fat_build_sbatch.sh"
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
+            def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
@@ -1774,14 +2198,29 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def slurmJobLogPath = "${jobWorkspace}/job-output.log"
             def scriptLaunchPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch.sh")
             def scriptLaunchPathNode = "${jobWorkspace}/${jobUID}-slurm_launch.sh"
+            def scriptPreparePathLocal = Utils.createTempLocation(pipeline, "./prepare_container.sh")
+            def scriptPreparePathNode = "${jobWorkspace}/${jobUID}-prepare_container.sh"
+            def scriptFatBuildBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/fat_build_sbatch_body.sh"
+            def scriptFatBuildBodyPathNode = "${jobWorkspace}/${jobUID}-fat_build_sbatch_body.sh"
+            def scriptPrepareBodyLocalPath = "${llmSrcLocal}/jenkins/scripts/prepare_container.sh"
+            def scriptPrepareBodyPathNode = "${jobWorkspace}/${jobUID}-prepare_container_body.sh"
+            // The fat sqsh builder's own netrc; see deliverFatBuilderNetrc.
+            def fatArtifactoryNetrcPathNode = "${jobWorkspace}/fat-artifactory-netrc"
             def scriptSubmitPathLocal = Utils.createTempLocation(pipeline, "./slurm_submit.sh")
             def scriptSubmitPathNode = "${jobWorkspace}/${jobUID}-slurm_submit.sh"
+            def sbatchFailureMarker = "[TRTLLM_SBATCH_FINAL_FAILURE]"
             def scriptTrackPathLocal = Utils.createTempLocation(pipeline, "./slurm_track.sh")
             def scriptTrackPathNode = "${jobWorkspace}/${jobUID}-slurm_track.sh"
             def s3SecretKeyPathLocal = Utils.createTempLocation(pipeline, "./s3_secret_key")
             def s3SecretKeyPathNode = "${jobWorkspace}/s3_secret_key"
             // Per-job enroot config (never shared ~/.config/enroot — that races across jobs).
             def enrootConfigDirNode = "${jobWorkspace}/enroot-config"
+            // Per-job netrc for the read helper that slurm_install.sh runs. It is not kept in
+            // enrootConfigDirNode, which the ENROOT srun prologue deletes before slurm_install.sh runs.
+            // The package's slurm_install.sh deletes it once every node of its step has finished
+            // downloading the package, before the tests start; a package whose slurm_install.sh has
+            // no remove_artifactory_netrc leaves it to cleanUpSlurmResources.
+            def artifactoryNetrcPathNode = "${jobWorkspace}/artifactory-netrc"
             def coverageConfigFile = "${jobWorkspace}/.coveragerc"
 
             stage("Initialize Test") {
@@ -1789,11 +2228,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
-                // Download and Unzip Tar File
+                // Download and Unzip Tar File. The node downloads it again itself, with the read
+                // helper. The URL that --exists resolves is for the older slurm_install.sh inside a
+                // package built before the helper existed, which downloads that URL instead.
+                def llmTarfileLocation = ""
                 timeout(time: 30, unit: 'MINUTES') {
-                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+                    llmTarfileLocation = fetchBuildArtifact(pipeline, llmTarArtifactPath, null, "exists")
+                    fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+                def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -1812,12 +2256,68 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptInstallPathNode,
                     true
                 )
+                // Image for both the fat sqsh builder and the job launch script below.
+                def container = LLM_DOCKER_IMAGE
+                if (cluster.containerRuntime.toString() == "ENROOT") {
+                    container = LLM_DOCKER_IMAGE
+                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
+                }
+                if (cluster.fatBuilderArgs != null) {
+                    Utils.exec(pipeline, script: "echo \"Script to build fat sqsh inline: \" && cat ${scriptFatBuildLocalPath}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        scriptFatBuildLocalPath,
+                        scriptFatBuildPathNode,
+                        true
+                    )
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
+
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptFatBuildBodyLocalPath, scriptFatBuildBodyPathNode, true)
+                    Utils.copyFileToRemoteHost(pipeline, remote, scriptPrepareBodyLocalPath, scriptPrepareBodyPathNode, true)
+
+                    def scriptFatBuildSbatchContent = generateFatBuildSbatchScript(
+                        fatBuildLogPath: fatBuildLogPath,
+                        fatBuilderArgs: cluster.fatBuilderArgs,
+                        containerDir: containerDir,
+                        container: container,
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        tarName: tarName,
+                        fetchHelperPathNode: scriptFetchHelperPathNode,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        fatBuildBodyPathNode: scriptFatBuildBodyPathNode
+                    )
+                    pipeline.writeFile(file: scriptFatBuildSbatchPathLocal, text: scriptFatBuildSbatchContent)
+                    Utils.exec(pipeline, script: "echo \"Fat builder sbatch script: \" && cat ${scriptFatBuildSbatchPathLocal}")
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        scriptFatBuildSbatchPathLocal,
+                        scriptFatBuildSbatchPathNode,
+                        true
+                    )
+                }
                 Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
                     scriptBashUtilsLocalPath,
                     scriptBashUtilsPathNode,
+                    true
+                )
+                // The read helper from the run's commit, which slurm_install.sh runs to download
+                // the packaged build.
+                def scriptFetchHelperLocalPath = readHelperPath(pipeline)
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptFetchHelperLocalPath,
+                    scriptFetchHelperPathNode,
                     true
                 )
 
@@ -1907,11 +2407,39 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     }
                 }
 
+                // Record this attempt's job before the token reaches its workspace, so that
+                // the off-pod cleanup removes the workspace even if this pod dies before the
+                // job is submitted. The registration after submission adds the job ID to the
+                // same entry; an earlier attempt's entry stays for its own cleanup.
+                registerSlurmResource(stageName, [clusterName: partition.clusterName, jobUID: jobUID, usedSbatch: true])
+                // Every job gets the helper's netrc: the read helper on the node contacts
+                // artifactory.nvidia.com whenever aws is the primary, wherever the package is.
+                // A frontend failover reruns this closure, which copies it again; when the submit
+                // script then reuses a job that has already downloaded, that copy stays until
+                // cleanUpSlurmResources. A job that the submit script resubmits, or that Slurm
+                // requeues, after the first run deleted it has no netrc, and its download fails.
+                def artifactoryNetrcPathLocal = "${pipeline.pwd(tmp: true)}/artifactory-netrc-${UUID.randomUUID().toString()}"
+                try {
+                    writeArtifactoryNetrc(pipeline, artifactoryNetrcPathLocal)
+                    // scp -p keeps the netrc's 600 mode on the node.
+                    Utils.copyFileToRemoteHost(
+                        pipeline,
+                        remote,
+                        artifactoryNetrcPathLocal,
+                        artifactoryNetrcPathNode
+                    )
+                } finally {
+                    sh(label: "Remove Artifactory netrc", script: "rm -f '${artifactoryNetrcPathLocal}'")
+                }
+                if (cluster.fatBuilderArgs != null) {
+                    deliverFatBuilderNetrc(pipeline, remote, fatArtifactoryNetrcPathNode)
+                }
+
                 // Generate .coveragerc: CBTS stages render coveragerc.template; all other stages get an empty rcfile (no coverage).
                 if (isCbtsStage(stageName)) {
                     // @TRTLLM_WHEEL_PATH@ stays a placeholder; slurm_run.sh substitutes it on the worker.
                     sh """
-                        cp ${llmSrcLocal}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ./.coveragerc
+                        cp ${llmSrcLocal}/jenkins/scripts/cbts/cbts/coverage/collection/coveragerc.template ./.coveragerc
                         sed -i \\
                             -e 's|@JOB_WORKSPACE@|${jobWorkspace}|g' \\
                             -e 's|@STAGE_NAME@|${stageName}|g' \\
@@ -1960,23 +2488,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     llmSrcNode,
                     stageName,
                     waivesListPathNode,
-                    perfMode,
                     jobWorkspace,
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
+                    0,
+                    0,
+                    partition.clusterName,
                 )
                 pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
 
                 // Generate Job Launch Script
-                def container = LLM_DOCKER_IMAGE
-                if (cluster.containerRuntime.toString() == "ENROOT") {
-                    container = LLM_DOCKER_IMAGE
-                        .replace("${ARTIFACTORY_DOCKER_HOST}/", "${ARTIFACTORY_DOCKER_HOST}#")
-                }
                 def mounts = getMountListForSlurmTest(cluster, true).join(",")
-                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode)
+                // Request one Slurm segment for multi-node disaggregated/aggregated perf-sanity
+                // and SingleNvlinkDomain stages; the cluster defines its topology constraints.
+                String[] taskArgs = getNodeArgs(nodeCount, gpuCount, disaggMultiNodeMode || aggMultiNodeMode || singleNvlinkDomainMode)
                 if (taskArgs == null) {
                     error "Invalid Slurm test stage name is set"
                 }
@@ -1987,86 +2514,97 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def containerImageArg = container
                 def srunPrologue = ""
                 if (cluster.containerRuntime.toString() == "ENROOT") {
-                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
-                    // Name the .sqsh by image digest (not job ID) so jobs sharing
-                    // an image reuse one .sqsh instead of re-running `enroot import`
-                    // per job. Path is resolved at runtime into ${enrootImagePath}.
+                    // containerImageArg is resolved at bash runtime via $enrootImagePath,
+                    // which srunPrologue sets to the fat sqsh (pre-built) or the digest-named
+                    // base sqsh (fallback). Base sqsh is shared across jobs by image digest.
                     containerImageArg = "\${enrootImagePath}"
+                    def containerDir = "${cluster.scratchPath}/users/svc_tensorrt/containers"
+                    def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                    def fatSqsh = computeFatSqshPath(fatSqshDir, llmTarArtifactPath, scriptFatBuildLocalPath)
+                    def fatBuildScriptHash = fatSqsh.scriptHash
+                    def fatHash = fatSqsh.hash
+                    def fatSqshPath = fatSqsh.path
 
                     srunPrologue = """
                     export ENROOT_CACHE_PATH='/home/svc_tensorrt/.cache/enroot'
 
-                    # Job-private enroot config (under jobWorkspace). Avoids racing on
-                    # the shared ~/.config/enroot/.credentials across concurrent jobs.
-                    export ENROOT_CONFIG_PATH="${enrootConfigDirNode}"
-                    cleanup_enroot_config() { rm -rf "\${ENROOT_CONFIG_PATH}"; }
-                    trap cleanup_enroot_config EXIT
-
-                    containerDir="$containerDir"
-                    mkdir -p "\$containerDir"
-                    # If the image URI already contains a manifest digest (@sha256:…) use
-                    # it directly for content-addressed caching; otherwise hash the tag
-                    # string, which is stable for per-build images but will not detect a
-                    # re-pushed mutable tag within the 3-day TTL window.
-                    if printf '%s' "$container" | grep -q '@sha256:'
-                    then
-                        imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+                    # Fat sqsh: pre-built on CPU node; if present, skip all pip installs.
+                    # Path pre-computed on Jenkins controller (hash=${fatBuildScriptHash}, fatHash=${fatHash}).
+                    if [ -f "${fatSqshPath}" ]; then
+                        echo "Reusing fat sqsh: ${fatSqshPath} (SKIP_INSTALL=1)"
+                        export enrootImagePath="${fatSqshPath}"
+                        export SKIP_INSTALL=1
+                        touch "${fatSqshPath}" || true
+                        # The fat sqsh is a local file, so enroot needs no registry credentials.
+                        rm -rf "${enrootConfigDirNode}"
                     else
-                        imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
-                    fi
-                    export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
-
-                    importContainerWithRetries() {
-                        local docker_uri=\$1
-                        local output_path=\$2
-                        local max_attempts=\${3:-3}
-                        local delay=\${4:-60}
-                        local attempt=1
-                        local tmp_path
-
-                        # Best-effort lock so racing jobs don't all import the same
-                        # image. flock may be a no-op on some shared filesystems;
-                        # correctness still holds since the import publishes atomically.
-                        exec 9>"\${output_path}.lock" || true
-                        flock 9 || true
-
-                        if [ -f "\$output_path" ]
+                        # Fat sqsh not ready; use digest-cached base sqsh + full install.
+                        # Job-private enroot config (under jobWorkspace). Avoids racing on
+                        # the shared ~/.config/enroot/.credentials across concurrent jobs.
+                        export ENROOT_CONFIG_PATH="${enrootConfigDirNode}"
+                        cleanup_enroot_config() { rm -rf "\${ENROOT_CONFIG_PATH}"; }
+                        trap cleanup_enroot_config EXIT
+                        containerDir="$containerDir"
+                        mkdir -p "\$containerDir"
+                        # If the image URI already contains a manifest digest (@sha256:...) use
+                        # it directly for content-addressed caching; otherwise hash the tag
+                        # string, which is stable for per-build images but will not detect a
+                        # re-pushed mutable tag while the cached .sqsh is kept.
+                        if printf '%s' "$container" | grep -q '@sha256:'
                         then
-                            echo "Reusing cached container image: \$output_path"
-                            # Refresh mtime so reused images survive age-based pruning.
-                            touch "\$output_path" || true
-                            flock -u 9 || true
-                            return 0
+                            imageDigest=\$(printf '%s' "$container" | grep -oP '(?<=@sha256:)[a-f0-9]+')
+                        else
+                            imageDigest=\$(printf '%s' "$container" | sha256sum | cut -d' ' -f1)
                         fi
+                        export enrootImagePath="\$containerDir/container-\${imageDigest}.sqsh"
 
-                        # Import to a temp path, then mv to publish atomically so
-                        # other jobs never see a partial .sqsh.
-                        tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
-                        rm -f "\$tmp_path"
+                        importContainerWithRetries() {
+                            local docker_uri=\$1
+                            local output_path=\$2
+                            local max_attempts=\${3:-3}
+                            local delay=\${4:-60}
+                            local attempt=1
+                            local tmp_path
 
-                        until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
-                        do
-                            if ((attempt >= max_attempts))
+                            # Best-effort lock so racing jobs don't all import the same image.
+                            exec 9>"\${output_path}.lock" || true
+                            flock 9 || true
+
+                            if [ -f "\$output_path" ]
                             then
-                                echo "enroot import failed after \$max_attempts attempts"
-                                rm -f "\$tmp_path"
+                                echo "Reusing cached container image: \$output_path"
+                                touch "\$output_path" || true
                                 flock -u 9 || true
-                                return 1
+                                return 0
                             fi
 
-                            echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                            tmp_path="\${output_path}.\${SLURM_JOB_ID}.tmp"
                             rm -f "\$tmp_path"
-                            sleep \$delay
-                            attempt=\$((attempt + 1))
-                        done
 
-                        mv -f "\$tmp_path" "\$output_path"
-                        flock -u 9 || true
-                    }
+                            until enroot import -o "\$tmp_path" -- "docker://\$docker_uri"
+                            do
+                                if ((attempt >= max_attempts))
+                                then
+                                    echo "enroot import failed after \$max_attempts attempts"
+                                    rm -f "\$tmp_path"
+                                    flock -u 9 || true
+                                    return 1
+                                fi
 
-                    importContainerWithRetries "$container" "\$enrootImagePath"
-                    cleanup_enroot_config
-                    trap - EXIT
+                                echo "enroot import failed (attempt \$attempt of \$max_attempts). Retrying in \${delay}s..."
+                                rm -f "\$tmp_path"
+                                sleep \$delay
+                                attempt=\$((attempt + 1))
+                            done
+
+                            mv -f "\$tmp_path" "\$output_path"
+                            flock -u 9 || true
+                        }
+
+                        importContainerWithRetries "$container" "\$enrootImagePath"
+                        cleanup_enroot_config
+                        trap - EXIT
+                    fi
                     """.replaceAll("(?m)^\\s*", "")
                 }
 
@@ -2079,7 +2617,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'BUILD_URL',
                     'JOB_NAME',
                     'globalVars',
-                    'gitlabCommit'
+                    'gitlabCommit',
+                    'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
                 def envVarsToExport = [:]
                 envVarNames.each { varName ->
@@ -2092,11 +2631,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
-                    "--container-env=NVIDIA_IMEX_CHANNELS"
+                    "--container-env=NVIDIA_IMEX_CHANNELS",
+                    "--container-env=SKIP_INSTALL"
                 ]
                 if (ENABLE_UPLOAD_TEST_RESULTS) {
                     srunArgs.add("--container-env=S3_SECRET_KEY")
                 }
+                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
                 envVarsToExport.each { varName, varValue ->
                     srunArgs.add("--container-env=${varName}")
                 }
@@ -2137,15 +2678,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
                     export tarName=$tarName
+                    export llmTarArtifactPath=$llmTarArtifactPath
+                    export LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}
+                    export ARTIFACTORY_NETRC=$artifactoryNetrcPathNode
+                    export ARTIFACTORY_CREDENTIAL_ID=$LLM_ARTIFACTS_CREDENTIALS_ID
                     export llmTarfile=$llmTarfile
                     export llmSrcNode=$llmSrcNode
                     export stageName=$stageName
-                    export perfMode=$perfMode
                     ${infraDryRun ? "export infraDryRun=true" : ""}
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    # Keep xtrace off around the token exports so they are not echoed into the Slurm job log.
+                    set +x
                     export HF_TOKEN=$HF_TOKEN
+                    export GITHUB_CLONE_TOKEN=$GITHUB_CLONE_TOKEN
+                    set -x
                     if [ -f "${s3SecretKeyPathNode}" ]; then
                         set +x
                         export S3_SECRET_KEY="\$(cat "${s3SecretKeyPathNode}")"
@@ -2153,7 +2701,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     fi
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
+                    # Keep xtrace off here too: the exported pipeline env includes OpenSearch credentials.
+                    set +x
                     ${envExportStatements}
+                    set -x
 
                     echo "Env NVIDIA_IMEX_CHANNELS: \$NVIDIA_IMEX_CHANNELS"
                     echo "Env NVIDIA_VISIBLE_DEVICES: \$NVIDIA_VISIBLE_DEVICES"
@@ -2215,8 +2766,16 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 def filesToKeepWhenRetry = [
                     scriptRunPathNode,
                     scriptInstallPathNode,
+                    scriptFatBuildPathNode,
+                    scriptFatBuildSbatchPathNode,
+                    scriptFatBuildBodyPathNode,
+                    scriptPrepareBodyPathNode,
                     scriptBashUtilsPathNode,
+                    scriptFetchHelperPathNode,
+                    artifactoryNetrcPathNode,
+                    fatArtifactoryNetrcPathNode,
                     scriptLaunchPathNode,
+                    scriptPreparePathNode,
                     scriptSubmitPathNode,
                     scriptTrackPathNode,
                     testListPathNode,
@@ -2234,6 +2793,35 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     ]
                 }
                 def findKeepWhenRetryArgs = filesToKeepWhenRetry.collect { " ! -name \"\$(basename \"${it}\")\"" }.join("")
+
+                // Generate Prepare Container script: submits the CPU fat-sqsh builder job
+                // (if needed) and polls until it completes. Run Pytest starts only after
+                // this stage returns, so the fat sqsh is already on disk when the GPU job
+                // starts and the srunPrologue can reuse it (SKIP_INSTALL=1).
+                def fatSqshDir = "${cluster.scratchPath}/users/svc_tensorrt/fat_sqsh"
+                def scriptPrepareContent = "#!/bin/bash\nset -euo pipefail\necho 'No fat sqsh builder configured; skipping Prepare Container.'\n"
+                if (cluster.fatBuilderArgs != null) {
+                    def fatBuildLogPath = SlurmConfig.getOutputFilePath("${cluster.homeDir}/slurm-logs", "${jobUID}-fat_build")
+                    scriptPrepareContent = generateFatPrepareScript(
+                        fatSqshDir: fatSqshDir,
+                        llmTarArtifactPath: llmTarArtifactPath,
+                        llmDockerImage: LLM_DOCKER_IMAGE,
+                        fatBuildScriptPathNode: scriptFatBuildPathNode,
+                        fatBuildSbatchPathNode: scriptFatBuildSbatchPathNode,
+                        fatBuildLogPath: fatBuildLogPath,
+                        artifactoryNetrcPathNode: fatArtifactoryNetrcPathNode,
+                        prepareBodyPathNode: scriptPrepareBodyPathNode
+                    )
+                }
+                pipeline.writeFile(file: scriptPreparePathLocal, text: scriptPrepareContent)
+                Utils.exec(pipeline, script: "echo 'Prepare Container script:' && cat ${scriptPreparePathLocal}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptPreparePathLocal,
+                    scriptPreparePathNode,
+                    true
+                )
 
                 def scriptSubmit = """#!/bin/bash
                     set -xEeuo pipefail
@@ -2264,15 +2852,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # Clean up workspace: remove all files/dirs not in the keep list
                     find "${jobWorkspace}" -maxdepth 1 -mindepth 1 ${findKeepWhenRetryArgs} -exec rm -rf {} +
 
+                    echo "=== [Run Pytest] Submitting GPU SLURM job: \$(date '+%Y-%m-%d %H:%M:%S') on \$(hostname) ==="
+                    # Prepare Container stage has already completed; fat sqsh is ready on disk
+                    # (or builder failed, in which case the GPU job falls back to base sqsh).
                     touch ${slurmJobLogPath}
-                    # Capture sbatch's combined output and persist it before acting on
-                    # the exit code: a failed sh step carries only the exit code back
-                    # to Jenkins, so a submission rejection's stderr (e.g. "Slurm
-                    # backup controller in standby mode") would otherwise never reach
-                    # the failure classifier. The pipeline reads sbatch_output.txt
-                    # back on failure (readSlurmSubmitOutput) and folds it into the
-                    # exception it throws.
-                    #
                     # Control-plane failover backoff: during a slurmctld failover the
                     # backup controller rejects submissions with "Slurm backup
                     # controller in standby mode" until it promotes, which takes up to
@@ -2287,13 +2870,33 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     # "standby mode" PERSISTENT so the stage does not keep re-running
                     # against a down controller. Any other sbatch failure still fails
                     # immediately.
+                    report_sbatch_failure() {
+                        local reason="\$1"
+                        local summary
+                        summary=\$(printf '%s' "\${sbatch_output}" | tr '\\r\\n' '  ')
+                        summary="\${summary:0:3000}"
+                        set +x
+                        printf '${sbatchFailureMarker} %s: %s\\n' "\${reason}" "\${summary}"
+                        set -x
+                    }
+
                     sbatch_max_attempts=6
                     sbatch_attempt=1
                     while true; do
+                        # Silence xtrace around the capture and prints: it would re-echo the
+                        # multi-line sbatch output in every traced command. Restore it only
+                        # if it was on, so a caller that turned it off stays off.
+                        case \$- in
+                            *x*) xtrace_was_on=1 ;;
+                            *)   xtrace_was_on=0 ;;
+                        esac
+                        { set +x; } 2>/dev/null
                         sbatch_rc=0
-                        sbatch_output=\$(sbatch ${scriptLaunchPathNode} 2>&1) || sbatch_rc=\$?
-                        printf '%s\\n' "\${sbatch_output}"
+                        sbatch_output=\$(${SlurmConfig.withGpuBudget(pipeline, partition.clusterName, "sbatch ${scriptLaunchPathNode}", gpuCount)} 2>&1) || sbatch_rc=\$?
                         printf '%s\\n' "\${sbatch_output}" > "${jobWorkspace}/sbatch_output.txt"
+                        if [ "\${xtrace_was_on}" -eq 1 ]; then
+                            set -x
+                        fi
                         if [ "\${sbatch_rc}" -eq 0 ]; then
                             break
                         fi
@@ -2303,15 +2906,17 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             sleep 30
                             continue
                         fi
+                        report_sbatch_failure "exit code \${sbatch_rc}"
                         echo "Error: Slurm job submission failed with exit code \${sbatch_rc}."
                         exit "\${sbatch_rc}"
                     done
                     jobId=\$(printf '%s\\n' "\${sbatch_output}" | awk '/Submitted batch job/ {print \$4; exit}')
                     if [ -z "\$jobId" ]; then
+                        report_sbatch_failure "no job ID returned"
                         echo "Error: Slurm job submission failed, no job ID returned."
                         exit 1
                     fi
-                    echo "Submitted Slurm job \$jobId"
+                    echo "=== [Run Pytest] GPU SLURM job submitted: gpu_job_id=\$jobId time=\$(date '+%Y-%m-%d %H:%M:%S') ==="
                     # Save Slurm job ID for later steps to retrieve
                     echo "\$jobId" > "${jobWorkspace}/slurm_job_id.txt"
                 """.replaceAll("(?m)^\\s*", "").trim()
@@ -2325,6 +2930,26 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptSubmitPathNode,
                     true
                 )
+            }
+
+            // Submit the CPU fat-sqsh builder job (if configured) and poll until it
+            // completes. Non-fatal: any failure here lets the GPU job fall back to base
+            // sqsh + full pip install. Runs on every attempt: prepare_container.sh exits
+            // immediately if the fat sqsh already exists, and a retry whose attempt 1
+            // died before the build still needs one.
+            stage("[${stageName}] Prepare Container") {
+                try {
+                    Utils.exec(
+                        pipeline,
+                        timeout: false,
+                        script: Utils.sshUserCmd(remote, scriptPreparePathNode),
+                        numRetries: 3
+                    )
+                } catch (InterruptedException e) {
+                    throw e
+                } catch (Exception e) {
+                    echo "[Prepare Container] Non-fatal failure: ${e.message}. GPU job will fall back to base sqsh + full install."
+                }
             }
 
             stage("[${stageName}] Run Pytest") {
@@ -2343,26 +2968,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 } catch (InterruptedException e) {
                     throw e
                 } catch (Exception submitEx) {
-                    // Only enrich failures the classifier cannot already act on. An
-                    // interrupt (user abort / pipeline timeout) or an exception that
-                    // already classifies as infra must propagate unchanged --
-                    // wrapping them in a fresh cause-less Exception would erase the
-                    // FlowInterruptedException / typed-infra signal from the chain.
-                    def preClassified = FailureClassifier.classify(submitEx, InfraFailure.SLURM)
-                    if (preClassified instanceof PipelineInterruption || preClassified instanceof InfraFailure) {
-                        throw submitEx
-                    }
-                    // The sh step's exception carries only the exit code, so fold the
-                    // sbatch output captured by the submit script (stderr included)
-                    // into a fresh exception for FailureClassifier.classify() at the
-                    // runLLMTestlistOnSlurm caller; the shared-lib PATTERN_CATALOG
-                    // (e.g. its "Slurm backup controller in standby mode" row) then
-                    // drives the retry/severity decision. An empty read (file
-                    // missing or unreadable) preserves today's behavior by
-                    // rethrowing the original exception unchanged.
-                    def sbatchOutput = readSlurmSubmitOutput(pipeline, remote, jobWorkspace, stageName)
-                    if (sbatchOutput) {
-                        throw new Exception("SLURM job submission failed for ${stageName}: ${sbatchOutput}")
+                    // The step log contains set -x command text, including catalog
+                    // signatures used by the submit script itself. Prefer the bounded
+                    // final-failure line so only the actual final sbatch output is
+                    // classified; let the outer retry boundary scan the whole step log
+                    // only if no marker exists.
+                    def diagnosticEvidence = FailureEvidenceCollector.collectOriginatingStepEvidence(
+                        pipeline,
+                        submitEx,
+                        [[id: "slurm-sbatch-final-failure", anyOf: [sbatchFailureMarker]]]
+                    )
+                    if (diagnosticEvidence.collectionStatus == "MATCHED") {
+                        def finalFailure = new Exception(
+                            "SLURM job submission failed for ${stageName}: ${diagnosticEvidence.matchedMessage}",
+                            submitEx
+                        )
+                        throw FailureClassifier.classify(finalFailure, InfraFailure.SLURM)
                     }
                     throw submitEx
                 }
@@ -2402,8 +3023,13 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     trap 'rc=\$?; echo "Error in file \${BASH_SOURCE[0]} on line \$LINENO: \$BASH_COMMAND (exit \$rc)"; exit \$rc' ERR
 
                     jobId=${slurmJobId}
-                    tail -f ${slurmJobLogPath} &
+                    echo "=== [Run Pytest] Tracking GPU SLURM job_id=\$jobId START: \$(date '+%Y-%m-%d %H:%M:%S') ==="
+                    tail -n +1 -F -- "${slurmJobLogPath}" &
                     tailPid=\$!
+
+                    noLogTimeoutSecs=7200
+                    lastLogSize=-1
+                    lastLogChangeEpoch=\$(date +%s)
 
                     # Wait until Slurm job is done
                     while true; do
@@ -2417,12 +3043,35 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                         if [[ -z \$STATUS || \$STATUS == "RUNNING" || \$STATUS == "PENDING" || \$STATUS == "CONFIGURING" ]]; then
                             echo "Slurm job \$jobId state: \${STATUS:-UNKNOWN}"
+                            if [[ \$STATUS == "RUNNING" ]]; then
+                                currentLogSize=0
+                                if [ -f "${slurmJobLogPath}" ]; then
+                                    currentLogSize=\$(stat -c %s "${slurmJobLogPath}" 2>/dev/null || echo 0)
+                                fi
+                                nowEpoch=\$(date +%s)
+                                if [ "\$currentLogSize" != "\$lastLogSize" ]; then
+                                    lastLogSize=\$currentLogSize
+                                    lastLogChangeEpoch=\$nowEpoch
+                                else
+                                    staleSecs=\$((nowEpoch - lastLogChangeEpoch))
+                                    if [ "\$staleSecs" -ge "\$noLogTimeoutSecs" ]; then
+                                        echo "Warning: no new log output for \${staleSecs}s (>= \${noLogTimeoutSecs}s), job \$jobId is likely stuck/timed out. Cancelling it."
+                                        scancel \$jobId || true
+                                    fi
+                                fi
+                            fi
                             sleep 300
                         else
                             echo "Slurm job \$jobId finished with state: \$STATUS"
                             break
                         fi
                     done
+
+                    # A failed job can reach a terminal accounting state before
+                    # its final output is visible on the login node's shared FS.
+                    if [[ \$STATUS != "COMPLETED" ]]; then
+                        sleep 15
+                    fi
 
                     # Stop and reap the log follower. It may have already exited
                     # when the remote log stream closes; that is not a test failure.
@@ -2461,6 +3110,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "Slurm job \$jobId nodelist: \${NODE_LIST:-UNKNOWN}"
                     printf '%s\n' "\$NODE_LIST" > "${jobWorkspace}/slurm_node_list.txt"
 
+                    echo "=== [Run Pytest] Tracking GPU SLURM job_id=\$jobId END: \$(date '+%Y-%m-%d %H:%M:%S') node=\${NODE_LIST:-UNKNOWN} status=\$STATUS exit_code=\$EXIT_CODE ==="
                     # Record the verdict and always exit 0: a re-run can't change a
                     # terminal state, so numRetries should only fire on transport loss.
                     printf '%s|%s\n' "\$STATUS" "\$EXIT_CODE" > "${jobWorkspace}/slurm_job_result.txt"
@@ -2627,36 +3277,38 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                             "test failure.",
                             null, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-job-still-running>")
                     }
-                    // A terminal FAILED state may be a node/device fault whose signature
-                    // (CUDA/NVLink/ECC/driver) printed only into the SLURM job output log,
-                    // never into this verdict. Scrape the log and, on a hit, surface the
-                    // matched line into a fresh exception so the authoritative catalog
-                    // (FailureClassifier.classify at the runLLMTestlistWithSbatch caller)
-                    // can match it and steer the retry off the bad node. A miss falls
-                    // through to the plain "Pytest failed" rethrow below.
-                    if (slurmState == "FAILED") {
-                        def deviceHit = scrapeSlurmLogForDeviceFault(pipeline, remote, slurmJobLogPath)
-                        if (deviceHit) {
-                            echo "[INFRA-RETRY] ${stageName}: device-fault signature in SLURM job ${slurmJobId} log; " +
-                                 "surfacing to classifier: ${deviceHit}"
-                            throw new Exception(
-                                "Device/interconnect fault on SLURM node during job ${slurmJobId} for ${stageName}: ${deviceHit}")
-                        }
+                    def jobFailure = new Exception(
+                        "SLURM job ${slurmJobId} for ${stageName} failed with state=" +
+                        "${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}")
+                    def evidence = collectSlurmJobLogEvidence(
+                        pipeline,
+                        remote,
+                        slurmJobLogPath,
+                    )
+                    def classified = FailureClassifier.classify(jobFailure, InfraFailure.SLURM, evidence)
+                    if (classified instanceof InfraFailure) {
+                        def classificationSource = evidence.collectionStatus == "MATCHED" ? "job log" : "job state"
+                        echo "[INFRA-RETRY] ${stageName}: SLURM ${classificationSource} matched " +
+                            "${classified.detectedPattern}: " +
+                            classified.message
+                        throw classified
                     }
                     echo "[INFRA-RETRY] ${stageName}: SLURM job ${slurmJobId} state=${slurmState ?: 'unknown'}, exit=${jobExit ?: 'unknown'}; deferring to classifier."
-                    throw new Exception("Pytest failed in SLURM job ${slurmJobId} for ${stageName}")
+                    throw jobFailure
                 }
             }
             echo "Finished test stage execution."
             }  // end CloudManager.withSlurmFrontendFailover
         }  // end withCredentials
     } catch (InterruptedException e) {
-        stageIsInterrupted = true
+        primaryError = e
         throw e
     } catch (Exception e) {
+        primaryError = e
         caughtStageError = e
         throw e
     } finally {
+        preservePrimaryFailure(primaryError) {
         // Resource cleanup must run even if metadata capture or result upload is interrupted.
         try {
             captureSlurmJobNodeList(pipeline, cluster, partition.clusterName, placementContext?.slurmJobId ?: null, placementContext, stageName, jobWorkspace)
@@ -2665,23 +3317,31 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             // the build UNSTABLE from an intermediate attempt's results. A genuine test
             // failure classifies as UserFailure -> not suppressed -> reported.
             boolean suppressTestReporting = (caughtStageError != null && retryContext != null) &&
-                retryContextAllowsRetry(null, retryContext, caughtStageError, false)
+                retryContextAllowsRetry(pipeline, retryContext, caughtStageError, false)
             uploadResults(pipeline, cluster, partition.clusterName, jobUID, stageName, postTag, suppressTestReporting)
             deleteProgressArtifact(stageName, postTag)
         } finally {
             stage("Clean Up Slurm Resource") {
-                // Workaround to handle the interruption during clean up SLURM resources
+                // Retry transient cleanup failures before leaving recovery to the sweep.
                 retry(3) {
                     try {
                         cleanUpSlurmResources(pipeline, cluster, partition.clusterName, jobUID)
+                    } catch (InterruptedException e) {
+                        throw e
                     } catch (Exception e) {
-                        error "Error during clean up SLURM resources: ${e.getMessage()} and retrying."
+                        // retry(3) retries any exception. Keep the cleanup failure typed
+                        // so its cause and scope survive if all attempts fail; the outer
+                        // preservePrimaryFailure then retains any original stage failure.
+                        throw new InfraFailure(
+                            "Error during clean up SLURM resources: ${e.getMessage()} and retrying.",
+                            e, InfraFailure.TRANSIENT, InfraFailure.SLURM, "<typed:slurm-cleanup-failure>")
                     }
                 }
             }
-            // Cleanup ran on the live pod; drop the registry entry so the off-pod
-            // finalizer/sweep does not reconcile already-freed resources.
-            deregisterSlurmResource(stageName)
+            // Reaching here means cleanup succeeded within its retry budget. If all
+            // attempts fail, the throw skips deregistration and leaves the entry for sweep.
+            deregisterSlurmResource(stageName, jobUID)
+        }
         }
     }
 }
@@ -2742,6 +3402,13 @@ def filterCbtsStageJobs(parallelJobs, parallelJobsFiltered, multiGpuJobs, testFi
                (needsSanity && key =~ /PackageSanityCheck/) ||
                (needsPerfSanity && key =~ /PerfSanity/)
     }
+    // Preserve baseline auto-triggered stages when coverage replaces the selected stage set.
+    if (cbts.scope == "coverage") {
+        def autoTriggerTags = testFilter[(AUTO_TRIGGER_TAG_LIST)] ?: []
+        filtered += parallelJobsFiltered.findAll { key, _ ->
+            autoTriggerTags.any { key.contains(it) }
+        }
+    }
     if (affectedSet.isEmpty()) {
         if (filtered.isEmpty()) {
             echo "CBTS [${cbts.scope}]: trigger-mode mismatch + nothing force-kept → no-op"
@@ -2780,7 +3447,7 @@ boolean isDispatcherPodFailure(Throwable e) {
     return ContextDeath.isContextDeath(e)
 }
 
-def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, cpver="cp312", String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
+def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, runWithSbatch=false, skipInstallWheel=false, String outerAttemptTag="", boolean useClusterDurations=false, Integer infraRetryMax=null)
 {
   echo "Run Slurm job with native sbatch: $runWithSbatch"
 
@@ -2802,6 +3469,17 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
     attempt++
     Map attemptPlacementContext = [
       excludedSlurmNodeListsByCluster: avoidedSlurmNodeListsByCluster.collectEntries { c, ns -> [(c): ns.collect()] }
+    ]
+    // Describes this attempt so the stage body can suppress its junit when a
+    // retryable infra failure means another attempt will follow (mirrors the K8s
+    // path's retryContext). scope=SLURM so classification/budget match this loop.
+    // Shared by result suppression and the retry decision for this attempt only.
+    Map slurmRetryContext = [
+      scope: InfraFailure.SLURM,
+      stageName: stageName,
+      attempt: attempt,
+      backoffMs: 60L * 1000L,
+      infraRetryMax: slurmInfraRetryMax,
     ]
     try {
       if (attempt > 1) {
@@ -2826,20 +3504,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       def innerSuffix = (attempt == 1) ? "" : "-attempt-${attempt}"
       def postTag = "${outerAttemptTag}${innerSuffix}"
 
-      // Describes this attempt so the stage body can suppress its junit when a
-      // retryable infra failure means another attempt will follow (mirrors the K8s
-      // path's retryContext). scope=SLURM so classification/budget match this loop.
-      def slurmRetryContext = [
-        scope: InfraFailure.SLURM,
-        stageName: stageName,
-        attempt: attempt,
-        backoffMs: 60L * 1000L,
-      ]
-
       if (nodeCount > 1 || runWithSbatch) {
-        runLLMTestlistWithSbatch(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithSbatch(pipeline, platform, testList, config, stageName, splitId, splits, gpuCount, nodeCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       } else {
-        runLLMTestlistWithAgent(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, gpuCount, skipInstallWheel, cpver, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
+        runLLMTestlistWithAgent(pipeline, platform, testList, config, stageName, splitId, splits, gpuCount, skipInstallWheel, postTag, useClusterDurations, attemptPlacementContext, slurmRetryContext)
       }
 
       // Job succeeded
@@ -2861,11 +3529,11 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
         echo "[INFRA-RETRY] ${stageName}: dispatcher pod died mid-run; not retrying on the dead pod (${e.toString()}). Failing closed for off-pod reconciliation."
         throw e
       }
-      // classify() handles FlowInterruptedException + exit-code-143 +
-      // typed throws + cause-chain pattern matching, returning one of
+      // classifyFailure() handles FlowInterruptedException + exit-code-143 +
+      // typed throws + originating-step evidence and cause-chain fallback, returning one of
       // PipelineInterruption / InfraFailure / UserFailure. Scope=SLURM
       // ensures we only match catalog rows tagged SLURM or BOTH.
-      def c = FailureClassifier.classify(e, InfraFailure.SLURM)
+      def c = classifyFailure(pipeline, e, InfraFailure.SLURM, slurmRetryContext)
       if (c instanceof PipelineInterruption) throw e
       if (!(c instanceof InfraFailure)) {
         // UserFailure -> don't retry, but leave a trace: a failure whose
@@ -2882,12 +3550,12 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
       if (attempt > effectiveMax) {
         echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
              "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
-        throw e
+        throw c
       }
       if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.SLURM, c, attempt, effectiveMax, 60L * 1000L, true)) {
         echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
              "but remaining CI timeout budget is too small for another SLURM attempt. Failing without retry."
-        throw e
+        throw c
       }
 
       echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
@@ -2927,6 +3595,72 @@ def stageMatchesPattern(String key, String pattern) {
 // Check if a stage key matches any pattern in the list.
 def stageMatchesAnyPattern(String key, List patterns) {
     return patterns.any { pattern -> stageMatchesPattern(key, pattern) }
+}
+
+// Return the OpenSearch regexp for sibling shards and their CBTS variants.
+String getTestReuseStagePattern(String stageName) {
+    def stageNamePrefix = stageName.replaceFirst(/-\d+(-cbts)?$/, "")
+    return "${stageNamePrefix}-[0-9]+(-cbts)?"
+}
+
+def failMaintenanceStage(String stageName, String reason) {
+    GlobalState.maintenanceSkips.add(stageName)
+    echo "Skip - Resource maintenance is in progress. No test agent was launched."
+    echo "Skip reason: ${reason}"
+    catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+        error "Stage '${stageName}' was not executed because of resource maintenance."
+    }
+}
+
+def warnUnmatchedMaintenancePatterns(Collection stageNames, List patterns) {
+    (patterns ?: []).findAll { pattern ->
+        !stageNames.any { stageName ->
+            stageMatchesPattern(stageName.toString(), pattern.toString())
+        }
+    }.each { pattern ->
+        echo "WARNING: Maintenance pattern '${pattern}' matched no selected stage in this job."
+    }
+}
+
+def escapeMaintenanceHtml(def value) {
+    return value.toString()
+        .replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+        .replace("'", '&#39;')
+        .replace('"', '&quot;')
+}
+
+def appendMaintenanceSummary(Map globalVars) {
+    try {
+        if (!GlobalState.maintenanceSkips) {
+            return
+        }
+
+        def parents = globalVars[ACTION_INFO]?.get('parents') ?: []
+        if (parents.size() < 2) {
+            echo "WARNING: No parent job found to append the maintenance summary."
+            return
+        }
+
+        def parentJob = parents[-2]
+        def buildLabel = "${escapeMaintenanceHtml(env.JOB_NAME)} #${escapeMaintenanceHtml(env.BUILD_NUMBER)}"
+        def buildUrl = escapeMaintenanceHtml(env.BUILD_URL)
+        def stages = GlobalState.maintenanceSkips.collect { stageName ->
+            "<b>${escapeMaintenanceHtml(stageName)}</b>"
+        }.unique().join('<br/>')
+        def reason = escapeMaintenanceHtml(globalVars[MAINTENANCE_ENTRIES].reason)
+        def summary = "<span data-maintenance-warning='true'>" +
+            "<b>Resource maintenance in <a href='${buildUrl}'>${buildLabel}</a>:</b> ${reason}<br/>" +
+            "<b>Affected stages:</b><br/>${stages}</span><br/>"
+        trtllm_utils.appendBuildDescription(
+            this, parentJob['name'], parentJob['build_number'], summary)
+        echo "Appended maintenance summary to parent build ${parentJob['name']} #${parentJob['build_number']}."
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "WARNING: Failed to append maintenance summary: ${e.toString()}"
+    }
 }
 
 // Test filter flags
@@ -2979,13 +3713,11 @@ def CBTS_RESULT = "cbts_result"
 def CBTS_COVERAGE = "cbts_coverage"
 @Field
 def INFRA_DRY_RUN = "infra_dry_run"
-// Suffix for CBTS-narrowed stages so their results aren't reused by non-CBTS runs.
+// Suffix for CBTS-narrowed stages so they cannot be reused as whole non-CBTS stages.
+// Their individual passed testcases may still be reused through an OpenSearch query.
 // A suffix (not prefix) keeps the GPU type as the first '-' token for positional parsers.
 @Field
 def CBTS_STAGE_SUFFIX = "-cbts"
-// Sentinel in the stage output dir; while it exists no process writes a .cbtscov file.
-@Field
-def CBTS_STOP_FILE_NAME = "cbts_stop"
 @Field
 def testFilter = [
     (REUSE_TEST): null,
@@ -3021,6 +3753,32 @@ def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def TRTLLM_VERSION_OVERRIDE = "trtllm_version_override"
 @Field
 def RUN_MODE = "run_mode"
+@Field
+def JOB_TYPE = "job_type"
+@Field
+def MAINTENANCE_ENTRIES = "maintenance_entries"
+// Whether this pipeline asked for BOLT-optimized binaries. Resolved once by
+// L0_MergeRequest.groovy::resolveBoltConsume and propagated here in globalVars,
+// so the release wheel below follows the same switch as the build tarball
+// instead of inventing a second answer to "is BOLT on".
+@Field
+def BOLT_CONSUME_BUILD = "bolt_consume_build"
+@Field
+def BOLT_PROFILE_REF = "bolt_profile_ref"
+@Field
+def BOLT_PUBLISH_VARIANT = "bolt_publish_variant"
+@Field
+def BOLT_PROFILE_BRANCH = "bolt_profile_branch"
+@Field
+def LLM_ARTIFACTS_PRIMARY_KEY = "llm_artifacts_primary"
+// Hoisted out of globalVars into BINDING variables in launchTestJobs. globalVars
+// is not a parameter of runLLMTestlistWithSbatch or runLLMTestlistOnPlatformImpl,
+// so reading it inside them throws MissingPropertyException; Build.groovy handles
+// BOLT_CONSUME_ENABLED the same way.
+BOLT_PINNED_REF = ""
+BOLT_TEST_BOLTED_TARBALL = false
+// Release scripts repository as [url: ..., commit: ...], resolved by L0_MergeRequest.
+TRTLLM_RELEASE_REPO = null
 def globalVars = [
     (GITHUB_PR_API_URL): null,
     (CACHED_CHANGED_FILE_LIST): null,
@@ -3028,12 +3786,27 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
     (TRTLLM_VERSION_OVERRIDE): null,
     (RUN_MODE): null,
+    (MAINTENANCE_ENTRIES): [reason: "", patterns: []],
+    (BOLT_CONSUME_BUILD): false,
+    // Pre-declared so updateMapWithJson() populates it from the parent: that
+    // helper only updates keys already present here, so an absent key is
+    // silently dropped -- which for this one would mean running unpinned
+    // without saying so.
+    (BOLT_PROFILE_REF): "",
+    (BOLT_PUBLISH_VARIANT): false,
+    (BOLT_PROFILE_BRANCH): "",
+    (JOB_TYPE): null,
+    // Pre-declared so updateMapWithJson() populates it from the parent (see
+    // LLM_ARTIFACTS_PRIMARY_FROM_PARENT).
+    (LLM_ARTIFACTS_PRIMARY_KEY): "",
+    "TRTLLM_RELEASE_REPO": null,
 ]
 
 class GlobalState {
     static def uploadResultStageNames = []
     static def stageAttemptEstimateMs = [:]
     static def stageAttemptEstimateDetails = [:]
+    static def maintenanceSkips = []
 
     // HOST_NODE_NAME to starting port section map
     // This map maintains the next available starting port for each host node
@@ -3122,13 +3895,48 @@ boolean hasBudgetForInfraRetry(def pipeline, String stageName, String scope, Inf
     ])
 }
 
+def classifyFailure(def pipeline, Throwable error, String scope, Map retryContext=null)
+{
+    if (error instanceof TrtllmCiException) return FailureClassifier.classify(error, scope)
+
+    // Reuse evidence only when it was collected for this exact error and classification scope.
+    boolean cachedForFailure = retryContext?.failureEvidence != null &&
+        retryContext.failureEvidenceError == error && retryContext.failureEvidenceScope == scope
+    Map evidence = cachedForFailure ? retryContext.failureEvidence : null
+    if (evidence == null) {
+        evidence = FailureEvidenceCollector.collectOriginatingStepEvidence(pipeline, error, FailureClassifier.failureEvidenceQueries(scope))
+        if (evidence.collectionStatus == "MATCHED") {
+            echo "[FAILURE-EVIDENCE] ${scope}: originating step matched ${evidence.matchedQueryId} [${evidence.matchedTerms.join(', ')}]"
+        }
+        if (retryContext != null) {
+            retryContext.failureEvidence = evidence
+            retryContext.failureEvidenceError = error
+            retryContext.failureEvidenceScope = scope
+        }
+    }
+    return FailureClassifier.classify(error, scope, evidence)
+}
+
+def preservePrimaryFailure(Throwable primaryError, Closure actions)
+{
+    try {
+        actions()
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        // Post-processing failures must not replace the failure that triggered them.
+        if (primaryError == null || FailureClassifier.classify(e, InfraFailure.BOTH) instanceof PipelineInterruption) throw e
+        echo "[INFRA-RETRY] Secondary failure while handling ${primaryError}:\n${Utils.getStackTrace(e)}"
+    }
+}
+
 boolean retryContextAllowsRetry(def pipeline, Map retryContext, Throwable error, boolean logDecision=false)
 {
     if (retryContext == null || error == null) {
         return false
     }
     String scope = retryContext.scope ?: InfraFailure.K8S
-    def classified = FailureClassifier.classify(error, scope)
+    def classified = classifyFailure(pipeline, error, scope, retryContext)
     if (!(classified instanceof InfraFailure)) {
         return false
     }
@@ -3198,7 +4006,7 @@ def readSlurmWorkspaceFile(def pipeline, Map remote, String path, String stageNa
         // fails over to another remote; swallowing it as "" would strand the stage on
         // the unreachable frontend. Any other read failure (missing file, transient)
         // is non-fatal -- the metadata is best-effort, so return "" and carry on.
-        if (CloudManager.isSlurmFrontendConnectionFailure(e)) {
+        if (CloudManager.isSlurmFrontendConnectionFailure(pipeline, e)) {
             throw e
         }
         echo "[INFRA-RETRY] ${stageName}: unable to read SLURM metadata file ${path}: ${e.toString()}"
@@ -3344,6 +4152,9 @@ def getStartingPortForHost(String hostNodeName, String stageName = "") {
  * Gets the HOST_NODE_NAME from the current environment.
  * Falls back to hostname if HOST_NODE_NAME is not set.
  *
+ * The name must stay distinct per pod: getStartingPortForHost() hands out a
+ * private port section per name.
+ *
  * @return The host node name
  */
 def getHostNodeName() {
@@ -3356,7 +4167,7 @@ def getHostNodeName() {
     ''', returnStdout: true).trim()
 }
 
-def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null)
+def cacheErrorAndUploadResult(pipeline, stageName, taskRunner, finallyRunner, noResultIfSuccess=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null)
 {
     checkStageName([stageName])
     def Boolean stageIsInterrupted = false
@@ -3366,30 +4177,22 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         taskRunner()
         stageIsFailed = false
     } catch (InterruptedException e) {
+        caughtError = e
         stageIsInterrupted = true
         throw e
     } catch (Exception e) {
         caughtError = e
         throw e
     } finally {
+        preservePrimaryFailure(caughtError) {
         ensureStageResultNotUploaded(stageName + postTag)
         if (stageIsInterrupted) {
             echo "Stage is interrupted, skip to upload test result."
         } else {
             // Temporarily disable to reduce the log size
             // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg || true; fi'
-            if (noResultIfSuccess && !stageIsFailed) {
-                // Clean up the workspace
-                sh """
-                    env | sort
-                    pwd && ls -alh
-                    rm -rf ./*
-                """
-
-                echo "Finished test stage execution."
-                return
-            }
-
+            boolean shouldProcessResults = !noResultIfSuccess || stageIsFailed
+            if (shouldProcessResults) {
             // Suppress synthetic stage-fail XML and junit() when this attempt is
             // an intermediate retry that classified as a retryable infra failure.
             // Without this, every transient pod-level failure poisons the per-build
@@ -3399,9 +4202,9 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             boolean suppressTestReporting = false
             if (stageIsFailed && caughtError != null) {
                 if (retryContext != null) {
-                    suppressTestReporting = retryContextAllowsRetry(null, retryContext, caughtError, false)
+                    suppressTestReporting = retryContextAllowsRetry(pipeline, retryContext, caughtError, false)
                 } else if (!isFinalAttempt) {
-                    def c = FailureClassifier.classify(caughtError, InfraFailure.K8S)
+                    def c = classifyFailure(pipeline, caughtError, InfraFailure.K8S)
                     suppressTestReporting = c instanceof InfraFailure
                 }
                 if (suppressTestReporting) {
@@ -3426,16 +4229,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                     sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
                 }
             }
-            sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
+            // Redact credential-looking values (e.g. OPEN_SEARCH_DB_CREDENTIALS) before
+            // writing: this file gets tar'd and uploaded to Artifactory, and Jenkins
+            // credential masking only applies to console log output, not to files.
+            sh "STAGE_NAME=${stageName} && env | sort | sed -E 's/^([A-Za-z0-9_]*(SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY|_PSW)[A-Za-z0-9_]*)=.*/\\1=***REDACTED***/' > ${stageName}/debug_env.txt"
             if (isCbtsStage(stageName)) {
                 freezeCbtsCoverage(stageName)
             }
             echo "Upload test results."
-            // promoteProgressTar is a server-side move of the already-uploaded
-            // progress snapshot. It is only valid when on-disk results*.xml are
-            // unchanged from that snapshot. After a rename (or any other local
-            // XML mutation) the snapshot is stale and must be re-tarred.
-            boolean xmlsMutated = false
             if (suppressTestReporting) {
                 // This attempt is superseded by a planned retry. Keep the tar for
                 // forensics, but move its result XMLs aside so the top-level Collect
@@ -3448,25 +4249,23 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
                         [ -e "\$f" ] && mv "\$f" "superseded-\$f"
                     done || true
                 """
-                xmlsMutated = true
             }
 
-            if (xmlsMutated || !promoteProgressTar(stageName, postTag)) {
-                if (xmlsMutated) {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: results*.xml changed on disk, re-uploading instead of promoting progress tar"
-                } else {
-                    echo "[PROGRESS-UPLOAD] ${stageName}: no successful progress upload recorded, falling back to direct upload"
-                }
-                def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
-                sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
-                trtllm_utils.uploadArtifacts(
-                    "results-${stageName}${postTag}.tar.gz",
-                    "${UPLOAD_PATH}/test-results/"
-                )
-            }
+            // Always re-tar and re-upload the current state of ${stageName}/,
+            // rather than trusting the last progress snapshot to still match it:
+            // debug_env.txt, CBTS coverage freeze, a rerun merge rewriting
+            // results.xml, or the superseded-file rename above can all leave the
+            // last uploaded snapshot stale.
+            def transformOpt = postTag ? "--transform 's|^\\(${stageName}/results[^/]*\\)\\.xml\$|\\1${postTag}.xml|'" : ""
+            sh "tar -czvf results-${stageName}${postTag}.tar.gz ${transformOpt} ${stageName}/"
+            trtllm_utils.uploadArtifacts(
+                "results-${stageName}${postTag}.tar.gz",
+                "${UPLOAD_PATH}/test-results/"
+            )
             deleteProgressArtifact(stageName, postTag)
             if (!suppressTestReporting) {
                 junit(testResults: "${stageName}/results*.xml")
+            }
             }
         }
 
@@ -3478,10 +4277,11 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         """
 
         echo "Finished test stage execution."
+        }
     }
 }
 
-def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMode = false, modelExpress = false)
+def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, modelExpress = false)
 {
     def targetCloud = "kubernetes-cpu"
     def selectors = """
@@ -3502,7 +4302,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: artifactory.pdx.nvidia.com/docker-remote/alpine:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -3645,18 +4445,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     kubernetes.io/os: linux
                     nvidia.com/gpu_type: ${gpuType}"""
             }
-        } else if (perfMode && !hasMultipleGPUs) {
-        // Use single GPU machine with "tensorrt/test_type: perf" for stable perf testing.
-        // H100 / A100 single GPU machine has this unique label in TensorRT Blossom pool.
-            selectors = """
-                    kubernetes.io/arch: ${arch}
-                    kubernetes.io/os: linux
-                    nvidia.com/gpu_type: ${gpuType}
-                    nvidia.com/driver_version: '${driverVersion}'
-                    tensorrt/test_type: perf"""
-        }
-        else
-        {
+        } else {
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
@@ -3693,7 +4482,8 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     securityContext:
                       capabilities:
                         add:
-                        - SYS_ADMIN"""
+                        - SYS_ADMIN
+                        - SYS_PTRACE"""
         break
     }
     if (modelExpress) {
@@ -3706,7 +4496,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     - name: TRTLLM_MX_E2E_REQUIRED
                       value: "1"
         """
-        // Mirrors the ModelExpress v0.4.1 Redis deployment and image contract.
+        // Mirrors the ModelExpress Redis deployment and image contract.
         // The image exposes /app/modelexpress-server and accepts the port/backend settings below.
         // Use regular containers because the Jenkins Kubernetes launcher does not
         // reliably attach to pods containing restartable init-container sidecars.
@@ -3755,12 +4545,15 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     imagePullPolicy: Always
         """
     }
-    // Temporarily avoid an arm64 CPU builder with repeated pod DNS/JNLP failures seen in Build-SBSA #5564.
-    def blockedNodeAffinity = targetCloud == "kubernetes-cpu" && arch == "arm64" ? '''
-                              - key: "kubernetes.io/hostname"
+    // CPU test pods mount the model scratch from 10.117.145.14, which can't be accessed from ipp6/ipp9 DC.
+    // Pods placed there stay in ContainerCreating. Build stage pods do not mount the model scratch,
+    // so they can still use these nodes.
+    def scratchUnreachableNodeAffinity = type == "cpu" ? '''
+                              - key: "region"
                                 operator: NotIn
                                 values:
-                                - "rl300-0021.ipp2a1.colossus"''' : ""
+                                - "ipp6"
+                                - "ipp9"''' : ""
     def nodeLabel = trtllm_utils.generateNodeLabel(nodeLabelPrefix)
     def pvcVolume = """
                 - name: sw-tensorrt-pvc
@@ -3783,15 +4576,13 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                     path: /vol/scratch1/scratch.michaeln_blossom
     """
 
-    // Austin FlexCache looks slow and unstable recently. Remove gh200 temporarily.
-    // That means gh200 nodes will use the default Blossom data scratch.
+    // RTXPro6000D and RTX5080 use the Austin model scratch.
     if (type.contains("6000d") || type.contains("rtx-5080")) {
-        // rtx-pro-6000d, gh200 and rtx-5080 nodes are located in Austin DC, we use the FlexCache to speed up the data access.
         llmModelVolume = """
                 - name: scratch-trt-llm-data
                   nfs:
-                    server: 10.20.162.212
-                    path: /vol/scratch26/scratch.trt_llm_data
+                    server: 10.59.164.111
+                    path: /vol/scratch58/scratch.trt_llm_data
         """
     }
 
@@ -3816,7 +4607,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
                                 values:
                                 - "core"
                                 - "qa_only"
-${blockedNodeAffinity}
+${scratchUnreachableNodeAffinity}
                 nodeSelector: ${selectors}
                 imagePullSecrets:
                   - name: ${ARTIFACTORY_IMAGE_PULL_SECRET}
@@ -3884,13 +4675,10 @@ def runLLMDocBuild(pipeline, config)
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
 
     // Step 2: download TRT-LLM tarfile
-    def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${BUILD_CONFIGS[config][TARNAME]}"
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
-    sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
+    def tarName = BUILD_CONFIGS[config][TARNAME]
+    fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/${tarName}", "${llmPath}/${tarName}")
+    sh "cd ${llmPath} && tar -zxf ${tarName}"
     // install python package
-    if (env.alternativeTRT) {
-        sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
 
@@ -3979,37 +4767,19 @@ def runLLMAgentFlowTest(pipeline, stageName)
     sh "cd ${WORKSPACE}/${stageName} && sed -i 's/testsuite name=\"pytest\"/testsuite name=\"${stageName}\"/g' results.xml || true"
 }
 
-def launchTestListCheck(pipeline)
-{
-    stageName = "Test List Check"
-    trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(LLM_DOCKER_IMAGE, "a10"), "trt-llm", {
-        try {
-            echoNodeAndGpuInfo(pipeline, stageName)
-            sh "nvidia-smi && nvidia-smi -q && nvidia-smi topo -m"
-            // download TRT-LLM tarfile
-            def tarName = BUILD_CONFIGS[VANILLA_CONFIG][TARNAME]
-            def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pwd && wget -nv ${llmTarfile} && ls -alh")
-            sh "tar -zxf ${tarName}"
-            def llmPath = sh (script: "realpath .", returnStdout: true).trim()
-            def llmSrc = "${llmPath}/TensorRT-LLM/src"
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install -r ${llmSrc}/requirements-dev.txt")
-            // --validate --parity: after --l0/--qa generate the collectable lists, assert every
-            // statically-verified parametrize ID is actually collectable (validate<->collection parity).
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.05 LLM_ROOT=${llmSrc} LLM_BACKEND_ROOT=${llmSrc}/triton_backend python3 ${llmSrc}/scripts/check_test_list.py --l0 --qa --waive --validate --parity"
-        } catch (InterruptedException e) {
-            throw e
-        } catch (Exception e) {
-            throw e
-        }
-    })
-}
-
 def generateTimeoutTestResultXml(pipeline, stageName) {
     def scriptPath = sh(
-        script: "find . -name generate_timeout_xml.py | head -n 1 | xargs realpath",
+        script: "find -L . -name generate_timeout_xml.py | head -n 1 | xargs --no-run-if-empty realpath",
         returnStdout: true
     ).trim()
+    if (!scriptPath) {
+        // Without the script no results-timeout.xml is written, but the tests that did not
+        // finish must still fail the stage.
+        def hasUnfinished = sh(script: "grep -q '[^[:space:]]' '${stageName}/unfinished_test.txt'", returnStatus: true) == 0
+        echo "generate_timeout_xml.py not found (source tree may have been cleaned up); skipping timeout XML generation" +
+            (hasUnfinished ? ", but ${stageName}/unfinished_test.txt lists unfinished tests." : ".")
+        return hasUnfinished
+    }
     def curPath = sh(script: "realpath .", returnStdout: true).trim()
     def outputFilePath = "${curPath}/${stageName}/results-timeout.xml"
     sh """python3 ${scriptPath} --stage-name '${stageName}' --test-file-path 'unfinished_test.txt' --output-file '${outputFilePath}'"""
@@ -4151,12 +4921,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     } else if (stageName.contains("-Generic-")) {
         // Generic stages select tests by marker expression rather than backend ownership.
         makoArgs += ["backend=generic"]
-    } else if (stageName.contains("-Verl-")) {
-        // If stageName contains "-Verl-", add "backend=verl" to makoArgs
-        // At this point, only tests with backend=verl or unspecified backend will be run
-        makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", "-FMHA-", or "-Verl-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-CPP-", "-Triton-", or "-FMHA-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -4227,7 +4993,13 @@ def renderTestDB(pipeline, testContext, llmSrc, stageName, preDefinedMakoOpts=nu
              "Test-db blocks conditioned on those properties (e.g. linux_distribution_name: ubuntu*) " +
              "will NOT be selected."
     }
-    sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==1.8.5+bc6df7"
+    // Artifacts built before ci_versions.properties existed (e.g. via reuse_build)
+    // lack the file; fall back to the version those artifacts were pinned to.
+    def ciVersionsPath = "${llmSrc}/jenkins/ci_versions.properties"
+    def ciVersions = fileExists(ciVersionsPath)
+        ? readProperties(file: ciVersionsPath)
+        : [TRT_TEST_DB_VERSION: "1.8.5+bc6df7"]
+    sh "pip3 install --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple --ignore-installed trt-test-db==${ciVersions.TRT_TEST_DB_VERSION}"
     // CBTS Layer 3: download the pre-built cbts_test_db/ tarball that the
     // orchestrator uploaded to Artifactory (see getCbtsResult in
     // L0_MergeRequest.groovy). This avoids re-running main.py locally and
@@ -4363,11 +5135,23 @@ def getSSHConnectionPorts(portConfigFile, stageName)
     return [userPort, monitorPort]
 }
 
-// Return true means the test rerun also fails. Return false otherwise.
-def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="") {
+// generate_rerun_tests_list opens rerun_0/1/2.txt eagerly but removes any that
+// end up empty, so this also guards against a future change to that cleanup.
+def fileHasContent(path) {
+    return fileExists(path) && readFile(path).trim()
+}
+
+// Return whether the rerun failed and any typed infra failure classified from
+// the rerun's originating shell step. The typed failure lets the outer retry
+// layer preserve bounded evidence after result/report generation finishes.
+def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="results.xml", testType="regular", postTag="", Map retryContext=null) {
     if (!fileExists("${WORKSPACE}/${stageName}/${resultFileName}")) {
-        echo "There is no ${resultFileName} file, skip the rerun step"
-        return true
+        // No results were ever flushed (e.g. the process was killed before any
+        // test finished reporting). test_rerun.py treats a missing xml as "no
+        // tests ran" and falls back to unfinished_test.txt / the original test
+        // list to classify each test, so keep going instead of assuming a
+        // rerun already failed.
+        echo "There is no ${resultFileName} file; falling back to unfinished/not-run classification for ${testType}"
     }
 
     // Create rerun directory structure to avoid conflicts
@@ -4406,6 +5190,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
 
     // Rerun tests
     def isRerunFailed = false
+    def rerunInfraFailure = null
     for (times in [1, 2]) {
         def currentRerunTestList = "${rerunDir}/rerun_${times}.txt"
         if (!fileExists(currentRerunTestList)) {
@@ -4471,13 +5256,18 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine, resultFileName="results.xml
                 echo "The ${testType} tests crashed when rerun attempt."
                 throw e
             }
+            String scope = retryContext?.scope ?: InfraFailure.K8S
+            def classified = classifyFailure(pipeline, e, scope, retryContext)
+            if (classified instanceof InfraFailure) {
+                rerunInfraFailure = classified
+            }
             echo "The ${testType} tests still failed after rerun attempt."
             isRerunFailed = true
         }
     }
 
     echo "isRerunFailed for ${testType}: ${isRerunFailed}"
-    return isRerunFailed
+    return [failed: isRerunFailed, infraFailure: rerunInfraFailure]
 }
 
 def generateRerunReport(stageName, llmSrc) {
@@ -4533,6 +5323,7 @@ def generateRerunReport(stageName, llmSrc) {
     // Collect all original and rerun result files
     def allInputFiles = []
 
+    // ---- Regular test results ----
     // Add original results
     if (fileExists("${WORKSPACE}/${stageName}/results.xml")) {
         allInputFiles.add("${WORKSPACE}/${stageName}/results.xml")
@@ -4541,7 +5332,18 @@ def generateRerunReport(stageName, llmSrc) {
             rerunResultFiles.add("${WORKSPACE}/${stageName}/results.xml")
         }
     }
+    // Add regular rerun results
+    if (hasRegularReruns) {
+        for (times in [1, 2]) {
+            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            if (fileExists(rerunFile)) {
+                allInputFiles.add(rerunFile)
+                rerunResultFiles.add(rerunFile)
+            }
+        }
+    }
 
+    // ---- Isolated test results ----
     // Add ALL isolated test results to allInputFiles
     def isolatedResults = sh(script: "find ${WORKSPACE}/${stageName} -name 'results_isolated_*.xml' 2>/dev/null || true", returnStdout: true).trim()
     if (isolatedResults) {
@@ -4550,26 +5352,15 @@ def generateRerunReport(stageName, llmSrc) {
                 allInputFiles.add(file.trim())
             }
         }
-        // Add isolated test results that have reruns to rerunResultFiles and add their rerun results to allInputFiles
-        isolatedTestsWithReruns.each { isolatedTest ->
-            if (fileExists(isolatedTest.originalResult)) {
-                rerunResultFiles.add(isolatedTest.originalResult)
-                echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
-            }
-            for (times in [1, 2]) {
-                def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
-                if (fileExists(rerunFile)) {
-                    allInputFiles.add(rerunFile)
-                    rerunResultFiles.add(rerunFile)
-                }
-            }
-        }
     }
-
-    // Add regular rerun results
-    if (hasRegularReruns) {
+    // Add isolated rerun results
+    isolatedTestsWithReruns.each { isolatedTest ->
+        if (fileExists(isolatedTest.originalResult)) {
+            rerunResultFiles.add(isolatedTest.originalResult)
+            echo "Added isolated result with reruns to rerunResultFiles: ${isolatedTest.originalResult}"
+        }
         for (times in [1, 2]) {
-            def rerunFile = "${regularRerunDir}/rerun_results_${times}.xml"
+            def rerunFile = "${isolatedTest.dir}/rerun_results_${times}.xml"
             if (fileExists(rerunFile)) {
                 allInputFiles.add(rerunFile)
                 rerunResultFiles.add(rerunFile)
@@ -4617,9 +5408,8 @@ def generateRerunReport(stageName, llmSrc) {
 }
 
 def mergeWaivesTxt(pipeline, llmSrc, stageName) {
-    def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
     try {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+        fetchBuildArtifact(pipeline, "${ARTIFACT_PATH}/waive_list/waives.txt", "waives.txt")
         if (!fileExists("waives.txt")) {
             error "There is no merged waives.txt file, use the default waives.txt."
         }
@@ -4667,12 +5457,14 @@ def reusePassedTestResults(llmSrc, stageName, waivesTxt, String postTag = "") {
         sh "mkdir -p ${workDir}"
 
         // 1. OpenSearch lookup -- tests that PASSED in a previous pipeline run
-        //    for this commit + stage.
+        //    for this commit + sibling stage shards. CBTS and non-CBTS results
+        //    are merged only at testcase granularity.
         def passedTestListFile = "${workDir}/passed_test_list.txt"
+        def stageNamePattern = getTestReuseStagePattern(stageName)
         sh """
             python3 ${llmSrc}/jenkins/scripts/open_search_query.py \
             --commit-id ${env.gitlabCommit} \
-            --stage-name ${stageName} \
+            --stage-name-pattern '${stageNamePattern}' \
             --output-file ${passedTestListFile}
         """
         if (fileExists(passedTestListFile)) {
@@ -4760,39 +5552,6 @@ REUSED_TESTS_EOF
     } catch (Exception e) {
         echo "Failed to add passed test list from previous pipeline run to the waives.txt. Error: ${e.message}"
     }
-}
-
-// Promotes the progress tar to the final results path via an Artifactory
-// server-side move (no data re-transfer). Returns true when a progress
-// snapshot existed and was promoted; false when no snapshot was uploaded or
-// the server-side move failed.
-// Virtual repo sw-tensorrt-generic does not support move; rewrite to the
-// backing local repo as we do for DELETE in deleteProgressArtifact().
-def promoteProgressTar(stageName, postTag="") {
-    def progressOkFile = "${WORKSPACE}/results-${stageName}${postTag}-progress.tar.gz.upload_ok"
-    if (!fileExists(progressOkFile)) {
-        return false
-    }
-    def localUploadPath = UPLOAD_PATH.replaceFirst(/^sw-tensorrt-generic\//, 'sw-tensorrt-generic-local/')
-    def srcArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}-progress.tar.gz"
-    def dstArtPath = "${localUploadPath}/test-results/results-${stageName}${postTag}.tar.gz"
-    def rc
-    withCredentials([usernamePassword(
-            credentialsId: 'urm-artifactory-creds',
-            usernameVariable: 'ART_USER',
-            passwordVariable: 'ART_PASS')]) {
-        rc = sh(
-            script: """curl -fsSL --retry 2 -u "\$ART_USER:\$ART_PASS" -X POST \
-                'https://urm.nvidia.com/artifactory/api/move/${srcArtPath}?to=/${dstArtPath}'""",
-            returnStatus: true
-        )
-        if (rc == 0) {
-            echo "[PROGRESS-UPLOAD] ${stageName}: progress tar moved to test-results/ as results-${stageName}${postTag}.tar.gz"
-        } else {
-            echo "[PROGRESS-UPLOAD] ${stageName}: move failed (rc=${rc}); results may already be at destination or progress tar was deleted"
-        }
-    }
-    return rc == 0
 }
 
 // Removes the in-progress checkpoint tarball uploaded by the inline
@@ -4915,7 +5674,7 @@ def priorAttemptTags(String postTag) {
     return priors
 }
 
-def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", String postTag="", boolean useClusterDurations=false)
+def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, String postTag="", boolean useClusterDurations=false, Map retryContext=null)
 {
     // Step 1: create LLM_ROOT dir and clean up the workspace
     def llmRootConfig = "${LLM_ROOT}${config}"
@@ -4931,12 +5690,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
     def llmPath = sh (script: "realpath ${llmRootConfig}", returnStdout: true).trim()
     def llmSrc = "${llmPath}/TensorRT-LLM/src"
     echoNodeAndGpuInfo(pipeline, stageName)
-
-    if (env.alternativeTRT && cpver) {
-        stage("Replace TensorRT") {
-            trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        }
-    }
 
     // Step 2: run tests
     stage ("Setup Environment")
@@ -4966,53 +5719,48 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         sh "python3 --version"
 
         sh "rm -rf results-${stageName}.tar.gz ${stageName}/*"
-        // download TRT-LLM tarfile
+        // Inside a fat sqsh (SLURM agent) TRT-LLM is pre-extracted at /tmp/TensorRT-LLM;
+        // symlink it to skip the ~2-min download.  In all other contexts (K8s pods,
+        // non-fat-sqsh SLURM) the directory does not exist, so fall back to download + tar.
         def tarName = BUILD_CONFIGS[config][TARNAME]
-        def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
-        timeout(time: 30, unit: 'MINUTES') {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
+        // /tmp/trtllm_installed.txt is written only by fat_build_inline.sh, distinguishing
+        // a pre-baked fat sqsh from a base image that merely has /tmp/TensorRT-LLM after
+        // a prior normal install on the same node.
+        def isFatSqsh = sh(script: "test -f /tmp/trtllm_installed.txt && test -d /tmp/TensorRT-LLM && echo yes || echo no", returnStdout: true).trim() == "yes"
+        if (isFatSqsh) {
+            sh "ln -sfn /tmp/TensorRT-LLM ${llmPath}/TensorRT-LLM"
+            // Resolve to real path so pytest --rootdir doesn't produce ../../../ node IDs.
+            llmSrc = sh(script: "realpath ${llmPath}/TensorRT-LLM/src", returnStdout: true).trim()
+        } else {
+            def llmTarArtifactPath = boltedTarArtifactPath(pipeline, config, tarName)
+            timeout(time: 30, unit: 'MINUTES') {
+                fetchBuildArtifact(pipeline, llmTarArtifactPath, "${llmPath}/${tarName}")
+            }
+            sh "cd ${llmPath} && tar -zxf ${tarName}"
         }
-        sh "cd ${llmPath} && tar -zxf ${tarName}"
 
         // install python package
-        timeout(time: 45, unit: 'MINUTES') {
-            if (env.alternativeTRT) {
-                sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
+        // isFatSqsh: deps and wheel are pre-baked in the fat sqsh — skip all installs.
+        // skipInstallWheel: wheel already installed externally (e.g. K8s sanity check
+        //   pre-installs a platform-specific wheel) — install deps but skip the wheel.
+        timeout(time: 60, unit: 'MINUTES') {
+            if (!isFatSqsh) {
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
+                // SMG's generated package remains an opt-in dependency. OpenEngine's
+                // private bindings and grpcio dependency are part of the base package.
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
             }
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
-            // Gateway adapters are opt-in extras excluded from requirements.txt;
-            // each gateway declares its pins in a dedicated
-            // requirements-<gateway>.txt, and a test stage installs exactly
-            // zero or one gateway file so every adapter is tested under the
-            // dependency set its real opt-in users receive. A gateway whose
-            // pins co-resolve with the default environment (SMG today) is
-            // installed in the shared stages so its unit tests run from the
-            // regular shard pool instead of being skipped at collection; a
-            // gateway whose pins conflict with the default environment (for
-            // example a protobuf major-version floor or a custom package
-            // index) must instead install its file behind a dedicated stage
-            // guard and skip this one (see the Ray install below for the
-            // stage-scoped pattern).
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-grpc-smg.txt")
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install opencv-python-headless")
             if (stageName.contains("-Ray-")) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]==2.55.1")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-                    mambaArch=\$(uname -m)
-                    pip3 install --no-deps \
-                        "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2/causal_conv1d-1.6.1%2Bcu13torch26.04cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl" \
-                        "https://github.com/state-spaces/mamba/releases/download/v2.3.0/mamba_ssm-2.3.0%2Bcu13torch26.01cxx11abiTRUE-cp312-cp312-linux_\${mambaArch}.whl"
-                """)
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash ${llmSrc}/jenkins/scripts/install_mamba.sh")
             }
-            if (!skipInstallWheel) {
+            if (!isFatSqsh && !skipInstallWheel) {
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
             }
             if (stageName.contains("-ModelExpress-")) {
+                // The wheel goes in with --no-deps above, so its `mx` extra never
+                // applies. nixl comes from the image (install_nixl.sh).
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install modelexpress==${MODEL_EXPRESS_VERSION}")
-                // ModelExpress 0.4.1 imports nixl._api, while requirements-dev.txt
-                // installs only the nixl-cu13 backend. Install the matching
-                // namespace shim without pulling the unused CUDA 12 backend.
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install --no-deps nixl==${MODEL_EXPRESS_NIXL_VERSION}")
             }
         }
 
@@ -5095,12 +5843,14 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def noRegularTests = false
         def noIsolateTests = false
         def rerunFailed = false
+        def rerunInfraFailure = null
+        def unrerunInfraFailure = null
+        def hasUnrerunFailure = false
         def infraDryRun = isInfraDryRun()
         if (infraDryRun) {
             testList = INFRA_DRY_RUN_TEST_CONTEXT
             splitId = 1
             splits = 1
-            perfMode = false
         }
 
         // When useClusterDurations is set, use a per-cluster durations file keyed on
@@ -5136,7 +5886,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
 
         // Process shard test list and create separate files for regular and isolate tests
-        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, perfMode, clusterDurationsPath)
+        def preprocessedLists = processShardTestList(llmSrc, testDBList, splitId, splits, clusterDurationsPath)
 
         // Test Coverage
         def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
@@ -5147,9 +5897,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (isCbtsStage(stageName)) {
             // K8s runner knows TRTLLM_WHL_PATH here, so all placeholders are substituted at controller time (no worker-side sed).
             sh """
-                # A sentinel left in a reused workspace would suppress this stage's writes.
-                mkdir -p ${WORKSPACE}/${stageName} && rm -f ${WORKSPACE}/${stageName}/${CBTS_STOP_FILE_NAME}
-                cp ${llmSrc}/jenkins/scripts/cbts/coverage_utils/coveragerc.template ${coverageConfigFile}
+                mkdir -p ${WORKSPACE}/${stageName}
+                cp ${llmSrc}/jenkins/scripts/cbts/cbts/coverage/collection/coveragerc.template ${coverageConfigFile}
                 sed -i \\
                     -e 's|@TRTLLM_WHEEL_PATH@|${TRTLLM_WHL_PATH}|g' \\
                     -e 's|@JOB_WORKSPACE@|${WORKSPACE}/${stageName}|g' \\
@@ -5181,7 +5930,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             llmSrc,
             stageName,
             waivesFilePath,
-            perfMode,
             "${WORKSPACE}/${stageName}",
             coverageConfigFile,
             "",  // pytestUtil
@@ -5284,20 +6032,41 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        def isRerunFailed = rerunFailedTests(
-                            stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag)
-                        if (isRerunFailed) {
+                        def rerunResult = rerunFailedTests(
+                            pipeline, stageName, llmSrc, pytestCommand, "results.xml", "regular", postTag, retryContext)
+                        // Unconditional: a test can crash again during the rerun itself
+                        // (isRerunFailed=true), and unfinished_test.txt is the only
+                        // record of that crash. junit()'s "results*.xml" glob picks up
+                        // results-timeout.xml directly, so this is what surfaces it.
+                        def hadUnfinishedTests = generateTimeoutTestResultXml(pipeline, stageName)
+                        if (rerunResult.failed) {
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Regular tests failed after rerun attempt"
                             }
                             rerunFailed = true
-                        } else if (generateTimeoutTestResultXml(pipeline, stageName)) {
+                            rerunInfraFailure = rerunResult.infraFailure ?: rerunInfraFailure
+                        } else if (hadUnfinishedTests) {
                             // Rerun passed but the first run had a timeout: mark this
                             // stage FAILURE so "[${stageName}] Run Pytest" turns red,
                             // not just the enclosing parent stage.
                             catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
                                 error "Some tests terminated unexpectedly, please check the test report."
                             }
+                        } else if (fileHasContent("${WORKSPACE}/${stageName}/rerun/regular/rerun_0.txt")) {
+                            String scope = retryContext?.scope ?: InfraFailure.K8S
+                            def classified = classifyFailure(pipeline, e, scope, retryContext)
+                            if (classified instanceof InfraFailure) {
+                                unrerunInfraFailure = classified
+                            }
+                            // Failures that finished (not a timeout) but were never
+                            // rerun because duration > 10 min and no known failure
+                            // signature matched: results.xml still carries their
+                            // original <failure>, but neither branch above fires for
+                            // them, so without this the stage silently reports green.
+                            catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+                                error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
+                            }
+                            hasUnrerunFailure = true
                         }
                     }
 
@@ -5305,8 +6074,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                     if (preprocessedLists.isolateCount > 0) {
                         stage ("[${stageName}] Run Pytest (Isolated)") {
                             echo "There are ${preprocessedLists.isolateCount} isolated tests to run"
-                            rerunFailed = runIsolatedTests(
-                                preprocessedLists, pytestCommand, llmSrc, stageName, postTag) || rerunFailed
+                            def isolatedResult = runIsolatedTests(
+                                pipeline, preprocessedLists, pytestCommand, llmSrc, stageName, postTag, retryContext)
+                            rerunFailed = isolatedResult.rerunFailed || rerunFailed
+                            rerunInfraFailure = isolatedResult.rerunInfraFailure ?: rerunInfraFailure
+                            unrerunInfraFailure = isolatedResult.unrerunInfraFailure ?: unrerunInfraFailure
+                            hasUnrerunFailure = isolatedResult.hasUnrerunFailure || hasUnrerunFailure
                         }
                     } else {
                         echo "No isolated tests to run for stage ${stageName}"
@@ -5330,7 +6103,8 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             if (isCbtsStage(stageName)) {
                 sh """
                     cd ${WORKSPACE}/${stageName} && \
-                    python3 ${llmSrc}/jenkins/scripts/cbts/coverage_utils/pystart_report.py \
+                    PYTHONPATH=${llmSrc}/jenkins/scripts/cbts \
+                    python3 -m cbts.command coverage collection pystart-report \
                         --glob '.cbtscov.${stageName}*' || true
                 """
             }
@@ -5343,7 +6117,12 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             }
         }
 
+        // Unguarded error() on purpose -- catchError here would swallow the
+        // throw that cacheErrorAndUploadResult relies on to fail the build.
         if (rerunFailed) {
+            if (rerunInfraFailure != null) {
+                throw rerunInfraFailure
+            }
             error "Some tests still failed after rerun attempts, please check the test report."
         }
 
@@ -5351,35 +6130,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             error "Some tests terminated unexpectedly, please check the test report."
         }
 
-        if (perfMode) {
-            // Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
-            basePerfFilename = "base_perf_pytorch.csv"
-            basePerfPath = "${llmSrc}/tests/integration/defs/perf/${basePerfFilename}"
-            stage("Check Perf Result") {
-                def perfCheckResult = sh(
-                    script: """
-                    python3 ${llmSrc}/tests/integration/defs/perf/sanity_perf_check.py \
-                        ${stageName}/perf_script_test_results.csv \
-                        ${basePerfPath}
-                    """,
-                    returnStatus: true
-                )
-                if (perfCheckResult != 0) {
-                    error "Performance regression detected and failing the build (exit code: ${perfCheckResult})"
-                }
+        if (hasUnrerunFailure) {
+            if (unrerunInfraFailure != null) {
+                throw unrerunInfraFailure
             }
-            stage("Create Perf Report") {
-                if (fileExists("${stageName}/perf_script_test_results.csv")) {
-                    sh """
-                        python3 ${llmSrc}/tests/integration/defs/perf/create_perf_comparison_report.py \
-                        --output_path ${stageName}/report.pdf \
-                        --files ${stageName}/perf_script_test_results.csv \
-                        ${basePerfPath}
-                    """
-                } else {
-                    echo "No perf script test results to create report"
-                }
-            }
+            error "Some tests failed and were not eligible for rerun (duration > 10 min, no matching failure signature), please check the test report."
         }
     }
 
@@ -5393,10 +6148,23 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 // composed with an attempt tag by the helper) and `isFinalAttempt` (so this
 // function's `cacheErrorAndUploadResult` can suppress synthetic stage-fail XML
 // and junit() for intermediate retryable failures).
-def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, cpver="cp312", postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
+def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG, stageName="Undefined", splitId=1, splits=1, skipInstallWheel=false, postTag="", boolean isFinalAttempt=true, Map retryContext=null, boolean useClusterDurations=false)
 {
-    cacheErrorAndUploadResult(stageName, {
-        runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, postTag, useClusterDurations)
+    cacheErrorAndUploadResult(pipeline, stageName, {
+        // PMIx builds a singleton ID, singleton.{hostname}.{pid}, that must fit a
+        // 50-byte buffer; our 63-character pod names overflow it and every
+        // MpiPoolSession spawn fails. PMIX_HOSTNAME replaces only the name PMIx
+        // sees, so the pod keeps its own for logging and for port sectioning in
+        // getHostNodeName(). Kept out of runLLMTestlistOnPlatformImpl: the SLURM
+        // path runs that on the compute node, where one shared name would break
+        // locality. The ALLOW_RUN_AS_ROOT pair now comes from the image
+        // (Dockerfile.multi); only the bare-metal sanity stages still set it.
+        def testEnv = [
+            "PMIX_HOSTNAME=mpi-node0",
+        ]
+        withEnv(testEnv) {
+            runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config, stageName, splitId, splits, skipInstallWheel, postTag, useClusterDurations, retryContext)
+        }
     }, {
         if (testFilter[(DEBUG_MODE)]) {
             try {
@@ -5437,17 +6205,13 @@ def runLLMTestlistOnPlatform(pipeline, platform, testList, config=VANILLA_CONFIG
 }
 
 
-def checkPipInstall(pipeline, wheel_path, version_override)
+def checkPipInstall(pipeline, wheel_path)
 {
     def wheelArtifactLinks = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
-    def versionLocal = version_override?.contains("+") ?
-        version_override.substring(version_override.indexOf("+") + 1) : ""
-    withEnv(["TRTLLM_VERSION_LOCAL=${versionLocal}"]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-            cd ${LLM_ROOT}/tests/unittest && \
-            python3 test_pip_install.py --wheel_path ${wheelArtifactLinks} --version_local "\${TRTLLM_VERSION_LOCAL}"
-            """)
-    }
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+        cd ${LLM_ROOT}/tests/unittest && \
+        python3 check_pip_install.py --wheel_path ${wheelArtifactLinks}
+        """)
 }
 
 
@@ -5472,8 +6236,11 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
     def kitmakerDryRunMetadata = null
     stage("Kitmaker Publish Dry Run") {
         catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
+            if (!TRTLLM_RELEASE_REPO?.url || !TRTLLM_RELEASE_REPO?.commit) {
+                error "TRTLLM_RELEASE_REPO is missing from globalVars; it is resolved by L0_MergeRequest"
+            }
             sh "rm -rf ${releaseScriptsDir}"
-            trtllm_utils.checkoutSource(RELEASE_SCRIPT_REPO, RELEASE_SCRIPT_COMMIT, releaseScriptsDir, false, true)
+            trtllm_utils.checkoutSource(TRTLLM_RELEASE_REPO.url, TRTLLM_RELEASE_REPO.commit, releaseScriptsDir, false, true)
             trtllm_utils.llmExecStepWithRetry(
                 pipeline,
                 script: "${python_bin} -m pip install -r ${releaseScriptsDir}/requirements.txt")
@@ -5502,12 +6269,6 @@ def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
 }
 
 
-def isKitmakerWheelDryRunEnabled()
-{
-    return RELEASE_SCRIPT_REPO && RELEASE_SCRIPT_COMMIT
-}
-
-
 def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 {
     if (!kitmakerDryRunMetadata?.releaseUuid) {
@@ -5531,6 +6292,95 @@ def checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 }
 
 
+// Apply the branch's latest promoted BOLT profile bundle to a freshly built
+// wheel, in place. Mirrors Build.groovy's premerge applyLatestBolt (same
+// llvm-bolt staging, same apply_latest.sh, same exit-code contract), but for a
+// standalone .whl rather than a packed tarball.
+//
+// Every failure is fatal, including a missing bundle. The caller only reaches
+// here when the pipeline asked for BOLT, and this wheel is what the release job
+// publishes, so "BOLT is on" has to mean the wheel IS optimized -- degrading to
+// an un-BOLTed wheel with a log line is how an unoptimized artifact reaches PyPI
+// unnoticed. That is stricter than Build.groovy's applyLatestBolt, which treats
+// a missing bundle as a skip; it has to, because the same switch covers x86_64,
+// where nothing is promoted yet. This path is aarch64-only and the switch is
+// main-only, so there is always a bundle to find.
+def applyLatestBoltToWheel(pipeline, String wheel, String cpu_arch, String boltProfileRef = "",
+                           String boltProfileBranch = "")
+{
+    def llvmArch = (cpu_arch == AARCH64_TRIPLE) ? "ARM64" : "X64"
+    // apply_latest.sh resolves exactly one branch, so try the build's own branch
+    // and fall back to main. Profiles are function-name-keyed and applied with
+    // -infer-stale-profile, so a nearby branch's bundle is valid -- the same
+    // candidate-branch fallback BuildDockerImage.groovy's overlay uses.
+    def branches = [env.gitlabTargetBranch, env.branch_name, "main"]
+        .collect { it?.toString()?.trim() }
+        .findAll { it }
+        .unique()
+    // A pin now supplies its own branch, so nothing is left to guess: the ref
+    // names one object under that branch's promote directory. Walking candidates
+    // would only add ways to fetch something other than what was pinned.
+    if (boltProfileRef && boltProfileBranch) {
+        branches = [boltProfileBranch]
+        echo "[bolt-wheel] pinned to BOLT bundle ${boltProfileRef} on ${boltProfileBranch}"
+    }
+
+    stage("BOLT release wheel") {
+        sh """
+            set -e
+            export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+            if ! command -v llvm-bolt >/dev/null 2>&1; then
+                . tensorrt_llm/scripts/bolt/internal/llvm_bolt_version.sh
+                echo "[bolt-wheel] staging llvm-bolt \${LLVM_BOLT_VERSION}"
+                tb=LLVM-\${LLVM_BOLT_VERSION}-Linux-${llvmArch}.tar.xz
+                mkdir -p .bolt-llvm
+                curl -fSL --retry 10 --retry-all-errors --retry-delay 15 --connect-timeout 60 \
+                     -o /tmp/\$tb "https://github.com/llvm/llvm-project/releases/download/llvmorg-\${LLVM_BOLT_VERSION}/\$tb"
+                tar -xJf /tmp/\$tb -C .bolt-llvm --strip-components=1
+                rm -f /tmp/\$tb
+            fi
+        """
+        // Exit codes (apply_latest.sh): 3 = no promoted bundle for branch/triple,
+        // 2 = apply error, 0 = applied. Only 3 is worth trying the next branch for;
+        // an apply error means the bundle IS there and did not take, which retrying
+        // against a different branch would only paper over.
+        def rc = 3
+        def appliedFrom = null
+        for (b in branches) {
+            rc = sh(returnStatus: true, script: """
+                export PATH="\$PWD/.bolt-llvm/bin:\$PATH"
+                export BOLT_PROFILE_REF='${boltProfileRef}'
+                # Quoted: the branch comes from job env and the wheel name from a
+                # directory listing, so an unquoted expansion would let a shell
+                # metacharacter in either run before apply_latest.sh starts.
+                bash tensorrt_llm/scripts/bolt/internal/apply_latest.sh \
+                     '${b}' '${cpu_arch}' '${wheel}' '${wheel}.bolted'
+            """)
+            if (rc != 3) {
+                appliedFrom = b
+                break
+            }
+            echo "[bolt-wheel] no promoted bundle for ${b}/${cpu_arch}; trying next candidate branch"
+        }
+        if (rc == 3 && boltProfileRef) {
+            error("[bolt-wheel] pinned BOLT bundle ${boltProfileRef} (${cpu_arch}) not found under any of " +
+                  "${branches.join(', ')}. This pipeline pinned a bundle the release wheel cannot fetch; " +
+                  "refusing to publish a wheel optimized with anything else.")
+        }
+        if (rc == 3) {
+            error("[bolt-wheel] no promoted BOLT bundle for any of ${branches.join(', ')} (${cpu_arch}); " +
+                  "refusing to upload an unoptimized release wheel (promote a bundle via BoltProfileGen, " +
+                  "or turn BOLT consume off for this run)")
+        }
+        if (rc != 0) {
+            error("[bolt-wheel] apply_latest.sh failed (rc=${rc}) for ${appliedFrom}/${cpu_arch}")
+        }
+        sh "mv -f ${wheel}.bolted ${wheel}"
+        echo "[bolt-wheel] ${wheel} is now BOLTed (profiles from ${appliedFrom}/${cpu_arch}" +
+             (boltProfileRef ? ", bundle ${boltProfileRef})" : ")")
+    }
+}
+
 def runLLMBuild(
     pipeline,
     cpu_arch,
@@ -5538,16 +6388,18 @@ def runLLMBuild(
     wheel_path="",
     version_override="",
     cpver="cp312",
-    plat_name="")
+    plat_name="",
+    is_dlfw=false,
+    boltConsume=false,
+    boltProfileRef="",
+    boltProfileBranch="",
+    kitmakerDryRun=false)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
     sh "ccache -sv"
 
     trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
-    if (env.alternativeTRT) {
-        sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
-    }
     // Random sleep to avoid resource contention
     sleep(10 * Math.random())
     sh "curl ifconfig.me || true"
@@ -5561,12 +6413,11 @@ def runLLMBuild(
 
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-dev.txt")
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install -r requirements-grpc-smg.txt")
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-    }
     buildArgs = "--clean --nixl_root /opt/nvidia/nvda_nixl"
     if (cpu_arch == AARCH64_TRIPLE) {
-        buildArgs += " -a '90-real;100-real;103-real;120-real'"
+        buildArgs += " -a '90;100;103;107;120;121'"
+    } else {
+        buildArgs += " -a '80;86;89;90;100;103;107;120'"
     }
     def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
@@ -5574,23 +6425,77 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${version_override}",
     ]) {
-        withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
-        }
-    }
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
-    echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
-    trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
-    def uploadedWheelPath = "${cpu_arch}/${wheel_path}${wheelName}"
+
+    // ENABLE_BOLT_COMPATIBLE=ON above only makes the binaries BOLT-able; it does
+    // not optimize them. The tarball gets the actual optimization elsewhere
+    // (Build.groovy premerge, BoltProfileGen postmerge), but this wheel is built
+    // and uploaded on its own, so without this step the released SBSA wheel ships
+    // unoptimized. Must run BEFORE the upload below, and before the local
+    // pip install / DLFW repack, so every consumer sees the same bytes.
+    //
+    // Gated on the pipeline's BOLT switch, not on the run mode: the wheel the
+    // release job publishes is the same artifact whether the run is nightly,
+    // weekly or GA, so the trigger has to be "is BOLT on", not "is this a
+    // nightly". aarch64 only -- x86_64 has no promoted bundle.
+    //
+    // Scoped to the wheel published at the root of <arch>/, which is the one the
+    // release job picks up. An imageTest/ build is a throwaway wheel compiled
+    // inside an already-released image to prove that image can still build from
+    // source; optimizing it would prove nothing and only add a failure mode.
+    if (boltConsume && cpu_arch == AARCH64_TRIPLE && !wheel_path) {
+        applyLatestBoltToWheel(pipeline, "tensorrt_llm/build/${wheelName}", cpu_arch,
+                               boltProfileRef, boltProfileBranch)
+    }
+
+    def rootWheelUploadPath = "${cpu_arch}/${wheel_path}"
+    // DLFW publishes the built public-version wheel under its subdirectory. Other
+    // builds continue to publish the built wheel at the original path.
+    def builtWheelUploadPath =
+        is_dlfw ? "${rootWheelUploadPath}dlfw/" : rootWheelUploadPath
+    echo "uploading ${wheelName} to ${builtWheelUploadPath}"
+    trtllm_utils.uploadArtifacts(
+        "tensorrt_llm/build/${wheelName}",
+        "${UPLOAD_PATH}/${builtWheelUploadPath}")
+
+    def uploadedWheelPath = "${builtWheelUploadPath}${wheelName}"
+    def wheelPath = uploadedWheelPath
+    if (is_dlfw) {
+        // NVIDIA_PYTORCH_VERSION ships with the NGC PyTorch image itself, which
+        // makes it the ground truth for the NGC release version. Example value: 26.08
+        def ngcReleaseVersion = sh(
+            returnStdout: true,
+            script: 'echo $NVIDIA_PYTORCH_VERSION'
+        ).trim()
+        def matcher = ngcReleaseVersion =~ /^(\d+)\.(\d+)$/
+        if (!matcher.find()) {
+            error "Failed to extract NGC Release version from NVIDIA_PYTORCH_VERSION: '${ngcReleaseVersion}'"
+        }
+        echo "NGC Release version: ${ngcReleaseVersion}"
+        def dlfwLocalVersion =
+            "ngcpytorch${matcher.group(1)}${matcher.group(2)}"
+        def localWheelPath = sh(
+            returnStdout: true,
+            script: "python3 tensorrt_llm/jenkins/scripts/repack_wheel.py " +
+                "tensorrt_llm/build/${wheelName} ${dlfwLocalVersion} " +
+                "--output-dir tensorrt_llm/build/local-version"
+        ).trim()
+        def localWheelName = localWheelPath.tokenize('/').last()
+        echo "uploading ${localWheelName} to ${rootWheelUploadPath}"
+        trtllm_utils.uploadArtifacts(
+            localWheelPath,
+            "${UPLOAD_PATH}/${rootWheelUploadPath}")
+        wheelPath = "${rootWheelUploadPath}${localWheelName}"
+    }
+
     def kitmakerDryRunMetadata = null
     if (version_override?.contains("+")) {
         echo "Skipping Kitmaker wheel dry run for local version '${version_override}'"
-    } else if (!isKitmakerWheelDryRunEnabled()) {
-        echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptCommit is not set"
+    } else if (!kitmakerDryRun) {
+        echo "Skipping Kitmaker wheel dry run outside post-merge"
     } else {
         def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
         kitmakerDryRunMetadata = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
@@ -5600,20 +6505,12 @@ def runLLMBuild(
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
-        def remove_trt = "rm -rf /usr/local/tensorrt"
-        if (env.alternativeTRT) {
-            pip_keep += "|^tensorrt=="
-            remove_trt = "echo keep /usr/local/tensorrt"
-        }
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
-        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
     }
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
 
     // Upload attribution files when they exist
     def attrDir = "tensorrt_llm/cpp/build/attribution"
@@ -5625,11 +6522,11 @@ def runLLMBuild(
     }
     checkKitmakerWheelDryRun(pipeline, kitmakerDryRunMetadata)
 
-    return wheelName
+    return wheelPath
 }
 
 
-def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cpver="cp312")
+def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false)
 {
     def whlUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
 
@@ -5644,31 +6541,18 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     sh "pwd && ls -alh"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${whlUrl}")
 
-    if (env.alternativeTRT) {
-        trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
-
     if (reinstall_dependencies) {
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
         def pip_keep = "^pip==|^torch==|^torchvision=="
-        def remove_trt = "rm -rf /usr/local/tensorrt"
-        if (env.alternativeTRT) {
-            pip_keep += "|^tensorrt=="
-            remove_trt = "echo keep /usr/local/tensorrt"
-        }
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
-        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
+        sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && rm -rf /usr/local/tensorrt'"
     }
     //WAR: remove python3-pygments first since it is installed in NGC PyTorch image
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
-    if (env.alternativeTRT) {
-        sh "bash -c 'pip3 show tensorrt || true'"
-    }
 
     def pkgUrl = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${linuxPkgName}"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${pkgUrl}")
@@ -5744,6 +6628,7 @@ def runInDockerOnNodeMultiStage(image, label, dockerArgs, partitionTimeout, need
                 // Minus 10 minutes to avoid the Slurm job being stopped earlier.
                 timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
                     docker.image(image).inside(dockerArgs) {
+                        trtllm_utils.setupGithubFetchAuth()
                         runner()
                     }
                 }
@@ -5762,6 +6647,7 @@ def runInEnrootOnNode(label, partitionTimeout)
 {
     return {
         runner -> node(label) {
+            trtllm_utils.setupGithubFetchAuth()
             // We submit the Slurm job with the Slurm partition's time spec.
             // Minus 10 minutes to avoid the Slurm job being stopped earlier.
             timeout(time: partitionTimeout - 10, unit: 'MINUTES') {
@@ -5878,7 +6764,7 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                     }
                     throw e
                 }
-                def c = FailureClassifier.classify(e, InfraFailure.K8S)
+                def c = classifyFailure(pipeline, e, InfraFailure.K8S)
                 if (c instanceof PipelineInterruption) throw e
                 if (!(c instanceof InfraFailure)) {
                     // UserFailure -> don't retry, but leave a trace: a pod/agent
@@ -5894,12 +6780,12 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
                 if (launchAttempt > K8S_INFRA_RETRY_MAX) {
                     echo "[INFRA-RETRY] ${stageName}: pod launch failed before execution (${c.detectedPattern}), " +
                          "but max launch retries (${K8S_INFRA_RETRY_MAX}) exhausted after ${launchAttempt} attempts. Failing."
-                    throw e
+                    throw c
                 }
                 if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, launchAttempt, K8S_INFRA_RETRY_MAX, 60L * 1000L, true)) {
                     echo "[INFRA-RETRY] ${stageName}: pod launch failed (${c.detectedPattern}) is retryable, " +
                          "but remaining CI timeout budget is too small for a relaunch. Failing without retry."
-                    throw e
+                    throw c
                 }
 
                 echo "[INFRA-RETRY] ${stageName}: pod/agent launch failed before execution on attempt ${launchAttempt}: ${c.detectedPattern}"
@@ -5920,6 +6806,15 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
     while (true) {
         attempt++
         Map attemptPlacementContext = [:]
+        // Shared by result suppression and the retry decision for this attempt only.
+        Map retryContext = [
+            scope: InfraFailure.K8S,
+            stageName: stageName,
+            attempt: attempt,
+            backoffMs: 60L * 1000L,
+            infraRetryMax: opts.infraRetryMax,
+            excludedKubernetesHostNodes: avoidedKubernetesHostNodes.collect(),
+        ]
         try {
             if (attempt > 1) {
                 echo "[INFRA-RETRY] ${stageName}: Starting attempt ${attempt} of ${k8sInfraRetryMax + 1}"
@@ -5945,14 +6840,6 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             // another intermediate attempt.
             def effectiveMaxThisAttempt = (lastSeverity == InfraFailure.PERSISTENT) ? Math.min(1, k8sInfraRetryMax) : k8sInfraRetryMax
             boolean isFinalAttempt = (attempt > effectiveMaxThisAttempt)
-            def retryContext = [
-                scope: InfraFailure.K8S,
-                stageName: stageName,
-                attempt: attempt,
-                backoffMs: 60L * 1000L,
-                infraRetryMax: opts.infraRetryMax,
-                excludedKubernetesHostNodes: avoidedKubernetesHostNodes.collect(),
-            ]
             def attemptPodSpec = trtllm_utils.withKubernetesHostNodeExclusion(podSpec, avoidedKubernetesHostNodes)
             trtllm_utils.launchKubernetesPodWithPlacement(pipeline, attemptPodSpec, containerName, attemptPlacementContext, { runner(attemptTag, isFinalAttempt, retryContext) })
             if (attempt > 1) {
@@ -5963,14 +6850,14 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             // User abort / pipeline timeout -- never retry
             throw e
         } catch (Exception e) {
-            // classify() handles FlowInterruptedException + exit-code-143 +
-            // typed throws + cause-chain pattern matching, returning one of
+            // classifyFailure() handles FlowInterruptedException + exit-code-143 +
+            // typed throws + originating-step evidence and cause-chain fallback, returning one of
             // PipelineInterruption / InfraFailure / UserFailure. Scope=K8S
             // ensures we only match catalog rows tagged K8S or BOTH; the new
             // scope-isolation guard inside classify() also prevents a typed
             // SLURM-scoped InfraFailure (e.g. from an inner SLURM retry that
             // exhausted its own budget) from being treated as K8s infra here.
-            def c = FailureClassifier.classify(e, InfraFailure.K8S)
+            def c = classifyFailure(pipeline, e, InfraFailure.K8S, retryContext)
             if (c instanceof PipelineInterruption) throw e
             if (!(c instanceof InfraFailure)) {
                 // UserFailure -> don't retry, but leave a trace so the decline
@@ -5986,12 +6873,12 @@ def runKubernetesPodWithInfraRetry(Map opts = [:], pipeline, podSpec, containerN
             if (attempt > effectiveMax) {
                 echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) " +
                      "but max retries (${effectiveMax}) exhausted after ${attempt} attempts. Failing."
-                throw e
+                throw c
             }
             if (!hasBudgetForInfraRetry(pipeline, stageName, InfraFailure.K8S, c, attempt, effectiveMax, 60L * 1000L, true)) {
                 echo "[INFRA-RETRY] ${stageName}: Infrastructure failure (${c.detectedPattern}) is retryable, " +
                      "but remaining CI timeout budget is too small for another K8s attempt. Failing without retry."
-                throw e
+                throw c
             }
 
             echo "[INFRA-RETRY] ${stageName}: Infrastructure failure detected on attempt ${attempt}: " +
@@ -6015,91 +6902,30 @@ def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCo
     return configs
 }
 
-// Infra-scoped fail-fast (inner/branch layer). Runs `jobs` under `parallel` so a
-// branch whose post-retry failure is a positive infra abort
-// (FailureClassifier.isDeferrableInfra) is recorded and swallowed -- its siblings
-// keep running instead of being SIGTERMed by failFast. A genuine test/build
-// failure (or an unclassified one) is rethrown unchanged, so failFast stays fully
-// active for real failures; an interrupt (e.g. a sibling's own fail-fast SIGTERM)
-// is also rethrown and never swallowed. After the join, a sub-job that saw ONLY
-// infra aborts and no real failure resolves to UNSTABLE (coverage incomplete, not
-// a failure) so the parent layer (L0_MergeRequest.launchJob) can spare the healthy
-// sibling architecture; a mixed sub-job already threw on its real failure and is
-// FAILURE (currentBuild.result worst-of semantics won't downgrade it).
-//
-// Scope: classify() is scope-filtered, so each branch is classified under its real
-// execution scope, passed per-stage in `stageScopes` (built in launchTestJobs from
-// opts.slurmDispatcher). Every branch is checked under K8S -- this is where the
-// motivating pod-scheduling abort (KubernetesClientTimeoutException) matches, and
-// keeps K8s-pod aborts of a SLURM dispatcher pod deferrable exactly as before.
-// SLURM dispatcher stages are ADDITIONALLY checked under SLURM so a SLURM-scoped
-// abort (SSH outage to the head node, slurm_track ssh exit 255, monitor loss while
-// the job is still active) defers too instead of cascading via failFast. The inner
-// SLURM retry (runLLMTestlistOnSlurm) has already been exhausted by the time the
-// branch body returns here, so this stays post-retry, mirroring the K8s path.
-// Stages absent from stageScopes default to K8S-only (phase-1 behavior). Gated on
-// ENABLE_INFRA_SCOPED_FAILFAST; off restores today's behavior exactly (plain
-// failFast + parallel, no wrapping, no UNSTABLE).
-def runBranchesWithInfraDefer(Map jobs, boolean failFast, Map stageScopes = [:]) {
-    if (!ENABLE_INFRA_SCOPED_FAILFAST) {
-        jobs.failFast = failFast
-        parallel jobs
-        return
-    }
-    // CPS serializes parallel-branch continuations onto a single VM thread, so a
-    // plain list append from the catch blocks below is safe -- there is no
-    // JVM-level concurrency to guard against here.
-    def deferred = []
-    def wrapped = jobs.collectEntries { stageName, body ->
-        // A SLURM dispatcher stage can abort under either scope: its dispatcher pod
-        // is a K8s pod (K8S-scoped aborts) that in turn drives the SLURM job
-        // (SLURM-scoped aborts). Check K8S for every stage and SLURM in addition
-        // for SLURM stages, so neither class of infra abort cascades.
+// Deferrable-infra predicate for trtllm_utils.runBranchesWithInfraDefer. Every
+// branch is checked under K8S -- where the motivating pod-scheduling abort
+// (KubernetesClientTimeoutException) matches, and which also covers K8s-pod
+// aborts of a SLURM dispatcher pod. A SLURM dispatcher stage (per stageScopes,
+// built from opts.slurmDispatcher) is ADDITIONALLY checked under SLURM so a
+// SLURM-scoped abort (SSH outage to the head node, slurm_track ssh exit 255,
+// monitor loss while the job is still active) defers too instead of cascading
+// via failFast. The inner SLURM retry (runLLMTestlistOnSlurm) is already
+// exhausted by the time the branch body returns, so this stays post-retry,
+// mirroring the K8s path. Stages absent from stageScopes are K8S-only.
+def infraDeferPredicate(def pipeline, Map stageScopes) {
+    return { e, stageName ->
         boolean slurmScoped = (stageScopes[stageName] == InfraFailure.SLURM)
-        [(stageName), {
-            try {
-                body()
-            } catch (InterruptedException e) {
-                throw e
-            } catch (Exception e) {
-                if (FailureClassifier.isDeferrableInfra(e, InfraFailure.K8S) ||
-                        (slurmScoped && FailureClassifier.isDeferrableInfra(e, InfraFailure.SLURM))) {
-                    def scopeTag = slurmScoped ? "SLURM/K8s" : "K8s"
-                    deferred.add([stage: stageName])
-                    echo "[INFRA-DEFER] ${stageName}: ${scopeTag} infra abort recorded; " +
-                         "siblings continue instead of fail-fast. ${e.toString()}"
-                    return
-                }
-                throw e
-            }
-        }]
-    }
-    wrapped.failFast = failFast
-    parallel wrapped
-    if (deferred) {
-        echo "[INFRA-DEFER] ${deferred.size()} stage(s) infra-incomplete " +
-             "(${deferred.collect { it.stage }.join(', ')}); marking result UNSTABLE " +
-             "(coverage incomplete, no genuine test failure)."
-        // Distinguish a per-branch infra blip from a cluster-wide outage: when EVERY
-        // branch in the group infra-aborted, the shared infra (a SLURM frontend / a
-        // whole cluster) is the likely culprit. Flag it loudly so a re-run isn't
-        // burned against still-down infra. (A prospective short-circuit that cancels
-        // healthy siblings the moment a quorum aborts is deliberately NOT done here:
-        // it would reintroduce the cross-branch SIGTERM cascade this seam removes.
-        // Tracked as a follow-up.) NB: compare against jobs.size(), not
-        // wrapped.size() -- `wrapped.failFast = failFast` above adds a `failFast`
-        // key that `parallel` consumes, inflating wrapped's entry count by one.
-        if (deferred.size() == jobs.size()) {
-            echo "[INFRA-DEFER] ALL ${jobs.size()} branch(es) infra-aborted; " +
-                 "suspected cluster-wide / shared-frontend outage rather than isolated blips."
-        }
-        currentBuild.result = 'UNSTABLE'
+        classifyFailure(pipeline, e, InfraFailure.K8S) instanceof InfraFailure ||
+            (slurmScoped && classifyFailure(pipeline, e, InfraFailure.SLURM) instanceof InfraFailure)
     }
 }
 
 def launchTestJobs(pipeline, testFilter, globalVars)
 {
     def versionOverride = globalVars[TRTLLM_VERSION_OVERRIDE] ?: ""
+    BOLT_PINNED_REF = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+    BOLT_TEST_BOLTED_TARBALL = globalVars[BOLT_PUBLISH_VARIANT] ?: false
+    TRTLLM_RELEASE_REPO = globalVars["TRTLLM_RELEASE_REPO"]
     // IMPORTANT: Stage Configuration Syntax Requirement
     //
     // The test_to_stage_mapping.py script expects stage definitions in the following format:
@@ -6118,7 +6944,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // may break the mapping functionality.
 
     x86TestConfigs = [
-        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-x86-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-x86-2": ["cpu", "l0_cpu", 2, 2],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "A10-PyTorch-1": ["a10", "l0_a10", 1, 3],
         "A10-PyTorch-2": ["a10", "l0_a10", 2, 3],
@@ -6132,8 +6959,15 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "H100_PCIe-PyTorch-Ray-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         // platform, test DB, split, splits, GPU count, ModelExpress sidecars
+        // In this Kubernetes map only, an optional 6th element `true` attaches the Redis +
+        // ModelExpress server sidecars and the CI ModelExpress env to the pod
+        // (`createKubernetesPodConfig(..., values[5])`). The Slurm maps read slot 6 as the
+        // node count and slot 7 as `runWithSbatch` instead.
         "DGX_H100-2_GPUs-PyTorch-ModelExpress-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "DGX_H100-4_GPUs-PyTorch-ModelExpress-OnDemand-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 4, true],
+        // Post-merge only: the `stage: post_merge` rows of l0_model_express, i.e. the TP=1 smoke
+        // rows of the non-representative families and the accuracy canaries.
+        "DGX_H100-2_GPUs-PyTorch-ModelExpress-Post-Merge-1": ["dgx-h100-x4", "l0_model_express", 1, 1, 2, true],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-PyTorch-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-PyTorch-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -6152,7 +6986,6 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "L40S-PyTorch-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "L40S-FMHA-Post-Merge-1": ["l40s", "l0_l40s", 1, 1],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "H100_PCIe-PyTorch-Perf-1": ["h100-cr", "l0_perf", 1, 1],
         "DGX_H200-8_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200", 1, 1, 8],
         "DGX_H200-4_GPUs-PyTorch-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 1, 4],
         "DGX_H200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["dgx-h200-x8", "l0_dgx_h200_perf_sanity", 1, 1, 8],
@@ -6169,7 +7002,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     ]
 
     x86TestConfigs = cbtsResizeSplits(x86TestConfigs)
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("-Perf-"), values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, values.size() > 5 ? values[5] : false), { attemptTag, isFinalAttempt, retryContext = null ->
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -6177,7 +7010,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext)
+        runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext)
     }]]}
     fullSet = parallelJobs.keySet()
 
@@ -6201,6 +7034,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_H100-4_GPUs-PyTorch-Others-2": ["auto:dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-CPP-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
         "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 9, 1, 1, true],
         "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 9, 1, 1, true],
         "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 9, 1, 1, true],
@@ -6225,12 +7059,14 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "DGX_B200-8_GPUs-PyTorch-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-3": ["auto:dgx-b200-flex", "l0_dgx_b200", 3, 4, 8, 1, true],
         "DGX_B200-8_GPUs-PyTorch-4": ["auto:dgx-b200-flex", "l0_dgx_b200", 4, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
-        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
+        // M3 CTX TP2/EP2 -> GEN TP4/EP1 C++ NIXL bounce accuracy (6 GPUs).
+        "DGX_B200-6_GPUs-PyTorch-M3-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_m3_6gpu", 1, 1, 6, 1, true],
         "B300-PyTorch-1": ["auto:dgx-b300-flex", "l0_b300", 1, 2, 1, 1, true],
         "B300-PyTorch-2": ["auto:dgx-b300-flex", "l0_b300", 2, 2, 1, 1, true],
         "B300-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_b300", 1, 1, 1, 1, true],
         "DGX_B300-4_GPUs-PyTorch-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 1, 4, 1, true],
+        // Keep this functional stage on AWS-PDX for EFA coverage.
+        "DGX_B300-2_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-1": ["b300-flex-aws-pdx", "l0_dgx_b300_efa_multi_nodes", 1, 1, 2, 2, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b300-flex", "l0_dgx_b300", 1, 2, 4, 1, true],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b300-flex", "l0_dgx_b300", 2, 2, 4, 1, true],
         // VisualGen PerfSanity post-merge test
@@ -6238,31 +7074,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // Single-GPU Gemma4 PerfSanity post-merge baseline
         "DGX_B200-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_perf_sanity", 1, 1, 1, 1, true],
         // PerfSanity post-merge tests
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
+        "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
     ]
-    // B200 PerfSanity pre-merge disaggregated (functional-only: perf regressions do not fail CI)
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        1,
-        16,
-        2
-    )
-    // B200 PerfSanity post-merge disaggregated
-    // 2 Nodes
-    x86SlurmTestConfigs += buildStageConfigs(
-        "DGX_B200-16_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU8-Post-Merge",
-        "auto:dgx-b200-flex",
-        "l0_b200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu8",
-        2,
-        16,
-        2
-    )
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -6280,7 +7094,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, false, retryContext?.infraRetryMax)
+        runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, false, retryContext?.infraRetryMax)
     }, [singleAttempt: true, slurmDispatcher: true]]]}
     // SLURM dispatcher pods run their own inner retry loop
     // (runLLMTestlistOnSlurm with SLURM_INFRA_RETRY_MAX). Disabling the outer
@@ -6294,7 +7108,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     // SBSA machines from the Blossom machine pool
     SBSATestConfigs = [
-        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 1],
+        "CPU-Generic-arm-1": ["cpu", "l0_cpu", 1, 2],
+        "CPU-Generic-arm-2": ["cpu", "l0_cpu", 2, 2],
         "GH200-PyTorch-Post-Merge-1": ["gh200", "l0_gh200", 1, 1],
         // DGX Spark is also named as GB10 Grace Blackwell Superchip.
         "GB10-PyTorch-1": ["gb10x", "l0_gb10", 1, 1],
@@ -6311,37 +7126,40 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
         "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
         "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 1, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 2, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 2, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
-        // PerfSanity pre-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 2, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 2, 4],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 4, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 4, 4],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 5, 4, 1, true, false],
-        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 5, 4, 1, true, false],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 4, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 5, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 6, 7, 4, 1, true, false],
+        "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 7, 7, 4, 1, true, false],
     ]
     SBSASlurmTestConfigs = cbtsResizeSplits(SBSASlurmTestConfigs)
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
-        // Each testcase uses 8 GPUs and 2 nodes.
+        // Each GB200 testcase below uses 8 GPUs and 2 nodes.
         // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
         "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
+        // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
+        // stage <-> test by list name with a line-based parser, so a shared list or a helper's
+        // output breaks the mapping. For SingleNvlinkDomain see singleNvlinkDomainMode.
+        "GB300-8_GPUs-2_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node2_gpu8", 1, 1, 8, 2],
+        "GB300-16_GPUs-4_Nodes-PyTorch-SingleNvlinkDomain-Post-Merge-1": ["auto:gb300-flex", "l0_gb300_multi_nodes_node4_gpu16", 1, 1, 16, 4],
     ]
     // PerfSanity post-merge aggregated
     // 2 Nodes
@@ -6349,35 +7167,17 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
-        6,
-        8,
-        2
-    )
-    // PerfSanity pre-merge disaggregated (functional-only: perf regressions do not fail CI)
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        1,
+        2,
         8,
         2
     )
     // PerfSanity post-merge disaggregated
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU2-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2",
-        1,
-        8,
-        2
-    )
-    multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        5,
+        2,
         8,
         2
     )
@@ -6390,95 +7190,22 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         12,
         3
     )
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
+        "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
         1,
-        12,
-        3
-    )
-    // 4 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
-        1,
-        16,
-        4
-    )
-    // 5 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
-        20,
-        5
-    )
-    // 6 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE4-GPU16-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node4_gpu16",
-        2,
-        24,
-        6
-    )
-    // 9 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "auto:gb200-flex",
-        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node8_gpu32",
-        1,
-        36,
-        9
-    )
-    // GB300 PerfSanity post-merge aggregated
-    // 2 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_node2_gpu8",
-        2,
         8,
         2
     )
     // GB300 PerfSanity post-merge disaggregated
-    // 3 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        4,
-        12,
-        3
-    )
-    // 5 Nodes
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-20_GPUs-5_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE4-GPU16-Post-Merge",
-        "gb300-flex-aws-cmh",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node4_gpu16",
-        2,
-        20,
-        5
-    )
-    // GB300 GLM-5 disaggregated (ctx DEP2)
-    // 3 Nodes (pre-merge, functional-only)
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-FUNCTIONAL-ONLY-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8",
-        "auto:gb300-flex",
-        "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        1,
-        12,
-        3
-    )
-    // 3 Nodes
+    // GLM-5 (ctx DEP2): 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU2-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu2_gen1_node2_gpu8",
-        2,
+        3,
         12,
         3
     )
@@ -6494,7 +7221,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 9 Nodes: ctx1 (1 node, 4 GPUs) + gen4 (2 nodes, 8 GPUs each) = 36 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-36_GPUs-9_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN4-NODE2-GPU8-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen4_node2_gpu8",
         2,
         36,
@@ -6512,7 +7239,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 11 Nodes: ctx3 (1 node, 4 GPUs each) + gen1 (8 nodes, 32 GPUs) = 44 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-44_GPUs-11_Nodes-PyTorch-Disagg-PerfSanity-CTX3-NODE1-GPU4-GEN1-NODE8-GPU32-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx3_node1_gpu4_gen1_node8_gpu32",
         2,
         44,
@@ -6527,7 +7254,34 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         56,
         14
     )
-    // Nemotron-Ultra-V3 8k64k con1: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
+    // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8",
+        6,
+        8,
+        2
+    )
+    // gen_only_no_context: gen1 (4 nodes, 16 GPUs), no ctx fleet = 16 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-16_GPUs-4_Nodes-PyTorch-PerfSanity-GEN1-NODE4-GPU16-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node4_gpu16",
+        2,
+        16,
+        4
+    )
+    // gen_only_no_context: gen1 (8 nodes, 32 GPUs), no ctx fleet = 32 GPUs
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB300-32_GPUs-8_Nodes-PyTorch-PerfSanity-GEN1-NODE8-GPU32-Post-Merge",
+        "auto:gb300-flex",
+        "l0_gb300_multi_nodes_perf_sanity_gen1_node8_gpu32",
+        2,
+        32,
+        8
+    )
+    // Nemotron-Ultra-V3 8k64k con1 and GLM-5.3-Flash FP8 8k1k con16: ctx1 (1 node, 4 GPUs) + gen1 tep4 (1 node, 4 GPUs) = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb300-flex",
@@ -6539,43 +7293,21 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Nemotron-Ultra-V3 50k2k con12: ctx1 (1 node, 4 GPUs) + gen6 (6 nodes, 4 GPUs each) = 28 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB300-28_GPUs-7_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN6-NODE1-GPU4-Post-Merge",
-        "gb300-flex-aws-cmh",
+        "auto:gb300-flex",
         "l0_gb300_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen6_node1_gpu4",
         2,
         28,
         7
     )
-    // Nemotron-Ultra-V3 50k2k con178: ctx5 (5 nodes, 4 GPUs each) + gen1 dep4 (1 node, 4 GPUs) = 24 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-CTX5-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
-        "gb300-flex-aws-cmh",
-        "l0_gb300_multi_nodes_perf_sanity_ctx5_node1_gpu4_gen1_node1_gpu4",
-        2,
-        24,
-        6
-    )
     // Nemotron-Ultra-V3 con9832 (8k64k) and con1197 (50k2k) are ctx_only-only:
     // their full 68-/72-GPU e2e+gen_only disagg topologies are intentionally not
     // created; the ctx_only ids run in the 4-GPU multi_gpus post-merge stage.
-    // GB300 DeepSeek-V4-Pro-DSpark, AgentX agentic trace replay.
-    // These lanes replay a ~1M-token multi-turn conversation trace for a fixed
-    // wall-clock duration instead of a fixed prompt count, so they are pinned to
-    // aws-cmh where the DSpark checkpoint and the trace corpus are staged.
-    // 6 Nodes: ctx2 (2 nodes, 8 GPUs each) + gen1 (2 nodes, 8 GPUs) = 24 GPUs
-    multiNodesSBSAConfigs += buildStageConfigs(
-        "GB300-24_GPUs-6_Nodes-PyTorch-Disagg-PerfSanity-AgentX-CTX2-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
-        "gb300-flex-aws-cmh",
-        "l0_gb300_multi_nodes_perf_sanity_ctx2_node2_gpu8_gen1_node2_gpu8",
-        1,
-        24,
-        6
-    )
     multiNodesSBSAConfigs = cbtsResizeSplits(multiNodesSBSAConfigs)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
         parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), { attemptTag, isFinalAttempt, retryContext = null ->
-            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3], false, "cp312", attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
+            runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, key, values[2], values[3], false, attemptTag, isFinalAttempt, retryContext, values[4] ?: false)
         }]]}
 
         // Add SBSA Slurm jobs
@@ -6594,7 +7326,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 1, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
         parallelJobs += parallelSlurmJobs
 
@@ -6608,7 +7340,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key.contains("llvm")) {
                 config = LLVM_CONFIG
             }
-            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("-Perf-"), key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, "cp312", attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
+            runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key, values[2], values[3], values[4] ?: 1, values[5] ?: 2, values[6] ?: false, false, attemptTag, values[7] ?: false, retryContext?.infraRetryMax)
         }, [singleAttempt: true, slurmDispatcher: true]]]}
 
         parallelJobs += parallelMultiNodesSBSAJobs
@@ -6636,7 +7368,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // pod-launch attempt; isFinalAttempt suppresses synthetic stage-fail XML
         // and junit() on intermediate retryable infra failures.
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
+            cacheErrorAndUploadResult(pipeline, "${key}", values[1], {}, true, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
@@ -6644,7 +7376,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // Runs on a CPU node ("build" pod type, kubernetes-cpu cloud) — it needs no
     // GPU and no TRT-LLM wheel, only its own `pip install -e agent-flow[test]`.
     // CBTS narrows this to agent-flow-only changes via
-    // jenkins/scripts/cbts/rules/agent_flow_rule.py; AGENT_FLOW_STAGE in that
+    // jenkins/scripts/cbts/cbts/rules/agent_flow.py; AGENT_FLOW_STAGE in that
     // rule MUST equal the stage name below or CBTS Layer 2 will drop it.
     agentFlowTestSpec = createKubernetesPodConfig(LLM_DOCKER_IMAGE, "build")
     // Single source of truth for the stage name: it is both the map key (which
@@ -6669,7 +7401,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     agentFlowTestJobs = agentFlowTestConfigs.collectEntries{key, values -> [key, [values[0], { attemptTag, isFinalAttempt, retryContext = null ->
         stage("[${key}] Run") {
-            cacheErrorAndUploadResult("${key}", values[1], {}, false, attemptTag, isFinalAttempt, retryContext)
+            cacheErrorAndUploadResult(pipeline, "${key}", values[1], {}, false, attemptTag, isFinalAttempt, retryContext)
         }
     }]]}
 
@@ -6741,7 +7473,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     }
 
     sanityCheckJobs = sanityCheckConfigs.collectEntries {key, values -> [toStageName(values[1], key), {
-        cacheErrorAndUploadResult(toStageName(values[1], key), {
+        cacheErrorAndUploadResult(pipeline, toStageName(values[1], key), {
             def cpu_arch = values[2]
             def gpu_type = values[1].toLowerCase()
             if (values[1] == "B200_PCIe") {
@@ -6765,32 +7497,33 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             sanityRunner = runInKubernetes(pipeline, sanitySpec, "trt-llm")
 
             def isDlfw = values[4]
-            def packageVersionOverride = versionOverride
-            if (isDlfw) {
-                // Extract PyTorch version from LLM_DOCKER_IMAGE. e.g. pytorch-26.02 -> 2602
-                def matcher = LLM_DOCKER_IMAGE =~ /:pytorch-(\d+)\.(\d+)-/
-                if (!matcher.find()) {
-                    error "Failed to extract PyTorch version from LLM_DOCKER_IMAGE: ${LLM_DOCKER_IMAGE}"
-                }
-                packageVersionOverride +=
-                    "+ngcpytorch${matcher.group(1)}${matcher.group(2)}"
-            }
-            def wheelName = ""
+            def wheelPath = ""
             def cpver = "cp312"
-            def pyver = "3.12"
             if (key.contains("PY310")) {
                 cpver = "cp310"
-                pyver = "3.10"
             }
 
+            // Same switch the build helpers use for the tarball, so the released
+            // wheel and the released tarball are never optimized differently.
+            def boltConsume = globalVars[BOLT_CONSUME_BUILD]?.toString() == "true"
+            // The bundle this pipeline pinned, so the released wheel is optimized
+            // with the same profiles the tested build was. Empty means unpinned:
+            // apply_latest.sh then takes whatever `latest` is, i.e. today's
+            // behaviour.
+            def boltProfileRef = globalVars[BOLT_PROFILE_REF]?.toString() ?: ""
+            def boltProfileBranch = globalVars[BOLT_PROFILE_BRANCH]?.toString() ?: ""
+            def kitmakerDryRun = testFilter[(IS_POST_MERGE)] ?: false
+
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", packageVersionOverride, cpver, values[7])
+                wheelPath = runLLMBuild(
+                    pipeline, cpu_arch, values[3], "", versionOverride, cpver,
+                    values[7], isDlfw, boltConsume, boltProfileRef, boltProfileBranch,
+                    kitmakerDryRun)
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
-            // def fullWheelPath = "${cpu_arch}/${wheelName}"
             // sanityRunner("Sanity check") {
-            //     runPackageSanityCheck(pipeline, fullWheelPath, values[3], cpver)
+            //     runPackageSanityCheck(pipeline, wheelPath, values[3])
             // }
 
             def checkPipStage = false
@@ -6801,7 +7534,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             }
 
             if (checkPipStage) {
-                stage("Run LLMAPI Test") {
+                stage("[${toStageName(values[1], key)}] Run LLMAPI Test") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)
                     runKubernetesPodWithInfraRetry(pipeline, pipInstallSanitySpec, "trt-llm", toStageName(values[1], key), { attemptTag, isFinalAttempt, retryContext = null ->
                         echo "###### Prerequisites Start ######"
@@ -6830,31 +7563,40 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                             def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-2")
+                            // Match the CUDA the DLFW base image builds the wheel with.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y cuda-toolkit-13-4")
                         }
-                        // Extra PyTorch CUDA 13.2 install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
+                        // Extra CUDA 13 PyTorch install for all bare-metal environments (Default PyTorch is for CUDA 12.8)
                         if (values[6]) {
-                            echo "###### Extra PyTorch CUDA 13.2 install Start ######"
-                            // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
-                            // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.12.0+cu130 torchvision==0.27.0+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple --extra-index-url https://download.pytorch.org/whl/cu130")
+                            echo "###### Extra CUDA 13 PyTorch install Start ######"
+                            // Must match what requirements.txt resolves to from the public index: the
+                            // wheel under test is linked against that libtorch, and a mismatch fails
+                            // the import with an undefined c10 symbol instead of a version error.
+                            // The internal mirror proxies https://download.pytorch.org/whl/cu132.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.14.0+cu132 torchvision==0.29.0+cu132 --extra-index-url https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pytorch-cuda-thirteen-two-remote/simple")
                         }
 
-                        def libEnv = []
-                        if (env.alternativeTRT) {
-                            stage("Replace TensorRT") {
-                                trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
-                            }
-                            libEnv += ["LD_LIBRARY_PATH+tensorrt=/usr/local/tensorrt/lib"]
-                            libEnv += ["LD_LIBRARY_PATH+nvrtc=/usr/local/lib/python${pyver}/dist-packages/nvidia/cuda_nvrtc/lib"]
-                        }
+                        // A stock image, so nothing here went through Dockerfile.multi or
+                        // install_base.sh: what a singleton MPI_Comm_spawn needs has to be
+                        // redone by hand, or checkPipInstall's quickstart hangs in
+                        // MpiPoolSession until the timeout. PRRTE will not fork its DVM as
+                        // root without these (Open MPI 4 only checked that in mpirun), and
+                        // PMIX_HOSTNAME is the hostname-too-long-for-MPI one -- see
+                        // runLLMTestlistOnPlatform.
+                        def libEnv = [
+                            "OMPI_ALLOW_RUN_AS_ROOT=1",
+                            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT=1",
+                            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM=1",
+                            "PMIX_HOSTNAME=mpi-node0",
+                        ]
                         echo "###### Check pip install Start ######"
                         withEnv(libEnv) {
                             // Retry 2 times if timeout occurs.
                             sh "env | sort"
                             trtllm_utils.llmRetry(1, "checkPipInstall", {
                                 timeout(time: 30, unit: 'MINUTES') {
-                                    checkPipInstall(pipeline, "${cpu_arch}", packageVersionOverride)
+                                    checkPipInstall(pipeline, wheelPath)
                                 }
                             })
                         }
@@ -6880,7 +7622,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
                         }
                         withEnv(libEnv) {
                             sh "env | sort"
-                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, cpver, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
+                            runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, toStageName(values[1], key), 1, 1, true, "-SubJob-RunTest" + attemptTag, isFinalAttempt, retryContext)
                         }
                     })
                 }
@@ -6921,9 +7663,9 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         println parallelJobsFiltered.keySet()
     }
 
-    // Check --post-merge, post-merge or TRT dependency testing pipelines.
+    // Check --post-merge or post-merge pipelines.
     // If true, add post-merge only test stages and multi-GPU test stages.
-    if (env.alternativeTRT || testFilter[(IS_POST_MERGE)]) {
+    if (testFilter[(IS_POST_MERGE)]) {
         parallelJobsFiltered += multiGpuJobs
         parallelJobsFiltered += postMergeJobs
     }
@@ -7041,6 +7783,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     echo "Check the passed GitLab bot testFilter parameters."
     def keysStr = parallelJobsFiltered.keySet().join(",\n")
     pipeline.echo "Now we will run stages: [\n${keysStr}\n]"
+    def maintenanceConfig = globalVars[MAINTENANCE_ENTRIES] ?: [reason: "", patterns: []]
+    def maintenancePatterns = maintenanceConfig.patterns ?: []
+    warnUnmatchedMaintenancePatterns(
+        parallelJobsFiltered.keySet(), maintenancePatterns)
 
     // Per-stage execution scope for infra-scoped fail-fast (runBranchesWithInfraDefer).
     // A stage carrying opts.slurmDispatcher runs its work through a SLURM dispatcher
@@ -7056,6 +7802,10 @@ def launchTestJobs(pipeline, testFilter, globalVars)
             if (key in testFilter[REUSE_STAGE_LIST]) {
                 stage("Skip - Reused") {
                     echo "Skip - Passed in the previous pipelines."
+                }
+            } else if (stageMatchesAnyPattern(key, maintenancePatterns)) {
+                stage("Skip - Maintenance") {
+                    failMaintenanceStage(key, maintenanceConfig.reason)
                 }
             } else if (values instanceof List) {
                 // parallelJobs entries are either [podSpec, runner] or
@@ -7136,19 +7886,29 @@ def launchTestJobsForImagesSanityCheck(pipeline, globalVars) {
     testConfigs = testConfigs.findAll { key, config ->
         return config.image != null
     }
+    def maintenanceConfig = globalVars[MAINTENANCE_ENTRIES] ?: [reason: "", patterns: []]
+    def maintenancePatterns = maintenanceConfig.patterns ?: []
+    warnUnmatchedMaintenancePatterns(
+        testConfigs.values()*.name, maintenancePatterns)
 
     echo "Filtered test configs with images:"
     println testConfigs
 
     def testJobs = testConfigs.collectEntries { key, values -> [values.name, {
-        if (values.wheelInstalled) {
+        if (stageMatchesAnyPattern(values.name, maintenancePatterns)) {
+            stage(values.name) {
+                stage("Skip - Maintenance") {
+                    failMaintenanceStage(values.name, maintenanceConfig.reason)
+                }
+            }
+        } else if (values.wheelInstalled) {
             stage(values.name) {
                 echo "Run ${values.name} sanity test."
                 imageSanitySpec = createKubernetesPodConfig(values.image, values.gpuType, values.k8sArch)
                 runKubernetesPodWithInfraRetry(pipeline, imageSanitySpec, "trt-llm", values.name, { attemptTag, isFinalAttempt, retryContext = null ->
                     sh "env | sort"
                     trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y git rsync curl")
-                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, false, values.name, 1, 1, true, null, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
+                    runLLMTestlistOnPlatform(pipeline, values.gpuType, "l0_sanity_check", values.config, values.name, 1, 1, true, "-SubJob-TestImage" + attemptTag, isFinalAttempt, retryContext)
                 })
             }
         } else {
@@ -7184,7 +7944,7 @@ pipeline {
         HF_HOME="${env.WORKSPACE_TMP}/.cache/huggingface"
         CCACHE_DIR="${CCACHE_DIR}"
         GITHUB_MIRROR="https://urm.nvidia.com/artifactory/github-go-remote"
-        PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
+        PIP_INDEX_URL="https://artifactory.pdx.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
         CMAKE_POLICY_VERSION_MINIMUM="3.5"
@@ -7205,25 +7965,16 @@ pipeline {
                     globalVars = trtllm_utils.updateMapWithJson(this, globalVars, env.globalVars, "globalVars")
                     globalVars = trtllm_utils.initializeCiBudget(this, globalVars, 24, 'HOURS', 'L0_Test')
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
-                }
-            }
-        }
-        stage("Check Test List")
-        {
-            when {
-                expression {
-                    // Only run the test list validation when necessary
-                    globalVars[RUN_MODE] != "nightly_release" &&
-                    env.targetArch == X86_64_TRIPLE &&
-                    testFilter[ONLY_ONE_GROUP_CHANGED] != "Docs" &&
-                    !(env.JOB_NAME ==~ /.*Multi-GPU.*/) &&
-                    !(env.JOB_NAME ==~ /.*BuildDockerImageSanityTest.*/)
-                }
-            }
-            steps
-            {
-                script {
-                    launchTestListCheck(this)
+                    if (globalVars[LLM_ARTIFACTS_PRIMARY_KEY]) {
+                        LLM_ARTIFACTS_PRIMARY_FROM_PARENT = globalVars[LLM_ARTIFACTS_PRIMARY_KEY].toString()
+                        echo "Build artifacts: primary location ${llmArtifactsPrimary()}, passed by the parent pipeline"
+                    }
+                    // The read helper that fetchBuildArtifact unstashes on every node.
+                    def fetchHelperDir = "${pwd(tmp: true)}/fetch-build-artifact"
+                    trtllm_utils.checkoutFile(LLM_REPO, env.gitlabCommit, "jenkins/scripts/fetch_build_artifact.sh", fetchHelperDir)
+                    dir(fetchHelperDir) {
+                        stash(name: FETCH_BUILD_ARTIFACT_STASH, includes: "fetch_build_artifact.sh")
+                    }
                 }
             }
         }
@@ -7281,7 +8032,8 @@ pipeline {
                                 echo "Skip multi-GPU testing. No test to run."
                             }
                             if (singleGpuJobs.size() > 0) {
-                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
+                                trtllm_utils.runBranchesWithInfraDefer(this, singleGpuJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(this, stageInfraScope))
                             } else if (isInfraDryRun()) {
                                 error "Skip single-GPU testing. No test to run for infrastructure dry run."
                             } else {
@@ -7290,20 +8042,23 @@ pipeline {
                         } else if (env.JOB_NAME ==~ /.*Multi-GPU.*/) {
                             echo "Only run multi-GPU tests."
                             if (dgxJobs.size() > 0) {
-                                runBranchesWithInfraDefer(dgxJobs, params.enableFailFast, stageInfraScope)
+                                trtllm_utils.runBranchesWithInfraDefer(this, dgxJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(this, stageInfraScope))
                             } else {
                                 error "Skip multi-GPU testing. No test to run."
                             }
                         } else {
                             if (singleGpuJobs.size() > 0) {
-                                runBranchesWithInfraDefer(singleGpuJobs, params.enableFailFast, stageInfraScope)
+                                trtllm_utils.runBranchesWithInfraDefer(this, singleGpuJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(this, stageInfraScope))
                             } else {
                                 echo "Skip single-GPU testing. No test to run."
                             }
 
                             if (dgxJobs.size() > 0) {
                                 stage(testPhase2StageName) {
-                                    runBranchesWithInfraDefer(dgxJobs, params.enableFailFast, stageInfraScope)
+                                    trtllm_utils.runBranchesWithInfraDefer(this, dgxJobs, params.enableFailFast,
+                                    ENABLE_INFRA_SCOPED_FAILFAST, infraDeferPredicate(this, stageInfraScope))
                                 }
                             }
                         }
@@ -7316,6 +8071,7 @@ pipeline {
                         } catch (Exception sweepErr) {
                             echo "[SLURM-FINALIZER] post-build sweep error: ${sweepErr}"
                         }
+                        appendMaintenanceSummary(globalVars)
                     }
                 }
             }

@@ -79,6 +79,10 @@ NVMLWrapper::NVMLWrapper()
     // Optional symbols - nullptr is OK (older drivers may not have these)
     *reinterpret_cast<void**>(&_nvmlDeviceGetGpuFabricInfoV) = loadSym(mHandle, "nvmlDeviceGetGpuFabricInfoV");
     *reinterpret_cast<void**>(&_nvmlDeviceGetGpuFabricInfo) = loadSym(mHandle, "nvmlDeviceGetGpuFabricInfo");
+    *reinterpret_cast<void**>(&_nvmlDeviceGetFieldValues) = loadSym(mHandle, "nvmlDeviceGetFieldValues");
+    *reinterpret_cast<void**>(&_nvmlDeviceGetMaxPcieLinkGeneration)
+        = loadSym(mHandle, "nvmlDeviceGetMaxPcieLinkGeneration");
+    *reinterpret_cast<void**>(&_nvmlDeviceGetMaxPcieLinkWidth) = loadSym(mHandle, "nvmlDeviceGetMaxPcieLinkWidth");
 
     if (!_nvmlDeviceGetGpuFabricInfoV)
     {
@@ -167,6 +171,33 @@ nvmlReturn_t NVMLWrapper::nvmlDeviceGetComputeRunningProcesses(
     nvmlDevice_t device, unsigned int* infoCount, nvmlProcessInfo_v2_t* infos) const
 {
     return (*_nvmlDeviceGetComputeRunningProcesses)(device, infoCount, infos);
+}
+
+nvmlReturn_t NVMLWrapper::nvmlDeviceGetFieldValues(nvmlDevice_t device, int valuesCount, nvmlFieldValue_t* values) const
+{
+    if (_nvmlDeviceGetFieldValues == nullptr)
+    {
+        return NVML_ERROR_FUNCTION_NOT_FOUND;
+    }
+    return (*_nvmlDeviceGetFieldValues)(device, valuesCount, values);
+}
+
+nvmlReturn_t NVMLWrapper::nvmlDeviceGetMaxPcieLinkGeneration(nvmlDevice_t device, unsigned int* maxLinkGen) const
+{
+    if (_nvmlDeviceGetMaxPcieLinkGeneration == nullptr)
+    {
+        return NVML_ERROR_FUNCTION_NOT_FOUND;
+    }
+    return (*_nvmlDeviceGetMaxPcieLinkGeneration)(device, maxLinkGen);
+}
+
+nvmlReturn_t NVMLWrapper::nvmlDeviceGetMaxPcieLinkWidth(nvmlDevice_t device, unsigned int* maxLinkWidth) const
+{
+    if (_nvmlDeviceGetMaxPcieLinkWidth == nullptr)
+    {
+        return NVML_ERROR_FUNCTION_NOT_FOUND;
+    }
+    return (*_nvmlDeviceGetMaxPcieLinkWidth)(device, maxLinkWidth);
 }
 
 bool NVMLWrapper::hasGpuFabricInfoV() const

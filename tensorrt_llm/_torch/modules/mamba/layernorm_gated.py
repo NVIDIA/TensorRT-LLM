@@ -16,6 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -67,6 +70,7 @@ def _layer_norm_fwd_1pass_kernel(
     NORM_BEFORE_GATE: tl.constexpr,
     IS_RMS_NORM: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
 ):
     # Map the program id to the row of X and Y it should compute.
@@ -106,6 +110,8 @@ def _layer_norm_fwd_1pass_kernel(
     # Normalize and apply linear transformation
     mask = cols < N
     w = tl.load(W + cols, mask=mask).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
     if HAS_BIAS:
         b = tl.load(B + cols, mask=mask).to(tl.float32)
     x_hat = (x - mean) * rstd if not IS_RMS_NORM else x * rstd
@@ -135,6 +141,22 @@ _MULTIROW_NUM_WARPS = 4
 _MULTIROW_MAX_N = 256
 
 
+@functools.lru_cache(maxsize=None)
+def _pdl_device_policy(device_index: int) -> tuple[bool, int]:
+    """Whether PDL is allowed on this device, and its SM count."""
+    props = torch.cuda.get_device_properties(device_index)
+    sm_version = props.major * 10 + props.minor
+    allowed = (sm_version >= 90
+               and os.environ.get("TRTLLM_ENABLE_PDL", "1") == "1")
+    return allowed, props.multi_processor_count
+
+
+def _multirow_pdl(grid_size: int, device_index: int) -> bool:
+    """Use PDL only when the launch grid cannot cover all SMs by itself."""
+    allowed, num_sms = _pdl_device_policy(device_index)
+    return allowed and grid_size < num_sms
+
+
 @triton.heuristics({"OUTPUT_FP8": lambda args: args["FP8_SCALE"] is not None})
 @triton.heuristics({"SAVE_RSTD": lambda args: args["Rstd"] is not None})
 @triton.jit
@@ -154,8 +176,11 @@ def _rms_norm_gated_fwd_multirow_kernel(
     ROWS: tl.constexpr,  # rows per program
     HEADS_PER_TOK: tl.constexpr,
     GATE_SIGMOID: tl.constexpr,
+    WEIGHT_IS_DELTA: tl.constexpr,
     SAVE_RSTD: tl.constexpr,
     OUTPUT_FP8: tl.constexpr,
+    LAUNCH_WITH_PDL: tl.constexpr,
+    EARLY_TRIGGER: tl.constexpr = False,
 ):
     """Gated rmsnorm(x), several short rows per program.
 
@@ -170,13 +195,23 @@ def _rms_norm_gated_fwd_multirow_kernel(
     row_mask = rows < M
     cols = tl.arange(0, N)
     mask2d = row_mask[:, None]
+    if EARLY_TRIGGER:
+        # Dependents read Y only after their own griddepcontrol.wait.
+        tl.extra.cuda.gdc_launch_dependents()
+    # The weight is a parameter (not produced in-step), so it is fetched before
+    # the PDL wait; X (the producer's output) and Z (an earlier in-step kernel's
+    # output) are read only after it.
+    w = tl.load(W + cols).to(tl.float32)
+    if WEIGHT_IS_DELTA:
+        w += 1.0
+    if LAUNCH_WITH_PDL:
+        tl.extra.cuda.gdc_wait()
     x_off = rows[:, None].to(tl.int64) * stride_x_row + cols[None, :]
     x = tl.load(X + x_off, mask=mask2d, other=0.0).to(tl.float32)
     var = tl.sum(x * x, axis=1) / N
     rstd = 1.0 / tl.sqrt(var + eps)
     if SAVE_RSTD:
         tl.store(Rstd + rows, rstd, mask=row_mask)
-    w = tl.load(W + cols).to(tl.float32)
     y = x * rstd[:, None] * w[None, :]
     tok = rows // HEADS_PER_TOK
     head = rows % HEADS_PER_TOK
@@ -195,6 +230,9 @@ def _rms_norm_gated_fwd_multirow_kernel(
         y *= tldevice.rcp_rn(tl.load(FP8_SCALE).to(tl.float32))
     y_off = rows[:, None].to(tl.int64) * stride_y_row + cols[None, :]
     tl.store(Y + y_off, y.to(Y.dtype.element_ty), mask=mask2d)
+    if LAUNCH_WITH_PDL and not EARLY_TRIGGER:
+        # Release only after both Rstd (when present) and Y have been stored.
+        tl.extra.cuda.gdc_launch_dependents()
 
 
 def _multirow_gated_rmsnorm_eligible(N, ngroups, bias, z, norm_before_gate,
@@ -252,9 +290,11 @@ def rms_norm_gated_token_major(
         return y
     out_dtype = torch.float8_e4m3fn if fp8_scale is not None else x.dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    grid = (triton.cdiv(M, _MULTIROW_ROWS), )
-    with torch.cuda.device(x.device.index):
-        _rms_norm_gated_fwd_multirow_kernel[grid](
+    grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+    device_index = x.device.index
+    launch_with_pdl = _multirow_pdl(grid_size, device_index)
+    with torch.cuda.device(device_index):
+        _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
             x,
             out,
             weight,
@@ -270,7 +310,13 @@ def rms_norm_gated_token_major(
             ROWS=_MULTIROW_ROWS,
             HEADS_PER_TOK=heads,
             GATE_SIGMOID=gate_sigmoid,
+            WEIGHT_IS_DELTA=False,
+            LAUNCH_WITH_PDL=launch_with_pdl,
             num_warps=_MULTIROW_NUM_WARPS,
+            # Dependents (out_proj) prefetch their weights; they read Y only
+            # after their own griddepcontrol.wait.
+            EARLY_TRIGGER=_pdl_device_policy(device_index)[0],
+            launch_pdl=launch_with_pdl,
         )
     return out
 
@@ -301,6 +347,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     fp8_scale=None,
     gate_activation="silu",
+    weight_is_delta=False,
 ):
     if gate_activation not in ("silu", "sigmoid"):
         raise ValueError(
@@ -337,9 +384,11 @@ def _layer_norm_fwd(
     rstd = torch.empty((ngroups * M, ), dtype=torch.float32, device=x.device)
     if _multirow_gated_rmsnorm_eligible(group_size, ngroups, bias, z,
                                         norm_before_gate, is_rms_norm):
-        grid = (triton.cdiv(M, _MULTIROW_ROWS), )
-        with torch.cuda.device(x.device.index):
-            _rms_norm_gated_fwd_multirow_kernel[grid](
+        grid_size = triton.cdiv(M, _MULTIROW_ROWS)
+        device_index = x.device.index
+        launch_with_pdl = _multirow_pdl(grid_size, device_index)
+        with torch.cuda.device(device_index):
+            _rms_norm_gated_fwd_multirow_kernel[(grid_size, )](
                 x,
                 out,
                 weight,
@@ -355,7 +404,10 @@ def _layer_norm_fwd(
                 ROWS=_MULTIROW_ROWS,
                 HEADS_PER_TOK=1,
                 GATE_SIGMOID=gate_sigmoid,
+                WEIGHT_IS_DELTA=weight_is_delta,
+                LAUNCH_WITH_PDL=launch_with_pdl,
                 num_warps=_MULTIROW_NUM_WARPS,
+                launch_pdl=launch_with_pdl,
             )
         return out, mean, rstd
     # Less than 64KB per feature: enqueue fused kernel
@@ -387,6 +439,7 @@ def _layer_norm_fwd(
             NORM_BEFORE_GATE=norm_before_gate,
             IS_RMS_NORM=is_rms_norm,
             GATE_SIGMOID=gate_sigmoid,
+            WEIGHT_IS_DELTA=weight_is_delta,
             num_warps=num_warps,
         )
     return out, mean, rstd
@@ -403,9 +456,13 @@ class RMSNorm(torch.nn.Module):
         device=None,
         dtype=None,
         is_nvfp4: bool = False,
+        weight_is_delta: bool = False,
     ):
-        """If group_size is not None, we do GroupNorm with each group having group_size elements.
-        group_size=None is equivalent to group_size=hidden_size (i.e. there's only 1 group).
+        """Create grouped RMSNorm with an optional activation gate.
+
+        ``group_size=None`` normalizes the full hidden dimension. When
+        ``weight_is_delta`` is true, the checkpoint stores ``weight - 1`` and
+        the kernel applies ``1 + weight`` (the Gemma convention).
         """
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -416,8 +473,13 @@ class RMSNorm(torch.nn.Module):
         self.register_parameter("bias", None)
         self.group_size = group_size if group_size is not None else hidden_size
         self.norm_before_gate = norm_before_gate
+        self.weight_is_delta = weight_is_delta
 
         self.is_nvfp4 = is_nvfp4
+        if self.is_nvfp4 and self.weight_is_delta:
+            raise ValueError(
+                "NVFP4 RMSNorm output quantization requires absolute norm "
+                "weights; delta-form weights are not supported")
         # nvfp4_scale will be set externally if is_nvfp4 is True
         self.nvfp4_scale: torch.Tensor | None = None
         # fp8_scale will be attached from the downstream static FP8 linear.
@@ -484,5 +546,6 @@ class RMSNorm(torch.nn.Module):
             norm_before_gate=self.norm_before_gate,
             is_rms_norm=True,
             fp8_scale=fp8_scale,
+            weight_is_delta=self.weight_is_delta,
         )
         return y.reshape(x_shape_og)

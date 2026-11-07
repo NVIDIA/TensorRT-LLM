@@ -7,7 +7,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
+from tensorrt_llm._torch.device_mesh import (DeviceMeshTopologyImpl,
+                                             SingleProcessGroup)
 from tensorrt_llm._utils import get_free_port
 from tensorrt_llm.mapping import Mapping
 
@@ -62,6 +63,21 @@ class TestMapping(unittest.TestCase):
             nprocs=world_size,
             join=True,
         )
+
+    @pytest.mark.gpu2
+    def test_one_rank_mapping_inside_a_larger_job(self):
+        """A Mapping with world_size 1 built while the job's mesh spans two ranks
+        must report rank 0 and size-1 groups of its own, not the job's, whether
+        the job's mesh has a tp dimension or only moe_tp/moe_ep."""
+        world_size = 2
+        for tp, moe_tp, moe_ep in ((2, -1, -1), (2, 1, 2)):
+            mp.spawn(
+                self._worker,
+                args=(world_size, get_free_port(), tp, 1, 1, moe_tp, moe_ep,
+                      "one_rank"),
+                nprocs=world_size,
+                join=True,
+            )
 
     @staticmethod
     def _worker(rank: int,
@@ -128,6 +144,27 @@ class TestMapping(unittest.TestCase):
 
                 assert mpi_value == device_mesh_value, \
                     f"Property {prop} mismatch: MPI={mpi_value}, DeviceMesh={device_mesh_value} (rank {rank})"
+        elif test_type == "one_rank":
+            job = mapping_device_mesh
+            job.build_mesh()
+
+            def check_job():
+                assert job.tp_rank == rank and job.tp_group_pg.size(
+                ) == world_size
+                assert job.pp_group_pg.size() == 1 and job.cp_group_pg.size(
+                ) == 1
+
+            check_job()
+            one = Mapping(world_size=1, tp_size=1, rank=0)
+            assert (one.tp_rank, one.pp_rank, one.cp_rank) == (0, 0, 0)
+            assert one.tp_group == [0] and one.pp_group == [
+                0
+            ] and one.cp_group == [0]
+            for group in (one.tp_group_pg, one.pp_group_pg, one.cp_group_pg):
+                assert isinstance(group, SingleProcessGroup), \
+                    f"one-rank mapping borrowed the job's group on rank {rank}"
+                assert group.size() == 1 and group.rank() == 0
+            check_job()  # the job's mapping is untouched by the one-rank one
         elif test_type == "pickle":
             mapping = mapping_device_mesh
 

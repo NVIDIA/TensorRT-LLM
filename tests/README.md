@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
 # How to run TRT-LLM tests
 
 ## 1. Unit test (Python)
@@ -55,7 +60,7 @@ pip install -r requirements-dev.txt
 cd tests/integration/defs
 
 # example 1: run a case
-pytest "accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_auto_dtype"
+pytest "accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_dummy_load_format"
 
 # example 2: run a test list
 pytest --rootdir . --test-list=<a txt file contains on test case per line>
@@ -76,16 +81,26 @@ pytest -k llmapi --co -q
 You can set the output directory for logs/runtime data using the --output-dir flag.
 For more options, refer to pytest --help, paying attention to Custom options added for TRT-LLM.
 
+### Optional media dependencies
+
+Video multimodal and VisualGen tests need optional packages that are not part of
+the default install (OpenCV, and for VisualGen also PyAV / ffmpeg).
+
+If these are already installed, tests proceed without further action. Otherwise
+set the following to auto-install missing packages:
+
+```bash
+export TRTLLM_AUTO_INSTALL_MEDIA_DEPS=1
+```
+
+When set, an autouse session fixture installs `opencv-python-headless` if needed,
+and VisualGen fixtures additionally install `av` and `ffmpeg` if needed. If the
+packages are missing and the flag is unset, those fixtures fail with an install
+hint.
+
 ### Common issues:
 
-1. `trtllm-build: not found`
-
-    Many of the test cases use `trtllm-build` command to build engines.
-    If you meet the error of `trtllm-build: not found`, you should add the `trtllm-build` path into your `PATH` env before launchig pytest. Normally if you install trtllm in the `$HOME/.local` or use `pip install -e ./` to install trtllm in-place, the trtllm-build command should be located in `$HOME/.local/bin`.
-
-    Thus you should do `export PATH=$HOME/.local/bin:$PATH` before running the pytest
-
-2. The `LLM_MODELS_ROOT` is not set correctly
+1. The `LLM_MODELS_ROOT` is not set correctly
 
     ```bash
         AssertionError: ...llm-models/gpt2-medium does not exist, and fail_if_path_is_invalid is True, please check the cache directory
@@ -102,10 +117,9 @@ For more options, refer to pytest --help, paying attention to Custom options add
 
 TRT-LLM C++ runtime tests are using [google-test](https://github.com/google/googletest) framework, and Pytest is used to run sets of these tests.
 
-The C++ runtime relies on TRT-LLM python frontend to generate engines as test data, so there are scripts to generate the engines in the C++ test [resources directory](../cpp/tests/resources/).
-Pytest calls these scripts from fixtures prior to launching the test cases.
-
-Details on usage of the resources scripts can be found in the [C++ Test document](../cpp/tests/README.md).
+The current C++ unit tests exercise shared runtime components and kernels. They are launched by
+[`test_unit_tests.py`](integration/defs/cpp/test_unit_tests.py).
+The targets are defined in [`cpp/tests/CMakeLists.txt`](../cpp/tests/CMakeLists.txt).
 
 ## 4. Performance regression test
 
@@ -133,7 +147,7 @@ The priority is A10 > A30 > L40S > A100 > H100 > B200.
 
 ## 2. Add an integration test
 
-Integrations tests usually run entire workflow, containing checkpoint converting, engine building and evaluating, to check functional and accuracy.
+Integration tests exercise model loading, inference, serving, and evaluation to check functionality and accuracy. Tests requiring model weights need GPU access and a valid `LLM_MODELS_ROOT`.
 
 Integration tests are stored in [`integration/defs`](./integration/defs). In particular, please see [`integration/defs/accuracy`](./integration/defs/accuracy) for more detailed guidance to add accuracy tests.
 

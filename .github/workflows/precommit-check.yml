@@ -49,16 +49,24 @@ jobs:
         run: |
           files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
             --paginate --jq '.[].filename' | paste -sd ' ' -)
+          count=$(echo "$files" | tr ' ' '\n' | sed '/^$/d' | wc -l)
+          echo "Changed file count from API: ${count}"
           echo "files=$files" >> $GITHUB_OUTPUT
+          echo "count=$count" >> $GITHUB_OUTPUT
 
       - name: Run pre-commit checks
         run: |
+          args=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
-            python3 -u scripts/release_check.py --files-from changed_files.txt
-          else
-            python3 -u scripts/release_check.py
+            count="${{ steps.changed-files.outputs.count }}"
+            # GitHub's PR Files API caps out at 3000 entries, silently truncating the
+            # list for huge PRs. Fail closed with a 2500 margin below that cap.
+            if [ -n "$count" ] && [ "$count" -gt 0 ] && [ "$count" -lt 2500 ]; then
+              echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
+              args="--files-from changed_files.txt"
+            fi
           fi
+          python3 -u scripts/release_check.py $args
 
       # Informational only: list test-list entries whose parametrize IDs cannot
       # be verified statically (runtime-computed argvalues/ids), grouped by

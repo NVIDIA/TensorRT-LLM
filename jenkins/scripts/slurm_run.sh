@@ -46,6 +46,20 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
+# Every rank needs the test sources importable, not just rank 0. Rank 0 runs
+# pytest, whose pythonpath ini setting (tests/integration/defs/pytest.ini sets
+# `pythonpath = ../../`, i.e. the tests/ root) plus rootdir handling puts both
+# tests/ and tests/integration on sys.path; ranks 1..N run the mgmn_worker_node
+# started by trtllm-llmapi-launch, a bare MPI worker that unpickles
+# request-attached objects the tests define (for example the logits processors
+# in `defs.accuracy.accuracy_core`) and otherwise dies with
+# "ModuleNotFoundError: No module named 'defs'". tests/ is needed too:
+# importing `defs.accuracy.accuracy_core` pulls in `defs.conftest`, which
+# imports the `test_common` package that lives at tests/test_common.
+# Single-node stages never see any of this because MpiPoolSession spawns its
+# workers with rank 0's sys.path.
+export PYTHONPATH="$llmSrcNode/tests/integration:$llmSrcNode/tests${PYTHONPATH:+:$PYTHONPATH}"
+
 # Wheel path for the CBTS .coveragerc @TRTLLM_WHEEL_PATH@ substitution below.
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
@@ -66,7 +80,8 @@ source "$llmSrcNode/jenkins/scripts/slurm_env_setup.sh"
 slurm_setup_runtime_env
 echo "Library Path:"
 echo "$LD_LIBRARY_PATH"
-env | sort
+# Redact secret values here so they do not leak into the job log
+env | sort | sed -E 's/^([^=]*(TOKEN|SECRET|PASSWORD|CREDENTIALS)[^=]*)=.*/\1=<redacted>/'
 
 echo "Full Command: $pytestCommand"
 
@@ -144,8 +159,6 @@ slurm_wait_all_ranks
 set +e
 
 pytest_exit_code=0
-perf_check_exit_code=0
-perf_report_exit_code=0
 
 eval $pytestCommand
 pytest_exit_code=$?
@@ -174,36 +187,5 @@ if [ $pytest_exit_code -eq 4 ]; then
     python3 -c "import sys; sys.path.insert(0, '.'); import conftest; print('DEBUG: conftest imported successfully')"
 fi
 
-if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    # Only PyTorch perf stages remain; the TensorRT perf baseline was removed.
-    basePerfFilename="base_perf_pytorch.csv"
-    basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
-    echo "Check Perf Result"
-    python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
-        $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_check_exit_code=$?
-
-    echo "Create Perf Report"
-    python3 $llmSrcNode/tests/integration/defs/perf/create_perf_comparison_report.py \
-        --output_path $stageName/report.pdf \
-        --files $stageName/perf_script_test_results.csv \
-        $basePerfPath
-    perf_report_exit_code=$?
-    echo "Rank${SLURM_PROCID} Perf report finished execution with exit code $perf_report_exit_code"
-
-    if [ "$perf_check_exit_code" -eq 0 ] && [ "$perf_report_exit_code" -ne 0 ]; then
-        perf_check_exit_code=$perf_report_exit_code
-    fi
-    echo "Rank${SLURM_PROCID} Perf check finished execution with exit code $perf_check_exit_code"
-fi
-
-if [ "$pytest_exit_code" -ne 0 ]; then
-    final_exit_code=$pytest_exit_code
-elif [ "$perf_check_exit_code" -ne 0 ]; then
-    final_exit_code=$perf_check_exit_code
-else
-    final_exit_code=0
-fi
-echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $final_exit_code"
-exit $final_exit_code
+echo "Rank${SLURM_PROCID} Final Slurm run finished execution with exit code $pytest_exit_code"
+exit $pytest_exit_code

@@ -288,8 +288,16 @@ class BenchmarkDataset(ABC):
         Args:
             requests (List[SampleRequest]): The current list of sampled
             requests.  num_requests (int): The target number of requests.
+
+        Raises:
+            ValueError: If the sampled list is empty and num_requests > 0,
+            since there is nothing to oversample from.
         """
         if len(requests) < num_requests:
+            if not requests:
+                raise ValueError(
+                    f"Cannot oversample an empty dataset to {num_requests} requests"
+                )
             additional = random.choices(requests,
                                         k=num_requests - len(requests))
             requests.extend(additional)
@@ -720,21 +728,33 @@ class CustomDataset(BenchmarkDataset):
                 self.data.append(json.loads(line))
         random.shuffle(self.data)
 
-    def sample(self, tokenizer: PreTrainedTokenizerBase,
-               num_requests: int) -> list[SampleRequest]:
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               output_len: Optional[int] = None,
+               **kwargs) -> list[SampleRequest]:
         """
         Optimized version using batch tokenization for better performance.
+
+        If output_len is provided, it overrides the per-sample "max_tokens"
+        from the dataset, which then becomes optional.
+
+        If the file holds fewer than num_requests lines, the samples are
+        oversampled to reach num_requests.
         """
+        if len(self.data) == 0:
+            raise ValueError("No data loaded from --dataset-path")
+
         # Collect all prompts and metadata
         prompts = []
         max_tokens_list = []
         prompt_lengths = []
 
-        for i, entry in enumerate(self.data):
-            if len(prompts) >= num_requests:
-                break
+        for i in range(num_requests):
+            entry = self.data[i % len(self.data)]
             prompt = entry["input"]["messages"][1]["content"]
-            max_tokens = entry["input"]["max_tokens"]
+            max_tokens = entry["input"][
+                "max_tokens"] if output_len is None else output_len
             prompts.append(prompt)
             max_tokens_list.append(max_tokens)
             if "num_tokens" in entry["input"] and isinstance(
@@ -761,6 +781,7 @@ class CustomDataset(BenchmarkDataset):
                     expected_output_len=max_tokens,
                 ))
 
+        self.maybe_oversample_requests(samples, num_requests)
         return samples
 
 
@@ -1132,14 +1153,12 @@ class VisionArenaDataset(HuggingFaceDataset):
         output_len = (output_len
                       if output_len is not None else self.DEFAULT_OUTPUT_LEN)
 
-        # Collect prompts for batch processing
-        prompts = []
         parser_fn = self.SUPPORTED_DATASET_PATHS.get(self.dataset_path)
         if parser_fn is None:
             raise ValueError(f"Unsupported dataset path: {self.dataset_path}")
         sampled_requests = []
         for item in self.data:
-            if len(prompts) >= num_requests:
+            if len(sampled_requests) >= num_requests:
                 break
             prompt = parser_fn(item)
             mm_content = [process_image(item["images"][0])]

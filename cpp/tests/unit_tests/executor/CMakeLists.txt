@@ -13,23 +13,127 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
-add_gtest(executorSamplingConfigTest samplingConfigTest.cpp)
-add_gtest(kvCacheConfigTest kvCacheConfigTest.cpp)
-add_gtest(decodingConfigTest decodingConfigTest.cpp)
-add_gtest(requestTest requestTest.cpp)
-add_gtest(responseTest responseTest.cpp)
+add_tllm_gtest(
+  executorSamplingConfigTest
+  OWNER
+  executor
+  SOURCES
+  samplingConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_serialization
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  kvCacheConfigTest
+  OWNER
+  executor
+  SOURCES
+  kvCacheConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_types
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  requestTest
+  OWNER
+  executor
+  SOURCES
+  requestTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  responseTest
+  OWNER
+  executor
+  SOURCES
+  responseTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;host")
 
-add_gtest(executorConfigTest executorConfigTest.cpp)
-add_gtest(executorTensorTest tensorTest.cpp)
-add_gtest(serializeUtilsTest serializeUtilsTest.cpp)
-add_gtest(requestWithIdTest requestWithIdTest.cpp)
-add_gtest(loraConfigTest loraConfigTest.cpp)
-add_gtest(coalesceTest coalesceTest.cpp)
-add_gtest(genUniqueAgentNameTest genUniqueAgentNameTest.cpp)
-target_link_libraries(genUniqueAgentNameTest PRIVATE ${Python3_LIBRARIES})
-add_gtest(ucxCommTest ucxCommTest.cpp TIMEOUT 60)
+add_tllm_gtest(
+  executorConfigTest
+  OWNER
+  executor
+  SOURCES
+  executorConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_types
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  executorTensorTest
+  OWNER
+  executor
+  SOURCES
+  tensorTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;gpu")
+add_tllm_gtest(
+  serializeUtilsTest
+  OWNER
+  executor
+  SOURCES
+  serializeUtilsTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  tllm::executor_memory_desc
+  tllm::batch_request_info
+  tllm::runtime_distributed
+  ${Python3_LIBRARIES}
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  loraConfigTest
+  OWNER
+  executor
+  SOURCES
+  loraConfigTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_values
+  LABELS
+  "unit;executor;gpu")
+add_tllm_gtest(
+  coalesceTest
+  OWNER
+  executor
+  SOURCES
+  coalesceTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_transfer_agent
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  genUniqueAgentNameTest
+  OWNER
+  executor
+  SOURCES
+  genUniqueAgentNameTest.cpp
+  LINK_LIBRARIES
+  tllm::executor_agent_name
+  Threads::Threads
+  LABELS
+  "unit;executor;host")
+add_tllm_gtest(
+  ucxCommTest
+  SOURCES
+  ucxCommTest.cpp
+  FULL_STACK
+  LABELS
+  "unit;full-stack;gpu"
+  TIMEOUT
+  60)
 target_link_libraries(ucxCommTest PRIVATE ${Python3_LIBRARIES})
-target_link_libraries(serializeUtilsTest PRIVATE ${Python3_LIBRARIES})
+
+# NIXL bounce-buffer v2 KV-cache transfer tests live in their own subdirectory
+# (mirrors the source layout under nixl_utils/bounce/). It self-gates on zmq and
+# NIXL_ROOT, so it is safe to descend unconditionally.
+add_subdirectory(bounce)
 
 # Skip MOONCAKE related tests on Rocky8
 set(IS_ROCKY8 FALSE)
@@ -38,8 +142,10 @@ if(EXISTS "/etc/redhat-release")
 endif()
 
 if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
-  add_gtest(agentCommTest agentCommTest.cpp)
-  add_gtest(transferAgentTest transferAgentTest.cpp)
+  add_tllm_gtest(agentCommTest SOURCES agentCommTest.cpp FULL_STACK LABELS
+                 "unit;full-stack;gpu")
+  add_tllm_gtest(transferAgentTest SOURCES transferAgentTest.cpp FULL_STACK
+                 LABELS "unit;full-stack;gpu")
 
   if(NIXL_ROOT)
     target_link_libraries(transferAgentTest PRIVATE tensorrt_llm_nixl_wrapper)
@@ -47,6 +153,9 @@ if(NIXL_ROOT OR (MOONCAKE_ROOT AND NOT IS_ROCKY8))
                                                 ${Python3_LIBRARIES})
     target_compile_definitions(transferAgentTest PRIVATE TEST_NIXL_BACKEND=1)
     target_compile_definitions(agentCommTest PRIVATE TEST_NIXL_BACKEND=1)
+
+    # NIXL bounce v2 tests (bounceTransportTest / bounceTransportFailureTest /
+    # bounceAgentE2ETest) live in bounce/CMakeLists.txt.
   endif()
 
   if(MOONCAKE_ROOT)

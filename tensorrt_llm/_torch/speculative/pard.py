@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -8,7 +11,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from ..attention_backend import AttentionMetadata
+from ..attention.backends import AttentionMetadata
 from ..pyexecutor.resource_manager import BaseResourceManager
 from .interface import SpecMetadata, SpecWorkerBase
 from .sa_enhancer import SADraftEnhancer
@@ -339,6 +342,8 @@ class PARDWorker(SpecWorkerBase):
 
         # Deferred kv_lens rewind (must happen after restore so it persists).
         self._apply_kv_rewind_after_draft(attn_metadata, spec_metadata)
+
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
         next_new_tokens = self._prepare_next_new_tokens(
             accepted_tokens,

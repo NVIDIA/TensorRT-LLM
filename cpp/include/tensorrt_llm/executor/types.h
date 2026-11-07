@@ -65,8 +65,6 @@ using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcess
 using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&, std::vector<Tensor>&,
     std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&,
     std::vector<std::optional<IdType>> const&)>;
-using MedusaChoices = std::vector<std::vector<SizeType32>>;
-using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;
 
@@ -200,19 +198,6 @@ enum class ModelType
     kDECODER_ONLY = 0,
     kENCODER_ONLY = 1,
     kENCODER_DECODER = 2,
-};
-
-/// @brief The batching type
-enum class BatchingType
-{
-    /// @brief STATIC refers to the traditional batching scheme with a batch of requests running in lockstep until the
-    /// full generation for all of them is complete. Requests in a batch are all padded up to the maximum input and
-    /// output sequence length of any member of the batch.
-    kSTATIC = 0,
-
-    /// @brief INFLIGHT refers to a scheme where newly arrived requests are dynamically incorporated into the batch
-    /// under execution, and requests are returned as soon as the end condition is met without any padding.
-    kINFLIGHT = 1,
 };
 
 /// @brief The policy used to select the subset of available requests in each iteration of the executor generation loop

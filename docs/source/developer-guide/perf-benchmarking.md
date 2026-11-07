@@ -37,6 +37,7 @@ The following guidance will mostly focus on benchmarks using `trtllm-bench` CLI.
       - [Supported Quantization Modes](#supported-quantization-modes)
     - [Preparing a Dataset](#preparing-a-dataset)
     - [Running with the PyTorch Workflow](#running-with-the-pytorch-workflow)
+      - [Keeping Host Stalls out of the Measured Run](#keeping-host-stalls-out-of-the-measured-run)
       - [Benchmarking with LoRA Adapters in PyTorch workflow](#benchmarking-with-lora-adapters-in-pytorch-workflow)
       - [Running multi-modal models in the PyTorch Workflow](#running-multi-modal-models-in-the-pytorch-workflow)
       - [Quantization in the PyTorch Flow](#quantization-in-the-pytorch-flow)
@@ -125,7 +126,7 @@ Export your token in the `HF_TOKEN` environment variable.
 - `NVFP4`
 
 For more information about quantization, refer to [](../features/quantization.md) and
-the [support matrix](../features/quantization.md#model-supported-matrix) of the supported quantization methods for each network.
+the [support matrix](../features/quantization.md#model-support-matrix) of the supported quantization methods for each network.
 
 ```{tip}
 Although TensorRT LLM supports more quantization modes than listed above, `trtllm-bench` currently only configures for
@@ -138,7 +139,7 @@ The throughput benchmark utilizes a fixed JSON schema to specify requests. The s
 
 | Key             | Required |     Type      | Description                                     |
 | :-------------- | :------: | :-----------: | :---------------------------------------------- |
-| `task_id`       |    Y     |    String     | Unique identifier for the request.              |
+| `task_id`       |    Y     |    Integer    | Unique identifier for the request.              |
 | `prompt`        |    N*    |    String     | Input text for a generation request.            |
 | `input_ids`     |    Y*    | List[Integer] | List of token IDs that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
@@ -150,14 +151,14 @@ defined at the same time. If you specify `input_ids`, the `prompt` entry is igno
 
 Refer to the following examples of valid entries for the benchmark:
 
-- Entries with a human-readable prompt and no logits.
+- Entries with a human-readable prompt and no token IDs.
 
   ```json
   {"task_id": 1, "prompt": "Generate an infinite response to the following: This is the song that never ends, it goes on and on my friend.", "output_tokens": 1000}
   {"task_id": 2, "prompt": "Generate an infinite response to the following: Na, na, na, na", "output_tokens": 1000}
   ```
 
-- Entries which contain logits.
+- Entries which contain token IDs (`input_ids`).
 
   ```json
   {"task_id":0,"input_ids":[863,22056,25603,11943,8932,13195,3132,25032,21747,22213],"output_tokens":128}
@@ -251,6 +252,23 @@ trtllm-bench --model meta-llama/Llama-3.1-8B \
   --backend pytorch
 ```
 
+#### Keeping Host Stalls out of the Measured Run
+
+With many short requests, for example context-only runs at high concurrency,
+rank 0 can be bound by host work, and a pause there makes every other rank wait
+at the next collective. `TRTLLM_WORKER_DISABLE_GC=1` disables Python's cyclic
+garbage collector in the worker processes, so a full collection over the
+in-flight requests cannot pause a rank. Memory held in reference cycles is then
+not freed until the run ends, so set it identically in every run you compare.
+
+With `TRTLLM_PROXY_BATCH_REQUESTS=1`, the executor proxy pickles each request on
+the submitting thread and a background thread sends each burst to the rank-0
+worker as one message, so the worker receives and authenticates one message per
+burst instead of one per request. The sender thread must take the GIL first, so
+while the submitting thread keeps running Python, as a busy `trtllm-serve` event
+loop does, a lone request can wait up to the interpreter's switch interval (5 ms
+by default) before it is sent.
+
 #### Benchmarking with LoRA Adapters in PyTorch workflow
 
 The PyTorch workflow supports benchmarking with LoRA (Low-Rank Adaptation) adapters. This requires preparing a dataset with LoRA metadata and configuring the LoRA settings.
@@ -339,7 +357,7 @@ trtllm-bench \
   --model Qwen/Qwen2-VL-2B-Instruct \
   prepare-dataset \
   --output mm_data.jsonl \
-  real-dataset
+  real-dataset \
   --dataset-name lmms-lab/MMMU \
   --dataset-split test \
   --dataset-image-key image \
@@ -511,6 +529,7 @@ Nested metric names are rendered as dotted paths:
 ===========================================================
 model_loader.checkpoint_preparation_seconds: 1.1774
 model_loader.weight_population_seconds: 0.5979
+model_loader.checkpoint_finalization_seconds: 0.0312
 model_loader.post_load_processing_seconds: 0.0049
 model_loader.total_model_loading_seconds: 1.9708
 ```

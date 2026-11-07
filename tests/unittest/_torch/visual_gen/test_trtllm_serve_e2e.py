@@ -39,6 +39,7 @@ from typing import List, Optional
 import pytest
 import requests
 import yaml
+from utils.util import skip_pre_blackwell
 
 # ---------------------------------------------------------------------------
 # Model paths
@@ -71,9 +72,7 @@ _REF_IMAGE_PATH = _PROJECT_ROOT / "examples" / "visual_gen" / "cat_piano.png"
 # parallel pytest sessions on the same OCI node fall into disjoint port
 # sections (CONTAINER_PORT_START / CONTAINER_PORT_NUM). It transparently falls
 # back to the plain free-port scan when those env vars are not set.
-_INTEGRATION_TESTS_DIR = _PROJECT_ROOT / "tests" / "integration"
-if str(_INTEGRATION_TESTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_TESTS_DIR))
+__extra_import_path__ = ["~/tests/integration"]
 from defs.common import get_free_port_in_ci  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -88,7 +87,12 @@ class RemoteVisualGenServer:
     adapted for diffusion / visual-gen models.
     """
 
-    MAX_SERVER_START_WAIT_S = 1200  # 20 min – large models need time to load
+    # Startup is bounded by one cold read of the checkpoint. Wan2.2-I2V-A14B is
+    # 117.5 GiB; at the 83-111 MiB/s measured from shared model storage that read
+    # takes 1080-1450 s, plus ~30 s of process start and ~80 s of warmup. Cold
+    # starts measured 1150-1201 s at 111 MiB/s, so 1200 s left no margin.
+    # The suite's per-test timeout (2400 s) still bounds a real hang.
+    MAX_SERVER_START_WAIT_S = 1800
 
     def __init__(
         self,
@@ -366,6 +370,7 @@ class TestWanImageToVideo:
             ),
         ],
     )
+    @skip_pre_blackwell
     def test_ti2v_sync(self, server, format_, expected_content_type):
         """Synchronous image-to-video via multipart POST /v1/videos/sync."""
         with open(_REF_IMAGE_PATH, "rb") as f:
@@ -381,7 +386,7 @@ class TestWanImageToVideo:
                     "format": format_,
                 },
                 files={
-                    "input_reference": ("cat_piano.png", f, "image/png"),
+                    "image_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert resp.status_code == 200, resp.text
@@ -400,6 +405,7 @@ class TestWanImageToVideo:
             ),
         ],
     )
+    @skip_pre_blackwell
     def test_ti2v_async_lifecycle(self, server, format_, expected_content_type):
         """Async i2v: create job with image → poll → download → delete."""
         base = server.url_for("v1", "videos")
@@ -418,7 +424,7 @@ class TestWanImageToVideo:
                     "format": format_,
                 },
                 files={
-                    "input_reference": ("cat_piano.png", f, "image/png"),
+                    "image_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert create_resp.status_code == 202, create_resp.text

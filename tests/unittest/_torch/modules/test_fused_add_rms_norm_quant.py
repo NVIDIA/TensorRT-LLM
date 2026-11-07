@@ -16,8 +16,7 @@
 
 import pytest
 import torch
-
-from tests.unittest.utils.util import getSMVersion
+from utils.util import getSMVersion
 
 
 def fused_add_rms_norm_quant_available():

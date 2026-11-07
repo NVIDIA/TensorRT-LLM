@@ -357,7 +357,7 @@ moe_config:
 
 ## Troubleshooting Tips
 
-- If you encounter CUDA out-of-memory errors, try reducing `--max_batch_size`, `--max_num_tokens`, or `--kv_cache_free_gpu_memory_fraction`. See the [doc](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md) for the explanation of these parameters.
+- If you encounter CUDA out-of-memory errors, try reducing `--max_batch_size`, `--max_num_tokens`, or `--kv_cache_free_gpu_memory_fraction`. See the [doc](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/legacy/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md) for the explanation of these parameters.
 - Add `print_iter_log: true` to extra LLM API options YAML file to inspect the per-iteration log.
 - Check GPU utilization with `nvidia-smi` while the server is running to inspect GPU status and memory usage.
 - If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed

@@ -25,20 +25,17 @@ by directory the same way ``test_test_to_stage_mapping.py`` imports from
 
 import faulthandler
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Callable
 
 import pytest
 
+__extra_import_path__ = ["~/tests/integration/defs/utils"]
+from periodic_junit import PeriodicJUnitXML
+
 pytestmark = pytest.mark.cpu_only
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
-PERIODIC_JUNIT_DIR = os.path.join(REPO_ROOT, "tests", "integration", "defs", "utils")
-sys.path.insert(0, PERIODIC_JUNIT_DIR)
-
-from periodic_junit import PeriodicJUnitXML  # noqa: E402
 
 # Bounds a stalled CI worker, not the expected latency: every wait below polls
 # for a condition that normally becomes true in milliseconds.

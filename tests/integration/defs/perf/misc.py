@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,7 +60,7 @@ def check_output(command: list) -> str:
     """
     Executes a command and returns its output.
     """
-    result = sp.run(command, stdout=sp.PIPE, stderr=sp.PIPE)
+    result = sp.run(command, stdout=sp.PIPE, stderr=sp.PIPE, timeout=60)
     if result.returncode != 0:
         raise sp.CalledProcessError(result.returncode,
                                     command,

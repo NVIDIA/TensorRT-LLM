@@ -277,6 +277,7 @@ def test_nemotron_gen_dep(llm_root, world_size):
             model_root / "NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
             "--layer-indices=4,5,6",
             "--mamba-ssm-cache-dtype=float16",
+            "--use-kv-cache-manager-v2",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
@@ -308,6 +309,7 @@ def test_qwen3_next_gen_tep(llm_root, world_size):
             "--no-enable-attention-dp",
             "--mamba-ssm-cache-dtype=float16",
             "--moe-backend=TRTLLM",
+            "--use-kv-cache-manager-v2",
         ],
         cwd=llm_root / "examples" / "layer_wise_benchmarks",
         env={
@@ -348,10 +350,9 @@ def test_kimi_k3_gen_dep(llm_root, world_size):
             model_root / "Kimi-K3",
             *layer_args,
             "--tokens-per-block=64",
-            # SiTU routed experts support no other backend, and GEN also builds
-            # a prefill runner.
+            # SiTU routed experts support no other backend. The prefill runner
+            # that GEN builds stays on its AUTO default, which resolves to TRTLLM.
             "--moe-backend=TRTLLM",
-            "--moe-backend-for-prefill=TRTLLM",
             # 1 golden + 3 draft tokens per generation step.
             "--batch-size=32",
             "--seq-len-q=4",

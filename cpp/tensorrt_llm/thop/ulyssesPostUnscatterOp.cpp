@@ -18,12 +18,36 @@
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/CUDAContext.h>
+#include <limits>
 #include <torch/extension.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+
+namespace
+{
+
+void checkInt32Dim(char const* name, int64_t value)
+{
+    TORCH_CHECK(value <= std::numeric_limits<int>::max(), name, " must fit in int32, got ", value);
+}
+
+void checkInt32Product(char const* name, int64_t lhs, int64_t rhs)
+{
+    TORCH_CHECK(
+        lhs == 0 || rhs <= std::numeric_limits<int>::max() / lhs, name, " must fit in int32, got ", lhs, "*", rhs);
+}
+
+void checkInt32SumProduct(char const* name, int64_t lhs, int64_t a, int64_t b, int64_t c)
+{
+    TORCH_CHECK(a <= std::numeric_limits<int64_t>::max() - b && a + b <= std::numeric_limits<int64_t>::max() - c, name,
+        " sum overflows int64");
+    checkInt32Product(name, lhs, a + b + c);
+}
+
+} // namespace
 
 // Post-Ulysses A2A unscatter: take Q/K/V tensors of shape [P, B, Sp, H, D]
 // (output of the head-dim -> seq-dim all-to-all) and produce SDPA-ready Q/K/V.
@@ -61,6 +85,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     int64_t const Sp_q = q_in.size(2), H_q = q_in.size(3);
     int64_t const Sp_k = k_in.size(2), H_k = k_in.size(3);
     int64_t const Sp_v = v_in.size(2), H_v = v_in.size(3);
+    checkInt32Dim("P", P);
+    checkInt32Dim("B", B);
+    checkInt32Dim("D", D);
+    checkInt32Dim("Sp_q", Sp_q);
+    checkInt32Dim("H_q", H_q);
+    checkInt32Dim("Sp_k", Sp_k);
+    checkInt32Dim("H_k", H_k);
+    checkInt32Dim("Sp_v", Sp_v);
+    checkInt32Dim("H_v", H_v);
+    checkInt32Product("P*Sp_q", P, Sp_q);
+    checkInt32Product("P*Sp_k", P, Sp_k);
+    checkInt32Product("P*Sp_v", P, Sp_v);
+    checkInt32SumProduct("P*(Sp_q+Sp_k+Sp_v)", P, Sp_q, Sp_k, Sp_v);
 
     bool const is_hnd = (layout == 0);
     auto opts = q_in.options();
@@ -96,17 +133,66 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_post_unscatter_q
     return std::make_tuple(q_out, k_out, v_out);
 }
 
+// Self-attention-only variant that consumes the raw packed 5D all-to-all receive buffer
+// [P, B, Sp, 3, H, D]. This removes the Python-side packed-QKV permute/contiguous/unbind
+// chain before VANILLA/HND SDPA.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> ulysses_packed_qkv_post_unscatter(
+    torch::Tensor& qkv_in, int64_t layout)
+{
+    TORCH_CHECK(qkv_in.dim() == 6, "ulysses_packed_qkv_post_unscatter expects [P, B, Sp, 3, H, D]");
+    TORCH_CHECK(qkv_in.size(3) == 3, "ulysses_packed_qkv_post_unscatter expects qkv dim size 3, got ", qkv_in.size(3));
+    TORCH_CHECK(layout == 0 || layout == 1, "layout must be 0 (HND) or 1 (NHD), got ", layout);
+
+    CHECK_INPUT(qkv_in, torch::kBFloat16);
+
+    int64_t const P = qkv_in.size(0);
+    int64_t const B = qkv_in.size(1);
+    int64_t const Sp = qkv_in.size(2);
+    int64_t const H = qkv_in.size(4);
+    int64_t const D = qkv_in.size(5);
+    TORCH_CHECK(D % 8 == 0, "D (last dim) must be divisible by 8 (bf16 vec=8)");
+    checkInt32Dim("P", P);
+    checkInt32Dim("B", B);
+    checkInt32Dim("Sp", Sp);
+    checkInt32Dim("H", H);
+    checkInt32Dim("D", D);
+    checkInt32Product("P*Sp", P, Sp);
+    checkInt32Product("3*P*Sp", 3, P * Sp);
+
+    bool const is_hnd = (layout == 0);
+    auto opts = qkv_in.options();
+    auto q_out = torch::empty({B, P * Sp, H, D}, opts);
+    auto k_out = torch::empty({B, P * Sp, H, D}, opts);
+    auto v_out = torch::empty({B, P * Sp, H, D}, opts);
+
+    if (qkv_in.numel() != 0)
+    {
+        auto stream = at::cuda::getCurrentCUDAStream();
+        tensorrt_llm::kernels::launchUlyssesPackedQkvPostUnscatter(qkv_in.data_ptr(), q_out.data_ptr(),
+            k_out.data_ptr(), v_out.data_ptr(), static_cast<int>(P), static_cast<int>(B), static_cast<int>(Sp),
+            static_cast<int>(H), static_cast<int>(D), stream);
+    }
+
+    if (is_hnd)
+    {
+        return std::make_tuple(q_out.transpose(1, 2), k_out.transpose(1, 2), v_out.transpose(1, 2));
+    }
+    return std::make_tuple(q_out, k_out, v_out);
+}
+
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     // layout: 0 = HND [B, H, P*Sp, D], 1 = NHD [B, P*Sp, H, D]. Default 0 keeps
     // backward compatibility with the original HND-only callers.
     m.def(
         "ulysses_post_unscatter_qkv(Tensor q_in, Tensor k_in, Tensor v_in, int layout=0) -> (Tensor, Tensor, Tensor)");
+    m.def("ulysses_packed_qkv_post_unscatter(Tensor qkv_in, int layout=0) -> (Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("ulysses_post_unscatter_qkv", &ulysses_post_unscatter_qkv);
+    m.impl("ulysses_packed_qkv_post_unscatter", &ulysses_packed_qkv_post_unscatter);
 }
 
 } // namespace torch_ext

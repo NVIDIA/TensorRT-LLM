@@ -29,6 +29,14 @@ void invokeConvertReqIndexToGlobal(int32_t const* reqId, int32_t const* blockTab
     int32_t strideFactor, int32_t layerId, int64_t btStride0, int64_t btStride1, int64_t tiStride0, int64_t tiStride1,
     int64_t outStride0, int64_t outStride1, cudaStream_t stream = 0);
 
+// Grouped (cross-layer fan-out) variant. `output` has shape [group_size, num_tokens, numTopkTokens];
+// `layerIds` is a device int32 array of length `groupSize` holding each member's layer offset.
+void invokeConvertReqIndexToGlobalGrouped(int32_t const* reqId, int32_t const* blockTable, int32_t const* tokenIndices,
+    int32_t const* layerIds, int32_t* output, int32_t numTokens, int32_t numTopkTokens, int32_t groupSize,
+    int32_t maxNumBlocksPerReq, int32_t blockSize, int32_t strideFactor, int64_t btStride0, int64_t btStride1,
+    int64_t tiStride0, int64_t tiStride1, int64_t outStrideG, int64_t outStride0, int64_t outStride1,
+    cudaStream_t stream = 0);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

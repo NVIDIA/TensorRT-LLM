@@ -189,10 +189,10 @@ void verify_dynamic_tree_rejection_out_op(th::Tensor& draftTokens, th::Tensor& t
     TORCH_CHECK(acceptIndex.size(0) >= batchSize && acceptIndex.size(1) >= numSpecStep, "acceptIndex buffer too small");
     TORCH_CHECK(acceptTokenNum.size(0) >= batchSize, "acceptTokenNum buffer too small");
     TORCH_CHECK(acceptToken.size(0) >= batchSize && acceptToken.size(1) >= numSpecStep, "acceptToken buffer too small");
-    TORCH_CHECK(seed.scalar_type() == torch::kInt64 && seed.numel() >= 1 && seed.is_cuda(),
-        "seed must be int64 CUDA tensor with >=1 element");
-    TORCH_CHECK(offset.scalar_type() == torch::kInt64 && offset.numel() >= 1 && offset.is_cuda(),
-        "offset must be int64 CUDA tensor with >=1 element");
+    TORCH_CHECK(seed.scalar_type() == torch::kInt64 && seed.numel() == batchSize && seed.is_cuda(),
+        "seed must be an int64 CUDA tensor with one element per request");
+    TORCH_CHECK(offset.scalar_type() == torch::kInt64 && offset.numel() == batchSize && offset.is_cuda(),
+        "offset must be an int64 CUDA tensor with one element per request");
 
     auto stream = at::cuda::getCurrentCUDAStream(draftTokens.device().index());
 

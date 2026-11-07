@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (add-model)=
 
 # Adding a Model

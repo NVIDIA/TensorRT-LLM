@@ -6,17 +6,16 @@ set(TRTLLM_NB_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
-    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/kvCacheManagerV2Utils.cpp
     batch_manager/kvCacheManagerV2.cpp
-    batch_manager/llmRequest.cpp
     common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    kvCacheCompression/bindings.cpp
     process_group/bindings.cpp
     runtime/bindings.cpp
     runtime/hostfunc.cpp
@@ -25,7 +24,7 @@ set(SRCS
     testing/kvCacheManagerTestUtilBinding.cpp
     userbuffers/bindings.cpp
     thop/bindings.cpp
-    ../runtime/ipcNvlsMemory.cu
+    visual_gen/coordinatorWatchdog.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -51,7 +50,8 @@ endif()
 # compilation of kvCacheManagerV2.cpp.
 target_include_directories(
   ${TRTLLM_NB_MODULE} PRIVATE ${PROJECT_SOURCE_DIR}/tensorrt_llm/common/sha256)
-
+target_include_directories(${TRTLLM_NB_MODULE}
+                           PRIVATE ${TRTLLM_FMHA_PARAMS_GENERATED_INCLUDE_DIR})
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 target_link_directories(${TRTLLM_NB_MODULE} PUBLIC
@@ -67,6 +67,7 @@ target_link_libraries(
   PUBLIC ${SHARED_TARGET}
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
+         Threads::Threads
          torch_python
          ${CUDA_DRV_LIB}
          th_common

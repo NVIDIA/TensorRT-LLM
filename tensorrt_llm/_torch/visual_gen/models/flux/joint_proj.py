@@ -257,6 +257,10 @@ class FluxJointQKVMLPProj(nn.Module):
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 reduce_output=False,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                # Flux runs a plain, unclamped SwiGLU, so it opts in to the
+                # fused Blackwell NVFP4 epilogue and the interleaved gate/up
+                # weight layout that epilogue reads.
+                use_cute_dsl_nvfp4_swiglu_blackwell=use_cute_dsl_blockscaling_mm,
                 override_tp_sharding={
                     "gate": (local_mlp_hidden_start, local_mlp_hidden_end),
                     "up": (local_mlp_hidden_start, local_mlp_hidden_end),

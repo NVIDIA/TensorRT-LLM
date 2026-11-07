@@ -210,7 +210,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params)
         norm_out += block_offset;
     }
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
 
@@ -306,7 +306,7 @@ __global__ void rmsNormFp4QuantKernel(RmsNormFp4QuantParams params)
             reinterpret_cast<uint32_t*>(params.quant_out)[access_id] = quant_val;
         }
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900) && (__CUDA_ARCH__ < 1200))
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
@@ -391,15 +391,15 @@ void launchRmsNormFp4QuantKernel(RmsNormFp4QuantParams const& params, cudaStream
 
 void residualRmsNormFp4Quant(RmsNormFp4QuantParams const& params, tensorrt_llm::DataType dataType, cudaStream_t stream)
 {
-    // The NVFP4 epilogue (cvt_warp_fp16_to_fp4) is compiled for
-    // __CUDA_ARCH__ >= 1000 and emits zeros otherwise. Keep the host-side guard
-    // in sync so unsupported architectures fail instead of silently producing
-    // zero FP4 output. Both datacenter Blackwell (SM 10.x) and client Blackwell
-    // (SM 12.x) provide the conversion operations used by the helper.
+    // The NVFP4 epilogue (cvt_warp_fp16_to_fp4) is compiled only for
+    // __CUDA_ARCH__ >= 1000 and emits zeros otherwise, so this kernel is correct
+    // only on SM 10.x and later. Fail fast on unsupported archs rather than
+    // silently producing wrong FP4 (the Python dispatch in rms_norm.py already
+    // routes those to the unfused path).
     int const sm = tensorrt_llm::common::getSMVersion();
-    TLLM_CHECK_WITH_INFO(isRmsNormFp4QuantSupportedSm(sm),
-        "residualRmsNormFp4Quant requires SM 10.x or SM 12.x (Blackwell); got SM %d. The fused NVFP4 epilogue is "
-        "unsupported on this arch.",
+    TLLM_CHECK_WITH_INFO(sm >= 100,
+        "residualRmsNormFp4Quant requires SM 10.x or later; got SM %d. The fused NVFP4 epilogue is unsupported on "
+        "this arch.",
         sm);
     TLLM_CHECK_WITH_INFO(params.quant_out != nullptr && params.scale_out != nullptr,
         "residualRmsNormFp4Quant requires quant_out and scale_out output buffers.");

@@ -24,6 +24,7 @@ Usage:
 import argparse
 
 from tensorrt_llm import VisualGen, VisualGenArgs
+from tensorrt_llm.visual_gen import MediaRef
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,7 +45,7 @@ def parse_args() -> argparse.Namespace:
         "--image",
         nargs="+",
         required=True,
-        help="One or more input image paths or URLs.",
+        help="One or more input image paths.",
     )
     parser.add_argument(
         "--prompt",
@@ -64,7 +65,7 @@ def main() -> None:
     extra_args = VisualGenArgs.from_yaml(args.visual_gen_args) if args.visual_gen_args else None
     visual_gen = VisualGen(model=args.model, args=extra_args)
     params = visual_gen.default_params
-    params.image = args.image if len(args.image) > 1 else args.image[0]
+    params.image_reference = [MediaRef(content=path, format="path") for path in args.image]
     output = visual_gen.generate(inputs=args.prompt, params=params)
     saved = output.save(args.output_path)
     print(f"Saved edited image to {saved}")

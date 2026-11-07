@@ -19,18 +19,149 @@
 import functools
 import math
 import os
-from typing import (Any, Callable, Dict, List, Optional, Tuple, TypedDict,
-                    Union, cast)
+from typing import (Any, Callable, Dict, List, NamedTuple, Optional, Tuple,
+                    TypedDict, Union, cast)
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from einops import rearrange
 from PIL import Image
 from torchvision.transforms import Normalize, Resize, ToTensor
+from transformers.image_processing_backends import TorchvisionBackend
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
+
+
+class VisionNormalization(NamedTuple):
+    """Processor statistics shared with vision encoder input preparation."""
+
+    rescale_factor: float | None
+    image_mean: tuple[float, ...] | None
+    image_std: tuple[float, ...] | None
+    out_dtype: torch.dtype
+    compute_dtype: torch.dtype | None = None
+
+
+def vision_normalization_from_processor(
+        frames: list[Any], processor: Any,
+        out_dtype: torch.dtype) -> VisionNormalization | None:
+    """Describe elementwise normalization for RGB PIL or uint8 HWC frames."""
+    # Workers reconstruct the table, so the processor must use the shared backend.
+    uses_shared_backend = all(
+        getattr(getattr(processor, name, None), "__func__", None) is getattr(
+            TorchvisionBackend, name)
+        for name in ("rescale_and_normalize", "rescale", "normalize"))
+    if not uses_shared_backend:
+        return None
+    if not (processor.do_rescale or processor.do_normalize):
+        return None
+    rgb_frames = frames and all(
+        (isinstance(frame, Image.Image) and frame.mode == "RGB") or
+        (isinstance(frame, np.ndarray) and frame.dtype == np.uint8
+         and frame.ndim == 3 and frame.shape[-1] == 3) for frame in frames)
+    if not rgb_frames:
+        return None
+    return VisionNormalization(
+        rescale_factor=processor.rescale_factor
+        if processor.do_rescale else None,
+        image_mean=((processor.image_mean, ) * 3 if np.isscalar(
+            processor.image_mean) else tuple(processor.image_mean))
+        if processor.do_normalize else None,
+        image_std=((processor.image_std, ) * 3 if np.isscalar(
+            processor.image_std) else tuple(processor.image_std))
+        if processor.do_normalize else None,
+        out_dtype=out_dtype,
+        compute_dtype=torch.get_default_dtype(),
+    )
+
+
+@functools.lru_cache(maxsize=32)
+def _vision_pixel_lookup_table(
+    normalization: VisionNormalization,
+    device: torch.device,
+    channels: int,
+    default_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Precompute processor outputs for every uint8 value of each channel."""
+    values = torch.arange(256, dtype=default_dtype,
+                          device="cpu").expand(channels, 1, -1)
+    image_mean, image_std = normalization.image_mean, normalization.image_std
+    if normalization.rescale_factor is not None and image_mean is not None:
+        image_mean = torch.tensor(image_mean, dtype=default_dtype,
+                                  device="cpu").unbind()
+        image_std = torch.tensor(image_std, dtype=default_dtype,
+                                 device="cpu").unbind()
+    values = TorchvisionBackend().rescale_and_normalize(
+        values,
+        do_rescale=normalization.rescale_factor is not None,
+        rescale_factor=normalization.rescale_factor,
+        do_normalize=normalization.image_mean is not None,
+        image_mean=image_mean,
+        image_std=image_std,
+    )
+    return values.to(dtype=normalization.out_dtype,
+                     device=device).reshape(channels, 256).contiguous()
+
+
+@triton.jit(do_not_specialize=["count", "channel_stride", "channels"])
+def _lookup_vision_pixels_kernel(source, table, target, count, channel_stride,
+                                 channels, BLOCK: tl.constexpr):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    pixels = tl.load(source + offsets, offsets < count, other=0).to(tl.int32)
+    channel = (offsets // channel_stride) % channels
+    values = tl.load(table + channel * 256 + pixels)
+    tl.store(target + offsets, values, offsets < count)
+
+
+def normalize_vision_pixels(
+    pixel_values: torch.Tensor,
+    normalization: VisionNormalization,
+) -> torch.Tensor:
+    """Apply processor normalization in the tensor's device.
+
+    Models reshape uint8 pixels to [..., channels, values_per_channel]. The
+    processor's shared elementwise step evaluates all 256 values on the CPU,
+    then casts once to the vision dtype. Models restore any padding inserted
+    after CPU normalization.
+    """
+    if pixel_values.dtype != torch.uint8:
+        raise ValueError("Device normalization requires uint8 pixels")
+    if pixel_values.ndim < 2:
+        raise ValueError("Vision pixels must include channel and value axes")
+    channels, channel_stride = pixel_values.shape[-2:]
+    if not channels or not channel_stride:
+        return pixel_values.to(normalization.out_dtype)
+    # Match the producer's intermediate precision when rebuilding the table.
+    table = _vision_pixel_lookup_table(
+        normalization, pixel_values.device, channels,
+        normalization.compute_dtype or torch.get_default_dtype())
+    if not pixel_values.is_cuda:
+        offsets = torch.arange(pixel_values.numel(), device=pixel_values.device)
+        channel = (offsets // channel_stride) % channels
+        return table[channel, pixel_values.reshape(-1).long()].reshape(
+            pixel_values.shape)
+    output = torch.empty_like(pixel_values,
+                              dtype=normalization.out_dtype,
+                              memory_format=torch.contiguous_format)
+    if pixel_values.numel():
+        grid = (triton.cdiv(pixel_values.numel(), 1024), )
+        _lookup_vision_pixels_kernel[grid](
+            pixel_values.contiguous(),
+            table,
+            output,
+            pixel_values.numel(),
+            channel_stride,
+            channels,
+            BLOCK=1024,
+            num_warps=4,
+        )
+    return output
+
 
 _MULTIMODAL_ENV_NAME = "TLLM_MULTIMODAL_DISAGGREGATED"
 
@@ -238,7 +369,10 @@ def _normalize_encoder_embeddings(
     return encoder_embeddings
 
 
-def _join_embeddings(embeddings: List[torch.Tensor]) -> torch.Tensor:
+def _join_embeddings(embeddings: List[torch.Tensor],
+                     *,
+                     start: int = 0,
+                     end: Optional[int] = None) -> torch.Tensor:
     """Join per-item/per-request embeddings along dim 0 without a needless copy.
 
     ``torch.cat`` always allocates, so calling it on a one-element list
@@ -248,8 +382,25 @@ def _join_embeddings(embeddings: List[torch.Tensor]) -> torch.Tensor:
     full extra allocation live at the prefill peak. Multimodal embeddings are
     read-only downstream -- they are sliced and scattered into the input
     embedding buffer, never written in place -- so returning the sole tensor
-    is equivalent to concatenating it.
+    is equivalent to concatenating it. If a row range is given, slice each
+    segment first so rows outside the current prefill chunk are never copied.
     """
+    if start != 0 or end is not None:
+        slices = []
+        offset = 0
+        for embedding in embeddings:
+            segment_end = offset + embedding.shape[0]
+            slice_end = segment_end if end is None else min(end, segment_end)
+            if max(start, offset) < slice_end:
+                slices.append(embedding[max(start - offset, 0):slice_end -
+                                        offset])
+            offset = segment_end
+            if end is not None and offset >= end:
+                break
+        if not slices:
+            return embeddings[0][:0]
+        embeddings = slices
+
     return embeddings[0] if len(embeddings) == 1 else torch.cat(embeddings,
                                                                 dim=0)
 
@@ -333,26 +484,17 @@ def get_multimodal_embeddings(
             )
             return encoder_embeddings
 
-        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
+        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"].
+        # A TP-sharded encoder can return an NCCL window tensor whose lease ends
+        # with the enclosing ModelCaller scope, while chunked prefill reads the
+        # cached rows in later iterations, so cache an owned copy instead of
+        # views of the encoder output.
+        encoder_embeddings = [encoder_embeddings[0].clone()]
         _store_chunked_prefill_embeddings(uncached_multimodal_params,
                                           encoder_embeddings)
 
-    # Step 4: Gather all embeddings for the batch
-    for param in multimodal_params:
-        # concatenate if embeds is a list of tensors
-        embeds = param.multimodal_data.get("multimodal_embedding")
-        if isinstance(embeds, list):
-            param.multimodal_data["multimodal_embedding"] = _join_embeddings(
-                embeds)
-
-    valid_params = [
-        param for param in multimodal_params
-        if param.multimodal_data.get("multimodal_embedding", None) is not None
-    ]
-    all_embeddings = _join_embeddings([
-        param.multimodal_data["multimodal_embedding"] for param in valid_params
-    ])
-    return [all_embeddings]
+    # Step 4: Gather after the stream wait and any encoder/cache writes.
+    return get_attached_multimodal_embeddings(multimodal_params)
 
 
 def get_attached_multimodal_embeddings(
@@ -360,19 +502,37 @@ def get_attached_multimodal_embeddings(
     """Gather embeddings already stored on MultimodalParams.
 
     Use this on E/P prefill workers and cached-only paths. The encoder already ran somewhere else.
-    This only makes the tensor list that `find_input_mm_embeds` slices.
+    Normally `find_input_mm_embeds` selects active rows afterwards. If item
+    scheduling attached current-chunk embeddings, select the same chunk from
+    any full-request embeddings before joining the batch. This keeps mixed
+    batches in one row layout without copying unrelated future chunks.
 
     Side-stream-prefetched requests must use `get_multimodal_embeddings`, which waits on
     `encoder_event` and registers attached tensors with the consuming stream before gathering them.
     """
+    current_chunk_only = any(
+        param.multimodal_data.get("multimodal_embedding_is_chunk", False)
+        for param in multimodal_params)
     attached_embeddings = []
     for param in multimodal_params:
         embeds = param.multimodal_data.get("multimodal_embedding")
         # No attached embedding for this request.
         if embeds is None:
             continue
-        # Some paths stash chunks. Slicer expects one tensor.
-        if isinstance(embeds, list):
+        runtime = param.multimodal_runtime
+        if (current_chunk_only and runtime is not None
+                and not param.multimodal_data.get(
+                    "multimodal_embedding_is_chunk", False)):
+            # Keep the full attached payload intact for later chunks/cache
+            # writes; only this forward's gathered tensor is chunk-local.
+            start = runtime.num_cached_mm_tokens
+            end = start + runtime.num_mm_tokens_in_chunk
+            if isinstance(embeds, list):
+                embeds = _join_embeddings(embeds, start=start, end=end)
+            else:
+                embeds = embeds[start:end]
+        elif isinstance(embeds, list):
+            # Legacy paths can attach a list of full-request output pieces.
             embeds = _join_embeddings(embeds)
             param.multimodal_data["multimodal_embedding"] = embeds
         if not isinstance(embeds, torch.Tensor):
@@ -450,6 +610,8 @@ def find_input_mm_embeds(
         )
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
+        # Item-scheduled batches were already sliced by the producer/gather
+        # path. Do not apply the cached-prefix offset a second time.
         return mm_embeds
 
     current_pos = 0
@@ -509,6 +671,18 @@ def filter_mm_token_from_input_ids(
     return text_token_indices, mm_token_indices
 
 
+def _as_copy_index(index: torch.Tensor,
+                   destination: torch.Tensor) -> torch.Tensor:
+    """Return ``index`` as the int64 index ``index_copy_`` needs on ``destination``.
+
+    Explicit indices can come from callers with another dtype or device; for the
+    executor's int64 device indices this is a no-op.
+    """
+    return index.to(device=destination.device,
+                    dtype=torch.long,
+                    non_blocking=True)
+
+
 def fuse_input_embeds(
     embedding_layer: Embedding,
     input_ids: torch.IntTensor,
@@ -541,9 +715,9 @@ def fuse_input_embeds(
           explicit indices for the active MM token positions.
         - Sync-free contract: passing both ``text_token_indices`` and
           ``mm_token_indices`` skips the GPU ``torch.where`` host sync. The
-          executor (``model_engine._prepare_inputs`` /
-          ``_prepare_tp_inputs_no_cache``) precomputes them on a CPU
-          ``input_ids`` copy via ``_prepare_multimodal_indices`` (which uses
+          executor (``DecoderInputPreparer.prepare_inputs`` /
+          ``NoKVCacheRunner._prepare_inputs``) precomputes them on a CPU
+          ``input_ids`` copy via ``runners.prepare_multimodal_indices`` (which uses
           ``filter_mm_token_from_input_ids`` against ``self.model.mm_token_ids``
           when present, else the OOV fallback ``>= vocab_size``) and ships
           them as pinned async H2D tensors in the inputs dict. VLM forwards
@@ -596,7 +770,8 @@ def fuse_input_embeds(
                                    mm_embed.shape[-1],
                                    device=text_embed.device,
                                    dtype=text_embed.dtype)
-        input_embeds[text_token_indices, :] = text_embed
+        input_embeds.index_copy_(
+            0, _as_copy_index(text_token_indices, input_embeds), text_embed)
     if extra_embeds is not None and len(extra_embeds) > 0:
         # only support single modality for deepstack features for now
         for i, extra_feature in enumerate(extra_embeds):
@@ -606,11 +781,15 @@ def fuse_input_embeds(
                 device=extra_feature.device,
                 dtype=extra_feature.dtype,
             )
-            extra_embed[mm_token_indices, :] = extra_feature
+            extra_embed.index_copy_(
+                0, _as_copy_index(mm_token_indices, extra_embed), extra_feature)
             extra_embeds[i] = extra_embed
 
-    input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
-                                                    device=input_embeds.device)
+    input_embeds.index_copy_(
+        0,
+        _as_copy_index(mm_token_indices, input_embeds),
+        mm_embed.to(dtype=input_embeds.dtype, device=input_embeds.device),
+    )
     if extra_embeds is not None and len(extra_embeds) > 0:
         return None, cast(torch.FloatTensor, input_embeds), extra_embeds
     return None, cast(torch.FloatTensor, input_embeds)

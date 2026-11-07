@@ -12,8 +12,7 @@ if __name__ == '__main__':
     ]
     sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
-    model_path = Path(os.environ.get(
-        "LLM_MODELS_ROOT")) / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    model_path = Path(os.environ.get("LLM_MODELS_ROOT")) / "Qwen3/Qwen3-0.6B"
     print(f'model_path: {model_path}')
 
     with LLM(model=str(model_path)) as llm:

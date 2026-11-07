@@ -9,6 +9,7 @@ import pytest
 import yaml
 
 from agent_flow import CLAUDE_CODE_DEFAULT_MODEL
+from agent_flow.workflows.perf_analyze import cli as cli_module
 from agent_flow.workflows.perf_analyze import progress as progress_module
 from agent_flow.workflows.perf_analyze import state as state_module
 from agent_flow.workflows.perf_analyze import workflow as workflow_module
@@ -188,7 +189,7 @@ def test_fresh_run_executes_stages_in_order(tmp_path):
     assert "serve" not in resolved
     assert resolved["sol"] == {"enabled": True}
     assert resolved["benchmark"]["random_input_len"] == 1024
-    assert resolved["profile"]["methods"] == ["nsys", "torch", "ncu"]
+    assert resolved["profile"]["methods"] == ["nsys", "ncu"]
 
 
 def test_fresh_run_with_sol_hint_runs_projector(tmp_path):
@@ -471,6 +472,8 @@ def test_clean_overwrites_stale_managed_files(tmp_path):
 def test_all_agents_use_claude_code_backend(tmp_path):
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for layer in (
             workflow.benchmarker,
             workflow.projector,
@@ -479,10 +482,97 @@ def test_all_agents_use_claude_code_backend(tmp_path):
         ):
             assert layer.config.backend.kind == "claude-code"
             assert layer.config.backend.model == CLAUDE_CODE_DEFAULT_MODEL
-            # Each role is gated by a required-tool stop hook.
-            assert layer.config.backend.hooks is not None
+            # Each role must record progress through the shared policy.
+            assert layer.config.required_tools == (f"append_{layer.config.name.lower()}_progress",)
+            assert layer.config.backend.hooks is None
     finally:
         workflow.close()
+
+
+def test_projector_and_analyzer_can_use_codex(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text(
+        yaml.safe_dump(
+            {
+                "agents": {
+                    "roles": {
+                        role: {
+                            "backend": "codex",
+                            "model": "gpt-6-astra",
+                            "reasoning_effort": "ultra",
+                        }
+                        for role in ("projector", "analyzer")
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        workflow._configure_agents()
+        for role in ("projector", "analyzer"):
+            backend = getattr(workflow, role).config.backend
+            assert (backend.kind, backend.model, backend.reasoning_effort) == (
+                "codex",
+                "gpt-6-astra",
+                "ultra",
+            )
+        assert workflow.benchmarker.config.backend.kind == "claude-code"
+        assert workflow.reporter.config.backend.kind == "claude-code"
+    finally:
+        workflow.close()
+
+
+def test_casebook_disable_reaches_every_backend(tmp_path):
+    workflow = Workflow(workspace=tmp_path / "ws")
+    workflow.task_path.write_text("casebook: {enabled: false}\n", encoding="utf-8")
+    try:
+        workflow._configure_agents()
+        for role in ("benchmarker", "projector", "analyzer", "reporter"):
+            assert getattr(workflow, role).config.backend.disabled_skills
+    finally:
+        workflow.close()
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_casebook", "input_casebook"),
+    [(True, False), (False, True)],
+)
+def test_cli_resume_builds_prompts_from_checkpointed_task(
+    tmp_path, monkeypatch, checkpoint_casebook, input_casebook
+):
+    task = _write_task(tmp_path)
+    input_data = yaml.safe_load(task.read_text(encoding="utf-8"))
+    input_data["casebook"] = {"enabled": input_casebook}
+    input_data["agents"] = {"roles": {"projector": {"backend": "claude-code"}}}
+    task.write_text(yaml.safe_dump(input_data), encoding="utf-8")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    checkpoint_data = dict(input_data)
+    checkpoint_data["casebook"] = {"enabled": checkpoint_casebook}
+    checkpoint_data["agents"] = {"roles": {"projector": {"backend": "codex"}}}
+    (workspace / "task.yaml").write_text(yaml.safe_dump(checkpoint_data), encoding="utf-8")
+    (workspace / state_module.STATE_FILENAME).write_text("{}", encoding="utf-8")
+
+    captured = {}
+
+    def resolve_methodology(enabled, backend_kind="claude-code"):
+        captured["backend_kind"] = backend_kind
+        return SolMethodology()
+
+    def build_prompts(**kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after prompt construction")
+
+    monkeypatch.setattr(cli_module, "resolve_sol_methodology", resolve_methodology)
+    monkeypatch.setattr(cli_module, "build_perf_analyze_prompts", build_prompts)
+
+    with pytest.raises(RuntimeError, match="stop after prompt construction"):
+        cli_module.main(["--task", str(task), "--workspace", str(workspace)])
+
+    assert captured["include_casebook"] is checkpoint_casebook
+    assert captured["backend_kind"] == "codex"
 
 
 def test_no_role_wires_an_external_mcp_server(tmp_path):
@@ -495,6 +585,8 @@ def test_no_role_wires_an_external_mcp_server(tmp_path):
     """
     workflow = Workflow(workspace=tmp_path / "ws")
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for layer in (
             workflow.benchmarker,
             workflow.projector,
@@ -613,6 +705,8 @@ def test_each_agent_has_its_progress_tools(tmp_path):
         "reporter": "append_reporter_progress",
     }
     try:
+        workflow.task_path.write_text("{}\n", encoding="utf-8")
+        workflow._configure_agents()
         for role, append_name in expected.items():
             layer = getattr(workflow, role)
             tool_names = [t.name for t in layer.config.backend.tools]
@@ -729,6 +823,30 @@ def test_analyzer_prompt_mentions_projection_only_when_enabled(tmp_path):
         assert marker in with_sol, marker
 
 
+def test_analyzer_prompt_instructs_the_nsys_timeline_decomposition(tmp_path):
+    ws = tmp_path / "ws"
+    workflow = Workflow(workspace=ws)
+    try:
+        _write_ws_task(ws, sol=False)
+        without = _capture_prompt(workflow, "analyzer", "_run_analyzer")
+        _write_ws_task(ws, sol=True)
+        with_sol = _capture_prompt(workflow, "analyzer", "_run_analyzer")
+    finally:
+        workflow.close()
+
+    # Not SOL-gated: every analyzer turn decomposes the timeline it just
+    # captured, and the driving prompt names the workspace path so the
+    # products land next to the other traces.
+    for prompt in (without, with_sol):
+        assert "internal-perf-nsight-system-analysis" in prompt
+        assert "trtllm-agent-toolkit:internal-perf-nsight-system-analysis" in prompt
+        assert "nsys export --type sqlite" in prompt
+        assert f"{ws}/nsys_analysis" in prompt
+        assert "nsys_analysis/" in prompt
+        # The section is reported from the pipeline, not the stats table.
+        assert "not from the `nsys stats` table alone" in prompt
+
+
 def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
     ws = tmp_path / "ws"
     workflow = Workflow(workspace=ws)
@@ -749,7 +867,7 @@ def test_analyzer_prompt_instructs_the_ncu_deep_dive(tmp_path):
         assert "trtllm-agent-toolkit:perf-nsight-compute-analysis" in prompt
         assert "server_ncu.ncu-rep" in prompt
         assert "ncu kernel analysis" in prompt
-        assert "default all three" in prompt
+        assert "default both" in prompt
 
 
 def test_reporter_prompt_mentions_projection_only_when_enabled(tmp_path):
@@ -889,3 +1007,78 @@ def test_projector_driving_prompt_fails_open_when_the_probe_could_not_run(tmp_pa
     # ...and the agent is handed both spellings, since the name is a guess.
     assert "trtllm-agent-toolkit:internal-perf-sol-analysis" in prompt
     assert "if the bare name is not found" in prompt
+
+
+# --------------------------------------------------- the workspace prompt snapshot
+
+
+_AGENT_ROLES = ("benchmarker", "projector", "analyzer", "reporter")
+
+
+def test_the_cli_snapshots_the_prompts_before_the_first_agent_runs(tmp_path, monkeypatch):
+    """The prompts must be on disk while the campaign is still live.
+
+    They exist only in the launching process's memory otherwise, so a run
+    in flight — or one read back later — has nothing to check its agents'
+    instructions against. Written before ``run``, from the bundle the
+    workflow was actually handed.
+    """
+    from agent_flow.workflows.perf_analyze import cli as cli_module
+    from agent_flow.workflows.perf_analyze.prompts import PROMPTS_DIRNAME
+
+    # `sol.enabled: false` keeps the CLI from probing the live skill list.
+    task = _write_task(tmp_path, sol=False)
+    ws = tmp_path / "ws"
+    seen: dict = {}
+
+    class _FakeWorkflow:
+        def __init__(self, **kwargs):
+            self.workspace = kwargs["workspace"]
+            self.prompts = kwargs["prompts"]
+            self.workspace.mkdir(parents=True, exist_ok=True)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def run(self, task_path):
+            directory = self.workspace / PROMPTS_DIRNAME
+            seen["snapshot"] = {
+                path.stem: path.read_text(encoding="utf-8") for path in directory.glob("*.md")
+            }
+            seen["bundle"] = self.prompts
+
+    monkeypatch.setattr(cli_module, "PerfAnalyzeWorkflow", _FakeWorkflow)
+    cli_module.main(["--task", str(task), "--workspace", str(ws)])
+
+    bundle = seen["bundle"]
+    # Equality against the handed bundle covers both halves: every role is
+    # there, and each file is that role's *composed* prompt — a snapshot
+    # rebuilt from the defaults would miss what the task spec switched on.
+    assert seen["snapshot"] == {role: getattr(bundle, role) for role in _AGENT_ROLES}
+
+
+def test_a_workspace_the_workflow_refuses_keeps_its_previous_snapshot(tmp_path):
+    """A refused launch must not overwrite the last run's record of its prompts.
+
+    The fresh-run guard exists so a forgotten workspace is never scribbled
+    over; the snapshot is written after it for exactly that reason.
+    """
+    from agent_flow.workflows.perf_analyze import cli as cli_module
+    from agent_flow.workflows.perf_analyze.prompts import PROMPTS_DIRNAME
+
+    task = _write_task(tmp_path, sol=False)
+    ws = tmp_path / "ws"
+    (ws / PROMPTS_DIRNAME).mkdir(parents=True)
+    (ws / PROMPTS_DIRNAME / "analyzer.md").write_text("the previous run's\n", encoding="utf-8")
+    # A prior run's output, with no checkpoint to resume from.
+    (ws / "benchmark_results.md").write_text("## Baseline\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        cli_module.main(["--task", str(task), "--workspace", str(ws)])
+
+    assert (ws / PROMPTS_DIRNAME / "analyzer.md").read_text(encoding="utf-8") == (
+        "the previous run's\n"
+    )

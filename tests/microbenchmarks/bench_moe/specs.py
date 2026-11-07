@@ -246,7 +246,8 @@ class ConfigSpec:
     """One executable MoE runtime configuration."""
 
     backend: str
-    parallel_mode: str  # "DEP" | "TEP" | "DTP" | "TTP" | "CUSTOM"
+    # "DEP" | "TEP" | "DTP" | "TTP" | hybrid "(D|T)TP<k>EP<m>" (e.g. "DTP2EP2") | "CUSTOM"
+    parallel_mode: str
     moe_ep_size: Optional[int] = None
     moe_tp_size: Optional[int] = None
     enable_attention_dp: Optional[bool] = None
@@ -418,8 +419,8 @@ BUILT_IN_MODELS: Dict[str, ModelSpec] = {
     # Kimi-K3. SiTU is gated, so ``activation_type`` stays SWIGLU (same fc1
     # geometry). ``build._situ_kwargs`` switches the epilogue for the backends
     # that implement it (TRTLLM / MEGAMOE_DEEPGEMM on W4A8_MXFP4_MXFP8,
-    # MEGAMOE_CUTEDSL / CUTLASS on NVFP4); other combinations keep the SwiGLU
-    # proxy.
+    # TRTLLM / CUTEDSL / MEGAMOE_CUTEDSL / CUTLASS on NVFP4); other
+    # combinations keep the SwiGLU proxy.
     "kimi_k3": ModelSpec(
         name="kimi_k3",
         num_experts=896,

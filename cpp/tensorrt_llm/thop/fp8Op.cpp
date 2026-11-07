@@ -19,7 +19,9 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
+#include "tensorrt_llm/kernels/fp8PerTokenQuant/fp8_per_token_quant.cuh"
 #include "tensorrt_llm/thop/thUtils.h"
+#include <c10/cuda/CUDAGuard.h>
 #include <torch/extension.h>
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
@@ -372,6 +374,52 @@ Tensor symmetric_dequantize_per_tensor(Tensor input, Tensor scales)
     return e4m3_dequantize_helper(input, scales, QuantizeMode::PER_TENSOR);
 }
 
+std::tuple<Tensor, Tensor> vectorized_per_token_fp8_quant(Tensor input)
+{
+    CHECK_CONTIGUOUS(input);
+    CHECK_TH_CUDA(input);
+    TORCH_CHECK(input.numel() != 0, "input should not be empty tensor");
+    TORCH_CHECK(input.dim() >= 2, "input dim should be >= 2");
+
+    auto const _st = input.scalar_type();
+    TORCH_CHECK(_st == torch::kFloat32 || _st == torch::kFloat16 || _st == torch::kBFloat16,
+        "vectorized_per_token_fp8_quant: input must be FP16, BF16, or FP32");
+
+    int64_t const numel = input.numel();
+    int64_t const hidden_size = input.size(-1);
+    int64_t const num_tokens = numel / hidden_size;
+    TORCH_CHECK(hidden_size <= INT_MAX, "hidden_size exceeds INT_MAX");
+    TORCH_CHECK(num_tokens <= INT_MAX, "num_tokens exceeds INT_MAX");
+
+    at::cuda::CUDAGuard device_guard{static_cast<signed char>(input.get_device())};
+
+    Tensor output
+        = torch::empty(input.sizes(), torch::dtype(torch::kFloat8_e4m3fn).device(torch::kCUDA).requires_grad(false));
+
+    std::vector<int64_t> scale_shape;
+    for (int i = 0; i < input.dim() - 1; ++i)
+        scale_shape.push_back(input.size(i));
+    scale_shape.push_back(1);
+    Tensor scales = torch::empty(scale_shape, torch::dtype(torch::kFloat32).device(torch::kCUDA).requires_grad(false));
+
+    auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+    auto* out_ptr = get_ptr<void>(output);
+    auto* scale_ptr = get_ptr<float>(scales);
+
+    if (_st == torch::kBFloat16)
+        tensorrt_llm::kernels::invokeVectorizedPerTokenFP8Quant(
+            out_ptr, scale_ptr, get_ptr<__nv_bfloat16 const>(input), static_cast<int>(hidden_size), num_tokens, stream);
+    else if (_st == torch::kFloat16)
+        tensorrt_llm::kernels::invokeVectorizedPerTokenFP8Quant(
+            out_ptr, scale_ptr, get_ptr<half const>(input), static_cast<int>(hidden_size), num_tokens, stream);
+    else
+        tensorrt_llm::kernels::invokeVectorizedPerTokenFP8Quant(
+            out_ptr, scale_ptr, get_ptr<float const>(input), static_cast<int>(hidden_size), num_tokens, stream);
+
+    return {output, scales};
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -388,6 +436,7 @@ TORCH_LIBRARY_FRAGMENT(tensorrt_llm, m)
     m.def("dequantize_e4m3_weight(Tensor weight, Tensor scales) -> Tensor");
     m.def("dequantize_e4m3_activation(Tensor activation, Tensor scales) -> Tensor");
     m.def("dequantize_e4m3_per_tensor(Tensor input, Tensor scales) -> Tensor");
+    m.def("vectorized_per_token_fp8_quant(Tensor input) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
@@ -401,6 +450,7 @@ TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
     m.impl("dequantize_e4m3_weight", &tensorrt_llm::torch_ext::symmetric_dequantize_weight);
     m.impl("dequantize_e4m3_activation", &tensorrt_llm::torch_ext::symmetric_dequantize_activation);
     m.impl("dequantize_e4m3_per_tensor", &tensorrt_llm::torch_ext::symmetric_dequantize_per_tensor);
+    m.impl("vectorized_per_token_fp8_quant", &tensorrt_llm::torch_ext::vectorized_per_token_fp8_quant);
 }
 
 static auto dequantize_mxe4m3_host = torch::RegisterOperators(

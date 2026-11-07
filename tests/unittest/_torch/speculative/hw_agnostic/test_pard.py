@@ -1,5 +1,3 @@
-import os
-import sys
 import unittest
 
 import pytest
@@ -8,8 +6,6 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, PARDDecodingConfig
-
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
 @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])

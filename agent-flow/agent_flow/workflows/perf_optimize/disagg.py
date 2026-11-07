@@ -54,7 +54,7 @@ DISAGG_CONFIG_KEY = "config"
 
 #: The harness only knows how to wrap workers in nsys (``profiling.nsys_on``
 #: plus a per-role iteration window in ``start_worker.sh``). There is no
-#: torch-profiler env var and no ncu path anywhere in it.
+#: ncu path anywhere in it.
 DISAGG_PROFILE_METHODS: tuple[str, ...] = ("nsys",)
 
 
@@ -251,7 +251,7 @@ def apply_harness_conditions(
     if dropped:
         notes.append(
             f"profile.methods {dropped} dropped: the disagg harness only wraps workers "
-            f"in nsys (no torch-profiler env var, no ncu path)"
+            f"in nsys (no ncu path)"
         )
 
     if task_data.pop("accuracy", None) is not None:

@@ -17,12 +17,13 @@ from typing_extensions import Required
 
 from tensorrt_llm.inputs import (ContentFormat, ConversationMessage,
                                  MultimodalData, MultimodalDataTracker,
-                                 add_multimodal_placeholders,
                                  load_base64_image_embeds)
-from tensorrt_llm.inputs.media_io import MEDIA_IO_REGISTRY, BaseMediaIO
+from tensorrt_llm.inputs.media_io import (MEDIA_IO_REGISTRY, BaseMediaIO,
+                                          is_local_media_url)
+from tensorrt_llm.inputs.model_config import resolve_top_level_model_type
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
-from tensorrt_llm.inputs.utils import interleave_mm_placeholders
+from tensorrt_llm.inputs.utils import apply_mm_placeholders
 from tensorrt_llm.logger import logger
 
 
@@ -111,6 +112,21 @@ def _make_media_io(
     )
 
 
+async def _load_request_media(media_io: BaseMediaIO, url: str) -> Any:
+    """Load one media URL taken from a request.
+
+    A local reference (`file://` URI or bare path) is read only from the
+    directory allowed by `TRTLLM_MEDIA_ALLOWED_LOCAL_PATH`, through
+    `BaseMediaIO.async_load_allowed_local_file`: the file is opened once on
+    the media executor and decoded through that open descriptor. The check
+    runs when the load is awaited, so a request whose media is discarded
+    unread is unaffected.
+    """
+    if is_local_media_url(url):
+        return await media_io.async_load_allowed_local_file(url)
+    return await media_io.async_load(url)
+
+
 def _parse_chat_message_content_mm_part(
     part: ChatCompletionContentPartParam
 ) -> tuple[str, Union[str, dict[str, str], None]]:
@@ -152,7 +168,7 @@ def parse_chat_message_content_part(
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="image",
-                              data=image_io.async_load(str_content),
+                              data=_load_request_media(image_io, str_content),
                               is_embedding=False)
 
     if part_type == "image_embeds":
@@ -171,7 +187,7 @@ def parse_chat_message_content_part(
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="video",
-                              data=video_io.async_load(str_content),
+                              data=_load_request_media(video_io, str_content),
                               is_embedding=False)
 
     if part_type == "audio_url":
@@ -180,7 +196,7 @@ def parse_chat_message_content_part(
                                   mm_data_tracker._multimodal_server_config,
                                   mm_data_tracker.request_media_io_kwargs)
         return MultimodalData(modality="audio",
-                              data=audio_io.async_load(str_content),
+                              data=_load_request_media(audio_io, str_content),
                               is_embedding=False)
 
     if part_type == "input_audio":
@@ -415,6 +431,10 @@ def _parse_assistant_message_content(message: Dict[str, Any],
             # The strict parse path delivers tool_calls as a single-use Pydantic `ValidatorIterator`
             # of already-validated OpenAI tool calls, so only materialize and normalize arguments.
             tool_calls = list(tool_calls)
+            # Put the list back: the iterator is spent now, and the router forwards this same
+            # request (or counts its tokens) after rendering it. A validation error still
+            # surfaces from the `list()` above, so the raw-body fallback is unchanged.
+            message["tool_calls"] = tool_calls
             result["tool_calls"] = [
                 _normalize_tool_call_arguments(index, item, lenient_json)
                 for index, item in enumerate(tool_calls)
@@ -430,24 +450,13 @@ def _parse_tool_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-def resolve_top_level_model_type(model_config: AutoConfig) -> str:
-    """Return the top-level HF model_type for a loaded config.
-
-    Newer composite configs (e.g. Qwen2_5_VLConfig) delegate the instance
-    attribute to `text_config`, returning e.g. "qwen2_5_vl_text" instead of the
-    top-level "qwen2_5_vl" used as the AutoConfig/registry key. The class-level
-    attribute is unaffected by this delegation, so prefer it.
-    """
-    return getattr(type(model_config), "model_type", None) or getattr(
-        model_config, "model_type", "")
-
-
 def parse_chat_messages_coroutines(
     messages: List[ChatCompletionMessageParam],
     model_config: AutoConfig,
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
     model_type_override: Optional[str] = None,
+    resolve_media: bool = True,
 ) -> Tuple[List[ConversationMessage], Coroutine[Any, Any, tuple[Optional[Dict[
         str, List[Any]]], Optional[Dict[str, List[Any]]]]], list[dict[str,
                                                                       int]]]:
@@ -465,6 +474,11 @@ def parse_chat_messages_coroutines(
             (e.g. `--media_io_kwargs`); defaults to empty.
         request_media_io_kwargs: Per-request override merged per
             modality with the server default via `BaseMediaIO.create`.
+        model_type_override: The model type to parse for, for a caller that
+            has no `model_config` (the KV-aware router) but knows the type.
+        resolve_media: When False the returned coroutine closes the
+            pending loads instead of running them and yields
+            `(None, None)`.
 
     Returns:
         `(conversation, mm_coroutine, mm_placeholder_counts)` where
@@ -474,7 +488,8 @@ def parse_chat_messages_coroutines(
     """
     conversation = []
     mm_placeholder_counts = []
-    model_type = resolve_top_level_model_type(model_config)
+    model_type = model_type_override or resolve_top_level_model_type(
+        model_config)
     mm_data_tracker = MultimodalDataTracker(
         model_type,
         multimodal_server_config,
@@ -526,31 +541,20 @@ def parse_chat_messages_coroutines(
                         placeholder] = msg_placeholder_counts.get(
                             placeholder, 0) + 1
 
-        if msg_placeholder_counts and content_format == ContentFormat.STRING:
-            # For STRING format, use interleaving when the model opts in
-            # and content_parts is available, otherwise fall back to bulk
-            # prepend/append according to placeholder_placement.
-            content_parts = parsed_msg.get("content_parts")
-            interleave = MULTIMODAL_PLACEHOLDER_REGISTRY.get_interleave_placeholders(
-                model_type)
-            if content_parts and interleave:
-                parsed_msg["content"] = interleave_mm_placeholders(
-                    model_type, content_parts, msg_placeholder_counts,
-                    mm_data_tracker.placeholder_modalities())
-            else:
-                msg_item_order = mm_data_tracker.item_order()[item_order_start:]
-                parsed_msg["content"] = add_multimodal_placeholders(
-                    type(model_config).model_type,
-                    parsed_msg["content"],
-                    msg_placeholder_counts,
-                    item_order=msg_item_order,
-                )
+        apply_mm_placeholders(model_type,
+                              parsed_msg,
+                              msg_placeholder_counts,
+                              mm_data_tracker,
+                              item_order_start=item_order_start,
+                              content_format=content_format)
         mm_placeholder_counts.append(msg_placeholder_counts)
 
     # ``item_order`` is populated synchronously by ``add_data``, so it can
     # be returned directly (not through the coroutine).
-    return (conversation, mm_data_tracker.retrieve_all_async(),
-            mm_placeholder_counts, mm_data_tracker.item_order())
+    mm_coroutine = (mm_data_tracker.retrieve_all_async()
+                    if resolve_media else mm_data_tracker.discard_all_async())
+    return (conversation, mm_coroutine, mm_placeholder_counts,
+            mm_data_tracker.item_order())
 
 
 def make_tool_call_id(id_type: str = "random", func_name=None, idx=None):

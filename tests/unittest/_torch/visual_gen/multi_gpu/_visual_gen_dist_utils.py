@@ -12,11 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared helpers for visual_gen multi-GPU (mp.spawn) tests.
+"""Shared helpers for the visual_gen multi-GPU tests.
 
 Provides :func:`spawn_with_retry`, which allocates a fresh master port and
 retries the spawn when the c10d rendezvous ``TCPStore`` loses the bind race and
-fails with ``EADDRINUSE``.
+fails with ``EADDRINUSE``. Used both by the ``mp.spawn`` harness and by the
+rank pool in ``_worker_pool.py``.
 
 Why the retry is needed: the CI-aware port allocator (``get_free_port_in_ci``)
 binds a probe socket, *closes* it, and returns the port number. ``mp.spawn``
@@ -26,18 +27,12 @@ test) can grab the port in the gap between the probe close and the re-bind, so a
 single allocation is not enough on busy nodes -- we must re-allocate and retry.
 """
 
-import sys
-from pathlib import Path
-
 import torch.multiprocessing as mp
 
 # The CI-aware allocator lives in tests/integration/defs/common.py. Adding that
 # directory to sys.path lets us reuse it (it tracks allocated ports per-process
 # so sequential tests don't collide, and honors CONTAINER_PORT_START/NUM).
-_INTEGRATION_DIR = Path(__file__).resolve().parents[4] / "integration"
-if str(_INTEGRATION_DIR) not in sys.path:
-    sys.path.insert(0, str(_INTEGRATION_DIR))
-from defs.common import get_free_port_in_ci  # noqa: E402
+__extra_import_path__ = ["~/tests/integration"]
 
 _ADDR_IN_USE_MARKERS = ("EADDRINUSE", "address already in use")
 
@@ -47,27 +42,41 @@ def _is_addr_in_use(exc: BaseException) -> bool:
     return any(marker in msg for marker in _ADDR_IN_USE_MARKERS)
 
 
-def spawn_with_retry(spawn_fn, max_retries: int = 10):
+def _free_port() -> int:
+    try:
+        from defs.common import get_free_port_in_ci
+    except ImportError:
+        # Not under pytest (no __extra_import_path__ finder): plain ephemeral port.
+        import socket
+
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+    return get_free_port_in_ci()
+
+
+def spawn_with_retry(
+    spawn_fn,
+    max_retries: int = 10,
+    retryable: tuple[type[BaseException], ...] = (mp.ProcessRaisedException, OSError),
+):
     """Run ``spawn_fn(port)`` with a fresh free port, retrying on EADDRINUSE.
 
-    ``spawn_fn`` receives a master port and is expected to call ``mp.spawn``
-    (passing the port through to the workers). If the rendezvous TCPStore fails
-    to bind because the port was grabbed after allocation, a new port is chosen
-    and the spawn is retried up to ``max_retries`` times. Any other failure
-    (e.g. a real assertion inside the test) propagates immediately.
+    ``spawn_fn`` receives a master port and starts the workers with it. If the
+    rendezvous TCPStore fails to bind because the port was grabbed after
+    allocation, a new port is chosen and the spawn is retried up to
+    ``max_retries`` times. ``retryable`` names the exception types that carry
+    that failure for the caller's harness (``mp.spawn`` raises
+    ``ProcessRaisedException``); any other failure, and any retryable exception
+    that is not EADDRINUSE, propagates immediately.
     """
     last_exc: BaseException | None = None
     for _ in range(max_retries):
-        port = get_free_port_in_ci()
+        port = _free_port()
         try:
             spawn_fn(port)
             return
-        except mp.ProcessRaisedException as exc:
-            if _is_addr_in_use(exc):
-                last_exc = exc
-                continue
-            raise
-        except OSError as exc:
+        except retryable as exc:
             if _is_addr_in_use(exc):
                 last_exc = exc
                 continue

@@ -69,16 +69,25 @@ def _make_hf_config(**values):
     return SimpleNamespace(get_text_config=lambda: text_config)
 
 
+def _factory_model_engine(pretrained_config: object) -> SimpleNamespace:
+    return SimpleNamespace(
+        mapping=SimpleNamespace(has_cp_helix=lambda: False),
+        spec_config=None,
+        model=SimpleNamespace(
+            model_config=SimpleNamespace(
+                pretrained_config=pretrained_config,
+                quant_config=None,
+            )
+        ),
+    )
+
+
 class TestConfigAndFactory:
-    def test_factory_allows_block_reuse_and_propagates_config_fields(self):
+    def test_factory_allows_block_reuse_and_propagates_config_fields(self) -> None:
         # The factory contract is independent of GPU-owned persistent buffers.
         fake_v2 = _make_fake_v2(enable_block_reuse=True)
         cfg = _make_tri_config(budget=32, beta=16, eviction_mode="per_head")
-        validate_kv_cache_compression_compatibility(
-            cfg,
-            SimpleNamespace(enable_block_reuse=True),
-            None,
-        )
+        pretrained_config = _make_test_pretrained_config()
         with (
             mock.patch(
                 "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
@@ -90,19 +99,35 @@ class TestConfigAndFactory:
         ):
             mgr = create_kv_cache_compression_manager(
                 cfg,
-                kv_cache_manager=fake_v2,
-                pretrained_config=_make_test_pretrained_config(),
+                model_engine=_factory_model_engine(pretrained_config),
+                kv_cache_config=SimpleNamespace(enable_block_reuse=True),
             )
+            mgr.bind_kv_cache_managers(fake_v2)
         assert isinstance(mgr, TriAttentionCompressionManager)
         assert mgr.budget == 32
         assert mgr.beta == 16
         assert mgr.eviction_mode == "per_head"
+        assert mgr.pretrained_config is pretrained_config
         assert mgr.kv_cache_manager is fake_v2
         assert fake_v2.kv_compression_manages_history
         assert cfg.changes_physical_kv_length
         assert cfg.supports_block_reuse()
         assert not cfg.supports_speculative_decoding()
         initialize.assert_called_once_with()
+
+        # The selector limit applies to both single-request and batch execution.
+        # Reject unsupported budgets before calibration I/O, while accepting the boundary.
+        with mock.patch.object(TriAttentionCompressionManager, "_load_calibration") as load:
+            with pytest.raises(ValueError, match="budget must be at most 16384"):
+                TriAttentionCompressionManager(
+                    _make_tri_config(budget=16385), pretrained_config=pretrained_config
+                )
+            load.assert_not_called()
+            supported = TriAttentionCompressionManager(
+                _make_tri_config(budget=16384), pretrained_config=pretrained_config
+            )
+            assert supported.budget == 16384
+            load.assert_called_once_with()
 
 
 class TestTriAttentionCompressionManager:
@@ -286,7 +311,7 @@ class TestEvictionLifecycle:
     @staticmethod
     def _make_due_decode_request(seq_len, *, num_extra_kv_tokens=0, kv_reserve_draft_tokens=0):
         # The growth and protected-tail capacity constants snapshot the
-        # manager at construction, so the reserve widths are set up front.
+        # manager at binding, so the reserve widths are set up front.
         request = _make_request(
             7,
             py_prompt_len=1024,
@@ -299,9 +324,9 @@ class TestEvictionLifecycle:
         with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
             mgr = TriAttentionCompressionManager(
                 _make_tri_config(budget=8),
-                fake_v2,
                 pretrained_config=_make_test_pretrained_config(),
             )
+            mgr.bind_kv_cache_managers(fake_v2)
         cache = SimpleNamespace(
             capacity=seq_len,
             history_length=1024,
@@ -441,14 +466,12 @@ class TestEvictionLifecycle:
     def test_one_model_draft_co_compression_is_accepted(self, spec_mode):
         draft_manager = _make_fake_v2(is_draft=True)
         with mock.patch.object(TriAttentionCompressionManager, "_initialize_eviction_state"):
-            TriAttentionCompressionManager(
+            manager = TriAttentionCompressionManager(
                 _make_tri_config(budget=8),
-                _make_fake_v2(),
-                draft_kv_cache_manager=draft_manager,
                 pretrained_config=_make_test_pretrained_config(),
             )
+            manager.bind_kv_cache_managers(_make_fake_v2(), draft_manager)
 
-        from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
         from tensorrt_llm.llmapi.llm_args import Eagle3DecodingConfig, MTPDecodingConfig
 
         spec_config = (
@@ -457,15 +480,18 @@ class TestEvictionLifecycle:
             else Eagle3DecodingConfig(
                 max_draft_len=1,
                 speculative_model="draft",
-                eagle3_one_model=True,
             )
         )
 
-        validate_kv_cache_compression_compatibility(
-            _make_tri_config(budget=8),
-            SimpleNamespace(enable_block_reuse=False),
-            spec_config,
-        )
+        with mock.patch(
+            "tensorrt_llm._torch.pyexecutor._util.is_sm_100f",
+            return_value=True,
+        ):
+            validate_kv_cache_compression_compatibility(
+                _make_tri_config(budget=8),
+                SimpleNamespace(enable_block_reuse=False),
+                spec_config,
+            )
 
 
 class TestFixedScoreMetadata:
@@ -548,6 +574,39 @@ class TestFixedScoreMetadata:
 
         assert snapshot[0, 0, 0, :5].tolist() == [36, 38, 40, 42, 44]
         assert staging._block_offsets_device[0, 0, 0, :5].tolist() == [46, 48, 50, 52, 54]
+
+    def test_device_page_table_snapshot_delegates_to_manager(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        current_stream = torch.cuda.current_stream(device)
+        host_table = torch.empty(
+            1,
+            1,
+            2,
+            8,
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=True,
+        )
+        gather = mock.Mock()
+        manager = _make_staging_manager(host_table, gather, current_stream)
+        manager.uses_device_page_table = True
+        manager.materialize_block_offsets_snapshot = mock.Mock()
+        staging = _make_bare_staging(device, max_requests=1, staged_blocks_per_seq=8)
+
+        staging._stage_block_offset_snapshot(
+            manager,
+            [7],
+            staging._block_offsets_host,
+            staging._block_offsets_device,
+        )
+
+        manager.materialize_block_offsets_snapshot.assert_called_once_with(
+            staging._block_offsets_device,
+            [7],
+            host_staging=staging._block_offsets_host,
+            stream=current_stream,
+        )
+        gather.assert_not_called()
 
 
 class TestKernelMaskedSwa:

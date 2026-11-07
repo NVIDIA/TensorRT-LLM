@@ -201,7 +201,7 @@ def peer_handle_type() -> cuda.CUmemAllocationHandleType:
     ``CUDA_ERROR_NOT_PERMITTED`` (800), so we use
     ``CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`` and exchange the FDs
     between sibling MPI workers via ``pidfd_open`` / ``pidfd_getfd``
-    (mirrors ``MnnvlMemory.get_allocation_prop`` in ``_mnnvl_utils.py``).
+    (mirrors ``MnnvlMemory.get_allocation_prop`` in ``mnnvl_memory.py``).
     """
     arch = platform.machine().lower()
     if "aarch64" in arch:
@@ -236,8 +236,8 @@ def create_local_handle(size: int, device_id: int) -> int:
 
     Uses CU_MEM_HANDLE_TYPE_NONE — the handle cannot be exported to other
     processes but avoids consuming NVLink fabric routing table entries.
-    Use this for buffers that only need local GPU access (e.g., page pool
-    double buffers that are written via P2P copy and read locally).
+    Use this for buffers that only need local GPU access (e.g., the page pool's
+    prefetch slots that are written via P2P copy and read locally).
 
     Args:
         size: Size in bytes (must be aligned to granularity).

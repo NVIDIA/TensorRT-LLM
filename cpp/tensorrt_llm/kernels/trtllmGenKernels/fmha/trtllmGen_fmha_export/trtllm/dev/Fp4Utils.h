@@ -201,8 +201,6 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
 
   // The public release uses the portable cvt-based path unconditionally; the fused
   // single-instruction dequant fast path is internal / not exposed in public PTX.
-#if defined(TLLM_PUBLIC_RELEASE) ||                                                                \
-  !(__CUDA_ARCH_SPECIFIC__ == 1000 || __CUDA_ARCH_SPECIFIC__ == 1030)
   // Convert SF from e4m3 to fp16x2 by packing the byte twice, then converting.
   uint16_t sfPacked = uint16_t(sf.storage) * 256u + uint16_t(sf.storage);
   uint32_t sfFp16x2;
@@ -235,8 +233,6 @@ inline __device__ cute::uint128_t convertE2m1ToE4m3(uint64_t srcX16, cutlass::fl
                  : "=r"(dst[ii * 2 + 0]), "=r"(dst[ii * 2 + 1])
                  : "r"(srcWords[ii]), "r"(sfFp16x2));
   }
-#else
-#endif
 
   return reinterpret_cast<cute::uint128_t&>(dst);
 }
@@ -505,6 +501,29 @@ inline __device__ int64_t getSfOffset(void const* gmemOutPtr,
                                       reinterpret_cast<char const*>(gmemBasePtr),
                                     hiddenDim,
                                     startTokenIdx);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <int sfByteIdx>
+inline __device__ void convertMxFp4x8ToBf16x8(uint32_t* eltsBf16x2,
+                                              uint32_t elts,
+                                              uint32_t sfE8x4) {
+  static_assert(sfByteIdx >= 0 && sfByteIdx < 4, "UE8M0 scale-factor byte index must be in [0, 3]");
+  asm volatile("{\n"
+               ".reg .b8 b0, b1, b2, b3;\n"
+               ".reg .b16 scale, unused;\n"
+               ".reg .b32 scaleDup;\n"
+               "mov.b32 {b0, b1, b2, b3}, %4;\n"
+               "prmt.b32 scaleDup, %5, 0, %6;\n"
+               "mov.b32 {scale, unused}, scaleDup;\n"
+               "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 %0, b0, scale;\n"
+               "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 %1, b1, scale;\n"
+               "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 %2, b2, scale;\n"
+               "cvt.rn.scaled::n2::ue8m0.bf16x2.e2m1x2 %3, b3, scale;\n"
+               "}\n"
+               : "=r"(eltsBf16x2[0]), "=r"(eltsBf16x2[1]), "=r"(eltsBf16x2[2]), "=r"(eltsBf16x2[3])
+               : "r"(elts), "r"(sfE8x4), "n"(sfByteIdx * 0x1111));
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

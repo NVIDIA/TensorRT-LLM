@@ -24,11 +24,49 @@ Key Design: Communication dispatch can happen BEFORE or AFTER quantization
 """
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple
+from collections.abc import Hashable
+from typing import List, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
 from tensorrt_llm.mapping import Mapping
+
+
+@runtime_checkable
+class CheckpointableCommunication(Protocol):
+    """MoE communication resource participating in engine sleep/wakeup.
+
+    Implementations own their local checkpoint details and expose a stable key
+    so the executor invokes each shared workspace exactly once.
+    """
+
+    def checkpoint_resource_key(self) -> Hashable:
+        """Return the identity shared by wrappers using one checkpoint resource."""
+        ...
+
+    def checkpoint_prepare(self) -> None:
+        """Detach checkpoint-backed resources after global quiescence."""
+        ...
+
+    def checkpoint_restore(self) -> None:
+        """Restore checkpoint-backed resources before admission reopens."""
+        ...
+
+
+@runtime_checkable
+class CheckpointBlockable(Protocol):
+    """Optional veto on sleep/wakeup, asked once before the engine serves.
+
+    Implementing CheckpointableCommunication is a property of the class;
+    whether a given instance may actually use it can depend on how that
+    instance was configured. Not implementing this protocol means nothing
+    blocks checkpointing.
+    """
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed."""
+        ...
 
 
 class Communication(ABC):
@@ -57,6 +95,15 @@ class Communication(ABC):
                 f"is not supported on this platform."
             )
         self._is_platform_supported = True
+
+    def checkpoint_blocked_reason(self) -> Optional[str]:
+        """Return why this instance's current configuration blocks
+        checkpointing, or None when it can proceed.
+
+        Defined here so every strategy answers the question, and only those
+        whose configuration can block checkpointing need to override it.
+        """
+        return None
 
     @staticmethod
     @abstractmethod
@@ -100,6 +147,28 @@ class Communication(ABC):
         Default: True for most strategies (post-quant is more common)
         """
         return True
+
+    def supports_finalize_before_combine(self) -> bool:
+        """Whether ``combine`` is an unweighted row sum over a dense per-token tensor.
+
+        A model-owned finalize that runs before the combine
+        (``ConfigurableMoE.unfinalized_combine_fn``) is only correct when the
+        combine itself reduces the already-finalized partials without applying
+        the routing weights again. A strategy whose combine consumes a
+        different row layout or applies the weights itself answers ``False``,
+        and the incompatibility is rejected at construction.
+        """
+        return True
+
+    def uses_internal_dispatch_quantization(self) -> bool:
+        """Return whether dispatch itself quantizes BF16 activations.
+
+        Strategies returning ``True`` receive unquantized activations and
+        return the quantized payload plus its scales. The external-comm
+        scheduler must therefore not invoke ``backend.quantize_input`` on
+        either side of dispatch.
+        """
+        return False
 
     def prepare_dispatch(
         self,

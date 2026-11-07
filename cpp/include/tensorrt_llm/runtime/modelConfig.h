@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,9 +16,10 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/runtime/common.h"
-#include "tensorrt_llm/runtime/lookaheadModule.h"
 #include "tensorrt_llm/runtime/loraModule.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/speculativeDecodingModule.h"
@@ -548,16 +549,6 @@ public:
         mModelVariant = modelVariant;
     }
 
-    [[nodiscard]] SizeType32 getMaxDecodingDraftTokens() const
-    {
-        return getSpeculativeDecodingMode().isNone() ? 0 : getSpeculativeDecodingModule().getMaxDecodingDraftTokens();
-    }
-
-    [[nodiscard]] SizeType32 constexpr getMaxDecodingTokens() const noexcept
-    {
-        return getSpeculativeDecodingMode().isNone() ? 1 : getSpeculativeDecodingModule().getMaxDecodingTokens();
-    }
-
     void constexpr setContextFMHA(bool contextFMHA) noexcept
     {
         mContextFMHA = contextFMHA;
@@ -716,23 +707,6 @@ public:
         std::shared_ptr<SpeculativeDecodingModule> const& speculativeDecodingModule) noexcept
     {
         mSpeculativeDecodingModule = speculativeDecodingModule;
-    }
-
-    void resetSpeculativeDecodingModule() noexcept
-    {
-        mSpeculativeDecodingModule.reset();
-    }
-
-    void enableSeamlessLookaheadDecoding(SizeType32 maxDraftTokens) noexcept
-    {
-        setSpeculativeDecodingMode(SpeculativeDecodingMode::LookaheadDecoding());
-        setSpeculativeDecodingModule(std::make_shared<LookaheadModule>(maxDraftTokens, maxDraftTokens));
-    }
-
-    void disableSeamlessLookaheadDecoding() noexcept
-    {
-        setSpeculativeDecodingMode(SpeculativeDecodingMode::None());
-        resetSpeculativeDecodingModule();
     }
 
     [[nodiscard]] tensorrt_llm::DataType getKvDataType() const

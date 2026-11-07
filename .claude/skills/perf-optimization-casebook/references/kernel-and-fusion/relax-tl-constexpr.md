@@ -50,7 +50,7 @@ measured: []
   wins.
 - **Apply via:** **not a server config knob** — a Triton-kernel edit. Delegate to
   **kernel-triton-writing**. Touch point (prior art, TRT-LLM repo):
-  `tensorrt_llm/_torch/attention_backend/sparse/kernel.py` — the kernel signature
+  `tensorrt_llm/_torch/attention/backends/sparse/dsa/kernels.py` — the kernel signature
   (keep `BLOCK_N: tl.constexpr`, relax the rest).
 - **Expected effect:** fewer Triton recompilations across layers/shapes → lower
   first-iteration and steady host time, smaller GPU-idle; no change to GPU

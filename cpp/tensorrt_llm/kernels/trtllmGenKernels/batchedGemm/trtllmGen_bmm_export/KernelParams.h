@@ -16,15 +16,15 @@
  */
 #pragma once
 
-#include "trtllm/gen/CommonUtils.h"
+#include <stdexcept>
 #include "trtllm/gen/SfLayoutDecl.h"
 #include "trtllm/gen/SparsityDecl.h"
-#include <stdexcept>
+#include "trtllm/gen/CommonUtils.h"
 #include <tuple>
 
-#include "BatchedGemmEnums.h"
-#include "Enums.h"
 #include "TmaDescriptor.h"
+#include "Enums.h"
+#include "BatchedGemmEnums.h"
 
 // NOTE: keep this code dependency free. It has to be included by the device code and has to be
 // compilable with NVRTC.

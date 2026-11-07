@@ -17,6 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include <cuda_fp8.h>
 
 #include "tensorrt_llm/common/envUtils.h"
@@ -111,6 +112,8 @@ __device__ __forceinline__ float sigmoid(float x)
 {
     return 1.0f / (1.0f + __expf(-x));
 }
+
+using common::fp8x4_to_float4;
 
 struct __align__(8) aligned_fp8x8
 {

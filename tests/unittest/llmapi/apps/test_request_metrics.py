@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import json
+import logging
+import threading
 
 import pytest
 
+from tensorrt_llm.logger import logger
+from tensorrt_llm.serve import perf_metrics as perf_metrics_module
 from tensorrt_llm.serve.perf_metrics import (
     CTX_CHUNK_METRICS_HEADER,
     RETURN_METRICS_HEADER,
@@ -31,6 +36,8 @@ from tensorrt_llm.serve.perf_metrics import (
     combine_disagg_metrics,
 )
 from tensorrt_llm.serve.scripts.time_breakdown import RequestDataParser
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _record(status="complete"):
@@ -74,6 +81,35 @@ def _record(status="complete"):
             }
         },
     }
+
+
+def _record_with_kv_transfer():
+    # _record() carries None for both KV timestamps, which every revision drops, so
+    # it cannot tell a working KV-transfer span from a zeroed one.
+    record = _record()
+    timing = record["phases"]["server"]["timing_metrics"]
+    timing["kv_cache_transfer_start"] = 1.011
+    timing["kv_cache_transfer_end"] = 1.013
+    return record
+
+
+def _disagg_record_from_headers(worker_record):
+    headers = build_metrics_headers([worker_record])
+    return headers, combine_disagg_metrics(
+        "42",
+        {
+            "ctx_server": "ctx:8000",
+            "gen_server": "gen:8000",
+            "timing_metrics": {
+                "server_arrival_time": 0.99,
+                "ctx_dispatch_time": 1.0,
+                "server_first_token_time": 1.03,
+            },
+        },
+        build_metrics_record_from_headers(headers, "ctx", request_id="42"),
+        build_metrics_record_from_headers(headers, "gen", request_id="42"),
+        disagg_request_id=42,
+    )
 
 
 def test_metrics_headers_use_metric_list_syntax():
@@ -156,6 +192,34 @@ def test_time_breakdown_parser_accepts_header_derived_disagg_record():
     assert parsed["disagg_server_arrival_time"] == pytest.approx(0.99)
     assert combined_headers[START_END_TIME_HEADER].count("ctx-start;") == 1
     assert combined_headers[SERVER_TIMING_HEADER].count("ctx_queue;") == 1
+
+
+def test_header_derived_record_keeps_kv_transfer_without_kv_cache_size():
+    # kv_cache_size is worker-local and has no Server-Timing header, so a record
+    # reconstructed from headers never carries it. Gating the KV-transfer timestamps
+    # on kv_cache_size therefore discarded them for every disaggregated request,
+    # zeroing that span; they must be gated on the timestamps themselves.
+    headers, record = _disagg_record_from_headers(_record_with_kv_transfer())
+    assert "server-kv-start;" in headers[START_END_TIME_HEADER]
+
+    gen_timing = record["phases"]["gen"]["timing_metrics"]
+    assert gen_timing["kv_cache_transfer_start"] == pytest.approx(1.011)
+    assert "kv_cache_size" not in gen_timing
+
+    timing = _jsonl_record(record)["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+    assert timing["kv_cache_transfer_start"] == pytest.approx(1.011)
+    assert timing["kv_cache_transfer_end"] == pytest.approx(1.013)
+    assert "kv_cache_size" not in timing
+
+
+def test_unpopulated_kv_transfer_timestamps_stay_absent():
+    # The other half of the same gate: an unpopulated timestamp must not be written
+    # as 0.0, or a consumer testing presence reads a zero-width transfer as real.
+    _, record = _disagg_record_from_headers(_record())
+
+    timing = _jsonl_record(record)["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
+    assert "kv_cache_transfer_start" not in timing
+    assert "kv_cache_transfer_end" not in timing
 
 
 @pytest.mark.asyncio
@@ -398,3 +462,142 @@ async def test_jsonl_writer_drops_only_malformed_record(tmp_path):
     records = [json.loads(line) for line in output_file.read_text().splitlines()]
     assert writer.dropped_records == 1
     assert records[0]["request_id"] == 42
+
+
+async def _wait_until(predicate, timeout=5.0):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not predicate():
+        assert loop.time() < deadline, "condition never became true"
+        await asyncio.sleep(0.01)
+
+
+def _written_request_ids(tmp_path):
+    output_file = next(tmp_path.glob("perf_metrics-test-*.jsonl"))
+    return [json.loads(line)["request_id"] for line in output_file.read_text().splitlines()]
+
+
+@pytest.fixture()
+def logged_errors():
+    """Capture the error messages the TRT-LLM logger emits."""
+    messages = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = Capture(level=logging.ERROR)
+    logger._logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger._logger.removeHandler(handler)
+
+
+class TestJsonlWriterSurvival:
+    """An unexpected failure costs the record or batch it hit, never the writer task.
+
+    The task is the queue's only consumer: once it ends, every later record is queued
+    without being written until the queue fills, and then dropped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_record_failing_unexpectedly_is_dropped_not_fatal(
+        self, tmp_path, logged_errors
+    ):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        # A phase that is not a mapping makes serialization raise AttributeError.
+        writer.submit(
+            {
+                "schema_version": 1,
+                "request_id": "1",
+                "status": "complete",
+                "phases": {"server": "not-a-mapping"},
+            }
+        )
+        writer.submit(_record())
+        await writer.close()
+
+        assert _written_request_ids(tmp_path) == [42], (
+            "a record that fails to serialize must be dropped alone; the records after it "
+            "must still be written"
+        )
+        assert writer.dropped_records == 1
+        assert any("AttributeError" in message for message in logged_errors)
+
+    @pytest.mark.asyncio
+    async def test_an_unexpected_write_failure_drops_one_batch_not_the_writer(
+        self, tmp_path, monkeypatch, logged_errors
+    ):
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        real_write = writer._write
+        failures = [RuntimeError("cannot schedule new futures after shutdown")]
+
+        def write_failing_once(data):
+            if failures:
+                raise failures.pop()
+            real_write(data)
+
+        monkeypatch.setattr(writer, "_write", write_failing_once)
+        # Both records are queued before the writer task next runs, so they share one batch.
+        first = _record()
+        first["request_id"] = "41"
+        writer.submit(first)
+        writer.submit(_record())
+        await _wait_until(lambda: writer.dropped_records > 0 or writer._task.done())
+        assert not writer._task.done(), "a failed batch write must not end the writer task"
+
+        survivor = _record()
+        survivor["request_id"] = "43"
+        writer.submit(survivor)
+        await writer.close()
+
+        assert _written_request_ids(tmp_path) == [43]
+        assert writer.dropped_records == 2, "every record in the failed batch counts as dropped"
+        assert any(
+            "Dropped 2 performance metrics record(s) that failed to write (RuntimeError" in message
+            # The traceback shows where the write failed.
+            and "Traceback (most recent call last)" in message
+            and "write_failing_once" in message
+            for message in logged_errors
+        )
+
+    def test_unexpected_errors_are_logged_first_then_every_thousandth(self, logged_errors):
+        writer = PerfMetricsJsonlWriter(None, "test")
+        logged_at = []
+        for count in range(1, 2001):
+            for stage in ("serialize", "write"):
+                num_logged = len(logged_errors)
+                writer._drop_after_unexpected_error(1, stage, RuntimeError("failed"))
+                if len(logged_errors) > num_logged:
+                    logged_at.append((stage, count))
+
+        assert logged_at == [
+            (stage, count) for count in (1, 1000, 2000) for stage in ("serialize", "write")
+        ]
+        assert writer.dropped_records == 4000
+
+    @pytest.mark.asyncio
+    async def test_close_still_cancels_a_stuck_write(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(perf_metrics_module, "_WRITER_SHUTDOWN_TIMEOUT_SECONDS", 0.1)
+        writer = PerfMetricsJsonlWriter(str(tmp_path), "test")
+        await writer.start()
+        entered = threading.Event()
+        release = threading.Event()
+
+        def stuck_write(data):
+            entered.set()
+            release.wait(timeout=5)
+
+        monkeypatch.setattr(writer, "_write", stuck_write)
+        writer.submit(_record())
+        await _wait_until(entered.is_set)
+        task = writer._task
+        try:
+            await writer.close()
+        finally:
+            release.set()
+
+        assert task.cancelled(), "close() must still be able to cancel a stuck writer task"

@@ -67,9 +67,8 @@ class VisualGenMetrics:
     prep, conditioning). ``0.0`` if not measured."""
 
     denoise: float = 0.0
-    """GPU-stream time of the denoising loop. For LTX-2's two-stage
-    pipeline this covers only the first stage; the second stage rolls into
-    ``post_denoise``."""
+    """GPU-stream time of the denoising loop. LTX-2's two-stage pipeline
+    marks the boundary at its decode, so this spans both of its stages."""
 
     post_denoise: float = 0.0
     """GPU-stream time after the denoising loop (VAE decode, format

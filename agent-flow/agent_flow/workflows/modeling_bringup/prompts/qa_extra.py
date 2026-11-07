@@ -84,8 +84,6 @@ the gap.
   HF/vLLM semantics copied into helpers.
 - The diff touches C++/CUDA/header files but validation used a stale wheel,
   or touched CMake without a clean rebuild.
-- The diff touches `auto_deploy/` or `tests/.../auto_deploy/` (out of
-  scope for modeling bring-up).
 - Accuracy gates are configured in `task.yaml` but were not run, or the
   enabled run skipped the LLM API smoke / accuracy canary preceding the
   full benchmark.
@@ -127,7 +125,7 @@ configured accuracy gates are all still required.
 
 ### Final-report contract (modeling-bringup terminal artifact)
 
-Every QA turn — **before** calling `append_qa_progress` — you MUST
+Every QA turn — **before** you record your progress entry — you MUST
 write the human-facing closure artifact to
 `<workspace>/final-report.md` using the built-in `Write` tool. The file
 is overwritten each turn; the last write at workflow termination is
@@ -265,9 +263,9 @@ silent-failure hypotheses, follow-up items.
 
 - File path: literally `<workspace>/final-report.md`. Overwrite, do
   not append.
-- `Status: ACCEPT` when (and only when) your `append_qa_progress`
-  decision this turn is `ACCEPT`. Otherwise `Status: INCOMPLETE`.
-- Write the file **before** you call `append_qa_progress`. If the
+- `Status: ACCEPT` when (and only when) your recorded `decision`
+  this turn is `ACCEPT`. Otherwise `Status: INCOMPLETE`.
+- Write the file **before** you record your progress entry. If the
   workflow is interrupted between the two writes, the report still
   exists on disk.
 - Ground Sections 2.1 and 2.3 in current workspace and TRT-LLM repo
@@ -323,7 +321,7 @@ yourself.
 2. If the line is missing or malformed (no `Stage closed:` prefix,
    no integer `<N>`, multiple conflicting lines), the Reviewer has
    violated the contract. REJECT this turn immediately. In your
-   `append_qa_progress` `summary`, write the literal sentence:
+   progress-entry `summary`, write the literal sentence:
 
    ```
    Reviewer APPROVE summary missing the required `Stage closed: Stage <N>` line.
@@ -431,7 +429,45 @@ SYSTEM_PROMPT_EXTENSION = "\n".join(
     ]
 )
 
+
 # Stage/Goal control flow is only wired when the workflow runs with
 # --replan-on-qa; ``build_modeling_bringup_prompts`` appends this block
 # on top of ``SYSTEM_PROMPT_EXTENSION`` in that mode only.
 STAGE_GOAL_EXTENSION = _STAGE_GOAL_QA_SCOPING
+
+_CONCURRENT_QA_PROTOCOL = """\
+## Concurrent node protocol — verifying one assigned node per turn
+
+In concurrent mode the orchestrator schedules the plan's
+`## Execution Graph` as a DAG and runs many nodes in parallel. You verify
+**exactly ONE node this turn** — its `id` and scope are given in your turn
+prompt. Everything you verify is confined to that node.
+
+- **Verify only the assigned node's `## <node-id>` acceptance
+  subsection.** Open `acceptance-criteria.md`, find the `## <node-id>`
+  subsection matching the node named in your turn prompt, and verify
+  exactly those `- [ ]` items with commands you run yourself. Items under
+  any other node's subsection are out of scope this turn.
+- **The runtime under test is the node's worktree.** Run your
+  verification in the node's own workspace (an isolated git worktree
+  unless the node declares `isolation: shared`).
+- **Record your verdict to YOUR private files.** Write your per-turn QA
+  result to your own node-scoped files; they describe only this node.
+- **Do NOT read or maintain a shared stage/goal status table**, do NOT
+  promote Goals, and never emit a stage-closed marker.
+  The orchestrator owns graph state, scheduling, and every node
+  transition; your job is the pass/fail verdict on this one node's
+  acceptance subsection.
+
+Every APPROVE-grade evidence rule above (you ran the commands yourself, GPU
+coverage where required, validated vs partially validated, an independent
+reference) still applies to the assigned node's items — concurrent mode
+narrows *which* items you verify to one `## <node-id>` subsection, not
+*how* you verify each one.
+"""
+
+# Concurrent DAG control flow is only wired when the workflow runs with
+# --concurrent; ``build_modeling_bringup_prompts`` appends this block on top of
+# ``SYSTEM_PROMPT_EXTENSION`` in that mode only (INSTEAD of STAGE_GOAL_EXTENSION
+# — concurrent is a distinct mode).
+CONCURRENT_EXTENSION = _CONCURRENT_QA_PROTOCOL

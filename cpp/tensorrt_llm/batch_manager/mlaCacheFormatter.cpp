@@ -131,7 +131,8 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     {
         TLLM_LOG_DEBUG(
             mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", (*llmRequest)->mRequestId);
-        TLLM_CHECK_WITH_INFO((*llmRequest)->mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
+        TLLM_CHECK_WITH_INFO(
+            (*llmRequest)->mSamplingConfig.getBeamWidth() == 1, "Currently only supports beam width 1.");
     }
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -441,7 +442,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto llmRequestOpt = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequestOpt.has_value(), "LlmRequest required for receiving KV cache");
     auto const& llmRequest = **llmRequestOpt;
-    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
+    TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.getBeamWidth() == 1, "Currently only supports beam width 1.");
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);

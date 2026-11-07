@@ -36,6 +36,10 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
+pytestmark = pytest.mark.cpu_only
+
 _MODELS_DIR = Path(__file__).parents[3] / "tensorrt_llm" / "_torch" / "models"
 
 _SENTINEL = "LAZY-OK"
@@ -437,5 +441,186 @@ def test_external_sibling_registrations_not_clobbered():
         assert MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder_metadata(
             "qwen3_vl") is custom_metadata, (
             "built-in import clobbered the external placeholder metadata")
+        """)
+    )
+
+
+def test_propagated_provider_replaces_an_earlier_one():
+    # A pool worker outlives the LLM that spawned it, so it can be handed a
+    # second architecture -> module mapping after it already resolved that
+    # architecture. Lookups short-circuit on the registry, so the new provider
+    # only takes effect if the stale entry is dropped when it arrives.
+    _run_fresh(
+        textwrap.dedent("""\
+        import pathlib
+        import sys
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        for provider in ("provider_a", "provider_b"):
+            pathlib.Path(root, provider + ".py").write_text(
+                "import torch.nn as nn\\n"
+                "from tensorrt_llm._torch.models.modeling_utils import register_auto_model\\n"
+                "\\n"
+                "@register_auto_model('SharedArchForCausalLM')\\n"
+                "class Model(nn.Module):\\n"
+                "    pass\\n")
+        sys.path.insert(0, root)
+
+        from tensorrt_llm._torch.models.modeling_utils import (
+            register_external_model_modules, get_registered_model_class)
+
+        arch = "SharedArchForCausalLM"
+
+        # First LLM in this worker.
+        register_external_model_modules({arch: "provider_a"})
+        first = get_registered_model_class(arch)
+        assert first.__module__ == "provider_a", first.__module__
+
+        # Second LLM reuses the worker with a different provider.
+        register_external_model_modules({arch: "provider_b"})
+        second = get_registered_model_class(arch)
+        assert second.__module__ == "provider_b", (
+            f"stale provider survived: {second.__module__}")
+
+        # Re-announcing the same provider changes nothing.
+        register_external_model_modules({arch: "provider_b"})
+        assert get_registered_model_class(arch) is second
+
+        # Back to the first provider: its module is already in sys.modules, so
+        # importing it again runs no decorator and the architecture is only
+        # resolvable if what they registered was kept.
+        register_external_model_modules({arch: "provider_a"})
+        third = get_registered_model_class(arch)
+        assert third is first, (
+            f"returning to the first provider lost it: {third}")
+        """)
+    )
+
+
+def test_propagated_provider_replaces_sibling_registrations():
+    # A provider owns every slot it filled, not just the model class: switching
+    # to one that brings no vision encoder must leave none behind, and switching
+    # back must bring the original's back with it.
+    _run_fresh(
+        textwrap.dedent("""\
+        import pathlib
+        import sys
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        pathlib.Path(root, "vision_provider.py").write_text(
+            "import torch.nn as nn\\n"
+            "from tensorrt_llm._torch.models.modeling_utils import (\\n"
+            "    register_auto_model, register_vision_encoder)\\n"
+            "\\n"
+            "class Encoder(nn.Module):\\n"
+            "    pass\\n"
+            "\\n"
+            "@register_vision_encoder(Encoder)\\n"
+            "@register_auto_model('SharedVLMArch')\\n"
+            "class Model(nn.Module):\\n"
+            "    pass\\n")
+        pathlib.Path(root, "text_provider.py").write_text(
+            "import torch.nn as nn\\n"
+            "from tensorrt_llm._torch.models.modeling_utils import register_auto_model\\n"
+            "\\n"
+            "@register_auto_model('SharedVLMArch')\\n"
+            "class Model(nn.Module):\\n"
+            "    pass\\n")
+        sys.path.insert(0, root)
+
+        from tensorrt_llm._torch.models.modeling_utils import (
+            get_registered_model_class, get_registered_vision_encoder,
+            register_external_model_modules)
+
+        arch = "SharedVLMArch"
+
+        register_external_model_modules({arch: "vision_provider"})
+        assert get_registered_model_class(arch).__module__ == "vision_provider"
+        encoder = get_registered_vision_encoder(arch)
+        assert encoder is not None and encoder[0].__module__ == "vision_provider"
+
+        # The replacement registers no vision encoder, so the architecture must
+        # have none -- not the one the previous provider left.
+        register_external_model_modules({arch: "text_provider"})
+        assert get_registered_model_class(arch).__module__ == "text_provider"
+        assert get_registered_vision_encoder(arch) is None, (
+            "stale vision encoder survived the provider change")
+
+        register_external_model_modules({arch: "vision_provider"})
+        restored = get_registered_vision_encoder(arch)
+        assert restored is not None and restored[0] is encoder[0], (
+            f"returning to the first provider lost its vision encoder: "
+            f"{restored}")
+        """)
+    )
+
+
+def test_dropped_declaration_restores_the_builtin():
+    # A worker reused by an LLM that declares no custom modules must fall back
+    # to the built-in provider, as a process that never saw the override would.
+    _run_fresh(
+        textwrap.dedent("""\
+        import pathlib
+        import sys
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        pathlib.Path(root, "custom_t5.py").write_text(
+            "import torch.nn as nn\\n"
+            "from tensorrt_llm._torch.models.modeling_utils import register_auto_model\\n"
+            "\\n"
+            "@register_auto_model('T5ForConditionalGeneration')\\n"
+            "class CustomT5(nn.Module):\\n"
+            "    pass\\n")
+        sys.path.insert(0, root)
+
+        from tensorrt_llm._torch.models.modeling_utils import (
+            get_registered_model_class, register_external_model_modules)
+
+        arch = "T5ForConditionalGeneration"
+        builtin = get_registered_model_class(arch)
+
+        register_external_model_modules({arch: "custom_t5"})
+        assert get_registered_model_class(arch).__module__ == "custom_t5"
+
+        register_external_model_modules({})
+        assert get_registered_model_class(arch) is builtin, (
+            "built-in provider did not come back once the override was gone")
+        """)
+    )
+
+
+def test_propagated_provider_replaces_a_builtin():
+    # The --custom_module_dirs case: the worker resolved the built-in provider
+    # for an architecture before being told a custom module now owns it.
+    _run_fresh(
+        textwrap.dedent("""\
+        import pathlib
+        import sys
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        pathlib.Path(root, "custom_t5.py").write_text(
+            "import torch.nn as nn\\n"
+            "from tensorrt_llm._torch.models.modeling_utils import register_auto_model\\n"
+            "\\n"
+            "@register_auto_model('T5ForConditionalGeneration')\\n"
+            "class CustomT5(nn.Module):\\n"
+            "    pass\\n")
+        sys.path.insert(0, root)
+
+        from tensorrt_llm._torch.models.modeling_utils import (
+            register_external_model_modules, get_registered_model_class)
+
+        arch = "T5ForConditionalGeneration"
+        builtin = get_registered_model_class(arch)
+        assert builtin.__module__.startswith("tensorrt_llm."), builtin.__module__
+
+        register_external_model_modules({arch: "custom_t5"})
+        custom = get_registered_model_class(arch)
+        assert custom.__module__ == "custom_t5", (
+            f"custom override ignored, still {custom.__module__}")
         """)
     )

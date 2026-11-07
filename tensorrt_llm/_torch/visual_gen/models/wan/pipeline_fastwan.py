@@ -27,6 +27,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
+from tensorrt_llm._torch.visual_gen.utils import make_noise_generator
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
@@ -40,6 +41,7 @@ from .pipeline_wan import WanPipeline
         "FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers",
     ],
     doc="FastWan 2.2 distilled (DMD) — 3-step Wan 2.2 TI2V-5B text-to-video.",
+    supports_nvfp4_vae=True,
 )
 class WanDMDPipeline(WanPipeline):
     """Wan 2.2 TI2V-5B with the DMD 3-step sampling loop.
@@ -115,15 +117,15 @@ class WanDMDPipeline(WanPipeline):
         if isinstance(prompt, str):
             prompt = [prompt]
         batch_size = len(prompt)
-        generator = torch.Generator(device=self.device).manual_seed(seed)
+        generator = make_noise_generator(seed, self.device)
         self.validate_resolution(height, width, num_frames)
 
         if negative_prompt:
             raise ValueError("FastWan is CFG-free and does not support negative prompts.")
         prompt_embeds, _ = self._encode_prompt(prompt, "", max_sequence_length)
 
-        if self._fixed_latent is not None:
-            latents = self._fixed_latent.to(device=self.device, dtype=self.dtype)
+        if (fixed_latent := self._get_fixed_latent()) is not None:
+            latents = fixed_latent.to(device=self.device, dtype=self.dtype)
         else:
             latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
 

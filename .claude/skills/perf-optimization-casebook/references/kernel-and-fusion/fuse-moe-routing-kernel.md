@@ -91,7 +91,7 @@ measured: []
   group-top-k / expert-top-k / normalize math, within fp tolerance). Still a
   kernel rewrite, so **verify vs reference**; tie-breaking on equal scores can
   differ from the PyTorch path.
-- **Verify:** correctness — `pytest tests/unittest/_torch/thop/parallel/test_noaux_tc.py`
+- **Verify:** correctness — `pytest tests/unittest/_torch/kernels/parallel_hw_agnostic/test_noaux_tc.py`
   and `test_moe.py`, plus the C++ `routingDeepSeekTest`; compare
   `topk_values`/`topk_indices` to the PyTorch reference within tolerance,
   including tie cases. Perf — nsys before/after: routing kernel count, total
@@ -110,6 +110,6 @@ measured: []
   `cpp/tensorrt_llm/kernels/noAuxTcKernels.cu`, `moeTopKFuncs.cuh`,
   `cpp/tensorrt_llm/thop/noAuxTcOp.cpp`,
   `tensorrt_llm/_torch/models/modeling_deepseekv3.py`; analogous TRTLLM-Gen MoE
-  routing kernels under `kernels/trtllmGenKernels/blockScaleMoe/Routing*.cu`.
+  routing kernels under `kernels/moe/trtllmGen/routing/Routing*.cu`.
   Owning specialist: **kernel-cuda-specialist**. Related: `perf-host-analysis`
   (inter-kernel gap), `perf-nsight-systems` (launch count).

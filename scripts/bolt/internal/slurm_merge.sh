@@ -36,15 +36,20 @@
 #           OUT_DIR LLVM_BOLT_VERSION BOLT_APPLY
 
 # ====================== EDIT THESE (cluster specifics) ======================
-# NOTE: this merge job is 100% CPU
-# (setup_env pip, readelf, merge-fdata, llvm-bolt .fdata->.yaml conversion,
-# packaging) and needs NO GPUs -- requesting gpus-per-node=4 holds a full GB200
-# node for nothing and queues behind GPU demand. Switch to a CPU partition (or
-# --gpus-per-node=0) once we confirm the target cluster accepts GPU-less jobs.
+# NOTE: this merge job is 100% CPU (setup_env pip, readelf, merge-fdata, llvm-bolt
+# .fdata->.yaml conversion, packaging, apply_bolt.py) and needs NO GPUs, so it runs
+# on the CPU partition rather than holding a whole GPU node idle behind GPU demand.
+# These clusters REJECT a zero GPU request (--gpus-per-node=0 / --gpus=0) -- any GPU
+# resource arg must be a positive integer -- so a CPU job omits every --gpus* arg.
+# The header below is the account/time/partition source of truth for both a
+# standalone `sbatch slurm_merge.sh` and the BoltProfileGen submission; the latter
+# passes only --partition on the sbatch CLI (overriding this header) so the CPU
+# partition name stays overridable via boltMergePartition. NOTE: these clusters
+# reject a submission that carries no account at all, so keep --account here.
 #SBATCH --account=coreai_tensorrt_ci
 #SBATCH --job-name=bolt-merge
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=4
+#SBATCH --partition=cpu
 #SBATCH --time=01:00:00
 
 set -euo pipefail
@@ -79,7 +84,11 @@ echo "[INFO] merge: FDATA_ROOT=$FDATA_ROOT  REF=$BOLT_REF  TRIPLE=$TRIPLE  OUT=$
 export ENROOT_CACHE_PATH="${ENROOT_CACHE_PATH:-/home/svc_tensorrt/.cache/enroot}"
 
 # ---- CI self-staging: llvm-bolt --------------------------------------------
-LLVM_BOLT_VERSION="${LLVM_BOLT_VERSION:-21.1.5}"
+# Pin comes from llvm_bolt_version.sh so this job, the collect hook, and the
+# Jenkins build pods cannot drift onto different llvm-bolt releases. Resolved via
+# TOOLKIT_HOST, not BASH_SOURCE: sbatch runs a COPY of this script out of the
+# node's spool dir, so its own path says nothing about where the toolkit lives.
+. "$TOOLKIT_HOST/internal/llvm_bolt_version.sh"
 if [ ! -x "$BUILDS_HOST/llvm/bin/llvm-bolt" ]; then
     echo "[INFO] Installing llvm-bolt ${LLVM_BOLT_VERSION} -> $BUILDS_HOST/llvm"
     case "$(uname -m)" in

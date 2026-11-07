@@ -36,6 +36,16 @@ llm.generate("Hello, my name is")
 
 ```{note}
 TensorRT LLM allows you to enable the FP8 KV cache manually, even for checkpoints that do not have it enabled by default.
+
+For encoder-decoder models in the PyTorch backend, KV-cache quantization
+applies to decoder self-attention only. The cross-attention pool is sized and
+allocated in the model dtype because cross-attention does not quantize K/V.
+This applies whether FP8 or NVFP4 is selected explicitly or inherited from the
+checkpoint with `dtype="auto"`; existing hardware-specific restrictions still
+apply to the self-attention cache.
+`cross_kv_cache_fraction` divides the memory budget between the two pools.
+Their token capacities reflect their respective dtypes and are each limited
+by an explicit `max_tokens`, when provided.
 ```
 
 Here is an example of how to set the FP8 KV Cache option:
@@ -60,6 +70,35 @@ llm = LLM(model='/path/to/model',
           kv_cache_config=KvCacheConfig(dtype='nvfp4'))
 llm.generate("Hello, my name is")
 ```
+
+This configures an active NVFP4 KV cache on the GPU. To keep the active GPU KV
+cache in its normal runtime type and use NVFP4 only while Pages reside in Host
+or Disk storage, see [KV Cache Compression](kv-cache-compression.md).
+
+#### NVFP4_PLUS MoE from MXFP4 Checkpoints
+
+On Rubin (SM107), the routed experts of an MXFP4 checkpoint can run as NVFP4_PLUS:
+E2M1 values with one UE5M3 scale per 32 values and no FP32 global scale. The E2M1
+weights load unchanged, every E8M0 scale becomes the UE5M3 scale of the same power
+of two, and the expert activations are quantized to the same format, so both MoE
+GEMMs run in FP4 without requantizing the checkpoint.
+
+Set `OVERRIDE_QUANT_ALGO=NVFP4_PLUS` and use the CuteDSL MoE backend. Under this
+override, `moe_config.backend: AUTO` selects `CUTEDSL`, and any other backend is
+rejected.
+
+```bash
+OVERRIDE_QUANT_ALGO=NVFP4_PLUS trtllm-serve <MXFP4 checkpoint> --config config.yaml
+```
+
+```yaml
+moe_config:
+  backend: CUTEDSL
+```
+
+NVFP4_PLUS supports bias-free SwiGLU experts, such as the routed experts of
+DeepSeek-V4. It needs `hidden_size` to be a multiple of 512 and the per-rank MoE
+intermediate size to be a multiple of 128.
 
 
 ### Offline Quantization with ModelOpt
@@ -124,16 +163,18 @@ The language component decides which quantization methods are supported by a giv
 | :------------- | :---:   | :---:  | :---: | :---: | :---: | :---: | :---: | :-------: | :-------: | :--------: | :--------: |
 | Blackwell(sm120)       |   Y     |   Y    |   Y   |   .   |   .   |   Y   |   .   |     .     |     .     |     .      |     .      |
 | Blackwell(sm100/103)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   Y   |     Y     |     Y     |     Y      |     Y      |
+| Rubin(sm107)       |   Y     |   Y    |   Y   |   Y   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Hopper           |   .     |   .    |   Y   |   Y   |   Y   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ada Lovelace          |   .     |   .    |   Y   |   .   |   .   |   Y   |   .   |     Y     |     Y     |     Y      |     Y      |
 | Ampere         |   .     |   .    |   .   |   .   |   .   |   Y   |   .   |     .     |     Y     |     .      |     Y      |
 
 ```{note}
-FP8 block wise scaling GEMM kernels for sm100/103 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).
+FP8 block wise scaling GEMM kernels for sm100/103/107 are using MXFP8 recipe (E4M3 act/weight and UE8M0 act/weight scale), which is slightly different from SM90 FP8 recipe (E4M3 act/weight and FP32 act/weight scale).
 ```
 
 
 ## Quick Links
 
+- [KV Cache Compression](kv-cache-compression.md)
 - [Pre-quantized Models by ModelOpt](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4)
 - [ModelOpt Support Matrix](https://nvidia.github.io/Model-Optimizer/guides/0_support_matrix.html)

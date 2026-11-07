@@ -1,23 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""State parity tests: indexed optimized KDA prefill vs FLA, kernel level.
+"""Indexed FlashInfer state parity against the independent FLA path.
 
-Complements test_kda_prefill_op.py (module outputs, no recurrent-state pool)
-with the cases the executor runtime actually exercises through
-KDAKernelDispatch:
-
-  * selected state-pool row parity in the pool's V-first [N, H, V, K] layout
-    — K == V == 128 for Kimi K3, so a layout mix-up is invisible to shape
-    checks and only caught numerically;
-  * a LARGE carried initial state — the K4 sign error fixed by dev-tech commit
-    e45ae259 (NV = U - W@S, was U + W@S) is masked by tiny/zero initial states
-    and random inputs, and only blows up when a real-magnitude state is
-    carried in;
-  * non-64-aligned varlen (single-sequence pad path and multi-sequence masked
-    path);
-  * fresh input tensors on every call — the runtime never reuses tensor
-    objects, so wrapper and compile-cache behavior sees runtime-style tensor
-    lifetimes instead of benchmark-style stable-object reuse.
+Cover V-first state layout, large carried states, partial packed sequences,
+changing head counts, chunked continuation, and repeated eager/graph calls.
+Inputs are raw Q/K/V; both recurrent kernels normalize Q/K internally.
 """
 
 import pytest
@@ -25,24 +12,27 @@ import torch
 
 pytest.importorskip("fla")
 
-from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
-from tests.unittest._torch.modules.kimi_kda.kda_prefill_test_utils import (  # noqa: E402
+from kda_prefill_test_utils import (  # noqa: E402
     assert_kda_close,
     run_fla_prefill,
     run_indexed_prefill,
 )
+
+from tensorrt_llm._torch.modules.kimi_kda._kda_kernels import KDAKernelDispatch  # noqa: E402
 
 NUM_HEADS = 96
 HEAD_DIM = 128
 
 
 def _has_supported_gpu() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability(0) in {(10, 0), (10, 3)}
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability(0) in {(10, 0), (10, 3), (10, 7)}
 
 
 pytestmark = pytest.mark.skipif(
     not _has_supported_gpu(),
-    reason="Kimi K3 is supported only on Blackwell (SM100/SM103)",
+    reason="FlashInfer KDA prefill requires SM100/SM103/SM107",
 )
 
 
@@ -146,7 +136,7 @@ def _expand_initial_state(initial_state: torch.Tensor | None, num_sequences: int
     ],
     ids=[
         "eqlen_fresh",
-        "eqlen_padded_carried",
+        "eqlen_partial_carried",
         "varlen_aligned_carried",
         "varlen_unaligned_carried",
         "single_unaligned_carried",
@@ -237,65 +227,6 @@ def test_runtime_scale_state_pool_matches_fla(
     )
     assert_kda_close("runtime_scale/output", actual_output, expected_output)
     assert_kda_close("runtime_scale/state", actual_state, expected_state)
-
-
-def _num_chunks(sequence_lengths: list[int]) -> int:
-    return sum((length + 63) // 64 for length in sequence_lengths)
-
-
-@pytest.mark.parametrize(
-    "victim_lengths,poison_lengths",
-    [([8191, 1], [8127, 65]), ([8000, 150, 42], [7999, 129, 64])],
-    ids=["autotuner_boundary", "mixed_partial_chunks"],
-)
-@torch.no_grad()
-def test_final_state_ignores_poisoned_scratch(
-    dispatch_pair: tuple[KDAKernelDispatch, KDAKernelDispatch],
-    gate_params: tuple[torch.Tensor, torch.Tensor],
-    victim_lengths: list[int],
-    poison_lengths: list[int],
-) -> None:
-    """Partial final chunks cannot consume stale rows from a cached scratch buffer."""
-    optimized, reference = dispatch_pair
-    assert sum(victim_lengths) == sum(poison_lengths)
-    assert _num_chunks(victim_lengths) == _num_chunks(poison_lengths)
-    total_tokens = sum(victim_lengths)
-
-    poison_inputs, _ = _make_inputs(1, total_tokens, seed=31)
-    q, k, v, g, beta = poison_inputs
-    poison_inputs = q * 100, k * 100, v * 1000, g, beta * 10
-    run_indexed_prefill(
-        optimized,
-        gate_params,
-        poison_inputs,
-        _make_cu_seqlens(poison_lengths),
-    )
-    torch.cuda.synchronize()
-
-    victim_inputs, initial_state = _make_inputs(
-        1,
-        total_tokens,
-        seed=32,
-        initial_state_scale=1.0,
-    )
-    initial_state = _expand_initial_state(initial_state, len(victim_lengths))
-    cu_seqlens = _make_cu_seqlens(victim_lengths)
-    actual_output, actual_state, _ = run_indexed_prefill(
-        optimized,
-        gate_params,
-        victim_inputs,
-        cu_seqlens,
-        initial_state=initial_state,
-    )
-    expected_output, expected_state = run_fla_prefill(
-        reference,
-        gate_params,
-        victim_inputs,
-        cu_seqlens,
-        initial_state=initial_state,
-    )
-    assert_kda_close("poisoned_scratch/output", actual_output, expected_output)
-    assert_kda_close("poisoned_scratch/state", actual_state, expected_state)
 
 
 def _run_head_count_case(
@@ -396,3 +327,64 @@ def test_chunked_continuation_matches_fla(
     assert_kda_close("chunked/first_output", first_output, full_output[:, :split])
     assert_kda_close("chunked/second_output", second_output, full_output[:, split:])
     assert_kda_close("chunked/state", second_state, full_state)
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True], ids=["eager", "cuda_graph"])
+@torch.no_grad()
+def test_prefill_is_repeatable(use_cuda_graph: bool) -> None:
+    """Repeated prefill calls must agree in eager execution and graph replay."""
+    generator = torch.Generator(device="cuda").manual_seed(20260921)
+    length = 1186
+    shape = (1, length, NUM_HEADS, HEAD_DIM)
+
+    def random_tensor(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(shape, device="cuda", generator=generator)
+
+    q = random_tensor(shape).bfloat16()
+    k = random_tensor(shape).bfloat16()
+    v = random_tensor(shape).bfloat16()
+    g = random_tensor(shape).bfloat16()
+    beta = random_tensor(shape[:-1])
+    a_log = torch.zeros(NUM_HEADS, device="cuda")
+    dt_bias = torch.zeros(NUM_HEADS * HEAD_DIM, device="cuda")
+    state = torch.empty(1, NUM_HEADS, HEAD_DIM, HEAD_DIM, device="cuda")
+    indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+    cu_seqlens = _make_cu_seqlens([length])
+    dispatch = KDAKernelDispatch(use_optimized_prefill=True, use_optimized_decode=False)
+
+    def run() -> torch.Tensor:
+        state.zero_()
+        output, _ = dispatch.prefill_chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            scale=HEAD_DIM**-0.5,
+            initial_state=None,
+            safe_gate=True,
+            lower_bound=-5.0,
+            cu_seqlens=cu_seqlens,
+            state_pool=state,
+            state_indices=indices,
+        )
+        return output
+
+    for _ in range(3):
+        output = run()
+    expected = output.clone()
+    expected_state = state.clone()
+    graph = None
+    if use_cuda_graph:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run()
+    for _ in range(128):
+        if graph is None:
+            output = run()
+        else:
+            graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)

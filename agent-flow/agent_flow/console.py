@@ -287,6 +287,11 @@ def _format_usage_body(usage: UsageInfo) -> str:
 
     if usage.cost_usd is not None:
         parts.append(f"[info]cost[/info] [target]${usage.cost_usd:.4f}[/target]")
+    if usage.estimated_thread_cost_usd is not None:
+        parts.append(
+            "[info]estimated thread cost[/info] "
+            f"[target]${usage.estimated_thread_cost_usd:.4f}[/target]"
+        )
     if usage.num_turns is not None:
         parts.append(f"[info]turns[/info] [target]{usage.num_turns}[/target]")
     if usage.duration_ms is not None:

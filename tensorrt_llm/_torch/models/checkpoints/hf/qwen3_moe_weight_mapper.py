@@ -1,12 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 
 
-@register_mapper("HF", "Qwen3MoeForCausalLM")
+@register_mapper(CheckpointFormat.HF, "Qwen3MoeForCausalLM")
 class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
 
     def init_model_and_config(self, model: nn.Module, config: ModelConfig):
@@ -24,6 +28,15 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
             tensors_to_duplicate.append("weight_scale")
         if module.quant_config.quant_mode.has_fp8_block_scales():
             tensors_to_duplicate.append("weight_scale_inv")
+        if module.quant_config.quant_mode.has_mxfp8():
+            # MXFP8 keeps one UE8M0 scale per weight row, so the scale rows
+            # must be duplicated exactly like the rows they describe -- unlike
+            # 128x128 block FP8, whose scale rows are out_features/128 and are
+            # remapped instead. Both spellings are listed because
+            # MXFP8LinearMethod._get_scale_name probes weight_scale_inv first
+            # and falls back to weight_scale; only the key actually present is
+            # touched.
+            tensors_to_duplicate.extend(["weight_scale_inv", "weight_scale"])
 
         if new_name in ['k_proj', 'v_proj']:
             num_kv_heads_list = [self._num_kv_heads

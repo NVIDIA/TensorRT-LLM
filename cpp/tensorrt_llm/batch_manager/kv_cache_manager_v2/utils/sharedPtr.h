@@ -20,8 +20,15 @@
 //
 // Motivation: std::shared_ptr uses atomic increments/decrements for thread
 // safety.  On ARM (Grace), atomics are significantly more expensive than on
-// x86.  The KV cache manager's shared_ptr usage is entirely single-threaded,
-// so the atomics are pure overhead.
+// x86, and the KV cache manager does not need them.
+//
+// THREADING REQUIREMENT: these refcounts are plain ints, so concurrent
+// manipulation of the same control block is a data race -- including between
+// two readers.  Safety comes from KvCacheManager's API lock serialising every
+// path that touches a SharedPtr, plus the fact that a KvCache is owned by one
+// thread at a time (see AGENTS.md, "Concurrency model").  Adding an unlocked
+// code path that copies or destroys one of these breaks that invariant
+// silently: there is no atomic to save you.
 //
 // Usage:
 //   SharedPtr<T>              replaces  std::shared_ptr<T>
@@ -553,7 +560,7 @@ SharedPtr<T> makeShared(Args&&... args)
     // Wire up EnableSharedFromThis if T (or a base) derives from it.
     if constexpr (detail::hasEnable<T>)
     {
-        result.mPtr->detail::template EnableBase<T>::mWeakThis = result;
+        static_cast<detail::EnableBase<T>&>(*result.mPtr).mWeakThis = result;
     }
 
     return result;

@@ -17,6 +17,8 @@ The PyTorch backend supports a wide variety of features, listed below:
 
 ## General usage
 
+TorchSampler is the only sampler; the `sampler_type` argument and the TRTLLM Sampler it selected have been removed. `sampler_type="auto"` and `sampler_type="TorchSampler"` are still accepted and ignored, while `sampler_type="TRTLLMSampler"` is rejected. When migrating off TRTLLM Sampler, also review the settings tuned for it, notably `logprobs`: under TorchSampler, `logprobs=0` returns the sampled token's log probability.
+
 Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 
 ```python
@@ -147,8 +149,9 @@ modes.
   * Top-P decay is not supported in combination with beam search or with speculative decoding
     modes that route draft tokens through the Torch Sampler; such requests are rejected.
 
-* Positive Min-P is not supported in combination with one-model speculative decoding. Such
-  requests are rejected at admission.
+* Positive Min-P is supported with one-model speculative decoding under the default
+  `advanced_sampling_mode: full`; the `no_*` specializations reject such requests at
+  admission (see [Advanced sampling mode](#advanced-sampling-mode-speculative-decoding)).
 
 * Occurrence penalties are supported: `repetition_penalty`, `presence_penalty` and
   `frequency_penalty` discourage (or encourage) the model from reusing tokens it has
@@ -183,7 +186,7 @@ modes.
     with `enable_penalty: true` in the speculative decoding config, because they need
     an occurrence workspace that is allocated up front. While the flag is off, a
     request that sets any of the three is rejected at admission rather than decoded
-    without them. Tree speculation (`eagle_choices` or a dynamic tree) is not
+    without them. Tree speculation (a dynamic tree) is not
     supported and such requests are rejected even when the flag is on. Only the
     target distribution is penalized; the draft model proposes from its unpenalized
     distribution, which leaves the sampled result unchanged but can lower the
@@ -195,13 +198,13 @@ modes.
 
 ### Performance
 
-The Torch Sampler leverages the optimized sampling kernels provided by
-[FlashInfer](https://docs.flashinfer.ai/api/sampling.html), which is a required
-dependency for the Torch Sampler. The sampler also uses the
-[sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
-whenever possible. This optimization does not compute the complete set of token sampling probabilities
-(after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
-required for speculative decoding (rejection sampling).
+The Torch Sampler samples every non-greedy strategy (temperature, top-k, top-p, min-p and their
+combinations) with one fused kernel, which applies all the filters in a single launch and takes
+the sampling parameters and the random seed and offset per row. A seeded request's random stream
+therefore depends only on its own seed and how far it has decoded, not on where it sits in the
+batch. The sampled tokens can still differ across batch sizes, because the kernel picks its
+algorithm by the number of rows. The kernel computes the complete set of token sampling
+probabilities (after top-k / top-p masking etc.) only when the user requests them.
 
 Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised
@@ -218,14 +221,21 @@ sampling configuration such that a filter is always disabled (`top_k = 0` /
 `advanced_sampling_mode` (on `DecodingBaseConfig`, so it is available to any
 speculative config) lets you skip those redundant kernels for a fixed deploy
 config. The output is identical to `FULL` whenever the skipped filter is already
-disabled, so this is a lossless throughput optimization for advanced use cases:
+disabled (except for the seeded draws noted below), so this is a lossless
+throughput optimization for advanced use cases:
 
-| Mode | `top_k` kernel | `top_p` kernel |
-|---|---|---|
-| `full` (default) | applied | applied |
-| `no_topk` | **skipped** | applied |
-| `no_topp` | applied | **skipped** |
-| `no_topk_no_topp` | **skipped** | **skipped** |
+| Mode | `top_k` kernel | `top_p` kernel | `min_p` kernel |
+|---|---|---|---|
+| `full` (default) | applied | applied | applied |
+| `no_topk` | **skipped** | applied | **rejected** |
+| `no_topp` | applied | **skipped** | **rejected** |
+| `no_topk_no_topp` | **skipped** | **skipped** | **rejected** |
+
+`full` applies all three in one fused kernel, which is why it is the only mode that takes
+`min_p`; the others have no `min_p` input, so such a request is **rejected at admission**
+rather than skipped like a disabled `top_k` or `top_p`. That kernel also skips a filter a
+request left at its neutral value, so the `no_*` modes save work only for requests that
+wanted the filter anyway.
 
 Notes:
 
@@ -240,6 +250,13 @@ Notes:
   sampling batches without a special case.
 * `advanced_sampling_mode` is a deploy-time choice; it is *not* part of the CUDA
   graph key, so it adds no extra warmup graphs.
+* Seeded draws of DFlash/DSpark: a one-model DFlash/DSpark deployment with
+  `no_topk_no_topp`, `use_rejection_sampling=False` and a vocab-sharded TP target
+  LM head (plain TP, no attention DP) samples its temperature-only target tokens
+  on each rank's vocab shard (Gumbel-max, without gathering the logits). They
+  follow the same distribution as with `FULL` (up to a tail below ~4e-9
+  probability that is never drawn), but from a different random stream: a seeded
+  request need not reproduce the token sequence it gets with `FULL`.
 
 ```python
 from tensorrt_llm.llmapi import MTPDecodingConfig
@@ -285,9 +302,6 @@ Parameter Configuration:
 
 Beam search rejects the following combinations, raising an error at admission:
 
-- **Disaggregated serving.** The pool of finished candidates the context server builds is not
-  part of the handoff, so a completion found there would be silently dropped. Use
-  `best_of=1` on a disaggregated deployment.
 - **A decreasing `beam_width_array`.** Only non-decreasing schedules are supported; the
   semantics of narrowing mid-decode are not defined.
 - **A `best_of` other than `max_beam_width`.** Every request in an engine runs at the same
@@ -312,6 +326,40 @@ sampling_params = SamplingParams(
 llm.generate(["Hello, my name is",
             "Hello, my name is"], sampling_params)
 ```
+
+### With disaggregated serving
+
+Beam search works with context-first disaggregated serving for dense-attention models. Both the
+context and the generation workers need the C++ KV cache manager V2, the Python transceiver with
+the NIXL backend, and the same `max_beam_width`:
+
+```yaml
+max_beam_width: 4
+kv_cache_config:
+  use_kv_cache_manager_v2: true
+cache_transceiver_config:
+  transceiver_runtime: PYTHON
+  backend: NIXL
+```
+
+The context worker transfers the prompt's KV cache once and hands the first token and cumulative
+log-probability of every beam to the generation worker, which expands the beams after the
+transfer completes. A beam whose first token is the end token is handed off as well: the
+generation worker builds the pool of finished candidates, so `early_stopping` and `n` apply there
+and no completion is dropped. Block reuse remains supported. See
+[Selecting the KV Cache Manager](kvcache.md#selecting-the-kv-cache-manager) for the V2 manager.
+
+The following are not supported:
+
+- **Generation-first scheduling** (`schedule_style: generation_first`). Only context-first
+  scheduling, the default, hands the per-beam log-probabilities to the generation worker.
+- **Pipelined KV transfer** (`cache_transceiver_config.enable_pipelined_transfer`). Admission
+  rejects a context-only request whose beam width is greater than 1.
+- **The C++ transceiver** (`transceiver_runtime: CPP`), which transfers beam width 1 only.
+- **Hybrid Mamba and sparse-attention models.** Creating KV cache manager V2 fails at startup
+  when `max_beam_width > 1`.
+- **KV cache connectors** (`kv_connector_config`). The executor fails at startup when
+  `max_beam_width > 1`.
 
 ### Over the OpenAI-compatible API
 

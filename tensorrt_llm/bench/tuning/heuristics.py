@@ -74,7 +74,7 @@ def calc_engine_setting(
     if model_config.is_mla():
         # MLA stores a single compressed KV entry per token:
         # head_dim = kv_lora_rank + qk_rope_head_dim, kv_factor = 1.
-        # Mirrors tensorrt_llm/_torch/pyexecutor/kv_cache_manager_v2.py and
+        # Mirrors tensorrt_llm/_torch/pyexecutor/kv_cache/kv_cache_manager_v2.py and
         # resource_manager.py, so the bench heuristic agrees with the runtime.
         mla_head_dim = model_config.kv_lora_rank + model_config.qk_rope_head_dim
         gb_per_token = (
@@ -122,9 +122,10 @@ def calc_engine_setting(
     bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
     if isinstance(model_config, (NemotronHybridConfig, Qwen3HybridConfig)):
         mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
-        if mamba_ssm_cache_dtype != "auto":
-            if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
-                bytes_per_elem = 4.0
+        if mamba_ssm_cache_dtype in (None, "auto"):
+            mamba_ssm_cache_dtype = model_config.dtype
+        if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
+            bytes_per_elem = 4.0
 
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(bytes_per_elem, target_seq_len)
     kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len + gb_per_extra_cache)

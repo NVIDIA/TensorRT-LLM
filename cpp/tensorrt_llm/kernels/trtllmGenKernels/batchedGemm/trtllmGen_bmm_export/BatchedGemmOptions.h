@@ -16,17 +16,17 @@
  */
 #pragma once
 
-#include "BatchedGemmEnums.h"
-#include "GemmGatedActOptions.h"
 #include "GemmOptions.h"
+#include "GemmGatedActOptions.h"
+#include "BatchedGemmEnums.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <vector>
+#include <algorithm>
 
 #ifndef TLLM_GEN_EXPORT_INTERFACE
-#include "trtllm/gen/CudaRunner.h"
 #include "trtllm/gen/GenCtx.h"
+#include "trtllm/gen/CudaRunner.h"
 #else
 #include <iostream>
 
@@ -104,20 +104,21 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         gemm::FusedBiasShuffleMode fusedBiasShuffleMode, bool fuseLoadSfTask, bool fuseUtccpWithUtcmma,
         bool gridTriggerSecondaryA, bool gridTriggerSecondaryB, bool gridWaitForPrimaryEarlyExit,
         bool gridWaitForPrimaryA, bool gridWaitForPrimaryB, bool hoistLoadTaskInit, bool hoistMmaTaskTryWaits, int k,
-        gemm::KernelTraits kernelTraits, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB, int m, int mmaK,
-        tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n, int numEpilogueWarps,
-        int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo, int numRegsPerThreadEpilogueWarp,
-        int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA, int numStagesB, int numStagesMma,
-        int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile, int numStagesSmemSfA, int numStagesSmemSfB,
-        int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId, bool outputDebugTensors, bool patchF2fp,
-        tg::Dtype perTokenSfDtype, gemm::SchedHostTask schedHostTask, int32_t sfBlockSizeA, int32_t sfBlockSizeB,
-        int32_t sfBlockSizeC, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        int32_t sfReshapeFactor, tg::Sparsity sparsityA, gemm::SplitK splitK, int tileK, int tileM, int tileN,
-        gemm::TileScheduler tileScheduler, bool transposeMmaOutput, bool useCustomizedMma3xNvFp4,
-        bool useCustomMmaSchedule, bool useDeepSeekFp8, bool useFlexibleClusterDims,
-        bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap, bool usePerTokenSfA, bool usePerTokenSfB,
-        bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps, bool useTwoMmaWarps,
-        bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize,
+        gemm::KernelTraits kernelTraits, bool fineGrainedConsumerA, bool fineGrainedConsumerB,
+        bool fineGrainedForceValid, bool fineGrainedProducer, gemm::MatrixLayout layoutA, gemm::MatrixLayout layoutB,
+        int m, int mmaK, tg::MmaKind mmaKind, int mmaM, int mmaN, int mmaTileK, bool mockAllReduce, int n,
+        int numEpilogueWarps, int numRegsCastAWarps, int numRegsCopySfLdsSttm, int numRegsCopySparsityInfo,
+        int numRegsPerThreadEpilogueWarp, int numRegsPerThreadNonEpilogueWarp, int numSlicesForSplitK, int numStagesA,
+        int numStagesB, int numStagesMma, int numStagesMmaWithinWorkTile, int numStagesMmaAcrossWorkTile,
+        int numStagesSmemSfA, int numStagesSmemSfB, int numStagesTmemSfA, int numStagesTmemSfB, int numStagesWorkId,
+        bool outputDebugTensors, bool patchF2fp, tg::Dtype perTokenSfDtype, gemm::SchedHostTask schedHostTask,
+        int32_t sfBlockSizeA, int32_t sfBlockSizeB, int32_t sfBlockSizeC, tg::SfLayout sfLayoutA,
+        tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC, int32_t sfReshapeFactor, tg::Sparsity sparsityA,
+        gemm::SplitK splitK, int tileK, int tileM, int tileN, gemm::TileScheduler tileScheduler,
+        bool transposeMmaOutput, bool useCustomizedMma3xNvFp4, bool useCustomMmaSchedule, bool useDeepSeekFp8,
+        bool useFlexibleClusterDims, bool useHoistTryWaitForCustomMmaSchedule, bool useMaxTmemOverlap,
+        bool usePerTokenSfA, bool usePerTokenSfB, bool useShuffledMatrix, bool useTmaStore, bool useTwoTmaLoadWarps,
+        bool useTwoMmaWarps, bool useUnrollLoop2xForMma, int validM, int validN, int validK, int worldSize,
         // GemmGatedActOptions
         gemmGatedAct::ActType actType, bool clampBeforeAct,
         // BatchedGemmOptions
@@ -134,7 +135,8 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
                 epilogueTileM, epilogueTileN, fallbackClusterDimX, fallbackClusterDimY, fallbackClusterDimZ,
                 fusedBiasShuffleMode, fuseLoadSfTask, fuseUtccpWithUtcmma, gridTriggerSecondaryA, gridTriggerSecondaryB,
                 gridWaitForPrimaryEarlyExit, gridWaitForPrimaryA, gridWaitForPrimaryB, hoistLoadTaskInit,
-                hoistMmaTaskTryWaits, k, kernelTraits, layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mmaTileK,
+                hoistMmaTaskTryWaits, k, kernelTraits, fineGrainedConsumerA, fineGrainedConsumerB,
+                fineGrainedForceValid, fineGrainedProducer, layoutA, layoutB, m, mmaK, mmaKind, mmaM, mmaN, mmaTileK,
                 mockAllReduce, n, numEpilogueWarps, numRegsCastAWarps, numRegsCopySfLdsSttm, numRegsCopySparsityInfo,
                 numRegsPerThreadEpilogueWarp, numRegsPerThreadNonEpilogueWarp, numSlicesForSplitK, numStagesA,
                 numStagesB, numStagesMma, numStagesMmaWithinWorkTile, numStagesMmaAcrossWorkTile, numStagesSmemSfA,
@@ -455,6 +457,20 @@ inline bool checkAndUpdateBatchedGemmOptions(
     {
         TLLM_CHECK_ERROR(
             options.mK % options.mTileK == 0, "K must be a multiple of tileK when using Ldg based SF routing");
+    }
+
+    if (options.mFineGrainedConsumerA || options.mFineGrainedConsumerB)
+    {
+        TLLM_CHECK_ERROR(
+            doesRouteImplUseNoRoute(options.mRouteImpl), "RouteAct is not supported with FineGrained consumer");
+        // Add tests for this if there is a use-case.
+        TLLM_CHECK_ERROR(!batchM, "FineGrained consumer has only been tested with Batch N");
+    }
+    if (options.mFineGrainedForceValid)
+    {
+        // The Tma oob opt will leave some values untouched, but FineGrained needs to guarantee all
+        // values are valid to avoid deadlocks.
+        TLLM_CHECK_ERROR(!options.mUseTmaOobOpt, "FineGrained force valid does not support Tma oob opt");
     }
 
     // Check if all elements in mBatchedM or mBatchedN are the same (uniform tokens per batch) and

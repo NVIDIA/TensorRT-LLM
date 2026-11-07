@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 (precision)=
 
 # Numerical Precision

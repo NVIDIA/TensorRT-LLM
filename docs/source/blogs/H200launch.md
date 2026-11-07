@@ -23,7 +23,7 @@ TensorRT LLM evaluation of the [new H200 GPU](https://nvidianews.nvidia.com/news
 
 Additional Performance data is available on the [NVIDIA Data Center Deep Learning Product Performance](https://developer.nvidia.com/deep-learning-performance-training-inference/ai-inference) page, & soon in [TensorRT LLM's Performance Documentation](https://nvidia.github.io/TensorRT-LLM/0.21.0/performance/perf-overview.html).
 
-### H200 vs H100
+## H200 vs H100
 
 H200's HBM3e larger capacity & faster memory enables up to **1.9x** performance on LLMs compared to H100. Max throughput improves due to its dependence on memory capacity and bandwidth, benefitting from the new HBM3e. First token latency is compute bound for most ISLs, meaning H200 retains similar time to first token as H100.
 
@@ -53,6 +53,6 @@ TensorRT LLM v0.5.0, TensorRT v9.1.0.4 | H200, H100 FP8. </sub>
 <sup>*(3) Max Throughput per GPU is defined as the highest tok/s per GPU, swept across TP configurations & BS powers of 2.*</sup>
 
 
-### Latest HBM Memory
+## Latest HBM Memory
 
 H200 is the newest addition to NVIDIA’s data center GPU portfolio. To maximize that compute performance, H200 is the first GPU with HBM3e memory with 4.8TB/s of memory bandwidth, a 1.4X increase over H100. H200 also expands GPU memory capacity nearly 2X to 141 gigabytes (GB). The combination of faster and larger HBM memory accelerates performance of LLM model inference performance with faster throughput and tokens per second.  These results are measured and preliminary, more updates expected as optimizations for H200 continue with TensorRT LLM.

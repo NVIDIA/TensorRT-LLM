@@ -377,6 +377,13 @@ PREFILL_CONFIGS = [
     # Basic mode (ratio=128)
     pytest.param(1, 128, 128, 128, False, id="basic_hd128_eq_ratio"),
     pytest.param(1, 256, 128, 512, False, id="basic_hd512_2chunks"),
+    # Basic mode, ratio=2: DeepSeek-V4.1's pooled long-range layers. The kernels
+    # are ratio-generic, so these exercise the same code path as ratio 128 with
+    # the smallest possible group -- where an off-by-one in the group walk shows
+    # up as a wrong answer rather than a wrong tail.
+    pytest.param(1, 64, 2, 512, False, id="v41_ratio2_hd512_32chunks", marks=skip_pre_blackwell),
+    pytest.param(4, 64, 2, 128, False, id="v41_ratio2_hd128_batch4", marks=skip_pre_blackwell),
+    pytest.param(1, 65, 2, 512, False, id="v41_ratio2_hd512_remainder", marks=skip_pre_blackwell),
 ]
 
 
@@ -459,6 +466,12 @@ DECODE_CONFIGS = [
     pytest.param(1, 4, 512, True, 8, id="overlap_hd512"),
     pytest.param(1, 128, 128, False, 256, id="basic_hd128_2compressions"),
     pytest.param(1, 128, 512, False, 256, id="basic_hd512_2compressions"),
+    # ratio=2 decode: a group completes every other step, so this is the densest
+    # possible interleaving of "hold the partial group" and "flush it".
+    pytest.param(
+        1, 2, 512, False, 16, id="v41_ratio2_hd512_8compressions", marks=skip_pre_blackwell
+    ),
+    pytest.param(2, 2, 128, False, 9, id="v41_ratio2_hd128_odd_steps", marks=skip_pre_blackwell),
 ]
 
 
@@ -722,6 +735,66 @@ def test_decode_accepts_bf16_kv_score_with_fp32_state():
                 rtol=2e-3,
                 atol=5e-3,
             )
+
+
+@pytest.mark.parametrize("next_n", [1, 2, 3, 4, 5, 6, 7, 8])
+def test_decode_cr128_hd512_bf16_state(next_n):
+    """Validate the production CR128 BF16/BF16 decode instantiation."""
+    batch_size, compress_ratio, head_dim = 2, 128, 512
+    page_size = compress_ratio
+    start_pos_val = compress_ratio - next_n
+
+    kv = torch.randn(batch_size, compress_ratio, head_dim, device="cuda").bfloat16()
+    score = torch.randn_like(kv)
+    ape = torch.randn(compress_ratio, head_dim, device="cuda")
+    score_with_ape = (score.float() + ape.unsqueeze(0)).bfloat16()
+
+    paged_kv = torch.zeros(batch_size, page_size, head_dim, device="cuda", dtype=torch.bfloat16)
+    paged_score = torch.zeros_like(paged_kv)
+    paged_kv[:, :start_pos_val] = kv[:, :start_pos_val]
+    paged_score[:, :start_pos_val] = score_with_ape[:, :start_pos_val]
+    block_table = torch.arange(batch_size, device="cuda", dtype=torch.int32).view(batch_size, 1)
+
+    kv_score = fuse_kv_score(
+        kv[:, start_pos_val:].reshape(-1, head_dim),
+        score[:, start_pos_val:].reshape(-1, head_dim),
+    )
+    kv_lens = torch.full((batch_size,), compress_ratio, device="cuda", dtype=torch.int32)
+    start_pos = torch.full((batch_size,), start_pos_val, device="cuda", dtype=torch.int32)
+    cu_seq_lens, cu_outputs = prepare_decode_metadata(
+        batch_size,
+        compress_ratio,
+        head_dim,
+        torch.device("cuda"),
+        next_n=next_n,
+    )
+    kv_comp = prepare_compress_output(
+        cu_outputs, batch_size, head_dim, torch.device("cuda"), torch.bfloat16
+    )
+
+    decode_kernel(
+        kv_score,
+        ape,
+        kv_lens,
+        start_pos,
+        cu_seq_lens,
+        cu_outputs,
+        kv_comp,
+        paged_kv,
+        paged_score,
+        block_table,
+        block_table,
+        compress_ratio,
+        head_dim,
+        page_size,
+        next_n=next_n,
+    )
+
+    weights = torch.softmax(score_with_ape.float(), dim=1)
+    expected = torch.sum(weights * kv.float(), dim=1).to(torch.bfloat16)
+    assert torch.allclose(expected, kv_comp, rtol=2e-3, atol=5e-3)
+    assert torch.equal(paged_kv[:, start_pos_val:], kv[:, start_pos_val:])
+    assert torch.equal(paged_score[:, start_pos_val:], score_with_ape[:, start_pos_val:])
 
 
 STATE_UPDATE_CONFIGS = [
@@ -1246,6 +1319,9 @@ PREFILL_DECODE_CONFIGS = [
     pytest.param(1, 256, 128, 128, False, 128, id="basic_hd128_prefill256_decode128"),
     pytest.param(1, 20, 4, 512, True, 12, id="overlap_hd512_prefill20_decode12"),
     pytest.param(1, 256, 128, 512, False, 128, id="basic_hd512_prefill256_decode128"),
+    pytest.param(
+        1, 31, 2, 512, False, 9, id="v41_ratio2_prefill31_decode9", marks=skip_pre_blackwell
+    ),
 ]
 
 
@@ -1424,12 +1500,19 @@ MTP_CONFIGS = [
     pytest.param(1, 4, 128, True, 4, id="overlap_hd128_next4"),
     pytest.param(1, 4, 512, True, 3, id="overlap_hd512_next3"),
     pytest.param(1, 4, 512, True, 8, id="overlap_hd512_next8"),
+    pytest.param(1, 4, 128, True, 16, id="overlap_hd128_next16"),
     pytest.param(2, 128, 128, False, 4, id="basic_hd128_multi_batch_next4"),
+    pytest.param(1, 128, 512, False, 2, id="basic_hd512_next2"),
+    pytest.param(1, 128, 512, False, 3, id="basic_hd512_next3"),
     pytest.param(1, 128, 512, False, 4, id="basic_hd512_next4"),
     pytest.param(1, 128, 512, False, 5, id="basic_hd512_next5"),
     pytest.param(1, 128, 512, False, 6, id="basic_hd512_next6"),
     pytest.param(1, 128, 512, False, 7, id="basic_hd512_next7"),
     pytest.param(1, 128, 512, False, 8, id="basic_hd512_next8"),
+    pytest.param(1, 128, 128, False, 16, id="chunk_hd128_next16"),
+    pytest.param(1, 128, 128, False, 128, id="chunk_hd128_next128"),
+    pytest.param(1, 128, 128, False, 129, id="chunk_hd128_next129"),
+    pytest.param(1, 128, 128, False, 257, id="chunk_hd128_next257"),
 ]
 
 
@@ -1551,12 +1634,11 @@ def test_decode_mtp(batch_size, compress_ratio, head_dim, overlap, next_n):
     "next_n,storage_next_n",
     [
         pytest.param(0, 1, id="zero"),
-        pytest.param(9, 9, id="above_max"),
         pytest.param((1 << 32) + 1, 1, id="large_int64"),
     ],
 )
-def test_decode_rejects_unsupported_next_n(next_n, storage_next_n):
-    """Decode rejects next_n outside the supported range before narrowing."""
+def test_decode_rejects_invalid_next_n(next_n, storage_next_n):
+    """Decode rejects next_n outside the int-backed runtime range before narrowing."""
     batch_size, compress_ratio, head_dim = 1, 4, 128
     state_dim = 2 * head_dim
     page_size = 8
@@ -1574,7 +1656,7 @@ def test_decode_rejects_unsupported_next_n(next_n, storage_next_n):
     cu_seq_lens = torch.tensor([0, storage_next_n], device="cuda", dtype=torch.int32)
     cu_outputs = torch.tensor([0, num_outputs], device="cuda", dtype=torch.int32)
 
-    with pytest.raises(RuntimeError, match=r"next_n.*\[1, 8\]"):
+    with pytest.raises(RuntimeError, match=r"next_n.*\[1, 2147483647\]"):
         decode_kernel(
             kv_score,
             ape,
@@ -1610,6 +1692,12 @@ CHUNKED_PREFILL_CONFIGS = [
     pytest.param(4, 512, True, 1, 3, 9, id="overlap_sp3_seq9_unaligned"),
     # overlap=False, aligned start_pos
     pytest.param(128, 128, False, 1, 128, 128, id="nonoverlap_sp128_seq128"),
+    # ratio=2 chunked prefill: `start_pos % ratio` is either 0 or 1, so the two
+    # entries below are the whole alignment space for V4.1's pooled layers.
+    pytest.param(2, 512, False, 1, 16, 16, id="v41_ratio2_sp16_seq16", marks=skip_pre_blackwell),
+    pytest.param(
+        2, 512, False, 1, 15, 17, id="v41_ratio2_sp15_seq17_unaligned", marks=skip_pre_blackwell
+    ),
     # overlap=False, unaligned start_pos
     pytest.param(128, 128, False, 1, 50, 206, id="nonoverlap_sp50_seq206_unaligned"),
     pytest.param(128, 128, False, 1, 5, 251, id="nonoverlap_sp5_seq251_2windows"),
@@ -1897,12 +1985,15 @@ def test_fused_postprocess_scatter(
         nope_dim,
         rope_dim,
         kv_cache_fused,
+        None,
         num_comp_tokens,
         cu_kv_comp,
         start_pos,
         block_offsets,
         compressed_mask,
         tokens_per_block,
+        0,
+        1.0,
         0,
         rotate_activation,
         None,
@@ -2004,12 +2095,15 @@ def test_fused_postprocess_scatter_masked_batches(
         nope_dim,
         rope_dim,
         kv_cache_fused,
+        None,
         num_comp_tokens,
         cu_kv_comp,
         start_pos,
         block_offsets,
         compressed_mask,
         tokens_per_block,
+        0,
+        1.0,
         0,
         True,
         None,
@@ -2243,6 +2337,7 @@ def test_fused_postprocess_scatter_fp8_pertensor(
         nope_dim,
         rope_dim,
         kv_cache_fused,
+        None,
         num_comp_tokens,
         cu_kv_comp,
         start_pos,
@@ -2250,6 +2345,8 @@ def test_fused_postprocess_scatter_fp8_pertensor(
         compressed_mask,
         tokens_per_block,
         1,
+        1.0,
+        0,
         rotate_activation,
         None,
         None,
@@ -2366,6 +2463,7 @@ def test_fused_postprocess_scatter_fp8_blockwise(
         nope_dim,
         rope_dim,
         kv_cache_fused,
+        None,
         num_comp_tokens,
         cu_kv_comp,
         start_pos,
@@ -2373,6 +2471,8 @@ def test_fused_postprocess_scatter_fp8_blockwise(
         compressed_mask,
         tokens_per_block,
         2,
+        1.0,
+        0,
         rotate_activation,
         fp8_output,
         scale_output,
@@ -2486,6 +2586,7 @@ def test_fused_postprocess_scatter_mxfp4(
         nope_dim,
         rope_dim,
         kv_cache_fused,
+        None,
         num_comp_tokens,
         cu_kv_comp,
         start_pos,
@@ -2493,6 +2594,8 @@ def test_fused_postprocess_scatter_mxfp4(
         compressed_mask,
         tokens_per_block,
         3,
+        1.0,
+        0,
         rotate_activation,
         fp4_output,
         scale_output,

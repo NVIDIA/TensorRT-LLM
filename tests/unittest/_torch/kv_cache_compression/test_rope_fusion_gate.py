@@ -9,8 +9,8 @@ engine's logical ``position_ids`` instead.
 
 import torch
 
+from tensorrt_llm._torch.attention.attention import Attention
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm.llmapi.llm_args import (
     KvCacheCompressionConfig,
     TriAttentionKvCacheCompressionConfig,

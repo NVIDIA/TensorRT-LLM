@@ -13,6 +13,7 @@ is strictly unchanged from the inlined version.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     # Type-only: importing tensorrt_llm.visual_gen at runtime would pull the
     # whole visual_gen tree into every LLM serving process.
     from tensorrt_llm.visual_gen.params import VisualGenParams
+    from tensorrt_llm.visual_gen.visual_gen import VisualGenResult
 
 
 def _video_content_type(suffix: str) -> str:
@@ -54,6 +56,9 @@ def _video_content_type(suffix: str) -> str:
 # File suffixes the GET /v1/videos/{id}/content and DELETE
 # /v1/videos/{id} routes try when the stored output_path is missing.
 _KNOWN_VIDEO_OUTPUT_SUFFIXES = (".mp4", ".avi", ".safetensors", ".pt")
+
+# Reference fields whose multipart text form is a JSON object, not a scalar.
+_REFERENCE_FIELDS = ("image_reference", "video_reference", "audio_reference")
 
 
 def _resolve_tensor_only_format(fmt, extra_params, extra_param_specs):
@@ -129,7 +134,8 @@ class _VideoRoutesMixin:
 
     Concrete subclasses (``OpenAIServer``) supply ``self.generator``,
     ``self.media_storage_path``, ``self.video_gen_tasks``, ``self.model``,
-    and ``self.create_error_response`` from their own initializer.
+    ``self._adjusted_steady_clock``, and ``self.create_error_response`` from
+    their own initializer.
     """
 
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
@@ -140,39 +146,35 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
-        # Stamp request arrival for the Server-Timing ``total`` (full server
-        # time, incl. request parsing) before any work.
-        request_received = time.perf_counter()
+        request_received = raw_request.state.server_arrival_time
+        # Prefixes this request's output files (``{video_id}_{i}``).
+        video_id = f"video_{uuid.uuid4().hex}"
         try:
-            # Client-side ValueErrors from content-type parsing, request
-            # translation, encoder-format preflight, parameter validation,
-            # and the synchronous engine call return 400. Serialization /
-            # encoder failures further down (server-side) fall through to
-            # the outer ``except Exception`` → 500.
+            # ValueError here is the client's fault and returns 400; anything
+            # further down falls through to the outer handler as a 500.
             try:
                 # Parse request based on content-type
                 request = await self._parse_video_generation_request(raw_request)
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                video_id = f"video_{uuid.uuid4().hex}"
-                params = parse_visual_gen_params(
-                    request,
-                    video_id,
-                    self.generator,
-                    media_storage_path=str(self.media_storage_path),
-                )
+                params = parse_visual_gen_params(request, self.generator)
                 request_format = _resolve_tensor_only_format(
-                    request.format, request.extra_params, self.generator.extra_param_specs
+                    request.format, params.extra_params, self.generator.extra_param_specs
                 )
                 resolved_encoder_fmt = _preflight_encoder_format(request_format)
                 logger.info(
                     f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
                 )
                 sync_video_start = time.perf_counter()
-                output = self.generator.generate(inputs=request.prompt, params=params)
+                # Awaited, not fire-and-forget: bad media / bad params must
+                # surface as a 400 rather than a failed job.
+                handle = await asyncio.to_thread(
+                    self.generator.generate_async, request.prompt, params
+                )
+                output = await handle.aresult()
             except ValidationError as exc:
                 return self._render_pydantic_validation_error(exc)
             except ValueError as exc:
@@ -213,7 +215,7 @@ class _VideoRoutesMixin:
                     f"Video {video_id} serialized as tensor: latency={latency:.3f}s "
                     f"generation={getattr(output.metrics, 'generation', 0.0):.3f}s"
                 )
-                total = time.perf_counter() - request_received
+                total = self._adjusted_steady_clock.now() - request_received
                 headers = build_visual_gen_timing_headers(
                     build_visual_gen_server_timings(output.metrics, total=total)
                 )
@@ -233,16 +235,13 @@ class _VideoRoutesMixin:
                 format=resolved_fmt,
                 frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
             )
-            if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
-                # Offload the blocking ffmpeg encode to a thread-pool executor so
-                # the event loop can start the next request's diffusion while this
-                # video encodes. Only overlaps when >=2 requests are in flight per
-                # server (i.e. client num_workers > server count).
-                saved_paths = await asyncio.get_running_loop().run_in_executor(
-                    None, lambda: output.save(paths_in, **_save_kwargs)
-                )
-            else:
-                saved_paths = output.save(paths_in, **_save_kwargs)
+            # Offload the blocking ffmpeg encode to a thread-pool executor so
+            # the event loop can start the next request's diffusion while this
+            # video encodes. Only overlaps when >=2 requests are in flight per
+            # server (i.e. client num_workers > server count).
+            saved_paths = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: output.save(paths_in, **_save_kwargs)
+            )
             latency = time.perf_counter() - sync_video_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0
@@ -252,7 +251,7 @@ class _VideoRoutesMixin:
                 f"latency={latency:.3f}s generation={generation:.3f}s "
                 f"denoise={denoise:.3f}s"
             )
-            total = time.perf_counter() - request_received
+            total = self._adjusted_steady_clock.now() - request_received
             headers = build_visual_gen_timing_headers(
                 build_visual_gen_server_timings(metrics, total=total)
             )
@@ -308,10 +307,35 @@ class _VideoRoutesMixin:
             form = await raw_request.form()
             data = {}
             for key in form:
+                if key in _REFERENCE_FIELDS:
+                    # Preserve repeated uploads and JSON objects/lists in their
+                    # per-slot wire order. FormData[key] keeps only the last part.
+                    references = []
+                    for value in form.getlist(key):
+                        if hasattr(value, "file"):
+                            references.append(value)
+                            continue
+                        if value == "":
+                            continue
+                        try:
+                            reference = json.loads(value)
+                        except json.JSONDecodeError as exc:
+                            raise ValueError(
+                                f"'{key}' must be an uploaded file or a JSON object/list string "
+                                f'like {{"content": ..., "format": "url"}}; {exc}'
+                            ) from exc
+                        references.append(reference)
+                    if len(references) == 1:
+                        data[key] = references[0]
+                    elif references:
+                        data[key] = [
+                            item
+                            for reference in references
+                            for item in (reference if isinstance(reference, list) else [reference])
+                        ]
+                    continue
                 value = form[key]
                 if hasattr(value, "file"):
-                    # Uploaded file (``input_reference``) — pass through
-                    # so the conversion layer reads ``.file``.
                     data[key] = value
                     continue
                 if key == "extra_params":
@@ -374,12 +398,11 @@ class _VideoRoutesMixin:
 
         Supports both JSON and multipart/form-data requests:
         - JSON: Send VideoGenerationRequest as application/json
-        - Multipart: Send form fields + optional input_reference file
+        - Multipart: Send form fields + optional image_reference / video_reference / audio_reference files
         """
-        # Stamp request arrival for the Server-Timing ``total`` (full server
-        # time, POST arrival -> job completed); the background task reads it
-        # back off the job to compute ``total``.
-        request_received = time.perf_counter()
+        request_received = raw_request.state.server_arrival_time
+        # Prefixes this request's output files and keys its VIDEO_STORE entry.
+        video_id = f"video_{uuid.uuid4().hex}"
         try:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
@@ -387,10 +410,7 @@ class _VideoRoutesMixin:
             if path_error is not None:
                 return path_error
 
-            video_id = f"video_{uuid.uuid4().hex}"
-            params = parse_visual_gen_params(
-                request, video_id, self.generator, media_storage_path=str(self.media_storage_path)
-            )
+            params = parse_visual_gen_params(request, self.generator)
             # Synchronously validate the resolved params against the
             # loaded pipeline's extra-param specs / declared defaults
             # so unknown ``extra_params`` keys and similar engine-side
@@ -402,14 +422,19 @@ class _VideoRoutesMixin:
                 params,
                 declared_defaults=self.generator.executor.default_generation_params,
                 extra_param_specs=self.generator.executor.extra_param_specs,
+                ref_slot_specs=self.generator.executor.ref_slot_specs,
             )
             request_format = _resolve_tensor_only_format(
-                request.format, request.extra_params, self.generator.extra_param_specs
+                request.format, params.extra_params, self.generator.extra_param_specs
             )
             _preflight_encoder_format(request_format)
             logger.info(
                 f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}"
             )
+
+            # Awaited before the 202, so bad media / unknown extra_params are a
+            # 400 rather than a queued job that later fails.
+            handle = await asyncio.to_thread(self.generator.generate_async, request.prompt, params)
 
             # Persist the queued job before scheduling the background task so
             # that a fast-completing task can always look it up in VIDEO_STORE.
@@ -427,13 +452,14 @@ class _VideoRoutesMixin:
             )
             await VIDEO_STORE.upsert(video_id, video_job)
 
-            # Start background generation task
+            # Start background task to await generation and save the result.
             task = asyncio.create_task(
                 self._generate_video_background(
                     video_id=video_id,
                     request=request,
                     params=params,
                     request_format=request_format,
+                    handle=handle,
                 )
             )
             self.video_gen_tasks[video_id] = task
@@ -460,8 +486,9 @@ class _VideoRoutesMixin:
         request: VideoGenerationRequest,
         params: VisualGenParams,
         request_format: str,
+        handle: "VisualGenResult",
     ):
-        """Background task to generate video and save to storage.
+        """Background task to await generation and save to storage.
 
         ``request_format`` is the format already resolved by the route (see
         :func:`_resolve_tensor_only_format`), not ``request.format``: the
@@ -474,8 +501,7 @@ class _VideoRoutesMixin:
             if job:
                 job.status = "generating"
                 await VIDEO_STORE.upsert(video_id, job)
-            future = self.generator.generate_async(inputs=request.prompt, params=params)
-            output = await future
+            output = await handle
 
             if output.video is None:
                 # Update job status to failed since we're in a background task
@@ -512,15 +538,23 @@ class _VideoRoutesMixin:
                     format=resolved_fmt,
                     frame_rate=output.frame_rate or request.frame_rate or params.frame_rate,
                 )
-                if os.environ.get("TRTLLM_VIDEO_ASYNC_ENCODE", "1") != "0":
-                    # Offload the blocking encode to a thread so the event loop
-                    # stays responsive during ``postprocessing`` — pollers can
-                    # observe the state and other requests progress meanwhile.
-                    saved_paths = await asyncio.get_running_loop().run_in_executor(
-                        None, lambda: output.save(paths_in, **_save_kwargs)
-                    )
-                else:
-                    saved_paths = output.save(paths_in, **_save_kwargs)
+                # Offload the blocking encode to a thread so the event loop
+                # stays responsive during ``postprocessing`` — pollers can
+                # observe the state and other requests progress meanwhile.
+                save_future = asyncio.get_running_loop().run_in_executor(
+                    None, lambda: output.save(paths_in, **_save_kwargs)
+                )
+                try:
+                    saved_paths = await asyncio.shield(save_future)
+                except asyncio.CancelledError:
+                    # A cancel cannot stop the encode once the thread picked it
+                    # up, and ``delete_video`` cleans up by path before this
+                    # coroutine records them. Outwait the thread and remove what
+                    # it wrote, so the cancellation leaves nothing behind.
+                    with contextlib.suppress(Exception):
+                        for path in await save_future:
+                            Path(path).unlink(missing_ok=True)
+                    raise
             latency = time.perf_counter() - background_start  # seconds
             metrics = output.metrics
             generation = metrics.generation if metrics is not None else 0.0
@@ -542,7 +576,7 @@ class _VideoRoutesMixin:
                 # from the status wire). ``total`` spans POST arrival ->
                 # completion.
                 total = (
-                    time.perf_counter() - job.request_started
+                    self._adjusted_steady_clock.now() - job.request_started
                     if job.request_started is not None
                     else None
                 )

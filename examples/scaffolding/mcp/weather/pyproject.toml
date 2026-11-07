@@ -1,12 +1,10 @@
 [project]
-name = "mcp"
+name = "weather-mcp"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
-
-[tool.uv.workspace]
-members = [
-    "e2b",
+dependencies = [
+    "httpx>=0.27.0",
+    "mcp[cli]>=1.23.0,<2.0.0",
 ]

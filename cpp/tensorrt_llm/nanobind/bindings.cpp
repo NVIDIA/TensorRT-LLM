@@ -20,7 +20,6 @@
 #include <nanobind/operators.h>
 #include <nanobind/stl/bind_vector.h>
 #include <nanobind/stl/chrono.h>
-#include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
@@ -31,37 +30,42 @@
 #include <vector>
 
 #include "tensorrt_llm/batch_manager/peftCacheManagerConfig.h"
+#include "tensorrt_llm/common/cudaArchitectures.h"
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/common/tllmDataType.h"
+#include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/moe/communication/moeAlltoAllCftSupport.h"
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
-#include "tensorrt_llm/nanobind/batch_manager/buffers.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
-#include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
+#include "tensorrt_llm/nanobind/kvCacheCompression/bindings.h"
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/suffixAutomaton/bindings.h"
 #include "tensorrt_llm/nanobind/testing/kvCacheManagerTestUtilBinding.h"
 #include "tensorrt_llm/nanobind/thop/bindings.h"
 #include "tensorrt_llm/nanobind/userbuffers/bindings.h"
+#include "tensorrt_llm/nanobind/visual_gen/coordinatorWatchdog.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/gptJsonConfig.h"
 #include "tensorrt_llm/runtime/ipcNvlsMemory.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
-#include "tensorrt_llm/runtime/samplingConfig.h"
+#include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
 namespace tpb = tensorrt_llm::nanobind::batch_manager;
 namespace tc = tensorrt_llm::common;
+namespace tk = tensorrt_llm::kernels;
 namespace tr = tensorrt_llm::runtime;
 namespace tle = tensorrt_llm::executor;
 using SizeType32 = tr::SizeType32;
@@ -72,14 +76,6 @@ using OptVec = std::optional<std::vector<T>>;
 #if not defined(TRTLLM_NB_MODULE)
 #error "TRTLLM_NB_MODULE must be defined"
 #endif
-
-namespace
-{
-tr::SamplingConfig makeSamplingConfig(std::vector<tr::SamplingConfig> const& configs)
-{
-    return tr::SamplingConfig(configs);
-}
-} // namespace
 
 NB_MODULE(TRTLLM_NB_MODULE, m)
 {
@@ -116,6 +112,22 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
                 tensorrt_llm::mpi::MpiComm::setSession(world.split(color, rank));
             });
 
+    nb::class_<tensorrt_llm::mpi::MpiProgressThread>(m, "MpiProgressThread",
+        "Native thread that issues a non-matching MPI_Iprobe every interval to keep the MPI progress engine "
+        "running without the GIL. Requires MPI_THREAD_MULTIPLE; stop it before MPI is finalized.")
+        .def(
+            "__init__",
+            [](tensorrt_llm::mpi::MpiProgressThread* self, int64_t fortran_handle, int64_t interval_us, int probe_tag)
+            {
+                new (self) tensorrt_llm::mpi::MpiProgressThread(
+                    tensorrt_llm::mpi::MpiProgressThread::commFromFortranHandle(fortran_handle),
+                    std::chrono::microseconds(interval_us), probe_tag);
+            },
+            nb::arg("fortran_handle"), nb::arg("interval_us"), nb::arg("probe_tag"))
+        .def("stop", &tensorrt_llm::mpi::MpiProgressThread::stop, nb::call_guard<nb::gil_scoped_release>())
+        .def_prop_ro("is_running", &tensorrt_llm::mpi::MpiProgressThread::isRunning)
+        .def_prop_ro("num_probes", &tensorrt_llm::mpi::MpiProgressThread::getNumProbes);
+
     nb::class_<tr::CudaStream>(m, "CudaStream")
         .def(
             "__init__",
@@ -138,17 +150,48 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
     auto mInternalBatchManagerKvCacheV2
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2", "KV Cache Manager V2 bindings");
+    auto mInternalKvCacheCompression
+        = mInternal.def_submodule("kv_cache_compression", "KV cache compression internal bindings");
     tensorrt_llm::nanobind::batch_manager::KvCacheManagerV2Bindings::initBindings(mInternalBatchManagerKvCacheV2);
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
+    mInternal.def("start_coordinator_watchdog", &tensorrt_llm::nanobind::visual_gen::startCoordinatorWatchdog,
+        nb::arg("coordinator_pid"), "Terminate this process when its coordinator exits.");
+    mInternalTesting.def("start_coordinator_watchdog_with_pidfd_error",
+        &tensorrt_llm::nanobind::visual_gen::testing::startCoordinatorWatchdogWithPidfdError,
+        nb::arg("coordinator_pid"), nb::arg("pidfd_error_code"),
+        "Test coordinator supervision when pidfd_open returns an error.");
+
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
     tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
+    tensorrt_llm::nanobind::kv_cache_compression::initBindings(mInternalKvCacheCompression);
     tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
+    buildInfo.attr("CFT_COUNTED_WRITES") = nb::bool_(static_cast<bool>(TLLM_CFT_HAS_CUDA_13_4_SUPPORT));
+
+    auto const toTuple = [](std::vector<int> const& architectures)
+    {
+        nb::list list;
+        for (int const sm : architectures)
+        {
+            list.append(sm);
+        }
+        return nb::tuple(list);
+    };
+    buildInfo.attr("CUDA_ARCHITECTURES") = toTuple(tensorrt_llm::common::getBuiltCudaArchitectures());
+    buildInfo.attr("SUPPORTED_CUDA_ARCHITECTURES") = toTuple(tensorrt_llm::common::getSupportedCudaArchitectures());
+    buildInfo.def("is_cuda_architecture_built", &tensorrt_llm::common::isCudaArchitectureBuilt, nb::arg("sm_version"),
+        "Whether a GPU of SM version `sm_version` (e.g. 90) is one this build was configured for.");
+    buildInfo.def("is_cuda_architecture_supported", &tensorrt_llm::common::isCudaArchitectureSupported,
+        nb::arg("sm_version"),
+        "Whether a GPU of SM version `sm_version` (e.g. 90) is one TensorRT-LLM provides optimized kernels for.");
+    buildInfo.def("check_cuda_architecture_supported", &tensorrt_llm::common::checkCudaArchitectureSupported,
+        nb::arg("device"),
+        "Raises if the GPU `device` is not one of the CUDA architectures this build was configured for.");
 
     nb::class_<tb::PeftCacheManagerConfig>(m, "PeftCacheManagerConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
@@ -184,6 +227,55 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("INT64", tensorrt_llm::DataType::kINT64)
         .value("NVFP4", tensorrt_llm::DataType::kFP4)
         .export_values();
+
+    nb::enum_<tk::AttentionMaskType>(m, "AttentionMaskType", nb::is_arithmetic())
+        .value("PADDING", tk::AttentionMaskType::PADDING)
+        .value("CAUSAL", tk::AttentionMaskType::CAUSAL)
+        .value("SLIDING_WINDOW_CAUSAL", tk::AttentionMaskType::SLIDING_WINDOW_CAUSAL)
+        .value("BIDIRECTIONAL", tk::AttentionMaskType::BIDIRECTIONAL)
+        .value("BIDIRECTIONALGLM", tk::AttentionMaskType::BIDIRECTIONALGLM)
+        .value("BLOCKSPARSE", tk::AttentionMaskType::BLOCKSPARSE)
+        .value("CUSTOM_MASK", tk::AttentionMaskType::CUSTOM_MASK);
+
+    nb::enum_<tk::PositionEmbeddingType>(m, "PositionEmbeddingType", nb::is_arithmetic())
+        .value("LEARNED_ABSOLUTE", tk::PositionEmbeddingType::kLEARNED_ABSOLUTE)
+        .value("ROPE_GPTJ", tk::PositionEmbeddingType::kROPE_GPTJ)
+        .value("ROPE_GPT_NEOX", tk::PositionEmbeddingType::kROPE_GPT_NEOX)
+        .value("LONG_ROPE", tk::PositionEmbeddingType::kLONG_ROPE)
+        .value("ALIBI", tk::PositionEmbeddingType::kALIBI)
+        .value("ALIBI_WITH_SCALE", tk::PositionEmbeddingType::kALIBI_WITH_SCALE)
+        .value("RELATIVE", tk::PositionEmbeddingType::kRELATIVE)
+        .value("CHATGLM", tk::PositionEmbeddingType::kCHATGLM)
+        .value("YARN", tk::PositionEmbeddingType::kYARN)
+        .value("ROPE_M", tk::PositionEmbeddingType::kROPE_M)
+        .value("DEFERRED", tk::PositionEmbeddingType::kDEFERRED);
+
+    nb::enum_<tk::RotaryScalingType>(m, "RotaryScalingType", nb::is_arithmetic())
+        .value("NONE", tk::RotaryScalingType::kNONE)
+        .value("LINEAR", tk::RotaryScalingType::kLINEAR)
+        .value("DYNAMIC", tk::RotaryScalingType::kDYNAMIC)
+        .value("LONG", tk::RotaryScalingType::kLONG)
+        .value("LLAMA3", tk::RotaryScalingType::kLLAMA3)
+        .value("YARN", tk::RotaryScalingType::kYARN)
+        .value("MROPE", tk::RotaryScalingType::kMROPE);
+
+    nb::class_<tk::BlockSparseParams>(m, "BlockSparseParams")
+        .def(nb::init<>())
+        .def_rw("block_size", &tk::BlockSparseParams::block_size)
+        .def_rw("homo_head_pattern", &tk::BlockSparseParams::homo_head_pattern)
+        .def_rw("num_local_blocks", &tk::BlockSparseParams::num_local_blocks)
+        .def_rw("vertical_stride", &tk::BlockSparseParams::vertical_stride);
+
+    nb::class_<tk::MlaMetaParams>(m, "MlaMetaParams")
+        .def(nb::init<>())
+        .def_rw("q_lora_rank", &tk::MlaMetaParams::q_lora_rank)
+        .def_rw("kv_lora_rank", &tk::MlaMetaParams::kv_lora_rank)
+        .def_rw("qk_nope_head_dim", &tk::MlaMetaParams::qk_nope_head_dim)
+        .def_rw("qk_rope_head_dim", &tk::MlaMetaParams::qk_rope_head_dim)
+        .def_rw("v_head_dim", &tk::MlaMetaParams::v_head_dim)
+        .def_rw("predicted_tokens_per_seq", &tk::MlaMetaParams::predicted_tokens_per_seq)
+        .def_rw("num_layers", &tk::MlaMetaParams::num_layers)
+        .def_rw("rope_append", &tk::MlaMetaParams::rope_append);
 
     nb::enum_<tr::ModelConfig::ModelVariant>(m, "GptModelVariant")
         .value("GPT", tr::ModelConfig::ModelVariant::kGpt)
@@ -249,6 +341,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             nb::arg("mamba_in_proj_size") = 0, nb::arg("mamba_inner_size") = 0, nb::arg("moe_latent_size") = 0);
 
     nb::class_<tc::QuantMode>(m, "QuantMode")
+        .def(nb::init<tc::QuantMode::BaseType>(), nb::arg("value"))
         .def_static("none", &tc::QuantMode::none)
         .def_static("int4_weights", &tc::QuantMode::int4Weights)
         .def_static("int8_weights", &tc::QuantMode::int8Weights)
@@ -298,6 +391,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def(nb::self == nb::self)
         .def(nb::self != nb::self);
 
+    // Python's QuantMode is an IntFlag, so let its value cross as one.
+    nb::implicitly_convertible<tc::QuantMode::BaseType, tc::QuantMode>();
+
     nb::class_<tr::ModelConfig>(m, "ModelConfig")
         .def(nb::init<SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32, tensorrt_llm::DataType>(),
             nb::arg("vocab_size"), nb::arg("num_layers"), nb::arg("num_attention_layers"), nb::arg("num_rnn_layers"),
@@ -316,7 +412,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("hidden_size", &tr::ModelConfig::getHiddenSize)
         .def_prop_ro("size_per_head", &tr::ModelConfig::getSizePerHead)
         .def_prop_ro("data_type", &tr::ModelConfig::getDataType)
-        .def_prop_ro("speculative_decoding_mode", &tr::ModelConfig::getSpeculativeDecodingMode)
         .def_prop_rw("head_size", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead)
         .def_prop_rw(
             "num_kv_heads_per_layer", &tr::ModelConfig::getNumKvHeadsPerLayer, &tr::ModelConfig::setNumKvHeadsPerLayer)
@@ -389,105 +484,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
             nb::arg("pipeline_parallelism") = nb::none(), nb::arg("context_parallelism") = nb::none(),
             nb::arg("device_ids") = nb::none(), nb::arg("enable_attention_dp") = false);
 
-    auto SamplingConfigGetState = [](tr::SamplingConfig const& config) -> nb::tuple
-    {
-        return nb::make_tuple(config.beamWidth, config.temperature, config.minLength, config.repetitionPenalty,
-            config.presencePenalty, config.frequencyPenalty, config.promptIgnoreLength, config.topK, config.topP,
-            config.randomSeed, config.topPDecay, config.topPMin, config.topPResetIds, config.beamSearchDiversityRate,
-            config.lengthPenalty, config.earlyStopping, config.noRepeatNgramSize, config.numReturnSequences,
-            config.minP, config.beamWidthArray);
-    };
-    auto SamplingConfigSetState = [](tr::SamplingConfig& self, nb::tuple t)
-    {
-        if (t.size() != 20)
-        {
-            throw std::runtime_error("Invalid SamplingConfig state!");
-        }
-
-        tr::SamplingConfig config;
-        config.beamWidth = nb::cast<SizeType32>(t[0]);
-        config.temperature = nb::cast<OptVec<float>>(t[1]);
-        config.minLength = nb::cast<OptVec<SizeType32>>(t[2]);
-        config.repetitionPenalty = nb::cast<OptVec<float>>(t[3]);
-        config.presencePenalty = nb::cast<OptVec<float>>(t[4]);
-        config.frequencyPenalty = nb::cast<OptVec<float>>(t[5]);
-        config.promptIgnoreLength = nb::cast<OptVec<SizeType32>>(t[6]);
-        config.topK = nb::cast<OptVec<SizeType32>>(t[7]);
-        config.topP = nb::cast<OptVec<float>>(t[8]);
-        config.randomSeed = nb::cast<OptVec<uint64_t>>(t[9]);
-        config.topPDecay = nb::cast<OptVec<float>>(t[10]);
-        config.topPMin = nb::cast<OptVec<float>>(t[11]);
-        config.topPResetIds = nb::cast<OptVec<TokenIdType>>(t[12]);
-        config.beamSearchDiversityRate = nb::cast<OptVec<float>>(t[13]);
-        config.lengthPenalty = nb::cast<OptVec<float>>(t[14]);
-        config.earlyStopping = nb::cast<OptVec<SizeType32>>(t[15]);
-        config.noRepeatNgramSize = nb::cast<OptVec<SizeType32>>(t[16]);
-        config.numReturnSequences = nb::cast<SizeType32>(t[17]);
-        config.minP = nb::cast<OptVec<float>>(t[18]);
-        config.beamWidthArray = nb::cast<OptVec<std::vector<SizeType32>>>(t[19]);
-
-        new (&self) tr::SamplingConfig(config);
-    };
-
-    nb::class_<tr::SamplingConfig>(m, "SamplingConfig")
-        .def(nb::init<SizeType32>(), nb::arg("beam_width") = 1)
-        .def(nb::init<tle::SamplingConfig, std::optional<tle::ExternalDraftTokensConfig>>(),
-            nb::arg("executor_sample_config"), nb::arg("external_draft_tokens_config") = std::nullopt)
-        .def_rw("beam_width", &tr::SamplingConfig::beamWidth)
-        .def_rw("temperature", &tr::SamplingConfig::temperature)
-        .def_rw("min_length", &tr::SamplingConfig::minLength)
-        .def_rw("repetition_penalty", &tr::SamplingConfig::repetitionPenalty)
-        .def_rw("presence_penalty", &tr::SamplingConfig::presencePenalty)
-        .def_rw("frequency_penalty", &tr::SamplingConfig::frequencyPenalty)
-        .def_rw("prompt_ignore_length", &tr::SamplingConfig::promptIgnoreLength)
-        .def_rw("top_k", &tr::SamplingConfig::topK)
-        .def_rw("top_p", &tr::SamplingConfig::topP)
-        .def_rw("random_seed", &tr::SamplingConfig::randomSeed)
-        .def_rw("top_p_decay", &tr::SamplingConfig::topPDecay)
-        .def_rw("top_p_min", &tr::SamplingConfig::topPMin)
-        .def_rw("top_p_reset_ids", &tr::SamplingConfig::topPResetIds)
-        .def_rw("beam_search_diversity_rate", &tr::SamplingConfig::beamSearchDiversityRate)
-        .def_rw("length_penalty", &tr::SamplingConfig::lengthPenalty)
-        .def_rw("early_stopping", &tr::SamplingConfig::earlyStopping)
-        .def_rw("no_repeat_ngram_size", &tr::SamplingConfig::noRepeatNgramSize)
-        .def_rw("num_return_sequences", &tr::SamplingConfig::numReturnSequences)
-        .def_rw("min_p", &tr::SamplingConfig::minP)
-        .def_rw("beam_width_array", &tr::SamplingConfig::beamWidthArray)
-        .def_rw("normalize_log_probs", &tr::SamplingConfig::normalizeLogProbs)
-        .def("__getstate__", SamplingConfigGetState)
-        .def("__setstate__", SamplingConfigSetState)
-        .def("__eq__", &tr::SamplingConfig::operator==);
-
-    nb::bind_vector<std::vector<tr::SamplingConfig>>(m, "SamplingConfigVector");
-
-    m.def("make_sampling_config", &makeSamplingConfig, nb::arg("configs"));
-
-    nb::class_<tr::GptJsonConfig>(m, "GptJsonConfig")
-        .def(nb::init<std::string, std::string, std::string, SizeType32, SizeType32, SizeType32, SizeType32,
-                 tr::ModelConfig, std::optional<tr::RuntimeDefaults>>(),
-            nb::arg("name"), nb::arg("version"), nb::arg("precision"), nb::arg("tensor_parallelism"),
-            nb::arg("pipeline_parallelism"), nb::arg("context_parallelism"), nb::arg("gpus_per_node"),
-            nb::arg("model_config"), nb::arg("runtime_defaults") = nb::none())
-        .def_static("parse", nb::overload_cast<std::string const&>(&tr::GptJsonConfig::parse), nb::arg("json"))
-        .def_static(
-            "parse_file", nb::overload_cast<std::filesystem::path const&>(&tr::GptJsonConfig::parse), nb::arg("path"))
-        .def_prop_ro("model_config", &tr::GptJsonConfig::getModelConfig)
-        .def_prop_ro("name", &tr::GptJsonConfig::getName)
-        .def_prop_ro("version", &tr::GptJsonConfig::getVersion)
-        .def_prop_ro("precision", &tr::GptJsonConfig::getPrecision)
-        .def_prop_ro("tensor_parallelism", &tr::GptJsonConfig::getTensorParallelism)
-        .def_prop_ro("pipeline_parallelism", &tr::GptJsonConfig::getPipelineParallelism)
-        .def_prop_ro("context_parallelism", &tr::GptJsonConfig::getContextParallelism)
-        .def_prop_ro("gpus_per_node", &tr::GptJsonConfig::getGpusPerNode)
-        .def_prop_ro("world_size", &tr::GptJsonConfig::getWorldSize)
-        .def_prop_ro("runtime_defaults", &tr::GptJsonConfig::getRuntimeDefaults)
-        .def("engine_filename",
-            nb::overload_cast<tr::WorldConfig const&, std::string const&>(
-                &tr::GptJsonConfig::engineFilename, nb::const_),
-            nb::arg("world_config"), nb::arg("model"))
-        .def("engine_filename",
-            nb::overload_cast<tr::WorldConfig const&>(&tr::GptJsonConfig::engineFilename, nb::const_),
-            nb::arg("world_config"));
+    // `tensorrt_llm.bindings.SamplingConfig` used to be a distinct runtime type that wrapped
+    // every executor sampling parameter in a one-element vector for the batched C++ decoder.
+    // That decoder is gone and LlmRequest now holds an executor::SamplingConfig directly, so
+    // the name is kept as an alias to avoid breaking `from tensorrt_llm.bindings import SamplingConfig`.
+    m.attr("SamplingConfig") = mExecutor.attr("SamplingConfig");
 
     nb::enum_<tb::LlmRequestState>(m, "LlmRequestState")
         .value("UNKNOWN", tb::LlmRequestState::kUNKNOWN)
@@ -514,7 +515,6 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("uvm", &tr::MemoryCounters::getUVM);
 
     tensorrt_llm::nanobind::process_group::initBindings(mInternalProcessGroup);
-    tpb::Buffers::initBindings(mInternalBatchManager);
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initKvCacheTestUtilBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
@@ -543,7 +543,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def("get_ipc_ptrs",
             [](tr::IpcNvlsHandle& self) { return reinterpret_cast<uintptr_t>(self.ipc_uc_ptrs.data()); });
 
-    m.def("ipc_nvls_allocate", &tr::ipcNvlsAllocate, nb::rv_policy::reference);
+    // Adding the McastGroupComm overload made this an unresolved overload set. Bind the MPI one so
+    // the exported signature stays unchanged; the other takes a shared_ptr<McastGroupComm>, which
+    // has no Python-facing counterpart.
+    m.def(
+        "ipc_nvls_allocate", nb::overload_cast<size_t, std::set<int>>(&tr::ipcNvlsAllocate), nb::rv_policy::reference);
     m.def("ipc_nvls_free", &tr::ipcNvlsFree);
     m.def("ipc_nvls_supported", &tr::ipcNvlsSupported);
 

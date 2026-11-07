@@ -1,6 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 import asyncio
-import os
-import sys
 import time
 
 from tensorrt_llm.executor.request import GenerationRequest
@@ -9,11 +9,10 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig, TorchLlmArgs
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
 # isort: on
 
-model_path = llm_models_root() / "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+model_path = llm_models_root() / "Qwen3/Qwen3-0.6B"
 assert model_path.exists()
 
 
@@ -29,7 +28,6 @@ class TestRpcWorkerTP1:
         )
         # Create RpcWorker instance
         self.worker = RpcWorker(
-            engine=model_path,
             llm_args=self.llm_args,
             hf_model_dir=model_path,
         )

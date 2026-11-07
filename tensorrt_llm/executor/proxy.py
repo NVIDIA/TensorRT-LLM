@@ -13,20 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import atexit
+import collections
 import concurrent.futures
 import json
 import os
+import pickle  # nosec B403
 import shutil
+import sys
 import tempfile
 import threading
+import time
 import weakref
-from queue import Empty
+from queue import Empty, Queue
 from typing import Dict, List, Optional, Union
 
 import torch
 import zmq
 import zmq.asyncio
 
+from tensorrt_llm._startup import _StartupTimer
 from tensorrt_llm.logger import logger
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
@@ -39,7 +44,8 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
-from .request import CancellingRequest, GenerationRequest
+from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
+                      StopProfileRequest)
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
 from .rpc.rpc_common import RPCError, get_unique_ipc_addr
@@ -61,7 +67,8 @@ __all__ = [
 # sleep() and wakeup() coordinate across all ranks via a dedicated control
 # communicator started in PyExecutor.start_worker(); rank-0 is the entry
 # point, so routing through the rank-0 RPC shim is correct.
-_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset({"sleep", "wakeup"})
+_MULTI_RANK_ALLOWED_METHODS: frozenset[str] = frozenset(
+    {"get_memory_status", "sleep", "wakeup"})
 
 
 def _check_collective_rpc_guard(
@@ -96,9 +103,135 @@ def _check_collective_rpc_guard(
             "this shim only reaches rank-0.")
 
 
+class _RequestSender:
+    """Batch a proxy's requests to the rank-0 worker on one background thread.
+
+    Used only with ``TRTLLM_PROXY_BATCH_REQUESTS=1``. Callers pickle each
+    request themselves and ``send`` the bytes, so a request is captured as it
+    is when it is submitted, and one that cannot be pickled fails in its
+    caller. The sender thread sends every payload queued since its previous
+    send as one list in one HMAC-signed message, so a burst of requests costs
+    the rank-0 worker one receive and one HMAC check instead of one per
+    request; the worker then unpickles each payload. The thread starts on
+    the first ``send``. From then on it is the only thread that writes to the
+    request queue's socket, which is not thread-safe, and it also sends the
+    worker's shutdown sentinel.
+
+    Trade-off: the sender thread must take the GIL before it can send. While
+    the submitting thread keeps running Python, for example a busy
+    trtllm-serve event loop, a lone request can wait up to the interpreter's
+    switch interval (5 ms by default) before it is sent.
+    """
+
+    MAX_BATCH_SIZE = 1024
+
+    def __init__(self, request_queue: IpcQueue, error_queue: Queue):
+        self._request_queue = request_queue
+        self._error_queue = error_queue
+        self._pending = collections.deque()
+        self._cond = threading.Condition()
+        self._closed = False
+        self._send_sentinel = False
+        # Set by the thread once it has drained the queue and will stop.
+        self._stopping = False
+        self._thread: Optional[threading.Thread] = None
+        # Bound here because ``close`` can run from a finalizer during
+        # interpreter teardown, when module globals may already be None.
+        self._is_finalizing = sys.is_finalizing
+
+    def send(self, payload: bytes) -> None:
+        """Queue a pickled request for the worker.
+
+        Payloads sent after ``close`` are dropped: the proxy is shutting down.
+        """
+        with self._cond:
+            if self._closed:
+                return
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run,
+                                                daemon=True,
+                                                name="proxy_request_sender")
+                self._thread.start()
+            self._pending.append(payload)
+            self._cond.notify()
+
+    def close(self,
+              timeout: Optional[float] = None,
+              *,
+              send_sentinel: bool = False) -> bool:
+        """Send everything queued, then stop the sender thread.
+
+        With ``send_sentinel``, the thread also sends the worker's shutdown
+        sentinel after the last payload, so the request queue keeps a single
+        writer. Calls after the thread has stopped return at once. During
+        interpreter finalization this returns without doing anything: the
+        daemon thread can no longer run, the ZMQ context may be gone, and
+        joining a thread there fails.
+
+        Returns:
+            Whether the caller still has to send the sentinel: true only if
+            ``send_sentinel`` is set and the thread did not send it, because it
+            never started or had already stopped.
+        """
+        if self._is_finalizing():
+            return False
+        with self._cond:
+            self._closed = True
+            thread = self._thread
+            caller_sends_sentinel = send_sentinel and (thread is None
+                                                       or self._stopping)
+            self._send_sentinel = self._send_sentinel or send_sentinel
+            self._cond.notify()
+        if thread is not None:
+            thread.join(timeout)
+            if not thread.is_alive():
+                self._thread = None
+        return caller_sends_sentinel
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while not self._pending and not self._closed:
+                    self._cond.wait()
+                if not self._pending:
+                    self._stopping = True
+                    send_sentinel = self._send_sentinel
+                    break
+                batch = [
+                    self._pending.popleft()
+                    for _ in range(min(len(self._pending), self.MAX_BATCH_SIZE))
+                ]
+            try:
+                self._request_queue.put(batch)
+            except Exception as e:
+                # The payloads are already pickled, so this is a transport
+                # error, which the proxy treats as fatal.
+                self._error_queue.put_nowait(e)
+        if send_sentinel:
+            # A bare None, not a batch: the worker stops at a top-level None.
+            try:
+                self._request_queue.put_noblock(None, retry=4)
+            except Exception as e:
+                self._error_queue.put_nowait(e)
+
+
+def _create_request_sender(request_queue: IpcQueue,
+                           error_queue: Queue) -> Optional[_RequestSender]:
+    """Return a batching request sender if TRTLLM_PROXY_BATCH_REQUESTS=1."""
+    if os.getenv("TRTLLM_PROXY_BATCH_REQUESTS", "0") != "1":
+        return None
+    return _RequestSender(request_queue, error_queue)
+
+
 class GenerationExecutorProxy(GenerationExecutor):
     READY_SIGNAL = b"READY"
     WORKER_PROCESS_IDENTITIES_SIGNAL = b"WORKER_PROCESS_IDENTITIES"
+    # Set when TRTLLM_PROXY_BATCH_REQUESTS=1; requests are put on
+    # ``request_queue`` directly otherwise.
+    _request_sender: Optional[_RequestSender] = None
+    # Total wait for the worker futures in an orderly shutdown. Generous
+    # enough for the teardown of a large engine.
+    _WORKER_SHUTDOWN_TIMEOUT_S = 180.0
 
     def __init__(
         self,
@@ -110,6 +243,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
     ) -> None:
+        proxy_start = time.perf_counter()
+        logger.info(f"[startup][pid={os.getpid()}] executor_proxy: start")
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
         super().__init__(
@@ -126,20 +261,22 @@ class GenerationExecutorProxy(GenerationExecutor):
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
         self._owns_mpi_session = mpi_session is None
 
-        if mpi_session is None:
-            if mpi_process_pre_spawned:
-                logger_debug('create comm session ...\n', "yellow")
-                self.mpi_session = create_mpi_comm_session(model_world_size)
+        with _StartupTimer("mpi_session_setup"):
+            if mpi_session is None:
+                if mpi_process_pre_spawned:
+                    logger_debug('create comm session ...\n', "yellow")
+                    self.mpi_session = create_mpi_comm_session(model_world_size)
+                else:
+                    logger_debug('create pool session ...\n', "yellow")
+                    self.mpi_session = MpiPoolSession(
+                        n_workers=model_world_size)
             else:
-                logger_debug('create pool session ...\n', "yellow")
-                self.mpi_session = MpiPoolSession(n_workers=model_world_size)
-        else:
-            # submit() launches one worker task per pool worker, so an
-            # external session must match the model's world size exactly;
-            # fail loudly instead of starting the wrong number of executors.
-            validate_session_world_size(mpi_session, model_world_size)
-            logger_debug('using external mpi session ...\n', "yellow")
-            self.mpi_session = mpi_session
+                # submit() launches one worker task per pool worker, so an
+                # external session must match the model's world size exactly;
+                # fail loudly instead of starting the wrong number of executors.
+                validate_session_world_size(mpi_session, model_world_size)
+                logger_debug('using external mpi session ...\n', "yellow")
+                self.mpi_session = mpi_session
 
         if isinstance(self.mpi_session,
                       (MpiCommSession, RemoteMpiCommSessionClient)):
@@ -161,8 +298,6 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         _llm_args = worker_kwargs.get("llm_args", None)
         self.garbage_collection_gen0_threshold = _llm_args.garbage_collection_gen0_threshold if _llm_args is not None else None
-        _backend = None if _llm_args is None else _llm_args.backend
-        self._is_pytorch_backend = _backend in ["pytorch", "_autodeploy"]
         self._enable_resource_governor = bool(
             getattr(_llm_args, "enable_resource_governor", False))
 
@@ -201,7 +336,14 @@ class GenerationExecutorProxy(GenerationExecutor):
         self.dispatch_result_thread: Optional[ManagedThread] = None
         self.rpc_client: Optional[RPCClient] = None
         self._worker_process_monitor = WorkerProcessMonitor()
+        logger.info(
+            f"[startup][pid={os.getpid()}] executor_proxy/pre_worker_setup: "
+            f"done in {time.perf_counter() - proxy_start:.3f}s (includes mpi_session_setup)"
+        )
         self._start_executor_workers(worker_kwargs)
+        logger.info(
+            f"[startup][pid={os.getpid()}] executor_proxy/workers_ready: "
+            f"elapsed={time.perf_counter() - proxy_start:.3f}s")
 
         # Create RPC client after workers are started (worker starts RPC server)
         self.rpc_client = RPCClient(self.rpc_addr, hmac_key=self.hmac_key)
@@ -218,6 +360,35 @@ class GenerationExecutorProxy(GenerationExecutor):
             daemon=True,
             name="proxy_error_monitor")
         self._error_monitor_thread.start()
+
+        # Single-thread executor that owns *all* profile-control IPC traffic
+        # (``request_queue.put`` for StartProfile/StopProfile and
+        # ``profile_ack_queue.get`` for the matching ack). Pinning these
+        # ZMQ socket operations to one owning thread is required because:
+        #
+        #   * pyzmq sockets are not thread-safe; concurrent access from
+        #     multiple threads — even one writer + one reader — is undefined
+        #     behavior in libzmq.
+        #   * The HTTP handler reaches us through ``asyncio.to_thread``,
+        #     which does not pin to the same worker thread between calls,
+        #     so back-to-back ``/start_profile`` and ``/stop_profile``
+        #     could otherwise touch ``profile_ack_queue`` from two
+        #     different threads.
+        #
+        # The HTTP handler still blocks on a Future returned by this
+        # executor, so the synchronous "chrome trace is on disk by the
+        # time /stop_profile returns 200" contract is preserved without
+        # any ZMQ socket op leaking into the FastAPI thread pool.
+        #
+        # NOTE: ``request_queue`` is also written from ``submit()`` /
+        # ``abort_request()`` on user-caller threads — that pre-existing
+        # cross-thread access is out of scope for this change. The fix
+        # here narrowly targets the new profile-control path.
+        # With TRTLLM_PROXY_BATCH_REQUESTS=1, the ``_request_sender`` thread
+        # writes the queue instead once it has started, shutdown sentinel
+        # included.
+        self._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="proxy_profile_control")
 
         # MPI registers its joiner using threading._register_atexit if possible.
         # These functions run before atexit.register, so to avoid deadlock,
@@ -445,6 +616,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                                           is_server=False,
                                           socket_type=zmq.PUSH,
                                           name="proxy_request_queue")
+            self._request_sender = _create_request_sender(
+                self.request_queue, self._error_queue)
             self.result_queue = FusedIpcQueue(frontend_result_addrs[0],
                                               is_server=True,
                                               fuse_message=False,
@@ -454,6 +627,8 @@ class GenerationExecutorProxy(GenerationExecutor):
             request_addr = None
             self.request_queue = IpcQueue(is_server=True,
                                           name="proxy_request_queue")
+            self._request_sender = _create_request_sender(
+                self.request_queue, self._error_queue)
             # TODO[chunweiy]: Unify IpcQueue and FusedIpcQueue
             # Use PULL mode when enable_postprocess_parallel as there are
             # multiple senders from multiple processes.
@@ -470,6 +645,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         self._resource_governor_queue = IpcQueue(
             is_server=True, name="proxy_resource_governor_queue"
         ) if self._enable_resource_governor else None
+        # Worker -> proxy ack channel for synchronous control requests
+        # (start_profile / stop_profile). Worker pushes a tuple
+        # ``(kind, error_msg)`` after it has finished processing the
+        # corresponding request; ``error_msg`` is non-None when
+        # ``PyExecutor`` rejected the call (e.g. RequestError "already
+        # in progress") so the proxy can re-raise. PAIR socket is fine
+        # because the worker leader is the sole producer.
+        # Created on first use, not here. Binding it at startup measurably
+        # perturbs this process: with the queue created eagerly the disagg
+        # /steady_clock_offset handshake takes 30-200 ms instead of 2-4 ms,
+        # which is enough to break the causality assertion in
+        # test_disaggregated_perf_metrics. Profiling is off in every normal
+        # deployment, so the socket is pure cost there anyway.
+        self.profile_ack_queue = None
         # Stats and KV events are now fetched via RPC, not IPC queues.
         return WorkerCommIpcAddrs(
             # A connect-mode queue has no bound .address; use the preset one.
@@ -528,7 +717,161 @@ class GenerationExecutorProxy(GenerationExecutor):
         # NOTE, it just sends a cancelling request to the request queue, but it
         # may take a while for the request to be cancelled in the worker and
         # send back a finished result.
-        self.request_queue.put(CancellingRequest(request_id))
+        self._send_request(CancellingRequest(request_id))
+
+    # Per-call timeouts for the synchronous worker round-trip. The stop
+    # path can take up to 30s because PyExecutor.stop_profile itself
+    # polls ``_profile_enabled`` for that long while the executor loop
+    # flushes the chrome trace; we add a small safety margin.
+    _START_PROFILE_ACK_TIMEOUT_S = 60.0
+    _STOP_PROFILE_ACK_TIMEOUT_S = 35.0
+
+    def _wait_profile_ack(self, expected_kind: str, timeout: float) -> None:
+        """Block on the worker's ack queue for a profile control request.
+
+        Waits for the worker to push an ack on ``profile_ack_queue``
+        matching ``expected_kind`` ("start" or "stop"), or until the
+        cumulative ``timeout`` elapses across any number of stale-ack
+        consumptions.
+
+        If a stale or out-of-order ack is read (e.g. the previous call
+        timed out and its ack arrived after we returned), we discard it
+        and keep waiting for the expected kind. Returning on a mismatch
+        would break the synchronous contract: the next call could return
+        before its own request has been processed, making the documented
+        guarantee ("trace is on disk by the time /stop_profile returns
+        200") unsound under back-to-back invocations.
+
+        If the worker reports a rejection (non-empty error message), we
+        re-raise as ``RuntimeError`` so the HTTP layer can map "already
+        in progress" / "pending" to 409. On true timeout we log a warning
+        and return — the chrome trace may still be flushing on the
+        backend, but blocking the FastAPI event loop indefinitely is
+        worse than a possibly-stale 200.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    f"{expected_kind}_profile: timed out waiting for "
+                    f"worker ack after {timeout:.1f}s. The chrome trace "
+                    "may not be on disk yet.")
+                return
+            try:
+                ack = self.profile_ack_queue.get(timeout=remaining)
+            except Empty:
+                logger.warning(
+                    f"{expected_kind}_profile: timed out waiting for "
+                    f"worker ack after {timeout:.1f}s. The chrome trace "
+                    "may not be on disk yet.")
+                return
+            kind, error_msg = ack
+            if kind != expected_kind:
+                # Out-of-order ack from a previous call; discard and keep
+                # waiting for the ack that belongs to this request.
+                logger.warning(
+                    f"profile ack kind mismatch (expected "
+                    f"{expected_kind!r}, got {kind!r}); discarding stale "
+                    "ack and continuing to wait.")
+                continue
+            if error_msg:
+                raise RuntimeError(error_msg)
+            return
+
+    def _ensure_profile_ack_queue(self):
+        """Bind the ack channel, once, on first profile control request.
+
+        Only ever called from ``_profile_control_executor``, which is a
+        single thread, so no additional locking is needed.
+        """
+        if self.profile_ack_queue is None:
+            self.profile_ack_queue = IpcQueue(is_server=True,
+                                              name="proxy_profile_ack_queue")
+        return self.profile_ack_queue.address
+
+    def _profile_control_call(self, kind: str, request, timeout: float) -> None:
+        """Worker-side body of ``start_profile`` / ``stop_profile``.
+
+        Runs on ``_profile_control_executor`` so all profile-related
+        ZMQ socket ops (``request_queue.put`` and ``profile_ack_queue.get``
+        via ``_wait_profile_ack``) happen on a single owning thread. With
+        TRTLLM_PROXY_BATCH_REQUESTS=1 the request is put by
+        ``_request_sender`` instead.
+        """
+        request.ack_addr = self._ensure_profile_ack_queue()
+        self._send_request(request)
+        self._wait_profile_ack(kind, timeout)
+
+    def _submit_profile_control(self, kind: str, request,
+                                timeout: float) -> None:
+        """Dispatch a profile-control request onto the owning thread.
+
+        ``shutdown()`` drains and clears ``_profile_control_executor``, so a
+        request arriving during or after teardown would otherwise fail with
+        ``AttributeError`` on ``None``. Raise ``RuntimeError`` instead — the
+        HTTP handlers already map it to a controlled response.
+
+        ``pre_shutdown()`` flips ``doing_shutdown`` and sends the quit
+        sentinel to the workers well before ``shutdown()`` clears the
+        executor, so check that first: a request submitted in that window
+        would otherwise block for the whole ack timeout waiting on workers
+        that are already exiting.
+        """
+        if self.doing_shutdown:
+            raise RuntimeError(
+                f"{kind}_profile: the executor proxy is shutting down; "
+                "profile control is unavailable.")
+        executor = self._profile_control_executor
+        if executor is None:
+            raise RuntimeError(
+                f"{kind}_profile: the executor proxy is shutting down or "
+                "already shut down; profile control is unavailable.")
+        executor.submit(self._profile_control_call, kind, request,
+                        timeout).result()
+
+    def start_profile(self,
+                      output_dir=None,
+                      num_steps=None,
+                      start_step: int = 0,
+                      activities=None) -> None:
+        """Forward runtime profiling start to the IPC worker process.
+
+        Blocks until the worker has processed the request, then
+        raises ``RuntimeError`` if ``PyExecutor`` rejected the start
+        (e.g. a profile window is already active or pending) so the
+        HTTP /start_profile endpoint can return 409.
+
+        The actual ZMQ traffic (``request_queue.put`` +
+        ``profile_ack_queue.get``) is dispatched onto
+        ``_profile_control_executor`` — a single-thread executor — so the
+        FastAPI thread-pool worker that called us never touches the
+        ZMQ sockets directly. ``Future.result()`` re-raises any
+        ``RuntimeError`` from ``_wait_profile_ack`` so the HTTP layer
+        still sees worker rejections.
+        """
+        request = StartProfileRequest(output_dir=output_dir,
+                                      num_steps=num_steps,
+                                      start_step=start_step,
+                                      activities=activities)
+        self._submit_profile_control("start", request,
+                                     self._START_PROFILE_ACK_TIMEOUT_S)
+
+    def stop_profile(self) -> None:
+        """Forward runtime profiling stop to the IPC worker process.
+
+        Blocks until the worker has finished flushing the chrome
+        trace. This makes the IPC-proxy path match the in-process and
+        RPC-proxy paths: by the time this method returns the trace
+        file is on disk, so HTTP callers can reliably read it
+        immediately after /stop_profile returns 200.
+
+        Like ``start_profile``, the actual ZMQ traffic is dispatched
+        onto ``_profile_control_executor`` so the calling thread never
+        touches the ZMQ sockets.
+        """
+        self._submit_profile_control("stop", StopProfileRequest(),
+                                     self._STOP_PROFILE_ACK_TIMEOUT_S)
 
     def dispatch_result_task(self) -> bool:
         # TODO[chunweiy]: convert the dispatch_result_task to async, that should
@@ -683,12 +1026,13 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         tracer_init_kwargs = get_tracer().init_kwargs if enable_llm_tracer(
         ) else None
-        # With the lazily loaded model zoo this snapshot is intentionally
-        # partial: it carries only externally-registered (and already
-        # resolved) classes; workers resolve built-ins on demand. Do not
-        # "fix" it by importing the zoo eagerly before submit.
+        # Only the architectures a worker cannot find for itself, and only as
+        # module names. Built-ins come from the worker's own static index, and
+        # naming a module rather than sending the class keeps the worker's zoo
+        # lazy -- a class in this payload would be resolved while unpickling,
+        # importing its module in every worker whether or not it is ever used.
         from tensorrt_llm._torch.models.modeling_utils import \
-            MODEL_CLASS_MAPPING
+            export_external_model_modules
         torch.cuda.Stream()
 
         # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
@@ -704,25 +1048,32 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.WORKER_PROCESS_IDENTITIES_SIGNAL
             if self._can_monitor_worker_processes() else None)
 
-        self.mpi_futures = self.mpi_session.submit(
-            worker_main,
-            **mpi_worker_kwargs,
-            worker_cls=self.worker_cls,
-            tracer_init_kwargs=tracer_init_kwargs,
-            _torch_model_class_mapping=MODEL_CLASS_MAPPING,
-            ready_signal=GenerationExecutorProxy.READY_SIGNAL,
-            worker_process_identities_signal=worker_process_identities_signal,
-        )
+        with _StartupTimer("worker_submit_to_ready") as startup_timer:
+            with startup_timer.phase("worker_submit"):
+                self.mpi_futures = self.mpi_session.submit(
+                    worker_main,
+                    **mpi_worker_kwargs,
+                    worker_cls=self.worker_cls,
+                    tracer_init_kwargs=tracer_init_kwargs,
+                    _torch_external_model_modules=export_external_model_modules(
+                    ),
+                    ready_signal=GenerationExecutorProxy.READY_SIGNAL,
+                    worker_process_identities_signal=
+                    worker_process_identities_signal,
+                )
 
-        self.workers_started = True
+            self.workers_started = True
 
-        status = self._wait_for_executor_workers_ready()
+            with startup_timer.phase("worker_initialization_wait"):
+                status = self._wait_for_executor_workers_ready()
 
-        ready_signal, error_trace = status[:2]
-        if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
-            logger.error(f"Executor worker initialization error: {error_trace}")
-            self._fail_initialization(
-                RuntimeError("Executor worker returned error"), ready_signal)
+            ready_signal, error_trace = status[:2]
+            if ready_signal != GenerationExecutorProxy.READY_SIGNAL:
+                logger.error(
+                    f"Executor worker initialization error: {error_trace}")
+                self._fail_initialization(
+                    RuntimeError("Executor worker returned error"),
+                    ready_signal)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the
@@ -831,7 +1182,35 @@ class GenerationExecutorProxy(GenerationExecutor):
         # empty list and therefore covered case (a) by accident.  Switching
         # to bare ``any(...)`` to better handle partial crashes regressed
         # case (a); keep both behaviours explicit.
-        if not self.mpi_futures or any(not f.done() for f in self.mpi_futures):
+        send_sentinel = not self.mpi_futures or any(not f.done()
+                                                    for f in self.mpi_futures)
+        self._close_request_sender(send_sentinel=send_sentinel)
+
+    def _send_request(self, request) -> None:
+        """Send a request to the rank-0 worker.
+
+        With TRTLLM_PROXY_BATCH_REQUESTS=1 the request is pickled here, on the
+        caller's thread, and ``_request_sender`` batches the bytes; otherwise
+        it is put on ``request_queue`` directly. Either way the worker receives
+        the request as it is now, and a request that cannot be pickled raises
+        here.
+        """
+        if self._request_sender is None:
+            self.request_queue.put(request)
+        else:
+            self._request_sender.send(pickle.dumps(request))
+
+    def _close_request_sender(self, send_sentinel: bool = False) -> None:
+        """Stop the request sender, if any, then send the shutdown sentinel if asked.
+
+        The sentinel follows every queued request. It is sent by the thread
+        that has been writing ``request_queue``: the sender thread once it has
+        started, the caller otherwise.
+        """
+        if self._request_sender is not None:
+            send_sentinel = self._request_sender.close(
+                timeout=5.0, send_sentinel=send_sentinel)
+        if send_sentinel:
             self.request_queue.put_noblock(None, retry=4)
 
     def _get_next_client_id(self) -> int:
@@ -856,6 +1235,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
     def shutdown(self):
         if not self.workers_started:
+            self._close_request_sender()
             self._cleanup_multi_frontend_ipc_dir()
             return
 
@@ -869,6 +1249,28 @@ class GenerationExecutorProxy(GenerationExecutor):
         # instead of blocking on each, and skip the ones still pending.
         if self._engine_dead:
             concurrent.futures.wait(self.mpi_futures, timeout=5.0)
+        else:
+            # A worker that dies *after* delivering its results (e.g. a segfault
+            # in its own teardown) queues no error, so _engine_dead is still
+            # False. Bound the wait with one deadline shared by all futures so
+            # that cannot wedge shutdown; pre_shutdown has already asked the
+            # workers to quit.
+            _, pending = concurrent.futures.wait(
+                self.mpi_futures, timeout=self._WORKER_SHUTDOWN_TIMEOUT_S)
+            if pending:
+                stuck = [
+                    i for i, f in enumerate(self.mpi_futures) if f in pending
+                ]
+                logger.warning(
+                    f"MPI worker future(s) {stuck} did not complete within "
+                    f"{self._WORKER_SHUTDOWN_TIMEOUT_S}s of shutdown; treating "
+                    "the worker world as dead")
+                # Route the rest of teardown through the dead-engine path:
+                # skip the stuck futures, bound the dispatcher join and
+                # abandon (rather than join) the session.
+                self._mark_engine_dead(
+                    TimeoutError(
+                        f"MPI worker future(s) {stuck} timed out on shutdown"))
 
         for f in self.mpi_futures:
             if self._engine_dead and not f.done():
@@ -895,6 +1297,16 @@ class GenerationExecutorProxy(GenerationExecutor):
             self.dispatch_result_thread.join(
                 timeout=5.0 if self._engine_dead else None)
 
+        # Drain the profile-control executor before closing its sockets.
+        # ``shutdown(wait=True)`` blocks until any in-flight
+        # start_profile/stop_profile call has finished its
+        # ``_wait_profile_ack`` round-trip on the owner thread, so we
+        # don't tear ``profile_ack_queue`` out from under it.
+        if hasattr(self, '_profile_control_executor'
+                   ) and self._profile_control_executor is not None:
+            self._profile_control_executor.shutdown(wait=True)
+            self._profile_control_executor = None
+
         # step3: finish all remaining work
 
         # close the RPC client
@@ -909,6 +1321,10 @@ class GenerationExecutorProxy(GenerationExecutor):
         if self._resource_governor_queue is not None:
             self._resource_governor_queue.close()
         self._cleanup_multi_frontend_ipc_dir()
+        # ``profile_ack_queue`` is only torn down here because the
+        # owning ``_profile_control_executor`` was just drained above.
+        if self.profile_ack_queue is not None:
+            self.profile_ack_queue.close()
 
         self.workers_started = False
         if self._owns_mpi_session:
@@ -925,10 +1341,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             print_alive_threads()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
-        """
-            Low-level API to the executor. Return a "future" GenerationResult
-            which can be waited.
-            Forwards the request to the workers through the request queue.
+        """Low-level API to the executor.
+
+        Returns a "future" GenerationResult which can be waited.
+        Forwards the request to the workers through the request queue.
         """
 
         # Sticky fast-fail: don't accept new work once the engine is known dead.
@@ -958,7 +1374,7 @@ class GenerationExecutorProxy(GenerationExecutor):
             raise EngineDeadError(self._fatal_error)
 
         with nvtx_range_debug("request_queue.put"):
-            self.request_queue.put(request)
+            self._send_request(request)
 
         self._handle_background_error()
 
@@ -1030,7 +1446,10 @@ class GenerationExecutorProxy(GenerationExecutor):
             logger.warning("RPC client not initialized, cannot get stats")
             return []
 
-        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
+        # Allow transport overhead beyond the worker's queue wait, while
+        # bounding the client even if the worker never replies.
+        stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote(
+            timeout=None if timeout is None else timeout + 1.0)
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
 
     def get_kv_cache_capacity(self) -> dict:
@@ -1041,12 +1460,45 @@ class GenerationExecutorProxy(GenerationExecutor):
             return {}
 
         try:
-            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote()
+            capacity = self.rpc_client.fetch_kv_cache_capacity_async().remote(
+                timeout=1.0)
             if isinstance(capacity, str):
                 capacity = json.loads(capacity)
             return capacity if isinstance(capacity, dict) else {}
         except (RPCError, json.JSONDecodeError) as e:
             logger.debug(f"Error fetching kv cache capacity via RPC: {e}")
+            return {}
+
+    def get_openengine_discovery(self) -> dict:
+        """Get startup OpenEngine discovery through its dedicated worker RPC."""
+        if self.rpc_client is None:
+            return {}
+        try:
+            discovery = self.rpc_client.fetch_openengine_discovery_async(
+            ).remote(timeout=1.0)
+            if isinstance(discovery, str):
+                discovery = json.loads(discovery)
+            return discovery if isinstance(discovery, dict) else {}
+        except (RPCError, json.JSONDecodeError) as error:
+            logger.debug(
+                f"Error fetching OpenEngine discovery via RPC: {error}")
+            return {}
+
+    def get_kv_cache_load(self) -> dict:
+        """Get a primary/GPU KV cache load snapshot via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get kv cache load")
+            return {}
+
+        try:
+            load = self.rpc_client.fetch_kv_cache_load_async().remote(
+                timeout=1.0)
+            if isinstance(load, str):
+                load = json.loads(load)
+            return load if isinstance(load, dict) else {}
+        except (RPCError, json.JSONDecodeError) as e:
+            logger.debug(f"Error fetching kv cache load via RPC: {e}")
             return {}
 
     def get_disaggregated_params(self) -> dict:
@@ -1105,7 +1557,8 @@ class GenerationExecutorProxy(GenerationExecutor):
         # Fetch stats via RPC and populate the result
         try:
             stats = self.rpc_client.fetch_stats_wait_async(
-                timeout=timeout).remote()
+                timeout=timeout).remote(
+                    timeout=None if timeout is None else timeout + 1.0)
         except Exception as e:
             logger.debug(f"Error fetching stats via RPC: {e}")
             stats = []
@@ -1241,6 +1694,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
             is_server=False,
             socket_type=zmq.PUSH,
             name=f"frontend_{frontend_id}_request_queue")
+        self._request_sender = _create_request_sender(self.request_queue,
+                                                      self._error_queue)
         self.result_queue = FusedIpcQueue(
             (attach_info["result_addrs"][frontend_id], hmac_key),
             is_server=True,
@@ -1290,6 +1745,8 @@ class GenerationExecutorFrontendProxy(GenerationExecutorProxy):
 
     def shutdown(self):
         self.pre_shutdown()
+        # Send the cancels queued by pre_shutdown before the lane goes idle.
+        self._close_request_sender()
         if self.rpc_client is not None:
             self.rpc_client.close()
             self.rpc_client = None

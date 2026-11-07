@@ -273,6 +273,10 @@ class DisaggClusterWorker:
     LOCALHOST_IPS = ["localhost", "127.0.0.1", "0.0.0.0", "::1",
                      "::"]  # nosec B104
 
+    # Floor on a refresh attempt's timeout, so a nearly-elapsed TTL window
+    # still gets one real attempt and _refresh_registration terminates.
+    _MIN_REFRESH_TIMEOUT_SEC = 1.0
+
     def __init__(self, role: ServerRole, host: str, port: int,
                  config: DisaggClusterConfig, storage: ClusterStorage):
         self._role = role
@@ -282,6 +286,7 @@ class DisaggClusterWorker:
         self._stop = False
         self._heartbeat_task = None
         self._last_heartbeat = 0
+        self._registration_expires_at = 0
         register_host = host
         # if the host is localhost and the cluster uri is not localhost, use the hostname to register the worker
         disagg_host = get_host_from_uri(self._config.cluster_uri)
@@ -330,6 +335,7 @@ class DisaggClusterWorker:
         logger.debug(
             f"Worker {self.worker_info.worker_id} registering, {asdict(worker_info)}"
         )
+        ttl_applied_after = key_time()
         success = await self._cluster_storage.set(
             self.worker_key,
             json.dumps(asdict(worker_info)),
@@ -350,6 +356,7 @@ class DisaggClusterWorker:
             logger.info(
                 f"Worker {self.worker_info.worker_id} registration successful")
         self._last_heartbeat = key_time()
+        self._stamp_registration_expiry(ttl_applied_after)
         if self._config.heartbeat_interval_sec > 0 and self._config.heartbeat_interval_sec < self._config.inactive_timeout_sec:
             if not self._heartbeat_task:
                 self._heartbeat_task = asyncio.create_task(
@@ -372,6 +379,57 @@ class DisaggClusterWorker:
                 f"Worker {self.worker_info.worker_id} deregistration failed")
         return success
 
+    def _stamp_registration_expiry(self, ttl_applied_after: float) -> None:
+        # Stamp from before the request was sent, not from its reply: the
+        # storage applied the new TTL somewhere in between, so the send time is
+        # the conservative expiry.
+        self._registration_expires_at = (ttl_applied_after +
+                                         self._config.inactive_timeout_sec)
+
+    async def _refresh_registration(self) -> bool:
+        """Refresh this worker's TTL, retrying until the storage answers.
+
+        A storage RPC is bounded only by the client's own timeout, which is as
+        coarse as the heartbeat interval and half of inactive_timeout_sec, so
+        awaiting one stalled /expire burns the whole TTL window. Bound each
+        attempt to a fraction of the time left and spend the rest retrying.
+
+        A timeout means "no answer yet", not "expired": the storage stamps the
+        new TTL when it *receives* the request and reaps lapsed keys lazily, so
+        _registration_expires_at is only a conservative local bound and the
+        registration normally outlives it. Treating it as definitive tears down
+        a healthy worker whose coordinator was merely busy for one interval --
+        it re-registers, which the coordinator reads as a leave/join, evicting
+        it from the routers so requests routed there fail. So retry through a
+        grace period; only an explicit "not refreshed", or silence past the
+        grace, is definitive.
+        """
+        grace_deadline = (self._registration_expires_at +
+                          self._config.inactive_timeout_sec)
+        while not self._stop:
+            attempt_start = key_time()
+            remaining = self._registration_expires_at - attempt_start
+            try:
+                refreshed = await asyncio.wait_for(
+                    self._cluster_storage.expire(
+                        self.worker_key, self._config.inactive_timeout_sec),
+                    timeout=max(self._MIN_REFRESH_TIMEOUT_SEC, remaining / 3))
+            except asyncio.TimeoutError:
+                now = key_time()
+                lapsed = now >= grace_deadline
+                action = ("giving up past the grace period"
+                          if lapsed else "retrying")
+                logger.warning(
+                    f"Worker {self.worker_info.worker_id} heartbeat refresh "
+                    f"stalled, {action} {now}")
+                if lapsed:
+                    return False
+                continue
+            if refreshed:
+                self._stamp_registration_expiry(attempt_start)
+            return refreshed
+        return False
+
     async def _heartbeat(self, validator=None):
         logger.info(f"Worker {self.worker_info.worker_id} heartbeat started")
         while not self._stop:
@@ -385,8 +443,7 @@ class DisaggClusterWorker:
                     f"Worker {self.worker_info.worker_id} is not valid, skipping heartbeat {key_time()}"
                 )
                 continue
-            expire_res = await self._cluster_storage.expire(
-                self.worker_key, self._config.inactive_timeout_sec)
+            expire_res = await self._refresh_registration()
             if not expire_res:
                 logger.warning(
                     f"Worker {self.worker_info.worker_id} heartbeat failed, re-registering {key_time()}"

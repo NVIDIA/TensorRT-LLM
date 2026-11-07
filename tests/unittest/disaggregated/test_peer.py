@@ -13,6 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import numpy as np
 import pytest
 
@@ -23,12 +26,19 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import (
     build_aux_transfer_layout,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.peer import (
+    AttentionPolicy,
     HNDHeadMismatchMapper,
     IntactMapper,
     NHDHeadMismatchMapper,
     ReplicatedMapper,
+    RingMapper,
 )
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
+from tensorrt_llm._torch.disaggregation.native.mixers.ssm.peer import (
+    ConvStateMismatchMapper,
+    MambaHeadMatchMapper,
+    MambaPolicy,
+)
 from tensorrt_llm._torch.disaggregation.native.peer import PeerOverlap, PeerRegistrar
 from tensorrt_llm._torch.disaggregation.native.rank_info import RankInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import KVRegionExtractorV1
@@ -37,6 +47,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
     MAMBA_CONV_ROLE,
     MAMBA_SSM_ROLE,
     AttentionLayerGroup,
+    CacheKind,
     KVCachePageTable,
     LocalLayer,
     MambaLayerGroup,
@@ -49,7 +60,9 @@ from tensorrt_llm._torch.disaggregation.resource.page import (
 pytestmark = pytest.mark.cpu_only
 
 
-def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mamba_tp=2):
+def make_page_table(
+    pool_ptrs=None, block_bytes=None, global_layer_ids=None, mamba_tp=2, kv_heads=2
+):
     """Create a KVCachePageTable for testing.
 
     ``mamba_tp`` is the TP degree the synthetic recurrent-state group is
@@ -80,7 +93,11 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
             entries.append((i, base_offset, buffer_size))
             entries.append((i, base_offset + buffer_size, buffer_size))
         pool_views.append(
-            PoolView(pool_idx=pi, buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE))
+            PoolView(
+                pool_idx=pi,
+                buffer_entries=np.array(entries, dtype=BUFFER_ENTRY_DTYPE),
+                num_kv_heads=kv_heads,
+            )
         )
     physical_pools = [
         PhysicalPool(base_address=ptr, slot_bytes=bs, num_slots=128)
@@ -89,7 +106,7 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
 
     attn_lg = AttentionLayerGroup(
         pool_group_idx=0,
-        kv_head_num_per_rank=2,
+        kv_head_num_per_rank=kv_heads,
         sliding_window_size=None,
         local_layers=local_layers,
         pool_views=pool_views,
@@ -110,6 +127,7 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
             pool_role=MAMBA_CONV_ROLE,
             mapper_kind=MapperKind.SECTIONED,
             bytes_per_layer=conv_slot_bytes,
+            section_bytes=[1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp],
         ),
         PoolView(
             pool_idx=1,
@@ -119,14 +137,13 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
             pool_role=MAMBA_SSM_ROLE,
             mapper_kind=MapperKind.INDEXED,
             bytes_per_layer=ssm_slot_bytes,
+            bytes_per_head=64,
         ),
     ]
     mamba_lg = MambaLayerGroup(
         pool_group_idx=1,
         local_layers=mamba_local_layers,
         pool_views=mamba_pool_views,
-        conv_section_bytes=[1024 // mamba_tp, 512 // mamba_tp, 512 // mamba_tp],
-        ssm_bytes_per_head=64,
     )
     conv_pool = PhysicalPool(base_address=0xA000, slot_bytes=conv_slot_bytes, num_slots=128)
     ssm_pool = PhysicalPool(base_address=0xB000, slot_bytes=ssm_slot_bytes, num_slots=128)
@@ -137,7 +154,7 @@ def make_page_table(pool_ptrs=None, block_bytes=None, global_layer_ids=None, mam
 
     return KVCachePageTable(
         tokens_per_block=16,
-        layer_groups=[attn_lg, mamba_lg],
+        layer_groups=([attn_lg] if kv_heads else []) + [mamba_lg],
         pool_groups=pool_groups,
     )
 
@@ -194,7 +211,7 @@ def make_rankinfo(
 
 
 def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
-    pt = make_page_table()
+    pt = make_page_table(kv_heads=self_ri.attention.kv_heads_per_rank)
     real_kv_extractor = KVRegionExtractorV1(pt)
     reg = PeerRegistrar(self_ri, real_kv_extractor)
     if peer_ri.page_table is None:
@@ -216,7 +233,7 @@ def _make_peer_registrar_and_peer_ri(self_ri, peer_ri):
             is_mla=peer_ri.attention.is_mla,
             enable_attention_dp=peer_ri.attention.enable_attention_dp,
             layer_num_per_pp=peer_ri.layer_num_per_pp,
-            page_table=make_page_table(),
+            page_table=make_page_table(kv_heads=peer_ri.attention.kv_heads_per_rank),
         )
     return reg, peer_ri
 
@@ -395,14 +412,378 @@ def test_multiple_overlap():
 
 
 def _make_peer_registrar(self_rankinfo):
-    pt = self_rankinfo.page_table if self_rankinfo.page_table else make_page_table()
+    pt = self_rankinfo.page_table or make_page_table(
+        kv_heads=self_rankinfo.attention.kv_heads_per_rank
+    )
     real_kv_extractor = KVRegionExtractorV1(pt)
     reg = PeerRegistrar(self_rankinfo, real_kv_extractor)
     return reg
 
 
-def test_peer_registrar_register_and_get():
+def _make_per_view_page_table(head_counts, mapper_kind):
+    """Two-token K/V buffers with four bytes per token/head."""
+    views = []
+    pools = []
+    for layer, heads in enumerate(head_counts):
+        buffer_bytes = 8 * heads
+        views.append(
+            PoolView(
+                pool_idx=layer,
+                buffer_entries=np.array(
+                    [(layer, 0, buffer_bytes), (layer, buffer_bytes, buffer_bytes)],
+                    dtype=BUFFER_ENTRY_DTYPE,
+                ),
+                mapper_kind=mapper_kind,
+                num_kv_heads=heads,
+            )
+        )
+        pools.append(
+            PhysicalPool(
+                base_address=0x1000 * (layer + 1), slot_bytes=2 * buffer_bytes, num_slots=8
+            )
+        )
+    return KVCachePageTable(
+        tokens_per_block=2,
+        layer_groups=[
+            AttentionLayerGroup(
+                pool_group_idx=0,
+                kv_head_num_per_rank=head_counts[0],
+                sliding_window_size=None,
+                local_layers=[LocalLayer(layer, layer) for layer in range(len(head_counts))],
+                pool_views=views,
+            )
+        ],
+        pool_groups=[PhysicalPoolGroup(pools=pools)],
+    )
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+def test_per_view_heads_select_correct_transfer_bytes(mapper_kind):
+    # TP4 -> TP1: the eight-head view shards all ranks, while the two-head
+    # view duplicates each head on two ranks. Rank 2 sends its second head.
+    self_ri = make_rankinfo(
+        tp_size=4,
+        tp_rank=2,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], mapper_kind),
+    )
+    reg = _make_peer_registrar(self_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = reg.get_kv_map(peer_ri, (0, 1), (0, 1))
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=16)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=32)),
+    )
+
+    if mapper_kind == MapperKind.NHD:
+        assert isinstance(mapper, NHDHeadMismatchMapper)
+        assert pair.src.memory.ptrs.tolist() == [1000, 1004, 1008, 1012]
+        assert pair.dst.memory.ptrs.tolist() == [2004, 2012, 2020, 2028]
+        assert pair.src.memory.bytes_per_region == 4
+    else:
+        assert isinstance(mapper, HNDHeadMismatchMapper)
+        assert pair.src.memory.ptrs.tolist() == [1000, 1008]
+        assert pair.dst.memory.ptrs.tolist() == [2008, 2024]
+        assert pair.src.memory.bytes_per_region == 8
+    assert pair.dst.memory.bytes_per_region == pair.src.memory.bytes_per_region
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize(
+    "view_idx,peer_tp_rank,src_head_idx",
+    [
+        (0, 0, 0),
+        (0, 1, 2),
+        (0, 2, 4),
+        (0, 3, 6),
+        (1, 0, 0),
+        (1, 1, 0),
+        (1, 2, 1),
+        (1, 3, 1),
+    ],
+)
+def test_per_view_heads_select_correct_transfer_bytes_with_larger_gen_tp(
+    mapper_kind: MapperKind, view_idx: int, peer_tp_rank: int, src_head_idx: int
+) -> None:
+    # TP1 -> TP4: the eight-head view sends two heads per receiver; the
+    # two-head view sends head 0 to ranks 0/1 and head 1 to ranks 2/3.
+    self_ri = make_rankinfo(
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], mapper_kind),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=4,
+        tp_rank=peer_tp_rank,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    reg = _make_peer_registrar(self_ri)
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    mapper = reg.get_kv_map(peer_ri, (0, view_idx), (0, view_idx))
+    src_heads = [8, 2][view_idx]
+    dst_heads = [2, 1][view_idx]
+    pair = mapper.map(
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([1000]), bytes_per_region=16 * src_heads)),
+        SpecRegion(memory=MemRegionGroup(ptrs=np.array([2000]), bytes_per_region=16 * dst_heads)),
+    )
+
+    if mapper_kind == MapperKind.NHD:
+        assert isinstance(mapper, NHDHeadMismatchMapper)
+        # Four bytes per token/head, with a fragment for each K/V token.
+        expected_src_ptrs = [1000 + 4 * src_head_idx + 4 * src_heads * i for i in range(4)]
+        expected_dst_ptrs = [2000 + 4 * dst_heads * i for i in range(4)]
+        expected_fragment_bytes = 4 * dst_heads
+    else:
+        assert isinstance(mapper, HNDHeadMismatchMapper)
+        # Eight bytes per head across both tokens, with one fragment per K/V.
+        expected_src_ptrs = [1000 + 8 * src_head_idx, 1000 + 8 * src_heads + 8 * src_head_idx]
+        expected_dst_ptrs = [2000, 2000 + 8 * dst_heads]
+        expected_fragment_bytes = 8 * dst_heads
+    assert pair.src.memory.ptrs.tolist() == expected_src_ptrs
+    assert pair.dst.memory.ptrs.tolist() == expected_dst_ptrs
+    assert pair.src.memory.bytes_per_region == expected_fragment_bytes
+    assert pair.dst.memory.bytes_per_region == expected_fragment_bytes
+
+
+def test_per_view_head_duplication_elects_senders_independently():
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=8,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([8, 2], MapperKind.INDEXED),
+    )
+    ownership = [[], []]
+    for rank in range(4):
+        self_ri = make_rankinfo(
+            tp_size=4,
+            tp_rank=rank,
+            kv_heads_per_rank=2,
+            tokens_per_block=2,
+            dims_per_head=2,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        reg = _make_peer_registrar(self_ri)
+        overlap = reg.get_peer_overlap(peer_ri, peer_dp_rank=0)
+        assert overlap.duplicate_head_factor == 1
+        assert overlap.duplicate_head_factors_for((0, 0)) == (1, 1)
+        assert overlap.duplicate_head_factors_for((0, 1)) == (2, 1)
+        for view in range(2):
+            ownership[view].append(reg.should_send_pool(overlap, peer_ri, 0, view))
+
+    assert ownership == [[True, True, True, True], [True, False, True, False]]
+
+
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+@pytest.mark.parametrize("invalid_heads", [None, 0, -1])
+@pytest.mark.parametrize("invalid_sides", [("local",), ("peer",), ("local", "peer")])
+def test_per_view_rejects_missing_or_invalid_head_counts(
+    mapper_kind: MapperKind, invalid_heads: int | None, invalid_sides: tuple[str, ...]
+) -> None:
+    self_ri = make_rankinfo(
+        tp_size=1,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        kv_heads_per_rank=2,
+        tokens_per_block=2,
+        dims_per_head=2,
+        page_table=_make_per_view_page_table([2, 1], mapper_kind),
+    )
+    # This view matches the rank-wide count: a fallback would silently accept it.
+    for side, ri in (("local", self_ri), ("peer", peer_ri)):
+        if side in invalid_sides:
+            ri.page_table.layer_groups[0].pool_views[0].num_kv_heads = invalid_heads
+    reg = _make_peer_registrar(self_ri)
+    with pytest.raises(ValueError, match="must publish a positive num_kv_heads"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+
+
+def _make_receiver_for_view_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    registrar: PeerRegistrar,
+    sender_infos: dict[str, RankInfo],
+    enforce_physical_ownership: bool,
+) -> tuple:
+    import tensorrt_llm._torch.disaggregation.native.transfer as transfer_module
+
+    messengers = {}
+
+    def make_messenger(*, mode: str, endpoint: str | None = None) -> Mock:
+        messenger = Mock()
+        messenger.endpoint = endpoint or "tcp://receiver"
+        if endpoint in sender_infos:
+            messenger.receive.return_value = [sender_infos[endpoint].to_bytes()]
+        messengers[endpoint] = messenger
+        return messenger
+
+    messenger_factory = Mock(side_effect=make_messenger)
+    monkeypatch.setattr(transfer_module, "ZMQMessenger", messenger_factory)
+    receiver = transfer_module.Receiver(
+        registrar,
+        Mock(),
+        enforce_physical_ownership=enforce_physical_ownership,
+    )
+    receiver._build_recv_req_info = Mock()
+    receiver._request_sender_data = Mock()
+    return receiver, messengers, messenger_factory
+
+
+@pytest.mark.parametrize("enforce_physical_ownership", [False, True])
+@pytest.mark.parametrize(
+    ("mismatch", "diagnostic"),
+    [
+        ("missing_heads", "must publish a positive num_kv_heads"),
+        ("pool_roles", "has no peer view with the same roles"),
+    ],
+)
+def test_receiver_rejects_view_mismatch_before_registration(
+    monkeypatch: pytest.MonkeyPatch,
+    enforce_physical_ownership: bool,
+    mismatch: str,
+    diagnostic: str,
+) -> None:
+    from tensorrt_llm._torch.disaggregation.base import TokenRange
+    from tensorrt_llm._torch.disaggregation.native.extent import Chunk
+    from tensorrt_llm._torch.disaggregation.native.transfer import (
+        KVRecvTask,
+        MessageType,
+        PeerIncompatibleError,
+        TaskStatus,
+    )
+
+    local_ri, bad_ri, good_ri = [
+        make_rankinfo(
+            instance_name=name,
+            tp_size=1,
+            tokens_per_block=2,
+            dims_per_head=2,
+            page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+        )
+        for name in ("receiver", "bad-sender", "good-sender")
+    ]
+    bad_view = bad_ri.page_table.layer_groups[0].pool_views[1]
+    if mismatch == "missing_heads":
+        bad_view.num_kv_heads = None
+    else:
+        bad_view.pool_role = frozenset({"other_kv"})
+    bad_ri.sender_endpoints = ["tcp://bad-sender"]
+    good_ri.sender_endpoints = ["tcp://good-sender"]
+    bad_endpoint = "tcp://bad-info"
+    good_endpoint = "tcp://good-info"
+    registrar = _make_peer_registrar(local_ri)
+    receiver, messengers, messenger_factory = _make_receiver_for_view_validation(
+        monkeypatch,
+        registrar,
+        {bad_endpoint: bad_ri, good_endpoint: good_ri},
+        enforce_physical_ownership,
+    )
+    chunk = Chunk(
+        block_ids_per_layer_groups=[np.array([], dtype=np.int64)],
+        kind_per_layer_group=[CacheKind.PAGED],
+        token_range=TokenRange(start=0, end=0),
+        is_last=True,
+    )
+
+    try:
+        for rid in (1, 2):
+            params = SimpleNamespace(ctx_info_endpoint=bad_endpoint, ctx_dp_rank=0)
+            task = KVRecvTask(rid, chunk, slice_id=0, params=params, aux_slot=None)
+            task._enforce_physical_ownership = enforce_physical_ownership
+            if enforce_physical_ownership:
+                task.begin_publication()
+
+            receiver.dispatch_task(task)
+
+            assert task.status == TaskStatus.ERROR
+            assert task.is_done
+            assert isinstance(task._exception, PeerIncompatibleError)
+            assert diagnostic in str(task._exception)
+            if enforce_physical_ownership:
+                assert task.resources_drained
+
+        assert bad_endpoint in receiver._incompatible_peers
+        assert bad_endpoint not in receiver._sender_ep_instance_map
+        assert receiver._dealers == {}
+        assert messenger_factory.call_count == 2  # Receiver listener and one info lookup.
+        receiver._request_sender_data.assert_not_called()
+        messengers[bad_endpoint].send.assert_called_once_with([MessageType.REQUEST_INSTANCE_INFO])
+        messengers[bad_endpoint].receive.assert_called_once_with()
+        messengers[bad_endpoint].stop.assert_called_once_with()
+        with pytest.raises(KeyError):
+            registrar.get_peer_rank_info(bad_ri.instance_name, bad_ri.instance_rank)
+
+        # The same receiver can still register a different, compatible sender.
+        good_params = SimpleNamespace(ctx_info_endpoint=good_endpoint, ctx_dp_rank=0)
+        sender_info = receiver._get_sender_info(good_params)
+        assert sender_info.instance_name == good_ri.instance_name
+        assert registrar.get_pool_mapping(sender_info) == {(0, 0): (0, 0), (0, 1): (0, 1)}
+        messengers["tcp://good-sender"].send.assert_called_once_with(
+            [MessageType.REGISTER_RANK_INFO, local_ri.to_bytes()]
+        )
+        assert receiver._get_sender_info(good_params) is sender_info
+        assert messenger_factory.call_count == 4  # One more info lookup and one sender dealer.
+        messengers[good_endpoint].receive.assert_called_once_with()
+        with pytest.raises(KeyError):
+            registrar.get_peer_rank_info(good_ri.instance_name, good_ri.instance_rank)
+    finally:
+        receiver.shutdown()
+
+
+def test_view_validation_allows_nonoverlapping_pp_stage() -> None:
+    local_page_table = _make_per_view_page_table([2, 1], MapperKind.INDEXED)
+    local_page_table.layer_groups[0].local_layers = [LocalLayer(0, 2), LocalLayer(1, 3)]
+    local_ri = make_rankinfo(
+        tp_size=1,
+        pp_size=2,
+        pp_rank=1,
+        instance_rank=1,
+        page_table=local_page_table,
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        tp_size=1,
+        pp_size=2,
+        page_table=_make_per_view_page_table([2, 1], MapperKind.INDEXED),
+    )
+    registrar = _make_peer_registrar(local_ri)
+
+    registrar.validate_view_head_geometry(peer_ri)
+
+    assert registrar.get_pool_mapping(peer_ri) == {}
+    with pytest.raises(KeyError):
+        registrar.get_peer_rank_info(peer_ri.instance_name, peer_ri.instance_rank)
+
+
+@pytest.mark.parametrize(
+    ("local_replay", "peer_replay"),
+    [(False, False), (True, True), (False, True), (True, False)],
+)
+def test_peer_registrar_register_and_get(local_replay: bool, peer_replay: bool) -> None:
     self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.bounded_replay_on_generation = local_replay
     reg = _make_peer_registrar(self_rankinfo)
     peer_ri = make_rankinfo(
         instance_name="peer",
@@ -410,6 +791,17 @@ def test_peer_registrar_register_and_get():
         layer_num_per_pp=[2],
         page_table=make_page_table(),
     )
+    peer_ri.bounded_replay_on_generation = peer_replay
+    if local_replay != peer_replay:
+        with pytest.raises(
+            ValueError,
+            match=f"bounded_replay_on_generation.*local={local_replay}, peer={peer_replay}",
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        with pytest.raises(KeyError):
+            reg.get_peer_rank_info("peer", 1)
+        return
+
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     assert reg.get_peer_rank_info("peer", 1) == peer_ri
 
@@ -599,7 +991,7 @@ def test_peer_registrar_get_kv_map_head_mismatch():
         tokens_per_block=16,
         dims_per_head=8,
         layer_num_per_pp=[2],
-        page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
     )
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
     mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
@@ -734,6 +1126,8 @@ def test_nhd_head_mismatch_mapper_slices_each_token():
         dst_layer_offsets=[0],
         self_ri=self_ri,
         peer_ri=peer_ri,
+        self_kv_heads=self_ri.attention.kv_heads_per_rank,
+        peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
         self_bytes_per_layer=32,
         peer_bytes_per_layer=16,
         self_buffers_per_layer=2,
@@ -774,6 +1168,8 @@ def test_nhd_head_mismatch_mapper_uses_scale_pool_geometry():
         dst_layer_offsets=[0],
         self_ri=self_ri,
         peer_ri=peer_ri,
+        self_kv_heads=self_ri.attention.kv_heads_per_rank,
+        peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
         self_bytes_per_layer=8,
         peer_bytes_per_layer=4,
         self_buffers_per_layer=2,
@@ -850,6 +1246,70 @@ def test_replicated_pool_owner_rotates_by_destination_dp_rank(peer_dp_rank):
     # slot selected by the destination dp rank.
     assert sum(ownership) == 1
     assert ownership.index(True) == peer_dp_rank % 8
+
+
+@pytest.mark.parametrize(
+    "peer_block_bytes,expected_mapper",
+    [(1344, RingMapper), (1024, ReplicatedMapper)],
+    ids=["ring_sizes_differ", "ring_sizes_match"],
+)
+def test_ring_views_move_positions_only_when_ring_sizes_differ(peer_block_bytes, expected_mapper):
+    """A 16-slot ring feeding a 21-slot ring needs the position-wise mapper.
+
+    Equal rings keep every position in the same slot, so the region copy is
+    already exact and stays in use.
+    """
+    self_pt = make_page_table(global_layer_ids=[0], block_bytes=[1024])
+    peer_pt = make_page_table(global_layer_ids=[0], block_bytes=[peer_block_bytes])
+    for page_table in (self_pt, peer_pt):
+        view = page_table.layer_groups[0].pool_views[0]
+        view.pool_role = frozenset({"mla_hp_tail"})
+        view.mapper_kind = MapperKind.REPLICATED
+        view.ring_slot_bytes = 64
+
+    reg = _make_peer_registrar(
+        make_rankinfo(instance_name="local", kv_heads_per_rank=1, page_table=self_pt)
+    )
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=4,
+        tp_size=1,
+        kv_heads_per_rank=1,
+        layer_num_per_pp=[1],
+        page_table=peer_pt,
+    )
+    mapper = reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    assert type(mapper) is expected_mapper
+    if expected_mapper is RingMapper:
+        assert (mapper.src_num_slots, mapper.dst_num_slots) == (16, 21)
+        assert mapper.retained_positions == 16
+
+
+def test_ring_mapper_splits_positions_where_either_ring_wraps():
+    """Positions 30..45 of a 16-slot ring land in their slots of a 21-slot ring."""
+    mapper = RingMapper([0, 100], [0, 200], slot_bytes=2, src_num_slots=16, dst_num_slots=21)
+    pairs = mapper.map_positions(np.array([1000]), np.array([5000]), [(30, 46)])
+
+    moved = {}
+    for pair in pairs:
+        size = pair.src.memory.bytes_per_region
+        assert pair.dst.memory.bytes_per_region == size
+        for src, dst in zip(pair.src.memory.ptrs.tolist(), pair.dst.memory.ptrs.tolist()):
+            for i in range(size // 2):
+                moved[src + 2 * i] = dst + 2 * i
+    expected = {
+        1000 + layer_src + (p % 16) * 2: 5000 + layer_dst + (p % 21) * 2
+        for layer_src, layer_dst in ((0, 0), (100, 200))
+        for p in range(30, 46)
+    }
+    assert moved == expected
+    # Runs break at src slot 16 (p=32) and dst slot 21 (p=42): 2 + 10 + 4.
+    assert sorted(pair.src.memory.bytes_per_region // 2 for pair in pairs) == [2, 4, 10]
+
+    with pytest.raises(ValueError, match="positions both rings retain"):
+        mapper.map_positions(np.array([1000]), np.array([5000]), [(29, 46)])
+    with pytest.raises(NotImplementedError):
+        mapper.map(None, None)
 
 
 def test_peer_registrar_tpb_divisible_warns_but_compatible():
@@ -985,6 +1445,8 @@ def test_nhd_mapper_rejects_non_divisible_region_geometry():
             dst_layer_offsets=[0],
             self_ri=self_ri,
             peer_ri=peer_ri,
+            self_kv_heads=self_ri.attention.kv_heads_per_rank,
+            peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
             self_bytes_per_layer=17,
             peer_bytes_per_layer=32,
             self_buffers_per_layer=2,
@@ -1002,6 +1464,8 @@ def test_nhd_mapper_rejects_tokens_per_block_mismatch():
             dst_layer_offsets=[0],
             self_ri=self_ri,
             peer_ri=peer_ri,
+            self_kv_heads=self_ri.attention.kv_heads_per_rank,
+            peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
             self_bytes_per_layer=32,
             peer_bytes_per_layer=64,
             self_buffers_per_layer=2,
@@ -1045,10 +1509,8 @@ def test_non_uniform_view_geometry_rejected_for_all_kinds():
     self_ri = make_rankinfo(page_table=self_pt)
     peer_ri = make_rankinfo(instance_name="peer", page_table=peer_pt)
     reg = _make_peer_registrar(self_ri)
-    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
-
-    with pytest.raises(ValueError, match="not uniform"):
-        reg.get_kv_map(peer_ri, (0, 0), (0, 0))
+    with pytest.raises(ValueError, match="not evenly distributed"):
+        reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
 
 
 def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
@@ -1067,7 +1529,7 @@ def test_peer_registrar_allows_byte_aligned_subbyte_head_mismatch():
         element_bytes=0.5,
         kv_heads_per_rank=4,
         tp_size=1,
-        page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
     )
     reg = _make_peer_registrar(self_ri)
     reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
@@ -1097,7 +1559,7 @@ def test_peer_registrar_rejects_misaligned_subbyte_head_mismatch():
         tokens_per_block=1,
         dims_per_head=1,
         tp_size=1,
-        page_table=make_page_table(block_bytes=[2048], mamba_tp=1),
+        page_table=make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4),
     )
     reg = _make_peer_registrar(self_ri)
 
@@ -1107,7 +1569,7 @@ def test_peer_registrar_rejects_misaligned_subbyte_head_mismatch():
 
 def test_peer_registrar_dispatches_nhd_mapper():
     self_pt = make_page_table()
-    peer_pt = make_page_table(block_bytes=[2048], mamba_tp=1)
+    peer_pt = make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4)
     self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     self_ri = make_rankinfo(
@@ -1131,7 +1593,7 @@ def test_peer_registrar_dispatches_nhd_mapper():
 
 def test_peer_registrar_warns_for_nhd_head_mismatch(monkeypatch):
     self_pt = make_page_table()
-    peer_pt = make_page_table(block_bytes=[2048], mamba_tp=1)
+    peer_pt = make_page_table(block_bytes=[2048], mamba_tp=1, kv_heads=4)
     self_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     peer_pt.layer_groups[0].pool_views[0].mapper_kind = MapperKind.NHD
     self_ri = make_rankinfo(kv_heads_per_rank=2, tp_size=2, page_table=self_pt)
@@ -1223,6 +1685,8 @@ def test_indexed_head_mismatch_subbyte_geometry_is_entries_derived():
         dst_layer_offsets=[0, 128],  # 2 layers x 128B/layer (kv_factor 2 x 64B)
         self_ri=self_ri,
         peer_ri=peer_ri,
+        self_kv_heads=self_ri.attention.kv_heads_per_rank,
+        peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
         self_bytes_per_layer=256,
         peer_bytes_per_layer=128,
         self_buffers_per_layer=2,
@@ -1251,8 +1715,137 @@ def test_indexed_head_mismatch_inconsistent_slot_geometry_raises():
             dst_layer_offsets=[0, 256],
             self_ri=self_ri,
             peer_ri=peer_ri,
+            self_kv_heads=self_ri.attention.kv_heads_per_rank,
+            peer_kv_heads=peer_ri.attention.kv_heads_per_rank,
             self_bytes_per_layer=256,
             peer_bytes_per_layer=256,  # should be 128 for half the heads
             self_buffers_per_layer=2,
             peer_buffers_per_layer=2,
         )
+
+
+# ---------------------------------------------------------------------------
+# Policy dispatch: the policy is chosen by CacheKind; each policy picks the
+# mapper for a view from its MapperKind, including REPLICATED.
+# ---------------------------------------------------------------------------
+
+
+def _add_replicated_side_view(page_table, *, bytes_per_layer=8):
+    """Graft a replicated recurrent side view (e.g. PLE) onto the mamba group."""
+    mamba_lg = page_table.layer_groups[1]
+    pool_group = page_table.pool_groups[mamba_lg.pool_group_idx]
+    pool_group.pools.append(
+        PhysicalPool(base_address=0xC000, slot_bytes=bytes_per_layer, num_slots=128)
+    )
+    mamba_lg.pool_views.append(
+        PoolView(
+            pool_idx=len(pool_group.pools) - 1,
+            buffer_entries=np.array(
+                [(0, 0, bytes_per_layer), (1, bytes_per_layer, bytes_per_layer)],
+                dtype=BUFFER_ENTRY_DTYPE,
+            ),
+            pool_role=frozenset({"ple_ngram_context"}),
+            mapper_kind=MapperKind.REPLICATED,
+            bytes_per_layer=bytes_per_layer,
+        )
+    )
+    return len(mamba_lg.pool_views) - 1
+
+
+def test_policy_dispatch_keys_on_cache_kind_only():
+    reg = _make_peer_registrar(make_rankinfo(instance_name="local"))
+    assert isinstance(reg._get_policy(CacheKind.PAGED), AttentionPolicy)
+    assert isinstance(reg._get_policy(CacheKind.STATE), MambaPolicy)
+
+
+def test_mamba_replicated_side_view_elects_one_sender():
+    """Replicated side state elects one sender per fan-in group.
+
+    Sharded conv state on the same layer group is sent by every mamba TP rank.
+    """
+    peer_pt = make_page_table(mamba_tp=1)
+    _add_replicated_side_view(peer_pt)
+    peer_ri = make_rankinfo(instance_name="peer", tp_size=1, page_table=peer_pt)
+    overlap = PeerOverlap()
+
+    conv_ownership = []
+    side_ownership = []
+    for tp_rank in range(2):
+        self_pt = make_page_table(mamba_tp=2)
+        side_idx = _add_replicated_side_view(self_pt)
+        self_ri = make_rankinfo(
+            instance_name="local", tp_size=2, tp_rank=tp_rank, page_table=self_pt
+        )
+        reg = _make_peer_registrar(self_ri)
+        conv_ownership.append(reg.should_send_pool(overlap, peer_ri, 1, 0))
+        side_ownership.append(reg.should_send_pool(overlap, peer_ri, 1, side_idx))
+
+    assert conv_ownership == [True, True]
+    assert side_ownership == [True, False]
+
+
+def test_mamba_replicated_side_view_copies_whole_layers_under_tp_mismatch():
+    """REPLICATED state ignores mamba TP.
+
+    The head-match mapper is used even when conv/SSM on the same group need a
+    resharding mapper.
+    """
+    self_pt = make_page_table(mamba_tp=2)
+    self_side = _add_replicated_side_view(self_pt)
+    peer_pt = make_page_table(mamba_tp=1)
+    peer_side = _add_replicated_side_view(peer_pt)
+    self_ri = make_rankinfo(instance_name="local", tp_size=2, page_table=self_pt)
+    peer_ri = make_rankinfo(instance_name="peer", tp_size=1, page_table=peer_pt)
+    reg = _make_peer_registrar(self_ri)
+
+    mapper = reg.get_kv_map(peer_ri, (1, self_side), (1, peer_side))
+    assert isinstance(mapper, MambaHeadMatchMapper)
+    conv_mapper = reg.get_kv_map(peer_ri, (1, 0), (1, 0))
+    assert isinstance(conv_mapper, ConvStateMismatchMapper)
+
+
+def test_attention_replicated_validation_ignores_state_groups():
+    """A STATE-only replicated-role mismatch is MambaPolicy's to reject."""
+    self_pt = make_page_table()
+    _add_replicated_side_view(self_pt)
+    peer_pt = make_page_table()
+    AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
+    ri = make_rankinfo(instance_name="local", page_table=self_pt)
+    with pytest.raises(ValueError, match="MambaPolicy.*differ on overlapping layers"):
+        MambaPolicy.validate_peer_compatible(ri, ri, self_pt, peer_pt)
+
+
+def test_attention_replicated_validation_rejects_missing_index_key_view():
+    self_pt = make_page_table(global_layer_ids=[0])
+    view = self_pt.layer_groups[0].pool_views[0]
+    view.pool_role = frozenset({"index_key"})
+    view.mapper_kind = MapperKind.REPLICATED
+    peer_pt = make_page_table(global_layer_ids=[0])
+    with pytest.raises(ValueError, match="AttentionPolicy.*differ on overlapping layers"):
+        AttentionPolicy.validate_peer_compatible(self_pt, peer_pt)
+
+
+@pytest.mark.parametrize(("local_draft", "peer_draft"), [(0, 0), (1, 1), (1, 0), (0, 1)])
+def test_peer_registrar_requires_matching_unified_draft_layers(
+    local_draft: int, peer_draft: int
+) -> None:
+    self_rankinfo = make_rankinfo(instance_name="local")
+    self_rankinfo.num_draft_layers = local_draft
+    reg = _make_peer_registrar(self_rankinfo)
+    peer_ri = make_rankinfo(
+        instance_name="peer",
+        instance_rank=1,
+        layer_num_per_pp=[2],
+        page_table=make_page_table(),
+    )
+    peer_ri.num_draft_layers = peer_draft
+    if local_draft != peer_draft:
+        with pytest.raises(
+            ValueError,
+            match=f"draft KV layer count differs.*local={local_draft}, peer={peer_draft}",
+        ):
+            reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+        return
+
+    reg.register(peer_ri.instance_name, peer_ri.instance_rank, peer_ri)
+    assert reg.get_peer_rank_info("peer", 1) == peer_ri

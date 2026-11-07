@@ -15,7 +15,7 @@
 
 import torch
 
-from .._utils import get_sm_version
+from .._utils import get_sm_version, is_sm_100f
 
 
 def preprocess_weights_for_mixed_gemm(
@@ -32,7 +32,7 @@ def preprocess_weights_for_mixed_gemm(
         sm_ = 80
     if len(tensor.shape) == 2:
         tensor = tensor.unsqueeze(0)
-    if sm_ == 100 or sm_ == 103:
+    if is_sm_100f(sm_):
         do_weight_interleave = False
 
     permutation_map = {

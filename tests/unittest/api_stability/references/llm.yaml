@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 methods:
   __init__:
     parameters:
@@ -14,6 +17,10 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_locality_domains:
+        annotation: bool
+        default: False
+        status: prototype
       cp_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
@@ -32,6 +39,10 @@ methods:
         default: null
         status: prototype
       return_perf_metrics:
+        annotation: bool
+        default: False
+        status: prototype
+      per_request_spec_decode_stats:
         annotation: bool
         default: False
         status: prototype
@@ -68,6 +79,14 @@ methods:
         annotation: int
         default: 1
         status: prototype
+      serve_frontend_affinity_port_stride:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      serve_graceful_shutdown_timeout_s:
+        annotation: Optional[int]
+        default: null
+        status: prototype
       custom_tokenizer:
         annotation: Optional[str]
         default: null
@@ -95,6 +114,10 @@ methods:
         annotation: Literal["pytorch"]
         default: pytorch
         status: deprecated
+      modeling_v2:
+        annotation: Literal['off', 'auto', 'require']
+        default: 'off'
+        status: prototype
       cuda_graph_config:
         annotation: Union[tensorrt_llm.llmapi.llm_args.DecodeCudaGraphConfig, tensorrt_llm.llmapi.llm_args.EncodeCudaGraphConfig, NoneType]
         default: null
@@ -124,8 +147,12 @@ methods:
         default: null
         status: prototype
       checkpoint_format:
-        annotation: Optional[str]
+        annotation: Union[tensorrt_llm.checkpoint_format.CheckpointFormat, str, NoneType]
         default: null
+        status: prototype
+      checkpoint_io_policy:
+        annotation: tensorrt_llm.llmapi.llm_args.CheckpointIOPolicy
+        default: auto
         status: prototype
       mx_config:
         annotation: tensorrt_llm.llmapi.llm_args.ModelExpressConfig
@@ -159,6 +186,14 @@ methods:
         annotation: bool
         default: False
         status: beta
+      enable_return_routed_experts:
+        annotation: bool
+        default: False
+        status: beta
+      lm_head_output_dtype:
+        annotation: Literal['auto', 'float32']
+        default: auto
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
         status: beta
@@ -171,7 +206,19 @@ methods:
         annotation: str
         default: TRTLLM
         status: beta
+      enable_mla_skip_correction:
+        annotation: bool
+        default: False
+        status: prototype
+      mla_skip_correction_threshold:
+        annotation: float
+        default: 8.0
+        status: prototype
       sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_in_graph_sampling:
         annotation: bool
         default: False
         status: prototype
@@ -191,9 +238,17 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      enable_tokenization_cache:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_req_stats:
         annotation: bool
         default: False
+        status: prototype
+      iter_perf_stats_interval:
+        annotation: int
+        default: 1
         status: prototype
       batch_wait_timeout_ms:
         annotation: float
@@ -223,6 +278,10 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      bounded_replay_on_generation:
+        annotation: bool
+        default: False
+        status: prototype
       torch_compile_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
         default: null
@@ -238,6 +297,10 @@ methods:
       enable_autotuner:
         annotation: bool
         default: True
+        status: prototype
+      use_fine_grained_sync:
+        annotation: bool
+        default: False
         status: prototype
       enable_layerwise_nvtx_marker:
         annotation: bool
@@ -255,6 +318,14 @@ methods:
         annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL', 'NCCL_SYMMETRIC']]
         default: AUTO
         status: beta
+      mnnvl_allreduce_fp8_payload:
+        annotation: bool
+        default: False
+        status: prototype
+      replicate_embedding:
+        annotation: bool
+        default: False
+        status: prototype
       decoding_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
         default: null
@@ -272,11 +343,11 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.QSASparseAttentionConfig, tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekV4SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.CSA2SparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, tensorrt_llm.llmapi.llm_args.MiniMaxM3SparseAttentionConfig, NoneType]
         default: null
         status: prototype
       kv_cache_compression_config:
-        annotation: Union[tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.ColdPageQuantizationCompressionConfig, tensorrt_llm.llmapi.llm_args.TriAttentionKvCacheCompressionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:
@@ -346,6 +417,10 @@ methods:
     return_annotation: None
   generate:
     parameters:
+      kv_hints:
+        annotation: Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], List[Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], NoneType]], NoneType]
+        default: null
+        status: prototype
       disaggregated_params:
         annotation: Union[tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], NoneType]
         default: null
@@ -368,6 +443,10 @@ methods:
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
+      kv_hints:
+        annotation: Union[tensorrt_llm.kv_hints.protocol.KvHintsEnvelope, dict[str, JsonValue], NoneType]
+        default: null
+        status: prototype
       disaggregated_params:
         annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
         default: null
@@ -465,10 +544,48 @@ methods:
     parameters: {}
     return_annotation: bytes
     status: prototype
+  get_memory_status:
+    parameters: {}
+    return_annotation: tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus
+    status: prototype
+  release:
+    parameters:
+      tags:
+        annotation: Optional[Sequence[tensorrt_llm.llmapi.llm_args.ExecutorMemoryType | str]]
+        default: null
+    return_annotation: None
+    status: prototype
+  resume:
+    parameters:
+      tags:
+        annotation: Optional[Sequence[tensorrt_llm.llmapi.llm_args.ExecutorMemoryType | str]]
+        default: null
+    return_annotation: None
+    status: prototype
   shutdown:
     parameters: {}
     return_annotation: None
     status: beta
+  start_profile:
+    parameters:
+      output_dir:
+        annotation: Optional[str]
+        default: null
+      num_steps:
+        annotation: Optional[int]
+        default: null
+      start_step:
+        annotation: int
+        default: 0
+      activities:
+        annotation: Optional[List[str]]
+        default: null
+    return_annotation: None
+    status: prototype
+  stop_profile:
+    parameters: {}
+    return_annotation: None
+    status: prototype
 properties:
   llm_id:
     annotation: str

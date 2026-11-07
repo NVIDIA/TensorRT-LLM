@@ -23,7 +23,7 @@ LLM server <-> ScaffoldingLlm <-> Coder / SWEBenchCoder
 Three services are involved:
 
 - Apiary daemon: manages sandbox sessions, image registry (populated at runtime via HTTP), and command execution
-- `coder_mcp.py`: exposes the Coder tool surface over MCP SSE
+- `coder_mcp.py`: exposes the Coder tool surface over MCP Streamable HTTP
 - LLM server: OpenAI-compatible endpoint used by Scaffolding
 
 ## Tooling Model
@@ -41,7 +41,7 @@ The Coder agent expects these MCP tools:
 
 File edits go through `shell` (e.g. `sed -i`, `cat <<'EOF' > path` heredocs, `tee`).
 
-`ApiaryMCPWorker` opens one SSE connection per Scaffolding execution scope, so parallel branches naturally get isolated sandboxes.
+`ApiaryMCPWorker` opens one MCP session per Scaffolding execution scope, so parallel branches naturally get isolated sandboxes.
 
 ## Prerequisites
 
@@ -117,12 +117,12 @@ Key flags:
 
 - `--apiary-url` — Apiary daemon URL
 - `--apiary-token` — bearer token for daemon auth
-- `--mcp-token` — bearer token required on the SSE endpoint
-- `--default-image` — fallback Docker image for sandbox sessions when an SSE client omits the `image` query parameter (must already be registered with the daemon)
+- `--mcp-token` — bearer token required on the MCP endpoint
+- `--default-image` — fallback Docker image for sandbox sessions when an MCP client omits the `image` query parameter (must already be registered with the daemon)
 - `--working-dir` — default sandbox working directory
 - `--idle-timeout` — idle session reap timeout in seconds
 
-Per-request image selection works through the SSE `image` query parameter. `ApiaryMCPWorker.set_scope_params(..., image=...)` is how the Scaffolding runners select the correct sandbox image for each request. The image is expected to be registered with the daemon already; the runners listed below do that for you.
+Per-request image selection works through the MCP `image` query parameter. `ApiaryMCPWorker.set_scope_params(..., image=...)` is how the Scaffolding runners select the correct sandbox image for each request. The image is expected to be registered with the daemon already; the runners listed below do that for you.
 
 ## Run a Single Coder Task
 
@@ -131,7 +131,7 @@ python examples/scaffolding/contrib/Coder/run_coder.py \
     --base_url http://localhost:8000/v1 \
     --model Qwen3/Qwen3-30B-A3B \
     --apiary_url http://172.17.0.1:8080 \
-    --mcp_url http://127.0.0.1:8083/sse \
+    --mcp_url http://127.0.0.1:8083/mcp \
     --image ubuntu:22.04 \
     --prompt "Implement a thread-safe LRU cache in Python" \
     --max_iterations 50 \
@@ -144,8 +144,8 @@ Important flags:
 
 - `--image`: Docker image used for the request's sandbox (auto-registered)
 - `--apiary_url` / `--apiary_token`: How to reach the Apiary daemon for image registration (defaults to `$APIARY_URL` / `$APIARY_API_TOKEN`)
-- `--mcp_url`: `coder_mcp.py` SSE endpoint
-- `--max_mcp_connections`: Max concurrent SSE / sandbox connections
+- `--mcp_url`: `coder_mcp.py` Streamable HTTP endpoint
+- `--max_mcp_connections`: Max concurrent MCP / sandbox sessions
 
 ## Run SWE-bench
 
@@ -158,7 +158,7 @@ python examples/scaffolding/contrib/Coder/run_swebench.py \
     --apiary_url http://172.17.0.1:8080 \
     --base_url http://localhost:8000/v1 \
     --model Qwen3/Qwen3-30B-A3B \
-    --mcp_url http://0.0.0.0:8083/sse \
+    --mcp_url http://127.0.0.1:8083/mcp \
     --max_parallel_requests 16
 ```
 
@@ -199,7 +199,7 @@ python -m examples.scaffolding.benchmarks \
     --coder_concurrency 16 \
     --coder_prompt_num 8 \
     --coder_max_iterations 50 \
-    --mcp_url http://0.0.0.0:8083/sse
+    --mcp_url http://127.0.0.1:8083/mcp
 ```
 
 Coder-specific flags:
@@ -237,7 +237,7 @@ async def main() -> None:
         base_url="http://localhost:8000/v1",
     )
     generation_worker = TRTOpenaiWorker(client, "Qwen3/Qwen3-30B-A3B")
-    mcp_worker = ApiaryMCPWorker("http://0.0.0.0:8083/sse")
+    mcp_worker = ApiaryMCPWorker("http://127.0.0.1:8083/mcp")
 
     llm = create_coder_scaffolding_llm(
         generation_worker,

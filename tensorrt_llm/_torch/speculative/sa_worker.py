@@ -30,7 +30,7 @@ import torch
 
 from tensorrt_llm._utils import prefer_pinned
 
-from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
+from ..pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManager
 from .interface import SpecMetadata, SpecWorkerBase
 from .suffix_automaton import SuffixAutomatonManager
 
@@ -196,6 +196,8 @@ class SAWorker(SpecWorkerBase):
         next_draft_tokens = self._generate_draft_tokens(
             accepted_tokens, num_accepted_tokens, spec_metadata, batch_size, num_contexts
         )
+
+        self._rollback_guided_decoder_after_verify(num_accepted_tokens)
 
         # Step 5: Prepare next_new_tokens for overlap scheduler
         next_new_tokens = self._prepare_next_new_tokens(

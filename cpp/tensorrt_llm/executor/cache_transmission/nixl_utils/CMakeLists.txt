@@ -13,6 +13,8 @@
 # License for the specific language governing permissions and limitations under
 # the License.
 
+add_subdirectory(bounce)
+
 # ============================================================================
 # NIXL Wrapper Library
 # ============================================================================
@@ -37,10 +39,41 @@ if(NIXL_ROOT)
                              PRIVATE ${PROJECT_SOURCE_DIR}/include)
 
   # Link against all NIXL libraries
-  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE NIXL::nixl)
+  target_link_libraries(
+    ${NIXL_WRAPPER_TARGET}
+    PRIVATE NIXL::nixl tllm::common_environment tllm::executor_transfer_agent
+            tllm::kv_cache_legacy tllm::runtime_distributed)
 
   # Link against CUDA runtime (for cudaMemcpy in posix fallback)
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+
+  # ------------------------------------------------------------------------
+  # Bounce v2 transport. Its real dependencies are NIXL (data plane, gated by
+  # the NIXL_ROOT block above) + zmq (control plane) — NOT UCX. So compile it
+  # whenever zmq is available, INDEPENDENT of ENABLE_UCX. cppzmq (header-only)
+  # is fetched at the top level when NIXL or UCX is on. Activates the
+  # TLLM_BOUNCE_V2 code paths; runtime use is still opt-in via
+  # CacheTransceiverConfig (kv_cache_bounce_size_mb > 0, Python (v2) transceiver
+  # only).
+  # ------------------------------------------------------------------------
+  if(TARGET tllm_executor_bounce_control)
+    target_sources(${NIXL_WRAPPER_TARGET} PRIVATE bounce/BounceTransport.cpp)
+    target_link_libraries(
+      ${NIXL_WRAPPER_TARGET}
+      PRIVATE
+        $<LINK_LIBRARY:WHOLE_ARCHIVE,tllm_executor_bounce_core,tllm_executor_bounce_cuda,tllm_executor_bounce_arena,tllm_executor_bounce_control>
+        ${NIXL_BUILD_LIBRARY})
+    target_compile_definitions(${NIXL_WRAPPER_TARGET} PRIVATE TLLM_BOUNCE_V2=1)
+    # The .cu device symbols must resolve into this shared lib.
+    set_target_properties(${NIXL_WRAPPER_TARGET}
+                          PROPERTIES CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+    message(STATUS "NIXL bounce v2: enabled (libzmq and cppzmq found)")
+  else()
+    message(
+      STATUS
+        "NIXL bounce v2: disabled - libzmq or cppzmq unavailable; kv_cache_bounce_size_mb > 0 will fail at startup with this build"
+    )
+  endif()
 
   set(NIXL_ENABLED TRUE)
 else()

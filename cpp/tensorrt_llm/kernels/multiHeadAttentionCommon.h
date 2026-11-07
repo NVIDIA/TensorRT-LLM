@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -111,6 +111,8 @@ static inline size_t get_size_in_bytes(size_t n, Data_type dtype)
     case DATA_TYPE_E2M1: TLLM_CHECK_WITH_INFO(n % 2 == 0, "Not supported."); return n / 2;
     case DATA_TYPE_E4M3: return n;
     case DATA_TYPE_E5M2: return n;
+    // SageAttention is int8 Q/K with an e4m3 PV; both halves are one byte.
+    case DATA_TYPE_KV_INT8_E4M3: return n;
     default: TLLM_CHECK_WITH_INFO(false, "FMHA Data Type is not supported."); return 0;
     }
 }
@@ -134,6 +136,7 @@ constexpr int32_t kSM_90 = 90;
 constexpr int32_t kSM_100 = 100;
 constexpr int32_t kSM_100f = 10100;
 constexpr int32_t kSM_103 = 103;
+constexpr int32_t kSM_107 = 107;
 constexpr int32_t kSM_120 = 120;
 constexpr int32_t kSM_121 = 121;
 
