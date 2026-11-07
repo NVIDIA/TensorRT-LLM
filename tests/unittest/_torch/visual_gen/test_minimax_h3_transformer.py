@@ -127,6 +127,20 @@ _NVFP4_SHAPES: dict[str, object] = {
 }
 
 
+# The static NVFP4 / FP8 GEMMs on Blackwell need K >= 64 and N a multiple of 32, so a
+# forward through pre-quantized Linears widens every dimension that feeds one
+# (text_dim, time_embed_dim, hidden_size, ffn_dim and the attention inner dim).
+_STATIC_QUANT_SHAPES: dict[str, object] = _NVFP4_SHAPES | {
+    "attention_head_dim": 32,
+    "hidden_size": 64,
+    "ffn_dim": 64,
+    "text_dim": 64,
+    "time_embed_hidden_dim": 64,
+    "time_embed_dim": 64,
+    "rope_freq_dim": 4,
+}
+
+
 def _make_dynamic_nvfp4_model_config(**overrides: object) -> DiffusionModelConfig:
     return _make_model_config(
         quant_config=QuantConfig(quant_algo=QuantAlgo.NVFP4),
@@ -219,10 +233,9 @@ def test_adaln_modulation_keeps_dynamic_fp8_input_high_precision() -> None:
 @pytest.mark.parametrize(
     ("quant_algo", "dynamic_weight_quant"),
     [
-        (QuantAlgo.FP8, False),
         (QuantAlgo.FP8_BLOCK_SCALES, False),
-        (QuantAlgo.NVFP4, False),
         (QuantAlgo.W4A8_AWQ, True),
+        (QuantAlgo.W4A8_AWQ, False),
     ],
 )
 def test_transformer_rejects_unvalidated_quantization_modes(
@@ -263,6 +276,55 @@ def test_transformer_accepts_dynamic_nvfp4_configuration() -> None:
 
     assert model.model_config.quant_config.quant_algo == QuantAlgo.NVFP4
     assert model.model_config.dynamic_weight_quant
+
+
+_H3_MEDIA_PROJECTIONS = ("proj_in", "audio_proj_in", "proj_out", "audio_proj_out")
+
+
+def _make_prequantized_nvfp4_model_config(
+    quant_config: QuantConfig | None = None, **overrides: object
+) -> DiffusionModelConfig:
+    """A ModelOpt NVFP4 export: static weights and activation scales, media projections excluded."""
+    return _make_model_config(
+        quant_config=quant_config
+        or QuantConfig(quant_algo=QuantAlgo.NVFP4, exclude_modules=list(_H3_MEDIA_PROJECTIONS)),
+        dynamic_weight_quant=False,
+        force_dynamic_quantization=False,
+        **(_NVFP4_SHAPES | overrides),
+    )
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_transformer_accepts_prequantized_checkpoint_config(quant_algo: QuantAlgo) -> None:
+    """ModelOpt NVFP4 and per-tensor FP8 exports: static weights and activation scales."""
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_prequantized_nvfp4_model_config(
+            quant_config=QuantConfig(
+                quant_algo=quant_algo, exclude_modules=list(_H3_MEDIA_PROJECTIONS)
+            )
+        )
+    )
+
+    assert model.transformer_blocks is not None
+    for name in _H3_MEDIA_PROJECTIONS:
+        assert not getattr(model, name).has_any_quant
+
+
+def test_media_projection_input_dtype_follows_each_projection() -> None:
+    """Excluded projections keep FP32 inputs; quantized ones get the model dtype."""
+    hidden_states = torch.zeros(1, 2, 16, dtype=torch.float32)
+
+    static_model = h3.MiniMaxH3Transformer3DModel(_make_prequantized_nvfp4_model_config())
+    for name in _H3_MEDIA_PROJECTIONS:
+        projection = getattr(static_model, name)
+        assert static_model._projection_input(projection, hidden_states).dtype == torch.float32
+
+    dynamic_model = h3.MiniMaxH3Transformer3DModel(_make_dynamic_nvfp4_model_config())
+    for name in _H3_MEDIA_PROJECTIONS:
+        projection = getattr(dynamic_model, name)
+        cast = dynamic_model._projection_input(projection, hidden_states)
+        assert cast.dtype == dynamic_model._model_dtype
+        assert cast.dtype != torch.float32
 
 
 def test_post_load_quantizes_nvfp4_projections_like_fp8() -> None:
@@ -306,6 +368,7 @@ def test_transformer_keeps_dynamic_fp8_linear_inputs_high_precision() -> None:
             self.dtype = output_dtype
             self.out_features = out_features
             self.output_dtype = output_dtype
+            self.has_any_quant = True
             self.input_dtypes: list[torch.dtype] = []
 
         def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -1079,6 +1142,59 @@ def test_diffusers_swiglu_weight_is_reordered_from_up_gate_to_gate_up() -> None:
     torch.testing.assert_close(remapped["transformer_blocks.0.ff.down_proj.weight"], down)
 
 
+def test_prequantized_swiglu_splits_rows_and_shares_input_side_tensors() -> None:
+    """ModelOpt NVFP4 exports carry one scale set for the fused ``[up, gate]``."""
+    n, k = 4, 32
+    up_rows = torch.arange(n * k // 2, dtype=torch.uint8).reshape(n, k // 2)
+    gate_rows = up_rows + 100
+    weight = torch.cat((up_rows, gate_rows))
+    weight_scale = torch.arange(2 * n * (k // 16), dtype=torch.float32).reshape(2 * n, k // 16)
+    weight_scale_2 = torch.tensor(0.5)
+    input_scale = torch.tensor(2.0)
+    pre_quant_scale = torch.arange(k, dtype=torch.float32)
+    prefix = "transformer_blocks.0.ff.net.0.proj."
+    remapped = h3.MiniMaxH3Transformer3DModel._remap_feed_forward_weights(
+        {
+            prefix + "weight": weight,
+            prefix + "weight_scale": weight_scale,
+            prefix + "weight_scale_2": weight_scale_2,
+            prefix + "input_scale": input_scale,
+            prefix + "pre_quant_scale": pre_quant_scale,
+        }
+    )
+
+    for half, rows in (("up", slice(0, n)), ("gate", slice(n, 2 * n))):
+        base = f"transformer_blocks.0.ff.{half}."
+        torch.testing.assert_close(remapped[base + "weight"], weight[rows])
+        torch.testing.assert_close(remapped[base + "weight_scale"], weight_scale[rows])
+        # Per-tensor and input-side tensors are shared, not halved.
+        assert remapped[base + "weight_scale_2"] is weight_scale_2
+        assert remapped[base + "input_scale"] is input_scale
+        assert remapped[base + "pre_quant_scale"] is pre_quant_scale
+
+
+def test_prequantized_fp8_swiglu_shares_scalar_weight_scale() -> None:
+    """Per-tensor FP8 exports store ``weight_scale`` as a scalar: shared, not split."""
+    n, k = 4, 32
+    weight = torch.zeros(2 * n, k, dtype=torch.float8_e4m3fn)
+    weight_scale = torch.tensor(0.03)
+    input_scale = torch.tensor(2.0)
+    prefix = "transformer_blocks.0.ff.net.0.proj."
+    remapped = h3.MiniMaxH3Transformer3DModel._remap_feed_forward_weights(
+        {
+            prefix + "weight": weight,
+            prefix + "weight_scale": weight_scale,
+            prefix + "input_scale": input_scale,
+        }
+    )
+
+    for half in ("up", "gate"):
+        base = f"transformer_blocks.0.ff.{half}."
+        assert remapped[base + "weight"].shape == (n, k)
+        assert remapped[base + "weight_scale"] is weight_scale
+        assert remapped[base + "input_scale"] is input_scale
+
+
 def test_weight_loader_reports_missing_linear_biases(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1692,3 +1808,168 @@ def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
     # Every parameter, including the re-ordered gate_up_proj and the renamed down_proj.
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(parameter, expected[name].to(parameter.dtype), rtol=0, atol=0)
+
+
+def _export_style_checkpoint(
+    reference_state: dict[str, torch.Tensor],
+    static_model: h3.MiniMaxH3Transformer3DModel,
+    quant_algo: QuantAlgo,
+) -> dict[str, torch.Tensor]:
+    """Build a ModelOpt-style checkpoint for ``static_model`` in the Diffusers layout.
+
+    Non-quantized tensors come from a BF16 model of the same shape. Every quantized Linear
+    gets packed weights and scales in the export's layout: NVFP4 stores ``uint8`` weights
+    ``[N, K/2]``, ``float8_e4m3fn`` block scales ``[N, K/16]``, a per-tensor
+    ``weight_scale_2`` and ``input_scale``; per-tensor FP8 stores ``float8_e4m3fn`` weights
+    ``[N, K]`` with a scalar ``weight_scale`` and ``input_scale``. Scales follow the export's
+    recipe: ``amax / 448`` for FP8 and ``amax / (448 * 6)`` for NVFP4's per-tensor scales,
+    with the activation amax taken as 4.
+    """
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    generator = torch.Generator().manual_seed(0)
+    e4m3_max = torch.finfo(torch.float8_e4m3fn).max
+    activation_amax = 4.0
+    if quant_algo == QuantAlgo.NVFP4:
+        input_scale = torch.tensor(activation_amax / (6.0 * e4m3_max))
+    else:
+        input_scale = torch.tensor(activation_amax / e4m3_max)
+
+    def to_diffusers(name: str) -> str:
+        return name.replace(".ff.gate_up_proj", ".ff.net.0.proj").replace(
+            ".ff.down_proj", ".ff.net.2"
+        )
+
+    checkpoint = {to_diffusers(k): v.clone() for k, v in reference_state.items()}
+    for name, module in static_model.named_modules():
+        if not isinstance(module, Linear) or not module.has_any_quant:
+            continue
+        out_features, in_features = module.out_features, module.in_features
+        if name.endswith(".qkv_proj"):
+            targets = [
+                (name[: -len("qkv_proj")] + sub, out_features // 3)
+                for sub in ("to_q", "to_k", "to_v")
+            ]
+        else:
+            targets = [(to_diffusers(name), out_features)]
+        # One high-precision weight per module, so the per-tensor scales agree across the
+        # q / k / v shards that the loader fuses (it requires equal ``input_scale`` and
+        # ``weight_scale_2``).
+        weight = torch.randn(out_features, in_features, generator=generator) * 0.05
+        if quant_algo == QuantAlgo.NVFP4:
+            # Block scales are e4m3 values of amax(block) / 6 over the global scale.
+            blocks = weight.reshape(out_features, in_features // 16, 16).abs().amax(dim=-1)
+            weight_scale_2 = blocks.max() / (6.0 * e4m3_max)
+            block_scales = (blocks / (6.0 * weight_scale_2)).to(torch.float8_e4m3fn)
+            packed = torch.randint(
+                0, 256, (out_features, in_features // 2), dtype=torch.uint8, generator=generator
+            )
+        else:
+            weight_scale = weight.abs().max() / e4m3_max
+            fp8_weight = (weight / weight_scale).to(torch.float8_e4m3fn)
+        row = 0
+        for target, n in targets:
+            for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale"):
+                checkpoint.pop(f"{target}.{suffix}", None)
+            rows = slice(row, row + n)
+            row += n
+            if quant_algo == QuantAlgo.NVFP4:
+                checkpoint[f"{target}.weight"] = packed[rows].clone()
+                checkpoint[f"{target}.weight_scale"] = block_scales[rows].clone()
+                checkpoint[f"{target}.weight_scale_2"] = weight_scale_2.clone()
+            else:
+                checkpoint[f"{target}.weight"] = fp8_weight[rows].clone()
+                checkpoint[f"{target}.weight_scale"] = weight_scale.clone()
+            checkpoint[f"{target}.input_scale"] = input_scale.clone()
+            if module.bias is not None:
+                checkpoint[f"{target}.bias"] = torch.randn(n, generator=generator) * 0.01
+    return checkpoint
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and get_sm_version() >= 100),
+    reason="static NVFP4 / FP8 Linears need a Blackwell GPU",
+)
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.NVFP4, QuantAlgo.FP8])
+def test_prequantized_checkpoint_loads_and_runs(quant_algo: QuantAlgo) -> None:
+    """A ModelOpt-style export goes through ``load_weights`` and one forward on the static path."""
+    shapes = _STATIC_QUANT_SHAPES | {"num_layers": 1, "num_refiner_layers": 1}
+    reference = h3.MiniMaxH3Transformer3DModel(_make_model_config(**shapes))
+    # TRT-LLM Linears allocate their parameters uninitialised; the non-quantized tensors
+    # (the FP32 media projections among them) reach the checkpoint from this state.
+    _initialize_diffusers_golden_weights(reference)
+    reference_state = {k: v.detach().cpu() for k, v in reference.state_dict().items()}
+    del reference
+
+    quant_config = QuantConfig(quant_algo=quant_algo, exclude_modules=list(_H3_MEDIA_PROJECTIONS))
+    model = h3.MiniMaxH3Transformer3DModel(
+        _make_prequantized_nvfp4_model_config(quant_config=quant_config, **shapes)
+    ).to("cuda")
+    assert not model.model_config.dynamic_weight_quant
+    checkpoint = _export_style_checkpoint(reference_state, model, quant_algo)
+
+    model.load_weights(checkpoint)
+    model.post_load_weights()
+
+    first = model.transformer_blocks[0]
+    assert first.attn.qkv_proj.has_any_quant and first.ff.gate_up_proj.has_any_quant
+    assert torch.isfinite(first.attn.qkv_proj.input_scale).all()
+    for name in _H3_MEDIA_PROJECTIONS:
+        assert not getattr(model, name).has_any_quant
+        assert getattr(model, name).weight.dtype == torch.float32
+
+    # The loaded scales must give finite dequantised weights, and every quantized Linear must
+    # produce a finite output of plausible magnitude (unit-scale inputs, 0.05-scale weights,
+    # K = 64), so a failure names the first GEMM that does not.
+    from tensorrt_llm._torch.modules.linear import Linear
+
+    amplitude_bound = 1e4
+    non_finite: list[str] = []
+    amplitudes: list[tuple[float, str]] = []
+    handles = []
+    for name, module in model.named_modules():
+        if not isinstance(module, Linear) or not module.has_any_quant:
+            continue
+        assert torch.isfinite(module.weight_scale.float()).all(), name
+        assert torch.isfinite(module.input_scale.float()).all(), name
+        if quant_algo == QuantAlgo.FP8:
+            assert torch.isfinite(module.weight.float() * module.weight_scale.float()).all(), name
+
+        def record(_module, _inputs, output, name=name) -> None:
+            shape = f"{name} {tuple(_inputs[0].shape)} -> {tuple(output.shape)}"
+            if not torch.isfinite(output).all():
+                non_finite.append(shape)
+            amplitudes.append((output.float().abs().amax().item(), shape))
+
+        handles.append(module.register_forward_hook(record))
+
+    # Rows: two text tokens, two video tokens, one audio token.
+    device = "cuda"
+    with torch.inference_mode():
+        video, audio = model(
+            hidden_states=torch.randn(1, 2, shapes["in_channels"], device=device),
+            audio_hidden_states=torch.randn(1, 1, shapes["audio_in_channels"], device=device),
+            encoder_hidden_states=torch.randn(
+                1, 2, shapes["text_dim"], device=device, dtype=torch.bfloat16
+            ),
+            timestep=torch.tensor([1.0], device=device),
+            conditioning_timesteps=torch.tensor([1.0], device=device),
+            timestep_indices=torch.zeros(5, dtype=torch.long, device=device),
+            token_tags=torch.tensor([1, 1, 0, 0, 2], device=device),
+            position_ids=torch.tensor(
+                [[0, 0, 0], [1, 0, 0], [2, 0, 0], [2, 0, 1], [3, 0, 0]], device=device
+            ),
+            video_indices=torch.tensor([2, 3], device=device),
+            audio_indices=torch.tensor([4], device=device),
+            text_indices=torch.tensor([0, 1], device=device),
+            return_dict=False,
+        )
+    for handle in handles:
+        handle.remove()
+    assert video.shape == (1, 2, shapes["in_channels"])
+    assert audio.shape == (1, 1, shapes["audio_in_channels"])
+    assert not non_finite, f"non-finite Linear outputs (first: {non_finite[0]})"
+    loudest = max(amplitudes)
+    assert loudest[0] < amplitude_bound, f"Linear output amplitude {loudest[0]:.3e} at {loudest[1]}"
+    assert torch.isfinite(video).all() and torch.isfinite(audio).all()
+    assert video.abs().max() < amplitude_bound and audio.abs().max() < amplitude_bound
