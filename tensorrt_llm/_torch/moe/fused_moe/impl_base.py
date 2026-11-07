@@ -167,6 +167,22 @@ def apply_moe_impl_construction_state(
     install_activation_params(module)
 
 
+def moe_tune_max_num_tokens(
+    model_config: ModelConfig, num_slots: int, experts_per_token: int
+) -> int:
+    """The largest token count a MoE leaf's autotuner profiles.
+
+    The best tactic converges once each expert sees ~16k tokens, well into the
+    compute-bound domain, so profiling stops there; it also never exceeds what a
+    forward can present (``max_num_tokens * dp_size``) or ``moe_max_num_tokens``.
+    """
+    return min(
+        model_config.moe_max_num_tokens,
+        16384 * num_slots // experts_per_token,
+        model_config.max_num_tokens * model_config.mapping.dp_size,
+    )
+
+
 class MoEImplBase(
     MoEExecutionContractMixin, MoEWeightOwnerMixin, MoEEplbWeightLayoutMixin, nn.Module, abc.ABC
 ):

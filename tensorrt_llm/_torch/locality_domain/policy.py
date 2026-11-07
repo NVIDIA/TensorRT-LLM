@@ -22,6 +22,7 @@ consolidated here.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
@@ -33,6 +34,18 @@ from tensorrt_llm._torch.locality_domain.layout import (
     make_nvfp4_linear_output_layout,
 )
 
+#: Set to ``1`` to also split MXFP8 fused FC12 MoE layers across locality
+#: domains. Off by default: the split wins at decode sizes but loses at
+#: prefill-sized rows, so it suits generation-only engines.
+MXFP8_MOE_LOCALITY_DOMAIN_ENV = "TRTLLM_LOCALITY_DOMAIN_MXFP8_MOE"
+
+
+def _default_allowed_ops() -> frozenset:
+    ops = {"nvfp4_linear", "bf16_linear", "bf16_bmm", "nvfp4_moe", "bf16_moe"}
+    if os.getenv(MXFP8_MOE_LOCALITY_DOMAIN_ENV, "0") == "1":
+        ops.add("mxfp8_moe")
+    return frozenset(ops)
+
 
 @dataclass(frozen=True)
 class LocalityDomainPolicy:
@@ -40,17 +53,7 @@ class LocalityDomainPolicy:
 
     enabled: bool = False
     num_partitions: int = 2
-    allowed_ops: frozenset = field(
-        default_factory=lambda: frozenset(
-            {
-                "nvfp4_linear",
-                "bf16_linear",
-                "bf16_bmm",
-                "nvfp4_moe",
-                "bf16_moe",
-            }
-        )
-    )
+    allowed_ops: frozenset = field(default_factory=_default_allowed_ops)
     allowed_backends: tuple = ("cutlass", "cublaslt", "cuda_core")
 
     def __post_init__(self):
@@ -252,11 +255,19 @@ class LocalityDomainExecutionPlanner:
     ) -> PartitionPlan:
         """Decide whether to partition a MoE GroupGemm for locality domain execution.
 
-        MoE locality domain replicates weights on each partition (not partitioned like Linear).
-        Each partition runs the full GroupGemm with inplace output into shared buffers.
+        NVFP4 and BF16 MoE split every expert's FC1 output columns (and the
+        matching FC2 rows) across the partitions; MXFP8 splits the inner
+        channels of the fused FC1+FC2 kernel, both shards accumulating into one
+        output. Each partition runs the full GroupGemm over all local experts.
         """
-        from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
-        from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+        from tensorrt_llm._torch.cute_dsl_utils import (
+            IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+            IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+        )
+        from tensorrt_llm._torch.locality_domain_utils import (
+            is_balanced_locality_domain_split,
+            is_locality_domain_enabled,
+        )
 
         if not self.policy.enabled:
             return PartitionPlan(
@@ -279,6 +290,11 @@ class LocalityDomainExecutionPlanner:
             and hasattr(quant_config, "quant_mode")
             and quant_config.quant_mode.has_nvfp4()
         )
+        is_mxfp8 = (
+            quant_config is not None
+            and hasattr(quant_config, "quant_mode")
+            and quant_config.quant_mode.has_mxfp8()
+        )
         has_any_quant = (
             quant_config is not None
             and hasattr(quant_config, "quant_mode")
@@ -288,6 +304,26 @@ class LocalityDomainExecutionPlanner:
 
         if is_nvfp4:
             op_name = "nvfp4_moe"
+        elif is_mxfp8:
+            if not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE:
+                return PartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=(
+                        "MXFP8 locality domain MoE requires the CuTe DSL fused FC12 kernel"
+                    ),
+                )
+            if is_balanced_locality_domain_split():
+                # The fused kernel needs every persistent cluster resident at
+                # once (FC2 spins on FC1 readiness); the balanced split
+                # backfills each partition without a co-scheduling guarantee.
+                return PartitionPlan(
+                    enabled=False,
+                    reason_if_disabled=(
+                        "MXFP8 locality domain MoE requires the strict locality domain "
+                        "split, not TLLM_LOCALITY_DOMAIN_STREAM_CREATE_METHOD=balanced"
+                    ),
+                )
+            op_name = "mxfp8_moe"
         elif is_bf16:
             op_name = "bf16_moe"
         elif not has_any_quant:
@@ -297,7 +333,8 @@ class LocalityDomainExecutionPlanner:
             )
         else:
             return PartitionPlan(
-                enabled=False, reason_if_disabled="locality domain MoE only supports NVFP4 or BF16"
+                enabled=False,
+                reason_if_disabled="locality domain MoE only supports NVFP4, MXFP8 or BF16",
             )
 
         # Both locality-domain MoE kernels fuse SwiGLU. Staying unpartitioned is
