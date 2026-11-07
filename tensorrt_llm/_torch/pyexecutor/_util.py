@@ -51,6 +51,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
 from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
@@ -5085,6 +5086,12 @@ def instantiate_sampler(
         sampler = get_spec_decoder(sampler_args, engine.spec_config)
         runtime_hooks = runtime_hooks_of(engine.model)
         if isinstance(sampler, SpecSampler):
+            if (engine.spec_config.spec_dec_mode.is_dspark()
+                    and mapping.pp_size == 1 and not mapping.enable_attention_dp
+                    and llm_args.modeling_v2 == "off"
+                    and isinstance(engine.model, SpecDecOneEngineForCausalLM)
+                    and engine.model.supports_speculative_output_scores()):
+                sampler.logit_projection = engine.model.project_speculative_logits
             if runtime_hooks.spec_step_fold is not None:
                 sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
             sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
