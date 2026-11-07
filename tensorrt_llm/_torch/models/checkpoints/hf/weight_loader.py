@@ -620,6 +620,41 @@ class HfWeightLoader(BaseWeightLoader):
         ]
         return filtered_weight_files or weight_files
 
+    def _files_with_key_prefixes(
+            self, checkpoint_dir: str, weight_files: list[str],
+            key_prefixes: tuple[str, ...] | None) -> list[str]:
+        """Return the files the index lists for ``key_prefixes``, or every file when it cannot tell."""
+        # The raw weight cache is keyed by file set; a full read lets the draft reuse the target's entry.
+        if (not key_prefixes or not weight_files
+                or (self._is_weight_cache_enabled()
+                    and self._weight_cache_max_entries() > 0)):
+            return weight_files
+        try:
+            with open(os.path.join(checkpoint_dir,
+                                   "model.safetensors.index.json"),
+                      encoding="utf-8") as f:
+                weight_map = json.load(f)["weight_map"]
+            indexed_files = set(weight_map.values())
+            holders = [{
+                file_name
+                for key, file_name in weight_map.items()
+                if key.startswith(prefix)
+            } for prefix in key_prefixes]
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return weight_files
+        file_names = {os.path.basename(path) for path in weight_files}
+        needed = set().union(*holders)
+        # A file the index does not list may hold any key.
+        if (not all(holders) or not needed <= file_names
+                or not file_names <= indexed_files):
+            return weight_files
+        selected = [
+            path for path in weight_files if os.path.basename(path) in needed
+        ]
+        logger.info(f"Reading {len(selected)} of {len(weight_files)} "
+                    f"checkpoint files that hold {key_prefixes} keys.")
+        return selected
+
     def build_checkpoint_catalog(
             self,
             checkpoint_dir: str,
@@ -797,8 +832,11 @@ class HfWeightLoader(BaseWeightLoader):
                 eligibility_reason = (
                     "the checkpoint requires model-specific lazy SafeTensors loading"
                 )
-            weight_files = self._selected_safetensors_files(
-                checkpoint_dir, use_consolidated)
+            weight_files = self._files_with_key_prefixes(
+                checkpoint_dir,
+                self._selected_safetensors_files(checkpoint_dir,
+                                                 use_consolidated),
+                kwargs.get("key_prefixes"))
             stats = [(path, os.stat(path)) for path in weight_files]
             if not weight_files:
                 eligibility_reason = "no SafeTensors checkpoint files were found"
@@ -956,6 +994,7 @@ class HfWeightLoader(BaseWeightLoader):
                              *,
                              _local_communicator=None,
                              _allow_prefetch: bool = True,
+                             key_prefixes: tuple[str, ...] | None = None,
                              **kwargs) -> dict[str, Any]:
         """Load weights with the native (no read-ahead) I/O policy."""
         if self._requires_lazy_safetensors(checkpoint_dir):
@@ -970,6 +1009,8 @@ class HfWeightLoader(BaseWeightLoader):
         ]
         if len(filtered_weight_files) > 0:
             weight_files = filtered_weight_files
+        weight_files = self._files_with_key_prefixes(checkpoint_dir,
+                                                     weight_files, key_prefixes)
         if weight_files:
             if _local_communicator is None and _allow_prefetch:
                 return self._with_weight_cache(
