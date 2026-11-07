@@ -17,10 +17,12 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
+import json
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from io import BytesIO
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
@@ -32,7 +34,10 @@ from PIL import Image, ImageOps
 from transformers import Qwen2TokenizerFast, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
 
 from tensorrt_llm._torch.visual_gen.checkpoints import WeightLoader
-from tensorrt_llm._torch.visual_gen.config import DiffusionPipelineConfig
+from tensorrt_llm._torch.visual_gen.config import (
+    DiffusionPipelineConfig,
+    create_attention_metadata_state,
+)
 from tensorrt_llm._torch.visual_gen.output import CudaPhaseTimer, PipelineOutput
 from tensorrt_llm._torch.visual_gen.pipeline import (
     BasePipeline,
@@ -45,6 +50,8 @@ from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
+from tensorrt_llm.visual_gen.args import AttentionConfig
+from tensorrt_llm.visual_gen.sparse_attention import VideoSparseAttentionConfig
 
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
@@ -75,6 +82,7 @@ from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
 from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from .vsa import build_h3_vsa_metadata, set_h3_vsa_context
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
@@ -164,10 +172,16 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
 
 @register_pipeline(
     "MiniMaxH3ModularPipeline",
-    hf_ids=["MiniMaxAI/MiniMax-H3"],
+    hf_ids=[
+        "MiniMaxAI/MiniMax-H3",
+        "FastVideo/FastVideo-FastH3-8-Step-V2",
+    ],
     defaults={"workflow": "fl2va"},
     download_patterns=[
         "modular_model_index.json",
+        "fastvideo_inference.json",
+        "checkpoint_content.json",
+        "checkpoint_metadata.json",
         "LICENSE",
         "README.md",
         "transformer/*",
@@ -203,6 +217,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         return torch.Generator().manual_seed(seed)
 
     def __init__(self, pipeline_config: DiffusionPipelineConfig) -> None:
+        self._configure_fasth3_attention(pipeline_config)
         self.text_encoder_tp_size = int(
             getattr(getattr(pipeline_config, "parallel", None), "text_encoder_tp_size", 1)
         )
@@ -377,6 +392,7 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     @property
     def default_generation_params(self) -> dict:
+        fastvideo_inference = getattr(self, "_fastvideo_inference", {})
         return {
             # MiniMax-H3 derives the default canvas from the first present
             # keyframe, or from 16:9 for T2VA.
@@ -384,7 +400,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             "width": None,
             "num_frames": 124,
             "frame_rate": float(MINIMAX_H3_FPS),
-            "num_inference_steps": 28,
+            "num_inference_steps": int(fastvideo_inference.get("num_inference_steps", 28)),
         }
 
     @property
@@ -428,6 +444,13 @@ class MiniMaxH3Pipeline(BasePipeline):
         return super().load_transformer_weights(checkpoint_dir)
 
     @property
+    def default_warmup_steps(self) -> int:
+        steps = getattr(self, "_fastvideo_inference", {}).get("dmd_denoising_steps")
+        if steps is not None:
+            return len(steps) + 1
+        return super().default_warmup_steps
+
+    @property
     def default_warmup_resolutions(self) -> list[tuple[int, int]]:
         return [(768, 1344)]
 
@@ -459,6 +482,46 @@ class MiniMaxH3Pipeline(BasePipeline):
             frame_rate=float(MINIMAX_H3_FPS),
             num_inference_steps=steps,
         )
+
+    @staticmethod
+    def _load_fasth3_manifest(checkpoint_dir: str) -> dict:
+        manifest_path = Path(checkpoint_dir) / "fastvideo_inference.json"
+        if manifest_path.exists():
+            with manifest_path.open() as f:
+                manifest = json.load(f)
+            if str(manifest.get("schema_version", "")).startswith("fasth3-"):
+                return manifest
+        return {}
+
+    @classmethod
+    def _configure_fasth3_attention(cls, config: DiffusionPipelineConfig) -> None:
+        pretrained = getattr(config, "primary_pretrained_config", None)
+        checkpoint_dir = getattr(pretrained, "_name_or_path", None)
+        manifest = cls._load_fasth3_manifest(checkpoint_dir) if checkpoint_dir else {}
+        if not manifest:
+            return
+
+        attention = config.attention
+        backend = attention.backend
+        if backend == "VANILLA" and "backend" not in attention.model_fields_set:
+            backend = "TRTLLM"
+        if backend not in ("TRTLLM", "CUTEDSL"):
+            raise ValueError("FastH3 requires VSA with the TRTLLM or CUTEDSL attention backend.")
+        sparse = attention.sparse_attention_config
+        if sparse is None:
+            sparse = VideoSparseAttentionConfig(vsa_sparsity=manifest.get("vsa_sparsity", 0.8))
+        elif sparse.algorithm != "vsa":
+            raise ValueError("FastH3 requires the vsa sparse attention algorithm.")
+        config.attention = AttentionConfig.model_validate(
+            {**attention.model_dump(), "backend": backend, "sparse_attention_config": sparse}
+        )
+        # Resolve defaults before constructing the transformer and loading its trained gate.
+        if backend == "TRTLLM" and config.attention_metadata_state is None:
+            config.attention_metadata_state = create_attention_metadata_state()
+        for model_config in config.model_configs.values():
+            model_config.attention = config.attention.model_copy(deep=True)
+            if backend == "TRTLLM" and model_config.attention_metadata_state is None:
+                model_config.attention_metadata_state = create_attention_metadata_state()
 
     def _init_transformer(self) -> None:
         self.transformer = MiniMaxH3Transformer3DModel(
@@ -510,6 +573,8 @@ class MiniMaxH3Pipeline(BasePipeline):
         del kwargs
         skip_components = skip_components or []
         offloaded = self.offloader.requested_components()
+
+        self._fastvideo_inference = self._load_fasth3_manifest(checkpoint_dir)
 
         if not _component_skipped(skip_components, PipelineComponent.TOKENIZER):
             self.tokenizer = Qwen2TokenizerFast.from_pretrained(
@@ -569,12 +634,42 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
-        if self.scheduler is not None:
+        # Distilled checkpoints carry their trained shifts in the scheduler configs.
+        if self.scheduler is not None and not getattr(self, "_fastvideo_inference", {}):
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
-        if self.audio_scheduler is not None:
+        if self.audio_scheduler is not None and not getattr(self, "_fastvideo_inference", {}):
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
         if self.vae is not None and self.device.type == "cuda":
             _prepare_vae_decoder(self.vae)
+
+    def _set_timesteps(self, num_inference_steps: int) -> None:
+        manifest = getattr(self, "_fastvideo_inference", {})
+        steps = manifest.get("dmd_denoising_steps")
+        if steps is None:
+            self.scheduler.set_timesteps(num_inference_steps, device=self.device)
+            self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+            return
+        if (
+            not steps
+            or any(type(step) is not int or not 0 < step <= 1000 for step in steps)
+            or any(left <= right for left, right in zip(steps, steps[1:]))
+        ):
+            raise ValueError("FastH3 DMD steps must be strictly decreasing integers in (0, 1000].")
+        if num_inference_steps != len(steps) + 1:
+            raise ValueError(
+                f"FastH3 requires {len(steps) + 1} sigma-grid points for {len(steps)} forwards."
+            )
+        base = torch.tensor([step / 1000.0 for step in steps] + [0.0], dtype=torch.float32)
+        for scheduler, shift_key in (
+            (self.scheduler, "video_scheduler_shift"),
+            (self.audio_scheduler, "audio_scheduler_shift"),
+        ):
+            shift = float(scheduler.shift)
+            if shift_key in manifest and shift != float(manifest[shift_key]):
+                raise ValueError(f"FastH3 {shift_key} disagrees with the checkpoint scheduler.")
+            # Shift each modality's trained noise clock once; explicit sigmas are not shifted.
+            sigmas = shift * base / (1 + (shift - 1) * base)
+            scheduler.set_timesteps(sigmas=sigmas, device=self.device)
 
     def torch_compile(self) -> None:
         super().torch_compile()
@@ -1217,8 +1312,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             condition_latents=condition_latents,
         )
 
-        self.scheduler.set_timesteps(num_inference_steps, device=self.device)
-        self.audio_scheduler.set_timesteps(num_inference_steps, device=self.device)
+        self._set_timesteps(num_inference_steps)
         # The denoise loop indexes both schedules with one counter, and
         # set_timesteps collapses float32 duplicates, so unequal lengths would
         # silently truncate a stream instead of failing.
@@ -1263,6 +1357,31 @@ class MiniMaxH3Pipeline(BasePipeline):
             self.scheduler.timesteps, self.audio_scheduler.timesteps
         )
 
+        _attn_cfg = self.pipeline_config.primary_model_config.attention
+        _sparse_cfg = getattr(_attn_cfg, "sparse_attention_config", None)
+        _vsa_active = (
+            getattr(_attn_cfg, "backend", "VANILLA") in ("CUTEDSL", "TRTLLM")
+            and _sparse_cfg is not None
+            and getattr(_sparse_cfg, "algorithm", None) == "vsa"
+        )
+        _vsa_sparsity = _sparse_cfg.vsa_sparsity if _vsa_active else 0.0
+        vsa_metadata = None
+        if _vsa_active:
+            if self.workflow == "ref2va" or keyframes:
+                raise ValueError("MiniMax-H3 VSA currently supports text-to-video only.")
+            patch = self.transformer.config.patch_size
+            grid = tuple(
+                size // p
+                for size, p in zip(
+                    (num_latent_frames, latent_height, latent_width), patch, strict=True
+                )
+            )
+            vsa_metadata = build_h3_vsa_metadata(
+                (text_indices.numel(), audio_indices.numel(), grid),
+                _vsa_sparsity,
+                self.device,
+            )
+
         def forward_fn(
             video_latents: torch.Tensor,
             extra_stream_latents: dict[str, torch.Tensor],
@@ -1273,7 +1392,7 @@ class MiniMaxH3Pipeline(BasePipeline):
         ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
             del timestep, encoder_hidden_states, extra_tensors
             unique_timesteps, timestep_indices = row_timestep_plan[index]
-            video_velocity, audio_velocity = self.transformer(
+            transformer_kwargs = dict(
                 hidden_states=torch.cat((condition_prefix, video_latents), dim=1),
                 audio_hidden_states=torch.cat(
                     (audio_condition_prefix, extra_stream_latents["audio"]), dim=1
@@ -1290,6 +1409,11 @@ class MiniMaxH3Pipeline(BasePipeline):
                 return_dict=False,
                 static_context=static_context,
             )
+            if _vsa_active:
+                with set_h3_vsa_context(vsa_metadata):
+                    video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
+            else:
+                video_velocity, audio_velocity = self.transformer(**transformer_kwargs)
             # A silent all-zero / non-finite velocity has been observed once in
             # practice: the run completed, reported success, and wrote a black
             # video with silent audio.  The cause was never reproduced, so fail
