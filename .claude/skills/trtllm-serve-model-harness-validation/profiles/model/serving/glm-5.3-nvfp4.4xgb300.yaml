@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# trtllm-serve --config for GLM-5.3-NVFP4 on one node of 4 GB300 GPUs: the configuration the shipped
+# GLM profile's cells were served with (production settings: full context, chunked prefill with
+# 8192-token chunks, block reuse on). Serve with:
+#
+#   TRTLLM_RAW_OUTPUT_DIR=<run>/raw trtllm-serve <checkpoint> \
+#       --tp_size 4 --ep_size 4 --max_seq_len 1048576 \
+#       --tool_parser glm47 --reasoning_parser glm --served_model_name <name the harness sends> \
+#       --post_processor_hook tensorrt_llm.executor.raw_output_hook.RawOutputDump \
+#       --config glm-5.3-nvfp4.4xgb300.yaml
+#
+# The hook flag and TRTLLM_RAW_OUTPUT_DIR need a build with the raw-output hook
+# (references/smoke.md section 3d); drop both on a build without it.
+#
+# MTP: GLM-5.3-NVFP4 ran with MTP 3 and the CUTEDSL MoE backend on GB300. The GLM-5 deployment guide
+# (docs/source/deployment-guide/deployment-guide-for-glm-5-on-trtllm.md) says MTP is not supported
+# with the GLM-5 NVFP4 checkpoint on B200 with the TRTLLM MoE backend. If your build, GPU or
+# checkpoint rejects MTP, remove speculative_config; nothing in the validation depends on it.
+# On other GPUs start from the deployment guide and keep the four production settings above.
+trust_remote_code: true
+enable_attention_dp: true
+attention_dp_config: {enable_kv_cache_aware_routing: true, kv_cache_routing_load_balance_weight: 0.0,
+                      kv_cache_routing_cold_start_warmup: true, enable_balance: false}
+max_batch_size: 16
+max_num_tokens: 8192
+enable_chunked_prefill: true
+scheduler_config: {capacity_scheduler_policy: MAX_UTILIZATION, context_chunking_policy: EQUAL_PROGRESS}
+kv_cache_config: {dtype: fp8, enable_block_reuse: true, free_gpu_memory_fraction: 0.85, tokens_per_block: 64}
+cuda_graph_config: {batch_sizes: [1, 2, 4, 8, 16], enable_padding: true}
+disable_overlap_scheduler: false
+moe_config: {backend: CUTEDSL}
+sparse_attention_config: {algorithm: dsa, enable_heuristic_topk: true}
+speculative_config: {decoding_type: MTP, max_draft_len: 3}
+# Iteration stats let /metrics tell a request queued in the engine from one that never reached it
+# (references/smoke.md section 5).
+enable_iter_perf_stats: true

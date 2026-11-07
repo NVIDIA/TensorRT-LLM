@@ -1,0 +1,1 @@
+rotate.sh is meant to keep the newest KEEP snapshot files in a directory, newest by the date in their names, and to delete the older ones, but its tests fail. Run `bash test_rotate.sh` to see which checks fail, fix rotate.sh (the test script is correct, so leave it alone), and run the tests again until every check passes. Then explain in two or three sentences what was wrong.

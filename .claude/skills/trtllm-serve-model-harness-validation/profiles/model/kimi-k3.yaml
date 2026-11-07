@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: Kimi-K3. Derived from the checkpoint's own encoder (encoding_k3.py, "XTML").
+schema: trtllm-serve-model-harness-validation/model-profile@1
+id: kimi-k3
+status: draft
+checkpoints:
+  - {name: Kimi-K3, model_type: kimi_k3, size_gb: 1561}
+  - {name: Kimi-K3-NVFP4, model_type: kimi_k3, size_gb: 1610}
+footprint: "Does not fit one 4xGB300 node (about 1.19 TB usable). Plan 2 or more nodes; there is
+  no smaller model with the same format."
+upstream: "main has the model (#17050, #17269), parsers (#17327) and serve extension
+  (serve/extensions/kimi_k3.py, #19499). Later parser rewrites and the [PAD] stop may not all
+  be on main: check main and open PRs before relying on its parsers."
+
+renderer:
+  kind: checkpoint_encoder                  # no chat_template.jinja in the checkpoint
+  reference: encoding_k3.py                 # sha256 prefix b9cb7ae100fed34b
+  notes:
+    - "Tags are <|open|>TAG ATTRS<|sep|> ... <|close|>TAG<|sep|>; TAG in message, think,
+       response, tools, call (tool, index), json, argument (key, type)."
+    - "In thinking mode every assistant message carries the think channel, even when empty."
+    - "Tool results are re-sorted into tool_calls order by tool_call_id."
+    - "serve/extensions/kimi_k3.py passes thinking, thinking_effort, tool_choice and
+       response_format to the encoder as template kwargs. Thinking and its effort come, in order,
+       from the client's chat_template_kwargs, the request's thinking object, then
+       reasoning_effort (low, high or max; none turns thinking off)."
+
+parsers:
+  tool: kimi_k3
+  reasoning: kimi_k3
+
+format_card:                                # partial: the call opener carries attributes
+  block_open: "<|open|>tools<|sep|>"
+  block_close: "<|close|>tools<|sep|>"
+  call_open: "<|open|>call"
+  call_close: "<|close|>call<|sep|>"
+  name_end: null                            # the name is an attribute; fault_mutations needs a K3 mode
+  value_open: null
+  value_close: "<|close|>argument<|sep|>"
+  qualified_prefix: "functions."
+  split_policy: token_boundaries            # never split <|...|> control tokens per character
+
+native:                                     # the raw view (C-13); grammar of encoding_k3.py
+  kind: kimi_xtml
+  prompt_opens: think                       # the generation prompt opens message and think
+  prompt_opens_without_thinking: think      # the encoder ignores enable_thinking: think either way
+  stop_markers: ["<|end_of_msg|>"]
+  repairs: []                               # serving rewrites accepted as by design
+  measured: "On recorded replies of a real deployment, every difference was a model anomaly or
+    the single-call policy"
+
+usage:
+  # Kimi's prompt accounting leaves out the 3-token generation opener (<|open|>think<|sep|>)
+  # that trtllm-serve renders, on the routes the K3 serving extension adjusts: the Chat route
+  # subtracts it (main: openai_server.py openai_chat sets num_prompt_tokens_offset from
+  # extensions/kimi_k3.py prompt_tokens_excluded_from_usage; postprocess_handlers.py subtracts
+  # it), and /v1/messages runs through openai_chat. The Responses route bills the whole prompt
+  # (responses_utils does not call the extension; measured on K3 x Codex: every reply billed its
+  # re-rendered prompt). A build whose Responses route subtracts it too bills 3 less there, and a
+  # cell on such a build needs responses: 3. No offset either way for a Chat request with its own
+  # template or prompt token ids, or with add_generation_prompt: false (the validator applies none
+  # to those), or when the server runs with --chat_template (declare 0 for such a cell).
+  # count_tokens on main does not subtract it.
+  prompt_offset: {chat-completions: 3, anthropic-messages: 3, responses: 0}
+
+markers:
+  - "<|open|>"
+  - "<|close|>"
+  - "<|sep|>"
+  - "<|end_of_msg|>"
+
+vocab_size: 163840                          # resolves id: last_vocab_id (M-02 on token ids)
+degenerate:
+  - {token: "[PAD]", id: last_vocab_id, run: 20}   # vocab_size 163840; seen in runaway loops
+                                                   # from a numerical bug, fixed at its source
+
+reasoning:
+  channel: think tag
+  history_policy: S1 - record from encoding_k3.py
+
+context:
+  model_max: 1048576
+  serving: "The production serving configuration (references/smoke.md 3c): context servers at
+    max_seq_len 996672 with chunked prefill and max_num_tokens 8192, and KIMI_K3_MLA_MAX_POSITIONS
+    1048576, since the MLA RoPE table must cover max_seq_len. Kimi-K3 does not fit one 4-GPU node: it
+    is served disaggregated (docs/source/features/disagg-serving.md), so no single-node config ships."
+
+known_findings:
+  - "The model can omit the first call's close tag, so stop text matches after the second call.
+     It is rare; the serving policy is open."
+  - "Character-level chunking of control tokens gives false parser findings; split at token
+     boundaries."
+  - "serve/extensions/kimi_k3.py gives every streaming chat request default stream_options,
+     imitating Kimi's API, so a usage chunk with empty choices ends every Chat Completions stream
+     even unrequested (rule CHT-08). Check each harness's stream parser against it."

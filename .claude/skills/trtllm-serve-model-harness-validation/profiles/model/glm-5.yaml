@@ -1,0 +1,110 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model profile: GLM-5.x. One family, several checkpoints whose chat templates differ:
+# pin the checkpoint and its template hash in every cell.
+schema: trtllm-serve-model-harness-validation/model-profile@1
+id: glm-5
+status: draft
+checkpoints:
+  - {name: GLM-5.2-NVFP4, model_type: glm_moe_dsa, size_gb: 465, template_sha256: 172dc74a35e1752d}
+  - {name: GLM-5.3-Flash, model_type: glm5_next, size_gb: 328, template_sha256: 34d5ee66b12fa644}
+  - {name: GLM-5.3-Flash-NVFP4, model_type: glm5_next, size_gb: 204, template_sha256: 34d5ee66b12fa644}
+  # nvidia/GLM-5.3-NVFP4: modelopt MIXED_PRECISION, experts NVFP4, layers 0-2 FP8, attention and
+  # the MTP layer BF16. Fits one 4xGB300 node (served DEP4 with MTP 3: 135.83 GiB of weights per
+  # rank).
+  - {name: GLM-5.3-NVFP4, model_type: glm_moe_dsa, size_gb: 464, template_sha256: 3740abcea51c4583}
+upstream: "main has glm_moe_dsa and glm5_next. Its glm4/glm47 parsers were rewritten in #19935.
+  glm5_next has no automatic tool-parser mapping on main. Merged since: #21108 (a fresh call
+  inside an open call's arguments abandons it) and #21109 (the owed </think> after a tool call is
+  dropped; the thinking mode is read off the prompt). A GLM-5.3-NVFP4 x Codex cell passed
+  (2026-11) on main plus #19665 (Responses asks for logprobs by default, so every request fails
+  under MTP), the capture changes and the harness's own items (contracts/codex-default.md). Its
+  audit also found #21449 (a tool result's image reaches a text-only model as a text note), which
+  its run did not exercise. Check their state before composing a build (references/smoke.md
+  section 3d)."
+
+renderer:
+  kind: chat_template
+  reference: chat_template.jinja
+  notes:
+    - "Tool calls render as <tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>."
+    - "GLM-5.2: enable_thinking switches <think></think>; GLM-5.3 and GLM-5.3-Flash always open
+       <think> and write 'Reasoning Effort: Low|High|Max' (default Max) whatever enable_thinking says."
+    - "developer messages must reach the template: a build whose chat path drops them for Jinja
+       templates loses the harness's instructions."
+
+parsers:
+  tool: glm47
+  reasoning: glm              # what GLM-5.3-NVFP4 is served with; glm47 / glm45 also registered
+  family: [glm4, glm47]
+
+format_card:
+  call_open: "<tool_call>"
+  name_end: "<arg_key>"
+  call_close: "</tool_call>"
+  block_open: null
+  block_close: null
+  value_open: "<arg_value>"
+  value_close: "</arg_value>"
+  qualified_prefix: "functions."
+
+native:                                     # the raw view (C-13); grammar of chat_template.jinja
+  # The reader's goldens (scripts/validate/native_goldens.py --glm) were rendered with the
+  # GLM-5.3-Flash template. template_sha256 is the first 16 hex digits of the SHA-256 of
+  # chat_template.jinja. Before trusting C-13 on a checkpoint whose hash differs, run
+  # `native_goldens.py --glm <checkpoint> --check`: GLM-5.3 (0e2b6268ac54f04d) read back 5 of 5,
+  # equal to the goldens. GLM-5.3-NVFP4 was not checked this way; C-13 read its replies in the
+  # cells it served.
+  kind: glm_xml
+  prompt_opens: think                       # GLM-5.3 always prefills <think>
+  stop_markers: ["<|user|>", "<|observation|>", "<|endoftext|>"]
+  repairs:
+    # The glm47 parser maps a name the model qualified wrongly (func_bp.exec,
+    # functions.collaboration.list_agents) to the declared tool its last segment names.
+    - qualified_name_suffix
+    # The glm reasoning parser ends the reasoning where a call opens inside it and drops the </think> the model writes after the call.
+    - owed_think_close
+  measured: "On recorded replies of a real deployment, every difference was a declared repair,
+    a model anomaly or the single-call policy"
+
+markers:
+  - "<tool_call>"
+  - "</tool_call>"
+  - "<arg_key>"
+  - "</arg_key>"
+  - "<arg_value>"
+  - "</arg_value>"
+  - "<think>"
+  - "</think>"
+  - "<|observation|>"
+  - "<|assistant|>"
+  - "<|user|>"
+  - "<|system|>"
+  - "<tool_response>"
+  - "</tool_response>"
+  - "/nothink"                              # codespell:ignore nothink
+  - "<|begin_of_box|>"
+  - "<|end_of_box|>"
+
+vocab_size: 154880                          # GLM-5.3-NVFP4 config.json
+degenerate:                                 # from the GLM-5.3-NVFP4 tokenizer; read on token ids. A
+                                            # precaution: no GLM run has shown one (M-02 counted 0)
+  - {id_range: [154821, 154826], run: 20}   # [MASK] [gMASK] [sMASK] <sop> <eop> <|system|>
+  - {id: 154828, run: 20}                   # <|assistant|>
+  - {id_range: [154830, 154837], run: 20}   # media and transcription markers
+  - {id_range: [154856, 154879], run: 20}   # untrained rows
+
+reasoning:
+  channel: think tags
+  known: "GLM can close </think> twice and can leave a leading </think> residue on a turn: a
+    close before any content is residue, not the end of the reasoning."
+
+context:
+  model_max: 1048576
+  serving: "The production serving configuration (references/smoke.md 3c): max_seq_len 1048576,
+    chunked prefill, max_num_tokens 8192, block reuse on. The full config and serve command for one
+    node of 4 GB300 GPUs: profiles/model/serving/glm-5.3-nvfp4.4xgb300.yaml."
+
+known_findings:
+  - "A tool name the model malformed is delivered as text, on both views."
+  - "C-09 flags on GLM replies come from the model's own second </think>, not from serving."

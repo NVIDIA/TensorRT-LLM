@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# trtllm-serve --config for DeepSeek-V4.1-Flash on one node of 4 GB300 GPUs: the configuration the
+# shipped DeepSeek-V4.1 profile's cells were served with (production settings: full context, chunked
+# prefill with 8192-token chunks, block reuse on). Serve with:
+#
+#   TRTLLM_RAW_OUTPUT_DIR=<run>/raw trtllm-serve <checkpoint> \
+#       --tp_size 4 --ep_size 4 --max_seq_len 1048576 --custom_tokenizer deepseek_v41 \
+#       --tool_parser deepseek_v41 --reasoning_parser deepseek_v41 \
+#       --served_model_name <name the harness sends> \
+#       --post_processor_hook tensorrt_llm.executor.raw_output_hook.RawOutputDump \
+#       --config deepseek-v41.4xgb300.yaml
+#
+# The hook flag and TRTLLM_RAW_OUTPUT_DIR need a build with the raw-output hook
+# (references/smoke.md section 3d); drop both on a build without it.
+#
+# Keep max_num_tokens at 8192 with chunked prefill on: larger prefill chunks (65,536 and up) lost
+# long-context recall on this model (the model profile's known_findings, references/smoke.md 3c).
+kv_cache_config:
+  tokens_per_block: 128
+  free_gpu_memory_fraction: 0.6
+  enable_block_reuse: true
+enable_attention_dp: true
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
+cuda_graph_config:
+  enable_padding: true
+enable_chunked_prefill: true
+max_batch_size: 16
+max_num_tokens: 8192
+# Iteration stats let /metrics tell a request queued in the engine from one that never reached it
+# (references/smoke.md section 5).
+enable_iter_perf_stats: true

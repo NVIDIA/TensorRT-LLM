@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# id	kind	size	dir
+t01-region-totals	read	small	t01-region-totals
+t02-settings-layers	read	small	t02-settings-layers
+t03-wordstats-bug	fix	small	t03-wordstats-bug
+t04-extract-helper	refactor	small	t04-extract-helper
+t05-log-audit	long-read	long	t05-log-audit
+t06-orders-report	fix	medium	t06-orders-report
+t07-precision-option	feature	medium	t07-precision-option
+t08-rotate-script	fix	small	t08-rotate-script
