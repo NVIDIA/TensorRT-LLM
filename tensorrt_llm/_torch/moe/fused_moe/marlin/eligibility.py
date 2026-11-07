@@ -35,6 +35,7 @@ from ..impl_contract import (
     check_quant_matches_identity,
 )
 from ..interface import _reject
+from ..trtllm_gen.eligibility import check_no_expert_bias
 
 
 def check_marlin_capabilities(cls: type, p: MoEProblem, d: MoEDeployment) -> MoEEligibility | None:
@@ -55,17 +56,16 @@ def check_marlin_capabilities(cls: type, p: MoEProblem, d: MoEDeployment) -> MoE
             f"{cls.__name__} W4A16 requires bfloat16 activations, got {p.dtype_act}",
         )
 
-    if p.bias:
-        return _reject(
-            MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{cls.__name__} has no expert bias; MiniMax-style SwigluBias without bias is eligible",
-        )
+    no_bias = check_no_expert_bias(cls, p)
+    if no_bias is not None:
+        return no_bias
 
     # ``_apply_activation`` reads the constants for SwigluBias only.
     if p.activation_constants and p.activation_type is not ActivationType.SwigluBias:
         return _reject(
             MoERejectReason.ACTIVATION_UNSUPPORTED,
-            f"{cls.__name__} only applies activation constants for SwigluBias, got {p.activation}",
+            f"{cls.__name__} only applies activation constants for SwigluBias, "
+            f"got {p.activation} with {sorted(p.activation_constants)}",
         )
 
     # Sorted-token dispatch has no EPLB slot layout, so a layer that registered
