@@ -262,6 +262,45 @@ curl http://localhost:8000/v1/completions \
     }' -w "\n"
 ```
 
+#### Request-wide deadline (experimental)
+
+The optional top-level `request_deadline` setting gives a validated request one
+total serving budget, starting before placement and covering the existing
+paired CTX/GEN workflow through completion. Streaming also requires the proxy
+to observe worker EOF, not acknowledgement that the remote client has consumed
+every chunk.
+Routing, CTX execution, receiver waiting, transfer queueing, and GEN execution
+all consume the same budget; the first token does not renew it.
+
+```yaml
+schedule_style: generation_first
+request_deadline:
+  total_seconds: 180
+```
+
+Set `TRTLLM_DISAGG_NO_RETRY=1` on the orchestrator and workers. The initial
+implementation requires generation-first scheduling and rejects bounded replay
+and GEN-only benchmarking. Setting `max_retries: 0` alone is not sufficient:
+the HTTP client otherwise retains a separate transient TCP retry budget.
+Omit `request_deadline` (the default) or set it to `null` to retain existing
+behavior without a request-wide timer.
+
+Expiry requests cancellation through the existing paired HTTP-leg cleanup.
+Before response headers, it produces HTTP 504; after streaming starts, it
+uses the protocol's stream-error path instead of changing the HTTP status.
+A late timeout cannot retract a terminal result already received by the client.
+This is a **request-budget timeout**,
+not evidence of a slow network transfer. Existing per-worker HTTP timeouts
+(`--request_timeout`) and KV-transfer safety deadlines retain their original
+meaning and can expire earlier.
+
+Cleanup can outlive logical expiry, so the configured budget is not a hard
+bound on error delivery or physical KV release. Safe retirement still belongs
+to the worker's lifecycle/resource owners. An already selected worker failure
+(including an in-band error) keeps its original cause while cleanup drains;
+existing worker HTTP deadlines still apply. Validate cancellation for the
+intended model and topology before deploying this experimental option.
+
 #### Responses API
 
 The disaggregated server also serves `/v1/responses`, with both `context_first` and `generation_first` scheduling, and `/v1/models`, which it answers from a context worker. A streamed response carries the generation worker's events unchanged. Unlike a single `trtllm-serve` instance, the disaggregated server keeps no response history:

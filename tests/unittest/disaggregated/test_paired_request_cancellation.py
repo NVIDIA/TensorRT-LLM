@@ -17,9 +17,14 @@ from tensorrt_llm.executor.base_worker import BaseWorker
 from tensorrt_llm.executor.request import GenerationRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.utils import context_length_exceeded_message
-from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig, ServerRole
+from tensorrt_llm.llmapi.disagg_utils import (
+    DisaggRequestDeadlineConfig,
+    DisaggServerConfig,
+    ServerRole,
+)
 from tensorrt_llm.sampling_params import SamplingParams
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinatorService
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestTimeoutError
 from tensorrt_llm.serve.openai_client import OpenAIHttpClient
 from tensorrt_llm.serve.openai_disagg_server import OpenAIDisaggServer
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
@@ -146,13 +151,14 @@ async def test_ctx_failure_releases_pending_gen_placement(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("stream", "failed_role", "sse_error"),
+    ("stream", "failed_role", "sse_error", "request_deadline"),
     [
-        (False, ServerRole.CONTEXT, False),
-        (True, ServerRole.CONTEXT, False),
-        (False, ServerRole.GENERATION, False),
-        (True, ServerRole.GENERATION, False),
-        (True, ServerRole.GENERATION, True),
+        (False, ServerRole.CONTEXT, False, False),
+        (True, ServerRole.CONTEXT, False, False),
+        (False, ServerRole.GENERATION, False, False),
+        (True, ServerRole.GENERATION, False, False),
+        (True, ServerRole.GENERATION, True, False),
+        (False, ServerRole.CONTEXT, False, True),
     ],
 )
 async def test_http_failure_reaches_paired_worker_abort(
@@ -160,6 +166,7 @@ async def test_http_failure_reaches_paired_worker_abort(
     stream: bool,
     failed_role: ServerRole,
     sse_error: bool,
+    request_deadline: bool,
 ) -> None:
     """Exercise HTTP disconnect through the worker's real abort entry points.
 
@@ -220,6 +227,11 @@ async def test_http_failure_reaches_paired_worker_abort(
         failed_requests += 1
         await http_request.read()
         await asyncio.wait_for(sibling_started.wait(), timeout=5)
+        if request_deadline:
+            # Neither worker completes first: only the request-wide timer can
+            # close the HTTP legs and reach the sibling's real abort path.
+            await asyncio.wait_for(engine_cancelled.wait(), timeout=5)
+            return web.Response(status=499)
         if sse_error:
             response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
             await response.prepare(http_request)
@@ -260,7 +272,13 @@ async def test_http_failure_reaches_paired_worker_abort(
         finally:
             sibling_finished.set()
 
-    config = DisaggServerConfig(server_configs=[], schedule_style="generation_first")
+    config = DisaggServerConfig(
+        server_configs=[],
+        schedule_style="generation_first",
+        request_deadline=DisaggRequestDeadlineConfig(total_seconds=1.0)
+        if request_deadline
+        else None,
+    )
     coordinator = DisaggCoordinatorService(config, client_factory=mock.Mock())
     service = OpenAIDisaggregatedService(config, coordinator, client_factory=mock.Mock())
     coordinator.get_disagg_request_id = mock.AsyncMock(return_value=42)
@@ -296,7 +314,10 @@ async def test_http_failure_reaches_paired_worker_abort(
                     CompletionRequest(model="test-model", prompt="hello", stream=stream)
                 )
             )
-            if sse_error:
+            if request_deadline:
+                with pytest.raises(DisaggRequestTimeoutError):
+                    await asyncio.wait_for(asyncio.shield(request_task), timeout=5)
+            elif sse_error:
                 response = await asyncio.wait_for(asyncio.shield(request_task), timeout=3)
 
                 async def read_stream() -> bytes:

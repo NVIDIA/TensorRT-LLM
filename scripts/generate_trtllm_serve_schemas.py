@@ -290,6 +290,7 @@ def generate_disagg_schema() -> dict:
     from tensorrt_llm.llmapi.disagg_utils import (
         DISAGG_NODE_ID_BITS,
         ConditionalDisaggConfig,
+        DisaggRequestDeadlineConfig,
         OtlpConfig,
         RouterConfig,
         extract_ctx_gen_cfgs,
@@ -326,6 +327,7 @@ def generate_disagg_schema() -> dict:
         _schema_for(ConditionalDisaggConfig, schema)
     )
     orchestrator["otlp_config"] = _nullable(_schema_for(OtlpConfig, schema))
+    orchestrator["request_deadline"] = _nullable(_schema_for(DisaggRequestDeadlineConfig, schema))
     orchestrator["disagg_cluster"] = properties["disagg_cluster"]
     orchestrator["internal_request_auth_key"] = properties["internal_request_auth_key"]
     # Mirror extract_disagg_cfg()'s node_id validation; the bit limit is shared.

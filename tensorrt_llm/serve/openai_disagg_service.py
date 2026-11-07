@@ -28,6 +28,7 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensResponse,
 )
 from tensorrt_llm.serve.disagg_coordinator import DisaggCoordinator
+from tensorrt_llm.serve.disagg_request_deadline import DisaggRequestDeadline
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -167,6 +168,16 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._gen_router = coordinator.gen_router
         self._client_factory = client_factory
         self._req_timeout_secs = req_timeout_secs
+        self._request_deadline_config = config.request_deadline
+        if self._request_deadline_config is not None:
+            if config.schedule_style != "generation_first":
+                raise ValueError("request_deadline currently requires generation_first scheduling")
+            if os.getenv("TRTLLM_DISAGG_NO_RETRY", "0") != "1":
+                raise ValueError("request_deadline requires TRTLLM_DISAGG_NO_RETRY=1")
+            if config.bounded_replay_on_generation:
+                raise ValueError("request_deadline does not support bounded_replay_on_generation")
+            if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+                raise ValueError("request_deadline requires paired CTX/GEN serving")
         # Opt-in body-shrink for generation_only requests; see _get_gen_request.
         self._strip_gen_message_history = config.gen_strip_message_history
         # Opt-in: ask context workers to return prompt_token_ids as base64 int32.
@@ -592,6 +603,39 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_gen_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        """Dispatch a paired request, optionally under one serving deadline.
+
+        Args:
+            request: Validated request accepted for placement and execution.
+            hooks: Existing serving observations for the request.
+
+        Returns:
+            A complete response or a stream that retains the original deadline.
+
+        Raises:
+            DisaggRequestTimeoutError: The configured E2E budget expires.
+        """
+        if self._request_deadline_config is None:
+            return await self._dispatch_gen_first(request, hooks)
+        deadline = DisaggRequestDeadline(self._request_deadline_config.total_seconds)
+        return await deadline.run(lambda: self._dispatch_gen_first(request, hooks, deadline))
+
+    async def _dispatch_gen_first(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        deadline: DisaggRequestDeadline | None = None,
+    ) -> UCompletionResponseOrGenerator:
+        """Run CTX and GEN using existing paired cancellation and stream ownership.
+
+        Args:
+            request: Accepted generation-first request.
+            hooks: Existing serving observations for the request.
+            deadline: Shared serving budget, or None for legacy behavior.
+
+        Returns:
+            The GEN response or its cleanup-owning stream.
+        """
         if hooks:
             hooks.on_req_begin(request)
         # empty server means client decides which server to use
@@ -636,9 +680,18 @@ class OpenAIDisaggregatedService(OpenAIService):
             #
             # Fix: eagerly start consuming the gen generator in a background
             # task so the HTTP POST fires, then pipe chunks through a queue.
-            gen_response = await self._gen_client.send_request(
-                gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
-            )
+            try:
+                gen_response = await self._gen_client.send_request(
+                    gen_req, server=gen_server, hooks=hooks, req_id=disagg_request_id
+                )
+            except (Exception, asyncio.CancelledError) as error:
+                if deadline is not None and isinstance(error, Exception):
+                    deadline.record_failure(error)
+                # CTX placement is reserved, but no CTX HTTP leg owns it yet.
+                await self._ctx_router.finish_request(
+                    request, success=False, req_id=disagg_request_id
+                )
+                raise
 
             queue: asyncio.Queue = asyncio.Queue()
             gen_error: asyncio.Future[None] = asyncio.get_running_loop().create_future()
@@ -648,12 +701,19 @@ class OpenAIDisaggregatedService(OpenAIService):
                 try:
                     async for chunk in gen_response:
                         await queue.put(chunk)
-                        if not gen_error.done() and error_observer.feed(chunk):
-                            gen_error.set_result(None)
+                        if (deadline is not None or not gen_error.done()) and error_observer.feed(
+                            chunk
+                        ):
+                            if deadline is not None:
+                                deadline.record_failure()
+                            if not gen_error.done():
+                                gen_error.set_result(None)
                 finally:
                     queue.put_nowait(None)  # sentinel; the task retains any error
 
-            consume_task: asyncio.Task = asyncio.create_task(_consume_gen())
+            consume_task: asyncio.Task = asyncio.create_task(
+                _consume_gen() if deadline is None else deadline.run(_consume_gen)
+            )
             ctx_task = asyncio.create_task(
                 self._ctx_client.send_request(
                     ctx_req,
@@ -694,7 +754,9 @@ class OpenAIDisaggregatedService(OpenAIService):
                 else:
                     # Normal GEN completion does not replace the CTX result.
                     await ctx_task
-            except (Exception, asyncio.CancelledError):
+            except (Exception, asyncio.CancelledError) as error:
+                if deadline is not None and isinstance(error, Exception):
+                    deadline.record_failure(error)
                 await _close_gen_response()
                 raise
             finally:
@@ -759,6 +821,10 @@ class OpenAIDisaggregatedService(OpenAIService):
                     )
                     return gen_response
                 return await gen_task
+            except Exception as error:
+                if deadline is not None:
+                    deadline.record_failure(error)
+                raise
             finally:
                 # Closing the HTTP leg requests worker cancellation. It does not
                 # authorize reuse of KV memory still owned by a physical transfer.

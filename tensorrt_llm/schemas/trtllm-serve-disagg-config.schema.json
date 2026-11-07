@@ -1716,6 +1716,23 @@
       "title": "DeepSeekV4SparseAttentionConfig",
       "type": "object"
     },
+    "DisaggRequestDeadlineConfig": {
+      "additionalProperties": false,
+      "description": "Optional total request budget enforced by the serving pair owner.",
+      "properties": {
+        "total_seconds": {
+          "description": "Total request budget in seconds, including routing, context, generation, and streaming. This does not change worker HTTP or KV-transfer deadlines.",
+          "exclusiveMinimum": 0,
+          "title": "Total Seconds",
+          "type": "number"
+        }
+      },
+      "required": [
+        "total_seconds"
+      ],
+      "title": "DisaggRequestDeadlineConfig",
+      "type": "object"
+    },
     "DisaggServerBlock": {
       "additionalProperties": false,
       "allOf": [
@@ -9986,6 +10003,30 @@
       "status": "prototype",
       "title": "Replicate Embedding",
       "type": "boolean"
+    },
+    "request_deadline": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "description": "Optional total request budget enforced by the serving pair owner.",
+          "properties": {
+            "total_seconds": {
+              "description": "Total request budget in seconds, including routing, context, generation, and streaming. This does not change worker HTTP or KV-transfer deadlines.",
+              "exclusiveMinimum": 0,
+              "title": "Total Seconds",
+              "type": "number"
+            }
+          },
+          "required": [
+            "total_seconds"
+          ],
+          "title": "DisaggRequestDeadlineConfig",
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "request_stats_max_iterations": {
       "anyOf": [
