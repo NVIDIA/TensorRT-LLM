@@ -15,6 +15,7 @@
 import os
 import threading
 import time
+import traceback
 import uuid
 from collections import Counter, defaultdict
 from itertools import chain
@@ -1094,11 +1095,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                     if isinstance(session, RxSession):
                         try:
                             session.notify_cancel()
-                        except Exception as error:
+                        except RuntimeError as error:
                             # Notification failure is not retirement evidence.
                             # Keep the owner under its original grace deadline.
                             logger.warning(
-                                f"Receive {rid} cancellation notification failed: {error}"
+                                f"Receive {rid} cancellation notification failed; "
+                                f"retaining resources and retrying: {error}\n{traceback.format_exc()}"
                             )
                     continue
                 failed.append(rid)
@@ -1286,7 +1288,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         return self._enable_pipelined_transfer
 
     def has_inflight_transfer(self, req: LlmRequest) -> bool:
-        """Whether a transfer session still owns this request's resources."""
+        """Whether a transfer session or cancelled admission fence retains resources."""
         rid = get_unique_rid(req)
         return (
             rid in self._send_sessions
@@ -1945,6 +1947,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         Returns:
             Whether cancellation is the committed logical outcome. An earlier
             failure and legacy configurations keep their existing response path.
+            With the bridge enabled, a passed ready fence remains retained until
+            cancel_request returns True, even when this method returns False.
         """
         if not getattr(self, "_fp4_mla_bridge_enabled", False):
             return False
@@ -1970,8 +1974,9 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False if any task is mid-write (TRANSFERRING); caller must
-        retry next iteration. Returns True when safe to free KV memory.
+        Returns False while a session or cancelled admission fence may access
+        request memory; caller must retry next iteration. Returns True only
+        after transfer and local CUDA claims settle, permitting resource release.
         """
         rid = get_unique_rid(req)
 

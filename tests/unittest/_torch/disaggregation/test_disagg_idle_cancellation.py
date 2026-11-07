@@ -700,7 +700,7 @@ def test_parked_executor_failure_precedes_generation_cancellation(
 
     def settle() -> None:
         """Supply safe completion evidence for both retained receive resources."""
-        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
         session.process_aux_agent_result(0, AgentResult.SUCCESS)
 
     def cancel() -> None:
@@ -1049,7 +1049,7 @@ def test_settled_receive_waits_for_terminal_response_before_request_release(
     session, _ = _published_receive(executor, request)
     _abort(executor, request)
     executor._cancel_waiting_disagg_requests([])
-    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
     session.process_aux_agent_result(0, AgentResult.SUCCESS)
 
     executor.disagg.poll_gen_transfers()
@@ -1063,6 +1063,115 @@ def test_settled_receive_waits_for_terminal_response_before_request_release(
     executor.resource_manager.free_resources.assert_not_called()
     executor.disagg.poll_gen_transfers()
     _assert_released_once(executor, request)
+
+
+@pytest.mark.parametrize("capacity_only", [False, True])
+def test_connector_save_waits_for_receive_retirement(
+    executor: PyExecutor, capacity_only: bool
+) -> None:
+    """A KV-moving connector cannot read a cancelled destination before it settles.
+
+    Args:
+        executor: Real cancellation path with controlled external resources.
+        capacity_only: Whether the connector only manages capacity, without KV I/O.
+    """
+    request = _request(1)
+    executor.active_requests = [request]
+    session, aux = _published_receive(executor, request)
+    connector = SimpleNamespace(
+        capacity_only=capacity_only,
+        release_unstarted_prefix_loads=Mock(),
+        defer_load_termination=Mock(return_value=False),
+        has_outstanding_save=Mock(return_value=False),
+        request_finished=Mock(return_value=False),
+    )
+    executor.kv_connector_manager = connector
+    executor.kv_cache_manager = SimpleNamespace(get_cache_indices=Mock(return_value=[3, 4]))
+    _abort(executor, request)
+
+    executor._handle_canceled_requests()
+
+    assert request.is_finished_due_to_cancellation == capacity_only
+    assert executor.canceled_req_ids == ([] if capacity_only else [1])
+    connector.request_finished.assert_not_called()
+    executor.resource_manager.free_resources.assert_not_called()
+    aux.free_slot.assert_not_called()
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
+    executor._handle_canceled_requests()
+    connector.request_finished.assert_not_called()
+    session.process_aux_agent_result(0, AgentResult.SUCCESS)
+    executor._handle_canceled_requests()
+
+    assert request.is_finished_due_to_cancellation
+    assert executor.canceled_req_ids == []
+    if capacity_only:
+        connector.request_finished.assert_not_called()
+        assert executor.disagg.has_local_retiring_gen_receives
+    else:
+        connector.request_finished.assert_called_once_with(request, [3, 4], None)
+        assert not executor.kv_cache_transceiver.has_inflight_transfer(request)
+        assert not executor.disagg.has_local_retiring_gen_receives
+        aux.free_slot.assert_called_once_with(0)
+
+
+@pytest.mark.parametrize("handoff", [False, True], ids=["logical-cancel", "fence-handoff"])
+@pytest.mark.parametrize("error_type", [RuntimeError, TypeError])
+def test_new_cancellation_boundary_preserves_unexpected_errors(
+    executor: PyExecutor, handoff: bool, error_type: type[Exception]
+) -> None:
+    """Retry operational errors without hiding bugs or dropping an unpublished fence.
+
+    Args:
+        executor: Real coordinator with controlled transceiver failure injection.
+        handoff: Whether to enter through the physical cancellation handoff.
+        error_type: Operational or unexpected error injected at the new boundary.
+    """
+    request = _request(1)
+    request.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+    ready = Mock(spec=["query"])
+    executor.disagg._unpublished_gen_receives[1] = (request, ready)
+    executor.kv_cache_transceiver.cancel_gen_logically = Mock(
+        side_effect=error_type("cancellation error")
+    )
+    executor.kv_cache_transceiver.cancel_request = Mock()
+    cancel = (
+        executor.disagg.request_cancellation if handoff else executor.disagg.cancel_gen_logically
+    )
+
+    if error_type is RuntimeError:
+        assert cancel(request) is False
+    else:
+        with pytest.raises(error_type, match="cancellation error"):
+            cancel(request)
+
+    assert executor.disagg._unpublished_gen_receives == {1: (request, ready)}
+    assert executor.disagg._retiring_gen_receives == {}
+    executor.kv_cache_transceiver.cancel_request.assert_not_called()
+    ready.query.assert_not_called()
+    executor.resource_manager.free_resources.assert_not_called()
+
+
+def test_receive_progress_does_not_hide_notification_programming_error(
+    executor: PyExecutor,
+) -> None:
+    """Unexpected errors escape the new polling guard without releasing ownership.
+
+    Args:
+        executor: Real receive session with a controlled notification boundary.
+    """
+    request = _request(1)
+    session, aux = _published_receive(executor, request)
+    session.cancel_local()
+    session.notify_cancel = Mock(side_effect=TypeError("invalid notification"))
+    transceiver = executor.kv_cache_transceiver
+
+    with pytest.raises(TypeError, match="invalid notification"):
+        transceiver._collect_done(transceiver._recv_sessions, transceiver._recv_reqs)
+
+    assert transceiver.has_inflight_transfer(request)
+    assert transceiver._recv_reqs == {1: request}
+    aux.free_slot.assert_not_called()
+    executor.resource_manager.free_resources.assert_not_called()
 
 
 def test_peer_notification_error_does_not_delay_logical_cancellation(executor: PyExecutor) -> None:
@@ -1096,7 +1205,7 @@ def test_peer_notification_error_does_not_delay_logical_cancellation(executor: P
     assert [call.args for call in notify.call_args_list if call.args[1]] == [(1, {"ctx"})]
     assert len(executor.responses[1]) == 1
     executor.resource_manager.free_resources.assert_not_called()
-    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+    session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
     session.process_aux_agent_result(0, AgentResult.SUCCESS)
     executor.disagg.poll_gen_transfers()
     _assert_released_once(executor, request)
@@ -1272,7 +1381,7 @@ def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
     executor._disable_mpi = False
     executor.request_accumulated = []
     executor.hang_detector = MagicMock()
-    executor.request_broadcaster = SimpleNamespace(broadcast=Mock(return_value=([], {})))
+    executor.request_broadcaster = SimpleNamespace(broadcast=Mock(return_value=[]))
     executor.executor_request_queue.batch_wait_timeout_ms = 1000.0
     queue = executor.executor_request_queue.request_queue
     original_get = queue.get
@@ -1291,7 +1400,7 @@ def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
     executor.resource_manager.free_resources.assert_not_called()
     assert executor.disagg._retiring_gen_receives == {1: request}
     if published:
-        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS)
+        session.process_kv_agent_result(0, 0, True, AgentResult.SUCCESS, _KV_RESULT_REPORT_TOKEN)
         session.process_aux_agent_result(0, AgentResult.SUCCESS)
     else:
         ready.query.return_value = True
@@ -1301,8 +1410,56 @@ def test_pending_receive_retirement_keeps_idle_fetch_and_shutdown_live(
     _assert_released_once(executor, request)
 
 
-def test_adp_receive_retirement_snapshot_keeps_empty_peer_live() -> None:
-    """Reuse the existing ADP vote so an empty rank cannot stop a peer's retirement."""
+def test_shutdown_without_retirement_skips_batch_wait(
+    executor: PyExecutor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A consumed shutdown sentinel cannot wait for another batch to arrive.
+
+    Args:
+        executor: Idle executor with its shutdown sentinel already consumed.
+        monkeypatch: Guards blocking queue reads.
+    """
+    executor.is_shutdown = True
+    executor.control_requests = []
+    executor._disable_mpi = False
+    executor.request_accumulated = []
+    executor.hang_detector = MagicMock()
+    executor.request_broadcaster = SimpleNamespace(broadcast=Mock(return_value=[]))
+    executor.executor_request_queue.batch_wait_timeout_ms = 1000.0
+    queue = executor.executor_request_queue.request_queue
+    original_get = queue.get
+
+    def nonblocking_get(block: bool = True, timeout: float | None = None) -> RequestQueueItem:
+        """Reject blocking reads while preserving the real empty-queue behavior.
+
+        Args:
+            block: Whether the queue read may wait.
+            timeout: Queue read timeout.
+
+        Returns:
+            An available queue item, if any.
+
+        Raises:
+            AssertionError: The executor attempts a blocking read.
+            queue.Empty: No item is available.
+        """
+        assert not block, "shutdown waited for a batch that will never arrive"
+        return original_get(block=block, timeout=timeout)
+
+    monkeypatch.setattr(queue, "get", nonblocking_get)
+    assert executor.should_stop_processing
+    executor._fetch_and_enqueue_requests(executor.waiting_queue, 0)
+    executor.request_broadcaster.broadcast.assert_called_once_with([], prefer_cpu=False)
+
+
+def test_adp_receive_retirement_snapshot_keeps_empty_peer_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reuse the existing ADP vote so an empty rank cannot stop a peer's retirement.
+
+    Args:
+        monkeypatch: Guards CUDA control execution while retirement remains pending.
+    """
     group = FakeDistGroup(world_size=2, tp_size=2)
     ranks = [
         CoordinatorHarness(dist=group.rank(rank), enable_attention_dp=True) for rank in range(2)
@@ -1320,10 +1477,32 @@ def test_adp_receive_retirement_snapshot_keeps_empty_peer_live() -> None:
         "tp_allgather",
         {"error_ids": [], "blocked_ids": [], "retiring_gen_receives": True},
     )
+    engines = []
+    for rank in ranks:
+        engine = object.__new__(PyExecutor)
+        engine._disagg_coordinator = rank.coordinator
+        engine.dist = rank.dist
+        engine.enable_attention_dp = True
+        engine.kv_connector_manager = None
+        engine.active_requests = []
+        engine.waiting_queue = FCFSWaitingQueue()
+        engine.is_shutdown = True
+        engine.control_requests = [SimpleNamespace(control_requires_drain=True)]
+        engines.append(engine)
+    synchronize = Mock(side_effect=AssertionError("control crossed pending retirement"))
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.py_executor.torch.cuda.synchronize", synchronize
+    )
+    assert [engine.should_stop_processing for engine in engines] == [False, False]
+    group.run(lambda rank: engines[rank]._handle_control_request())
+    synchronize.assert_not_called()
+    assert [rank.dist.calls[-1] for rank in ranks] == [("tp_allgather", 0)] * 2
+
     ranks[1].coordinator._retiring_gen_receives.clear()
     group.run(lambda rank: ranks[rank].coordinator.handle_errors_synced())
     assert not any(rank.coordinator.has_retiring_gen_receives for rank in ranks)
-    assert [len(rank.dist.calls) for rank in ranks] == [2, 2]
+    assert [engine.should_stop_processing for engine in engines] == [True, True]
+    assert [len(rank.dist.calls) for rank in ranks] == [3, 3]
 
 
 class _ReachedScheduler(Exception):

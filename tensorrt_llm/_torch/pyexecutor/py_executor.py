@@ -1203,7 +1203,7 @@ class PyExecutor:
                 self.async_transfer_manager)
         if hasattr(self.scheduler, "set_retiring_gen_receives_probe"):
             self.scheduler.set_retiring_gen_receives_probe(
-                lambda: self.disagg.has_retiring_gen_receives)
+                lambda: self.disagg.has_local_retiring_gen_receives)
 
         # Router is built after async_transfer_manager so KVCacheAwareADPRouter
         # can receive the transfer-manager reference at construction time.
@@ -10889,10 +10889,10 @@ class PyExecutor:
                 if self.disagg.request_cancellation(request):
                     request.state = LlmRequestState.DISAGG_TRANS_ERROR
                 continue
-            # Even an unsubmitted CTX request may be in the transceiver's
-            # peer-info wait set. Cancel there before a late ready can revive it.
             logically_cancelled = (generation_waiting and
                                    self.disagg.cancel_gen_logically(request))
+            # Even an unsubmitted CTX request may be in the transceiver's
+            # peer-info wait set. Cancel there before a late ready can revive it.
             if not logically_cancelled and not self.disagg.request_cancellation(
                     request):
                 continue
@@ -10967,7 +10967,10 @@ class PyExecutor:
                 request.state = LlmRequestState.DISAGG_TRANS_ERROR
             return False
 
-        if self.disagg.cancel_gen_logically(request):
+        # KV-moving connectors can read destination pages when cancellation
+        # finishes the request. Keep that handoff behind physical retirement.
+        if (not self._kv_connector_moves_kv
+                and self.disagg.cancel_gen_logically(request)):
             return True
 
         async_transfer_manager = getattr(self, "async_transfer_manager", None)
