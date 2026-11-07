@@ -38,6 +38,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_man
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.regions import RegionProvider
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType
+from tensorrt_llm._utils import async_tensor_h2d
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -780,11 +781,7 @@ class KDAReplayState:
             for slot in host_slots
         ]
         slots = _host_slots_to_device(host_slots, self.rand_seed.device)
-        self.rand_seed[slots] = torch.tensor(
-            seeds,
-            dtype=torch.int64,
-            device=self.rand_seed.device,
-        )
+        self.rand_seed[slots] = async_tensor_h2d(seeds, torch.int64, self.rand_seed.device)
 
     def reset_slots(
         self,
@@ -1710,20 +1707,20 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if not active_requests:
             return
         device = replay.prev_num_accepted_tokens.device
-        replay_indices = torch.tensor(
+        replay_indices = async_tensor_h2d(
             self.get_replay_state_indices([request.py_request_id for request in active_requests]),
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
-        accepted_drafts = torch.tensor(
+        accepted_drafts = async_tensor_h2d(
             [request.py_num_accepted_draft_tokens for request in active_requests],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
-        is_dummy_request = torch.tensor(
+        is_dummy_request = async_tensor_h2d(
             [dummy_map.get(request.py_request_id, False) for request in active_requests],
-            dtype=torch.bool,
-            device=device,
+            torch.bool,
+            device,
         )
         replay.record_acceptance(replay_indices, accepted_drafts, is_dummy_request)
 
