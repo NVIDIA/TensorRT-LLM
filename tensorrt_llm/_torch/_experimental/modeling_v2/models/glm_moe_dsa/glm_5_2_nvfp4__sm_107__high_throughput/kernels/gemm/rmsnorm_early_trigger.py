@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Adapted from FlashInfer 0.6.18.post1 (https://github.com/flashinfer-ai/flashinfer) under the
+# Adapted from FlashInfer (https://github.com/flashinfer-ai/flashinfer) under the
 # Apache-2.0 license: RMSNormKernel, _get_compiled_rmsnorm_kernel and rmsnorm_cute from
 # flashinfer/norm/kernels/rmsnorm.py, and the reduction and predicate helpers they use from
 # flashinfer/norm/utils.py. The only change is where the kernel triggers its PDL dependents.

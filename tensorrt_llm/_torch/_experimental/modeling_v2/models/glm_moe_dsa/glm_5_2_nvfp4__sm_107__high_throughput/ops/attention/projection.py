@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 def build_projection_weights(mla) -> None:
     indexer = mla.mqa.indexer
-    old = getattr(mla, "fused_a_indexer_weight", None)
+    fused = getattr(mla, "fused_a_indexer_weight", None)
     mla.fused_a_indexer_weight = None
     linear = mla.kv_a_proj_with_mqa
     if indexer is None or linear.has_any_quant or linear.bias is not None:
@@ -41,14 +41,14 @@ def build_projection_weights(mla) -> None:
     shape = (sum(p.shape[0] for p in parts), 6144)
     if shape != (2784, 6144):
         return
-    if old is None or tuple(old.shape) != shape or old.device != linear.weight.device:
-        old = linear.weight.new_empty(shape)
+    if fused is None or tuple(fused.shape) != shape or fused.device != linear.weight.device:
+        fused = linear.weight.new_empty(shape)
     offset = 0
     with torch.no_grad():
         for part in parts:
-            old[offset : offset + part.shape[0]].copy_(part)
+            fused[offset : offset + part.shape[0]].copy_(part)
             offset += part.shape[0]
-    mla.fused_a_indexer_weight = old
+    mla.fused_a_indexer_weight = fused
 
 
 def _q_b_norm_fold_ready(mla: MLA) -> bool:

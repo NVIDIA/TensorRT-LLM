@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Configuration and quantization scope for the HIGH target's MTP layers."""
+"""Configuration and quantization scope for the high-throughput target's MTP layers."""
 
 import copy
 from typing import Optional

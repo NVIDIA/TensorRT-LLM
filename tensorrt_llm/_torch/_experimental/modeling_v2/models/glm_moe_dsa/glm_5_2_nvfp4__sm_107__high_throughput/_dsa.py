@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""DSA context and generation dispatch for the HIGH MLA module."""
+"""DSA context and generation dispatch for the high-throughput MLA module."""
 
 from __future__ import annotations
 

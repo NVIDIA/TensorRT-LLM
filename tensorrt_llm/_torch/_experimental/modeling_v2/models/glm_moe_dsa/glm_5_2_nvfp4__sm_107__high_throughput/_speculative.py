@@ -30,7 +30,7 @@ def _slice_spec_position_ids(
 class Glm52SpecDecOneEngineForCausalLM(
     DecoderModelForCausalLM[TModel, TConfig], Generic[TModel, TConfig]
 ):
-    """Run the HIGH target and its checkpoint MTP layer in one engine."""
+    """Run the high-throughput target and its checkpoint MTP layer in one engine."""
 
     spec_decode_fast_paths = False
     runtime_hooks = None
