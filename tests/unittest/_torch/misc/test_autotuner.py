@@ -1846,6 +1846,24 @@ def test_parallel_tactics_split_skips_non_helix_cp_ranks():
         tactics, DistributedTuningStrategy.PARALLEL) == tactics
 
 
+@pytest.mark.parametrize("num_tactics", [0, 1, 3, 15, 16, 17])
+def test_parallel_tactics_short_list_keeps_one_candidate_per_idle_rank(
+        num_tactics: int) -> None:
+    from types import SimpleNamespace
+
+    tactics = list(range(num_tactics))
+    shards = []
+    for rank in range(16):
+        tuner = SimpleNamespace(_is_distributed=lambda: True,
+                                _tuning_group=lambda: (16, rank))
+        selected = autotuner.AutoTuner._maybe_parallelize_tactics(
+            tuner, tactics, DistributedTuningStrategy.PARALLEL)
+        shards.append(selected)
+        assert len(selected) <= max(1, (num_tactics + 15) // 16)
+        assert bool(selected) == bool(tactics)
+    assert set(tactic for shard in shards for tactic in shard) == set(tactics)
+
+
 def test_profiling_cache_enum_tactic_roundtrip(tmp_path):
     # An enum tactic must survive save -> load: repr("<Enum.X: v>") isn't
     # ast.literal_eval-parsable, so the cache serializes tactic.value instead.
