@@ -907,9 +907,9 @@ SlotCount StorageManager::numRetainedCopies(CacheLevel level, std::optional<Pool
 
 void StorageManager::addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot)
 {
+    // With several disk levels a page may still retain a copy at another level; keep only the newest.
     if (auto it = mRetainedByPage.find(&page); it != mRetainedByPage.end())
     {
-        TLLM_CHECK_DEBUG_WITH_INFO(false, "Page already has a retained copy");
         eraseRetainedCopy(it->second);
     }
     mRetainedCopies.push_back(RetainedCopy{&page, level, pgIdx, std::move(slot), false});

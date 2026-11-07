@@ -28,9 +28,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <sys/stat.h>
 #include <thread>
 #include <unistd.h>
@@ -457,12 +459,23 @@ struct DiskTransfer
 class DiskIoPool
 {
 public:
-    explicit DiskIoPool(size_t numThreads)
+    //! Returns how many of \p numThreads workers started.
+    size_t start(size_t numThreads) noexcept
     {
-        for (size_t i = 0; i < numThreads; ++i)
+        size_t started = 0;
+        try
         {
-            std::thread([this] { run(); }).detach();
+            for (; started < numThreads; ++started)
+            {
+                std::thread([this] { run(); }).detach();
+            }
         }
+        catch (std::exception const& e)
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] started %zu of %zu disk I/O threads: %s", started, numThreads, e.what());
+        }
+        return started;
     }
 
     void waitIdle()
@@ -553,11 +566,13 @@ private:
     std::deque<Piece> mWrites;
 };
 
+// Set once by configureAsyncDiskIo, before gAsyncDiskIoThreads. Intentionally leaked: detached workers may
+// still be waiting on it during static destruction.
+std::atomic<DiskIoPool*> gDiskIoPool{nullptr};
+
 DiskIoPool& diskIoPool()
 {
-    // Intentionally leaked: detached workers may still be waiting on it during static destruction.
-    static auto* const pool = new DiskIoPool(gAsyncDiskIoThreads.load());
-    return *pool;
+    return *gDiskIoPool.load(std::memory_order_acquire);
 }
 
 struct DiskLaunch
@@ -590,7 +605,13 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
     CompletionFlags* const flags = completionFlags();
     if (flags == nullptr)
     {
-        return cuLaunchHostFunc(stream, hostFnRunDiskTransfer, new DiskLaunch{std::move(transfer)});
+        auto launch = std::make_unique<DiskLaunch>(DiskLaunch{std::move(transfer)});
+        CUresult const result = cuLaunchHostFunc(stream, hostFnRunDiskTransfer, launch.get());
+        if (result == CUDA_SUCCESS)
+        {
+            static_cast<void>(launch.release());
+        }
+        return result;
     }
     uint64_t const ticket = flags->nextTicket.fetch_add(1);
     if (ticket > kFlagSlots)
@@ -606,6 +627,8 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
     if (CUresult const result = cuLaunchHostFunc(stream, hostFnSubmitDiskTransfer, launch.get());
         result != CUDA_SUCCESS)
     {
+        // Retire the ticket, or the transfer that reuses its word after the ring wraps would wait forever.
+        flags->host[ticket % kFlagSlots].store(ticket, std::memory_order_release);
         return result;
     }
     static_cast<void>(launch.release()); // owned by the callback now
@@ -615,7 +638,7 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
 
 bool asyncDiskIo() noexcept
 {
-    return gAsyncDiskIoThreads.load(std::memory_order_relaxed) > 0;
+    return gAsyncDiskIoThreads.load(std::memory_order_acquire) > 0;
 }
 
 } // namespace
@@ -650,19 +673,38 @@ void configureAsyncDiskIo(size_t numThreads) noexcept
     {
         return;
     }
-    size_t current = 0;
-    if (gAsyncDiskIoThreads.compare_exchange_strong(current, numThreads))
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (size_t const current = gAsyncDiskIoThreads.load(); current != 0)
     {
-        auto const& config = diskIoConfig();
-        TLLM_LOG_INFO(
-            "[kvCacheManagerV2Utils] async disk I/O: threads=%zu chunk_bytes=%zu direct_write=%d direct_read=%d",
-            numThreads, config.chunkBytes, static_cast<int>(config.directWrite), static_cast<int>(config.directRead));
+        if (current != numThreads)
+        {
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] async disk I/O already uses %zu threads; ignoring a request for %zu", current,
+                numThreads);
+        }
+        return;
     }
-    else if (current != numThreads)
+    auto* pool = gDiskIoPool.load();
+    if (pool == nullptr)
     {
-        TLLM_LOG_WARNING("[kvCacheManagerV2Utils] async disk I/O already uses %zu threads; ignoring a request for %zu",
-            current, numThreads);
+        pool = new (std::nothrow) DiskIoPool;
+        if (pool == nullptr)
+        {
+            return;
+        }
+        gDiskIoPool.store(pool, std::memory_order_release);
     }
+    size_t const started = pool->start(numThreads);
+    if (started == 0)
+    {
+        TLLM_LOG_WARNING("[kvCacheManagerV2Utils] no disk I/O thread started; using synchronous disk I/O");
+        return;
+    }
+    gAsyncDiskIoThreads.store(started, std::memory_order_release);
+    auto const& config = diskIoConfig();
+    TLLM_LOG_INFO("[kvCacheManagerV2Utils] async disk I/O: threads=%zu chunk_bytes=%zu direct_write=%d direct_read=%d",
+        started, config.chunkBytes, static_cast<int>(config.directWrite), static_cast<int>(config.directRead));
 }
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
