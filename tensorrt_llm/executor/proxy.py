@@ -49,6 +49,7 @@ from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import PostprocWorker, PostprocWorkerConfig
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
+from .remote_worker_process_monitor import WORKER_WATCH_HINT
 from .request_sender import _RequestSender
 from .result import GenerationResult, IterationResult
 from .rpc import RPCClient
@@ -1012,8 +1013,9 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         if not self._worker_process_monitor.wait_remote_ready():
             self._fail_initialization(
-                RuntimeError(
-                    "Remote worker process supervision is unavailable"),
+                RuntimeInitError(
+                    "Remote worker process supervision is unavailable",
+                    hint=WORKER_WATCH_HINT),
                 self._detect_worker_death_during_init())
 
         with self._command_failure_lock:
@@ -1021,9 +1023,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             self._workers_ready = command_failure is None
         if command_failure is not None:
             self._fail_initialization(
-                RuntimeError(
-                    "Executor command connection lost during initialization"),
-                command_failure)
+                RuntimeInitError(
+                    "Executor command connection lost during initialization",
+                    reason="worker_died"), command_failure)
 
         # Register the fast-death callback only after the world reported
         # ready: on an already-completed future, add_done_callback() runs the

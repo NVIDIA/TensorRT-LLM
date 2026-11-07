@@ -29,8 +29,11 @@ from pathlib import Path
 _HEARTBEAT_INTERVAL = 0.5
 _HEARTBEAT_TIMEOUT = 5.0
 _RECEIVE_WAIT = 0.1
+# A worker call that returns or raises reports its outcome through MPI, which
+# arrives after the helper's final report. Defer to that outcome briefly.
+_RETURN_GRACE = 2.0
 _START_TIMEOUT = 10.0
-_NETWORK_HINT = (
+WORKER_WATCH_HINT = (
     "Set TRTLLM_WORKER_WATCH_HOST to this proxy's address reachable from every MPI worker "
     "and allow worker-to-proxy TCP traffic through the firewall. "
     "TRTLLM_WORKER_WATCH_PORT selects a fixed listener port. "
@@ -60,6 +63,7 @@ class RemoteWorkerProcessMonitor:
         """
         import zmq
 
+        from tensorrt_llm._errors import ConfigInputError, ResourceError, RuntimeInitError
         from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
 
         from .ipc import IpcQueue
@@ -69,29 +73,34 @@ class RemoteWorkerProcessMonitor:
         self._lock = threading.Lock()
         self._stopped = threading.Event()
         self._seen: dict[int, tuple[dict, float]] = {}
+        self._returned: dict[int, tuple[dict, float]] = {}
         self._failure: dict | None = None
         host = os.environ.get("TRTLLM_WORKER_WATCH_HOST") or get_local_ip()
         try:
             family, _, _, _, address = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)[0]
         except socket.gaierror as error:
-            raise RuntimeError(
-                f"Cannot resolve process-watch host {host!r}. {_NETWORK_HINT}"
+            raise RuntimeInitError(
+                f"Cannot resolve process-watch host {host!r}. {WORKER_WATCH_HINT}",
+                hint=WORKER_WATCH_HINT,
             ) from error
         host = address[0]
         # Reject wildcard advertised addresses; this comparison does not bind.
         # Loopback is valid when every rank can report to this endpoint.
         if ipaddress.ip_address(host).is_unspecified:
-            raise RuntimeError(
-                f"Cannot advertise wildcard process-watch host {host!r}. {_NETWORK_HINT}"
+            raise RuntimeInitError(
+                f"Cannot advertise wildcard process-watch host {host!r}. {WORKER_WATCH_HINT}",
+                hint=WORKER_WATCH_HINT,
             )
         port = os.environ.get("TRTLLM_WORKER_WATCH_PORT", "*")
         if port != "*":
             try:
                 port_number = int(port)
             except ValueError as error:
-                raise ValueError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535") from error
+                raise ConfigInputError(
+                    "TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535"
+                ) from error
             if not 1 <= port_number <= 65535:
-                raise ValueError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535")
+                raise ConfigInputError("TRTLLM_WORKER_WATCH_PORT must be between 1 and 65535")
             port = str(port_number)
         ipv6 = family == socket.AF_INET6
         # The advertised address may be forwarded from outside this namespace.
@@ -107,8 +116,10 @@ class RemoteWorkerProcessMonitor:
                 ipv6=ipv6,
             )
         except zmq.ZMQError as error:
-            raise RuntimeError(
-                f"Cannot bind process-watch listener {bind_address}. {_NETWORK_HINT}"
+            raise ResourceError(
+                f"Cannot bind process-watch listener {bind_address}. {WORKER_WATCH_HINT}",
+                reason="port",
+                hint=WORKER_WATCH_HINT,
             ) from error
         port = self._queue.address[0].rsplit(":", 1)[1]
         advertised_host = f"[{host}]" if ipv6 else host
@@ -152,7 +163,7 @@ class RemoteWorkerProcessMonitor:
             "MPI ranks %s did not report to process-watch endpoint %s. %s",
             missing,
             self.endpoint.address,
-            _NETWORK_HINT,
+            WORKER_WATCH_HINT,
         )
         return False
 
@@ -171,7 +182,9 @@ class RemoteWorkerProcessMonitor:
             if previous is not None and sequence <= previous[0]["sequence"]:
                 return
             self._seen[rank] = (report, time.monotonic())
-        if report.get("kind") != "alive":
+            if report.get("kind") == "returned":
+                self._returned.setdefault(rank, (report, time.monotonic()))
+        if report.get("kind") not in ("alive", "returned"):
             self._fail({**report, "reason": "worker exited"})
 
     def _run(self) -> None:
@@ -209,10 +222,15 @@ class RemoteWorkerProcessMonitor:
                 # Check leases after each bounded drain, even if traffic keeps
                 # arriving. A busy peer must not hide a silent rank forever.
                 with self._lock:
+                    returned = [
+                        r for r, seen in self._returned.values() if now - seen > _RETURN_GRACE
+                    ]
                     expired = [
                         r for r, seen in self._seen.values() if now - seen > _HEARTBEAT_TIMEOUT
                     ]
-                if expired:
+                if returned:
+                    self._fail({**returned[0], "reason": "worker returned without an MPI result"})
+                elif expired:
                     self._fail({**expired[0], "reason": "heartbeat timed out"})
         except Exception as error:
             # Losing the supervisor is itself a terminal loss of worker coverage.
@@ -258,9 +276,13 @@ class WorkerProcessWatch:
             self._process.stdin.flush()
             readable, _, _ = select.select([self._process.stdout], [], [], _START_TIMEOUT)
             if not readable or self._process.stdout.readline().strip() != "ready":
-                raise RuntimeError(
+                from tensorrt_llm._errors import RuntimeInitError
+
+                # The hint stays in the message for launchers that forward only text.
+                raise RuntimeInitError(
                     f"MPI rank {rank} process watch failed to connect to {endpoint.address}. "
-                    f"{_NETWORK_HINT}"
+                    f"{WORKER_WATCH_HINT}",
+                    hint=WORKER_WATCH_HINT,
                 )
         except BaseException:
             self.close()
@@ -345,8 +367,10 @@ def _watch_process() -> int:
             report["sequence"] += 1
             readable, _, _ = select.select([sys.stdin], [], [], _HEARTBEAT_INTERVAL)
             if readable:
-                sys.stdin.readline()
-                report["kind"] = "exited"
+                # A stop request means the worker call ended in a live process;
+                # end of input without one means the worker process is gone.
+                stopped = sys.stdin.readline().strip() == "stop"
+                report["kind"] = "returned" if stopped else "exited"
 
 
 if __name__ == "__main__":
