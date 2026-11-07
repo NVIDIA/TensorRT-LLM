@@ -120,7 +120,7 @@ class LayerwiseNvtxMarker(object):
                                                            tensor_list=[])
         if in_tensor_list:
             marker_dict['Inputs'] = in_tensor_list
-            logger.debug("Input Tensor List-> {in_tensor_list}")
+            logger.debug(f"Input Tensor List-> {in_tensor_list}")
 
         nvtx.range_push("{}".format(marker_dict))
 
