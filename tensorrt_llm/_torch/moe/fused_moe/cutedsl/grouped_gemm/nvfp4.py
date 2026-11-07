@@ -41,10 +41,18 @@ from ...impl_identity import MoEImplDescriptor, register_moe_impl
 from ...interface import MoESchedulerKind
 from ...quantization import NVFP4CuteDslFusedMoEMethod
 from ..identity import grouped_gemm_identity
-from ..kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from ..kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    prequantized_nvfp4_input_scale,
+    quantize_input_nvfp4,
+)
 from ..runners import CuteDslFusedMoENvfp4Runner
 from .base import CuteDslFusedMoEBase
 from .eligibility import check_grouped_gemm_leaf
+
+# Import-time opt-in for the grouped-GEMM leaf's tiled BF16 input quantizer.
+TRITON_INPUT_QUANT = os.environ.get("TRTLLM_MOE_TRITON_FP4_QUANT", "0") == "1"
 
 # Kill switch for TrtllmCutedslGroupedGemmNvfp4Impl.quantize_input_async.
 ASYNC_INPUT_QUANT = os.environ.get("TLLM_MOE_ASYNC_INPUT_QUANT", "1") == "1"
@@ -127,19 +135,35 @@ class TrtllmCutedslGroupedGemmNvfp4Impl(CuteDslFusedMoEBase):
             and getattr(self, "_locality_domain_runtime", None) is None
         )
 
-    def prequantized_nvfp4_input_scale(self) -> torch.Tensor | None:
-        """``quantize_input`` passes an unswizzled ``Fp4QuantizedTensor`` through, except on a
-        layer with a pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC)."""
-        if getattr(self, "fc31_act_scale", None) is not None:
-            return None
-        return self.fc31_input_scale
+    # Shared NVFP4 input handling: the passthrough rule and its prequant
+    # exception live once in kernel_inputs.py.
+    prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
 
     def consumes_sort_tables(self) -> bool:
         """Runs on the routing kernel's tables when they match the tuned tile
         (``run_moe_nvfp4``); not with locality domains or a slot remap."""
         return self._locality_domain_runtime is None and self.num_slots == self.num_experts
 
-    quantize_input = quantize_input_nvfp4
+    def quantize_input(
+        self,
+        x: torch.Tensor | Fp4QuantizedTensor,
+        post_quant_comm: bool = True,
+        *,
+        enable_triton: bool = TRITON_INPUT_QUANT,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Quantize eligible inputs with the tiled Triton kernel when enabled.
+
+        ``TRTLLM_MOE_TRITON_FP4_QUANT`` sets this grouped-GEMM leaf's default
+        at import time; it does not enable the dense-GEMM or fused-FC12 leaves.
+        Callers can override it with ``enable_triton``; input eligibility and
+        the NVFP4 backend's architecture requirements still apply.
+        """
+        return quantize_input_nvfp4(
+            self,
+            x,
+            post_quant_comm,
+            enable_triton=enable_triton,
+        )
 
     def quantize_input_async(
         self,

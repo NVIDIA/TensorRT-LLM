@@ -97,6 +97,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     List,
     Literal,
     NamedTuple,
@@ -131,6 +132,7 @@ from ..distributed.ops import MnnvlOwnWorkspace, MnnvlPushTarget
 from ..distributed.symm_mem_allgather import SymmetricMemoryAllGather
 from ..kimi_k3_cache_policy import KIMI_K3_FP8_KV_LAYERS_ENV, get_kimi_k3_fp8_kv_layer_ids
 from ..model_config import ModelConfig
+from ..modules.dwdp.dense.manager import get_global_dense_dwdp_manager
 from ..modules.gated_mlp import GatedMLP
 from ..modules.helix_tail import HelixTail
 from ..modules.kimi_kda import KimiKDALinearAttention
@@ -211,6 +213,10 @@ _ROUTER_FIRST_MAX_TOKENS = 64
 # SMs a fork at the start would hand to the shared GEMMs. The bound is the batch range where that
 # ordering is the faster one.
 _MOE_FRONT_FORK_AT_HEAD_MAX_TOKENS = 16
+# The router-logits kernel pays where the K3 latent stream lets its result be consumed
+# early: measured on GB300 (SM103) and VR200 (SM107). SM100 keeps ``dsv3_router_gemm_op``:
+# without the overlap the shorter launch only shortens the route tail it replaced.
+_ROUTER_LOGITS_KERNEL_SMS = ((10, 3), (10, 7))
 # SMs the shared expert's GEMMs keep to while they run beside routed experts whose backend leaves
 # that many SMs free of its persistent grid (``MoEImplBase.reserve_sms_for_concurrent_kernels``).
 _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID = 16
@@ -234,7 +240,7 @@ def _latent_all_reduce_workspace(latent_size: int) -> MnnvlOwnWorkspace:
 
 
 @contextmanager
-def _cublas_sm_limit(num_sms: int):
+def _cublas_sm_limit(num_sms: int) -> Iterator[None]:
     """Run the cuBLAS GEMMs issued inside on ``num_sms`` SMs (no limit for 0).
 
     Uses torch's SM carveout, which cuBLAS reads when a GEMM is issued, so CUDA graph capture
@@ -317,7 +323,12 @@ class KimiK3MoEGate(nn.Module):
                 from ..moe.kernels.blackwell import kimi_k3_router_logits
 
                 x = hidden_2d.contiguous()
-                if kimi_k3_router_logits.can_run(x, self.weight):
+                if (
+                    kimi_k3_router_logits.can_run(x, self.weight)
+                    # Measured SMs only (_ROUTER_LOGITS_KERNEL_SMS): an unmeasured SM keeps
+                    # the kernel it replaces.
+                    and torch.cuda.get_device_capability(x.device) in _ROUTER_LOGITS_KERNEL_SMS
+                ):
                     return torch.ops.trtllm.kimi_k3_router_logits(x, self.weight)
             return torch.ops.trtllm.dsv3_router_gemm_op(
                 hidden_2d.contiguous(),
@@ -2158,6 +2169,15 @@ class KimiK3MoERuntime(nn.Module):
         )
 
         routed_moe_model_config = self._routed_moe_model_config(model_config)
+        # The router-logits kernel pays where the K3 latent stream lets its result be
+        # consumed early (CuteDSL / CuteDSL-FC12); elsewhere (the default TRTLLM backend,
+        # no-graph forwards) the shorter launch only shortens the route tail, so those
+        # keep ``trtllm::dsv3_router_gemm_op``.
+        if self.gate.logits_kernel:
+            self.gate.logits_kernel = routed_moe_model_config.moe_backend in (
+                "CUTEDSL",
+                "CUTEDSL_FC12",
+            )
         routed_quant_config = self._resolve_routed_quant_config(model_config, layer_idx)
         # Resolved here so ``load_weights`` reads the checkpoint layout off the
         # module instead of re-deriving it at each of its three call sites.
@@ -2300,17 +2320,18 @@ class KimiK3MoERuntime(nn.Module):
             and not self._defer_shared_allreduce
             and not (isinstance(shared_down, TrtllmLinear) and shared_down.use_fused_gemm_allreduce)
         )
-        # A persistent routed grid that leaves SMs free (CUTEDSL_FC12) runs beside the shared
-        # expert, whose GEMMs keep to those SMs, instead of waiting for them. MoE modules and
-        # backends outside the ``MoEImplBase`` contract do not offer it.
-        reserve_sms = getattr(
-            getattr(self.routed_experts, "backend", None),
-            "reserve_sms_for_concurrent_kernels",
-            None,
-        )
+        # The routed grid can run SM-short only where the backend sizes a persistent
+        # grid it can shrink (``MoEImplBase.sm_reserve_ceiling``; the fused FC12 leaf
+        # offers 16). This is the construction-time capability; the per-launch reserve
+        # and its carveout pairing are decided per forward (_shared_sms_now), because
+        # multi-stream is a per-forward state and the FP8 weight-read swap can move the
+        # shared projections onto a CuTe DSL GEMM after construction.
         self._shared_sms = (
-            reserve_sms(_SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID)
-            if reserve_sms is not None and not self._defer_shared_allreduce
+            min(
+                _SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID,
+                self.routed_experts.backend.sm_reserve_ceiling(),
+            )
+            if not self._defer_shared_allreduce
             else 0
         )
         # Kimi K3's routed experts may be placed die-major on a two-domain device (the backend
@@ -3032,6 +3053,29 @@ class KimiK3MoERuntime(nn.Module):
         routed_model_config._frozen = True
         return routed_model_config
 
+    def _shared_sms_now(self) -> int:
+        """SMs the shared expert's GEMMs keep to beside the routed grid this forward,
+        the per-launch reserve's pairing (the torch SM carveout).
+
+        Zero unless this forward runs the shared expert on a side stream --
+        ``do_multi_stream``, or an AutoTuner pass, which must profile the shrunk
+        FC12 grid the captured graphs go on to launch -- or when the shared
+        projections no longer go through torch's cuBLAS (``F.linear``): the FP8
+        weight-read swap can have replaced them with a CuTe DSL GEMM after
+        construction, and those kernels ignore the carveout."""
+        from ..autotuner import AutoTuner
+
+        if not (do_multi_stream() or AutoTuner.get().is_tuning_mode):
+            return 0
+        down = self.shared_experts.down_proj
+        if (
+            isinstance(down, _Fp8BlockScaleWeightReadLinear)
+            or getattr(down, "use_cute_dsl_bf16_gemm", False)
+            or getattr(down, "use_custom_cublas_mm", False)
+        ):
+            return 0
+        return self._shared_sms
+
     def _front_plan(self, num_tokens: int) -> _MoEFrontPlan:
         """Issue order of a decode MoE front with the latent stream (multi-stream, i.e. CUDA
         graphs), decided in this one place from what the routed experts and latent_down declare.
@@ -3044,7 +3088,10 @@ class KimiK3MoERuntime(nn.Module):
           logits is the gate's choice, see ``KimiK3MoEGate``.)
         - When the routed experts take an NVFP4 input as is (``nvfp4_input_scale``), latent_down
           emits it from its GEMM epilogue where the projection serves this many rows
-          (``_Fp8BlockScaleWeightReadLinear.emits_nvfp4``).
+          (``_Fp8BlockScaleWeightReadLinear.emits_nvfp4`` -- the weight-read swap itself is the
+          existing ``KIMI_K3_FP8_WEIGHT_READ_MOE_MLP`` opt-in, so a default deployment never
+          takes this branch), and only when the sorting kernel routes this batch
+          (``routes_with_sort_tables``): the epilogue's route tactics were tuned beside it.
         - When the routing kernel also writes the experts' ``moe_sort`` tables
           (``routes_with_sort_tables``), the routing chain is short enough that the persistent
           routed grid, which holds every SM, launches while the shared expert's GEMMs or
@@ -3074,6 +3121,9 @@ class KimiK3MoERuntime(nn.Module):
                 nvfp4_scale is not None
                 and isinstance(down, _Fp8BlockScaleWeightReadLinear)
                 and down.emits_nvfp4(num_tokens)
+                # The fused epilogue's route tactics were tuned with the routing kernel
+                # beside them; without it (e.g. a locality-domain policy) it is a loss.
+                and moe.routes_with_sort_tables(num_tokens)
             ),
         )
 
@@ -3254,6 +3304,15 @@ class KimiK3MoERuntime(nn.Module):
                 moe_kwargs["output_dtype"] = hidden_states.dtype
             if tail_targets is not None:
                 moe_kwargs["output_push"] = tail_targets[1].view
+            # Only a launch with the shared expert beside it gives up SMs (an in-order
+            # launch keeps the full grid); the AutoTuner pass requests the reserve the
+            # captured graphs launch with, so tuning and capture share a cache key.
+            # Re-asked per forward: eager forwards launch here, a captured graph bakes
+            # the launch's reserve in.
+            if not torch.compiler.is_compiling():
+                self.routed_experts.backend.reserve_sms_for_concurrent_kernels(
+                    self._shared_sms_now()
+                )
             y = self.routed_experts(
                 routed_in,
                 router_logits,
@@ -3278,8 +3337,10 @@ class KimiK3MoERuntime(nn.Module):
                 partial = self._min_latency_shared(identity)
                 if partial is not None:
                     return partial
-            # Beside the routed grid (multi-stream) the shared GEMMs keep to the SMs it leaves.
-            with _cublas_sm_limit(self._shared_sms if do_multi_stream() else 0):
+            # Beside the routed grid (multi-stream / the AutoTuner pass) the shared GEMMs
+            # keep to the SMs it leaves -- one per-forward source of truth with the
+            # reserve the routed launch asked for.
+            with _cublas_sm_limit(self._shared_sms_now()):
                 shared_out = self.shared_experts(
                     identity,
                     final_all_reduce_params=(
@@ -3666,12 +3727,65 @@ class KimiMLARuntime(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Dense DWDP: the tables its setup reads off every decoder layer.
+# ---------------------------------------------------------------------------
+
+# Plain attributes (a tensor, or a tuple of tensors) under the dense roots that dense DWDP may
+# move as weights: the fused KDA projections, decode constants and the low-M GEMM's scale copies.
+# Parameters and buffers need no entry.
+DWDP_DENSE_ATTR_ALLOW: frozenset[str] = frozenset(
+    {
+        "_low_m_weight_scale",
+        "_bfa_proj_weight",
+        "_qkvg_proj_weight",
+        "_gate_b_t",
+        "_packed_conv_weight",
+        "_mtp_conv_weights",
+        "_w_q_t",
+        "_w_k_t",
+        "_w_v_t",
+        "_A_log_f32",
+        "_dt_bias_f32",
+        "_onorm_w_f32",
+    }
+)
+
+# Names that never make dense DWDP move a storage: per-call scratch tensors and the routing bias.
+# A reference under one of these names to a storage that moves through another reference is still
+# repointed with it.
+DWDP_DENSE_EXCLUDE: frozenset[str] = frozenset(
+    {
+        "_o_dense",
+        "_fused_q_placeholder",
+        "softmax_stats_tensor",
+        "temp_softmax_stats_tensor",
+        "e_score_correction_bias",
+    }
+)
+
+_DENSE_DWDP_SEGMENTS = ("attn", "moe")
+# Children of the MoE block that hold its dense weights: the router, the shared expert and the
+# latent projections and norm. The routed experts belong to expert DWDP and are never a dense root.
+_DENSE_DWDP_MOE_ROOTS = (
+    "gate",
+    "shared_experts",
+    "routed_expert_down_proj",
+    "routed_expert_up_proj",
+    "routed_expert_norm",
+)
+
+
+# ---------------------------------------------------------------------------
 # Decoder layer.
 # ---------------------------------------------------------------------------
 
 
 @nccl_window_tensor_scoped_module
 class KimiLinearDecoderLayer(nn.Module):
+    # Read by dense DWDP setup next to ``dense_dwdp_roots``.
+    dense_dwdp_attr_allow: frozenset[str] = DWDP_DENSE_ATTR_ALLOW
+    dense_dwdp_exclude: frozenset[str] = DWDP_DENSE_EXCLUDE
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -3796,6 +3910,44 @@ class KimiLinearDecoderLayer(nn.Module):
         self.self_attention_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
         self.mlp_res_proj = nn.Linear(cfg.hidden_size, 1, bias=False, dtype=dtype)
 
+        # The dense DWDP manager exists before the model is built (DwdpManager registers it with
+        # expert DWDP, py_executor_creator when dense DWDP runs standalone); forward() reaches the
+        # dense DWDP runtime through it.
+        self._dense_dwdp = get_global_dense_dwdp_manager()
+
+    def dense_dwdp_roots(self, segment: str) -> list[tuple[str, nn.Module]]:
+        """The modules holding this layer's dense DWDP weights of ``segment``.
+
+        Implements ``modules.dwdp.dense.types.DenseRootsProvider``. Dense DWDP moves the
+        replicated weights reachable from these roots (see ``DWDP_DENSE_ATTR_ALLOW`` and
+        ``DWDP_DENSE_EXCLUDE``) and reads them back only inside the windows ``forward`` opens.
+
+        Args:
+            segment: ``"attn"`` for the attention weights, ``"moe"`` for the MoE-dense weights:
+                the router, the shared expert and the latent projections. The routed experts
+                are never a root.
+
+        Returns:
+            ``(path relative to this layer, module)`` pairs in walk order; [] when the layer's
+            weights stay replicated: a layer without the MoE block (layer 0 of Kimi-K3) or one
+            whose weights were removed (layer-wise benchmarks).
+
+        Raises:
+            ValueError: ``segment`` is neither ``"attn"`` nor ``"moe"``.
+        """
+        if segment not in _DENSE_DWDP_SEGMENTS:
+            raise ValueError(
+                f"Kimi K3 dense DWDP segment must be one of {_DENSE_DWDP_SEGMENTS}; got {segment!r}"
+            )
+        if not self.is_moe or not _has_weights(self):
+            return []
+        if segment == "attn":
+            if self.is_kda:
+                return [("linear_attn", self.linear_attn)]
+            return [("self_attn", self.self_attn)]
+        moe = self.block_sparse_moe
+        return [(f"block_sparse_moe.{name}", getattr(moe, name)) for name in _DENSE_DWDP_MOE_ROOTS]
+
     def forward(
         self,
         hidden_states: torch.Tensor | _DeferredMoEResidual,
@@ -3844,6 +3996,17 @@ class KimiLinearDecoderLayer(nn.Module):
         def _full_rows(t: torch.Tensor) -> torch.Tensor:
             return t if sliced is None else sliced.all_gather(t, num_tokens)
 
+        # Dense DWDP read windows: every read of this layer's attention weights happens between
+        # H1 (wait_layer) and H2 (attention_done), every read of its MoE-dense weights (router,
+        # shared expert, latent projections) between H1 and H3 (layer_done). Their staging slots
+        # are refilled with a later layer's weights once a window closes, so a read outside its
+        # window sees another layer's bytes.
+        manager = getattr(self, "_dense_dwdp", None)
+        dense = manager.dense if manager is not None else None
+        if dense is not None and not dense.covers(self.layer_idx):
+            dense = None
+        if dense is not None:
+            dense.wait_layer(self.layer_idx)  # H1
         valid_block_residual = block_residual[:num_snapshots]
         normed = None
         attn_input_mxfp8 = None
@@ -3927,6 +4090,8 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states = self.self_attn(
                 hidden_states, attn_metadata, prequantized_input=prequantized_input
             )
+        if dense is not None:
+            dense.attention_done(self.layer_idx)  # H2: no attention weight is read after this.
 
         if prefix_sum is None:
             prefix_sum = hidden_states
@@ -3959,12 +4124,19 @@ class KimiLinearDecoderLayer(nn.Module):
                 # The next layer's decode mix finishes the column-parallel tail's call.
                 column_parallel_tail=defers and attn_metadata.num_contexts == 0,
             )
+            if dense is not None:
+                # H3: no MoE-dense weight is read after this; a deferred residual update carries
+                # only the routed and shared outputs.
+                dense.layer_done(self.layer_idx)
             residual_update = _DeferredMoEResidual(prefix_sum, routed, shared)
             if defers:
                 return residual_update, num_snapshots
             return residual_update.materialize(), num_snapshots
 
-        prefix_sum = prefix_sum + self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        if dense is not None:
+            dense.layer_done(self.layer_idx)  # H3: no MoE-dense weight is read after this.
+        prefix_sum = prefix_sum + hidden_states
         return prefix_sum, num_snapshots
 
     def attention_output_reduction(self) -> Tuple[Optional[AllReduce], int]:
@@ -4101,10 +4273,39 @@ class KimiLinearModel(DecoderModel):
             key="kimi_k3_aux_capture_mode",
         )
 
+        # The dense DWDP manager exists before the model is built (DwdpManager registers it with
+        # expert DWDP, py_executor_creator when dense DWDP runs standalone); forward() primes dense
+        # DWDP through it.
+        self._dense_dwdp = get_global_dense_dwdp_manager()
+
+    def _prewarm_k3_moe_front_kernels(self) -> int:
+        """Compile the MoE front's kernels (sorting routing, router logits) ahead of serving,
+        so no first 65-256-token forward compiles them; returns the kernels compiled (0 when
+        this deployment keeps the front on the ops the kernels replace)."""
+        from ..moe.kernels.blackwell import kimi_k3_router_logits, kimi_k3_routing
+
+        runtime = next(
+            (
+                getattr(layer, "block_sparse_moe", None)
+                for layer in self.layers
+                if getattr(layer, "block_sparse_moe", None) is not None
+            ),
+            None,
+        )
+        if runtime is None:
+            return 0
+        compiled = 0
+        if runtime.gate.logits_kernel:
+            compiled += kimi_k3_router_logits.precompile()
+        if runtime.routed_experts.sort_routing_applies:
+            compiled += kimi_k3_routing.precompile(self.num_experts)
+        return compiled
+
     def prewarm_decode_kernels(self, max_num_tokens: int, verify_batches: bool) -> int:
-        """JIT-compile the decode attention-residual kernel variants (``kimi_k3_attn_res``) and
-        the prequantized FP8 low-M GEMMs that forwards of up to ``max_num_tokens`` tokens reach,
-        so no served step compiles them; returns the number of kernels compiled.
+        """JIT-compile the decode attention-residual kernel variants (``kimi_k3_attn_res``), the
+        MoE front's sorting-routing and router-logits kernels, and the prequantized FP8 low-M
+        GEMMs that forwards of up to ``max_num_tokens`` tokens reach, so no served step compiles
+        them; returns the number of kernels compiled.
 
         The decode-kernel prewarm hook ``DecoderWarmup`` calls on every module that defines it.
         Depends only on the model layout, the device and the attention-residual settings, so
@@ -4112,8 +4313,9 @@ class KimiLinearModel(DecoderModel):
         batches, which hand the KDA projections MXFP8 operands.
         """
         device_index = torch.cuda.current_device()
+        compiled = self._prewarm_k3_moe_front_kernels()
         if not _FUSED_ATTN_RES_ENABLED or not _decode_attn_res_on_device(device_index):
-            return 0
+            return compiled
         from ..kernels.blackwell import fp8_block_scale_low_m_gemm, kimi_k3_attn_res
 
         cfg = self._text_cfg
@@ -4135,7 +4337,7 @@ class KimiLinearModel(DecoderModel):
                 variant.mxfp8,
                 variant.snapshots_after_wait,
             )
-        compiled = len(variants)
+        compiled += len(variants)
         if not verify_batches:
             return compiled
         # Prequantized GEMMs: the KDA q/k/v/g projections fed by the mix's MXFP8 output, and the
@@ -4187,6 +4389,14 @@ class KimiLinearModel(DecoderModel):
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        # Dense DWDP H0: make sure the first two layers' dense weights (and, with expert DWDP,
+        # their experts) are enqueued before any layer runs (the previous forward's end or the
+        # non-overlap executor loop usually already did). After a forward that stopped midway, a
+        # WAR barrier on this stream comes first.
+        manager = getattr(self, "_dense_dwdp", None)
+        if manager is not None and manager.dense is not None:
+            manager.ensure_primed()
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -4943,6 +5153,13 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
         return name_map, expected_keys, expert_jobs
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        if getattr(self.model, "_dense_dwdp_active", False):
+            # The dense weights are views of staging slots that several layers share: a load
+            # would write into them, and the next gather overwrites that from the row store.
+            raise RuntimeError(
+                "Kimi K3 load_weights is not supported while dense DWDP is active: the dense "
+                "weights live in staging slots shared across layers"
+            )
         prefix = "language_model." if any(k.startswith("language_model.") for k in weights) else ""
         params = self._trunk_parameters()
         name_map, expected_keys, expert_jobs = self.checkpoint_name_plan(prefix)

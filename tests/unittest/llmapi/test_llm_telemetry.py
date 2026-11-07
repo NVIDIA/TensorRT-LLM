@@ -344,7 +344,7 @@ class TestRuntimeArchitecturePayloadFlow:
             ("runtime", "Qwen3ForTextEmbedding"),
             ("generation", "Qwen3ForCausalLM"),
             ("missing_executor", "Qwen3ForCausalLM"),
-            ("missing_model", "Qwen3ForCausalLM"),
+            ("missing_runtime_config", "Qwen3ForCausalLM"),
             ("null_runtime_config", "Qwen3ForCausalLM"),
         ],
     )
@@ -359,19 +359,13 @@ class TestRuntimeArchitecturePayloadFlow:
         llm = object.__new__(BaseLLM)
         llm.args = SimpleNamespace(telemetry_config=None)
         llm._hf_model_config = raw_config
-        llm._encoder_executor = SimpleNamespace(
-            model_engine=SimpleNamespace(
-                model=SimpleNamespace(
-                    model_config=SimpleNamespace(pretrained_config=runtime_config)
-                )
-            )
-        )
+        llm._encoder_executor = SimpleNamespace(pretrained_config=runtime_config)
         if executor_state == "generation":
             llm._encoder_executor = None
         elif executor_state == "missing_executor":
             del llm._encoder_executor
-        elif executor_state == "missing_model":
-            del llm._encoder_executor.model_engine.model
+        elif executor_state == "missing_runtime_config":
+            del llm._encoder_executor.pretrained_config
 
         report_args = {}
 

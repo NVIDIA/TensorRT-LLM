@@ -23,14 +23,21 @@ from tensorrt_llm._torch.pyexecutor.engine.runners.encoder import (
     EncoderConfig,
     EncoderPreparedInputs,
     EncoderRunner,
-    EncoderRunnerConfig,
+    resolve_scheduled_encoder_args,
 )
 from tensorrt_llm._torch.pyexecutor.engine.runners.encoder_decoder import (
     EncoderStage,
     EncoderStageConfig,
 )
-from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs
-from tensorrt_llm.llmapi.llm_args import EncodeCudaGraphConfig, EncodeExtraInputSpec
+from tensorrt_llm._torch.pyexecutor.engine.runners.interface import PackedInputs, ScheduledInputs
+from tensorrt_llm.llmapi.llm_args import (
+    CudaGraphConfig,
+    EncodeCudaGraphConfig,
+    EncodeExtraInputSpec,
+    PrefillCudaGraphBackend,
+    TorchCompileConfig,
+    TorchLlmArgs,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -59,7 +66,7 @@ def _encoder_config(
             def encoder_graph_spec(self) -> tuple[tuple[int, ...], torch.dtype, int]:
                 return feature_spec
 
-    config_type = EncoderStageConfig if encoder_decoder else EncoderRunnerConfig
+    config_type = EncoderStageConfig if encoder_decoder else EncoderConfig
     kwargs = dict(
         model=_Model(),
         mapping=SimpleNamespace(tp_size=tp_size),
@@ -71,10 +78,71 @@ def _encoder_config(
         without_logits=False,
         attention_backend=TrtllmAttention,
         enable_autotuner=False,
+        is_encoder_decoder=encoder_decoder,
     )
-    if encoder_decoder:
-        kwargs["is_encoder_decoder"] = True
     return config_type.create(**kwargs), feature_spec
+
+
+@pytest.mark.parametrize(
+    ("cuda_graph_config", "expected_encode_config"),
+    [
+        (None, False),
+        (CudaGraphConfig(), False),
+        (EncodeCudaGraphConfig(batch_sizes=[1], num_tokens=[16], seq_lens=[16]), True),
+    ],
+)
+def test_encoder_runner_graph_config_comes_only_from_cuda_graph_config(
+    cuda_graph_config: CudaGraphConfig | None,
+    expected_encode_config: bool,
+) -> None:
+    """Encode-only takes its buckets from `cuda_graph_config`, never from
+    `encoder_cuda_graph_config`."""
+    llm_args = SimpleNamespace(
+        cuda_graph_config=cuda_graph_config,
+        encoder_cuda_graph_config=EncodeCudaGraphConfig(
+            batch_sizes=[8],
+            num_tokens=[64],
+            seq_lens=[64],
+        ),
+        enable_autotuner=False,
+    )
+    model = object()
+    mapping = object()
+    dist = object()
+    model_caller = Mock()
+    runtime_features = AttentionRuntimeFeatures()
+    runner_config = object()
+
+    with (
+        patch.object(EncoderConfig, "create", return_value=runner_config) as create_config,
+        patch.object(EncoderRunner, "__init__", return_value=None) as init,
+    ):
+        runner = EncoderRunner.create(
+            model,
+            llm_args=llm_args,
+            mapping=mapping,
+            dist=dist,
+            max_batch_size=4,
+            max_num_tokens=16,
+            max_seq_len=16,
+            max_beam_width=1,
+            model_caller=model_caller,
+            attention_backend=TrtllmAttention,
+            attention_runtime_features=runtime_features,
+        )
+
+    assert isinstance(runner, EncoderRunner)
+    resolved = create_config.call_args.kwargs["graph_config"]
+    assert resolved is (cuda_graph_config if expected_encode_config else None)
+    init.assert_called_once_with(
+        model,
+        runner_config,
+        mapping=mapping,
+        dist=dist,
+        moe_load_balancer=None,
+        model_caller=model_caller,
+        attention_runtime_features=runtime_features,
+    )
 
 
 @pytest.mark.parametrize(
@@ -467,7 +535,7 @@ def _warmup_runner(*, world_size: int) -> EncoderRunner:
 
 def test_encoder_warmup_recovers_from_oom_when_not_distributed() -> None:
     runner = _warmup_runner(world_size=1)
-    runner._execute_prepared = Mock(side_effect=[torch.OutOfMemoryError("OOM"), None])
+    runner._execute_prepared = Mock(side_effect=[torch.OutOfMemoryError("OOM"), {}])
 
     with patch("torch.cuda.empty_cache") as empty_cache, patch("torch.cuda.synchronize"):
         runner._run_warmup_shapes([(2, 16, 8), (1, 8, 8)])
@@ -487,6 +555,56 @@ def test_encoder_warmup_oom_is_fatal_when_distributed() -> None:
 
     assert raised.value is error
     runner._execute_prepared.assert_called_once_with(runner._prepare_encoder_batch.return_value)
+
+
+@pytest.mark.parametrize("nested", [True, False])
+def test_encoder_warmup_runs_nested_output_models_eagerly(nested: bool) -> None:
+    runner = _warmup_runner(world_size=1)
+    runner._model = SimpleNamespace(extra_attrs={})
+    runner._config = SimpleNamespace(max_batch_size=2, max_num_tokens=8, max_seq_len=4)
+    logits = torch.ones(5, 2)
+    if nested:
+        logits = torch.nested.nested_tensor([logits[:2], logits[2:]])
+    runner._execute_prepared = Mock(return_value={"logits": logits})
+    runner._run_autotuner_warmup = Mock()
+    runner._capture_encoder_cuda_graphs = Mock()
+
+    with (
+        patch.object(encoder_module.AutoTuner, "get"),
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.synchronize"),
+        patch.object(encoder_module.logger, "warning") as warning,
+    ):
+        runner.warmup()
+
+    assert runner._encoder_cuda_graph_runner.enabled is not nested
+    assert warning.called is nested
+
+
+def test_encoder_warmup_stays_within_a_one_token_budget() -> None:
+    runner = _warmup_runner(world_size=1)
+    runner._encoder_cuda_graph_runner.build_capture_sequence_lengths = (
+        EncoderCUDAGraphRunner.build_capture_sequence_lengths
+    )
+    runner._model = SimpleNamespace(extra_attrs={})
+    runner._config = SimpleNamespace(max_batch_size=1, max_num_tokens=1, max_seq_len=4)
+    runner._prepare_capture_inputs = Mock(
+        return_value=EncoderPreparedInputs({}, sequence_lengths=[1])
+    )
+    runner._execute_prepared = Mock(return_value={"logits": torch.ones(1, 2)})
+    runner._run_autotuner_warmup = Mock()
+    runner._capture_encoder_cuda_graphs = Mock()
+
+    with (
+        patch.object(encoder_module.AutoTuner, "get"),
+        patch("torch.cuda.empty_cache"),
+        patch("torch.cuda.synchronize"),
+    ):
+        runner.warmup()
+
+    warmup_batches = [call.args[0] for call in runner._prepare_capture_inputs.call_args_list]
+    assert warmup_batches
+    assert all(sum(batch) <= 1 for batch in warmup_batches)
 
 
 def _capture_input_runner(extra_input_specs: list[EncodeExtraInputSpec]) -> EncoderRunner:
@@ -542,3 +660,115 @@ def test_encoder_release_clears_owned_graph_backend(release_nccl_window_owners: 
     runner._encoder_cuda_graph_runner.clear.assert_called_once_with(
         release_nccl_window_owners=release_nccl_window_owners
     )
+
+
+def _scheduled_request(
+    seq_slot: int,
+    tokens: list[int],
+    *,
+    position_ids: list[int] | None = None,
+    multimodal_data: dict | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        get_tokens=Mock(return_value=tokens),
+        py_seq_slot=seq_slot,
+        py_position_ids=position_ids,
+        py_multimodal_data=multimodal_data,
+    )
+
+
+def _scheduled_inputs(requests: list[SimpleNamespace]) -> ScheduledInputs:
+    return ScheduledInputs(
+        batch=SimpleNamespace(context_requests=requests), gather_context_logits=True
+    )
+
+
+def test_scheduled_requests_pack_into_one_batch_with_filled_position_ids() -> None:
+    first = _scheduled_request(3, [11, 12, 13])
+    second = _scheduled_request(1, [21, 22], position_ids=[5, 6])
+
+    packed = object.__new__(EncoderRunner)._pack_scheduled(_scheduled_inputs([first, second]))
+
+    assert packed == PackedInputs(
+        [11, 12, 13, 21, 22],
+        [3, 2],
+        model_inputs={"position_ids": [0, 1, 2, 5, 6]},
+        gather_context_logits=True,
+    )
+    assert (first.py_batch_idx, second.py_batch_idx) == (3, 1)
+
+
+def test_scheduled_requests_reject_multimodal_inputs() -> None:
+    request = _scheduled_request(0, [1, 2], multimodal_data={"image": object()})
+
+    with pytest.raises(ValueError, match="cannot carry multimodal inputs"):
+        object.__new__(EncoderRunner)._pack_scheduled(_scheduled_inputs([request]))
+
+
+def test_scheduled_warmup_rejects_kv_cache_manager() -> None:
+    runner = object.__new__(EncoderRunner)
+    runner._model = SimpleNamespace(extra_attrs={})
+    resource_manager = Mock()
+    resource_manager.get_resource_manager.return_value = object()
+
+    with pytest.raises(AssertionError, match="but a KV cache manager was allocated"):
+        runner.warmup(resource_manager)
+
+
+def test_encoder_graph_rejects_nested_outputs() -> None:
+    runner = object.__new__(EncoderRunner)
+    runner._encoder_cuda_graph_runner = SimpleNamespace(get_graph_pool=Mock(return_value=None))
+    nested = torch.nested.nested_tensor([torch.ones(2), torch.ones(3)])
+    runner._execute_encoder_cuda_graph = Mock(return_value={"logits": nested})
+    prepared = EncoderPreparedInputs({}, sequence_lengths=[2, 3], graph_key=(2, 8, 4))
+
+    with pytest.raises(ValueError, match="require dense outputs"):
+        runner._execute_prepared(prepared)
+
+
+def test_scheduled_encoder_args_reject_extra_model_inputs() -> None:
+    llm_args = TorchLlmArgs(
+        model="dummy",
+        cuda_graph_config=EncodeCudaGraphConfig(
+            batch_sizes=[1],
+            num_tokens=[8],
+            seq_lens=[8],
+            extra_model_inputs=[
+                EncodeExtraInputSpec(name="token_type_ids", shape=("num_tokens",), dtype="int32")
+            ],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="can only be supplied through LLM.encode"):
+        resolve_scheduled_encoder_args(llm_args)
+
+
+@pytest.mark.parametrize("backend", ["piecewise", "breakable"])
+def test_scheduled_encoder_args_drop_prefill_cuda_graphs(backend: str) -> None:
+    llm_args = TorchLlmArgs(model="dummy", prefill_cuda_graph_backend=backend)
+
+    with patch.object(encoder_module.logger, "warning") as warning:
+        resolved = resolve_scheduled_encoder_args(llm_args)
+
+    warning.assert_called_once()
+    assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
+    assert resolved.torch_compile_config is None
+    assert llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend(backend)
+
+
+def test_scheduled_encoder_args_keep_explicit_compile_config() -> None:
+    compile_config = TorchCompileConfig(max_num_streams=1)
+    llm_args = TorchLlmArgs(
+        model="dummy", prefill_cuda_graph_backend="piecewise", torch_compile_config=compile_config
+    )
+
+    resolved = resolve_scheduled_encoder_args(llm_args)
+
+    assert resolved.prefill_cuda_graph_backend == PrefillCudaGraphBackend.DISABLED
+    assert resolved.torch_compile_config == compile_config
+
+
+def test_scheduled_encoder_args_keep_supported_settings() -> None:
+    llm_args = TorchLlmArgs(model="dummy")
+
+    assert resolve_scheduled_encoder_args(llm_args) is llm_args

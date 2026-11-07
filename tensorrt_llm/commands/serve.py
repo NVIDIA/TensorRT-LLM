@@ -35,6 +35,7 @@ from typing import (TYPE_CHECKING, Any, Dict, Iterator, NoReturn, Optional,
                     Sequence, Set, Tuple)
 
 import click
+import pydantic
 import torch
 import uvloop
 import yaml
@@ -56,7 +57,7 @@ from tensorrt_llm.commands.utils import (collect_explicit_cli_keys,
 from tensorrt_llm.executor.utils import MAX_NUM_FRONTENDS, LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi.disagg_utils import (
-    DisaggClusterConfig, MetadataServerConfig, ServerRole,
+    DisaggClusterConfig, DisaggServerConfig, MetadataServerConfig, ServerRole,
     extract_disagg_cluster_config, parse_disagg_config_file,
     parse_metadata_server_config_file, validate_config_bool,
     validate_internal_request_auth_key)
@@ -487,6 +488,42 @@ def _diagnose_port_in_use(port: int) -> str:
     return "; ".join(details)
 
 
+def _bind_failure(kind: str, host: str, port: int,
+                  error: OSError) -> RuntimeError:
+    """Log a failed listener bind and return the exception to raise.
+
+    An address lookup failure (``socket.gaierror``) is an ``OSError`` too, but
+    no port was ever tried, so it is reported as such instead of being
+    diagnosed as a port conflict. It covers both a name that does not resolve
+    and an address of a family the socket cannot use, such as an IPv6 literal
+    on an IPv4-only listener.
+    """
+    if isinstance(error, socket.gaierror):
+        reason = f"address lookup failed for host {host!r}: {error}"
+        logger.error(f"Failed to bind {kind} socket to {host}:{port} "
+                     f"(pid={os.getpid()}): {reason}")
+        return RuntimeError(f"Failed to bind socket to {host}:{port}: {reason}")
+    holder = _diagnose_port_in_use(port)
+    logger.error(
+        f"Failed to bind {kind} socket to {host}:{port} (pid={os.getpid()}): "
+        f"{error}. Current port holder(s): {holder}")
+    return RuntimeError(f"Failed to bind socket to {host}:{port}: {error}. "
+                        f"Port holder(s): {holder}")
+
+
+def _listener_address_family(kind: str, host: str,
+                             port: int) -> socket.AddressFamily:
+    """The family to bind ``host`` with: IPv6 only if it resolves to nothing else."""
+    try:
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
+                                       socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise _bind_failure(kind, host, port, e) from e
+    if all(info[0] == socket.AF_INET6 for info in addr_info):
+        return socket.AF_INET6
+    return socket.AF_INET
+
+
 def _reserve_multi_frontend_port(host: str, port: int,
                                  family: socket.AddressFamily) -> socket.socket:
     """Refuse a port another server uses; return a lock to hold while serving.
@@ -617,6 +654,113 @@ def _resolve_default_num_serve_frontends(llm_args: dict, *, requested: bool,
     llm_args["num_serve_frontends"] = 1
 
 
+def _bool_setting(value: object) -> bool:
+    """A boolean LLM argument as TorchLlmArgs reads it; False if it does not parse.
+
+    A value that does not parse is left to the LLM arguments' own validation.
+    """
+    try:
+        return pydantic.TypeAdapter(bool).validate_python(value)
+    except pydantic.ValidationError:
+        return False
+
+
+def _dense_dwdp_setting(dwdp_config: object) -> bool:
+    """Whether a ``dwdp_config`` value of the LLM arguments enables dense DWDP.
+
+    The value is a ``DwdpConfig`` once the YAML is merged, or a mapping; a
+    value that does not parse is left to the LLM arguments' own validation.
+    """
+    if isinstance(dwdp_config, dict):
+        return _bool_setting(dwdp_config.get("enable_dense"))
+    return getattr(dwdp_config, "enable_dense", False) is True
+
+
+#: The ``TRTLLM_DISAGG_ROLE`` of the servers of a disaggregated MPI launch, by
+#: server type.
+_DISAGG_SERVER_ROLES = {"ctx": "context", "gen": "generation"}
+
+_DENSE_DWDP_FOR_CONTEXT_ONLY = (
+    "dwdp_config.enable_dense is for context servers only: dense DWDP gathers "
+    "the dense weights of every covered layer in every forward, decode steps "
+    "included.")
+
+
+def _serving_role(role: Optional[str]) -> Optional[str]:
+    """``"context"`` or ``"generation"`` for a ``TRTLLM_DISAGG_ROLE`` value.
+
+    Matched as the usage telemetry matches it: case-insensitive, with the
+    compatible legacy values that start with ``ctx`` or ``gen`` (``ctx0``,
+    ``gen0``). None for any other value.
+    """
+    normalized = (role or "").lower()
+    if normalized == "context" or normalized.startswith("ctx"):
+        return "context"
+    if normalized.startswith("gen"):
+        return "generation"
+    return None
+
+
+def _check_context_only_settings(llm_args: dict, *, warn: bool) -> None:
+    """Refuse dense DWDP on a generation server; warn without the context role.
+
+    Dense DWDP (``dwdp_config.enable_dense``) gathers the dense weights of
+    every covered layer in every forward, decode steps included, so it is
+    meant for context servers. The role is the one the server's ranks see in
+    ``TRTLLM_DISAGG_ROLE`` (read by :func:`_serving_role`): ``launch_server``
+    publishes it from ``--server_role``, the disaggregated MPI worker from its
+    server's type, and a gRPC server, which takes no ``--server_role``, keeps
+    the one its environment holds. A server without the context role gets a
+    warning that names the remedy. Runs before the LLM is built, so a refused
+    launch fails before the model loads.
+
+    Args:
+        llm_args: The merged LLM arguments of the server.
+        warn: Whether to log the warning; an attached frontend repeats its
+            launcher's check without it.
+
+    Raises:
+        click.BadParameter: Dense DWDP is refused for the server's role.
+    """
+    if not _dense_dwdp_setting(llm_args.get("dwdp_config")):
+        return
+    role = _serving_role(os.environ.get(DisaggLauncherEnvs.TLLM_DISAGG_ROLE))
+    if role == "generation":
+        raise click.BadParameter(
+            f"{_DENSE_DWDP_FOR_CONTEXT_ONLY} Remove it from this server's "
+            "configuration.")
+    if warn and role != "context":
+        logger.warning(
+            "dwdp_config.enable_dense is set on a server without the context "
+            "role, where dense DWDP gathers the dense weights of every covered "
+            "layer in every forward, decode steps included. It is meant for "
+            "context servers and refused on generation servers; launch "
+            "context servers with --server_role CONTEXT (a gRPC server with "
+            "TRTLLM_DISAGG_ROLE=context) so that the role is checked.")
+
+
+def _refuse_dense_dwdp_on_generation_servers(
+        disagg_cfg: DisaggServerConfig) -> None:
+    """Refuse dense DWDP on the generation servers of a disaggregated MPI launch.
+
+    Every rank of the launch runs this on the same configuration before the
+    world is split, so a refused launch exits on every rank. The server
+    process of an instance's leader would refuse it too, but only once the
+    instance's other ranks wait for its MPI tasks, which then never come.
+
+    Raises:
+        click.BadParameter: A generation server enables dense DWDP, in its own
+            settings or in the top-level ones it inherits.
+    """
+    for server_cfg in disagg_cfg.server_configs:
+        if (_DISAGG_SERVER_ROLES.get(server_cfg.type) == "generation" and
+                _dense_dwdp_setting(server_cfg.other_args.get("dwdp_config"))):
+            raise click.BadParameter(
+                f"{_DENSE_DWDP_FOR_CONTEXT_ONLY} Set it under context_servers "
+                "only: the generation servers also inherit the top-level "
+                "settings.")
+
+
 def launch_server(
         host: str,
         port: int,
@@ -636,7 +780,7 @@ def launch_server(
         internal_disagg_auth_key: Optional[str] = None,
         report_addr: Optional[str] = None,
         enable_runtime_control_endpoints: bool = False,
-        runtime_control_api_key: Optional[str] = None):
+        runtime_control_api_key: Optional[str] = None) -> None:
 
     # Publish an explicit serving role before constructing/spawning the model.
     # Remote-tail context workers use it to omit generation-only weights.
@@ -656,6 +800,8 @@ def launch_server(
     model = served_model_name or llm_args["model"]
 
     multi_frontend = _init_multi_frontend_mode(llm_args, multi_frontend_enabled)
+    _check_context_only_settings(llm_args,
+                                 warn=not multi_frontend.is_attached_frontend)
     # An attached frontend gets the launcher's socket from its spawn env; the
     # launcher is its parent.
     multi_frontend_serving = None
@@ -693,10 +839,7 @@ def launch_server(
                 "--num_serve_frontends 1 to keep it.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    address_family = _listener_address_family("server", host, port)
     port_lock = (_reserve_multi_frontend_port(host, port, address_family)
                  if multi_frontend.is_launcher else contextlib.nullcontext())
     with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
@@ -720,12 +863,7 @@ def launch_server(
             if port == 0:
                 port = s.getsockname()[1]
         except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
+            raise _bind_failure("server", host, port, e) from e
 
         # Only now is the address final, and the socket stays bound from here
         # until uvicorn takes it over, so no one can steal the port in between.
@@ -793,7 +931,9 @@ def launch_server(
                     enable_runtime_control_endpoints=
                     enable_runtime_control_endpoints,
                     runtime_control_api_key=runtime_control_api_key,
-                    multi_frontend_serving=multi_frontend_serving)
+                    multi_frontend_serving=multi_frontend_serving,
+                    graceful_shutdown_timeout=llm.args.
+                    serve_graceful_shutdown_timeout_s)
                 _apply_fastapi_middlewares(server.app, middleware)
 
                 # Optionally disable GC (default: not disabled)
@@ -818,7 +958,7 @@ def launch_mm_encoder_server(
     encoder_args: dict,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
     allow_request_chat_template: bool = False,
-):
+) -> None:
     model = encoder_args["model"]
     encoder_args.pop("build_config", None)
     mm_encoder = MultimodalEncoder(**encoder_args)
@@ -829,7 +969,9 @@ def launch_mm_encoder_server(
         server_role=ServerRole.MM_ENCODER,
         metadata_server_cfg=metadata_server_cfg,
         tool_parser=None,
-        allow_request_chat_template=allow_request_chat_template)
+        allow_request_chat_template=allow_request_chat_template,
+        graceful_shutdown_timeout=mm_encoder.args.
+        serve_graceful_shutdown_timeout_s)
     uvloop.run(server(host, port))
 
 
@@ -914,7 +1056,7 @@ def launch_embedding_server(
     max_queue_delay: float,
     max_queue_size: int,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
-):
+) -> None:
     model = llm_args["model"]
     llm_args.pop("build_config", None)
     # encode_only is forced on below; drop any value coming from --config to avoid
@@ -944,13 +1086,15 @@ def launch_embedding_server(
     # (no KV cache / sampler / scheduler), coalesced behind the dynamic batcher.
     llm = PyTorchLLM(encode_only=True, **llm_args)
 
-    server = OpenAIServer(generator=llm,
-                          model=model,
-                          server_role=ServerRole.EMBEDDING,
-                          metadata_server_cfg=metadata_server_cfg,
-                          tool_parser=None,
-                          embedding_max_queue_delay=max_queue_delay,
-                          embedding_max_queue_size=max_queue_size)
+    server = OpenAIServer(
+        generator=llm,
+        model=model,
+        server_role=ServerRole.EMBEDDING,
+        metadata_server_cfg=metadata_server_cfg,
+        tool_parser=None,
+        embedding_max_queue_delay=max_queue_delay,
+        embedding_max_queue_size=max_queue_size,
+        graceful_shutdown_timeout=llm.args.serve_graceful_shutdown_timeout_s)
     asyncio.run(server(host, port))
 
 
@@ -987,10 +1131,7 @@ def launch_visual_gen_server(
     # uvicorn. VisualGen initialization can take many minutes; if we deferred
     # the bind until uvicorn started, anything else on the host could grab the
     # port in that window and trtllm-serve would die at bind() time.
-    addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
-                                   socket.SOCK_STREAM)
-    address_family = socket.AF_INET6 if all(
-        [info[0] == socket.AF_INET6 for info in addr_info]) else socket.AF_INET
+    address_family = _listener_address_family("VisualGen server", host, port)
     with socket.socket(address_family, socket.SOCK_STREAM) as s:
         # See launch_server: without this, TIME_WAIT tombstones from the
         # connections this server accepted refuse a restart for ~60s.
@@ -998,12 +1139,7 @@ def launch_visual_gen_server(
         try:
             s.bind((host, port))
         except OSError as e:
-            holder = _diagnose_port_in_use(port)
-            logger.error(
-                f"Failed to bind VisualGen server socket to {host}:{port} "
-                f"(pid={os.getpid()}): {e}. Current port holder(s): {holder}")
-            raise RuntimeError(f"Failed to bind socket to {host}:{port}: {e}. "
-                               f"Port holder(s): {holder}")
+            raise _bind_failure("VisualGen server", host, port, e) from e
 
         logger.info(f"Initializing VisualGen ({model})")
 
@@ -1765,6 +1901,7 @@ def serve(
 
                 from tensorrt_llm.grpc.smg.server import launch_smg_server
 
+                _check_context_only_settings(llm_args, warn=True)
                 launch_smg_server(host,
                                   port,
                                   llm_args,
@@ -1782,6 +1919,8 @@ def serve(
 
                 grpc_multi_frontend = _init_multi_frontend_mode(llm_args,
                                                                 enabled=True)
+                _check_context_only_settings(
+                    llm_args, warn=not grpc_multi_frontend.is_attached_frontend)
                 with _provision_kv_cache_pool(
                         llm_args,
                         owns_engine=not grpc_multi_frontend.is_attached_frontend
@@ -2302,14 +2441,8 @@ def disaggregated(
             if disagg_cfg.port == 0:
                 disagg_cfg.port = s.getsockname()[1]
         except OSError as e:
-            holder = _diagnose_port_in_use(disagg_cfg.port)
-            logger.error(
-                f"Failed to bind disaggregated server socket to "
-                f"{disagg_cfg.hostname}:{disagg_cfg.port} (pid={os.getpid()}): "
-                f"{e}. Current port holder(s): {holder}")
-            raise RuntimeError(
-                f"Failed to bind socket to {disagg_cfg.hostname}:{disagg_cfg.port}: {e}. "
-                f"Port holder(s): {holder}")
+            raise _bind_failure("disaggregated server", disagg_cfg.hostname,
+                                disagg_cfg.port, e) from e
 
         _publish_bound_address(report_addr, disagg_cfg.hostname,
                                disagg_cfg.port)
@@ -2499,13 +2632,7 @@ def _serve_coordinator_and_fleet(disagg_cfg, config_file,
         coord_socket.bind((public_host, coord_port))
     except OSError as e:
         coord_socket.close()
-        holder = _diagnose_port_in_use(coord_port)
-        logger.error(f"Failed to bind coordinator socket to "
-                     f"{public_host}:{coord_port} (pid={os.getpid()}): {e}. "
-                     f"Current port holder(s): {holder}")
-        raise RuntimeError(
-            f"Failed to bind socket to {public_host}:{coord_port}: {e}. "
-            f"Port holder(s): {holder}")
+        raise _bind_failure("coordinator", public_host, coord_port, e) from e
 
     # 1. Launch the delegating fleet pointed at the implicit coordinator we start
     #    below (port-1 for TCP; UDS for the hot path). Workers hold
@@ -2739,6 +2866,20 @@ def _shared_draft_kv_blocker(server_configs) -> Optional[str]:
             return ("speculative_config to be DFlash with attention_backend "
                     "TRTLLM, or DSpark with attention_backend AUTO, TRTLLM "
                     "or CUTEDSL, in both sections")
+        if (spec.get("draft_len_schedule") is not None
+                or spec.get("max_concurrency") is not None):
+            return "draft_len_schedule and max_concurrency to be unset in both sections"
+        if cfg.other_args.get("attn_backend", "TRTLLM") != "TRTLLM":
+            return "attn_backend TRTLLM in both sections"
+        if cfg.other_args.get("pipeline_parallel_size", 1) != 1:
+            return "pipeline_parallel_size to be 1 in both sections"
+        if cfg.other_args.get("kv_cache_compression_config") is not None:
+            return "kv_cache_compression_config to be unset in both sections"
+        kv_cache = cfg.other_args.get("kv_cache_config") or {}
+        if str(kv_cache.get("dtype", "auto")).lower().startswith("mixed_"):
+            return "a uniform KV cache dtype in both sections"
+        if kv_cache.get("tokens_per_block", 32) not in (16, 32, 64):
+            return "kv_cache_config.tokens_per_block to be 16, 32, or 64 in both sections"
     return None
 
 
@@ -2779,6 +2920,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str,
             "remove num_serve_frontends and serve_frontend_affinity_port_stride "
             "from context_servers, or launch the context servers with trtllm-serve."
         )
+    _refuse_dense_dwdp_on_generation_servers(disagg_cfg)
 
     from tensorrt_llm._utils import mpi_rank
     if os.environ.get(DisaggLauncherEnvs.
@@ -2883,8 +3025,7 @@ def _launch_disaggregated_server(disagg_config_file: str, llm_args: dict):
     server_cfg = disagg_config.server_configs[int(instance_idx)]
 
     # Set disagg role for telemetry (server_cfg.type is 'ctx' or 'gen')
-    role_map = {"ctx": "context", "gen": "generation"}
-    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = role_map.get(
+    os.environ[DisaggLauncherEnvs.TLLM_DISAGG_ROLE] = _DISAGG_SERVER_ROLES.get(
         server_cfg.type, "")
 
     logger.info(

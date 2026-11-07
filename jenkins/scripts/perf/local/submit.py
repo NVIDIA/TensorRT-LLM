@@ -32,6 +32,7 @@ from benchmark_utils import (  # noqa: E402
     DISAGG_BENCHMARK_MODES,
     DISAGG_CONFIG_MODES,
     GEN_ONLY_NO_CONTEXT_MODE,
+    add_eplb_shm_mount,
     ctx_only_world_size,
     dwdp_ctx_layout,
     dwdp_ctx_size,
@@ -573,7 +574,9 @@ def generate_sbatch_params(args, hardware_config, work_dir):
     return lines
 
 
-def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_config=None):
+def generate_srun_args(
+    args, runtime_mode, timestamp, llm_src="", hardware_config=None, config=None
+):
     """Generate srun arguments."""
     is_aggr = runtime_mode == "aggregated"
     container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
@@ -591,6 +594,7 @@ def generate_srun_args(args, runtime_mode, timestamp, llm_src="", hardware_confi
     if llm_src and llm_src not in mounts:
         llm_src_mount = f"{llm_src}:{llm_src}"
         mounts = f"{mounts},{llm_src_mount}" if mounts else llm_src_mount
+    mounts = add_eplb_shm_mount(mounts, config, llm_src)
     if mounts:
         lines.append(f"--container-mounts={mounts}")
 
@@ -961,7 +965,9 @@ def main():
     sbatch_lines = generate_sbatch_params(args, hardware_config, work_dir)
 
     # Generate srun args
-    srun_args_lines = generate_srun_args(args, runtime_mode, timestamp, llm_src, hardware_config)
+    srun_args_lines = generate_srun_args(
+        args, runtime_mode, timestamp, llm_src, hardware_config, config
+    )
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(

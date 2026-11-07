@@ -389,7 +389,11 @@ class BaseMoeRoutingMethod(nn.Module):
     ) -> bool:
         """Whether :meth:`apply_with_sort` routes ``num_tokens`` tokens of
         ``num_experts`` contiguous FP32 router logits on ``device`` for experts
-        ``[local_expert_offset, local_expert_offset + local_num_experts)``."""
+        ``[local_expert_offset, local_expert_offset + local_num_experts)``.
+
+        Describes eager forwards only: :meth:`apply_with_sort` declines under
+        ``torch.compiler.is_compiling()``, so a compiled graph re-routes
+        through :meth:`apply` and never sees the sorting kernel."""
         return False
 
     def get_experts_per_token(self) -> int:
@@ -640,10 +644,17 @@ class DeepSeekV3MoeRoutingMethod(BaseMoeRoutingMethod):
         from ..kernels.blackwell import kimi_k3_routing
         from .impl_contract import MoESortTables
 
-        bias = self.e_score_correction_bias
-        if not kimi_k3_routing.can_run(router_logits, bias, local_expert_offset,
-                                       local_num_experts):
+        # Decline out-of-scope shapes before the op (the op validates tensors
+        # and raises rather than declining); dtype/alignment still fall to the op.
+        if not kimi_k3_routing.serves(
+                router_logits.shape[0],
+                router_logits.shape[1],
+                local_expert_offset,
+                local_num_experts,
+                router_logits.device,
+        ):
             return None
+        bias = self.e_score_correction_bias
         topk_ids, topk_weights, *sort_outputs = torch.ops.trtllm.noaux_tc_route_sort(
             router_logits, bias, float(self.routing_impl.routed_scaling_factor),
             local_expert_offset, local_num_experts)

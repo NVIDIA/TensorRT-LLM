@@ -2166,6 +2166,9 @@ def _create_usage(
     originating request, so its prompt tokens are only reachable that way.
     """
     if num_prompt_tokens is None:
+        # Unadjusted: counts the whole rendered prompt, ignoring
+        # num_prompt_tokens_offset. Callers that want chat parity pass
+        # ResponsesAPIPostprocArgs.usage_num_prompt_tokens().
         prompt_token_ids = getattr(final_res, "prompt_token_ids", None)
         if prompt_token_ids is None:
             return None
@@ -2184,6 +2187,10 @@ def _create_usage(
     if ctx_prompt_tokens is not None:
         input_tokens = ctx_prompt_tokens
         cached_tokens = ctx_cached_tokens
+    # The engine counts cached tokens over the whole rendered prompt, which can
+    # be longer than the prompt usage reports (see
+    # PostprocArgs.num_prompt_tokens_offset).
+    cached_tokens = min(cached_tokens, input_tokens)
 
     return ResponseUsage(
         input_tokens=input_tokens,

@@ -76,6 +76,10 @@ scheduler_config:
 
 ### Selecting the KV Cache Manager
 
+```{warning}
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+```
+
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
 selects between them and defaults to `true`, which selects the V2 manager. Set it
 to `false` to select the V1 C++ manager for models that support it. Set it to
@@ -143,17 +147,17 @@ kv_cache_config:
 
 The first part of the dtype names the history storage (NVFP4 values with one
 FP8 scale per 16 elements); the second part is the dtype attention computes
-in and the retained tokens are stored in. Like `dtype: fp8`, it overrides the
+in and the first/last tokens are stored in. Like `dtype: fp8`, it overrides the
 checkpoint's KV quantization: `fp8` selects FP8 KV, `float16` and `bfloat16`
-select the unquantized model dtype. Retention follows the
-cache page granularity, and at least one of `mixed_precision_first_n` and
+select the unquantized model dtype. The first/last tokens are kept in
+whole cache pages, and at least one of `mixed_precision_first_n` and
 `mixed_precision_last_n` must be positive.
 
-Each mixed-precision layer owns two pools: its original pool holds the NVFP4
-history, and a second layer group, appended after the model's own layer
-groups, holds the retained tokens. When `pool_ratio` is set it must therefore
-carry one more entry than the model has layer groups, with the retained-token
-group last; leave it unset to size all groups automatically. Sliding-window
+Each mixed-precision layer keeps two pools: the mixed-precision low pool holds
+the NVFP4 history and the mixed-precision high pool holds the first/last tokens.
+The mixed-precision high pools form one extra layer group after the model's own,
+so a `pool_ratio` must carry one more entry than the model has layer groups, with
+the mixed-precision high group last; leave it unset to size all groups automatically. Sliding-window
 layers and layers whose KV is shared with another layer stay native.
 
 Before a mixed-precision layer runs, the attention metadata gathers the two
@@ -167,9 +171,18 @@ forward converts up to the longest sequence in the batch for every
 mixed-precision layer (the full span inside CUDA graphs), which is the
 feature's per-step cost.
 
-The prototype requires the TRTLLM or FlashInfer attention backend with
-`use_kv_cache_manager_v2: true`, and does not support speculative decoding,
-beam search, sparse attention, cold-page compression or context parallelism.
+The prototype requires `use_kv_cache_manager_v2: true` with the TRTLLM or
+FlashInfer attention backend. It supports the standard V2 manager (dense
+models), the hybrid Mamba manager (Qwen3.5, Kimi-K3) and the sparse MLA
+backends (DSA, DeepSeek-V4), and the speculative decoding modes below. Beam
+search, cold-page compression, KV connectors and context parallelism are not
+supported.
+
+| Speculative decoding | Status | KV cache of the drafter layers |
+|---|---|---|
+| MTP (one-model) | Supported | Mixed-precision high and low pools, like the model's own layers |
+| EAGLE3 (one-model) and other drafters with their own architecture | Supported | Plain cache: the mixed-precision high dtype on dense backends, NVFP4 (the mixed-precision low dtype) on DSA and DeepSeek-V4 |
+| Dynamic-tree drafting | Not supported | Rejected at startup |
 
 ### SWA Endpoint Retention
 

@@ -459,7 +459,13 @@ def _register_fake():
         pass
 
     @torch.library.register_fake("trtllm::dwdp_fabric_gather")
-    def _(dst_ptrs, src_ptrs, lines, row_starts, blocks_per_row, threads):
+    def _(dst_ptrs,
+          src_ptrs,
+          lines,
+          row_starts,
+          blocks_per_row,
+          threads,
+          use_tma=False):
         # Copies through raw device pointers; no return value.
         pass
 
@@ -1732,6 +1738,19 @@ def _register_fake():
             (size_k // tile_size, size_n * tile_size // pack_factor),
             dtype=b_q_weight.dtype)
 
+    @torch.library.register_fake("trtllm::reorder_helix_mla_kv")
+    def _(gathered: torch.Tensor, cu_global: torch.Tensor,
+          global_offsets: torch.Tensor, cu_local: torch.Tensor,
+          local_offsets: torch.Tensor, rank_offsets: torch.Tensor,
+          tokens_per_block: int, lora_size: int,
+          rope_size: int) -> List[torch.Tensor]:
+        # One output row per gathered row: the compressed KV and k_pe parts.
+        num_tokens = gathered.shape[0]
+        return [
+            gathered.new_empty((num_tokens, lora_size)),
+            gathered.new_empty((num_tokens, rope_size)),
+        ]
+
     @torch.library.register_fake("trtllm::mla_rope_generation")
     def _(
         fused_q: Optional[torch.Tensor],
@@ -1894,6 +1913,43 @@ def _register_fake():
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
         return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fmha_dense_fp8")
+    def _(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: int,
+        scale_bmm1: Optional[torch.Tensor],
+        scale_out: torch.Tensor,
+        fp16_softmax: bool,
+        out_dtype: torch.dtype,
+    ):
+        return q.new_empty(q.shape, dtype=out_dtype)
+
+    @torch.library.register_fake("trtllm::dit_v_amax")
+    def _(qkv: torch.Tensor, num_heads: int, head_dim: int):
+        return qkv.new_empty((1, ), dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::fused_dit_qk_norm_rope_fp8")
+    def _(
+        qkv: torch.Tensor,
+        num_heads: int,
+        head_dim: int,
+        eps: float,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        cos_emb: torch.Tensor,
+        sin_emb: torch.Tensor,
+        interleave: bool,
+        qk_mul: float,
+        v_amax: Optional[torch.Tensor],
+    ):
+        shape = (qkv.shape[0], num_heads, head_dim)
+        q8, k8, v8 = (qkv.new_empty(shape, dtype=torch.float8_e4m3fn)
+                      for _ in range(3))
+        return q8, k8, v8, qkv.new_empty((1, ), dtype=torch.float32)
 
     @torch.library.register_fake("trtllm::fused_adaptive_layernorm")
     def _(

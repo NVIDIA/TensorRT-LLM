@@ -53,6 +53,9 @@ class _RoutedExperts:
 
     all_reduce = None
     comm = None
+    # The backend surface the eager forward reads for the per-launch SM
+    # reserve: this stand-in sizes no persistent grid to shrink.
+    backend = SimpleNamespace(reserve_sms_for_concurrent_kernels=lambda num_sms: None)
 
     def nvfp4_input_scale(self, num_tokens):
         return None
@@ -104,6 +107,8 @@ def _runtime(log):
     runtime._reduce_routed_output = False
     runtime._defer_shared_allreduce = False
     runtime._shared_gemms_can_lead = True
+    # _shared_sms as __init__ builds it here: the stand-in backend reserves none.
+    runtime._shared_sms = 0
     runtime.moe_routed_event = None
     runtime.shared_expert_stream = torch.cuda.Stream()
     runtime.latent_down_stream = torch.cuda.Stream()

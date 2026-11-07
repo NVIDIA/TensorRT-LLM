@@ -45,7 +45,14 @@ REPO_ROOT = CONFIG_ROOT.parent.parent
 CURATED_DIR = CONFIG_ROOT / "curated"
 DATABASE_DIR = CONFIG_ROOT / "database"
 
-CURATED_CONFIGS = collect_yaml_files(CURATED_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
+# curated/eplb/ holds MoE expert-placement tables that curated configs reference through
+# moe_config.load_balancer; like lookup.yaml they are not standalone serving configs.
+CURATED_EPLB_DIR = CURATED_DIR / "eplb"
+CURATED_CONFIGS = [
+    path
+    for path in collect_yaml_files(CURATED_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
+    if CURATED_EPLB_DIR not in path.parents
+]
 DATABASE_CONFIGS = collect_yaml_files(DATABASE_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
 ALL_CONFIGS = sorted(CURATED_CONFIGS + DATABASE_CONFIGS)
 ALL_LOOKUP_PATHS = sorted((DATABASE_DIR / "lookup.yaml", CURATED_DIR / "lookup.yaml"))
@@ -207,6 +214,13 @@ def _serve_cli_args(config_path: Path, port: int = 17999):
         str(config_path),
         "--port",
         str(port),
+        # With more than one frontend, launch_server spawns attached frontend
+        # processes by re-executing sys.argv (here: the pytest command line);
+        # a single frontend keeps the real launch_server in-process. Passing
+        # the flag skips the default frontend-count resolution, so this test
+        # covers the single-frontend path only.
+        "--num_serve_frontends",
+        "1",
     ]
 
 
@@ -218,6 +232,8 @@ class _MockOpenAIServer:
     def __init__(self, generator, model, **kwargs):
         self.generator = generator
         self.model = model
+        # launch_server registers --middleware objects on the server's app.
+        self.app = FastAPI()
 
     def __call__(self, host, port, sockets=None):
         return _noop_serve(host, port, sockets)

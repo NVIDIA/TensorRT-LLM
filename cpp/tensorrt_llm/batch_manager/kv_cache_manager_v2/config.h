@@ -141,6 +141,10 @@ enum class ReusePolicy
     //! available groups at resume; missing or unselected groups use fresh pages for recomputation.
     //! These pages may be evicted independently without removing the REQUIRED prefix.
     OPTIONAL = 2,
+    //! REQUIRED for sink blocks, OPTIONAL for the sliding window: sinks constrain the prefix match and are
+    //! claimed with it; the window is selected at resume, and ReuseGroupStatus::complete describes it.
+    //! Attention layers only.
+    SINK_REQUIRED_ONLY = 3,
 };
 
 // ---------------------------------------------------------------------------
@@ -366,6 +370,10 @@ struct SsmLayerConfig
             if (buf.isSparse)
             {
                 throw std::invalid_argument("Sparse buffers are only supported for attention layers");
+            }
+            if (buf.effectiveReusePolicy(reusePolicy) == ReusePolicy::SINK_REQUIRED_ONLY)
+            {
+                throw std::invalid_argument("SINK_REQUIRED_ONLY is only supported for attention layers");
             }
             buf.validate();
         }

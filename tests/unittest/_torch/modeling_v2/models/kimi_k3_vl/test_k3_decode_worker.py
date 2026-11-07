@@ -239,6 +239,7 @@ _ACCEPT_DECLINES = {
         "attn.mamba_metadata.state_indices", torch.zeros(4, dtype=torch.int64)
     ),
     "the private context arena": _set("worker._ctx_block_tables", None),
+    "a sliding-window draft pool": _set("worker._ctx_pool_windowed", True),
     "no draft block offsets": _set("attn.draft_kv_cache_block_offsets", None),
     "no KV lengths": _set("attn.kv_lens_cuda", None),
     "a vocab-sharded draft embedding": _set(

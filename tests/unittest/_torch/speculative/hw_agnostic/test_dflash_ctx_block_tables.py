@@ -140,8 +140,9 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
     decode.assert_called_once()
     encoded, divisor, table, counts = decode.call_args.args
     # The layer offset is removed once, by the decode.
-    assert decode.call_args.kwargs == {"block_offset": block_offset}
+    assert encoded.dtype == dtype
     assert torch.equal(encoded, original[1, :2, 0])
+    assert decode.call_args.kwargs == {"block_offset": block_offset}
     assert divisor == 2
     assert table is worker._ctx_block_tables
     assert counts is worker._ctx_block_counts

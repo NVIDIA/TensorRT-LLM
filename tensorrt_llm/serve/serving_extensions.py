@@ -94,8 +94,25 @@ class ServingExtension:
         """Tool declarations carried on messages rather than on the request."""
         return []
 
-    def prompt_tokens_excluded_from_usage(self, request: "ChatCompletionRequest") -> int:
-        """Number of trailing rendered prompt tokens not reported as prompt usage."""
+    def prompt_tokens_excluded_from_usage(
+        self,
+        *,
+        add_generation_prompt: bool,
+        pre_tokenized: bool,
+        request_chat_template: Optional[str],
+    ) -> int:
+        """Number of trailing rendered prompt tokens not reported as prompt usage.
+
+        Routes ask through ``RenderResources.prompt_tokens_excluded_from_usage``,
+        which answers zero without asking when the server has a ``--chat_template``.
+
+        Args:
+            add_generation_prompt: Whether the prompt ends in the template's
+                generation prompt.
+            pre_tokenized: Whether the client supplied the prompt token ids, so
+                that no prompt is rendered.
+            request_chat_template: The request-level chat template, if any.
+        """
         return 0
 
     def apply_chat_extensions(self, request) -> None:

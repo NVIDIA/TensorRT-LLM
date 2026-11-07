@@ -294,3 +294,23 @@ def test_sm107_selected_only_with_rubin_cute_dsl(monkeypatch, rubin_dsl):
     )
     assert routing.serves_with_sort(8, NUM_EXPERTS, 0, 56, logits.device) == rubin_dsl
     assert (routing.apply_with_sort(logits, 0, 56) is not None) == rubin_dsl
+
+
+def test_route_sort_op_rejects_unsupported_operands():
+    """``trtllm::noaux_tc_route_sort`` raises on operands the kernel does not serve, so a
+    direct caller cannot run past the kernel's token limit into its fixed buffers."""
+    m_over = 257
+    logits = torch.zeros((m_over, NUM_EXPERTS), dtype=torch.float32, device="cuda")
+    bias = torch.zeros((NUM_EXPERTS,), dtype=torch.float32, device="cuda")
+    with pytest.raises(ValueError, match="256"):
+        torch.ops.trtllm.noaux_tc_route_sort(logits, bias, 1.0, 0, NUM_EXPERTS)
+    with pytest.raises(ValueError, match="dtype=torch.bfloat16"):
+        torch.ops.trtllm.noaux_tc_route_sort(logits.to(torch.bfloat16), bias, 1.0, 0, NUM_EXPERTS)
+
+
+def test_route_sort_op_serves_valid_logits():
+    """A supported call through the registered op server matches the kernel API."""
+    logits, bias = _logits(4, seed=3)
+    out = torch.ops.trtllm.noaux_tc_route_sort(logits, bias, 1.5, 0, NUM_EXPERTS)
+    ref_ids, _ = _noaux(logits, bias, 1.5)
+    _assert_bit_equal(out[0], ref_ids, "op ids")

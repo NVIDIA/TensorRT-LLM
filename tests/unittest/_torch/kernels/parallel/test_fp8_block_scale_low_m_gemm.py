@@ -1243,8 +1243,14 @@ def test_nvfp4_out_declines_unsupported_inputs():
     with pytest.raises(ValueError):
         _nvfp4_run(big, w, packed, gsf)
     # The low-M kernel stages its BF16 output tile in two quantized-activation stages.
-    tactic = mod.LowMTactic(mma_n=8, split_k=1, a_stages=2, b_stages=1)
-    with pytest.raises(ValueError):
+    # The tactic is valid for the BF16 kernel (quant_groups=1 keeps b_stages=1 legal
+    # there) and violates only the NVFP4 staging rule, so the test fails if that check
+    # is removed or weakened.
+    tactic = mod.LowMTactic(
+        mma_n=32, split_k=1, a_stages=2, x_stages=4, b_stages=1, quant_warps=4, quant_groups=1
+    )
+    mod.validate_tactic(n, k, tactic)
+    with pytest.raises(ValueError, match="b_stages"):
         mod.validate_nvfp4_out_tactic(n, k, tactic)
 
 

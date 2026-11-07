@@ -9,6 +9,7 @@ import threading
 import time
 from typing import Iterable, List, Optional
 
+from tensorrt_llm.bindings.executor import Request
 from tensorrt_llm.llmapi.disagg_utils import get_local_request_id
 
 from ..distributed import Distributed
@@ -58,6 +59,11 @@ class RequestQueueItem:
     # original arrival on the same clock.
     admit_arrival: Optional[float] = None
     admit_orig_arrival: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        # Normalize bound inputs before any queue, ADP, or broadcast handoff.
+        if isinstance(self.request, Request):
+            self.request = ExecutorRequest.adapt(self.request)
 
     @property
     def is_shutdown_request(self):

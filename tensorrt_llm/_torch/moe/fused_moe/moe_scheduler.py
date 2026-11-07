@@ -527,11 +527,15 @@ class ExternalCommMoEScheduler(MoEScheduler):
         supports_post_quant = moe.comm is None or moe.comm.supports_post_quant_dispatch()
         used_fused_route_quant = False
         sort_tables = None
+        sorted_ids = None
         if requires_separated_routing:
             # ``MoEImplBase`` declines a fused route+quant path by default. The
             # conditions are the scheduler's: a fused result skips the separate
             # dispatch and carries no per-token scale to fold a router weight or
             # an EPLB layout into.
+            # The fixed part of this is ConfigurableMoE.routed_ids_unchanged; it is
+            # spelled out here because ``routing_aux`` is per forward and tests may
+            # hand a namespace in for ``moe``.
             routes_unchanged = (
                 not moe._using_load_balancer()
                 and not moe.apply_router_weight_on_input
@@ -563,6 +567,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
             if sorted_result is not None:
                 token_selected_experts, token_final_scales, sort_tables = sorted_result
+                # The tables describe exactly these ids; hold on to them past the
+                # perfect-router hook below, which may rebind token_selected_experts.
+                sorted_ids = token_selected_experts
             elif fused_result is None:
                 # Separated routing: ConfigurableMoE calls routing_method.
                 if routing_aux is None:
@@ -668,8 +675,9 @@ class ExternalCommMoEScheduler(MoEScheduler):
         token_selected_slots = get_calibrator().maybe_collect_or_replay_slots(
             moe.num_slots, token_selected_slots
         )
-        if token_selected_slots is not token_selected_experts:
-            # Replayed ids: the routing kernel's tables describe other ids.
+        if sort_tables is not None and token_selected_slots is not sorted_ids:
+            # Replaced (perfect-router) or replayed (calibrator) ids: the routing
+            # kernel's tables describe other ids.
             sort_tables = None
 
         # ========== Step 4: Communication prepare phase (NVLINK two-sided only) ==========

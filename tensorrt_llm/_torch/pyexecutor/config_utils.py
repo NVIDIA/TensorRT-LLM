@@ -9,6 +9,7 @@ import torch
 import transformers
 
 from tensorrt_llm._utils import str_dtype_to_torch
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
                                           is_speculators_dspark_config,
                                           translate_speculators_dspark_config)
@@ -1034,9 +1035,11 @@ def build_minimax_dspark_draft_config(
 
 def load_pretrained_config(model_name_or_path: str,
                            trust_remote_code: bool = False,
-                           checkpoint_format: Optional[str] = None,
+                           checkpoint_format: CheckpointFormat | str
+                           | None = None,
                            **kwargs) -> transformers.PretrainedConfig:
-    if checkpoint_format in ("mistral", "mistral_large_3"):
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         return MistralConfigLoader().load(model_name_or_path).pretrained_config
@@ -1046,7 +1049,8 @@ def load_pretrained_config(model_name_or_path: str,
     model_type = config_dict.get("model_type")
     architectures = config_dict.get("architectures") or []
 
-    if checkpoint_format in ("mistral", "mistral_large_3"):
+    if checkpoint_format in (CheckpointFormat.MISTRAL,
+                             CheckpointFormat.MISTRAL_LARGE_3):
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
         model_config = MistralConfigLoader().load(
@@ -1149,6 +1153,22 @@ def load_pretrained_config(model_name_or_path: str,
             text_dict["quantization_config"] = quantization_config
         model_config = Qwen4ExpTextConfig.from_dict(text_dict)
         model_config.architectures = ["Qwen4ExpForCausalLM"]
+    elif model_type in ("apertus1p5", "apertus1p5_text"):
+        # Apertus 1.5 runs text-only on the Apertus decoder; its image and
+        # audio tokenizers are not supported.
+        text_dict = dict(config_dict.get("text_config") or config_dict)
+        text_dict["model_type"] = "apertus"
+        # The input embedding also covers the image and audio codes; the
+        # runtime's vocab_size is the output (lm_head) vocabulary.
+        output_vocab_size = text_dict.get("output_vocab_size")
+        if output_vocab_size is not None:
+            text_dict["input_vocab_size"] = text_dict["vocab_size"]
+            text_dict["vocab_size"] = output_vocab_size
+        if "quantization_config" in config_dict:
+            text_dict.setdefault("quantization_config",
+                                 config_dict["quantization_config"])
+        model_config = transformers.ApertusConfig.from_dict(text_dict)
+        model_config.architectures = ["Apertus1p5ForConditionalGeneration"]
     elif model_type in ("deepseek_v41", "deepseek_v41_text"):
         # Preserve the composite config and propagate its dtype to the text tower.
         # Vision checkpoints use the internal ConditionalGeneration dispatch alias.

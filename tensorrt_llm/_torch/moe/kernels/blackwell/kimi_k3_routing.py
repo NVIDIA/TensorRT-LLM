@@ -27,9 +27,10 @@ the side-stream kernels it runs with.
   rows of an expert follow the token order, which is what ``moe_sort``'s single-CTA kernels
   produce (its cluster kernel orders rows by atomics). CTA 0 writes the tile arrays.
 
-The kernel is launched with programmatic dependent launch: it stages the bias (a weight) in
-shared memory before ``griddepcontrol.wait`` and releases its dependents once the top-k is
-done. It keeps no state between launches, so a captured CUDA graph replays it as is.
+The kernel is launched with programmatic dependent launch (``use_pdl``, defaulting to
+``TRTLLM_ENABLE_PDL``, like the ops it replaces): it stages the bias (a weight) in shared
+memory before ``griddepcontrol.wait`` and releases its dependents once the top-k is done. It
+keeps no state between launches, so a captured CUDA graph replays it as is.
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ from cutlass import Float32, Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
 from . import raw_ptx as ptx
 
 #: Experts selected per token.
@@ -408,7 +410,14 @@ class NoauxTcRouteSortKernel:
         local_cap: Largest number of local experts served.
     """
 
-    def __init__(self, num_experts: int, num_warps: int, warps_per_token: int, local_cap: int):
+    def __init__(
+        self,
+        num_experts: int,
+        num_warps: int,
+        warps_per_token: int,
+        local_cap: int,
+        use_pdl: bool = TRTLLM_ENABLE_PDL,
+    ) -> None:
         if not supports_num_experts(num_experts):
             raise ValueError(f"num_experts={num_experts} must be a multiple of 128 up to 1024")
         if warps_per_token not in (1, 2) or num_warps % warps_per_token:
@@ -431,6 +440,7 @@ class NoauxTcRouteSortKernel:
         self.region_cap = 64 if warps_per_token == 1 else 32
         self.region_slots = self.region_cap + 4
         self.local_cap = local_cap
+        self.use_pdl = use_pdl
         # Local experts handled per thread in the sort scan (contiguous).
         self.experts_per_thread = (local_cap + self.threads - 1) // self.threads
         self.max_tiles_per_expert = (MAX_M + TILE_SIZE - 1) // TILE_SIZE
@@ -500,7 +510,7 @@ class NoauxTcRouteSortKernel:
             cluster=(self.num_ctas, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
-            use_pdl=True,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -554,7 +564,8 @@ class NoauxTcRouteSortKernel:
             ptx.st_shared_v4_f32(bias_smem + e4 * 16, v[0], v[1], v[2], v[3])
         # Every CTA of the cluster must be running before a peer writes its shared memory.
         cute.arch.cluster_arrive_relaxed()
-        cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
         cute.arch.barrier()
 
         for token in cutlass.range(t_begin + team, t_end, self.teams, unroll=1):
@@ -577,7 +588,8 @@ class NoauxTcRouteSortKernel:
                 local_offset,
                 local_num,
             )
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_launch_dependents()
 
         cute.arch.barrier()
         cute.arch.cluster_wait()
@@ -986,8 +998,16 @@ def _config(m: int) -> tuple[int, int]:
 
 
 @functools.cache
-def _compiled_kernel(num_experts: int, num_warps: int, warps_per_token: int, local_cap: int):
-    kernel = NoauxTcRouteSortKernel(num_experts, num_warps, warps_per_token, local_cap)
+def _compiled_kernel(
+    num_experts: int,
+    num_warps: int,
+    warps_per_token: int,
+    local_cap: int,
+    use_pdl: bool = TRTLLM_ENABLE_PDL,
+) -> object:
+    kernel = NoauxTcRouteSortKernel(
+        num_experts, num_warps, warps_per_token, local_cap, use_pdl=use_pdl
+    )
     dummy = Int64(1 << 20)
     return cute.compile(
         kernel,
@@ -1030,6 +1050,28 @@ def sort_outputs(
     )
 
 
+def precompile(num_experts: int, use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
+    """Compile every (``num_warps``, ``warps_per_token``, ``local_cap``) variant ``_config`` can
+    land on, ahead of serving, so no served step compiles them; returns the compiles done (0
+    when the current device is one the kernel does not serve).
+
+    ``_config`` token bands: 8-warp CTAs with two-warp teams up to 32 tokens, one-warp teams
+    up to 64, 16-warp CTAs above; ``local_cap`` is ``_SMALL_LOCAL_CAP`` up to that many local
+    experts, ``num_experts`` above.
+    """
+    if not supports_device(torch.cuda.current_device()):
+        return 0
+    compiled = 0
+    for warps_per_token, num_warps in ((2, 8), (1, 8), (1, 16)):
+        local_caps = {num_experts}
+        if num_experts > _SMALL_LOCAL_CAP:
+            local_caps.add(_SMALL_LOCAL_CAP)
+        for local_cap in sorted(local_caps):
+            _compiled_kernel(num_experts, num_warps, warps_per_token, local_cap, use_pdl=use_pdl)
+            compiled += 1
+    return compiled
+
+
 def can_run(
     logits: torch.Tensor,
     e_score_correction_bias: torch.Tensor,
@@ -1070,7 +1112,7 @@ def run_route_sort(
     local_num_experts: int,
     topk_ids: torch.Tensor,
     topk_weights: torch.Tensor,
-    sort_outputs: tuple[torch.Tensor, ...],
+    sort_buffers: tuple[torch.Tensor, ...],
 ) -> None:
     """Launch the routing on the current stream (inputs as :func:`can_run` accepts them).
 
@@ -1082,15 +1124,17 @@ def run_route_sort(
         local_num_experts: Experts of this rank.
         topk_ids: Output ``int32 [M, 16]``, bit-identical to ``noaux_tc_op``'s ids.
         topk_weights: Output ``fp32 [M, 16]``, bit-identical to ``noaux_tc_op``'s weights.
-        sort_outputs: ``moe_sort`` outputs for this rank and 128-row tiles, as
+        sort_buffers: ``moe_sort`` outputs for this rank and 128-row tiles, as
             :func:`sort_outputs` allocates them. Only valid entries are written (as in
             ``moe_sort``); the rows of an expert are in ascending token order.
     """
     m, num_experts = logits.shape
     warps_per_token, num_warps = _config(m)
     local_cap = _SMALL_LOCAL_CAP if local_num_experts <= _SMALL_LOCAL_CAP else num_experts
-    compiled = _compiled_kernel(num_experts, num_warps, warps_per_token, local_cap)
-    tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_outputs)
+    compiled = _compiled_kernel(
+        num_experts, num_warps, warps_per_token, local_cap, use_pdl=TRTLLM_ENABLE_PDL
+    )
+    tile_expert, tile_limit, e2p, p2e, total, num_tiles = (t.data_ptr() for t in sort_buffers)
     scale_bits = struct.unpack("<q", struct.pack("<d", float(routed_scaling_factor)))[0]
     compiled(
         Int32(m),

@@ -16,15 +16,28 @@ import pytest
 import torch
 import yaml
 from torch import nn
-from transformers import LlamaConfig, MistralConfig, Phi3Config, Qwen2Config, Qwen3Config
-from utils.post_transform_qualification import (
-    PostTransformQualificationCase,
-    assert_post_transform_lifecycle_equivalent,
+from transformers import (
+    LlamaConfig,
+    MistralConfig,
+    Phi3Config,
+    Qwen2Config,
+    Qwen3Config,
+    Qwen3MoeConfig,
 )
+from utils.post_transform_qualification import (
+    AllReduceStub,
+    PostTransformQualificationCase,
+    assert_every_parameter_was_loaded,
+    assert_post_transform_lifecycle_equivalent,
+    keep_factory_parameters,
+    module_state_snapshot,
+)
+from utils.util import getSMVersion
 
 import tensorrt_llm._torch.weight_sharing as weight_sharing_mod
 import tensorrt_llm.mapping as mapping_mod
 from tensorrt_llm._torch import distributed as distributed_mod
+from tensorrt_llm._torch import model_config as model_config_mod
 from tensorrt_llm._torch.attention import mla as mla_mod
 from tensorrt_llm._torch.attention.mla import MLA
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
@@ -34,16 +47,26 @@ from tensorrt_llm._torch.models import modeling_mistral as modeling_mistral_mod
 from tensorrt_llm._torch.models import modeling_phi3 as modeling_phi3_mod
 from tensorrt_llm._torch.models import modeling_qwen as modeling_qwen_mod
 from tensorrt_llm._torch.models import modeling_qwen3 as modeling_qwen3_mod
+from tensorrt_llm._torch.models import modeling_qwen3_moe as modeling_qwen3_moe_mod
+from tensorrt_llm._torch.models.checkpoints.hf.qwen3_moe_weight_mapper import Qwen3MoeHfWeightMapper
 from tensorrt_llm._torch.models.checkpoints.mx.checkpoint_loader import MXCheckpointLoader
 from tensorrt_llm._torch.models.modeling_multimodal_mixin import MultimodalModelMixin
 from tensorrt_llm._torch.models.modeling_utils import get_registered_model_class
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode
+from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+from tensorrt_llm._torch.moe.fused_moe.cutlass import TrtllmCutlassUnquantizedImpl
+from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoEEnvironment
+from tensorrt_llm._torch.moe.fused_moe.impl_environment import MoEDep, override_moe_environment
+from tensorrt_llm._torch.moe.fused_moe.interface import MoEWeightLoadingMode
+from tensorrt_llm._torch.moe.fused_moe.moe_resolution import resolve_moe_impl
+from tensorrt_llm._torch.moe.fused_moe.quantization import UnquantizedFusedMoEMethod
 from tensorrt_llm._torch.pyexecutor import model_loader as model_loader_mod
 from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
 from tensorrt_llm._torch.weight_sharing import (
     ARTIFACT_IDENTITY_FORMAT_VERSION,
     LLAMA_POST_TRANSFORM_LAYOUT_ABI_V1,
     PHI3_DENSE_POST_TRANSFORM_LAYOUT_ABI_V1,
+    QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1,
     SOURCE_IDENTITY_FORMAT_VERSION,
     WEIGHT_MANIFEST_DIR_ENV,
     WEIGHT_MANIFEST_ROLE_ENV,
@@ -52,6 +75,7 @@ from tensorrt_llm._torch.weight_sharing import (
     PostTransformFeature,
     PostTransformProfile,
     PostTransformProfileRegistry,
+    PostTransformQualificationDecision,
     PostTransformQualificationReason,
     PostTransformRuntimeConfig,
     PostTransformRuntimeConstraints,
@@ -61,6 +85,7 @@ from tensorrt_llm._torch.weight_sharing import (
     load_weight_manifest,
 )
 from tensorrt_llm.llmapi.llm_args import LoadFormat
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 _SOURCE_IDENTITY = model_loader_mod.SourceIdentity(
     format_version=SOURCE_IDENTITY_FORMAT_VERSION,
@@ -121,7 +146,8 @@ class _TinyModel(nn.Module):
     def __init__(self, events):
         super().__init__()
         self.model_config = SimpleNamespace(
-            pretrained_config=SimpleNamespace(architectures=["TinyForCausalLM"], model_type="tiny")
+            pretrained_config=SimpleNamespace(architectures=["TinyForCausalLM"], model_type="tiny"),
+            mapping=mapping_mod.Mapping(),
         )
         self._weights_transformed = False
         self.linear = _LinearStub()
@@ -183,6 +209,10 @@ class _UnqualifiedMistralForCausalLM(modeling_mistral_mod.MistralForCausalLM):
 
 
 class _UnqualifiedPhi3ForCausalLM(modeling_phi3_mod.Phi3ForCausalLM):
+    pass
+
+
+class _UnqualifiedQwen3MoeForCausalLM(modeling_qwen3_moe_mod.Qwen3MoeForCausalLM):
     pass
 
 
@@ -490,6 +520,234 @@ def _tiny_phi3_model(
     return model
 
 
+_QWEN3_MOE_PROFILE_ID = "qwen3-moe-for-causal-lm-bf16-cutlass-target-v1"
+_QWEN3_MOE_NUM_EXPERTS = 4
+
+
+def _qwen3_moe_hf_config(**overrides: object) -> Qwen3MoeConfig:
+    values: dict[str, object] = {
+        "architectures": ["Qwen3MoeForCausalLM"],
+        "attention_bias": False,
+        "decoder_sparse_step": 1,
+        "head_dim": 32,
+        "hidden_act": "silu",
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "max_position_embeddings": 64,
+        "mlp_only_layers": [],
+        "moe_intermediate_size": 256,
+        "norm_topk_prob": True,
+        "num_attention_heads": 4,
+        "num_experts": _QWEN3_MOE_NUM_EXPERTS,
+        "num_experts_per_tok": 2,
+        "num_hidden_layers": 2,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-6,
+        "rope_scaling": None,
+        "tie_word_embeddings": False,
+        "torch_dtype": torch.bfloat16,
+        "vocab_size": 64,
+    }
+    values.update(overrides)
+    return Qwen3MoeConfig(**values)
+
+
+# `_tiny_qwen3_moe_model` builds its routed experts on CUDA through the CUTLASS
+# leaf for unquantized weights, which supports SM80 and newer.
+_requires_cutlass_bf16_moe = pytest.mark.skipif(
+    not torch.cuda.is_available() or getSMVersion() < 80,
+    reason="the Qwen3 MoE fixture needs CUDA and the SM80+ CUTLASS MoE leaf",
+)
+
+
+def _tiny_qwen3_moe_model(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    model_class: type[nn.Module] = modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
+    tp_size: int = 1,
+    rank: int = 0,
+    moe_ep_size: int = -1,
+) -> nn.Module:
+    """Build a two-layer Qwen3 MoE model on CUDA with deterministic weights.
+
+    The routed experts run through `ConfigurableMoE` over the CUTLASS leaf for
+    unquantized weights, whose kernels need CUDA tensors. `moe_ep_size=2` at
+    `tp_size=2` selects the MoE-EP partition; the default leaves MoE TP equal
+    to TP. TP=2 builds one rank of the group with collectives stubbed out, as
+    the dense TP=2 tests do. Every per-rank expert GEMM dimension stays at
+    least 128 in both partitions.
+    """
+    if tp_size > 1:
+        monkeypatch.setattr(mapping_mod, "mpi_disabled", lambda: False)
+        monkeypatch.setattr(distributed_mod, "AllReduce", AllReduceStub)
+        monkeypatch.setattr(modeling_qwen3_moe_mod, "AllReduce", AllReduceStub)
+        monkeypatch.setattr(modeling_qwen3_moe_mod, "MoEAllReduce", AllReduceStub)
+        monkeypatch.setattr(modeling_qwen3_moe_mod, "can_access_peer", lambda _mapping: False)
+    with torch.device("cuda"):
+        model = model_class(
+            ModelConfig(
+                pretrained_config=_qwen3_moe_hf_config(),
+                mapping=mapping_mod.Mapping(
+                    world_size=tp_size,
+                    rank=rank,
+                    tp_size=tp_size,
+                    moe_ep_size=moe_ep_size,
+                ),
+                max_num_tokens=16,
+                max_seq_len=16,
+            )
+        )
+    with torch.no_grad():
+        for index, parameter in enumerate(model.parameters()):
+            values = torch.arange(
+                parameter.numel(),
+                dtype=torch.float32,
+                device=parameter.device,
+            ).reshape(parameter.shape)
+            # Centered and scaled so the routed-expert outputs stay well inside
+            # the BF16 range.
+            parameter.copy_((((values + index) % 17) - 8).to(parameter.dtype) / 64)
+    return model
+
+
+def _qwen3_moe_layout_state(model: nn.Module) -> dict[str, object]:
+    layers = model.model.layers
+    layer = layers[0]
+    experts = layer.mlp.experts
+    backend = experts.backend
+    return {
+        "attention_type": type(layer.self_attn).__name__,
+        "qkv_weight_mode": layer.self_attn.qkv_proj.weights_loading_config.weight_mode,
+        "qkv_weight_shape": tuple(layer.self_attn.qkv_proj.weight.shape),
+        "q_norm_weight_shape": tuple(layer.self_attn.q_norm.weight.shape),
+        "k_norm_weight_shape": tuple(layer.self_attn.k_norm.weight.shape),
+        "fuse_qk_norm_rope": layer.self_attn.fuse_qk_norm_rope,
+        "rope_fusion": layer.self_attn.rope_fusion,
+        "router_weight_shape": tuple(layer.mlp.gate.weight.shape),
+        "router_weight_dtype": layer.mlp.gate.weight.dtype,
+        "experts_type": type(experts).__name__,
+        "backend_type": type(backend).__name__,
+        "backend_id": type(backend).descriptor.identity.canonical(),
+        "quant_method_type": type(backend.quant_method).__name__,
+        "quant_scales": backend.quant_scales,
+        "weight_loading_mode": backend.weight_loading_mode,
+        "routing_method_type": type(experts.routing_method).__name__,
+        "routing_scales_dtype": getattr(experts.routing_method, "output_dtype", None),
+        "w3_w1_weight_shape": tuple(backend.w3_w1_weight.shape),
+        "w2_weight_shape": tuple(backend.w2_weight.shape),
+        "expert_size_per_partition": backend.expert_size_per_partition,
+        "initial_local_expert_ids": tuple(backend.initial_local_expert_ids),
+        "layer_load_balancer": backend.layer_load_balancer,
+        "layer0_next_norm": layers[0].next_layer_layernorm is layers[1].input_layernorm,
+        "layer1_next_norm": layers[1].next_layer_layernorm is model.model.norm,
+        "tied_lm_head": model.lm_head.weight is model.model.embed_tokens.weight,
+    }
+
+
+def _qwen3_moe_hidden_states(model: nn.Module) -> torch.Tensor:
+    router_weight = model.model.layers[0].mlp.gate.weight
+    values = torch.arange(
+        3 * model.config.hidden_size,
+        dtype=torch.float32,
+        device=router_weight.device,
+    ).reshape(3, model.config.hidden_size)
+    return ((values % 17) - 8).to(router_weight.dtype) / 17
+
+
+def _qwen3_moe_router_logits(model: nn.Module) -> torch.Tensor:
+    return model.model.layers[0].mlp.gate(_qwen3_moe_hidden_states(model))
+
+
+def _qwen3_moe_routed_expert_output(model: nn.Module) -> torch.Tensor:
+    """Run the first layer's routed experts on fixed hidden states.
+
+    The synthetic router logits send the three tokens to experts {0, 1}, {2, 3}
+    and {0, 3}, so every expert, and both ranks of the MoE-EP partition, does
+    work. Top-2 routing keeps the CUTLASS finalize deterministic. Under MoE TP or
+    EP the result is this rank's partial sum; the decoder layer reduces it later.
+    """
+    hidden_states = _qwen3_moe_hidden_states(model)
+    router_logits = torch.tensor(
+        [[4.0, 3.0, 0.0, 0.0], [0.0, 0.0, 4.0, 3.0], [3.0, 0.0, 0.0, 4.0]],
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    output = model.model.layers[0].mlp.experts(hidden_states, router_logits, use_dp_padding=False)
+    torch.cuda.synchronize()
+    return output
+
+
+# This fixture's routed-expert forward has not been validated below SM90, so
+# the lifecycle cases that compare its output skip there with this reason; the
+# tensor, state, and guard checks of the other cases still run on every GPU.
+_requires_sm90_routed_expert_forward = pytest.mark.skipif(
+    not torch.cuda.is_available() or getSMVersion() < 90,
+    reason="the Qwen3 MoE fixture's routed-expert forward is validated only on SM90 and newer",
+)
+
+
+def _qwen3_moe_hf_state_dict() -> dict[str, torch.Tensor]:
+    """Return the tiny config's checkpoint tensors in the Hugging Face layout.
+
+    Routed experts are stored per expert, as in a checkpoint on disk. Every
+    value is positive, so no loaded tensor can equal the factory's fill, which
+    is centered on zero.
+    """
+    config = _qwen3_moe_hf_config()
+    hidden, head_dim = config.hidden_size, config.head_dim
+    q_rows = config.num_attention_heads * head_dim
+    kv_rows = config.num_key_value_heads * head_dim
+    inter = config.moe_intermediate_size
+    shapes = {
+        "model.embed_tokens.weight": (config.vocab_size, hidden),
+        "model.norm.weight": (hidden,),
+        "lm_head.weight": (config.vocab_size, hidden),
+    }
+    for layer in range(config.num_hidden_layers):
+        prefix = f"model.layers.{layer}."
+        shapes |= {
+            prefix + "input_layernorm.weight": (hidden,),
+            prefix + "post_attention_layernorm.weight": (hidden,),
+            prefix + "self_attn.q_proj.weight": (q_rows, hidden),
+            prefix + "self_attn.k_proj.weight": (kv_rows, hidden),
+            prefix + "self_attn.v_proj.weight": (kv_rows, hidden),
+            prefix + "self_attn.o_proj.weight": (hidden, q_rows),
+            prefix + "self_attn.q_norm.weight": (head_dim,),
+            prefix + "self_attn.k_norm.weight": (head_dim,),
+            prefix + "mlp.gate.weight": (config.num_experts, hidden),
+        }
+        for expert in range(config.num_experts):
+            shapes |= {
+                prefix + f"mlp.experts.{expert}.gate_proj.weight": (inter, hidden),
+                prefix + f"mlp.experts.{expert}.up_proj.weight": (inter, hidden),
+                prefix + f"mlp.experts.{expert}.down_proj.weight": (hidden, inter),
+            }
+    state_dict = {}
+    for index, (name, shape) in enumerate(shapes.items()):
+        values = torch.arange(torch.Size(shape).numel(), dtype=torch.float32).reshape(shape)
+        state_dict[name] = (((values + index) % 17 + 1) / 256).to(torch.bfloat16)
+    return state_dict
+
+
+def _qwen3_moe_hf_checkpoint_loader(
+    state_dict: dict[str, torch.Tensor],
+) -> Callable[[nn.Module], None]:
+    """Return a `prepare_producer` hook that loads `state_dict` like a real HF load."""
+
+    def _load(model: nn.Module) -> None:
+        mapper = Qwen3MoeHfWeightMapper()
+        mapper.init_model_and_config(model, model.model_config)
+        model.load_weights(dict(state_dict), mapper)
+
+    return _load
+
+
+def _qwen3_moe_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
+    values: dict[str, object] = {"rope_fusion": False}
+    values.update(overrides)
+    return _bf16_dense_runtime_config(**values)
+
+
 def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfig:
     """Return the runtime config a qualified BF16 dense tiny model realizes at TP1.
 
@@ -511,6 +769,7 @@ def _bf16_dense_runtime_config(**overrides: object) -> PostTransformRuntimeConfi
         "cp_size": 1,
         "moe_tp_size": 1,
         "moe_ep_size": 1,
+        "moe_cluster_size": 1,
         "attention_tp_size": 1,
         "attention_cp_size": 1,
         "attention_dp": False,
@@ -714,7 +973,7 @@ def test_construct_checkpoint_loader_passes_mx_config():
         server_query_timeout_s=17,
     )
 
-    checkpoint_loader = model_loader_mod._construct_checkpoint_loader(
+    checkpoint_loader = model_loader_mod.construct_checkpoint_loader(
         None,
         "MX",
         mx_config=mx_config,
@@ -739,9 +998,9 @@ def _format_documented_values(
 # A profile that needs a new phrase adds it here rather than special-casing
 # its model type.
 _DOCUMENTED_SCOPES = {
-    PostTransformTransferScope.TARGET_MODEL: "dense {dtypes}",
+    PostTransformTransferScope.TARGET_MODEL: "{family_kind} {dtypes}",
     PostTransformTransferScope.COMPLETE_MODEL: (
-        "dense {dtypes} vision-language model with its vision encoder"
+        "{family_kind} {dtypes} vision-language model with its vision encoder"
     ),
 }
 # Keyed by the profile's (`rope_types`, `rope_fusion`) constraints.
@@ -757,7 +1016,11 @@ _DOCUMENTED_SLIDING_WINDOWS = {
 
 
 def _documented_constraints(profile: PostTransformProfile) -> str:
-    """Render the support-table constraint text that a registry profile implies."""
+    """Render the support-table constraint text that a registry profile implies.
+
+    A MoE profile also names its pinned MoE backend and admitted routed-expert
+    partitions, and adds the MoE load balancer and DWDP to the exclusions.
+    """
     constraints = profile.runtime_constraints
     assert constraints.quant_algorithms == frozenset({"none"})
     assert constraints.kv_cache_quant_algorithms == frozenset({"none"})
@@ -768,9 +1031,15 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     assert constraints.attention_dp == frozenset({False})
     assert constraints.multi_node == frozenset({False})
     assert constraints.tied_word_embeddings == frozenset({False})
-    assert constraints.moe_backends is None
-    assert constraints.moe_tp_sizes is None
-    assert constraints.moe_ep_sizes is None
+    moe_profile = constraints.moe_backends is not None
+    if moe_profile:
+        assert constraints.moe_tp_sizes == constraints.tp_sizes
+        assert constraints.moe_ep_sizes == constraints.tp_sizes
+        assert constraints.moe_cluster_sizes == frozenset({1})
+    else:
+        assert constraints.moe_tp_sizes is None
+        assert constraints.moe_ep_sizes is None
+        assert constraints.moe_cluster_sizes is None
     assert constraints.attention_tp_sizes == constraints.tp_sizes
     assert constraints.attention_cp_sizes == constraints.cp_sizes
     assert constraints.pp_sizes == constraints.cp_sizes
@@ -784,14 +1053,34 @@ def _documented_constraints(profile: PostTransformProfile) -> str:
     attention_backends = _format_documented_values(constraints.attention_backends)
     tp_sizes = _format_documented_values(constraints.tp_sizes)
     pp_cp_sizes = _format_documented_values(constraints.pp_sizes)
-    model_description = _DOCUMENTED_SCOPES[profile.transfer_scope].format(dtypes=dtypes)
+    if moe_profile:
+        family_kind = "MoE"
+        moe_backend_description = (
+            f"{_format_documented_values(constraints.moe_backends)} MoE backend, "
+        )
+        partition_description = (
+            f"TP={tp_sizes}, MoE TP={_format_documented_values(constraints.moe_tp_sizes)} and "
+            f"MoE EP={_format_documented_values(constraints.moe_ep_sizes)} with "
+            "MoE TP x MoE EP = TP, "
+            f"MoE cluster={_format_documented_values(constraints.moe_cluster_sizes)}"
+        )
+        moe_exclusions = "MoE load balancer, DWDP, "
+    else:
+        family_kind = "dense"
+        moe_backend_description = ""
+        partition_description = f"TP={tp_sizes}"
+        moe_exclusions = ""
+    model_description = _DOCUMENTED_SCOPES[profile.transfer_scope].format(
+        family_kind=family_kind, dtypes=dtypes
+    )
     rope_description = _DOCUMENTED_ROPE[(constraints.rope_types, constraints.rope_fusion)]
     sliding_window_description = _DOCUMENTED_SLIDING_WINDOWS[constraints.sliding_windows]
     return (
         f"Single-node {model_description}, unquantized weights and KV cache, "
-        f"{attention_backends} attention, {rope_description}{sliding_window_description}, "
-        f"untied embeddings, TP={tp_sizes}, PP/CP={pp_cp_sizes}, no LoRA, sparse attention, "
-        "attention DP, speculative mode, or separately loaded draft model"
+        f"{attention_backends} attention, {moe_backend_description}{rope_description}"
+        f"{sliding_window_description}, untied embeddings, {partition_description}, "
+        f"PP/CP={pp_cp_sizes}, no LoRA, sparse attention, attention DP, {moe_exclusions}"
+        "speculative mode, or separately loaded draft model"
     )
 
 
@@ -846,8 +1135,16 @@ def _mx_e2e_cases() -> dict[str, dict[str, object]]:
         (case,) = param.args
         options = {keyword.arg: keyword.value for keyword in param.keywords}
         row = {keyword.arg: ast.literal_eval(keyword.value) for keyword in case.keywords}
-        assert ast.unparse(options["marks"].func) == "pytest.mark.skip_less_device"
-        row["min_devices"] = ast.literal_eval(options["marks"].args[0])
+        marks = options["marks"]
+        marks = marks.elts if isinstance(marks, ast.List) else [marks]
+        mark_args = {ast.unparse(mark.func): mark.args for mark in marks}
+        # Every row names its GPU count; a row may also require device memory.
+        assert len(mark_args) == len(marks)
+        assert set(mark_args) <= {
+            "pytest.mark.skip_less_device",
+            "pytest.mark.skip_less_device_memory",
+        }
+        row["min_devices"] = ast.literal_eval(mark_args["pytest.mark.skip_less_device"][0])
         case_id = ast.literal_eval(options["id"])
         assert case_id not in rows
         rows[case_id] = row
@@ -876,10 +1173,13 @@ def _l0_model_express_case_ids() -> dict[int, list[str]]:
     return case_ids
 
 
-def _documented_names(text: str, start: str, end: str) -> set[str]:
-    """Return the leading name of each item enumerated between `start` and `end`.
+def _documented_names(text: str, start: str, end: str, known_names: set[str]) -> set[str]:
+    """Return the family name that starts each item enumerated between `start` and `end`.
 
-    A missing anchor fails with its text, so whoever rewords
+    Each item starts with one of `known_names`, and the longest match wins, so
+    `Qwen3 MoE` is not read as `Qwen3`. A name matches only when no word
+    character or dot follows it, so `Qwen3.5` is never read as `Qwen3`. A
+    missing anchor fails with its text, so whoever rewords
     `docs/source/features/model-express.md` knows which anchor to update here.
     """
     doc = "docs/source/features/model-express.md"
@@ -890,43 +1190,97 @@ def _documented_names(text: str, start: str, end: str) -> set[str]:
     if begin < 0:
         pytest.fail(f"{doc} has no anchor {start!r} before {end!r}; update this test's anchors")
     enumeration = text[begin + len(start) : stop]
-    return {re.match(r"[\w.]+", item).group() for item in re.split(r",? and |, ", enumeration)}
+    documented = set()
+    for item in re.split(r",? and |, ", enumeration):
+        matches = [name for name in known_names if re.match(re.escape(name) + r"(?![\w.])", item)]
+        assert matches, f"{doc} names {item!r}, which no qualified profile covers"
+        documented.add(max(matches, key=len))
+    return documented
 
 
-def _profile_family(profile: PostTransformProfile) -> str:
-    """Return the family that names a profile's donor/receiver rows, such as `qwen3_5`.
-
-    A profile ID names its family before `-for-`.
-    """
-    return profile.profile_id.split("-for-")[0]
+# The documentation spells these families differently from their architecture names.
+_MX_FAMILY_DISPLAY_NAMES = {"Qwen3MoeForCausalLM": "Qwen3 MoE"}
 
 
 def _documented_family(profile: PostTransformProfile) -> str:
     """Return the family name by which the doc refers to a profile, such as `Qwen3.5`."""
+    if profile.architecture in _MX_FAMILY_DISPLAY_NAMES:
+        return _MX_FAMILY_DISPLAY_NAMES[profile.architecture]
     family = re.sub(r"For(?:CausalLM|ConditionalGeneration)$", "", profile.architecture)
     return family.replace("_", ".")
+
+
+def _moe_ep_row_partitions(profile: PostTransformProfile) -> list[tuple[int, int]]:
+    """Return the `(TP size, MoE EP size)` pairs with MoE EP above 1 that a profile admits.
+
+    MoE TP takes the rest of TP, so a pair is admitted when the profile admits that MoE TP size.
+    """
+    constraints = profile.runtime_constraints
+    if constraints.moe_backends is None:
+        return []
+    return [
+        (tp_size, moe_ep_size)
+        for tp_size in sorted(constraints.tp_sizes)
+        for moe_ep_size in sorted(constraints.moe_ep_sizes)
+        if moe_ep_size > 1
+        and tp_size % moe_ep_size == 0
+        and tp_size // moe_ep_size in constraints.moe_tp_sizes
+    ]
+
+
+# Donor/receiver rows of each qualified profile, as `(case-ID stem, repository
+# cache stem, model path override variable)`. The rows are `<case-ID stem>-tp1`
+# and `<case-ID stem>-tp2`, plus `<case-ID stem>-tp<N>-ep<M>` for each MoE EP
+# size above 1 that a MoE profile admits. A family can have several profiles, so
+# a profile ID does not name its rows.
+_MX_E2E_ROWS = {
+    "llama-for-causal-lm-target-v1": ("llama-bf16", "llama", "TRTLLM_MX_LLAMA_MODEL"),
+    "qwen2-for-causal-lm-bf16-target-v1": ("qwen2-bf16", "qwen2", "TRTLLM_MX_QWEN2_MODEL"),
+    "qwen3-for-causal-lm-bf16-target-v1": ("qwen3-bf16", "qwen3", "TRTLLM_MX_QWEN3_MODEL"),
+    "mistral-for-causal-lm-bf16-target-v1": ("mistral-bf16", "mistral", "TRTLLM_MX_MISTRAL_MODEL"),
+    "phi3-for-causal-lm-bf16-target-v1": ("phi3-bf16", "phi3", "TRTLLM_MX_PHI3_MODEL"),
+    "qwen3_5-for-conditional-generation-bf16-complete-v1": (
+        "qwen3_5-bf16",
+        "qwen3_5",
+        "TRTLLM_MX_QWEN3_5_MODEL",
+    ),
+    "qwen3-moe-for-causal-lm-bf16-cutlass-target-v1": (
+        "qwen3-moe-bf16",
+        "qwen3-moe",
+        "TRTLLM_MX_QWEN3_MOE_MODEL",
+    ),
+}
 
 
 @pytest.mark.cpu_only
 def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
     """Every qualified profile has TP1 and TP2 donor/receiver rows that CI schedules.
 
-    The `_MX_CASES` rows must follow the shared naming scheme, and
-    `l0_model_express.yml` must list each row exactly once, in a block whose GPU
-    count matches the row's two TP groups.
+    `_MX_E2E_ROWS` names the rows of each profile and needs one entry per
+    qualified profile. The `_MX_CASES` rows must follow the shared naming
+    scheme, and `l0_model_express.yml` must list each row exactly once, in a
+    block whose GPU count matches the row's two TP groups.
     """
+    profiles = ModelLoader._post_transform_profile_registry().profiles
+    assert set(_MX_E2E_ROWS) == {profile.profile_id for profile in profiles}, (
+        "Every qualified profile needs exactly one `_MX_E2E_ROWS` entry"
+    )
+    for column in zip(*_MX_E2E_ROWS.values(), strict=True):
+        assert len(set(column)) == len(column), (
+            f"Two profiles share the `_MX_E2E_ROWS` value of one column: {column}"
+        )
     cases = _mx_e2e_cases()
     ci_case_ids = _l0_model_express_case_ids()
     expected_case_ids = set()
-    for profile in ModelLoader._post_transform_profile_registry().profiles:
-        family = _profile_family(profile)
+    for profile in profiles:
+        case_stem, cache_stem, model_env = _MX_E2E_ROWS[profile.profile_id]
         for tp_size in (1, 2):
-            case_id = f"{family}-bf16-tp{tp_size}"
+            case_id = f"{case_stem}-tp{tp_size}"
             expected_case_ids.add(case_id)
             expected_row = {
-                "model_env": f"TRTLLM_MX_{family.upper()}_MODEL",
-                "default_model_subdir": cases[f"{family}-bf16-tp1"]["default_model_subdir"],
-                "repository_cache_prefix": f"models--trtllm-mx-e2e--{family}-tp{tp_size}",
+                "model_env": model_env,
+                "default_model_subdir": cases[f"{case_stem}-tp1"]["default_model_subdir"],
+                "repository_cache_prefix": f"models--trtllm-mx-e2e--{cache_stem}-tp{tp_size}",
                 "tp_size": tp_size,
                 # The donor and the receiver each hold one TP group.
                 "min_devices": 2 * tp_size,
@@ -934,7 +1288,24 @@ def test_mx_e2e_rows_and_ci_list_match_qualified_profile_registry() -> None:
             if profile.transfer_scope is PostTransformTransferScope.COMPLETE_MODEL:
                 # A complete-model profile carries a vision encoder, so its rows probe with images.
                 expected_row["probe"] = "image"
+            if profile.runtime_constraints.moe_backends is not None:
+                # MoE rows disable the CUTLASS FC2+finalize fusion, which is not
+                # deterministic for top-k greater than 2.
+                expected_row["moe_disable_finalize_fusion"] = True
             assert cases[case_id] == expected_row
+            assert case_id in ci_case_ids[2 * tp_size]
+        # A MoE profile has one more row for each admitted MoE EP size above 1. It
+        # repeats the row of its TP size with its own repository cache and MoE EP size.
+        for tp_size, moe_ep_size in _moe_ep_row_partitions(profile):
+            case_id = f"{case_stem}-tp{tp_size}-ep{moe_ep_size}"
+            expected_case_ids.add(case_id)
+            assert cases[case_id] == {
+                **cases[f"{case_stem}-tp{tp_size}"],
+                "repository_cache_prefix": (
+                    f"models--trtllm-mx-e2e--{cache_stem}-tp{tp_size}-ep{moe_ep_size}"
+                ),
+                "moe_ep_size": moe_ep_size,
+            }
             assert case_id in ci_case_ids[2 * tp_size]
 
     assert set(cases) == expected_case_ids
@@ -965,16 +1336,22 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
     documentation = _repository_text("docs/source/features/model-express.md")
     text = " ".join(documentation.split())
 
-    assert _documented_names(text, "The ", " profiles are text-only") == text_only_families
+    assert (
+        _documented_names(text, "The ", " profiles are text-only", families) == text_only_families
+    )
     assert (
         _documented_names(
             text,
             "pins its qualified RoPE realization: ",
             " require the default fused RoPE path",
+            families,
         )
         == fused_rope_families
     )
-    assert _documented_names(text, "currently limited to the exact ", " profiles above") == families
+    assert (
+        _documented_names(text, "currently limited to the exact ", " profiles above", families)
+        == families
+    )
 
     qualification_test = documentation[
         documentation.index("### Qualification Test") : documentation.index(
@@ -982,7 +1359,8 @@ def test_documentation_prose_matches_qualified_profile_registry() -> None:
         )
     ]
     cases = _mx_e2e_cases()
-    assert set(re.findall(r"\b[a-z][a-z0-9_]*-bf16-tp\d+\b", qualification_test)) == set(cases)
+    case_id_pattern = r"\b[a-z][a-z0-9_]*(?:-[a-z0-9_]+)*?-bf16-tp\d+(?:-ep\d+)?\b"
+    assert set(re.findall(case_id_pattern, qualification_test)) == set(cases)
     assert set(re.findall(r"\bTRTLLM_MX_[A-Z0-9_]+_MODEL\b", qualification_test)) == {
         row["model_env"] for row in cases.values()
     }
@@ -1784,6 +2162,530 @@ def test_mistral_dense_profile_qualifies_full_attention_layer_types() -> None:
     assert decision.profile.profile_id == "mistral-for-causal-lm-bf16-target-v1"
 
 
+def _qwen3_moe_profile() -> PostTransformProfile:
+    (profile,) = (
+        candidate
+        for candidate in ModelLoader._post_transform_profile_registry().profiles
+        if candidate.profile_id == _QWEN3_MOE_PROFILE_ID
+    )
+    return profile
+
+
+def _qualify_qwen3_moe_model(model: nn.Module) -> PostTransformQualificationDecision:
+    return ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+
+@_requires_cutlass_bf16_moe
+def test_qwen3_moe_profile_qualifies_full_staged_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A staged receiver matches a producer that ran the real Hugging Face load path.
+
+    The producer loads a checkpoint-format state dict through the production
+    weight mapper and then runs every post-load hook; the receiver only gets
+    the producer's parameters and the staged finalization walks. The
+    routed-expert output has its own SM90+ case,
+    `test_qwen3_moe_staged_receiver_matches_routed_expert_output`.
+    """
+    state_dict = _qwen3_moe_hf_state_dict()
+    prepare_producer, factory_parameters = keep_factory_parameters(
+        _qwen3_moe_hf_checkpoint_loader(state_dict)
+    )
+    case = PostTransformQualificationCase(
+        profile_id=_QWEN3_MOE_PROFILE_ID,
+        model_factory=lambda: _tiny_qwen3_moe_model(monkeypatch),
+        unqualified_model_factory=lambda: _tiny_qwen3_moe_model(
+            monkeypatch,
+            model_class=_UnqualifiedQwen3MoeForCausalLM,
+        ),
+        qualify_model=_qualify_qwen3_moe_model,
+        state_probes=(
+            ("layout", _qwen3_moe_layout_state),
+            ("module-state", module_state_snapshot),
+        ),
+        output_probes=(
+            ("embedding-logits", _dense_embedding_logits),
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("router-logits", _qwen3_moe_router_logits),
+        ),
+        prepare_producer=prepare_producer,
+    )
+
+    producer, receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert_every_parameter_was_loaded(producer, factory_parameters)
+    # The producer's bytes come from the checkpoint through the weight mapper.
+    assert torch.equal(
+        producer.model.embed_tokens.weight.cpu(), state_dict["model.embed_tokens.weight"]
+    )
+    assert torch.equal(producer.lm_head.weight.cpu(), state_dict["lm_head.weight"])
+    producer_backend = producer.model.layers[0].mlp.experts.backend
+    for expert in range(_QWEN3_MOE_NUM_EXPERTS):
+        prefix = f"model.layers.0.mlp.experts.{expert}."
+        # `w3_w1_weight` stacks the up projection before the gate projection.
+        assert torch.equal(
+            producer_backend.w3_w1_weight[expert].cpu(),
+            torch.cat(
+                [state_dict[prefix + "up_proj.weight"], state_dict[prefix + "gate_proj.weight"]]
+            ),
+        )
+        assert torch.equal(
+            producer_backend.w2_weight[expert].cpu(), state_dict[prefix + "down_proj.weight"]
+        )
+
+    decision = _qualify_qwen3_moe_model(receiver)
+    assert decision.transform_abi_id == QWEN3_MOE_CUTLASS_POST_TRANSFORM_LAYOUT_ABI_V1
+    assert (
+        PostTransformRuntimeConfig.from_model_config(producer.model_config, model=producer)
+        == _qwen3_moe_runtime_config()
+    )
+    # The receiver marks the backend behind the `_weights_removed` wrapper
+    # without loading, which a later transform walk must not undo.
+    backend = receiver.model.layers[0].mlp.experts.backend
+    assert backend._weights_transformed is True
+    config = _qwen3_moe_hf_config()
+    hidden_size, head_dim = config.hidden_size, config.head_dim
+    intermediate_size = config.moe_intermediate_size
+    qkv_rows = (config.num_attention_heads + 2 * config.num_key_value_heads) * head_dim
+    assert _qwen3_moe_layout_state(producer) == {
+        "attention_type": modeling_qwen3_mod.Qwen3Attention.__name__,
+        "qkv_weight_mode": WeightMode.FUSED_QKV_LINEAR,
+        "qkv_weight_shape": (qkv_rows, hidden_size),
+        "q_norm_weight_shape": (head_dim,),
+        "k_norm_weight_shape": (head_dim,),
+        "fuse_qk_norm_rope": True,
+        "rope_fusion": False,
+        "router_weight_shape": (_QWEN3_MOE_NUM_EXPERTS, hidden_size),
+        "router_weight_dtype": torch.bfloat16,
+        "experts_type": ConfigurableMoE.__name__,
+        "backend_type": TrtllmCutlassUnquantizedImpl.__name__,
+        "backend_id": "trtllm.cutlass.grouped_gemm.none",
+        "quant_method_type": UnquantizedFusedMoEMethod.__name__,
+        "quant_scales": (),
+        "weight_loading_mode": MoEWeightLoadingMode.VANILLA,
+        "routing_method_type": "RenormalizeMoeRoutingMethod",
+        "routing_scales_dtype": torch.float32,
+        "w3_w1_weight_shape": (_QWEN3_MOE_NUM_EXPERTS, 2 * intermediate_size, hidden_size),
+        "w2_weight_shape": (_QWEN3_MOE_NUM_EXPERTS, hidden_size, intermediate_size),
+        "expert_size_per_partition": _QWEN3_MOE_NUM_EXPERTS,
+        "initial_local_expert_ids": tuple(range(_QWEN3_MOE_NUM_EXPERTS)),
+        "layer_load_balancer": None,
+        "layer0_next_norm": True,
+        "layer1_next_norm": True,
+        "tied_lm_head": False,
+    }
+
+
+# The admitted TP2 partitions as `(MoE EP size, MoE TP size)`; `moe_ep_size=-1`
+# leaves MoE TP equal to TP.
+_QWEN3_MOE_TP2_PARTITIONS = (
+    pytest.param(-1, 2, id="moe-tp2"),
+    pytest.param(2, 1, id="moe-ep2"),
+)
+
+
+@_requires_cutlass_bf16_moe
+@pytest.mark.parametrize("rank", [0, 1])
+@pytest.mark.parametrize("moe_ep_size, moe_tp_size", _QWEN3_MOE_TP2_PARTITIONS)
+def test_qwen3_moe_profile_qualifies_tp2_rank_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    rank: int,
+    moe_ep_size: int,
+    moe_tp_size: int,
+) -> None:
+    """Each simulated TP2 rank's staged receiver matches its producer that ran the real load."""
+    prepare_producer, factory_parameters = keep_factory_parameters(
+        _qwen3_moe_hf_checkpoint_loader(_qwen3_moe_hf_state_dict())
+    )
+    case = PostTransformQualificationCase(
+        profile_id=_QWEN3_MOE_PROFILE_ID,
+        model_factory=lambda: _tiny_qwen3_moe_model(
+            monkeypatch,
+            tp_size=2,
+            rank=rank,
+            moe_ep_size=moe_ep_size,
+        ),
+        unqualified_model_factory=lambda: _tiny_qwen3_moe_model(
+            monkeypatch,
+            model_class=_UnqualifiedQwen3MoeForCausalLM,
+            tp_size=2,
+            rank=rank,
+            moe_ep_size=moe_ep_size,
+        ),
+        qualify_model=_qualify_qwen3_moe_model,
+        state_probes=(
+            ("layout", _qwen3_moe_layout_state),
+            ("module-state", module_state_snapshot),
+        ),
+        output_probes=(
+            ("fused-qkv", _dense_fused_qkv_output),
+            ("router-logits", _qwen3_moe_router_logits),
+        ),
+        prepare_producer=prepare_producer,
+    )
+
+    producer, _receiver = assert_post_transform_lifecycle_equivalent(case)
+
+    assert_every_parameter_was_loaded(producer, factory_parameters)
+    resolved_moe_ep_size = 2 // moe_tp_size
+    assert PostTransformRuntimeConfig.from_model_config(
+        producer.model_config, model=producer
+    ) == _qwen3_moe_runtime_config(
+        tp_size=2,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=resolved_moe_ep_size,
+        attention_tp_size=2,
+    )
+    config = _qwen3_moe_hf_config()
+    hidden_size, head_dim = config.hidden_size, config.head_dim
+    local_experts = _QWEN3_MOE_NUM_EXPERTS // resolved_moe_ep_size
+    local_intermediate_size = config.moe_intermediate_size // moe_tp_size
+    # Attention TP splits the query and key/value heads over the two ranks.
+    local_qkv_rows = (config.num_attention_heads + 2 * config.num_key_value_heads) * head_dim // 2
+    layout = _qwen3_moe_layout_state(producer)
+    assert layout["qkv_weight_shape"] == (local_qkv_rows, hidden_size)
+    assert layout["router_weight_shape"] == (_QWEN3_MOE_NUM_EXPERTS, hidden_size)
+    assert layout["w3_w1_weight_shape"] == (
+        local_experts,
+        2 * local_intermediate_size,
+        hidden_size,
+    )
+    assert layout["w2_weight_shape"] == (local_experts, hidden_size, local_intermediate_size)
+    expert_rank = rank if resolved_moe_ep_size > 1 else 0
+    assert layout["initial_local_expert_ids"] == tuple(
+        range(expert_rank * local_experts, (expert_rank + 1) * local_experts)
+    )
+
+
+@_requires_cutlass_bf16_moe
+@_requires_sm90_routed_expert_forward
+@pytest.mark.parametrize(
+    "tp_size, rank, moe_ep_size",
+    [
+        pytest.param(1, 0, -1, id="tp1"),
+        pytest.param(2, 0, -1, id="moe-tp2-rank0"),
+        pytest.param(2, 1, -1, id="moe-tp2-rank1"),
+        pytest.param(2, 0, 2, id="moe-ep2-rank0"),
+        pytest.param(2, 1, 2, id="moe-ep2-rank1"),
+    ],
+)
+def test_qwen3_moe_staged_receiver_matches_routed_expert_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tp_size: int,
+    rank: int,
+    moe_ep_size: int,
+) -> None:
+    """A staged receiver's routed experts compute exactly what its producer's compute.
+
+    The other Qwen3 MoE lifecycle cases compare tensors, state, guards, and
+    the dense outputs on every SM80+ GPU. This case adds the routed-expert
+    output, which this fixture validates only on SM90 and newer.
+    """
+
+    def factory(
+        model_class: type[nn.Module] = modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
+    ) -> nn.Module:
+        return _tiny_qwen3_moe_model(
+            monkeypatch,
+            model_class=model_class,
+            tp_size=tp_size,
+            rank=rank,
+            moe_ep_size=moe_ep_size,
+        )
+
+    case = PostTransformQualificationCase(
+        profile_id=_QWEN3_MOE_PROFILE_ID,
+        model_factory=factory,
+        unqualified_model_factory=lambda: factory(_UnqualifiedQwen3MoeForCausalLM),
+        qualify_model=_qualify_qwen3_moe_model,
+        state_probes=(("layout", _qwen3_moe_layout_state),),
+        output_probes=(("routed-experts", _qwen3_moe_routed_expert_output),),
+        prepare_producer=_qwen3_moe_hf_checkpoint_loader(_qwen3_moe_hf_state_dict()),
+    )
+
+    assert_post_transform_lifecycle_equivalent(case)
+
+
+@_requires_cutlass_bf16_moe
+def test_staged_qwen3_moe_finalization_preserves_mx_tensor_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Routed-expert tensors behind the removed wrapper stay in the MX catalog.
+
+    `ConfigurableMoE` is `_weights_removed`, so loader walks skip it, but the
+    expert weights live in its backend child and must be registered for
+    transfer and keep their storage through staged finalization.
+    """
+    model = _tiny_qwen3_moe_model(monkeypatch)
+
+    ModelLoader._setup_aliases(model)
+    registered_catalog = _mx_canonical_parameter_catalog(model)
+
+    ModelLoader._setup_aliases(model)
+    ModelLoader._mark_weights_transformed(model)
+    ModelLoader._walk_cache_state(model)
+    published_catalog = _mx_canonical_parameter_catalog(model)
+
+    assert published_catalog == registered_catalog
+    for layer_index in range(2):
+        prefix = f"model.layers.{layer_index}.mlp."
+        assert {
+            f"{prefix}gate.weight",
+            f"{prefix}experts.backend.w3_w1_weight",
+            f"{prefix}experts.backend.w2_weight",
+        } <= registered_catalog.keys()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides, expected_dimensions",
+    [
+        pytest.param({"moe_backend": "TRTLLM"}, {"moe_backend"}, id="trtllm-moe-backend"),
+        pytest.param({"moe_backend": "CUTEDSL"}, {"moe_backend"}, id="cutedsl-moe-backend"),
+        pytest.param({"moe_backend": "DEEPGEMM"}, {"moe_backend"}, id="deepgemm-moe-backend"),
+        pytest.param({"moe_backend": "TRITON"}, {"moe_backend"}, id="triton-moe-backend"),
+        pytest.param({"moe_backend": "MARLIN"}, {"moe_backend"}, id="marlin-moe-backend"),
+        pytest.param({"moe_backend": "VANILLA"}, {"moe_backend"}, id="vanilla-moe-backend"),
+        pytest.param(
+            {"tp_size": 4, "moe_tp_size": 4, "attention_tp_size": 4},
+            {"tp_size", "moe_tp_size", "attention_tp_size"},
+            id="moe-tp4",
+        ),
+        pytest.param(
+            {"tp_size": 4, "moe_tp_size": 1, "moe_ep_size": 4, "attention_tp_size": 4},
+            {"tp_size", "moe_ep_size", "attention_tp_size"},
+            id="moe-ep4",
+        ),
+        pytest.param(
+            {
+                "tp_size": 2,
+                "moe_tp_size": 1,
+                "moe_ep_size": 1,
+                "moe_cluster_size": 2,
+                "attention_tp_size": 2,
+            },
+            {"moe_cluster_size"},
+            id="moe-cluster2",
+        ),
+        pytest.param(
+            {"quant_algorithm": "FP8_BLOCK_SCALES"},
+            {"quant_algorithm"},
+            id="fp8-block-scales-weights",
+        ),
+    ],
+)
+def test_qwen3_moe_profile_rejects_unqualified_moe_variants(
+    overrides: dict[str, object],
+    expected_dimensions: set[str],
+) -> None:
+    """The Qwen3 MoE profile rejects other MoE backends, wider partitions, and FP8 block scales.
+
+    `test_bf16_profiles_reject_unqualified_runtime_variants` covers the
+    variants that every BF16 profile rejects.
+    """
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
+        architecture="Qwen3MoeForCausalLM",
+        model_type="qwen3_moe",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_qwen3_moe_runtime_config(**overrides),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED
+    assert decision.unsupported_runtime_dimensions == frozenset(expected_dimensions)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        pytest.param({}, id="tp1"),
+        pytest.param(
+            {"tp_size": 2, "moe_tp_size": 2, "attention_tp_size": 2},
+            id="moe-tp2",
+        ),
+        pytest.param(
+            {"tp_size": 2, "moe_tp_size": 1, "moe_ep_size": 2, "attention_tp_size": 2},
+            id="moe-ep2",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    "feature",
+    [PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP],
+)
+def test_qwen3_moe_profile_rejects_unsupported_moe_features(
+    overrides: dict[str, object],
+    feature: PostTransformFeature,
+) -> None:
+    def qualify(
+        enabled_features: frozenset[PostTransformFeature],
+    ) -> PostTransformQualificationDecision:
+        return ModelLoader._post_transform_profile_registry().qualify(
+            root_model_class=modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
+            architecture="Qwen3MoeForCausalLM",
+            model_type="qwen3_moe",
+            speculative_mode=None,
+            protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+            transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+            enabled_features=enabled_features,
+            runtime_config=_qwen3_moe_runtime_config(**overrides),
+        )
+
+    qualified = qualify(frozenset())
+    assert qualified.qualified
+    assert qualified.profile is _qwen3_moe_profile()
+
+    decision = qualify(frozenset({feature}))
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
+    assert decision.unsupported_features == frozenset({feature})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [80, 89, 90, 100, 103, 107, 120, 121])
+def test_qwen3_moe_auto_backend_resolves_to_qualified_cutlass(
+    monkeypatch: pytest.MonkeyPatch, sm: int
+) -> None:
+    """`AUTO` resolves to the pinned literal for BF16 Qwen3 MoE on every SM."""
+
+    def in_sm_family(low: int, high: int) -> Callable[[int | None], bool]:
+        return lambda sm_version=None: low <= (sm if sm_version is None else sm_version) < high
+
+    # `resolve_moe_backend` reads the SM through these names of its module.
+    monkeypatch.setattr(model_config_mod, "get_sm_version", lambda: sm)
+    monkeypatch.setattr(model_config_mod, "is_sm_100f", in_sm_family(100, 110))
+    monkeypatch.setattr(model_config_mod, "is_sm_120f", in_sm_family(120, 130))
+
+    resolved = ModelConfig.resolve_moe_backend("AUTO", "Qwen3MoeForCausalLM", QuantConfig())
+
+    assert resolved == "CUTLASS"
+    assert _qwen3_moe_profile().runtime_constraints.moe_backends == frozenset({resolved})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm", [80, 89, 90, 100, 103, 107, 120, 121])
+@pytest.mark.parametrize(
+    "mapping_kwargs",
+    [
+        pytest.param({}, id="tp1"),
+        pytest.param({"world_size": 2, "tp_size": 2}, id="moe-tp2"),
+        pytest.param({"world_size": 2, "tp_size": 2, "moe_ep_size": 2}, id="moe-ep2"),
+    ],
+)
+def test_moe_profile_backend_literals_realize_one_implementation(
+    mapping_kwargs: dict[str, int], sm: int
+) -> None:
+    """Each pinned MoE backend literal resolves to exactly one implementation.
+
+    MoE profiles pin the configured literal and the model quantization, not the
+    realized implementation. That is exact only while one implementation can
+    serve the pinned format under the literal, on every SM and admitted
+    partition, so neither a degraded resolution nor a newer architecture
+    realizes a different expert layout. A family that gains a second
+    implementation for that format needs a realized-implementation dimension
+    first.
+    """
+    moe_profiles = [
+        profile
+        for profile in ModelLoader._post_transform_profile_registry().profiles
+        if profile.runtime_constraints.moe_backends is not None
+    ]
+    assert [profile.profile_id for profile in moe_profiles] == [_QWEN3_MOE_PROFILE_ID], (
+        "extend this test with the new MoE profile's model configuration"
+    )
+    constraints = moe_profiles[0].runtime_constraints
+    assert constraints.quant_algorithms == frozenset({"none"})
+    for moe_backend in constraints.moe_backends:
+        model_config = ModelConfig(
+            # The Qwen3-30B-A3B expert shapes: 128 experts, top-8, MoE intermediate size 768.
+            pretrained_config=_qwen3_moe_hf_config(
+                hidden_size=2048,
+                moe_intermediate_size=768,
+                num_experts=128,
+                num_experts_per_tok=8,
+            ),
+            mapping=mapping_mod.Mapping(**mapping_kwargs),
+            moe_backend=moe_backend,
+        )
+        # Every optional dependency is present, so a candidate that only a missing
+        # wheel keeps out of the running still counts.
+        environment = MoEEnvironment(sm=sm, available_deps=tuple(dep.value for dep in MoEDep))
+        with override_moe_environment(environment):
+            report = resolve_moe_impl(model_config)
+
+        assert report.eligible == (TrtllmCutlassUnquantizedImpl.__name__,)
+        assert report.winner == TrtllmCutlassUnquantizedImpl.__name__
+        assert not report.degraded
+
+
+@pytest.mark.cpu_only
+def test_qwen3_vl_moe_root_does_not_inherit_qwen3_moe_profile() -> None:
+    vl_root = get_registered_model_class("Qwen3VLMoeForConditionalGeneration")
+    assert vl_root is not None
+    assert vl_root is not modeling_qwen3_moe_mod.Qwen3MoeForCausalLM
+    assert (
+        get_registered_model_class("Qwen3MoeForCausalLM")
+        is modeling_qwen3_moe_mod.Qwen3MoeForCausalLM
+    )
+
+    decision = ModelLoader._post_transform_profile_registry().qualify(
+        root_model_class=vl_root,
+        architecture="Qwen3MoeForCausalLM",
+        model_type="qwen3_moe",
+        speculative_mode=None,
+        protocol_version=ModelLoader._MX_STAGED_RECEIVER_TRANSFORM_PROTOCOL_VERSION,
+        transfer_scope=PostTransformTransferScope.TARGET_MODEL,
+        runtime_config=_qwen3_moe_runtime_config(),
+    )
+
+    assert not decision.qualified
+    assert decision.reason is PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+
+
+@pytest.mark.cpu_only
+def test_moe_profiles_pin_partition_and_one_backend_per_abi() -> None:
+    """Registry invariants that keep every MoE profile fail-closed.
+
+    A MoE profile pins exactly one MoE backend (routed-expert layouts differ per
+    backend), the MoE TP and EP sizes, and `moe_cluster_size=1`, and supports
+    neither EPLB nor DWDP; each transform-layout ABI belongs to one root and MoE
+    backend. Its TP stays at most 2, where independent MoE TP and EP sets admit
+    only the pure MoE-TP and MoE-EP partitions. Dense profiles leave every
+    MoE-only dimension unconstrained. A profile counts as MoE here when it pins
+    `moe_backends`; `assert_post_transform_lifecycle_equivalent` requires those
+    pins for every profile whose model holds routed experts, so a MoE profile
+    cannot pass as dense.
+    """
+    abi_owners: dict[str, tuple[str, str]] = {}
+    moe_profiles = 0
+    for profile in ModelLoader._post_transform_profile_registry().profiles:
+        constraints = profile.runtime_constraints
+        if constraints.moe_backends is None:
+            assert constraints.moe_tp_sizes is None
+            assert constraints.moe_ep_sizes is None
+            assert constraints.moe_cluster_sizes is None
+            continue
+        moe_profiles += 1
+        (moe_backend,) = constraints.moe_backends
+        assert constraints.moe_tp_sizes is not None
+        assert constraints.moe_ep_sizes is not None
+        assert constraints.moe_cluster_sizes == frozenset({1})
+        assert constraints.tp_sizes is not None and max(constraints.tp_sizes) <= 2
+        assert PostTransformFeature.MOE_LOAD_BALANCER not in profile.supported_features
+        assert PostTransformFeature.DWDP not in profile.supported_features
+        owner = (profile.root_model_class.class_name, moe_backend)
+        assert abi_owners.setdefault(profile.transform_abi_id, owner) == owner
+    assert moe_profiles
+
+
 @pytest.mark.cpu_only
 def test_legacy_llama_file_mistral_root_is_not_qualified() -> None:
     legacy_root = modeling_llama_mod.MistralForCausalLM
@@ -2141,9 +3043,17 @@ def test_phi4mm_root_does_not_inherit_phi3_profile() -> None:
             None,
             id="phi3",
         ),
+        pytest.param(
+            modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
+            "Qwen3MoeForCausalLM",
+            "qwen3_moe",
+            False,
+            None,
+            id="qwen3-moe",
+        ),
     ],
 )
-def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
+def test_bf16_profiles_reject_unqualified_runtime_variants(
     overrides: dict[str, object],
     expected_dimensions: set[str],
     root_model_class: type[nn.Module],
@@ -2152,7 +3062,11 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
     supported_rope_fusion: bool,
     supported_sliding_window: str | None,
 ) -> None:
-    """Each dense profile rejects runtime variants outside its qualified constraints."""
+    """Each BF16 profile, dense or MoE, rejects runtime variants outside its qualified constraints.
+
+    The MoE-only variants of the Qwen3 MoE profile are in
+    `test_qwen3_moe_profile_rejects_unqualified_moe_variants`.
+    """
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
@@ -2201,6 +3115,14 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
             id="qwen3-fused-rope",
         ),
         pytest.param(
+            modeling_qwen3_moe_mod.Qwen3MoeForCausalLM,
+            "Qwen3MoeForCausalLM",
+            "qwen3_moe",
+            {"rope_fusion": True},
+            "rope_fusion",
+            id="qwen3-moe-fused-rope",
+        ),
+        pytest.param(
             modeling_mistral_mod.MistralForCausalLM,
             "MistralForCausalLM",
             "mistral",
@@ -2226,14 +3148,14 @@ def test_bf16_dense_profiles_reject_unqualified_runtime_variants(
         ),
     ],
 )
-def test_bf16_dense_profiles_reject_wrong_realized_dimension(
+def test_bf16_profiles_reject_wrong_realized_dimension(
     root_model_class: type[nn.Module],
     architecture: str,
     model_type: str,
     realized_overrides: dict[str, object],
     expected_dimension: str,
 ) -> None:
-    """Each dense profile rejects a realized RoPE fusion or window it was not qualified for."""
+    """Each BF16 profile rejects a realized RoPE fusion or window it was not qualified for."""
     decision = ModelLoader._post_transform_profile_registry().qualify(
         root_model_class=root_model_class,
         architecture=architecture,
@@ -2262,6 +3184,16 @@ def test_bf16_dense_profiles_reject_wrong_realized_dimension(
                 "attention_tp_size": 2,
             },
             id="alternate-moe-partition",
+        ),
+        pytest.param(
+            {
+                "tp_size": 2,
+                "moe_tp_size": 1,
+                "moe_ep_size": 1,
+                "moe_cluster_size": 2,
+                "attention_tp_size": 2,
+            },
+            id="moe-cluster-partition",
         ),
     ],
 )
@@ -2374,6 +3306,129 @@ def test_separate_draft_model_is_not_qualified_by_target_only_profile(
     assert not decision.qualified
     assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
     assert decision.unsupported_features == frozenset({PostTransformFeature.SEPARATE_DRAFT_MODEL})
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "uses_load_balancer, dwdp_size, expected_features",
+    [
+        pytest.param(False, 0, frozenset(), id="no-moe-feature"),
+        pytest.param(
+            True,
+            0,
+            frozenset({PostTransformFeature.MOE_LOAD_BALANCER}),
+            id="realized-load-balancer",
+        ),
+        pytest.param(
+            False,
+            2,
+            frozenset({PostTransformFeature.DWDP}),
+            id="dwdp",
+        ),
+    ],
+)
+def test_qualification_reports_realized_moe_lifecycle_features(
+    monkeypatch: pytest.MonkeyPatch,
+    uses_load_balancer: bool,
+    dwdp_size: int,
+    expected_features: frozenset[PostTransformFeature],
+) -> None:
+    """A realized EPLB balancer or a DWDP mapping fails qualification closed.
+
+    EPLB changes which experts a rank stores without changing the MoE TP or EP
+    size, and DWDP forces both sizes to 1 while each rank stores its own expert
+    range, so the size constraints cannot reject either; the loader reports
+    them as features that no profile supports. MoE layers keep
+    `layer_load_balancer` at `None` unless EPLB applies. The test uses a real
+    MoE weight owner and a real `Mapping`, so renaming either attribute that
+    the loader reads fails it.
+    """
+    monkeypatch.setattr(
+        ModelLoader,
+        "_POST_TRANSFORM_PROFILE_REGISTRY",
+        _tiny_profile_registry(),
+    )
+    model = _TinyModel([])
+    # `__new__`: the gate reads only the realized balancer, not kernels or weights.
+    experts = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
+    nn.Module.__init__(experts)
+    experts.layer_load_balancer = object() if uses_load_balancer else None
+    model.experts = experts
+    if dwdp_size:
+        model.model_config.mapping = mapping_mod.Mapping(
+            world_size=dwdp_size, tp_size=dwdp_size, dwdp_size=dwdp_size
+        )
+
+    decision = ModelLoader._qualify_post_transform_profile(
+        model,
+        speculative_mode=None,
+        loads_draft_weights=False,
+    )
+
+    assert decision.qualified == (not expected_features)
+    assert decision.unsupported_features == expected_features
+    if expected_features:
+        assert decision.reason is PostTransformQualificationReason.FEATURE_NOT_SUPPORTED
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "decision, expected_details",
+    [
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.ROOT_MODEL_CLASS_NOT_REGISTERED
+            ),
+            "",
+            id="reason-only",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.RUNTIME_CONFIG_NOT_SUPPORTED,
+                unsupported_runtime_dimensions=frozenset({"tp_size", "moe_backend"}),
+            ),
+            "; unsupported_runtime_dimensions=moe_backend,tp_size",
+            id="runtime-dimensions",
+        ),
+        pytest.param(
+            PostTransformQualificationDecision(
+                PostTransformQualificationReason.FEATURE_NOT_SUPPORTED,
+                unsupported_features=frozenset(
+                    {PostTransformFeature.MOE_LOAD_BALANCER, PostTransformFeature.DWDP}
+                ),
+            ),
+            "; unsupported_features=dwdp,moe_load_balancer",
+            id="features",
+        ),
+    ],
+)
+def test_skipped_mx_publish_logs_only_reported_details(
+    monkeypatch: pytest.MonkeyPatch,
+    decision: PostTransformQualificationDecision,
+    expected_details: str,
+) -> None:
+    """The skip-publish log names only the details the decision reports.
+
+    `qualify()` stops at a runtime mismatch before it checks features, so an
+    empty feature set there does not mean that no unsupported feature is active.
+    """
+    messages: list[str] = []
+    monkeypatch.setattr(model_loader_mod.logger, "info", messages.append)
+    checkpoint_loader = SimpleNamespace(checkpoint_format="MX", post_load_publish=MagicMock())
+
+    ModelLoader.__new__(ModelLoader)._post_load_publish(
+        checkpoint_loader,
+        _TinyModel([]),
+        checkpoint_dir="/checkpoint",
+        weights_preloaded=False,
+        qualification=decision,
+    )
+
+    assert messages == [
+        "Skipping MX post-transform publish for _TinyModel: qualification "
+        f"reason={decision.reason.value}{expected_details}."
+    ]
+    checkpoint_loader.post_load_publish.assert_not_called()
 
 
 @pytest.mark.cpu_only

@@ -78,6 +78,27 @@ _SHADOW_BUILD_FINISH_GRACE = 30.0
 _FALLBACK_IDENTITY_TIMEOUT = 300.0
 
 
+def _log(message: str) -> None:
+    """Write one diagnostic line straight to file descriptor 1.
+
+    Most messages come from the build, warm, and discard threads. ``print()``
+    would resolve ``sys.stdout``, which pytest swaps on every test phase and
+    frees at teardown of each test's ``capfd``/``capsys`` capture. CPython
+    3.12.3, the CI interpreter, keeps only a borrowed reference to it inside
+    ``print()``, so a print racing that teardown can write to a freed stream
+    and crash the pytest process. Writing the descriptor reaches the same
+    destination, since pytest's fd capture redirects fd 1, without touching a
+    Python stream object.
+
+    Best-effort: a failed write is dropped so it can never skip the cleanup
+    that follows a log call.
+    """
+    try:
+        os.write(1, f"{message}\n".encode("utf-8", "replace"))
+    except OSError:
+        pass
+
+
 def _fallback_identity_timeout() -> float:
     """Mirror the lower-level env contract while its module is still loading."""
     raw = os.environ.get("TRTLLM_MPI_IDENTITY_TIMEOUT")
@@ -223,10 +244,9 @@ def warm_page_cache(model_dir: str) -> float:
     if available is not None and total_bytes > available:
         # Larger than RAM: pages would be evicted before the test loads them —
         # pure filer traffic with zero benefit (e.g. multi-hundred-GB models).
-        print(
+        _log(
             f"[session-prefetch] skipping warm of {model_dir}: {total_bytes >> 30} GiB "
-            f"exceeds available host memory ({available >> 30} GiB)",
-            flush=True,
+            f"exceeds available host memory ({available >> 30} GiB)"
         )
         return 0.0
     t0 = time.monotonic()
@@ -246,10 +266,9 @@ def warm_page_cache(model_dir: str) -> float:
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="session-prefetch-io") as ex:
         total = sum(ex.map(_read, files))
     gib = total / (1 << 30)
-    print(
+    _log(
         f"[session-prefetch] warmed page cache: {gib:.1f} GiB from "
-        f"{model_dir} in {time.monotonic() - t0:.1f}s",
-        flush=True,
+        f"{model_dir} in {time.monotonic() - t0:.1f}s"
     )
     return gib
 
@@ -316,10 +335,7 @@ def _reap_dead_pool(session: object) -> None:
         # not enumerate. Swallowing is required -- the SIGKILL sweep below is
         # what actually reclaims the survivors' GPU memory, and it must run
         # whatever abandon() did. Surface it instead of passing silently.
-        print(
-            f"[session-prefetch] WARNING: abandon() failed on a part-dead pool: {exc!r}",
-            flush=True,
-        )
+        _log(f"[session-prefetch] WARNING: abandon() failed on a part-dead pool: {exc!r}")
     mpi_session = sys.modules.get("tensorrt_llm.llmapi.mpi_session")
     process_start_time = getattr(mpi_session, "_process_start_time", None)
     if process_start_time is None:
@@ -419,7 +435,7 @@ class SessionPrefetcher:
                 else:
                     self.stats["warm_noops"] += 1  # no local weights / RAM guard
         except Exception as e:  # warming must never break the tests
-            print(f"[session-prefetch] page-cache warm failed (harmless): {e}", flush=True)
+            _log(f"[session-prefetch] page-cache warm failed (harmless): {e}")
 
     def schedule_shadow(self, spec: int, env_overlay=None) -> None:
         """Start building a spare ``spec``-worker pool in the background.
@@ -464,17 +480,13 @@ class SessionPrefetcher:
             # out blocks its shutdown on actual worker exit.
             session = MpiPoolSession(n_workers=spec, wait_shutdown=True, env_overrides=env_overlay)
             if any(session.submit_sync(_worker_import_report_cuda)):
-                print(
+                _log(
                     "[session-prefetch] note: tensorrt_llm import initialized an idle "
-                    "CUDA context in the prefetched workers (library version behavior)",
-                    flush=True,
+                    "CUDA context in the prefetched workers (library version behavior)"
                 )
             self._publish(spec, session, snapshot, gen)
         except Exception as e:  # prefetch must never break the tests
-            print(
-                f"[session-prefetch] background build failed (falling back to synchronous): {e}",
-                flush=True,
-            )
+            _log(f"[session-prefetch] background build failed (falling back to synchronous): {e}")
 
     def _publish(self, spec, session, snapshot, gen: int) -> None:
         """Publish a finished background build, unless it was abandoned.
@@ -491,7 +503,7 @@ class SessionPrefetcher:
                 self.stats["pools_built"] += 1
                 return
             self.stats["pools_discarded_superseded"] += 1
-        print("[session-prefetch] discarding superseded background build", flush=True)
+        _log("[session-prefetch] discarding superseded background build")
         session.shutdown()
 
     def _drain(self, timeout: float | None = None) -> _Built | None:
@@ -561,10 +573,7 @@ class SessionPrefetcher:
             # outer pytest timeout. The dead world cannot be joined, so
             # abandon it before the synchronous fallback.
             self.stats["pools_discarded_dead"] += 1
-            print(
-                "[session-prefetch] discarding prefetched pool with dead worker",
-                flush=True,
-            )
+            _log("[session-prefetch] discarding prefetched pool with dead worker")
             threading.Thread(
                 target=_reap_dead_pool,
                 args=(built.session,),
@@ -578,7 +587,7 @@ class SessionPrefetcher:
             # wait_shutdown=True, so its shutdown() blocked until the workers
             # actually exited (and released their memory).
             self.stats["pools_handed_over"] += 1
-            print(f"[session-prefetch] handing over prefetched {spec}-worker pool", flush=True)
+            _log(f"[session-prefetch] handing over prefetched {spec}-worker pool")
             return built.session
         # Spec/env/sys.path mismatch (test skipped, reordered, or changed
         # state the frozen workers would not see): discard.
@@ -666,7 +675,7 @@ class SessionPrefetcher:
             # build remains registered, preventing another shadow from being
             # launched; the daemon thread is bounded by the lower-level
             # identity timeout unless the MPI runtime itself is wedged.
-            print(f"[session-prefetch] cleanup timed out: {e}", flush=True)
+            _log(f"[session-prefetch] cleanup timed out: {e}")
             built = None
         if built is not None:
             built.session.shutdown()
@@ -678,7 +687,7 @@ class SessionPrefetcher:
             parts = ", ".join(f"{k}={v}" for k, v in sorted(self.stats.items()))
             if self._warmed_gib:
                 parts += f", warmed_gib={self._warmed_gib:.1f}"
-            print(f"[session-prefetch] session summary: {parts}", flush=True)
+            _log(f"[session-prefetch] session summary: {parts}")
 
 
 PREFETCHER = SessionPrefetcher()

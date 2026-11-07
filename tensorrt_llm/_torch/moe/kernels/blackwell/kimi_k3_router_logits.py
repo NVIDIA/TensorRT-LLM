@@ -20,8 +20,8 @@ memory by TMA (128-byte swizzle, bank-conflict-free fragment loads) **before**
 ``griddepcontrol.wait``: with PDL the copy runs while the previous kernel finishes. Each warp loads
 its slice of the activation (16 KB) straight into registers in one round trip after the wait.
 
-PDL: the kernel triggers its dependents right after its own ``griddepcontrol.wait``; before the
-wait it reads only the router weight.
+PDL: with ``TRTLLM_ENABLE_PDL`` (the default) the kernel waits on the previous grid and triggers
+its dependents right after that wait; before the wait it reads only the router weight.
 
 The geometry is fixed at 896 x 7168 on purpose: bit-identity holds against
 ``router_gemm_mma_kernel``'s summation order, and ``dsv3_router_gemm_op`` instantiates that MMA
@@ -43,6 +43,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
 
+from ....kernels.blackwell.utils import TRTLLM_ENABLE_PDL
 from . import raw_ptx as ptx
 
 #: Router geometry.
@@ -51,29 +52,29 @@ HIDDEN_SIZE = 7168
 #: Largest token count (one m16 tile, like ``router_gemm_mma_kernel``).
 MAX_M = 16
 #: K slices of ``router_gemm_mma_kernel`` (its warps) and their width.
-NUM_SLICES = 14
-SLICE_K = HIDDEN_SIZE // NUM_SLICES
+_NUM_SLICES = 14
+_SLICE_K = HIDDEN_SIZE // _NUM_SLICES
 #: 32-wide K chunks per slice.
-CHUNKS = SLICE_K // 32
+_CHUNKS = _SLICE_K // 32
 #: Cluster: 2 CTAs x 7 slices; 2 n8 expert tiles (16 experts) per cluster.
-CLUSTER = 2
-SLICES_PER_CTA = NUM_SLICES // CLUSTER
-TILES = 2
-NUM_WARPS = SLICES_PER_CTA
-THREADS = 32 * NUM_WARPS
-CLUSTER_EXPERTS = 8 * TILES
-NUM_CTAS = (NUM_EXPERTS // CLUSTER_EXPERTS) * CLUSTER
+_CLUSTER = 2
+_SLICES_PER_CTA = _NUM_SLICES // _CLUSTER
+_TILES = 2
+_NUM_WARPS = _SLICES_PER_CTA
+_THREADS = 32 * _NUM_WARPS
+_CLUSTER_EXPERTS = 8 * _TILES
+_NUM_CTAS = (NUM_EXPERTS // _CLUSTER_EXPERTS) * _CLUSTER
 #: Weight TMA box: 8 rows x 64 BF16 (one 1 KB 128-byte-swizzle atom).
 _BOX_K = 64
-_BOXES_PER_SLICE = SLICE_K // _BOX_K
+_BOXES_PER_SLICE = _SLICE_K // _BOX_K
 _W_BOX_BYTES = 8 * _BOX_K * 2
 #: One fragment set of the two tiles: 2 tiles x 32 lanes x 4 floats.
-_FRAG_BYTES = TILES * 32 * 4 * 4
+_FRAG_BYTES = _TILES * 32 * 4 * 4
 #: L2 eviction hint for the streamed weight (CacheHintSm90::EVICT_FIRST).
 _EVICT_FIRST = 0x12F0000000000000
 
-assert HIDDEN_SIZE % (NUM_SLICES * 32) == 0 and NUM_SLICES % CLUSTER == 0
-assert NUM_EXPERTS % CLUSTER_EXPERTS == 0
+assert HIDDEN_SIZE % (_NUM_SLICES * 32) == 0 and _NUM_SLICES % _CLUSTER == 0
+assert NUM_EXPERTS % _CLUSTER_EXPERTS == 0
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,11 @@ def _ldg_v4_b32_if(valid, addr, *, loc=None, ip=None):
 class KimiK3RouterLogitsKernel:
     """``logits[M, 896]``, bit-identical to ``router_gemm_mma_kernel`` (see the module docstring)."""
 
+    def __init__(self, use_pdl: bool = TRTLLM_ENABLE_PDL) -> None:
+        """``use_pdl``: launch with programmatic dependent launch (``griddepcontrol`` wait and
+        trigger inside the kernel; the weight TMA copy ahead of the wait)."""
+        self.use_pdl = use_pdl
+
     @cute.jit
     def __call__(
         self,
@@ -160,7 +166,7 @@ class KimiK3RouterLogitsKernel:
             cute.nvgpu.warpgroup.SmemLayoutAtomKind.K_SW128, cutlass.BFloat16
         )
         # Weight boxes [8 rows, 64 k, (slice, tile, box)].
-        w_boxes = SLICES_PER_CTA * TILES * _BOXES_PER_SLICE
+        w_boxes = _SLICES_PER_CTA * _TILES * _BOXES_PER_SLICE
         w_layout = cute.tile_to_shape(atom, (8, _BOX_K, w_boxes), order=(0, 1, 2))
         tma_atom_w, tma_w = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(),
@@ -171,26 +177,26 @@ class KimiK3RouterLogitsKernel:
 
         @cute.struct
         class SharedStorage:
-            w_full: cute.struct.MemRange[cutlass.Int64, NUM_WARPS]
+            w_full: cute.struct.MemRange[cutlass.Int64, _NUM_WARPS]
             mbox_full: cutlass.Int64
             sW: cute.struct.Align[
                 cute.struct.MemRange[cutlass.BFloat16, cute.cosize(w_layout.outer)], 1024
             ]
             # Slice partials [warp][tile][lane][4], then the peer's running sum [tile][lane][4].
             red: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Float32, NUM_WARPS * _FRAG_BYTES // 4], 16
+                cute.struct.MemRange[cutlass.Float32, _NUM_WARPS * _FRAG_BYTES // 4], 16
             ]
             mbox: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, _FRAG_BYTES // 4], 16]
 
         self.shared_storage = SharedStorage
         self.kernel(tma_atom_w, tma_w, w_layout, x_addr, m, out_addr).launch(
-            grid=(NUM_CTAS, 1, 1),
-            block=(THREADS, 1, 1),
-            cluster=(CLUSTER, 1, 1),
+            grid=(_NUM_CTAS, 1, 1),
+            block=(_THREADS, 1, 1),
+            cluster=(_CLUSTER, 1, 1),
             smem=self.shared_storage.size_in_bytes(),
             min_blocks_per_mp=1,
             stream=stream,
-            use_pdl=True,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -208,14 +214,14 @@ class KimiK3RouterLogitsKernel:
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         lane = cute.arch.lane_idx()
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        group = cta // CLUSTER
+        group = cta // _CLUSTER
         storage = utils.SmemAllocator().allocate(self.shared_storage)
         w_full = storage.w_full.data_ptr()
         mbox_full = storage.mbox_full
         w_base = storage.sW.data_ptr().toint()
         red_base = storage.red.data_ptr().toint()
         mbox_base = storage.mbox.data_ptr().toint()
-        s = rank * SLICES_PER_CTA + warp
+        s = rank * _SLICES_PER_CTA + warp
 
         with cute.arch.elect_one():
             cute.arch.mbarrier_init(w_full + warp, 1)
@@ -239,21 +245,22 @@ class KimiK3RouterLogitsKernel:
         )
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive_and_expect_tx(
-                w_full + warp, TILES * _BOXES_PER_SLICE * _W_BOX_BYTES
+                w_full + warp, _TILES * _BOXES_PER_SLICE * _W_BOX_BYTES
             )
-        for t in cutlass.range_constexpr(TILES):
+        for t in cutlass.range_constexpr(_TILES):
             for j in cutlass.range_constexpr(_BOXES_PER_SLICE):
                 cute.copy(
                     tma_atom_w,
-                    tWg[(None, group * TILES + t, s * _BOXES_PER_SLICE + j)],
-                    tWs[(None, (warp * TILES + t) * _BOXES_PER_SLICE + j)],
+                    tWg[(None, group * _TILES + t, s * _BOXES_PER_SLICE + j)],
+                    tWs[(None, (warp * _TILES + t) * _BOXES_PER_SLICE + j)],
                     tma_bar_ptr=w_full + warp,
                     cache_policy=Int64(_EVICT_FIRST),
                 )
 
-        cute.arch.griddepcontrol_wait()
-        # Safe trigger point: everything up to the previous grid is complete.
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+            # Safe trigger point: everything up to the previous grid is complete.
+            cute.arch.griddepcontrol_launch_dependents()
 
         # router_gemm_mma_kernel fragments: lane (g, q) holds activation rows g and g + 8 and
         # weight row g at k = chunk + 8 q .. + 8. The whole slice of the activation is loaded
@@ -266,28 +273,28 @@ class KimiK3RouterLogitsKernel:
         row1 = Int32(0)
         if g + 8 < m:
             row1 = Int32(1)
-        a0_base = x_addr + Int64(g * (HIDDEN_SIZE * 2) + (s * SLICE_K + q * 8) * 2)
+        a0_base = x_addr + Int64(g * (HIDDEN_SIZE * 2) + (s * _SLICE_K + q * 8) * 2)
         a1_base = a0_base + Int64(8 * HIDDEN_SIZE * 2)
         acts = []
-        for cc in cutlass.range_constexpr(CHUNKS):
+        for cc in cutlass.range_constexpr(_CHUNKS):
             a_off = Int64(cc * 64)
             acts.append(
                 (_ldg_v4_b32_if(row0, a0_base + a_off), _ldg_v4_b32_if(row1, a1_base + a_off))
             )
-        w_warp = w_base + warp * (TILES * _BOXES_PER_SLICE * _W_BOX_BYTES)
+        w_warp = w_base + warp * (_TILES * _BOXES_PER_SLICE * _W_BOX_BYTES)
         cute.arch.mbarrier_wait(w_full + warp, 0)
-        accs = [[Float32(0.0)] * 4 for _ in range(TILES)]
-        nxt = [self._wfrag(w_warp, g, q, t, 0) for t in range(TILES)]
-        for cc in cutlass.range_constexpr(CHUNKS):
+        accs = [[Float32(0.0)] * 4 for _ in range(_TILES)]
+        nxt = [self._wfrag(w_warp, g, q, t, 0) for t in range(_TILES)]
+        for cc in cutlass.range_constexpr(_CHUNKS):
             cur = nxt
-            if cc + 1 < CHUNKS:
-                nxt = [self._wfrag(w_warp, g, q, t, cc + 1) for t in range(TILES)]
+            if cc + 1 < _CHUNKS:
+                nxt = [self._wfrag(w_warp, g, q, t, cc + 1) for t in range(_TILES)]
             a0, a1 = acts[cc]
-            for t in cutlass.range_constexpr(TILES):
+            for t in cutlass.range_constexpr(_TILES):
                 bw = cur[t]
                 acc = _mma_bf16((a0[0], a1[0], a0[1], a1[1]), bw[0], bw[1], accs[t])
                 accs[t] = list(_mma_bf16((a0[2], a1[2], a0[3], a1[3]), bw[2], bw[3], acc))
-        for t in cutlass.range_constexpr(TILES):
+        for t in cutlass.range_constexpr(_TILES):
             acc = accs[t]
             ptx.st_shared_v4_f32(
                 red_base + warp * _FRAG_BYTES + (t * 32 + lane) * 16, acc[0], acc[1], acc[2], acc[3]
@@ -301,13 +308,15 @@ class KimiK3RouterLogitsKernel:
             if tidx == 0:
                 # One arrival plus CTA 0's bytes complete the mailbox phase.
                 cute.arch.mbarrier_arrive_and_expect_tx(mbox_full, _FRAG_BYTES)
-        if tidx < TILES * 32:
+        if tidx < _TILES * 32:
             off = tidx * 16
             tot = [Float32(0.0)] * 4
             if rank == 1:
-                cute.arch.mbarrier_wait(mbox_full, 0)
+                # CTA 0 completes the mailbox with a cluster-scope st.async, so the acquire
+                # must be cluster scope too (a CTA-scope wait leaves the loads unordered).
+                ptx._try_wait_cluster(mbox_full.toint())
                 tot = list(ptx.ld_shared_v4_f32(mbox_base + off))
-            for w in cutlass.range_constexpr(NUM_WARPS):
+            for w in cutlass.range_constexpr(_NUM_WARPS):
                 v = ptx.ld_shared_v4_f32(red_base + w * _FRAG_BYTES + off)
                 for i in cutlass.range_constexpr(4):
                     tot[i] = tot[i] + v[i]
@@ -320,7 +329,7 @@ class KimiK3RouterLogitsKernel:
                 ln = tidx & 31
                 for i in cutlass.range_constexpr(4):
                     row = (ln >> 2) + (i >> 1) * 8
-                    col = group * CLUSTER_EXPERTS + t_idx * 8 + (ln & 3) * 2 + (i & 1)
+                    col = group * _CLUSTER_EXPERTS + t_idx * 8 + (ln & 3) * 2 + (i & 1)
                     if row < m:
                         ptx.st_global_f32(out_addr + Int64((row * NUM_EXPERTS + col) * 4), tot[i])
         # No CTA leaves while its peer may still write into its mailbox.
@@ -341,8 +350,9 @@ class KimiK3RouterLogitsKernel:
 
 
 @functools.cache
-def _compiled():
-    kernel = KimiK3RouterLogitsKernel()
+def _compiled(use_pdl: bool = TRTLLM_ENABLE_PDL) -> object:
+    """The kernel compiled for ``use_pdl`` (cached per variant)."""
+    kernel = KimiK3RouterLogitsKernel(use_pdl)
     return cute.compile(
         kernel,
         make_ptr(cutlass.BFloat16, 1 << 20, cute.AddressSpace.gmem, assumed_align=16),
@@ -397,7 +407,7 @@ def run_router_logits(
 
     Inputs as :func:`can_run` accepts them; they are not re-validated.
     """
-    _compiled()(
+    _compiled(use_pdl=TRTLLM_ENABLE_PDL)(
         make_ptr(cutlass.BFloat16, weight.data_ptr(), cute.AddressSpace.gmem, assumed_align=16),
         Int64(hidden_states.data_ptr()),
         Int32(hidden_states.shape[0]),
@@ -406,11 +416,21 @@ def run_router_logits(
     )
 
 
+def precompile(use_pdl: bool = TRTLLM_ENABLE_PDL) -> int:
+    """Compile the kernel for the current device ahead of serving; returns the kernels
+    compiled (0 when the device is not one the kernel serves)."""
+    if not _is_supported_device(torch.cuda.current_device()):
+        return 0
+    _compiled(use_pdl=use_pdl)
+    return 1
+
+
 __all__ = [
     "HIDDEN_SIZE",
     "MAX_M",
     "NUM_EXPERTS",
     "KimiK3RouterLogitsKernel",
     "can_run",
+    "precompile",
     "run_router_logits",
 ]

@@ -80,7 +80,22 @@ def mnnvl_allreduce_transport(
         num_tokens / group_size) * group_size * hidden_dim * elem_size
 
 
-_thread_local = threading.local()
+# Allocating these workspaces is a TP-wide collective, so whether a rank
+# allocates must not depend on which thread builds its model: RpcWorker builds
+# rank 0 on an RPC executor thread and the other ranks on their main thread.
+# The caches are therefore shared by all threads of the process, and a
+# per-mapping lock serializes each allocation.
+_allreduce_workspaces: Dict[Mapping, Tuple[list, torch.Tensor]] = {}
+_lowprecision_allreduce_workspaces: Dict[Mapping, Tuple[list,
+                                                        torch.Tensor]] = {}
+_allreduce_workspace_locks: Dict[Mapping, threading.Lock] = {}
+_allreduce_workspace_locks_guard = threading.Lock()
+
+
+def _get_allreduce_workspace_lock(mapping: Mapping) -> threading.Lock:
+    with _allreduce_workspace_locks_guard:
+        return _allreduce_workspace_locks.setdefault(mapping, threading.Lock())
+
 
 # Mirrored by the autotune context so Dynamo can guard this branch without
 # tracing the stateful AutoTuner singleton.
@@ -262,35 +277,29 @@ def warmup_named_allreduce_topologies(model: nn.Module) -> None:
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
-    if not hasattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}'):
-        setattr(_thread_local, f'allreduce_workspaces_{mapping.pp_rank}', {})
-
-    allreduce_workspaces = getattr(_thread_local,
-                                   f'allreduce_workspaces_{mapping.pp_rank}')
-    if mapping not in allreduce_workspaces:
-        ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
-            mapping,
-            CustomAllReduceHelper.max_workspace_size_auto(
-                mapping.tp_size, support_deterministic=False),
-        )
-        allreduce_workspaces[mapping] = (ipc_buffers, workspace)
-    return allreduce_workspaces[mapping][1]
+    with _get_allreduce_workspace_lock(mapping):
+        if mapping not in _allreduce_workspaces:
+            ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
+                mapping,
+                CustomAllReduceHelper.max_workspace_size_auto(
+                    mapping.tp_size, support_deterministic=False),
+            )
+            _allreduce_workspaces[mapping] = (ipc_buffers, workspace)
+        return _allreduce_workspaces[mapping][1]
 
 
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
-    if not hasattr(_thread_local, 'lowprecision_allreduce_workspaces'):
-        _thread_local.lowprecision_allreduce_workspaces = {}
-    lowprecision_allreduce_workspaces = _thread_local.lowprecision_allreduce_workspaces
-    if mapping not in lowprecision_allreduce_workspaces:
-        ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
-            mapping,
-            CustomAllReduceHelper.max_workspace_size_lowprecision(
-                mapping.tp_size),
-        )
-        lowprecision_allreduce_workspaces[mapping] = (ipc_buffers, workspace)
-        CustomAllReduceHelper.initialize_lowprecision_buffers(
-            workspace, mapping.tp_size)
-    return
+    with _get_allreduce_workspace_lock(mapping):
+        if mapping not in _lowprecision_allreduce_workspaces:
+            ipc_buffers, workspace = CustomAllReduceHelper.allocate_lowprecision_workspace(
+                mapping,
+                CustomAllReduceHelper.max_workspace_size_lowprecision(
+                    mapping.tp_size),
+            )
+            _lowprecision_allreduce_workspaces[mapping] = (ipc_buffers,
+                                                           workspace)
+            CustomAllReduceHelper.initialize_lowprecision_buffers(
+                workspace, mapping.tp_size)
 
 
 def _initialize_allreduce_mnnvl_protocol(workspace: _MnnvlWorkspace,
@@ -1738,9 +1747,9 @@ class AllReduce(nn.Module):
         # AllReduceRunner.forward can use during the autotuner warm-up phase.
         extra_attrs = get_model_extra_attrs()
         # Declared by the model: never run or tune NCCL_SYMMETRIC (plain NCCL instead).
-        self._exclude_nccl_symmetric = bool(
-            extra_attrs
-            and extra_attrs.get("allreduce_exclude_nccl_symmetric", False))
+        self._exclude_nccl_symmetric = bool(extra_attrs and extra_attrs.get(
+            "allreduce_exclude_nccl_symmetric", False)) or (os.environ.get(
+                "TRTLLM_AR_TUNE_NCCL_SYMMETRIC", "1") != "1")
         # Declared by the model: the MNNVL path runs its residual RMSNorm fusions on the CuTe DSL kernels.
         fused_norm = bool(
             extra_attrs

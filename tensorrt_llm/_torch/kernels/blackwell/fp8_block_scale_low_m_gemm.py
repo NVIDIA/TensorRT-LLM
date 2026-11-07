@@ -4437,6 +4437,8 @@ def check_prequantized_inputs(
     sf_bytes = _ceil_div(m, MMA_M) * MMA_M * (k // SF_VEC)
     if xs.dtype != torch.uint8 or not xs.is_contiguous() or xs.numel() < sf_bytes:
         raise ValueError(f"xs must be the contiguous uint8 R128c4 scale of {m} rows")
+    if xs.device != xq.device:
+        raise ValueError(f"xs must live on xq's device, got {xs.device} vs {xq.device}")
     if xq.data_ptr() % 16 or xs.data_ptr() % 4:
         raise ValueError("xq must be 16-byte and xs 4-byte aligned")
     _check_weight(w, w_scale, k)
@@ -4444,10 +4446,12 @@ def check_prequantized_inputs(
 
 def check_gate(x: torch.Tensor, gate: torch.Tensor) -> None:
     """Raise ``ValueError`` unless ``gate`` is a valid multiplier of ``x`` for the gated GEMM:
-    BF16 shaped like ``x``, unit column stride, a row stride that is a multiple of 8 elements,
-    16-byte aligned."""
+    BF16 shaped like ``x``, on ``x``'s device, unit column stride, a row stride that is a
+    multiple of 8 elements, 16-byte aligned."""
     if gate.dtype != torch.bfloat16 or gate.dim() != 2 or tuple(gate.shape) != tuple(x.shape):
         raise ValueError("gate must be a 2D bfloat16 tensor shaped like x")
+    if gate.device != x.device:
+        raise ValueError(f"gate must live on x's device, got {gate.device} vs {x.device}")
     if gate.stride(1) != 1 or gate.stride(0) % 8 or gate.stride(0) < gate.shape[1]:
         raise ValueError("gate needs unit column stride and a row stride that is a multiple of 8")
     if gate.data_ptr() % 16:
@@ -4496,6 +4500,7 @@ __all__ = [
     "pack_block_scale_from_mxfp8_layout",
     "push_stages_fit",
     "quant_bf16x8_to_e4m3",
+    "sigmoid_bf16",
     "run_low_m_gemm",
     "run_low_m_gemm_nvfp4",
     "run_low_m_gemm_all_reduce_push",

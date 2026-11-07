@@ -32,6 +32,8 @@ from torch import Tensor, nn
 from transformers import (AutoProcessor, PretrainedConfig,
                           PreTrainedTokenizerBase)
 
+from tensorrt_llm.checkpoint_format import CheckpointFormat
+
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .content_format import ContentFormat
@@ -247,6 +249,7 @@ class BaseMultimodalInputProcessor(ABC):
                  config,
                  tokenizer,
                  trust_remote_code: bool = True,
+                 vision_gpu_normalize: bool = False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self._config = config
@@ -254,6 +257,7 @@ class BaseMultimodalInputProcessor(ABC):
         self._tokenizer = tokenizer
         self._use_fast: bool = kwargs.get('use_fast', True)
         self._trust_remote_code = trust_remote_code
+        self._vision_gpu_normalize = vision_gpu_normalize
         self._multimodal_hashing_supported: Optional[bool] = None
 
     def _init_tokenization_cache(self, enable_tokenization_cache: bool,
@@ -1156,7 +1160,7 @@ def register_input_processor(
 def create_input_processor(
     model_path_or_dir: str,
     tokenizer,
-    checkpoint_format: Optional[str] = "HF",
+    checkpoint_format: CheckpointFormat | str | None = CheckpointFormat.HF,
     trust_remote_code: bool = True,
     enable_tokenization_cache: bool = False,
     **kwargs,
@@ -1188,7 +1192,7 @@ def create_input_processor(
 
     config = None
 
-    if checkpoint_format in ("HF", "MX"):
+    if checkpoint_format in (CheckpointFormat.HF, CheckpointFormat.MX):
         try:
             model_config = ModelConfig.from_pretrained(
                 model_path_or_dir, trust_remote_code=trust_remote_code)
@@ -1197,7 +1201,8 @@ def create_input_processor(
             logger.debug(
                 f"Unable to load HF config from {model_path_or_dir}: {e}. Falling back."
             )
-    elif checkpoint_format in ("mistral", "mistral_large_3"):
+    elif checkpoint_format in (CheckpointFormat.MISTRAL,
+                               CheckpointFormat.MISTRAL_LARGE_3):
         logger.debug(f"Detected checkpoint_format={checkpoint_format}.")
         from tensorrt_llm._torch.models.checkpoints.mistral.config_loader import \
             MistralConfigLoader
@@ -1223,6 +1228,10 @@ def create_input_processor(
             logger.info("Unregistered model, using DefaultInputProcessor")
             input_processor_cls = None
         if input_processor_cls is not None:
+            if "vision_gpu_normalize" in kwargs:
+                kwargs["vision_gpu_normalize"] = kwargs[
+                    "vision_gpu_normalize"] and getattr(
+                        model_cls, "supports_vision_gpu_normalize", False)
             if (issubclass(input_processor_cls, BaseMultimodalInputProcessor)
                     and input_processor_cls.supports_tokenization_cache):
                 kwargs["enable_tokenization_cache"] = enable_tokenization_cache

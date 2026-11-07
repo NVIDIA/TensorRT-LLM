@@ -179,7 +179,9 @@ def _native_pair(
     status = Mock(wait=Mock(return_value=completes), is_completed=Mock(return_value=completes))
     status.last_status_str.return_value = "ERROR"
     worker._sender._agent = SimpleNamespace(
-        name="nixl", submit_transfer_requests=Mock(return_value=status)
+        name="nixl",
+        check_remote_descs=Mock(return_value=True),
+        submit_transfer_requests=Mock(return_value=status),
     )
     request = SimpleNamespace(op="WRITE", remote_name="gen")
     monkeypatch.setattr(transfer_mod.Sender, "_make_agent_request", Mock(return_value=request))

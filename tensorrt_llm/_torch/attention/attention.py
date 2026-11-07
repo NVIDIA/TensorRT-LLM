@@ -96,6 +96,8 @@ def attn_custom_op_inplace(
     mrope_position_deltas: Optional[torch.Tensor],
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
+    variable_window_token_starts: Optional[torch.Tensor],
+    variable_window_token_ends: Optional[torch.Tensor],
     attention_sinks: Optional[torch.Tensor],
     relative_attention_bias: Optional[torch.Tensor],
     relative_attention_max_distance: int,
@@ -122,6 +124,8 @@ def attn_custom_op_inplace(
         mrope_position_deltas,
         attention_window_size,
         attention_mask_data,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
         output=output,
         output_sf=output_sf,
         attention_sinks=attention_sinks,
@@ -987,6 +991,8 @@ class Attention(nn.Module):
         has_lora: bool = False,
         output_gate: Optional[torch.Tensor] = None,
         kv_append: Optional[KvAppendPlan] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ):
         """Run the attention backend; with output_gate, the returned output has the gate applied (by the backend or
         here), and kv_append is the KV-append plan of a GQA decode layer (see preprocess_qkv)."""
@@ -1023,6 +1029,8 @@ class Attention(nn.Module):
                     mrope_position_deltas=mrope_position_deltas,
                     attention_window_size=attention_window_size,
                     attention_mask_data=attention_mask_data,
+                    variable_window_token_starts=variable_window_token_starts,
+                    variable_window_token_ends=variable_window_token_ends,
                     softmax_stats_tensor=softmax_stats,
                     attention_sinks=attention_sinks,
                     relative_attention_bias=relative_attention_bias,
@@ -1076,6 +1084,8 @@ class Attention(nn.Module):
             relative_attention_max_distance=relative_attention_max_distance,
             output_gate=output_gate,
             kv_append=kv_append,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
         )
         with attn_metadata.mixed_precision_kv_staging(self.attn.layer_idx):
             attn_output = self.attn.forward(q,
@@ -1109,6 +1119,8 @@ class Attention(nn.Module):
         has_lora: bool = False,
         output_gate: Optional[torch.Tensor] = None,
         kv_append: Optional[KvAppendPlan] = None,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         if self.sparse_attn_hooks is not None:
@@ -1127,6 +1139,8 @@ class Attention(nn.Module):
                 relative_attention_max_distance,
                 has_lora,
                 output_gate,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 **kwargs,
             )
             if sparse_output is not None:
@@ -1160,6 +1174,8 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                variable_window_token_starts,
+                variable_window_token_ends,
                 attention_sinks,
                 relative_attention_bias,
                 relative_attention_max_distance,
@@ -1178,6 +1194,8 @@ class Attention(nn.Module):
                 mrope_position_deltas,
                 attention_window_size,
                 attention_mask_data,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
                 attention_sinks=attention_sinks,
                 relative_attention_bias=relative_attention_bias,
                 relative_attention_max_distance=relative_attention_max_distance,
@@ -1216,6 +1234,8 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1289,6 +1309,8 @@ class Attention(nn.Module):
             has_lora=bool(lora_params),
             output_gate=gate,
             kv_append=kv_append,
+            variable_window_token_starts=variable_window_token_starts,
+            variable_window_token_ends=variable_window_token_ends,
             **kwargs,
         )
 

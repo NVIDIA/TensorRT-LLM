@@ -45,13 +45,14 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MixedMambaHybridCacheManager
 from tensorrt_llm._torch.pyexecutor.model_loader import (
     ModelLoader,
-    _construct_checkpoint_loader,
+    construct_checkpoint_loader,
     validate_and_set_kv_cache_quant,
     validate_and_set_mamba_ssm_cache_dtype,
 )
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import get_model_extra_attrs, model_extra_attrs
 from tensorrt_llm._utils import local_mpi_size, mpi_rank, mpi_world_size, torch_dtype_to_binding
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig, KvCacheConfig, MoeConfig, TorchLlmArgs
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -437,7 +438,7 @@ class Runner:
     ) -> None:
         super().__init__()
 
-        checkpoint_loader = _construct_checkpoint_loader(None, "HF")
+        checkpoint_loader = construct_checkpoint_loader(None, CheckpointFormat.HF)
         # Please refer to `tensorrt_llm/_torch/pyexecutor/model_loader.py` for effective args
         llm_args = TorchLlmArgs(
             model=pretrained_model_name_or_path,
@@ -914,6 +915,11 @@ class Runner:
                 dp_rank,
                 self.model_config.mapping.moe_ep_size,
             )
+            # A backend that routes through `routing_method.apply_with_sort` (the kernels
+            # that write the moe_sort tables) would bypass the replacement above: make it
+            # decline, so the scheduler falls back to the replaced `apply`.
+            apply_with_sort_orig = moe_module.routing_method.apply_with_sort
+            moe_module.routing_method.apply_with_sort = lambda *args, **kwargs: None
 
             # Replace `run_moe` for TRTLLMGenFusedMoE TEP because it does not call `routing_method.apply`
             if isinstance(moe_module, TRTLLMGenFusedMoE):
@@ -936,14 +942,20 @@ class Runner:
             forward_impl_orig = moe_module.forward_impl
             moe_module.forward_impl = make_forward_impl_check(moe_module, forward_impl_orig)
 
-            original_methods.append((apply_method_orig, run_moe_orig, forward_impl_orig))
+            original_methods.append(
+                (apply_method_orig, apply_with_sort_orig, run_moe_orig, forward_impl_orig)
+            )
         try:
             yield
         finally:
-            for moe_module, (apply_method_orig, run_moe_orig, forward_impl_orig) in zip(
-                moe_modules, original_methods
-            ):
+            for moe_module, (
+                apply_method_orig,
+                apply_with_sort_orig,
+                run_moe_orig,
+                forward_impl_orig,
+            ) in zip(moe_modules, original_methods):
                 moe_module.routing_method.apply = apply_method_orig
+                moe_module.routing_method.apply_with_sort = apply_with_sort_orig
                 if isinstance(moe_module, TRTLLMGenFusedMoE):
                     moe_module.run_moe = run_moe_orig
                 moe_module.forward_impl = forward_impl_orig

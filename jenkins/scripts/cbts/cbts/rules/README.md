@@ -20,8 +20,8 @@ for the overall CBTS architecture.
 | `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
-| `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus complete `l0_cpu`; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
-| `out_of_scope.py` | `OutOfScopeRule` | `noop` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
+| `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
+| `out_of_scope.py` | `OutOfScopeRule` | `noop` / `testsonly` | Reviewed metadata paths, root issue-template and developer-assistant folders, `.gitignore` at any depth, conventional clang filenames under `cpp/`, verified static-check-only `pyproject.toml` edits, QA/dev lists, timing caches, microbenchmarks, and CBTS infrastructure |
 
 ## PythonFormattingRule
 
@@ -42,10 +42,12 @@ Claims every file under `docs/` plus Markdown and reStructuredText files
 anywhere in the repository, excluding paths recognized by `is_out_of_scope`.
 The same exclusion applies to Python docstring contributions. Every claim contributes the literal
 `CPU-Build_Docs` stage, which runs Doxygen and Sphinx `make html`. Changes under
-`docs/` additionally keep every block and entry in `l0_cpu.yml`, because CPU
-tests directly read documentation sources such as `model-express.md` and import
-the telemetry extension under `docs/source/_ext/`. If the CPU test-db blocks or
-stages cannot be resolved for a `docs/` change, the rule forces fallback instead
+`docs/` additionally select registered documentation-related CPU tests: docs
+helpers, API stability, tools, usage/telemetry, serving-schema validation, and
+model-loader documentation checks. A parent YAML entry retains its complete
+suite and options. This preserves tests reading `model-express.md` and importing
+the extensions under `docs/source/_ext/` without running unrelated CPU entries.
+If the CPU test-db blocks or stages cannot be resolved for a `docs/` change, the rule forces fallback instead
 of silently running docs alone. Markdown and reStructuredText outside `docs/`
 run only the docs build, matching the legacy Docs path without adding unrelated
 CPU tests.
@@ -62,7 +64,7 @@ classes, and functions. The input analyzer checks the unmodified patch against
 the post-image, parses both images, and separates literal docstring lines from
 code lines. A Python file with only those edits is claimed by `DocsRule` and
 excluded from the other rules. For a mixed file, the rule contributes the docs
-build and complete CPU validation without claiming the file; other rules and
+build and the same documentation-related CPU tests without claiming the file; other rules and
 coverage analyze the remaining executable edits. The original patch remains
 available to coverage to reconstruct the pre-image. Selections combine by
 union, including the independent docs stage when coverage narrows the residual.
@@ -94,6 +96,13 @@ Outcomes:
   `l0_sanity_check`.
 
 ## TestsDefRule
+
+Changes to `tests/integration/defs/perf/test_perf.py`, its shared `utils.py`,
+or their statically discovered imported helpers also select
+`unittest/others/test_perf_qa_functional.py` in the CPU test list.
+This protects the QA harness without scheduling a GPU benchmark. Existing
+PerfSanity matches are retained for shared helpers; helpers imported only by
+the QA test select its CPU coverage. Missing CPU coverage forces fallback.
 
 For each file under `tests/` in the diff:
 
@@ -136,19 +145,23 @@ pre-image view (`iter_diff_pre_image`: context + `-` lines, in-hunk
 order), where a deleted class's `class` statement or a deleted section's
 key line is directly visible:
 
-- `.py`: `_recover_deleted_scope_anchors` runs only after post-image
-  mapping already failed, so modification diffs keep their finer
-  method-level anchors. `_py_class_scopes_from_deletions` attributes at
-  class level — a method-level walk would have to guess which `def` a
-  stray decorator line belongs to.
+- `.py`: first reconstruct the complete pre-image from the raw patch,
+  verifying its context and added lines against the checked-out source.
+  AST mapping then combines the deleted lines' old test scopes with the
+  added lines' new scopes, including decorators. This keeps a top-level
+  test's decorator replacement scoped to that test and preserves both
+  sides of a rename. Module-level changes retain the file fallback.
+  If reconstruction fails, `_recover_deleted_scope_anchors` uses the
+  hunk-local class attribution from `_py_class_scopes_from_deletions`.
 - reference YAML: `_yaml_top_keys_from_deletions` reads `-` lines,
   `iter_diff_added_post_line_numbers` reads `+` lines off the post-image.
 
-Both return `None` — forcing the file-level fallback — when a `-` line's
-owning scope is not visible inside its hunk, since only 3 context lines
-are guaranteed. Pre-image *line numbers* are never used:
-`strip_noop_diff_lines` drops blank / comment-only `-` lines, which
-shifts every later pre-image number.
+The hunk-local readers return `None` — forcing the file-level fallback —
+when a `-` line's owning scope is not visible inside its hunk, since only
+3 context lines are guaranteed. Complete-source AST mapping uses pre-image
+line numbers from the raw patch. Never derive these from normalized diffs:
+`strip_noop_diff_lines` drops blank / comment-only `-` lines, shifting every
+later pre-image number.
 
 ### accuracy/references/*.yaml
 
@@ -265,7 +278,7 @@ Outcomes:
   `scripts/visualgen_eval/**`, or `tensorrt_llm/_torch/visual_gen/**`)
   → `scope=visualgenonly`;
   sanity off (VG changes don't affect wheel sanity); perfsanity on iff
-  a matched block lives in `l0_perf` or `*perf_sanity*`.
+  a matched block lives in `*perf_sanity*`.
 - VG source touched, any outward-facing path under
   `tensorrt_llm/visual_gen/` or `tensorrt_llm/media/` → `scope=visualgenonly`
   with shared serving, full CPU, package sanity, and performance sanity.
@@ -393,9 +406,8 @@ Source changed but no modeling_v2 block in any yaml (defensive) →
 
 Claims non-documentation source changes under `tensorrt_llm/grpc/openengine/` and keeps only test-db
 entries under `unittest/grpc/openengine/`. The stub-based tests are registered in `l0_cpu.yml`, so
-they resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each, and stages CBTS runs
-unconditionally (`ALWAYS_RUN_STAGE_PREFIX`), so they still run on every baseline and fallback
-pipeline. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
+they explicitly resolve to `CPU-Generic-x86-1` / `CPU-Generic-arm-1` — one split each.
+CBTS adds no unrelated CPU tests to this selection. `test_capability_conformance.py` builds a real `LLM` and so is registered in `l0_a10.yml`,
 adding `A10-PyTorch-*`: an OpenEngine change does pull one GPU shard. Any GPU serves — the model is
 TinyLlama-1.1B — so it sits with the other gateway tests rather than claiming a scarcer type.
 OpenEngine's private bindings and gRPC runtime are base package dependencies, so no stage-name guard
@@ -407,12 +419,17 @@ source-plus-test changes combine through the `testsonly` scope family.
 
 ## OutOfScopeRule
 
-Claims changes outside product-test selection as `scope=noop`, contributing no
-test stages or block filters. The main entry point still retains the always-run
-CPU stages. With only noop contributions, the source `l0_cpu` list runs without
-case filtering. In a mixed PR, other rules or coverage select the remaining
-changes; noop adds no requirement to retain the entire CPU suite. Build and
-repository checks remain upstream.
+Claims changes outside product-test selection, including reviewed metadata, issue
+templates, developer-assistant configuration, QA/dev lists, timing caches,
+microbenchmarks, and verified static-check-only pyproject edits. These contribute
+`scope=noop` without CPU stages. Every rule owns its test contributions; the
+entry point never appends a generic CPU suite. Coverage Tier 2 retains its
+separate policy of preserving CPU tests; fallback uses the baseline pipeline.
+
+CBTS infrastructure changes contribute `scope=testsonly` with the registered
+`unittest/scripts` CPU suite, including CBTS regression tests. Missing CPU scripts
+registration forces fallback. Other out-of-scope files in the same PR add no
+CPU tests. Build and repository checks remain upstream.
 
 `OUT_OF_SCOPE_EXACT_PATHS` lists reviewed metadata files by complete repository
 path. A new YAML, JSON, TOML, or template file is not automatically exempt,

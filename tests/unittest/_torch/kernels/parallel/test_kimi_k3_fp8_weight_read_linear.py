@@ -297,7 +297,9 @@ def test_forward_nvfp4_matches_gemm_then_fp4_quantize(m):
 
     _, linear = _make(3584, 7168, seed=m)
     linear.post_load_weights()
-    expected_max_m = 256 if getSMVersion() == 107 else 0
+    # The model's own gate is the kernel's route check: SM107 with the Rubin-capable
+    # CuTe DSL build (a build without it serves no NVFP4 output even on SM107).
+    expected_max_m = 256 if IS_CUTLASS_DSL_RUBIN_AVAILABLE and getSMVersion() == 107 else 0
     assert linear.emits_nvfp4(m) == (m <= expected_max_m)
     assert not linear.emits_nvfp4(expected_max_m + 1)
     if not linear.emits_nvfp4(m):
@@ -312,3 +314,15 @@ def test_forward_nvfp4_matches_gemm_then_fp4_quantize(m):
     ref_codes, ref_scales = torch.ops.trtllm.fp4_quantize(y, global_sf, 16, False, False)
     assert torch.equal(codes, ref_codes)
     assert torch.equal(scales.view(-1), ref_scales.view(-1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@RUBIN
+@pytest.mark.parametrize("rows", [1, 64, 128, 129, 170, 256])
+def test_takes_prequantized_input_covers_the_low_m_gemm_range(rows):
+    """``takes_prequantized_input`` hands over the MXFP8 operand wherever ``forward`` runs the
+    low-M GEMM, mid-M included: the mid-M GEMM reads one R128c4 scale block per 128 rows, so
+    rows past the first block take the operand too."""
+    _, linear = _make(3584, 7168, seed=11)
+    expected = 1 <= rows <= linear._low_m.max_m
+    assert linear.takes_prequantized_input(rows) == expected

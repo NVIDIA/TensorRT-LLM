@@ -81,7 +81,12 @@ from ..interface import MoESchedulerKind, _reject
 from ..quantization import MoEWeightLoadingMode, NVFP4CuteDslFusedMoEMethod
 from ..routing import BaseMoeRoutingMethod
 from .identity import KERNEL_FUSED_FC12, PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL
-from .kernel_inputs import NvFp4WeightView, finalize_routing_scales, quantize_input_nvfp4
+from .kernel_inputs import (
+    NvFp4WeightView,
+    finalize_routing_scales,
+    prequantized_nvfp4_input_scale,
+    quantize_input_nvfp4,
+)
 from .runners import CuteDslFusedMoENvfp4Runner
 
 
@@ -99,6 +104,12 @@ class CuteDslFc12FusedMoENvfp4Runner(CuteDslFusedMoENvfp4Runner):
     @staticmethod
     def _tile_sizes() -> list[int]:
         return [128, 256]
+
+
+# The most SMs the fused FC12 grid keeps free beside it (the measured R200
+# split); the model's per-forward ``reserve_sms_for_concurrent_kernels``
+# request, bounded by this ceiling, is applied at every launch.
+_SM_RESERVE_CEILING = 16
 
 
 @register_moe_impl
@@ -293,17 +304,17 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         # all-to-all combine workspace.
         return True
 
-    def prequantized_nvfp4_input_scale(self) -> torch.Tensor | None:
-        """``quantize_input`` passes an unswizzled ``Fp4QuantizedTensor`` through, except on a
-        layer with a pre-quant activation scale (NVFP4_AWQ / NVFP4_ARC)."""
-        if getattr(self, "fc31_act_scale", None) is not None:
-            return None
-        return self.fc31_input_scale
+    def sm_reserve_ceiling(self) -> int:
+        """Whole clusters fewer, at least one launched (one CTA holds an SM's
+        register file): the 16-SM split measured on a VR200. Per-launch the model
+        hands the reserve of ``reserve_sms_for_concurrent_kernels`` over, bounded
+        by this ceiling."""
+        return _SM_RESERVE_CEILING
 
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """The fused kernel's persistent grid launches enough whole clusters fewer to leave
         ``num_sms`` SMs without an FC12 CTA, and the small-batch kernel's grid that many CTAs
-        fewer (``sm_reserve`` of either op)."""
+        fewer (``reserved_sms`` of the fused op, ``sm_reserve`` of the small-batch op)."""
         if num_sms < 0:
             raise ValueError(f"num_sms must be non-negative, got {num_sms}")
         self._concurrent_sm_reserve = num_sms
@@ -426,7 +437,10 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ------------------------------------------------------------------
     # Input quantization and dispatch (NVFP4 only)
     # ------------------------------------------------------------------
+    # Shared NVFP4 input handling: the passthrough rule and its prequant
+    # exception live once in kernel_inputs.py, bound like quantize_input.
     quantize_input = quantize_input_nvfp4
+    prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
 
     def _join_pending_x_ready(self) -> None:
         """Wait for the input-ready event handed to ``run_moe_nvfp4`` (once per forward)."""
@@ -740,7 +754,7 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             activation_type=int(self.activation_type),
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
-            sm_reserve=self._concurrent_sm_reserve,
+            reserved_sms=self._concurrent_sm_reserve,
             die_major=self.weights_die_major,
         )
         return moe_output

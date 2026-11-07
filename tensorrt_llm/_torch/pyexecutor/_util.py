@@ -52,6 +52,7 @@ from ..disaggregation.kv_cache_transceiver import (AttentionTypeCpp,
 from ..hostfunc import set_low_latency_dispatch
 from ..model_config import ModelConfig, _get_kv_cache_layer_specs
 from ..models.modeling_multimodal_mixin import MultimodalModelMixin
+from ..modules.dwdp.dense.manager import DenseDwdpManager
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..speculative import (draft_prompt_lookahead, get_draft_block_width,
                            get_num_extra_kv_tokens, get_num_spec_layers,
@@ -93,6 +94,8 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+_DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
+_CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
 
 # Page sizes of a standalone drafter's separate KV pool (DFlash, standalone
 # DSpark). The pool keeps the target's kv_cache_config.tokens_per_block when it
@@ -109,6 +112,15 @@ _STANDALONE_DRAFT_TOKENS_PER_BLOCK = 32
 # Aggregated helix skips memory profiling, so its default KV fraction leaves
 # room for prefill activations. TODO(TRTLLM-17127): remove once helix profiles.
 _HELIX_AGG_FREE_GPU_MEMORY_FRACTION = 0.6
+
+
+def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
+                                  estimating_kv_cache: bool) -> int:
+    """Return IndexMapper headroom required by the execution policy."""
+    if getattr(spec_config, "enable_confidence_scheduling", False):
+        return (0 if estimating_kv_cache else
+                _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS)
+    return _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -996,6 +1008,28 @@ def _derive_draft_max_attention_window(
         return _normalize_attention_windows(max_attention_window, max_seq_len)
 
     return None
+
+
+def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
+    """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
+    if draft_kv_config.pool_ratio is None:
+        return
+    if draft_kv_config.mixed_precision_kv is not None:
+        # An MTP draft manager with mixed-precision KV has its own pool plus a
+        # mixed-precision high pool, so the target's pool_ratio does not fit it.
+        logger.warning(
+            f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
+            "target KV cache only; the mixed-precision MTP draft KV cache sizes "
+            "its pools automatically.")
+        draft_kv_config.pool_ratio = None
+    elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
+          and len(draft_kv_config.pool_ratio) != 1):
+        # pool_ratio describes one manager's layer groups: the target's ratios do not fit the draft.
+        logger.info(
+            "Normalizing the separate one-model draft KV cache pool_ratio "
+            f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
+            "layer group.")
+        draft_kv_config.pool_ratio = [1.0]
 
 
 class KvCacheCreator:
@@ -2391,11 +2425,13 @@ class KvCacheCreator:
         """Whether the drafter's block attention reads its context KV from the
         manager's pages at this run's page size.
 
-        A loaded DSpark drafter declares it; otherwise only TRTLLM pages.
+        A loaded DSpark drafter declares it; otherwise only TRTLLM pages of 16,
+        32 or 64 tokens.
         """
         drafter = self._loaded_standalone_dspark_drafter()
         if drafter is None:
-            return backend == "TRTLLM"
+            return (backend == "TRTLLM"
+                    and self._tokens_per_block in (16, 32, 64))
         return drafter.reads_managed_ctx_pages(self._tokens_per_block)
 
     def _unified_drafter_reads_helix_pages(self) -> bool:
@@ -2479,11 +2515,11 @@ class KvCacheCreator:
         if _has_variable_kv_cache_geometry(
                 self._model_engine.model.model_config):
             return "the target uses different KV cache geometry across layers"
-        if self._llm_args.kv_cache_compression_config is not None:
-            return "KV cache compression is enabled"
         if getattr(self._kv_cache_config, "mixed_precision_kv",
                    None) is not None:
-            return "mixed-precision KV is enabled"
+            return "retained-token mixed-precision KV cache is enabled"
+        if self._llm_args.kv_cache_compression_config is not None:
+            return "KV cache compression is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
         # external drafter cannot yet describe. Keep their existing fallback.
         if not self._unified_target_manager_cls_supported():
@@ -2514,6 +2550,10 @@ class KvCacheCreator:
                     int(draft_model_config.pretrained_config.num_hidden_layers))
             ))
         if len(set(draft_windows)) > 1:
+            logger.info_once(
+                f"{self._unified_drafter_name()}: draft layers have different "
+                "effective attention windows; keeping a separate draft KV cache.",
+                key="dflash_mixed_draft_windows_fallback")
             return "the draft layers use different attention windows"
         if self._is_disagg and not self._dflash_disagg_layouts_compatible(
                 target_layout, draft_layout):
@@ -2869,8 +2909,13 @@ class KvCacheCreator:
         max_attention_window = (None if estimating_kv_cache else
                                 self._get_draft_max_attention_window(
                                     max_seq_len, kv_cache_config))
-        return kv_cache_config.model_copy(
-            update={"max_attention_window": max_attention_window})
+        update = {"max_attention_window": max_attention_window}
+        if (kv_cache_config.mixed_precision_kv is not None and
+                not self._speculative_config.spec_dec_mode.is_mtp_one_model()):
+            # MTP layers use mixed-precision KV like the target; a drafter with
+            # its own architecture uses the "auto" KV dtype instead.
+            update["dtype"] = "auto"
+        return kv_cache_config.model_copy(update=update)
 
     def _create_one_model_draft_kv_cache_manager(
         self,
@@ -2904,19 +2949,7 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        if (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
-                and draft_kv_config.pool_ratio is not None
-                and len(draft_kv_config.pool_ratio) != 1):
-            # pool_ratio describes one manager's layer-group layout. The
-            # target hybrid manager may have separate recurrent-state and
-            # attention layer groups, while a non-VSWA draft manager has one
-            # attention layer group. Reusing the target's ratios fails its arity
-            # check.
-            logger.info(
-                "Normalizing the separate one-model draft KV cache pool_ratio "
-                f"from {draft_kv_config.pool_ratio} to [1.0] for its single "
-                "layer group.")
-            draft_kv_config.pool_ratio = [1.0]
+        _fit_draft_pool_ratio(draft_kv_config)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -4027,6 +4060,9 @@ def _create_kv_cache_manager(
         manager_extra_kwargs["max_copy_beam_width"] = max_copy_beam_width
         manager_extra_kwargs[
             "cold_page_codec_provider"] = cold_page_codec_provider
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            manager_extra_kwargs["num_reserved_index_slots"] = (
+                _get_num_reserved_index_slots(spec_config, estimating_kv_cache))
         manager_extra_kwargs["kv_events_config"] = kv_events_config
         manager_extra_kwargs["joint_kv_cache_reuse"] = joint_kv_cache_reuse
         manager_extra_kwargs[
@@ -4226,6 +4262,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "nemotron_hybrid"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The manager tells its draft layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             mamba_params.state_size,
@@ -4284,6 +4323,9 @@ def _create_kv_cache_manager(
         mamba_manager_extra_kwargs = dict(manager_extra_kwargs)
         mamba_manager_extra_kwargs.update(
             _mamba_conv_layout_kwargs(kv_cache_manager_cls, "qwen3_next"))
+        if issubclass(kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            # The manager tells its draft layers apart by the model's layer count.
+            mamba_manager_extra_kwargs["pretrained_config"] = config
         if (issubclass(kv_cache_manager_cls,
                        (CppMambaHybridCacheManager, MambaHybridCacheManagerV2))
                 and model_engine is not None):
@@ -4627,6 +4669,7 @@ def create_py_executor_resources(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
 ) -> PyExecutorResources:
     """Build the resource graph shared by initial execution and rebinding."""
@@ -5029,6 +5072,7 @@ def create_py_executor_resources(
         virtual_memory_pools=virtual_memory_pools,
         kv_connector_manager=kv_connector_manager,
         dwdp_manager=dwdp_manager,
+        dense_dwdp_manager=dense_dwdp_manager,
         max_seq_len=executor_max_seq_len,
         max_num_sequences=max_num_sequences,
         waiting_queue_policy=waiting_queue_policy,
@@ -5061,6 +5105,7 @@ def create_py_executor_instance(
     virtual_memory_pools: Optional[dict] = None,
     execution_stream: Optional[torch.cuda.Stream] = None,
     dwdp_manager: Optional[DwdpManager] = None,
+    dense_dwdp_manager: Optional[DenseDwdpManager] = None,
     max_num_sequences: Optional[int] = None,
     transfer_budget_is_explicit: bool = False,
 ) -> PyExecutor:
@@ -5083,6 +5128,7 @@ def create_py_executor_instance(
         virtual_memory_pools=virtual_memory_pools,
         execution_stream=execution_stream,
         dwdp_manager=dwdp_manager,
+        dense_dwdp_manager=dense_dwdp_manager,
         max_num_sequences=max_num_sequences,
     )
     spec_config = model_engine.spec_config
@@ -5117,6 +5163,7 @@ def create_py_executor_instance(
         execution_stream=execution_stream,
         waiting_queue_policy=execution_resources.waiting_queue_policy,
         dwdp_manager=execution_resources.dwdp_manager,
+        dense_dwdp_manager=execution_resources.dense_dwdp_manager,
         enable_kv_pool_rebalance=llm_args.kv_cache_config.
         enable_kv_pool_rebalance,
         kv_pool_rebalance_check_interval=llm_args.kv_cache_config.
@@ -5194,9 +5241,16 @@ def instantiate_sampler(
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         sampler = get_spec_decoder(sampler_args, engine.spec_config)
-        spec_step_fold = runtime_hooks_of(engine.model).spec_step_fold
-        if spec_step_fold is not None and isinstance(sampler, SpecSampler):
-            sampler.bind_spec_step_fold(spec_step_fold)
+        runtime_hooks = runtime_hooks_of(engine.model)
+        if isinstance(sampler, SpecSampler):
+            if runtime_hooks.spec_step_fold is not None:
+                sampler.bind_spec_step_fold(runtime_hooks.spec_step_fold)
+            sampler.d2h_side_stream_copies = runtime_hooks.sampler_d2h_side_stream
+            sampler.static_slot_ids = runtime_hooks.spec_small_h2d
+            if runtime_hooks.sampler_d2h_side_stream:
+                logger.info(
+                    "[M3 host] spec sampler store copies on the D2H side stream"
+                )
         return sampler
 
     if mm_encoder_only:
@@ -5207,10 +5261,11 @@ def instantiate_sampler(
         # is never opened, so PyTorch would never release its allocation.
         returns_responses = mapping.rank == 0 or (mapping.enable_attention_dp
                                                   and 0 in mapping.tp_group)
-        return EarlyStopWithMMResult(return_mm_results=returns_responses)
+        return EarlyStopWithMMResult(return_mm_results=returns_responses,
+                                     max_num_tokens=engine.max_num_tokens)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
-        return EarlyStopSampler()
+        return EarlyStopSampler(max_num_tokens=engine.max_num_tokens)
     return TorchSampler(sampler_args)
 
 

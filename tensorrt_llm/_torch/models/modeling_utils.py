@@ -8,8 +8,9 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import (Any, Callable, ClassVar, Dict, Generic, Iterator, List,
-                    Literal, Optional, Tuple, Type, TypeVar, Union)
+from typing import (TYPE_CHECKING, Any, Callable, ClassVar, Dict, Generic,
+                    Iterator, List, Literal, Optional, Tuple, Type, TypeVar,
+                    Union)
 
 import torch
 from torch import nn
@@ -19,6 +20,7 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.peft.lora.loaders import HfLoraLoader
 from tensorrt_llm._utils import local_mpi_rank
+from tensorrt_llm.checkpoint_format import CheckpointFormat
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...logger import logger
@@ -33,8 +35,15 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MoE, VanillaMoE, is_moe_weight_owner
 from ..speculative import SpecMetadata
+from ..utils import split
 from ._arch_index import (MODEL_ARCH_TO_MODULE, SPEC_MODE_TO_MODULE,
                           is_builtin_zoo_module)
+
+if TYPE_CHECKING:
+    # The checkpoints package imports this module, so import its loader base
+    # classes for type checking only.
+    from .checkpoints.base_config_loader import BaseConfigLoader
+    from .checkpoints.base_weight_loader import BaseWeightLoader
 
 
 @contextlib.contextmanager
@@ -106,6 +115,44 @@ class MetaInitMode(TorchDispatchMode):
             raise MetaInitException(
                 f"Meta tensor used in unsupported function: {func}")
         return func(*args, **kwargs)
+
+
+def concatenate_weights_by_tp_rank(components: list[torch.Tensor],
+                                   tp_size: int) -> torch.Tensor:
+    """Concatenate projection components in rank-major row order.
+
+    Args:
+        components: Tensors shaped ``[rows_i, ...]`` with matching trailing
+            dimensions. Each physical row count must be divisible by
+            ``tp_size``. Packed weights remain packed; callers must ensure
+            logical channel boundaries align with physical row boundaries.
+        tp_size: Number of tensor-parallel ranks.
+
+    Returns:
+        A tensor ordered as ``[c0_r0 | c1_r0 | ... | c0_r1 | c1_r1 | ...]``.
+        A contiguous row split gives each rank its slice of every component.
+        With one rank, this is a plain concatenation along dimension zero.
+    """
+    if not components:
+        raise ValueError("rank blocking requires at least one projection")
+    if tp_size <= 0:
+        raise ValueError(f"tp_size must be positive, got {tp_size}")
+    trailing_shape = components[0].shape[1:]
+    for component in components:
+        if component.ndim == 0 or component.shape[1:] != trailing_shape:
+            raise ValueError(
+                "rank-blocked projections must have matching trailing dimensions"
+            )
+        if component.shape[0] % tp_size:
+            raise ValueError(
+                f"projection rows {component.shape[0]} are not divisible by tp_size={tp_size}"
+            )
+    if tp_size == 1:
+        return torch.cat(components, dim=0)
+    rows: list[torch.Tensor] = []
+    for rank in range(tp_size):
+        rows.extend(split(c, tp_size, rank) for c in components)
+    return torch.cat(rows, dim=0)
 
 
 def duplicate_kv_weight(weight: torch.Tensor, num_kv_heads: int,
@@ -1383,7 +1430,7 @@ def register_vision_encoder(
     return wrapper
 
 
-def register_mapper(format: str, name: Optional[str] = None):
+def register_mapper(format: CheckpointFormat | str, name: Optional[str] = None):
 
     def decorator(cls):
         if name is not None:
@@ -1397,7 +1444,7 @@ def register_mapper(format: str, name: Optional[str] = None):
     return decorator
 
 
-def register_checkpoint_weight_loader(name: str):
+def register_checkpoint_weight_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1406,7 +1453,7 @@ def register_checkpoint_weight_loader(name: str):
     return decorator
 
 
-def register_checkpoint_loader(name: str):
+def register_checkpoint_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[name] = cls
@@ -1415,7 +1462,7 @@ def register_checkpoint_loader(name: str):
     return decorator
 
 
-def register_config_loader(name: str):
+def register_config_loader(name: CheckpointFormat | str):
 
     def decorator(cls):
         MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name] = cls
@@ -1424,13 +1471,14 @@ def register_config_loader(name: str):
     return decorator
 
 
-def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+def get_checkpoint_weight_loader(
+        name: CheckpointFormat | str) -> Type["BaseWeightLoader"]:
     if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default checkpoint weight loader {name} not found.")
     return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
 
 
-def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+def get_config_loader(name: CheckpointFormat | str) -> Type["BaseConfigLoader"]:
     if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
         raise ValueError(f"Default config loader {name} not found.")
     return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]

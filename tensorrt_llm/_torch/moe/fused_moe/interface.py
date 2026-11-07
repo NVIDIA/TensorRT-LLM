@@ -381,52 +381,49 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             self.initial_global_assignments = list(range(self.num_experts))
             self.allreduce = None
 
-        # Override expert layout when DWDP is enabled.  This must run before
-        # create_weights() (which is invoked later by ConfigurableMoE) so the
-        # fused MoE backend allocates ``num_experts_per_worker`` slots per
-        # rank — not ``num_experts // ep_size``.  fixup_moe_backends() at
-        # setup_dwdp() time later promotes these to the full composite-VA
-        # view (``ep_size = 1``, ``slot_start = 0``,
-        # ``slot_end = num_experts``); the earlier override is still
-        # required because ``mapping.moe_ep_size`` is now 1, so the
-        # un-overridden default would be ``expert_size_per_partition =
-        # num_experts`` (each rank allocating storage for every expert).
-        self._init_dwdp_expert_layout()
+        # The DWDP layout is not set here: ConfigurableMoE sizes a layer DWDP
+        # manages once its backend exists (_decide_dwdp), and every other layer
+        # keeps the layout above.
         self._init_perfect_router(model_config)
 
-    def _init_dwdp_expert_layout(self):
-        """Override expert layout when DWDP is enabled.
+    def _init_dwdp_expert_layout(self) -> None:
+        """Override the expert layout of a layer DWDP manages.
 
-        Plumbs ``num_experts_per_worker`` (storage size) and
-        ``start_expert_id`` (storage start) from the active
-        ``DwdpManager``.  This is a no-op when DWDP is not enabled
-        (``get_global_dwdp_manager()`` returns ``None``).
+        ``ConfigurableMoE._decide_dwdp`` calls it for an eligible layer, after
+        the backend exists and before the backend sync and ``create_weights``:
+        ``mapping.moe_ep_size`` is 1 under DWDP, so the default layout would
+        allocate every expert on every rank.  An invalid DwdpConfig raises
+        here, on every rank alike, before any weight exists.
+        ``fixup_moe_backends()`` at ``setup_dwdp()`` time later promotes the
+        layout to the full composite-VA view (``ep_size = 1``,
+        ``slot_start = 0``, ``slot_end = num_experts``).
 
-        For the uniform partition case (``num_prefetch_experts ==
-        num_experts_per_worker == num_experts // dwdp_size``) this is
-        mathematically equivalent to the legacy ``ep_size = dwdp_size``
-        layout.  It additionally enables:
+        Sizes this layer from this rank's range ``[start, end)`` of the
+        ``ExpertPartition`` the active ``DwdpManager`` computes for
+        ``num_experts`` (``DwdpManager.expert_partition``): it allocates
+        ``end - start`` rows, and the weight loaders put experts
+        ``start .. end - 1`` into them.  Ranks may store different counts:
+        the balanced partition (``num_experts_per_worker ==
+        num_prefetch_experts == 0``) stores the floor or the ceil of
+        ``num_experts / dwdp_size`` experts per rank, the larger counts on
+        the lower ranks, and a capped strided partition cuts the last range
+        short at ``num_experts``.  No rank allocates a row for an expert it
+        does not store.  ``setup_dwdp`` checks every rank's rows against the
+        same partition across the DWDP group.  This is a no-op when DWDP is
+        not enabled (``get_global_dwdp_manager()`` returns ``None``).
 
-        * Non-uniform partition (``dwdp_size`` does not divide
-          ``num_experts``): user picks ``num_prefetch_experts < num_experts_per_worker``
-          so that ``(dwdp_size - 1) * num_prefetch_experts + num_experts_per_worker
-          == num_experts`` exactly.  Adjacent ranks' valid ranges
-          overlap by ``num_experts_per_worker - num_prefetch_experts``
-          experts; ``_validate_partition_config`` rejects
-          configurations whose last-rank end exceeds ``num_experts``
-          because the GB200 cuMemMap-with-fabric-handle ABI requires
-          ``mnnvl_size == handle_phys_size`` (no partial mapping), so
-          tail-padded storage cannot be partially mapped into a
-          ``num_experts``-sized composite VA.
-        * Redundancy (``num_prefetch_experts < num_experts_per_worker``
-          with ``(dwdp_size - 1) * stride + size == num_experts``):
-          consecutive ranks' ranges overlap; peer-side
-          ``lookup_owner`` (Phase 2) picks the lowest-rank owner so
-          reads of shared experts are deterministic.
+        In a strided partition with ``num_prefetch_experts <
+        num_experts_per_worker`` adjacent ranges overlap (redundancy), and
+        ``lookup_owner`` picks the lowest-rank owner so reads of shared
+        experts are deterministic.
 
         DWDP and MoE EPLB are mutually exclusive — DWDP swaps
         ``param.data`` to a composite-VA tensor at runtime, which the
         EPLB rebalancer would clobber.
+
+        Raises:
+            ValueError: The DwdpConfig gives no valid partition of
+                ``num_experts`` experts over the DWDP group.
         """
         from tensorrt_llm._torch.pyexecutor.dwdp import get_global_dwdp_manager
 
@@ -437,28 +434,17 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
             "DWDP and EPLB (MoE load balancer) cannot be used together. "
             "Disable one of dwdp_config or moe_load_balancer.")
 
+        partition = dwdp_manager.expert_partition(self.num_experts)
+        start, end = partition.range_of(dwdp_manager.dwdp_rank)
         self.num_slots = self.num_experts
-        self.expert_size_per_partition = dwdp_manager.num_experts_per_worker
-        dwdp_size = dwdp_manager.dwdp_size
-        # Routing-side expert assignment: distribute ``num_experts`` round-robin
-        # across DWDP ranks.  Independent of the storage layout — the gate uses
-        # this to map expert ids to ranks, while DWDP composite VA handles the
-        # actual weight access.
-        self.initial_global_assignments = [
-            (ep_rank * self.num_experts // dwdp_size + local_slot_id) %
-            self.num_experts for ep_rank in range(dwdp_size)
-            for local_slot_id in range(self.expert_size_per_partition)
-        ]
-        # Storage range: ``[start, start + size)``.  Phase 2's strict
-        # validation guarantees ``slot_end <= num_experts``, so every
-        # storage slot maps to a valid expert id.  ``len(initial_local_expert_ids)
-        # == expert_size_per_partition`` is preserved, which is required
-        # by the per-slot weight-scale copy in
-        # ``quantization.load_quant_scales``.
-        self.slot_start = dwdp_manager.start_expert_id
-        self.slot_end = self.slot_start + self.expert_size_per_partition
-        self.initial_local_expert_ids = list(
-            range(self.slot_start, self.slot_end))
+        self.expert_size_per_partition = end - start
+        # Only a load balancer reads it, and DWDP excludes one (above).
+        self.initial_global_assignments = list(range(self.num_experts))
+        # Storage range: row ``i`` holds expert ``start + i``.  The loaders
+        # enumerate ``initial_local_expert_ids`` to pick the experts to load.
+        self.slot_start = start
+        self.slot_end = end
+        self.initial_local_expert_ids = list(range(start, end))
 
     def _get_perfect_router_dtype(self) -> torch.dtype:
         if self.routing_method.routing_method_type in (

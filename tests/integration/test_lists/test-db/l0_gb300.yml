@@ -128,6 +128,10 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+  # qwen4_exp target, pre-merge: tep4 with three drafts and IndexShare, gsm8k and then
+  # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
+  # run post-merge (l0_gb300_multi_gpus).
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
 
 # K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
 - condition:

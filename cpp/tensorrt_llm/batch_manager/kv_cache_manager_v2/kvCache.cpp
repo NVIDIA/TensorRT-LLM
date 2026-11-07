@@ -282,7 +282,18 @@ void KvCache::_collectReuseCandidates()
                     status.coverage.emplace_back(beg.value() * mTokensPerBlock, limit.value() * mTokensPerBlock);
                 }
             };
-            collectRange(BlockOrdinal{0}, stale.beg);
+            if (policy == ReusePolicy::SINK_REQUIRED_ONLY)
+            {
+                // SINK_REQUIRED_ONLY claimed its sinks with the prefix match; only its window is a candidate.
+                if (stale.beg > BlockOrdinal{0})
+                {
+                    status.coverage.emplace_back(0, stale.beg.value() * mTokensPerBlock);
+                }
+            }
+            else
+            {
+                collectRange(BlockOrdinal{0}, stale.beg);
+            }
             if (status.complete)
             {
                 collectRange(stale.end, BlockOrdinal{end / mTokensPerBlock});
@@ -318,11 +329,13 @@ bool KvCache::_needsFreshPrefixPages(LifeCycleId lc) const
 
 void KvCache::_selectOptionalGroups(std::vector<LifeCycleId> const& groups)
 {
+    auto const isOptional = [](ReusePolicy policy)
+    { return policy == ReusePolicy::OPTIONAL || policy == ReusePolicy::SINK_REQUIRED_ONLY; };
     // Validate everything before touching the previous attempt's mappings.
     for (auto lc : groups)
     {
-        if (lc < LifeCycleId{0} || lc >= mOptionalCandidates.size()
-            || mReuseStatus[lc.value()].policy != ReusePolicy::OPTIONAL || !mReuseStatus[lc.value()].complete)
+        if (lc < LifeCycleId{0} || lc >= mOptionalCandidates.size() || !isOptional(mReuseStatus[lc.value()].policy)
+            || !mReuseStatus[lc.value()].complete)
         {
             throw std::invalid_argument("Selected OPTIONAL group has no reusable state at the claimed prefix");
         }
@@ -366,8 +379,7 @@ void KvCache::_selectOptionalGroups(std::vector<LifeCycleId> const& groups)
         std::unique(mSelectedOptionalGroups.begin(), mSelectedOptionalGroups.end()), mSelectedOptionalGroups.end());
     for (LifeCycleId lc{0}; lc < mOptionalCandidates.size(); ++lc)
     {
-        if (std::find(groups.begin(), groups.end(), lc) == groups.end()
-            && mReuseStatus[lc.value()].policy == ReusePolicy::OPTIONAL)
+        if (std::find(groups.begin(), groups.end(), lc) == groups.end() && isOptional(mReuseStatus[lc.value()].policy))
         {
             mOptionalCandidates[lc].clear();
             mReuseStatus[lc.value()].complete = false;
@@ -398,9 +410,12 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
 
         // Attention lifecycle: yield non-stale blocks (sink + window).
         LifeCycle const& lc = lcs.getLifeCycle(lcId);
-        if (mNeverResumed && _needsFreshPrefixPages(lcId))
+        // Allocated by first resume; private pages are never claimed from the tree. SINK_REQUIRED_ONLY
+        // claimed its sinks with the prefix match, so only its window waits for the first resume.
+        bool const freshWindow = mNeverResumed && _needsFreshPrefixPages(lcId);
+        if (freshWindow && reusePolicy(lc) != ReusePolicy::SINK_REQUIRED_ONLY)
         {
-            continue; // Allocated by first resume; private pages are never claimed from the tree.
+            continue;
         }
         auto staleRange = _getStaleRange(mHistoryLength, lc);
         BlockOrdinal staleBeg = staleRange.beg;
@@ -419,6 +434,10 @@ std::vector<KvCache::ActivePage> KvCache::_activePages() const
                 if (!isNull)
                     result.push_back({ord, bi, lcId});
             }
+        }
+        if (freshWindow)
+        {
+            continue;
         }
 
         // Window blocks: [staleEnd, numBlocks) — skip scratch blocks.
@@ -590,6 +609,16 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
 
     TypedVec<LifeCycleId, SlotCount> numSlotsNeeded(numLc, 0);
     bool hasPartial = false;
+    // A partial tail claimed from the tree is copied before the request appends to it: the tail of every group
+    // that keeps its claimed pages, and of an unselected SINK_REQUIRED_ONLY group whose prefix ends in its sinks.
+    auto const copiesPartialTail = [&](LifeCycleId lc)
+    {
+        auto const* attn = std::get_if<AttnLifeCycle>(&mManager->lifeCycles()[lc]);
+        BlockOrdinal const tail{numCommittedTokens() / mTokensPerBlock};
+        bool const tailIsRequiredSink
+            = attn && attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY && tail < BlockOrdinal{attn->numSinkBlocks};
+        return hasPartial && (!_needsFreshPrefixPages(lc) || tailIsRequiredSink);
+    };
     if (mNeverResumed)
     {
         TLLM_CHECK_DEBUG(mBeamWidth == BeamIndex{1});
@@ -601,9 +630,14 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             if (_needsFreshPrefixPages(lc))
             {
                 auto const stale = _getStaleRange(mHistoryLength, lifeCycle);
-                for (BlockOrdinal ord{0}; ord < stale.beg; ++ord)
+                // [0, stale.beg) are the sinks. SINK_REQUIRED_ONLY claimed them with the prefix match; only its
+                // window is fresh.
+                if (reusePolicy(lifeCycle) != ReusePolicy::SINK_REQUIRED_ONLY)
                 {
-                    privateOrdinals[lc].push_back(ord);
+                    for (BlockOrdinal ord{0}; ord < stale.beg; ++ord)
+                    {
+                        privateOrdinals[lc].push_back(ord);
+                    }
                 }
                 for (BlockOrdinal ord = stale.end; ord < mBlocks.size(); ++ord)
                 {
@@ -611,7 +645,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
                 }
                 numSlotsNeeded[lc] += static_cast<SlotCount>(privateOrdinals[lc].size());
             }
-            else if (isSsm || hasPartial)
+            if (isSsm || copiesPartialTail(lc))
             {
                 // Every SSM policy needs one writable state slot, independent of prefix length.
                 numSlotsNeeded[lc] += 1;
@@ -654,8 +688,7 @@ bool KvCache::resume(std::optional<CUstream> stream, std::optional<std::vector<L
             if (!tmpSlots[lc].empty())
             {
                 // Mirrors Python: `if self._never_resumed and (... SsmLifeCycle or has_partial):`
-                bool const isPrivate = _needsFreshPrefixPages(lc);
-                bool needsDeferred = mNeverResumed && (mManager->lifeCycles().isSsm(lc) || (!isPrivate && hasPartial));
+                bool needsDeferred = mNeverResumed && (mManager->lifeCycles().isSsm(lc) || copiesPartialTail(lc));
                 for (size_t i = 0; i < privateOrdinals[lc].size(); ++i)
                 {
                     privateSlots[lc].push_back(std::move(tmpSlots[lc].back()));
@@ -1484,7 +1517,10 @@ void KvCache::_snapshotPartialBlockToTree(BlockOrdinal ordinal, bool commitSsm)
     std::vector<LifeCycleId> attachedLcs;
     for (auto const& [lcIdx, attn] : mManager->lifeCycles().attentionLifeCycles())
     {
-        if (!requiresPrefixCoverage(*attn))
+        // REQUIRED attaches every partial block; SINK_REQUIRED_ONLY only a partial sink block.
+        bool const requiredSink
+            = attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY && ordinal < BlockOrdinal{attn->numSinkBlocks};
+        if (!requiresPrefixCoverage(*attn) && !requiredSink)
         {
             continue;
         }
@@ -2856,7 +2892,7 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
         if (mManager->lifeCycles().isSsm(lcId))
             continue;
 
-        if (!requiresPrefixCoverage(allLc[lcId]))
+        if (!requiresPrefixCoverage(allLc[lcId]) && reusePolicy(allLc[lcId]) != ReusePolicy::SINK_REQUIRED_ONLY)
         {
             continue;
         }
@@ -2923,8 +2959,12 @@ void KvCache::_setupForReuse(BlockRadixTree::ReuseMatch const& match, bool claim
 
         for (BlockOrdinal ord{0}; ord < staleStart; ++ord)
             processOrdinal(ord);
-        for (BlockOrdinal ord = staleEnd; ord < numMatchedBlocks; ++ord)
-            processOrdinal(ord);
+        // A SINK_REQUIRED_ONLY window is not claimed here; it is an OPTIONAL candidate selected at resume.
+        if (reusePolicy(allLc[lcId]) != ReusePolicy::SINK_REQUIRED_ONLY)
+        {
+            for (BlockOrdinal ord = staleEnd; ord < numMatchedBlocks; ++ord)
+                processOrdinal(ord);
+        }
 
         // For SWA, only sink and live-window pages at the matched endpoint are materialized. Stale
         // spans inherit the next live page's level, because that later anchor is what enables those
@@ -3114,8 +3154,12 @@ bool KvCache::_checkSanity() const
 
                 auto const& staleRange = staleRanges[lc];
                 auto const& scratchRange = scratchRangesVec[lc];
-                bool const isPrivate = !requiresPrefixCoverage(lcs[lc]);
-                if (_needsFreshPrefixPages(lc) && mNeverResumed)
+                // SINK_REQUIRED_ONLY claims its sinks with the prefix match, as REQUIRED does.
+                auto const* attn = std::get_if<AttnLifeCycle>(&lcs[lc]);
+                bool const requiredSink = attn && attn->reusePolicy == ReusePolicy::SINK_REQUIRED_ONLY
+                    && ordinal < BlockOrdinal{attn->numSinkBlocks};
+                bool const isPrivate = !requiresPrefixCoverage(lcs[lc]) && !requiredSink;
+                if (_needsFreshPrefixPages(lc) && mNeverResumed && !requiredSink)
                 {
                     TLLM_CHECK_DEBUG(blockPageIsNull(bp));
                     continue;

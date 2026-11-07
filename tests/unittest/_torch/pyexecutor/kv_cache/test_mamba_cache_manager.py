@@ -871,6 +871,9 @@ def test_qwen3_gdn_replay_supports_cpp_and_v2_managers(monkeypatch):
     assert isinstance(mgr._speculative_state, GDNReplayState)
     assert captured_v2["max_num_tokens"] == 256
     assert captured_v2["vocab_size"] == pretrained_config.vocab_size
+    assert captured_v2["pretrained_config"] is pretrained_config
+    assert "pretrained_config" not in captured_cpp
+    assert "pretrained_config" not in captured_mixed
     assert "model_type" not in captured_v2
     assert captured_v2["conv_state_layout"] == "q_k_v"
     from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.legacy import (
@@ -952,8 +955,11 @@ def test_nemotron_factory_passes_vocab_size_only_to_v2(monkeypatch, manager_cls,
 
     if manager_cls is MambaHybridCacheManagerV2:
         assert captured["vocab_size"] == 131072
+        # The manager tells its draft layers apart by the model's layer count.
+        assert captured["pretrained_config"] is config
     else:
         assert "vocab_size" not in captured
+        assert "pretrained_config" not in captured
 
 
 def test_hybrid_cache_manager_factory_rejects_cpp_preference_with_explicit_v2(
@@ -3830,9 +3836,11 @@ def _build_v2_hybrid_with_mamba_layer(
     max_batch_size=4,
     num_mamba_layers=1,
     num_attention_layers=1,
+    num_draft_layers=0,
     num_kv_heads=4,
     mapping=None,
     spec_config=None,
+    pretrained_config=None,
     use_replay_state_update=False,
     enable_block_reuse=False,
     enable_partial_reuse=True,
@@ -3868,8 +3876,9 @@ def _build_v2_hybrid_with_mamba_layer(
     max_num_tokens: int = 8192,
 ) -> MambaHybridCacheManagerV2:
     """Construct a real MambaHybridCacheManagerV2."""
-    mamba_mask = [True] * num_mamba_layers + [False] * num_attention_layers
-    attn_mask = [False] * num_mamba_layers + [True] * num_attention_layers
+    # Draft layers of a combined speculative manager follow the model's layers in both masks.
+    mamba_mask = [True] * num_mamba_layers + [False] * (num_attention_layers + num_draft_layers)
+    attn_mask = [False] * num_mamba_layers + [True] * (num_attention_layers + num_draft_layers)
     if mapping is None:
         mapping = Mapping(
             world_size=1,
@@ -3945,7 +3954,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         kv_cache_config=kv_cache_config,
         kv_cache_type=CacheTypeCpp.SELF,
-        num_layers=num_attention_layers,
+        num_layers=num_attention_layers + num_draft_layers,
         num_kv_heads=num_kv_heads,
         head_dim=64,
         tokens_per_block=32,
@@ -3955,6 +3964,7 @@ def _build_v2_hybrid_with_mamba_layer(
         mapping=mapping,
         spec_config=spec_config,
         layer_mask=attn_mask,
+        **({"pretrained_config": pretrained_config} if pretrained_config is not None else {}),
         vocab_size=1024,
         use_replay_state_update=use_replay_state_update,
         dtype=dtype,
@@ -4207,6 +4217,59 @@ def test_v2_hybrid_nvfp4_page_table_omits_ssm_block_scales(kv_cache_dtype: str) 
 
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[ssm_pool_id, :, 1]) == 0
         assert torch.count_nonzero(mgr.kv_cache_pool_pointers[attention_pool_id, :, 1]) > 0
+    finally:
+        mgr.shutdown()
+
+
+def _mixed_precision_kv_cache_config() -> KvCacheConfig:
+    """A small mixed-precision NVFP4 cache whose leading and trailing 32 tokens keep FP16."""
+    return KvCacheConfig(
+        max_tokens=512,
+        enable_block_reuse=False,
+        dtype="mixed_nvfp4_float16",
+        mixed_precision_first_n=32,
+        mixed_precision_last_n=32,
+    )
+
+
+@skip_no_cuda
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_appends_high_group():
+    """The attention layer's mixed-precision high layer comes after the SSM and attention layers.
+
+    Disaggregated transfer gives it its own layer id.
+    """
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+    )
+    try:
+        # Layer 0: recurrent state, layer 1: attention, layer 2: its mixed-precision high layer.
+        assert mgr.mixed_precision_high_layers == {1: 2}
+        assert not mgr._is_local_mamba_layer(2)
+        assert mgr.get_buffers(0) is None
+        low = mgr.get_buffers(1, mixed_precision_pool="low")
+        high = mgr.get_buffers(1, mixed_precision_pool="high")
+        assert low.dtype == torch.uint8
+        assert high.dtype == torch.float16
+        assert high.shape[1:] == (2, 32, 4, 64)
+        mgr.add_dummy_requests([123], token_nums=[128], is_gen=False)
+        low_pages, high_pages = mgr.get_mixed_precision_page_tables([123], 1)
+        assert len(low_pages[0]) == len(high_pages[0]) == 4
+        assert min(low_pages[0]) >= 0
+        # The leading (sink) and trailing (window) pages are always in the mixed-precision high pool.
+        assert high_pages[0][0] >= 0 and high_pages[0][-1] >= 0
+        assert isinstance(mgr.check_invalid_values_in_kv_cache(), bool)
+        # Model layer L -> 2L, the mixed-precision high layer of layer L -> 2L + 1.
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in build_page_table_from_manager(mgr).layer_groups
+            for layer in group.local_layers
+        }
+        assert ids == {0: 0, 1: 2, 2: 3}
     finally:
         mgr.shutdown()
 
@@ -8091,3 +8154,51 @@ def test_v2_kda_replay_seed_of_all_layers_at_once_is_bit_identical():
         stacked_replay["kda_conv_k"][1, 3, :, :4], stacked._conv_states[1][3, 2:4, :]
     )
     assert stacked.prev_num_accepted_tokens.tolist() == [5, 0, 5, 0]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_disagg_ids_of_a_recurrent_only_rank():
+    """A pipeline rank holding only recurrent layers still names model layer L as 2L."""
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_mamba_layers=2,
+        num_attention_layers=0,
+    )
+    try:
+        assert mgr.mixed_precision_high_layers == {}
+        page_table = build_page_table_from_manager(mgr)
+        ids = {
+            layer.local_layer_id: layer.global_layer_id
+            for group in page_table.layer_groups
+            for layer in group.local_layers
+        }
+        assert ids == {0: 0, 1: 2}
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 12),
+    reason="Mixed-precision NVFP4 KV requires Blackwell",
+)
+def test_v2_hybrid_mixed_precision_eagle3_layer_stays_plain():
+    """An Eagle3 layer in the hybrid manager keeps a normal KV cache, unlike an MTP layer."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+    mgr = _build_v2_hybrid_with_mamba_layer(
+        dtype=DataType.HALF,
+        kv_cache_config=_mixed_precision_kv_cache_config(),
+        num_draft_layers=1,
+        spec_config=Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model"),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+    )
+    try:
+        # Layer 0: recurrent state, layer 1: attention, layer 2: the Eagle3 layer.
+        assert mgr.draft_layer_ids == (2,)
+        assert mgr.mixed_precision_high_layers == {1: 3}
+    finally:
+        mgr.shutdown()

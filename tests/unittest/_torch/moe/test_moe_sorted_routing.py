@@ -48,18 +48,6 @@ def _routing(bias, top_k=TOP_K, n_group=1, topk_group=1, is_fused=True):
     )
 
 
-@pytest.mark.parametrize(
-    "kwargs",
-    [dict(n_group=8, topk_group=4), dict(top_k=8), dict(is_fused=False)],
-    ids=["grouped", "top8", "unfused"],
-)
-def test_apply_with_sort_declines_other_routing(kwargs):
-    """Only ungrouped fused top-16 routing has a sorting kernel."""
-    bias = torch.zeros(NUM_EXPERTS)
-    logits = torch.zeros(4, NUM_EXPERTS)
-    assert _routing(bias, **kwargs).apply_with_sort(logits, 0, 112) is None
-
-
 def test_apply_with_sort_declines_cpu_logits():
     bias = torch.zeros(NUM_EXPERTS)
     assert _routing(bias).apply_with_sort(torch.zeros(4, NUM_EXPERTS), 0, 112) is None
@@ -91,6 +79,20 @@ def _cute_dsl_available() -> bool:
 cute_dsl = pytest.mark.skipif(
     not _cute_dsl_available(), reason="needs SM100/SM103/SM107 and CuTe DSL"
 )
+
+
+@cute_dsl
+@pytest.mark.parametrize(
+    "kwargs",
+    [dict(n_group=8, topk_group=4), dict(top_k=8), dict(is_fused=False)],
+    ids=["grouped", "top8", "unfused"],
+)
+def test_apply_with_sort_declines_other_routing(kwargs):
+    """Only ungrouped fused top-16 routing has a sorting kernel: on a device the kernel
+    runs on (CUDA logits), these decline by configuration, not by the CPU fallback."""
+    bias = torch.zeros(NUM_EXPERTS, device="cuda")
+    logits = torch.zeros(4, NUM_EXPERTS, device="cuda")
+    assert _routing(bias, **kwargs).apply_with_sort(logits, 0, 112) is None
 
 
 def _fc12_available() -> bool:
@@ -354,6 +356,14 @@ def test_shared_gemms_lead_routed_experts(monkeypatch, m):
         return real_quantize(latent)
 
     monkeypatch.setattr(moe, "quantize_nvfp4_input", counting_quantize)
+    ready_events = []
+    real_moe_forward = moe.forward
+
+    def recording_forward(*args, **kwargs):
+        ready_events.append(kwargs.get("input_ready_event"))
+        return real_moe_forward(*args, **kwargs)
+
+    monkeypatch.setattr(moe, "forward", recording_forward)
     hidden = (torch.randn((m, HIDDEN), device="cuda") * 0.5).to(torch.bfloat16)
     outputs = {}
     for lead in (False, False, True):
@@ -362,10 +372,16 @@ def test_shared_gemms_lead_routed_experts(monkeypatch, m):
         )
         assert runtime._front_plan(m).shared_first == lead
         quantized_inputs.clear()
+        ready_events.clear()
         with torch.inference_mode(), with_multi_stream(True):
             routed, shared = runtime(hidden, return_parts=True)
         torch.cuda.synchronize()
         assert quantized_inputs == ([m] if lead else [])
+        # Output equality holds in either order; the routed experts waited behind
+        # the shared GEMMs' event exactly when they lead.
+        assert ready_events == [
+            runtime.moe_shared_gemm_event if lead else runtime.moe_latent_ready_event
+        ]
         torch.testing.assert_close(shared, hidden * 0.5 + 1.0, rtol=0, atol=0)
         outputs.setdefault(lead, []).append(routed)
 
@@ -389,7 +405,12 @@ def test_nvfp4_input_scale_only_where_the_forward_takes_the_input_as_is(blocker)
     scale = torch.tensor(1.0)
     moe = SimpleNamespace(
         comm=object() if blocker == "comm" else None,
-        _using_load_balancer=lambda: blocker == "eplb",
+        # The stub lists ``routed_ids_unchanged`` independently so the property
+        # under test reads it (a comm strategy, EPLB or the router-weight fold
+        # makes the ids reach the backend changed) without needing a full
+        # ConfigurableMoE. The "chunked" blocker leaves it True on purpose: the
+        # property must decline on the chunk test alone.
+        routed_ids_unchanged=blocker not in ("comm", "eplb", "router_weight_on_input"),
         apply_router_weight_on_input=blocker == "router_weight_on_input",
         moe_max_num_tokens=4 if blocker == "chunked" else 64,
         backend=SimpleNamespace(prequantized_nvfp4_input_scale=lambda: scale),
@@ -583,8 +604,11 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
     ids = torch.ops.trtllm.noaux_tc_op(logits, bias, 1, 1, TOP_K, SCALE)[1]
     _assert_same_rows(routed, unreserved, _local_counts(ids, 0, NUM_EXPERTS))
 
-    # In order on one stream (no CUDA graph) there is nothing to share SMs with.
+    # In order on one stream (no CUDA graph) there is nothing to share SMs with: the
+    # carveout goes away and FC12 keeps every SM.
     carveouts.clear()
+    reserves.clear()
     with torch.inference_mode(), with_multi_stream(False):
         runtime(hidden, return_parts=True)
     assert carveouts == [before]
+    assert reserves == [0]

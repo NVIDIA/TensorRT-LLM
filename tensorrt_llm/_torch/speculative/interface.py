@@ -657,6 +657,9 @@ class SpecMetadata:
     # from the model's RuntimeHooks). The argmax path never reads them, and the
     # next sampled batch rewrites every row it reads.
     skip_greedy_rng_upload: bool = False
+    # Stage the per-step Philox seed/offset uploads into the engine's step-input
+    # pack (RuntimeHooks.pack_spec_rng_uploads) instead of copying each one.
+    pack_rng_uploads: bool = False
     # Advanced-sampling specialization (deploy-time; from DecodingBaseConfig.advanced_sampling_mode).
     advanced_sampling_mode: AdvancedSamplingMode = AdvancedSamplingMode.FULL
     # Whether the occurrence penalties are enabled (deploy-time; from
@@ -970,7 +973,15 @@ class SpecMetadata:
                                        device='cuda')
 
         def _upload(dst: torch.Tensor, values: list[int]) -> None:
-            _upload_host_values(dst, values, torch.int64)
+            src = torch.tensor(values,
+                               dtype=torch.int64,
+                               pin_memory=prefer_pinned())
+            if self.pack_rng_uploads:
+                # The forward is the first reader of these buffers, so the copy
+                # may move to the pack's flush (a plain copy when no pack is open).
+                step_inputs.copy_(dst[:len(values)], src)
+            else:
+                dst[:len(values)].copy_(src, non_blocking=True)
 
         # An all-greedy batch runs the argmax graph, which reads none of these
         # buffers. The offset windows above still advance, so skipping the

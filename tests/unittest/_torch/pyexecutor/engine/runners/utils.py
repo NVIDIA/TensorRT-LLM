@@ -3,7 +3,7 @@
 
 
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import torch
 from _torch.pyexecutor.engine_test_utils import _AttentionBackend
@@ -12,17 +12,14 @@ from tensorrt_llm._torch.attention.backends.interface import AttentionRuntimeFea
 from tensorrt_llm._torch.pyexecutor.engine.input_buffers import InputBuffers
 from tensorrt_llm._torch.pyexecutor.engine.runners.mm_encoder import MultimodalEncoderRunner
 from tensorrt_llm._torch.pyexecutor.engine.runners.no_kv_cache import NoKVCacheRunnerConfig
-from tensorrt_llm._torch.pyexecutor.engine.runners.pooling import PoolingRunner
 from tensorrt_llm.llmapi.llm_args import PrefillCudaGraphBackend
 
 
 def _make_runner(
-    runner_type: type[PoolingRunner] | type[MultimodalEncoderRunner],
+    runner_type: type[MultimodalEncoderRunner],
     model: torch.nn.Module | SimpleNamespace,
     config: NoKVCacheRunnerConfig | None = None,
-    *,
-    model_caller: Mock | None = None,
-) -> PoolingRunner | MultimodalEncoderRunner:
+) -> MultimodalEncoderRunner:
     config = config or _config()
     buffers = InputBuffers(
         input_ids_cuda=torch.empty(config.max_num_tokens, dtype=torch.int),
@@ -34,8 +31,6 @@ def _make_runner(
         moe_load_balancer=None,
         attention_runtime_features=AttentionRuntimeFeatures(),
     )
-    if issubclass(runner_type, PoolingRunner):
-        kwargs["model_caller"] = model_caller or Mock(return_value={"logits": torch.empty(0)})
     with patch.object(InputBuffers, "allocate", return_value=buffers):
         return runner_type(model, config, **kwargs)
 
