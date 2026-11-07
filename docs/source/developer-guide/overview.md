@@ -163,6 +163,32 @@ Set `TLLM_HANG_DIAGNOSTICS=1` to enable additional PyExecutor diagnostics. It
 is disabled by default and remains silent unless initialization or execution
 hangs, then dumps worker stacks and the latest available executor state.
 
+Every CI unit test runs under the parent hang watchdog, which dumps all thread
+stacks to stderr shortly before a test's timeout kills it; a hang cannot be
+predicted, so it cannot be marked in advance.
+
+On top of that, add `@pytest.mark.hang_diagnostics` to a pytest unit test to
+enable the executor diagnostics above for that test, including its setup and
+teardown, and to write durable per-process report files. Unmarked tests do not
+create these report directories. Successful invocations with no hang reports
+remove their temporary directories.
+
+The CI unittest wrapper copies opted-in reports into the outer test's stdout
+log when inner pytest exits. Reports
+include the test identity, worker stacks, and available executor phase, iteration,
+request, and CUDA completion state. Stacks and phase metadata are saved before
+querying CUDA, so a stalled query still leaves evidence. An oversized report is
+elided around its ends rather than crowding out the rest of the log. Each inner invocation,
+including a retry, reserves a separate `hang-diagnostics-*` path under the test
+output directory; it is created only when a marked test starts. These files
+survive inner pytest timeouts and termination; collection requires the outer
+wrapper to remain running. Runs without a detected hang produce no additional
+log output.
+
+For a custom runner, set `TLLM_HANG_DIAGNOSTICS_DIR` to a shared writable directory
+and collect its per-process reports after failure. A kill can only preserve
+diagnostics that were emitted before termination.
+
 ## DeepGEMM Barrier Timeout
 
 The DeepGEMM MegaMoE kernels synchronize expert-parallel ranks with in-kernel

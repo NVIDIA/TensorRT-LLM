@@ -118,8 +118,14 @@ class ExecutorHangDiagnostics:
         return event
 
     def get_status_dump(self) -> str:
-        phase, started_at, iteration, details, forward_event = self._snapshot
-        phase_age = max(0.0, time.monotonic() - started_at)
+        """Report CUDA completion state, the one thing the snapshot cannot carry.
+
+        Deliberately narrow: ``get_snapshot_dump`` is registered first and already
+        reports rank, iteration, phase, phase age, and request details, so
+        repeating them here would double every hang report. This query can stall
+        inside the CUDA runtime, which is why it stays separate and last.
+        """
+        *_, forward_event = self._snapshot
         if forward_event is None:
             cuda_completion = "not-recorded"
         else:
@@ -130,10 +136,17 @@ class ExecutorHangDiagnostics:
             except Exception as error:  # noqa: BLE001 - diagnostics must not mask a hang
                 cuda_completion = f"query-failed({type(error).__name__}: {error})"
 
-        status = (
-            f"PyExecutor hang diagnostics: rank={self._rank}, "
-            f"iteration={iteration}, phase={phase}, phase_age={phase_age:.1f}s, "
+        return (
+            f"PyExecutor forward CUDA completion: rank={self._rank}, "
             f"forward_cuda_completion={cuda_completion}"
+        )
+
+    def get_snapshot_dump(self) -> str:
+        """Report phase metadata without entering the CUDA runtime."""
+        phase, started_at, iteration, details, _ = self._snapshot
+        status = (
+            f"PyExecutor phase snapshot: rank={self._rank}, iteration={iteration}, "
+            f"phase={phase}, phase_age={max(0.0, time.monotonic() - started_at):.1f}s"
         )
         if details:
             status += f", {details}"
@@ -154,5 +167,7 @@ def create_executor_hang_diagnostics(
         event = event_factory(enable_timing=False)
     except Exception:  # noqa: BLE001 - diagnostics must not affect execution
         event = None
+    # Preserve phase metadata before a CUDA query can encounter a stalled context.
+    status_provider_registry.register_status_provider(diagnostics.get_snapshot_dump)
     status_provider_registry.register_status_provider(diagnostics.get_status_dump)
     return diagnostics, event

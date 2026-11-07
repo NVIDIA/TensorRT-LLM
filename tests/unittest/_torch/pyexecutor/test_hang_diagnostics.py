@@ -1,10 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import threading
+from pathlib import Path
 from unittest.mock import MagicMock, Mock, call
 
 import pytest
 
+from tensorrt_llm._torch.pyexecutor import hang_detector as hang_detector_module
 from tensorrt_llm._torch.pyexecutor.hang_detector import HangDetector
 from tensorrt_llm._torch.pyexecutor.hang_diagnostics import (
     _INITIALIZATION_HANG_TIMEOUT_SECONDS,
@@ -134,6 +138,9 @@ def test_create_hang_diagnostics_registers_status_provider(
     assert forward_event is event
     event_factory.assert_called_once_with(enable_timing=False)
     assert diagnostics.get_status_dump in detector._status_providers
+    assert detector._status_providers.index(diagnostics.get_snapshot_dump) < (
+        detector._status_providers.index(diagnostics.get_status_dump)
+    )
 
 
 def test_create_hang_diagnostics_tolerates_event_creation_failure(
@@ -176,13 +183,21 @@ def test_hang_diagnostics_reports_latest_phase_and_cuda_state(
         details="active_request_ids=[42]",
         forward_completion_event=event,
     )
+    # The two registered providers are complementary, not redundant: the
+    # snapshot carries the phase metadata without touching CUDA, and the status
+    # dump adds only the completion state its query can stall on.
+    snapshot = diagnostics.get_snapshot_dump()
     status = diagnostics.get_status_dump()
 
+    assert "rank=3" in snapshot
+    assert "iteration=17" in snapshot
+    assert "phase=forward_returned" in snapshot
+    assert "active_request_ids=[42]" in snapshot
+
     assert "rank=3" in status
-    assert "iteration=17" in status
-    assert "phase=forward_returned" in status
     assert f"forward_cuda_completion={expected}" in status
-    assert "active_request_ids=[42]" in status
+    assert "phase=" not in status
+    assert "iteration=" not in status
 
 
 def test_hang_diagnostics_tolerates_cuda_query_failure() -> None:
@@ -194,6 +209,20 @@ def test_hang_diagnostics_tolerates_cuda_query_failure() -> None:
     status = diagnostics.get_status_dump()
 
     assert "forward_cuda_completion=query-failed(RuntimeError: CUDA context unavailable)" in status
+
+
+def test_phase_snapshot_does_not_query_cuda() -> None:
+    diagnostics = ExecutorHangDiagnostics(rank=2)
+    event = Mock()
+    diagnostics.record(
+        "sampling", iteration=17, details="active_request_ids=[42]", forward_completion_event=event
+    )
+    status = diagnostics.get_snapshot_dump()
+    assert "rank=2" in status
+    assert "phase=sampling" in status
+    assert "iteration=17" in status
+    assert "active_request_ids=[42]" in status
+    event.query.assert_not_called()
 
 
 def test_hang_diagnostics_tolerates_cuda_record_failure() -> None:
@@ -223,3 +252,76 @@ def test_hang_diagnostics_retains_event_until_explicitly_cleared() -> None:
         forward_completion_event=None,
     )
     assert "forward_cuda_completion=not-recorded" in diagnostics.get_status_dump()
+
+
+def test_report_file_failure_does_not_prevent_hang_callback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = tmp_path / "not-a-directory"
+    blocker.write_text("")
+    monkeypatch.setenv("TLLM_HANG_DIAGNOSTICS_DIR", str(blocker / "reports"))
+    callback = Mock()
+    detector = HangDetector(on_detected=callback)
+    asyncio.run(detector._report_hang())
+    callback.assert_called_once_with()
+
+
+def test_failed_file_stack_dump_keeps_logging_before_status_queries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TLLM_HANG_DIAGNOSTICS_DIR", str(tmp_path))
+    events = []
+
+    def failed_dump(**_kwargs):
+        raise OSError("diagnostic file unavailable")
+
+    def status():
+        events.append("status")
+        return "executor state"
+
+    monkeypatch.setattr(hang_detector_module.faulthandler, "dump_traceback", failed_dump)
+    monkeypatch.setattr(
+        hang_detector_module, "_best_effort_log_error", lambda _: events.append("log")
+    )
+    monkeypatch.setattr(hang_detector_module, "print_all_stacks", lambda: events.append("stacks"))
+    callback = Mock()
+    detector = HangDetector(on_detected=callback)
+    detector.register_status_provider(status)
+    asyncio.run(detector._report_hang())
+    assert events[:3] == ["log", "stacks", "status"]
+    callback.assert_called_once_with()
+
+
+def test_blocked_status_provider_still_reports_to_both_destinations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A provider that never returns must suppress neither the file nor stderr."""
+    monkeypatch.setenv("TLLM_HANG_DIAGNOSTICS_DIR", str(tmp_path))
+    events = []
+    monkeypatch.setattr(
+        hang_detector_module, "_best_effort_log_error", lambda _: events.append("log")
+    )
+    monkeypatch.setattr(hang_detector_module, "print_all_stacks", lambda: events.append("stacks"))
+
+    blocked = threading.Event()
+    reported = threading.Event()
+
+    def blocked_provider():
+        reported.set()
+        blocked.wait(30)
+        return "never reached"
+
+    detector = HangDetector(on_detected=Mock())
+    detector.register_status_provider(blocked_provider)
+    worker = threading.Thread(target=lambda: asyncio.run(detector._report_hang()), daemon=True)
+    worker.start()
+    try:
+        assert reported.wait(10), "status provider was never queried"
+        # Logging already happened, so the stall cannot cost the stderr report.
+        assert events == ["log", "stacks"]
+        report = next(iter(tmp_path.glob("worker-*.txt"))).read_text()
+        assert "Hang detected" in report
+        assert "_report_hang" in report
+    finally:
+        blocked.set()
+        worker.join(timeout=10)

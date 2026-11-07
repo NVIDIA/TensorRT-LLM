@@ -19,6 +19,7 @@ import signal
 import sys
 import traceback
 import warnings
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Generator
@@ -51,6 +52,7 @@ from integration.defs import test_list_parser
 # is harmless.
 from test_common import s3_output
 from test_common import session_prefetcher_hooks as _prefetch_hooks
+from test_common.hang_diagnostics import hang_diagnostics_for_test
 
 
 def dump_threads(signum, frame):
@@ -59,6 +61,9 @@ def dump_threads(signum, frame):
 
 def pytest_configure(config):
     _prefetch_hooks.pytest_configure(config)
+    config.addinivalue_line(
+        "markers",
+        "hang_diagnostics: opt into executor state and durable CI hang reports")
     os.environ.setdefault("TRTLLM_NO_USAGE_STATS", "1")
 
     # avoid thread leak of tqdm's TMonitor
@@ -104,6 +109,7 @@ def pytest_configure(config):
             save_unfinished_test=periodic_save_unfinished_test,
             unfinished_test_path=periodic_unfinished_test_path,
             dump_hang_traceback=periodic_hang_traceback,
+            hang_traceback_dir=os.environ.get("TLLM_HANG_DIAGNOSTICS_DIR"),
         )
         config.pluginmanager.register(reporter, 'periodic_junit')
         print_info("PeriodicJUnitXML reporter registered (unittest)")
@@ -151,7 +157,8 @@ def pytest_runtest_makereport(item, call):
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    yield
+    with hang_diagnostics_for_test(item):
+        yield
 
     rerunfailures_excinfos = getattr(item, _RERUNFAILURES_EXCINFOS_ATTR, None)
     if rerunfailures_excinfos is not None:
@@ -221,6 +228,12 @@ def pytest_addoption(parser):
         help=
         "Specify a file containing a list of waives, one per line. After filtering collected tests, Pytest will "
         "apply the waive state specified by this file to the set of tests to be run.",
+    )
+    parser.addoption(
+        "--hang-diagnostics-root",
+        default=None,
+        help=
+        "Report location for tests marked hang_diagnostics; created only on opt-in."
     )
     # Periodic JUnit options: must be registered here so they are recognized when
     # pytest is run with unittest paths (integration test_unittests.py spawns such a run).
@@ -409,7 +422,7 @@ def pytest_sessionstart(session):
 
 
 @pytest.fixture(autouse=True)
-def cuda_error_early_quit(capfd):
+def cuda_error_early_quit(request):
     """
     Fixture to handle CUDA error.
 
@@ -425,7 +438,14 @@ def cuda_error_early_quit(capfd):
         except RuntimeError as e:
             msg = str(e)
             if 'CUDA error:' in msg:
-                with capfd.disabled():
+                # Absent under -p no:capture; the streams are then already
+                # live, and an AttributeError here would mask the CUDA error
+                # and skip the os._exit() the worker restart depends on.
+                capman = request.config.pluginmanager.getplugin(
+                    "capturemanager")
+                disabled = (nullcontext() if capman is None else
+                            capman.global_and_fixture_disabled())
+                with disabled:
                     traceback.print_exception(e, file=sys.stderr)
                     print("CUDA Error occurred, worker must quit now",
                           file=sys.stderr)
@@ -600,6 +620,7 @@ def setup_ray_cluster() -> Generator[int, None, None]:
             ray.shutdown()
 
 
+@pytest.hookimpl(tryfirst=True)
 def pytest_runtest_setup(item):
     _prefetch_hooks.pytest_runtest_setup(item)
 

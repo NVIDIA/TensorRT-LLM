@@ -20,6 +20,8 @@ from subprocess import CalledProcessError
 from typing import NoReturn, Optional
 
 from defs.conftest import tests_path
+from test_common.hang_diagnostics import (collect_hang_diagnostics,
+                                          hang_diagnostics_root)
 
 _MAX_CULPRITS = 20
 
@@ -289,6 +291,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "--periodic-junit",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
+        # Every test gets the parent watchdog: a hang cannot be predicted, so it
+        # cannot be marked in advance. Its stderr dump is now actually retained
+        # (the autouse capfd fixture used to swallow it). The hang_diagnostics
+        # marker adds the durable per-process report files on top of this.
         "--periodic-hang-traceback",
     ]
     if unfinished_test_path:
@@ -375,6 +381,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         return os.pathsep.join(pythonpath_entries)
 
     def run_command(cmd, num_workers=1):
+        diagnostics_dir = hang_diagnostics_root(output_dir)
+        cmd = [*cmd, f"--hang-diagnostics-root={diagnostics_dir}"]
         try:
             env = {'PYTHONPATH': build_pythonpath()}
             # This batch runs without -p cbts_plugin, so name the role for the CBTS coverage
@@ -406,6 +414,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             print(f"{'='*60}\n")
             return False
         finally:
+            collect_hang_diagnostics(diagnostics_dir)
             if s3_output_module is not None:
                 try:
                     drained = s3_output_module.drain_pending_uploads(
