@@ -90,6 +90,10 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         KVCacheV2Scheduler, MultimodalEagerEncoderScheduler,
                         MultimodalScheduler, SimpleScheduler,
                         SimpleUnifiedScheduler)
+from .scheduler.gen_preemption import GenPreemptionSettings
+from .scheduler.gen_preemption import \
+    resident_headroom as gen_preempt_resident_headroom
+from .scheduler.gen_preemption import unsupported_headroom_reason
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -4369,14 +4373,15 @@ def compute_max_num_sequences(mapping: Mapping,
 
     ``enable_overlap_headroom`` is intentionally opt-in; see
     ``should_enable_overlap_headroom``. Pipeline parallelism already sizes the
-    pool by ``pp_size``.
+    pool by ``pp_size``. GEN slot preemption adds a slot per paused request.
     """
     if mapping.has_pp():
         num_micro_batches = mapping.pp_size
     else:
         num_micro_batches = (2 if enable_overlap_headroom
                              and not disable_overlap_scheduler else 1)
-    return max_batch_size * num_micro_batches
+    return (max_batch_size * num_micro_batches +
+            gen_preempt_resident_headroom(max_batch_size))
 
 
 def resolve_max_num_sequences(model_engine,
@@ -4973,6 +4978,11 @@ def create_py_executor_instance(
         dense_dwdp_manager=dense_dwdp_manager,
         max_num_sequences=max_num_sequences,
     )
+    # Mirror the creator's gen_preemption gate (the pools were sized against
+    # the same reason): an executor that cannot pause keeps the feature off
+    # here instead of re-deriving a short-pool warning from its own check.
+    headroom_reason = unsupported_headroom_reason(
+        llm_args.scheduler_config.gen_preemption, llm_args)
     spec_config = model_engine.spec_config
     config = model_engine.model.model_config.pretrained_config
     return PyExecutor(
@@ -5017,6 +5027,9 @@ def create_py_executor_instance(
         enable_non_overlap_adp_forward_intent=(
             should_enable_non_overlap_adp_forward_intent(
                 mapping, llm_args.disable_overlap_scheduler)),
+        gen_preemption=GenPreemptionSettings.from_config(
+            llm_args.scheduler_config.gen_preemption)
+        if headroom_reason is None else None,
     )
 
 

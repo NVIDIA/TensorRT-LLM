@@ -540,6 +540,41 @@ def test_v2_builder_resolves_mixed_precision_high_layer_heads(virtual_layers: bo
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("virtual_layers", [False, True])
+@pytest.mark.parametrize("mapper_kind", [MapperKind.INDEXED, MapperKind.NHD])
+def test_v2_builder_resolves_appended_mixed_precision_heads(
+    virtual_layers: bool, mapper_kind: MapperKind
+) -> None:
+    from types import SimpleNamespace
+
+    attrs = {
+        (layer, role): SimpleNamespace(
+            life_cycle_id=0, pool_index=0, offset=(2 * index + role_index) * 128, size=128
+        )
+        for index, layer in enumerate((3, 4))
+        for role_index, role in enumerate((Role.KEY, Role.VALUE))
+    }
+    manager = _make_fake_v2_manager(attrs, {Role.ALL: mapper_kind}, slot_bytes_list=(512,))
+    manager.impl.layer_grouping = ((3, 4),)
+    manager.impl.init_config.layers.extend([SimpleNamespace(window_size=128)] * 3)
+    manager.pp_layers = [20, 22]
+    manager.layer_offsets = {20: 0, 22: 1}
+    manager.num_kv_heads_per_layer = [8, 2]
+    manager.mixed_precision_high_layers = {0: 3, 1: 4}
+    manager.get_disagg_global_layer_ids = lambda _: [41, 45]
+    if virtual_layers:
+        # The high layers are appended separately from the low cache's virtual layers.
+        manager._layer_attn_to_layer_id = {(20, 0): 0, (22, 0): 1, (22, 1): 2}
+
+    layer_group = build_page_table_from_manager(manager).layer_groups[0]
+
+    assert [layer.global_layer_id for layer in layer_group.local_layers] == [41, 45]
+    assert [view.num_kv_heads for view in layer_group.pool_views] == [8, 2]
+    assert [get_unique_layers(view) for view in layer_group.pool_views] == [{3}, {4}]
+    assert layer_group.sliding_window_size == 128
+
+
+@pytest.mark.cpu_only
 def test_v2_builder_accepts_replicated_virtual_layer_without_head_count() -> None:
     from types import SimpleNamespace
 

@@ -983,7 +983,16 @@ def test_pool_scaling_prevents_mmmu_pro_underestimation():
     assert per_pool_tokens >= max_seq_len
 
 
-def test_v2_cache_size_per_token_models_generation_swa_cost():
+@pytest.mark.parametrize("preemption", [False, True])
+def test_v2_cache_size_per_token_models_generation_swa_cost(preemption, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
+
+    monkeypatch.setattr(
+        gen_preemption,
+        "_active_settings",
+        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
+    )
+
     class FakeModelConfig:
         quant_config = None
         pretrained_config = SimpleNamespace(
@@ -1024,7 +1033,9 @@ def test_v2_cache_size_per_token_models_generation_swa_cost():
     )
 
     # Per layer: K+V * kv_heads * head_dim * bf16 bytes = 2 * 2 * 8 * 2.
-    expected = CacheCost(slope=64, intercept=3 * 2 * (2048 + 64) * 64)
+    # A full batch of 3 plus one paused resident requires 4 SWA windows.
+    residents = 4 if preemption else 3
+    expected = CacheCost(slope=64, intercept=residents * 2 * (2048 + 64) * 64)
     assert no_scratch_size_per_token == expected
     assert scratch_size_per_token == expected
 
@@ -1395,7 +1406,15 @@ def test_v2_resolved_draft_width_does_not_change_target_only_headroom(
     ) == _get_generation_kv_capacity(spec_config, is_draft=False, layer_specs=layer_specs)
 
 
-def test_v2_quota_from_max_tokens_models_context_swa_scratch():
+@pytest.mark.parametrize("preemption", [False, True])
+def test_v2_quota_from_max_tokens_models_context_swa_scratch(preemption, monkeypatch):
+    from tensorrt_llm._torch.pyexecutor.scheduler import gen_preemption
+
+    monkeypatch.setattr(
+        gen_preemption,
+        "_active_settings",
+        gen_preemption.GenPreemptionSettings(tpot_budget=0.1 if preemption else None),
+    )
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_specs = None
     manager._has_cp_helix = False
@@ -1411,15 +1430,21 @@ def test_v2_quota_from_max_tokens_models_context_swa_scratch():
     ]
 
     max_tokens = 1200
+    residents = 6 if preemption else 4  # active batch plus the paused cap
+    assert manager._get_generation_request_capacity() == residents
 
     manager.enable_swa_scratch_reuse = False
     no_scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
-    assert no_scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 20 + 4 * 2 * 192 * 10)
+    assert no_scratch_quota == (
+        max_tokens * 20 + manager.max_num_tokens * 20 + residents * 2 * 192 * 10
+    )
     assert manager._get_max_tokens_from_quota(no_scratch_quota) == max_tokens
 
     manager.enable_swa_scratch_reuse = True
     scratch_quota = manager._get_quota_from_max_tokens(max_tokens)
-    assert scratch_quota == (max_tokens * 20 + manager.max_num_tokens * 10 + 4 * 2 * 192 * 10)
+    assert scratch_quota == (
+        max_tokens * 20 + manager.max_num_tokens * 10 + residents * 2 * 192 * 10
+    )
     assert manager._get_max_tokens_from_quota(scratch_quota) == max_tokens
 
 

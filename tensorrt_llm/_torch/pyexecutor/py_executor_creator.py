@@ -67,6 +67,7 @@ from .kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from .model_engine import ModelEngine
 from .model_loader import ModelLoader, construct_checkpoint_loader
 from .py_executor import PyExecutor
+from .scheduler import gen_preemption
 
 _MLA_KV_CACHE_REUSE_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120, 121)
 _MLA_CHUNKED_PREFILL_SUPPORTED_SM_VERSIONS = (90, 100, 103, 107, 120)
@@ -648,6 +649,14 @@ def _create_py_executor(
     kv_connector_config = llm_args.kv_connector_config
 
     scheduler_config = llm_args.scheduler_config
+    # Reserve paused-request headroom only when startup prerequisites allow it.
+    headroom_reason = gen_preemption.unsupported_headroom_reason(
+        scheduler_config.gen_preemption, llm_args)
+    if headroom_reason:
+        logger.warning(
+            f"[gen_preempt] GEN slot preemption disabled: {headroom_reason}")
+    gen_preemption.configure(
+        None if headroom_reason else scheduler_config.gen_preemption)
 
     # Since peft_cache_config may be subject to change, avoid these changes propagate back
     # to llm_args.peft_cache_config

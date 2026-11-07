@@ -4625,6 +4625,61 @@
       "title": "EncodeExtraInputSpec",
       "type": "object"
     },
+    "GenPreemptionConfig": {
+      "additionalProperties": false,
+      "anyOf": [
+        {
+          "properties": {
+            "tpot_budget": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "target_output_tps": {
+              "type": "null"
+            }
+          }
+        }
+      ],
+      "description": "GEN slot preemption on a disaggregated generation worker.\n\nWhen every slot is taken and the next waiting request is at risk of missing\nits TTFT target, a decode request is paused in place for it. Set at most\none field to bound the TPOT cost (neither: off). Needs the auto GEN\nadmission policy and the KV cache manager V2 scheduler.",
+      "properties": {
+        "target_output_tps": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Per-request output tokens/s floor kept by about 80% of requests.",
+          "status": "prototype",
+          "title": "Target Output Tps"
+        },
+        "tpot_budget": {
+          "anyOf": [
+            {
+              "exclusiveMaximum": 1.0,
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Allowed mean-TPOT increase from pauses, as a fraction (0.10 = +10%).",
+          "status": "prototype",
+          "title": "Tpot Budget"
+        }
+      },
+      "title": "GenPreemptionConfig",
+      "type": "object"
+    },
     "GmsConfig": {
       "additionalProperties": false,
       "description": "Prototype configuration for GPU Memory Service (GMS) weight sharing.\n\nComposes orthogonally with ``checkpoint_format`` on ``TorchLlmArgs``:\nGMS controls *where* weights live (a node-shared GPU memory pool\nso multiple TRT-LLM instances zero-copy share the same bytes),\nwhile ``checkpoint_format`` controls *how* they get there (HF disk,\nMX P2P, etc.). Effective only when ``TorchLlmArgs.load_format ==\nLoadFormat.GMS``; setting any non-default field here without that\nload_format triggers a warning via :meth:`TorchLlmArgs.validate_gms_config`.\n\nTwo roles are decided at connect time by the GMS daemon, not by\nconfig:\n\n- **RW (writer)**: the first instance loads weights into the pool\n  via the normal checkpoint-loader pipeline, then commits them.\n- **RO (reader)**: subsequent instances zero-copy materialize the\n  already-committed layout \u2014 no disk I/O, no per-instance copies.\n\nSee :class:`tensorrt_llm._torch.memory.gpu_memory_backend.GMSBackend`\nfor the integration adapter and the ``LoadFormat.GMS`` branch in\n``ModelLoader.load`` for orchestration.",
@@ -8019,6 +8074,11 @@
           "description": "Use KV prefix-reuse estimates for scheduler admission, duplicate-request deferral, and token-budget decisions. This is orthogonal to kv_cache_config.enable_block_reuse.",
           "title": "Enable Prefix Aware Scheduling",
           "type": "boolean"
+        },
+        "gen_preemption": {
+          "$ref": "#/$defs/GenPreemptionConfig",
+          "description": "GEN slot preemption on disaggregated generation workers.",
+          "status": "prototype"
         },
         "use_python_scheduler": {
           "default": false,
