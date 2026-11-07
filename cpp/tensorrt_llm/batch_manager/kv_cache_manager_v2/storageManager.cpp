@@ -457,13 +457,6 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
         TLLM_CHECK_WITH_INFO(maxColdPageBytes <= std::numeric_limits<size_t>::max() / kPageStagingDepth,
             "Cold-page staging size overflow");
         pageStagingBytes = std::max(kDefaultPageStagingBytes, kPageStagingDepth * maxColdPageBytes);
-        // TLLM_KVCM2_PAGE_STAGING_MB: larger pinned staging, so a disk restore runs as fewer, larger read -> decode
-        // rounds (each round costs a host callback and a stream sync on top of the I/O).
-        if (char const* env = std::getenv("TLLM_KVCM2_PAGE_STAGING_MB"); env != nullptr && std::atoll(env) > 0)
-        {
-            size_t const requested = static_cast<size_t>(std::atoll(env)) << 20u;
-            pageStagingBytes = std::max(pageStagingBytes, requested - requested % maxColdPageBytes);
-        }
     }
 
     for (LifeCycleId lifeCycle{0}; lifeCycle < numLifeCycles(); ++lifeCycle)
