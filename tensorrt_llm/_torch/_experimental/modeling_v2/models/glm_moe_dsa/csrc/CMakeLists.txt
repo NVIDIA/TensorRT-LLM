@@ -32,3 +32,9 @@ add_modeling_v2_target(
   SOURCES *.cu *.cpp
   DEPS internal_cutlass trtllm_gen_fmha_interface
   REQUIRES MULTI_DEVICE)
+
+add_modeling_v2_target(
+  glm_moe_dsa glm_5_2_nvfp4__sm_107__high_throughput
+  ARCHS 100f
+  SOURCES *.cu *.cpp
+  REQUIRES MULTI_DEVICE)
