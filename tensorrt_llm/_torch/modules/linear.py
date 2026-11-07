@@ -3601,8 +3601,8 @@ class MXFP8LinearMethod(LinearMethodBase):
 
     Three execution paths share a common loader:
       - Reference (no CUTLASS op compiled): dequantize the weight to compute
-        dtype once after loading and run F.linear on it, at 2 more bytes per
-        parameter. Used to seed M1 tests and as a portable fallback.
+        dtype and run F.linear. Slow but correct -- used to seed M1 tests and
+        as a portable fallback.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
@@ -3822,40 +3822,15 @@ class MXFP8LinearMethod(LinearMethodBase):
                 output = output + bias
         else:
             # Dequant reference: w_deq = w_e4m3 * 2^(scale - 127) per K-block.
-            w_deq = module._buffers.get("_mxfp8_dequant_weight")
-            if w_deq is None or w_deq.dtype != input.dtype:
-                w_deq = self._dequant_weight(module).to(input.dtype)
+            from tensorrt_llm._torch.modules.mxfp8_utils import \
+                dequant_mxfp8_weight
+            w_deq = dequant_mxfp8_weight(module.weight, module.weight_scale,
+                                         self.BLOCK_SIZE).to(input.dtype)
             output = F.linear(input, w_deq, bias)
 
         if len(original_shape) > 2:
             output = output.reshape(*original_shape[:-1], output.shape[-1])
         return output
-
-    def _dequant_weight(self, module: Linear) -> torch.Tensor:
-        from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
-        return dequant_mxfp8_weight(module.weight, module.weight_scale,
-                                    self.BLOCK_SIZE)
-
-    def transform_weights(self, module: Linear) -> None:
-        LinearMethodBase.transform_weights(self, module)
-        self.cache_derived_state(module)
-
-    def cache_derived_state(self, module: Linear) -> None:
-        """Keep the reference path's dequantized weight so forward stays one GEMM.
-
-        A reload refreshes it in place, so captured CUDA graphs keep a valid address.
-        """
-        if self.use_cutlass:
-            return
-        w_deq = self._dequant_weight(module).to(module.dtype)
-        cached = module._buffers.get("_mxfp8_dequant_weight")
-        if (cached is not None and cached.shape == w_deq.shape
-                and cached.dtype == w_deq.dtype):
-            cached.copy_(w_deq)
-        else:
-            module.register_buffer("_mxfp8_dequant_weight",
-                                   w_deq,
-                                   persistent=False)
 
     @staticmethod
     def _get_scale_name(weights: List[Dict]):
@@ -4005,8 +3980,6 @@ class MXFP8LinearMethod(LinearMethodBase):
             copy_weight(module.weight_scale, swizzled)
             # Release the staging copy; the next load reallocates it.
             delattr(module, "tmp_weight_scale_raw")
-        if "_mxfp8_dequant_weight" in module._buffers:
-            self.cache_derived_state(module)
         super().process_weights_after_loading(module)
 
     def _store_fused_scales(self, module: Linear, shard_keys: tuple,
