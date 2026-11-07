@@ -45,6 +45,16 @@ def test_pinned_decision_matches_every_stock_candidate(nk, m, scale) -> None:
     runner = FlashInferMXFP8GemmRunner(torch.bfloat16)
     for tactic in (FlashInferMXFP8GemmRunner.CUTE_DSL, FlashInferMXFP8GemmRunner.CUTLASS):
         ref = runner.forward([xq, xsf, wq, wsf], tactic=tactic)
-        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), tactic
+        assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), str(
+            {
+                "tactic": tactic,
+                "different_bits": int((out.view(torch.int16) != ref.view(torch.int16)).sum()),
+                "elements": out.numel(),
+                "max_abs_error": float((out.float() - ref.float()).abs().max()),
+                "max_relative_error": float(
+                    ((out.float() - ref.float()).abs() / ref.float().abs().clamp_min(1e-30)).max()
+                ),
+            }
+        )
     again = _pinned_mxfp8_gemm(xq, xsf, wq, wsf, torch.bfloat16)
     assert torch.equal(out.view(torch.int16), again.view(torch.int16))

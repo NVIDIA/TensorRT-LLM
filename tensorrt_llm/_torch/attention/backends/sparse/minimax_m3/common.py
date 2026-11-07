@@ -18,7 +18,7 @@ import torch
 
 from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
 
-from ..params import SparseMetadataParams, SparseParams
+from ..params import SparseBackendForwardArgs, SparseMetadataParams, SparseParams
 
 # Re-exported so this module stays the one place the backends reach for
 # paged-cache plumbing, wherever it is defined.
@@ -27,12 +27,22 @@ from .kernels.paged_cache import write_kv_slots
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
 
+    from tensorrt_llm._torch.utils import MxFp8QuantizedTensor
     from tensorrt_llm.mapping import Mapping
 
 # Sentinel scores that force init and local blocks into the top-k regardless
 # of their computed score. Init outranks local.
 _INIT_SCORE = 1e30
 _LOCAL_SCORE = 1e29
+
+
+@dataclass(kw_only=True, slots=True)
+class MiniMaxM3BackendForwardArgs(SparseBackendForwardArgs):
+    """Call-owned M3 attention output request and the optional quantized result."""
+
+    mxfp8_output: bool = False
+    mxfp8_skip_bf16: bool = False
+    mxfp8_result: Optional[MxFp8QuantizedTensor] = None
 
 
 def index_head_range(

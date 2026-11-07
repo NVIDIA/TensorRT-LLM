@@ -37,13 +37,14 @@ void invokeMinimaxM3RouterGemv(__nv_bfloat16 const* x, int32_t ldx, int32_t m, i
 
 //! TF32 tensor-core router for 128 experts and 1 <= M <= 48 (K % 1024 == 0): `out[M, 128]` with the weights rounded
 //! to TF32 (round to nearest, ties away) and fp32 accumulation, independent of the cluster size picked. Optional
-//! NVFP4 activation as in `invokeMinimaxM3RouterGemv`.
+//! NVFP4 activation as in `invokeMinimaxM3RouterGemv`. With fullFp32, consume three TF32 weight residuals.
 void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
-    uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream);
+    uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream, bool fullFp32 = false);
 
 //! The cluster size `invokeMinimaxM3RouterTc` launches with (16 or 8): decided once per process from the device's
-//! co-scheduling (device-static) and configures both kernels. SM107 callers use the router only when this is 16.
-int minimaxM3RouterTcCluster(int32_t k);
+//! co-scheduling (device-static, per precision mode) and configures both kernels. SM107 callers use the router only
+//! when this is 16.
+int minimaxM3RouterTcCluster(int32_t k, bool fullFp32 = false);
 
 } // namespace kernels
 

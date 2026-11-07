@@ -29,6 +29,9 @@ if TYPE_CHECKING:
     from .moe_load_balancer import SingleLayerMoeLoadBalancer
     from .routing import BaseMoeRoutingMethod, RoutingMethodType
 
+DETERMINISTIC_MOE_FINALIZE = "deterministic_moe_finalize"
+
+
 # ---------------------------------------------------------------------------
 # Declaration
 # ---------------------------------------------------------------------------
@@ -301,6 +304,7 @@ class MoEDeployment:
     # actually serve it is ``env.has_dep(MoEDep.LOCALITY_DOMAIN)``.
     locality_domain_requested: bool = False
     force_dynamic_quantization: bool = False
+    deterministic_finalize_requested: bool = False
 
     @property
     def smart_router(self) -> bool:

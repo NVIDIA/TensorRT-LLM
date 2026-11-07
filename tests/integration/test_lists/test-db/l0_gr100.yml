@@ -13,6 +13,35 @@ l0_gr100:
       stage: post_merge
       backend: pytorch
   tests:
+  # MiniMax-M3 context kernels and router validation; all run on one Rubin GPU.
+  - unittest/_torch/attention/sparse/msa/test_msa_backend.py::test_segmented_proxy_reads_current_page_table_before_pack_flush
+  - unittest/_torch/kernels/serial/test_m3_ctx_clc_gemm.py
+  - unittest/_torch/kernels/serial/test_m3_ctx_fused_quant.py
+  - unittest/_torch/kernels/serial/test_sm107_allreduce_rmsnorm_rows.py
+  - unittest/_torch/kernels/serial/test_m3_qkv_fusion.py
+  - unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py::test_minimax_m3_nvfp4_rows_matches_per_token_bitwise
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_dense_prefill_fa4.py
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_dense_prefill_fa4_patched.py
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_tile_select.py
+  - unittest/_torch/attention/sparse/msa/test_msa_prefill_nvfp4_out_in_place.py
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_sparse_attn_decode.py::test_msa_nvfp4_r2_store_matches_reference
+  - unittest/_torch/attention/sparse/msa/test_msa_k2q_ws_stream.py::test_k2q_workspace_matches_stock_contents
+  - unittest/_torch/attention/sparse/msa/test_msa_q_e4m3.py
+  - unittest/_torch/attention/sparse/msa/test_minimax_m3_proxy_nofill.py
+  - unittest/_torch/attention/test_drafter_kv_tail_zero.py
+  - unittest/_torch/modules/test_prequantized_mxfp8_streams.py
+  - unittest/_torch/moe/test_cutedsl_rubin_deterministic.py
+  - unittest/_torch/moe/test_cutedsl_swiglu_oai_resolution.py
+  - unittest/_torch/moe/test_router_gemm.py
+  - unittest/_torch/moe/test_m3_router_tc_fp4_moe.py
+  - unittest/_torch/moe/test_m3_fold_shared_finalize.py
+  - unittest/_torch/modeling/test_minimax_m3_router_fp32_cast.py
+  - unittest/_torch/modeling/test_minimax_m3_router_tc_gen.py
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_mxfp8_small_m_buckets_map_first_on_sm107
+  - unittest/_torch/kernels/parallel/test_mxfp8_mxfp8_gemm.py::test_mxfp8_native_tactic_cache_sm107_small_m_buckets
+  - unittest/_torch/kernels/parallel/test_mxfp8_mxfp8_gemm.py::test_mxfp8_mxfp8_sm107_tactics_bitwise_equal
+  - unittest/_torch/models/test_minimax_m3.py::test_embedding_gather_matches_f_embedding_for_any_id_layout
+  - unittest/_torch/moe/test_unpermute_residual.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/activation

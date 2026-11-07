@@ -2468,6 +2468,36 @@ def test_SchedulerConfig_declaration() -> None:
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("reserve", [None, 0, 2048])
+@pytest.mark.parametrize("adaptive", [None, False, True])
+@pytest.mark.parametrize("reprobe", [None, 1, 8])
+def test_scheduler_append_reserve_config(reserve: int | None,
+                                         adaptive: bool | None,
+                                         reprobe: int | None) -> None:
+    config = SchedulerConfig(context_append_reserve_tokens=reserve,
+                             context_append_reserve_adaptive=adaptive,
+                             context_append_reserve_reprobe_iterations=reprobe)
+    assert config.context_append_reserve_tokens == reserve
+    assert config.context_append_reserve_adaptive is adaptive
+    assert config.context_append_reserve_reprobe_iterations == reprobe
+    restored = SchedulerConfig.model_validate_json(config.model_dump_json())
+    assert restored == config
+    PybindMirror.maybe_to_pybind(config)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("field,value", [
+    ("context_append_reserve_tokens", -1),
+    ("context_append_reserve_reprobe_iterations", 0),
+    ("context_append_reserve_reprobe_iterations", -1),
+])
+def test_scheduler_append_reserve_rejects_invalid_values(
+        field: str, value: int) -> None:
+    with pytest.raises(ValidationError, match=field):
+        SchedulerConfig(**{field: value})
+
+
+@pytest.mark.cpu_only
 def test_PeftCacheConfig_declaration():
     config = PeftCacheConfig(num_host_module_layer=1,
                              num_device_module_layer=1,

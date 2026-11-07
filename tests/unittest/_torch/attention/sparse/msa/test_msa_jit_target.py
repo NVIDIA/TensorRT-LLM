@@ -7,6 +7,8 @@ Runs on CPU: torch.cuda is faked and nothing is compiled.
 
 import os
 import re
+from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
@@ -15,9 +17,10 @@ from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils 
     msa_package_available,
 )
 
-pytestmark = pytest.mark.skipif(
-    not msa_package_available(), reason="fmha_sm100 (MSA submodule) required"
-)
+pytestmark = [
+    pytest.mark.cpu_only,
+    pytest.mark.skipif(not msa_package_available(), reason="fmha_sm100 (MSA submodule) required"),
+]
 
 ARCH_ENV = "MINFER_FMHA_CUDA_ARCH"
 
@@ -29,15 +32,20 @@ def jit(monkeypatch, tmp_path):
     import fmha_sm100.jit as jit
 
     monkeypatch.setattr(jit, "_jit_target_value", jit._JIT_TARGET_UNSET)
+    monkeypatch.setattr(jit, "_proxy_modes_cache", None)
     monkeypatch.setattr(jit, "CACHE_BASE", tmp_path)
     monkeypatch.setenv(ARCH_ENV, "")
     return jit
 
 
-def fake_gpus(monkeypatch, *capabilities):
+def fake_gpus(monkeypatch: pytest.MonkeyPatch, *capabilities: tuple[int, int]) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: bool(capabilities))
     monkeypatch.setattr(torch.cuda, "device_count", lambda: len(capabilities))
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda i: capabilities[i])
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device=None: capabilities[0 if device is None else device],
+    )
 
 
 def gencodes(jit, cache_dir):
@@ -63,8 +71,8 @@ def test_one_architecture_is_the_target_and_is_exported(jit, monkeypatch, capabi
 
 @pytest.mark.parametrize(
     "capabilities",
-    [[(10, 0), (10, 3)], [(9, 0)], [(12, 0)], []],
-    ids=["sm100_and_sm103", "sm90", "sm120", "no_gpu"],
+    [[(10, 0), (10, 3)], [(10, 7)], [(9, 0)], [(12, 0)], []],
+    ids=["sm100_and_sm103", "sm107_family", "sm90", "sm120", "no_gpu"],
 )
 def test_other_devices_keep_the_portable_image(jit, monkeypatch, capabilities):
     fake_gpus(monkeypatch, *capabilities)
@@ -104,3 +112,31 @@ def test_a_shared_build_is_loaded_until_the_target_has_its_own(jit, monkeypatch)
     target_dir.mkdir(parents=True)
     (target_dir / so_name).touch()
     assert jit._built_dir("plan", so_name) == target_dir
+
+
+@pytest.mark.parametrize(
+    "targets", [((10, 0), (10, 7)), ((10, 7), (10, 0))], ids=["sm100_first", "sm107_first"]
+)
+@pytest.mark.parametrize("disable_r2", [False, True])
+def test_aot_cache_and_codegen_follow_each_target(
+    jit: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    targets: tuple[tuple[int, int], tuple[int, int]],
+    disable_r2: bool,
+) -> None:
+    # The optional MSA package and its import path are prepared by the jit fixture.
+    from src.common import aot_cache
+
+    monkeypatch.setattr(aot_cache, "_build_fingerprint_cache", {})
+    monkeypatch.setattr(aot_cache, "_r2_store_cache", {})
+    monkeypatch.setattr(aot_cache, "_AOT_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("TRTLLM_MSA_DISABLE_R2STORE", "1" if disable_r2 else "0")
+    paths = []
+    for target in (*targets, targets[0]):
+        fake_gpus(monkeypatch, target)
+        assert aot_cache.r2_store_enabled() is (target == (10, 7) and not disable_r2)
+        assert aot_cache._build_fingerprint().startswith(f"sm{target[0]}{target[1]}-")
+        paths.append(aot_cache._key_to_path(("target_isolation", 128)))
+    assert paths[0] != paths[1]
+    assert paths[0] == paths[2]

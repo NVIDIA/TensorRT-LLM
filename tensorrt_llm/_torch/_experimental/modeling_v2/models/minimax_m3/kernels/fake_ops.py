@@ -33,7 +33,13 @@ def _(x, w, sf_scale, pdl):
 
 
 @torch.library.register_fake("trtllm::minimax_m3_router_tc")
-def _(x, w, sf_scale, pdl):
+def _(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    sf_scale: torch.Tensor | None,
+    pdl: bool,
+    full_fp32: bool = False,
+) -> list[torch.Tensor]:
     outputs = _minimax_m3_router_fp4_outputs(x, w)
     return outputs if sf_scale is not None else outputs[:1]
 

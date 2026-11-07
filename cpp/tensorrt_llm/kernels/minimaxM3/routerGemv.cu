@@ -273,6 +273,19 @@ __device__ __forceinline__ uint32_t f2tf32(float f)
     return r;
 }
 
+// Keep a finite leading term when nearest TF32 rounding would overflow a finite weight.
+// The following residual terms retain the difference; legacy one-term conversion is unchanged.
+__device__ __forceinline__ uint32_t f2tf32WeightTerm(float f)
+{
+    uint32_t const bits = __float_as_uint(f);
+    uint32_t const rounded = f2tf32(f);
+    if ((bits & 0x7fffffffU) < 0x7f800000U && (rounded & 0x7fffffffU) == 0x7f800000U)
+    {
+        return bits & 0xffffe000U;
+    }
+    return rounded;
+}
+
 __device__ __forceinline__ uint32_t mapa_u32(void const* p, uint32_t rank)
 {
     uint32_t r;
@@ -280,7 +293,7 @@ __device__ __forceinline__ uint32_t mapa_u32(void const* p, uint32_t rank)
     return r;
 }
 
-template <int CL>
+template <int CL, bool FULL_FP32 = false>
 __global__ void __launch_bounds__(256) m3_router_tc_kernel(__nv_bfloat16 const* __restrict__ x, int ldx,
     float const* __restrict__ w, float* __restrict__ out, int M, int K, uint8_t* __restrict__ q_out,
     uint8_t* __restrict__ sf_out, float const* __restrict__ sf_scale)
@@ -372,28 +385,47 @@ __global__ void __launch_bounds__(256) m3_router_tc_kernel(__nv_bfloat16 const* 
         for (int st = warp * steps; st < (warp + 1) * steps; ++st)
         {
             int const kk = h * ks + st * 8;
-            uint32_t const a0 = f2tf32(w_s[g * wst + kk + t]);
-            uint32_t const a1 = f2tf32(w_s[(g + 8) * wst + kk + t]);
-            uint32_t const a2 = f2tf32(w_s[g * wst + kk + t + 4]);
-            uint32_t const a3 = f2tf32(w_s[(g + 8) * wst + kk + t + 4]);
-#pragma unroll
-            for (int nt = 0; nt < 6; ++nt)
+            float r0 = w_s[g * wst + kk + t];
+            float r1 = w_s[(g + 8) * wst + kk + t];
+            float r2 = w_s[g * wst + kk + t + 4];
+            float r3 = w_s[(g + 8) * wst + kk + t + 4];
+            constexpr int terms = FULL_FP32 ? 3 : 1;
+#pragma unroll 1
+            for (int term = 0; term < terms; ++term)
             {
-                if (nt < ntiles)
+                uint32_t const a0 = FULL_FP32 ? f2tf32WeightTerm(r0) : f2tf32(r0);
+                uint32_t const a1 = FULL_FP32 ? f2tf32WeightTerm(r1) : f2tf32(r1);
+                uint32_t const a2 = FULL_FP32 ? f2tf32WeightTerm(r2) : f2tf32(r2);
+                uint32_t const a3 = FULL_FP32 ? f2tf32WeightTerm(r3) : f2tf32(r3);
+#pragma unroll
+                for (int nt = 0; nt < 6; ++nt)
                 {
-                    int const m = nt * 8 + g;
-                    float bx0 = 0.f, bx1 = 0.f;
-                    if (m < M)
+                    if (nt < ntiles)
                     {
-                        bx0 = __bfloat162float(x_s[m * xst + kk + t]);
-                        bx1 = __bfloat162float(x_s[m * xst + kk + t + 4]);
+                        int const m = nt * 8 + g;
+                        float bx0 = 0.f, bx1 = 0.f;
+                        if (m < M)
+                        {
+                            bx0 = __bfloat162float(x_s[m * xst + kk + t]);
+                            bx1 = __bfloat162float(x_s[m * xst + kk + t + 4]);
+                        }
+                        uint32_t const b0 = f2tf32(bx0), b1 = f2tf32(bx1);
+                        asm volatile(
+                            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+                            "{%8,%9}, {%0,%1,%2,%3};\n"
+                            : "+f"(acc[nt][0]), "+f"(acc[nt][1]), "+f"(acc[nt][2]), "+f"(acc[nt][3])
+                            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
                     }
-                    uint32_t const b0 = f2tf32(bx0), b1 = f2tf32(bx1);
-                    asm volatile(
-                        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
-                        "{%8,%9}, {%0,%1,%2,%3};\n"
-                        : "+f"(acc[nt][0]), "+f"(acc[nt][1]), "+f"(acc[nt][2]), "+f"(acc[nt][3])
-                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                }
+                if constexpr (FULL_FP32)
+                {
+                    if (term + 1 < terms)
+                    {
+                        r0 = __fsub_rn(r0, __uint_as_float(a0));
+                        r1 = __fsub_rn(r1, __uint_as_float(a1));
+                        r2 = __fsub_rn(r2, __uint_as_float(a2));
+                        r3 = __fsub_rn(r3, __uint_as_float(a3));
+                    }
                 }
             }
         }
@@ -520,7 +552,8 @@ void invokeMinimaxM3RouterGemv(__nv_bfloat16 const* x, int32_t ldx, int32_t m, i
     launchGemv<1>(x, ldx, m, k, w, e, out, qOut, sfOut, sfScale, pdl, stream);
 }
 
-int minimaxM3RouterTcCluster(int32_t k)
+template <bool FULL_FP32>
+int minimaxM3RouterTcClusterImpl(int32_t k)
 {
     // 16-CTA clusters (128 CTAs, one K slice each) when the device co-schedules all 8, else 8-CTA clusters; decided
     // once per process (device-static, for the first K seen: MiniMax-M3 has one hidden size) and configures both
@@ -543,8 +576,9 @@ int minimaxM3RouterTcCluster(int32_t k)
                        max_optin - static_cast<int>(attrs.sharedSizeBytes))
                 == cudaSuccess;
         };
-        TLLM_CHECK_WITH_INFO(configure(m3_router_tc_kernel<8>, false), "failed to configure the router kernel");
-        if (!configure(m3_router_tc_kernel<16>, true))
+        TLLM_CHECK_WITH_INFO(
+            configure(m3_router_tc_kernel<8, FULL_FP32>, false), "failed to configure the router kernel");
+        if (!configure(m3_router_tc_kernel<16, FULL_FP32>, true))
         {
             cudaGetLastError();
             return 8;
@@ -562,7 +596,7 @@ int minimaxM3RouterTcCluster(int32_t k)
         cfg.attrs = attr;
         cfg.numAttrs = 1;
         int clusters = 0;
-        if (cudaOccupancyMaxActiveClusters(&clusters, m3_router_tc_kernel<16>, &cfg) != cudaSuccess)
+        if (cudaOccupancyMaxActiveClusters(&clusters, m3_router_tc_kernel<16, FULL_FP32>, &cfg) != cudaSuccess)
         {
             cudaGetLastError();
             return 8;
@@ -572,7 +606,13 @@ int minimaxM3RouterTcCluster(int32_t k)
     return cluster;
 }
 
-void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
+int minimaxM3RouterTcCluster(int32_t k, bool fullFp32)
+{
+    return fullFp32 ? minimaxM3RouterTcClusterImpl<true>(k) : minimaxM3RouterTcClusterImpl<false>(k);
+}
+
+template <bool FULL_FP32>
+void invokeMinimaxM3RouterTcImpl(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
     uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream)
 {
     int64_t const M = m, K = k;
@@ -600,13 +640,26 @@ void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int
         return cudaLaunchKernelEx(
             &cfg, kernel, x, ldx, w, out, static_cast<int>(M), static_cast<int>(K), qOut, sfOut, sfScale);
     };
-    int const cluster = minimaxM3RouterTcCluster(k);
-    cudaError_t const err
-        = cluster == 16 ? launch_tc(m3_router_tc_kernel<16>, 16) : launch_tc(m3_router_tc_kernel<8>, 8);
+    int const cluster = minimaxM3RouterTcClusterImpl<FULL_FP32>(k);
+    cudaError_t const err = cluster == 16 ? launch_tc(m3_router_tc_kernel<16, FULL_FP32>, 16)
+                                          : launch_tc(m3_router_tc_kernel<8, FULL_FP32>, 8);
     if (err != cudaSuccess)
     {
         cudaGetLastError();
         TLLM_CUDA_CHECK(err);
+    }
+}
+
+void invokeMinimaxM3RouterTc(__nv_bfloat16 const* x, int32_t ldx, int32_t m, int32_t k, float const* w, float* out,
+    uint8_t* qOut, uint8_t* sfOut, float const* sfScale, bool pdl, cudaStream_t stream, bool fullFp32)
+{
+    if (fullFp32)
+    {
+        invokeMinimaxM3RouterTcImpl<true>(x, ldx, m, k, w, out, qOut, sfOut, sfScale, pdl, stream);
+    }
+    else
+    {
+        invokeMinimaxM3RouterTcImpl<false>(x, ldx, m, k, w, out, qOut, sfOut, sfScale, pdl, stream);
     }
 }
 

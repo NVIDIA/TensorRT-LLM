@@ -25,6 +25,7 @@
 
 #include <cstdint>
 #include <cuda_fp16.h>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -59,10 +60,41 @@ int getMxfp8SmVersion()
     return smVersion;
 }
 
+// SM107 only: context chunks of a cached-prefix turn have M below kMxfp8LargeMMin. Exact-M cache keys
+// leave those M values untuned, and the default config runs at about half the speed of the best tactic
+// on SM107. These buckets give them tuned tactics. Every compiled tactic gives bitwise-identical
+// results, so bucketing changes speed only. Set to false to keep exact-M keys on SM107 as well.
+constexpr bool kMxfp8Sm107SmallMBuckets = true;
+constexpr int64_t kMxfp8Sm107SmallMBucketList[] = {8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, kMxfp8LargeMMin - 1};
+
+bool useMxfp8SmallMBuckets()
+{
+    return kMxfp8Sm107SmallMBuckets && getMxfp8SmVersion() == 107;
+}
+
+std::vector<int64_t> getMxfp8SmallMBuckets()
+{
+    if (!useMxfp8SmallMBuckets())
+    {
+        return {};
+    }
+    return {std::begin(kMxfp8Sm107SmallMBucketList), std::end(kMxfp8Sm107SmallMBucketList)};
+}
+
 int64_t getMxfp8TuningBucket(int64_t const m)
 {
     if (m < kMxfp8LargeMMin)
     {
+        if (useMxfp8SmallMBuckets())
+        {
+            for (int64_t const bucket : kMxfp8Sm107SmallMBucketList)
+            {
+                if (m <= bucket)
+                {
+                    return bucket;
+                }
+            }
+        }
         return m;
     }
     if (m <= kMxfp8M8kBucket)
@@ -286,6 +318,12 @@ public:
         return entry.has_value() ? entry->tactic : kMxfp8TacticCacheMiss;
     }
 
+    //! Returns the small-M tuning buckets of this GPU, empty unless SM107 small-M bucketing is enabled.
+    std::vector<int64_t> getSmallMTuningBuckets() const
+    {
+        return getMxfp8SmallMBuckets();
+    }
+
     //! Removes every registered MXFP8 serving tactic.
     void clearTacticCache() const
     {
@@ -322,6 +360,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         .def("get_num_configs", &tensorrt_llm::torch_ext::MXFP8GemmRunner::getNumConfigs)
         .def("register_tactic", &tensorrt_llm::torch_ext::MXFP8GemmRunner::registerTactic)
         .def("get_cached_tactic", &tensorrt_llm::torch_ext::MXFP8GemmRunner::getCachedTactic)
+        .def("get_small_m_tuning_buckets", &tensorrt_llm::torch_ext::MXFP8GemmRunner::getSmallMTuningBuckets)
         .def("clear_tactic_cache", &tensorrt_llm::torch_ext::MXFP8GemmRunner::clearTacticCache);
 
     m.def(

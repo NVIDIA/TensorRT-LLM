@@ -1446,6 +1446,21 @@
       "path": "scheduler_config.capacity_scheduler_policy"
     },
     {
+      "capture_policy": "bool|none",
+      "kind": "value",
+      "path": "scheduler_config.context_append_reserve_adaptive"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_append_reserve_reprobe_iterations"
+    },
+    {
+      "capture_policy": "int|none",
+      "kind": "value",
+      "path": "scheduler_config.context_append_reserve_tokens"
+    },
+    {
       "allowed_values": [
         "FIRST_COME_FIRST_SERVED",
         "EQUAL_PROGRESS",

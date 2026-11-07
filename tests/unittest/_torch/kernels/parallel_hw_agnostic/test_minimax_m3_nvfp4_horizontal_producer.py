@@ -436,3 +436,74 @@ def test_minimax_m3_nvfp4_horizontal_producer_cuda_graph_replay() -> None:
     assert torch.equal(data_cache, reference_data)
     assert torch.equal(scale_cache, reference_scale)
     assert torch.equal(index_cache.view(torch.uint8), reference_index.view(torch.uint8))
+
+
+@pytest.mark.parametrize("num_tokens", [1024, 1027])
+@pytest.mark.parametrize(
+    "num_heads_q,num_kv_heads",
+    [pytest.param(32, 2, id="tp2"), pytest.param(16, 1, id="tp4"), pytest.param(8, 1, id="tp8")],
+)
+def test_minimax_m3_nvfp4_rows_matches_per_token_bitwise(
+    num_tokens: int, num_heads_q: int, num_kv_heads: int
+) -> None:
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("Rows producer dispatch requires SM107")
+
+    torch.manual_seed(20629)
+    num_pages = (num_tokens + 127) // 128 + 3
+    total_heads = num_heads_q + 3 * num_kv_heads + 1
+    packed = torch.randn(num_tokens, total_heads * 128, dtype=torch.bfloat16, device="cuda")
+    weights = [torch.randn(128, dtype=torch.bfloat16, device="cuda") for _ in range(4)]
+    inv_scales = torch.tensor([1.0, 1.75, 0.625], dtype=torch.float32, device="cuda")
+    rope_cache = _rope_cache(2048)
+    positions = (torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 7 + 3) % 2048
+    # 53 is coprime to the cache capacity, so all valid writes are unique.
+    slots = (torch.arange(num_tokens, dtype=torch.int32, device="cuda") * 53 + 11) % (
+        num_pages * 128
+    )
+    slots[1] = -1
+    slots[2] = num_pages * 128
+    slots[-2] = -1
+    slots[-1] = num_pages * 128
+
+    whole_pools = _nvfp4_caches(num_pages + 2, num_kv_heads)
+    sliced_pools = _nvfp4_caches(num_pages + 2, num_kv_heads)
+    # Nonzero guard pages expose rejected-slot writes. Keep the same strided
+    # full-cache geometry in both launches, including the per-token slices.
+    for pool in (*whole_pools, *sliced_pools):
+        pool.view(torch.uint8).fill_(0x35)
+    whole_caches = tuple(pool[1:-1] for pool in whole_pools)
+    sliced_caches = tuple(pool[1:-1] for pool in sliced_pools)
+
+    def run_slice(
+        start: int, end: int, caches: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return _run_nvfp4(
+            packed[start:end],
+            *caches,
+            slots[start:end],
+            inv_scales,
+            num_heads_q,
+            num_kv_heads,
+            *weights,
+            rope_cache,
+            positions[start:end],
+        )
+
+    whole_q, whole_index_q = run_slice(0, num_tokens, whole_caches)
+    # Both chunks stay below 1024, forcing the original per-token dispatch.
+    first_q, first_index_q = run_slice(0, 1023, sliced_caches)
+    tail_q, tail_index_q = run_slice(1023, num_tokens, sliced_caches)
+    assert torch.equal(
+        whole_q.view(torch.uint8),
+        torch.cat((first_q.view(torch.uint8), tail_q.view(torch.uint8))),
+    )
+    assert torch.equal(
+        whole_index_q.view(torch.uint8),
+        torch.cat((first_index_q.view(torch.uint8), tail_index_q.view(torch.uint8))),
+    )
+    for whole, sliced in zip(whole_pools, sliced_pools):
+        assert torch.equal(whole.view(torch.uint8), sliced.view(torch.uint8))
+        for pool in (whole, sliced):
+            assert torch.all(pool[0].view(torch.uint8) == 0x35)
+            assert torch.all(pool[-1].view(torch.uint8) == 0x35)

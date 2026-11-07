@@ -14,13 +14,15 @@ Results are [total_q, num_kv_heads, topk] int32, ascending with -1 padding.
 from __future__ import annotations
 
 import functools
+import os
 from types import ModuleType
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.fmha.utils import get_multi_processor_count_for_device
-from tensorrt_llm._utils import async_tensor_h2d
+from tensorrt_llm._utils import async_tensor_h2d, get_sm_version
+from tensorrt_llm.logger import logger
 
 from .kernels.msa_utils import (
     MSA_REQUIRED_HEAD_DIM,
@@ -32,6 +34,22 @@ from .kernels.msa_utils import (
 
 if TYPE_CHECKING:
     from .common import MiniMaxM3SparseConfig
+
+# SM107: take the top-16 of prefill steps with the tile select (minimax_m3_select_prefill_tile), which reads each
+# 32-byte sector of the head-major scores once for 8 queries; the in-tree selector reads one score per sector per
+# pass. Same top-16 set (see the op). Kill switch: False keeps every step on minimax_m3_select_blocks.
+_SM107_TILE_SELECT = os.environ.get("TRTLLM_MSA_TILE_SELECT", "1") == "1"
+# Below this many query rows the in-tree selector's one-CTA-per-row grid is at least as fast.
+_SM107_TILE_SELECT_MIN_Q = 256
+# The op's shared-memory bound (kMinimaxM3SelectPrefillTileMaxBlocks).
+_SM107_TILE_SELECT_MAX_BLOCKS = 5856
+# The prefill proxy scores into an unfilled buffer: fmha_sm100 would allocate it with torch.full(-inf), but its
+# OnlyScore kernel writes every [head, block, token] with block below the token's causal block count (masked rows of a
+# tile as -inf), and the selectors read only those.
+# mega1: OFF by default (fmha_sm100's -inf fill, stock) while the random-first-token CTX bug is root-caused: with
+# recycled buffers an entry the kernel does not write would hold the previous request's scores.
+# TRTLLM_MSA_PROXY_NO_FILL=1 re-enables the unfilled buffer.
+_PROXY_SCORES_NO_FILL = os.environ.get("TRTLLM_MSA_PROXY_NO_FILL", "0") == "1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -102,6 +120,24 @@ def _cutedsl_score(
         decode_query_len,
     )
     return True
+
+
+def _unfilled_max_score(plan: tuple, idx_q: torch.Tensor) -> Optional[torch.Tensor]:
+    """The proxy's [num_index_heads, max_k_tiles, total_q] float32 max-score buffer, unfilled.
+
+    Shaped from the plan as fmha_sm100 shapes its own; None when the plan does not carry that geometry (a step split
+    into decode and prefill parts), which keeps fmha_sm100's allocation.
+    """
+    info = plan[3] if isinstance(plan, tuple) and len(plan) > 3 else None
+    if not isinstance(info, dict):
+        return None
+    max_k_tiles = int(info.get("max_k_tiles", -1))
+    num_heads = int(info.get("orig_num_qo_heads", 0))
+    if max_k_tiles <= 0 or num_heads <= 0:
+        return None
+    return torch.empty(
+        (num_heads, max_k_tiles, int(idx_q.shape[0])), dtype=torch.float32, device=idx_q.device
+    )
 
 
 def _proxy_max_score(
@@ -178,6 +214,69 @@ def _proxy_kv_splits(qo_lens: list[int], qo_offsets: list[int], num_index_heads:
     return min(_PROXY_MAX_KV_SPLITS, num_sms // (num_segments * num_index_heads))
 
 
+def proxy_segment_rows(
+    qo_lens_cpu: torch.Tensor,
+    kv_lens_cpu: torch.Tensor,
+    qo_offset_cpu: torch.Tensor,
+    segment_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cut each request's query rows into consecutive rows of at most segment_tokens.
+
+    Segment j of a request covers its query tokens [j * segment_tokens, end) and keeps the
+    causal key range those tokens see: the request's kv_len shortened by the tokens after the
+    segment, and its qo_offset advanced to the segment's first token. Requests with no query
+    tokens contribute no rows. Returns host int32 (qo_lens, kv_lens, qo_offset) and the int64
+    source request of every segment, in token order.
+    """
+    seg_qo, seg_kv, seg_off, seg_src = [], [], [], []
+    for row, (q, kv, off) in enumerate(
+        zip(qo_lens_cpu.tolist(), kv_lens_cpu.tolist(), qo_offset_cpu.tolist())
+    ):
+        for start in range(0, q, segment_tokens):
+            end = min(start + segment_tokens, q)
+            seg_qo.append(end - start)
+            seg_kv.append(kv - (q - end))
+            seg_off.append(off + start)
+            seg_src.append(row)
+    as_i32 = lambda values: torch.tensor(values, dtype=torch.int32)  # noqa: E731
+    return (
+        as_i32(seg_qo),
+        as_i32(seg_kv),
+        as_i32(seg_off),
+        torch.tensor(seg_src, dtype=torch.long),
+    )
+
+
+def proxy_segment_page_ranges(
+    kv_lens_cpu: torch.Tensor, seg_kv: torch.Tensor, seg_src: torch.Tensor, page_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Locate each segment's pages in the flat per-request page table (build_kv_page_indices).
+
+    Request r's pages start at the sum of the earlier requests' page counts, and a segment
+    needs the first ceil(seg_kv / page_size) of them. Returns host int64 (starts, counts).
+    """
+    pages = ((kv_lens_cpu.to(torch.long) + (page_size - 1)) // page_size).clamp_(min=0)
+    request_start = torch.cumsum(pages, 0) - pages
+    counts = (seg_kv.to(torch.long) + (page_size - 1)) // page_size
+    return request_start.index_select(0, seg_src), counts
+
+
+def gather_page_ranges(
+    flat: torch.Tensor, starts: torch.Tensor, counts: torch.Tensor, total: int, out: torch.Tensor
+) -> None:
+    """Write the concatenation of flat[start : start + count] for every range to out[:total].
+
+    Host range offsets and counts are staged together; the index is expanded on flat's
+    device without host synchronization. The caller retains ownership of the output buffer.
+    """
+    device = flat.device
+    range_first = torch.cumsum(counts, 0) - counts
+    staged = async_tensor_h2d(torch.stack((starts - range_first, counts)), torch.int64, device)
+    index = torch.arange(total, device=device)
+    index += torch.repeat_interleave(staged[0], staged[1], output_size=total)
+    torch.index_select(flat, 0, index, out=out[:total])
+
+
 def _segmented_proxy_plan(
     fmha_sm100: ModuleType,
     qo_lens: list[int],
@@ -193,26 +292,18 @@ def _segmented_proxy_plan(
     Each segment keeps its row's causal window and writes each block max once, from the same
     Q.K products: the scores are bitwise those of the unsplit plan.
     """
-    seg_qo_lens, seg_kv_lens, seg_offsets = [], [], []
-    # seg_shifts: the row's first page in kv_indices minus the segment's first gathered slot.
-    seg_pages, seg_shifts = [], []
-    row_first_page = num_gathered = 0
-    for qo_len, prefix in zip(qo_lens, qo_offsets):
-        for first in range(0, qo_len, _PROXY_SEGMENT_LEN):
-            n = min(_PROXY_SEGMENT_LEN, qo_len - first)
-            kv_len = prefix + first + n
-            pages = (kv_len + page_size - 1) // page_size
-            seg_qo_lens.append(n)
-            seg_kv_lens.append(kv_len)
-            seg_offsets.append(prefix + first)
-            seg_pages.append(pages)
-            seg_shifts.append(row_first_page - num_gathered)
-            num_gathered += pages
-        row_first_page += (prefix + qo_len + page_size - 1) // page_size
+    qo_lens_cpu = torch.tensor(qo_lens, dtype=torch.int32)
+    qo_offsets_cpu = torch.tensor(qo_offsets, dtype=torch.int32)
+    kv_lens_cpu = qo_lens_cpu + qo_offsets_cpu
+    seg_qo_lens, seg_kv_lens, seg_offsets, seg_src = proxy_segment_rows(
+        qo_lens_cpu, kv_lens_cpu, qo_offsets_cpu, _PROXY_SEGMENT_LEN
+    )
+    starts, counts = proxy_segment_page_ranges(kv_lens_cpu, seg_kv_lens, seg_src, page_size)
+    num_gathered = int(counts.sum())
     plan = fmha_sm100.fmha_sm100_plan(
-        torch.tensor(seg_qo_lens, dtype=torch.int32),
-        torch.tensor(seg_kv_lens, dtype=torch.int32),
-        qo_offset=torch.tensor(seg_offsets, dtype=torch.int32),
+        seg_qo_lens,
+        seg_kv_lens,
+        qo_offset=seg_offsets,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
         causal=True,
@@ -221,10 +312,9 @@ def _segmented_proxy_plan(
         output_maxscore=True,
     )
     # fmha_sm100 sizes a request's page span by its kv_len, so each segment gets its own page copy.
-    staged = async_tensor_h2d([seg_shifts, seg_pages], torch.int64, kv_indices.device)
-    gather = torch.arange(num_gathered, device=kv_indices.device)
-    gather += torch.repeat_interleave(staged[0], staged[1], output_size=num_gathered)
-    return plan, kv_indices.index_select(0, gather)
+    gathered = kv_indices.new_empty(num_gathered)
+    gather_page_ranges(kv_indices, starts, counts, num_gathered, gathered)
+    return plan, gathered
 
 
 def segmented_proxy_plan(
@@ -326,6 +416,42 @@ def _combined_topk_table(
         out = out.transpose(0, 1)
     out[:ctx_tokens].copy_(ctx_table)
     out[ctx_tokens:].copy_(gen_table)
+    return out
+
+
+def _tile_select(
+    max_score_kv: torch.Tensor,
+    n_valid_blocks: torch.Tensor,
+    init_blocks: int,
+    local_blocks: int,
+) -> Optional[torch.Tensor]:
+    """Top-16 table from the SM107 prefill tile select, or None outside its gate or shapes.
+
+    Returns the same head-major backed [total_q, num_kv_heads, 16] int32 table as
+    select_blocks_from_maxscore(..., head_major_output=True).
+    """
+    if not _SM107_TILE_SELECT or get_sm_version() != 107:
+        return None
+    if (
+        max_score_kv.dtype != torch.float32
+        or max_score_kv.dim() != 3
+        or max_score_kv.stride(2) != 1
+        or max_score_kv.shape[2] < _SM107_TILE_SELECT_MIN_Q
+        or max_score_kv.shape[1] > _SM107_TILE_SELECT_MAX_BLOCKS
+    ):
+        return None
+    num_kv_heads, _, total_q = max_score_kv.shape
+    out = torch.empty(
+        (num_kv_heads, total_q, MSA_REQUIRED_TOPK), dtype=torch.int32, device=max_score_kv.device
+    ).permute(1, 0, 2)
+    nvb = n_valid_blocks.to(device=max_score_kv.device, dtype=torch.int32).contiguous()
+    torch.ops.trtllm.minimax_m3_select_prefill_tile(
+        max_score_kv, nvb, out, init_blocks, local_blocks
+    )
+    logger.info_once(
+        "MSA prefill select: tile select, 8 queries per CTA (SM107)",
+        key="minimax_m3_sm107_tile_select",
+    )
     return out
 
 
@@ -511,6 +637,13 @@ class MsaIndexer:
                 causal=True,
             )
         fmha_sm100 = require_msa_module()
+        if max_score is None and _PROXY_SCORES_NO_FILL:
+            max_score = _unfilled_max_score(proxy_plan, idx_q)
+            if max_score is not None:
+                logger.info_once(
+                    "MSA indexer proxy: scores into an unfilled max-score buffer",
+                    key="minimax_m3_proxy_scores_no_fill",
+                )
         _, scores = fmha_sm100.fmha_sm100(
             idx_q,
             idx_k_paged,
@@ -535,8 +668,14 @@ class MsaIndexer:
         decode kernel reads the table head-major and takes every generation
         row, while fmha_sm100 reads whatever strides it is handed.
         """
+        max_score_kv = _group_max_reduce(max_score, self.config)
+        table = _tile_select(
+            max_score_kv, n_valid_blocks, self.config.init_blocks, self.config.local_blocks
+        )
+        if table is not None:
+            return table
         return select_blocks_from_maxscore(
-            _group_max_reduce(max_score, self.config),
+            max_score_kv,
             topk=MSA_REQUIRED_TOPK,
             n_valid_blocks=n_valid_blocks,
             init_blocks=self.config.init_blocks,

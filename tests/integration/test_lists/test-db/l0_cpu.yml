@@ -109,6 +109,8 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/spec/test_modeling_v2_m3_wide_draft_logits.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_draft_attention_bcg_route.py
   - unittest/_torch/attention/test_fallback_fmha_extra_page_sizes.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_ctx_stack_route.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_capture_boundary.py::test_ctx_router_cache_refreshes_in_place_after_refit
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_dense_backend_library_order
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_fp8_indexer_rejects_different_qk_norm_epsilons
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_moe_reduces_only_local_terms
@@ -122,6 +124,10 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_tp_matches_unsharded_reference
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_index_head_range_rejects_invalid_geometry
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_uses_one_engine_speculative_base
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_enables_clc_only_for_target_linears
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_opts_in_only_its_routed_moe_config
+  - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_backend_is_rubin_only
+  - unittest/_torch/moe/test_cutedsl_swiglu_oai_resolution.py
   - unittest/_torch/models/test_minimax_m3.py::test_setup_aliases_preserves_one_engine_draft_weight_loading
   - unittest/_torch/models/test_minimax_m3.py::test_eagle_capture_precedes_next_layer_norm
   - unittest/_torch/models/test_minimax_m3.py::test_piecewise_attention_boundary_runs_horizontal_producer
@@ -140,10 +146,35 @@ l0_cpu:
   - unittest/_torch/models/test_minimax_m3_vl.py
   - unittest/_torch/models/test_minimax_m3_vl_spec_reuse.py
   - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_split_router_weight_reconstructs_fp32
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_fp4_input_scale_rejects_cutedsl_awq_prescale
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_fixed_router_refit_preserves_allocation
+  - unittest/_torch/models/test_minimax_m3.py::test_minimax_m3_gate_unsupported_fixed_geometry_uses_stock
+  - unittest/_torch/modules/test_m3_ctx_clc_dispatch.py
+  - unittest/_torch/attention/fmha/test_msa_combine_mxfp8.py
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_mxfp8_carrier_is_consumed_without_requantization
+  - unittest/_torch/modules/test_mxfp8_linear.py::test_mxfp8_bf16_only_consumer_rejects_an_omitted_view
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_combine_passes_its_explicit_result_to_o_proj
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_combine_keeps_compile_and_padded_handoff_tensor_only
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_combine_declines_live_row_mismatch
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_mlp_unwraps_carrier_before_lora_adapter
+  - unittest/_torch/models/test_minimax_m3_drafter_rows.py
+  - unittest/_torch/kernels/serial/test_m3_qkv_contract.py
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_invalid_arguments_keep_stock_fallback
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_keeps_native_mxfp8_without_rubin_dsl
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_shares_initialization_cache
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_qkv_fused_skips_autotune_pass
   # l0_h100 and l0_b200 select unittest/_torch/misc with -m "not cpu_only", so this entry is
   # what runs it.
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
+  - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_takes_eager_qkv
+  - unittest/_torch/models/test_minimax_m3.py::test_bcg_bucket_keeps_captured_qkv_off_rubin
+  - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_engages_on_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_swiglu_mxfp8_avoids_non_consuming_decode_graph
+  - unittest/_torch/models/test_minimax_m3.py::test_shared_fold_into_trtllm_gen_finalize_is_sm107_only
+  - unittest/_torch/models/test_minimax_m3.py::test_fused_qkv_rows_agree_between_eager_and_breakable
+  - unittest/_torch/models/test_minimax_m3.py::test_ctx_boundary_norm_declines_off_rubin_and_off_geometry
+  - unittest/_torch/models/test_minimax_m3.py::test_cutedsl_shared_fold_only_without_token_dispatch
   - unittest/_torch/models/checkpoints
   - unittest/_torch/modules
   - unittest/_torch/moe
@@ -156,6 +187,7 @@ l0_cpu:
   - unittest/_torch/speculative/test_spec_slot_pool_sizing.py
   - unittest/_torch/flashinfer/test_flashinfer_cubin_pool.py
   - unittest/_torch/test_custom_config_registration.py
+  - unittest/_torch/misc/test_fp4_moe_tactic_table.py
   - unittest/_torch/test_hf_quant_config.py
   - unittest/_torch/test_mmap_utils.py
   - unittest/_torch/test_connector.py

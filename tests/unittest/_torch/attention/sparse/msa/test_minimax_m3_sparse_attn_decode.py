@@ -10,10 +10,12 @@ The PyTorch oracle follows the vLLM reference linked in the file header
 truncated at the query token's own causal extent.
 """
 
+import inspect
 import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -46,7 +48,7 @@ HEAD_DIM = 128
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 skip_not_sm100 = pytest.mark.skipif(
-    get_sm_version() not in (100, 103),
+    not torch.cuda.is_available() or get_sm_version() not in (100, 103),
     reason="MiniMax-M3 NVFP4 and fmha_sm100 require SM100/SM103.",
 )
 
@@ -305,6 +307,95 @@ def _make_nvfp4_inputs(seq_lens, *, num_kv_heads=1, group=8, decode_query_len=1,
         v_ref=reference[1],
         decode_query_len=decode_query_len,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or get_sm_version() != 107,
+    reason="R2 sparse-prefill store requires SM107",
+)
+def test_msa_nvfp4_r2_store_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
+    require_msa_module()
+    # Optional CuTe-DSL dependency: import only after the GPU/platform gate.
+    from fmha_sm100 import sparse as msa_sparse
+    from src.common import aot_cache
+
+    interface = inspect.getmodule(msa_sparse.sparse_atten_nvfp4_kv_func)
+    assert interface is not None
+    q_len, kv_len, group = 257, 513, 8
+    case = _make_nvfp4_inputs([kv_len], group=group, decode_query_len=q_len, seed=101)
+    cu_q = torch.tensor([0, q_len], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
+    row_ptr, q_indices, schedule = msa_sparse.build_k2q_csr(
+        case.topk_idx,
+        cu_q,
+        cu_k,
+        PAGE_SIZE,
+        total_k=kv_len,
+        max_seqlen_k=kv_len,
+        max_seqlen_q=q_len,
+        total_rows=(kv_len + PAGE_SIZE - 1) // PAGE_SIZE,
+        qhead_per_kv=group,
+        return_schedule=True,
+    )
+    # Fewer blocks than top-k: the helper selects the entire causal prefix.
+    # Use independently dequantized K/V, including a partial last page.
+    pages = case.block_table[0].long()
+    keys = case.k_ref[pages, 0].reshape(-1, HEAD_DIM)[:kv_len]
+    values = case.v_ref[pages, 0].reshape(-1, HEAD_DIM)[:kv_len]
+    logits = torch.einsum("qhd,kd->qhk", case.q.float(), keys) * HEAD_DIM**-0.5
+    causal_end = kv_len - q_len + torch.arange(q_len, device="cuda")
+    invalid = torch.arange(kv_len, device="cuda")[None, :] > causal_end[:, None]
+    logits.masked_fill_(invalid[:, None, :], -float("inf"))
+    reference = torch.einsum("qhk,kd->qhd", logits.softmax(dim=-1), values)
+    reference_lse = logits.logsumexp(dim=-1)
+
+    results = []
+    for enabled in (False, True):
+        with monkeypatch.context() as patch:
+            patch.setenv("TRTLLM_MSA_DISABLE_R2STORE", "0" if enabled else "1")
+            patch.setattr(aot_cache, "_r2_store_cache", {})
+            patch.setattr(aot_cache, "_build_fingerprint_cache", {})
+            patch.setattr(aot_cache, "_AOT_DISABLE", True)
+            patch.setattr(interface, "_compile_cache", {})
+            # Observe real compilation; a cached binary must not hide either path.
+            compile_spy = Mock(spec_set=interface.cute.compile, wraps=interface.cute.compile)
+            patch.setattr(interface.cute, "compile", compile_spy)
+            out, lse = msa_sparse.sparse_atten_nvfp4_kv_func(
+                case.q,
+                case.k_paged,
+                case.v_paged,
+                case.scales["k_block_scale"],
+                case.scales["v_block_scale"],
+                case.scales["k_global_scale"],
+                case.scales["v_global_scale"],
+                row_ptr,
+                q_indices,
+                MSA_REQUIRED_TOPK,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                max_seqlen_q=q_len,
+                max_seqlen_k=kv_len,
+                blk_kv=PAGE_SIZE,
+                causal=True,
+                softmax_scale=HEAD_DIM**-0.5,
+                partial_dtype=torch.bfloat16,
+                return_softmax_lse=True,
+                page_table=case.block_table,
+                seqused_k=case.seq_lens,
+                schedule=schedule,
+            )
+            kernels = [
+                call.args[0]
+                for call in compile_spy.call_args_list
+                if call.args
+                and isinstance(call.args[0], interface.SparseAttentionForwardNvfp4KvSm100)
+            ]
+            assert kernels and all(kernel.r2_store is enabled for kernel in kernels)
+            torch.testing.assert_close(out.float(), reference, rtol=3e-2, atol=3e-2)
+            torch.testing.assert_close(lse, reference_lse, rtol=1e-2, atol=1e-2)
+            results.append((out.clone(), lse.clone()))
+    assert torch.equal(results[0][0].view(torch.int16), results[1][0].view(torch.int16))
+    assert torch.equal(results[0][1].view(torch.int32), results[1][1].view(torch.int32))
 
 
 def _run_nvfp4(case, **kwargs):
@@ -1330,6 +1421,8 @@ def test_msa_jit_cache_tracks_sources_and_build_modes(
     build_script.write_text("compiler_flags = '-std=c++20'\n")
     monkeypatch.setattr(jit, "_PACKAGE_DIR", package)
     monkeypatch.setattr(jit, "_FMHA_VARLEN_DIR", csrc)
+    # Pin the SM107 default proxy modes; other devices add the kill knobs' directory suffix.
+    monkeypatch.setattr(jit, "_proxy_modes", lambda: (False, False))
     for name in ("GPU_TRACE", "SM_TIMING", "FMHA_GMEM_CHECK"):
         monkeypatch.delenv(name, raising=False)
     cache_root = tmp_path / "cache"

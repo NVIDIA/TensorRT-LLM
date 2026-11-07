@@ -128,6 +128,7 @@ from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config impo
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.config import (
     _validate_runtime as _validate_runtime,
 )
+from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops import context as _ctx_ops
 from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.activation.m3_silu_and_mul import (
     m3_silu_and_mul,
 )
@@ -205,6 +206,9 @@ from tensorrt_llm._torch.attention.backends import AttentionMetadata
 from tensorrt_llm._torch.attention.backends.fmha.msa_prefill import _aligned_nvfp4_dequant_scales
 from tensorrt_llm._torch.attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3 import MiniMaxM3MsaSparseAttention
+from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.common import (
+    MiniMaxM3BackendForwardArgs,
+)
 from tensorrt_llm._torch.attention.backends.sparse.minimax_m3.kernels.msa_utils import (
     MSA_REQUIRED_TOPK,
     msa_paged_kv,
@@ -259,7 +263,7 @@ from tensorrt_llm._torch.speculative.interface import (
 from tensorrt_llm._torch.speculative.interface import (
     should_use_separate_draft_kv_cache as should_use_separate_draft_kv_cache,
 )
-from tensorrt_llm._torch.utils import ActType_TrtllmGen, get_model_extra_attrs
+from tensorrt_llm._torch.utils import ActType_TrtllmGen, MxFp8QuantizedTensor, get_model_extra_attrs
 from tensorrt_llm._utils import mpi_rank, prefer_pinned
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -1502,6 +1506,8 @@ def _linear(
     marks the projections the fused low-M MXFP8 GEMM may take (``LOW_M_GEMM_MAX_TOKENS``: no TP2 configuration is
     built, so ``linear_path`` never selects it).
     """
+    if isinstance(x, MxFp8QuantizedTensor):
+        return _ctx_prequant_linear(core, x, wk, sk, low_m_gemm), False
     w, s = core.w[wk], core.w[sk]
     x = x.contiguous()
     mode = _mx_mode(core.mxfp8)
@@ -1656,10 +1662,23 @@ class _MoeScalars:
 
 def _router_logits(core, i: int, h: torch.Tensor) -> torch.Tensor:
     """The fp32 router logits of MoE layer ``i`` when the MoE runs unfused outside ``ROUTER_TC_GEN``'s rows (the decode
-    steps' engines route in-kernel): ``F.linear(float(h), w)``, the built-in gate's generation-step arithmetic; the
+    steps' engines route in-kernel): this target's existing ``F.linear(float(h), w)`` arithmetic; the
     experts then quantize their bf16 input themselves."""
     _record("m3_fp32_linear", h.shape[0] if h.dim() == 2 else 0)
     return m3_fp32_linear(h, core.w[f"l{i}_router"])
+
+
+def _context_router_logits(core, i: int, h: torch.Tensor) -> torch.Tensor:
+    """Context logits from all three BF16 weight terms, with fixed tile and K/term order within each split-K regime.
+
+    TRTLLM_CTX_ROUTER_TF32_FIXED=0 retains this target's existing fp32 router fallback.
+    """
+    w_split = core.router_w_split.get(i)
+    if w_split is not None and h.dtype == torch.bfloat16 and h.dim() == 2 and h.is_contiguous():
+        taken("router_gemm", h.shape[0], "fixed-tile BF16-split context router")
+        _record("router_gemm", h.shape[0])
+        return torch.ops.trtllm.router_gemm(h, w_split)
+    return _router_logits(core, i, h)
 
 
 def _decode_router_logits(core, i: int, h: torch.Tensor) -> torch.Tensor:
@@ -1792,6 +1811,234 @@ def _routed_experts(core, i: int, x, x_sf, router_logits, do_finalize: bool):
 def _split_chunk(rows: int, num_chunks: int) -> List[int]:
     """The MoE scheduler's even split: the first ``rows % num_chunks`` chunks take one more row."""
     return _modeling_support._split_chunk(_SUPPORT_TARGET, rows, num_chunks)
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# The built-in MiniMax-M3 CTX stack on prefill-sized steps with context rows
+# --------------------------------------------------------------------------------------------------------------------
+
+# A step with context rows of at least CTX_STACK_MIN_ROWS rows (the layer input's rows: context chunks + generation
+# rows) runs the CTX path of the built-in MiniMax-M3 model (modeling_minimaxm3) in the same order, each item behind its
+# own kill switch and row gate there:
+# * sparse layers: the fused QKV-index MXFP8 GEMM with the NVFP4 producer in its epilogue (TRTLLM_CTX_QKV_FUSED), then
+#   the attention core with the combine writing the o_proj input as MXFP8 (TRTLLM_CTX_P5A_COMBINE_MXFP8);
+# * every boundary of at least the CTX norm's rows: the all-reduce, then residual + RMSNorm emitting the next linear's
+#   MXFP8 input and, before the MoE, the routed experts' NVFP4 input (TRTLLM_CTX_NORM_MXFP8 / TRTLLM_CTX_NORM_FP4);
+# * the MoE at those rows: the fixed-tile TF32 router, the runner's own finalize, then the shared + routed add.
+# Below CTX_STACK_MIN_ROWS the step keeps this target's generic path. Kill constant: False runs every step there.
+# Only eager steps: a breakable prefill graph's captured buckets run the generic path, as the stack never runs inside a
+# capture. The CTX norm (and the MoE hand-off it feeds) starts at CTX_NORM_MIN_ROWS rows, the built-in
+# ``_CTX_NORM_MXFP8_MIN_ROWS``.
+CTX_STACK = True
+CTX_STACK_MIN_ROWS = 4096
+CTX_NORM_MIN_ROWS = _ctx_ops.NORM_MXFP8_MIN_ROWS
+CTX_STACK_PATH = "m3_ctx_stack"
+
+
+def _ctx_stack_step(step: dict, rows: int) -> bool:
+    """Whether this step takes the built-in CTX stack: an eager step with context rows and at least
+    ``CTX_STACK_MIN_ROWS`` rows."""
+    return (
+        CTX_STACK
+        and rows >= CTX_STACK_MIN_ROWS
+        and int(step["num_contexts"]) > 0
+        and not is_in_breakable_cuda_graph()
+    )
+
+
+def _ctx_norm_rows(x: torch.Tensor) -> bool:
+    """Whether a boundary of ``x`` in an eager step reaches the CTX norm's rows."""
+    if isinstance(x, MxFp8QuantizedTensor):
+        x = x.unquantized()
+    return (
+        CTX_STACK
+        and x.dim() == 2
+        and x.shape[0] >= CTX_NORM_MIN_ROWS
+        and not is_in_breakable_cuda_graph()
+    )
+
+
+def _ctx_prequant_linear(
+    core, x: torch.Tensor | MxFp8QuantizedTensor, wk: str, sk: str, low_m_gemm: bool
+) -> torch.Tensor:
+    """Project a call-owned CTX MXFP8 carrier, or use the ordinary BF16 path."""
+    mode = _mx_mode(core.mxfp8)
+    if not isinstance(x, MxFp8QuantizedTensor):
+        return _linear(core, x, wk, sk, low_m_gemm)[0]
+    if mode.decode_graph:
+        return _linear(core, x.unquantized(), wk, sk, low_m_gemm)[0]
+    if not x.is_sf_swizzled:
+        raise ValueError("CTX MXFP8 projection requires swizzled activation scales")
+    act, act_scale = x.quantized()
+    w, s = core.w[wk], core.w[sk]
+    _record("m3_mxfp8_gemm_prequant", tuple(w.shape), x.shape[0])
+    if mode.flashinfer:
+        return torch.ops.trtllm.flashinfer_mm_mxfp8(act, act_scale, w, s, torch.bfloat16)
+    gemm = (
+        torch.ops.trtllm.mxfp8_mxfp8_gemm_autotuned
+        if mode.native_tuning
+        else torch.ops.trtllm.mxfp8_mxfp8_gemm
+    )
+    return gemm(act, act_scale, w, s, core.mx_alpha, torch.bfloat16)
+
+
+def _ctx_fp4_input_scale(core, i: int, rows: int) -> Optional[torch.Tensor]:
+    """The routed experts' NVFP4 fc31 input scale when the CTX norm's NVFP4 output can stand in for their own quantize
+    (one runner call, as the built-in ``MiniMaxM3MoE.fp4_input_scale``); None otherwise."""
+    if rows > core.moe_max_num_tokens:
+        return None
+    scale = core.moe[i].fc31_input_scale
+    if scale.dtype != torch.float32 or scale.numel() != 1:
+        return None
+    return scale
+
+
+def _ctx_reduce_norm(
+    core, x: torch.Tensor, residual: torch.Tensor, norm_w: torch.Tensor, moe_layer=None
+):
+    """The built-in CTX boundary (``MiniMaxM3DecoderLayer._reduce_norm_mxfp8``): the plain all-reduce, then one kernel
+    for the residual add + RMSNorm that returns the next linear's MXFP8 input in a carrier and,
+    before MoE layer ``moe_layer``, the routed experts' NVFP4 input. Returns ``(normed, updated residual, nvfp4)``
+    (``nvfp4`` = (packed e2m1, linear block scales) or None), or None where the built-in keeps the stock boundary."""
+    from tensorrt_llm._torch.modules.linear import ctx_eager_only
+
+    rows, hidden = x.shape[0], x.shape[1]
+    if (
+        not _ctx_ops.NORM_MXFP8
+        or rows < _ctx_ops.NORM_MXFP8_MIN_ROWS
+        or hidden % 256 != 0
+        or hidden // 8 > 1024
+        or x.dtype != torch.bfloat16
+        or not ctx_eager_only()
+    ):
+        return None
+    reduced = m3_allreduce(x, core.allreduce, AllReduceParams(fusion_op=AllReduceFusionOp.NONE))
+    fp4_scale = None
+    if moe_layer is not None and _ctx_ops.NORM_FP4 and _ctx_ops.norm_op_has_fp4():
+        fp4_scale = _ctx_fp4_input_scale(core, moe_layer, rows)
+    if fp4_scale is None:
+        outs = torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+            reduced, residual, norm_w, core.rms_eps, True
+        )
+    else:
+        outs = torch.ops.trtllm.minimax_m3_ctx_residual_rmsnorm_mxfp8(
+            reduced, residual, norm_w, core.rms_eps, True, fp4_scale
+        )
+    normed, act, act_scale = outs[:3]
+    _record("m3_ctx_norm", rows, fp4_scale is not None)
+    taken(
+        CTX_STACK_PATH,
+        rows,
+        "CTX norm + MXFP8" + (" + NVFP4 MoE input" if fp4_scale is not None else ""),
+    )
+    return (
+        MxFp8QuantizedTensor(
+            act,
+            act_scale,
+            is_sf_swizzled=True,
+            unquantized_hidden_states=normed,
+            producer_stream=torch.cuda.current_stream(normed.device),
+        ),
+        reduced,
+        ((outs[3], outs[4]) if fp4_scale is not None else None),
+    )
+
+
+def _ctx_fused_qkv(
+    core, i: int, hidden: torch.Tensor | MxFp8QuantizedTensor, position_ids, step: dict
+):
+    """The built-in fused QKV-index MXFP8 GEMM with the NVFP4 producer in its epilogue
+    (``MiniMaxM3Attention._ctx_fused_qkv_gemm_producer``) over this target's packed QKV weight and caches: Q / index-Q
+    (FP8) out, K / V / index-K written. None where the built-in declines (its row gate, the tuning pass, a cache the
+    kernel's alignment contract does not take); the caller then runs the projection + producer."""
+    from tensorrt_llm._torch.modules.linear import ctx_eager_only
+
+    quantized_input = hidden if isinstance(hidden, MxFp8QuantizedTensor) else None
+    if quantized_input is not None:
+        hidden = quantized_input.unquantized()
+
+    rows = int(hidden.shape[0])
+    manager = step["kv_cache_manager"]
+    if (
+        not _ctx_ops.QKV_FUSED
+        or not ctx_eager_only()
+        or hidden.dim() != 2
+        or not hidden.is_contiguous()
+        or hidden.dtype != torch.bfloat16
+        or not _ctx_ops.qkv_fused_takes_rows(rows)
+        or _ctx_ops.autotuner_tuning()
+        or position_ids is None
+        or manager is None
+        or not _nvfp4_layer(manager, i)
+    ):
+        return None
+    buffers = manager.get_buffers(i, kv_layout="HND")
+    scale_buffers = manager.get_block_scale_buffers(i, kv_layout="HND")
+    index_k_cache = step["msa_idx_k_cache"](i)
+    out_cache_loc = step["msa_out_cache_loc"]
+    kv_quant_scale = core.inv_kv_scales[i]
+    cos_sin = core.rotary_cos_sin
+    # The checks the built-in caller makes and the runner's own argument asserts do not: the RoPE table (64 rotary
+    # dims, fp32), the NVFP4 KV quant scale, and an index-K cache with the main pool's pages.
+    if (
+        buffers is None
+        or scale_buffers is None
+        or not _nvfp4_fused_write_layout(buffers, scale_buffers, core.kv_heads)
+        or index_k_cache.shape[0] != buffers.shape[0]
+        or not kv_quant_scale.is_cuda
+        or kv_quant_scale.dtype != torch.float32
+        or kv_quant_scale.numel() < 3
+        or not kv_quant_scale.is_contiguous()
+        or not cos_sin.is_cuda
+        or cos_sin.dtype != torch.float32
+        or not cos_sin.is_contiguous()
+        or cos_sin.dim() != 3
+        or tuple(cos_sin.shape[1:]) != (2, 32)
+        or out_cache_loc is None
+        or out_cache_loc.dtype != torch.int32
+        or not out_cache_loc.is_contiguous()
+        or out_cache_loc.numel() < rows
+    ):
+        return None
+    w = core.w
+    runner = _ctx_ops.qkv_fused_runner(core.heads, core.kv_heads, core.index_heads)
+    if runner is None:
+        return None
+    q = hidden.new_empty((rows, core.heads, core.head_dim), dtype=torch.float8_e4m3fn)
+    index_q = hidden.new_empty((rows, core.index_heads, core.head_dim), dtype=torch.float8_e4m3fn)
+    prequant = quantized_input.quantized() if quantized_input is not None else None
+    act, act_scale = (
+        prequant if prequant is not None else torch.ops.trtllm.mxfp8_quantize(hidden, True)
+    )
+    try:
+        args = runner.make_args(
+            act.view(rows, -1),
+            act_scale,
+            w[f"l{i}_qkv_w"],
+            w[f"l{i}_qkv_s"],
+            core.mx_alpha,
+            q,
+            index_q,
+            buffers.view(torch.uint8),
+            scale_buffers,
+            index_k_cache,
+            out_cache_loc[:rows],
+            kv_quant_scale,
+            cos_sin,
+            position_ids.reshape(-1).contiguous().to(torch.int32),
+            torch.cat(
+                (w[f"l{i}_q_norm"], w[f"l{i}_k_norm"], w[f"l{i}_idx_q_norm"], w[f"l{i}_idx_k_norm"])
+            ),
+            core.rms_eps,
+        )
+    except (AssertionError, ValueError):
+        # A cache geometry outside the kernel's alignment contract: the caller's projection + producer (the MXFP8
+        # activation taken here is quantized again there, bitwise the same).
+        return None
+    runner.run_args(args)
+    _record("m3_ctx_fused_qkv", rows)
+    taken(CTX_STACK_PATH, rows, "fused QKV GEMM + producer")
+    return q.flatten(1), index_q.flatten(1)
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -2247,6 +2494,7 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         self.mapping = mapping
         # Whether the 9..16-row generation router takes the TF32 tensor-core kernel (set by prebuild_kernels).
         self.router_tc_cluster16 = False
+        self.router_w_split: Dict[int, torch.Tensor] = {}
         self.vocab_size = cfg.vocab_size
         d = _weights.MODEL_WEIGHTS.dims(self)
         self.num_layers = d.num_layers
@@ -2424,6 +2672,25 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
             )
             for i in sorted(self.moe_layers)
         }
+        # The same three-term weight representation as the built-in context gate, with stable refit buffers.
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
+            ROUTER_TF32_FIXED as _CTX_ROUTER_TF32_FIXED,
+        )
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
+            split_router_weight_bf16,
+        )
+        from tensorrt_llm._torch.moe.fused_moe import (
+            router_gemm,  # noqa: F401 - registers the custom op
+        )
+
+        self.router_w_split = (
+            {
+                i: split_router_weight_bf16(self.w[f"l{i}_router"].float())
+                for i in sorted(self.moe_layers)
+            }
+            if _CTX_ROUTER_TF32_FIXED
+            else {}
+        )
         self._build_embed_owners()
         self.prebuild_kernels()
         self._prefill = PrefillTarget(self)
@@ -2431,8 +2698,16 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
         self._built_for = identity
 
     def cache_derived_state(self) -> None:
-        """The staged loaders' entry to the same build (``post_load_weights``)."""
+        """Build the target and refresh captured router weights after in-place refit."""
         self.post_load_weights()
+        from tensorrt_llm._torch._experimental.modeling_v2.models.minimax_m3.ops.context import (
+            split_router_weight_bf16,
+        )
+
+        # post_load_weights intentionally skips rebuilding unchanged storages;
+        # their contents can still change on refit. Captures retain these buffers.
+        for i, cached in self.router_w_split.items():
+            cached.copy_(split_router_weight_bf16(self.w[f"l{i}_router"].float()))
 
     def _derive_moe(self, i: int) -> _MoeScalars:
         """The routed experts' kernel scalars from the checkpoint's per-tensor scales (trtllm-gen NVFP4 layout).
@@ -2864,7 +3139,17 @@ class MiniMaxM3Tp2ModelingV2(DecoderModel):
 _BCG_CORES: Dict[str, "MiniMaxM3Tp2ModelingV2"] = {}
 
 
-def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
+def _msa_attention_live(
+    core,
+    i: int,
+    q,
+    k,
+    v,
+    idx_q,
+    md,
+    output,
+    mxfp8_output: Optional[MiniMaxM3BackendForwardArgs] = None,
+) -> None:
     """The MSA backend over a step's live rows (``md.num_tokens``; a padded step's pad rows of ``output`` are left as
     allocated): the KV write unless a producer wrote the caches, the sparse layers' top-k block selection, the FMHA
     over the context rows and any generation rows beside them."""
@@ -2883,6 +3168,7 @@ def _msa_attention_live(core, i: int, q, k, v, idx_q, md, output) -> None:
         sparse,
         core.inv_kv_scales[i] if nvfp4 else None,
         core.kv_scales[i] if nvfp4 else None,
+        sparse_backend_args=mxfp8_output if output.shape[0] == live else None,
     )
 
 
@@ -3004,12 +3290,21 @@ class PrefillTarget:
         return hidden
 
     def _swiglu_mlp(
-        self, h: torch.Tensor, prefix: str, low_m_gemm: bool, dense: bool = False
+        self,
+        h: torch.Tensor,
+        prefix: str,
+        low_m_gemm: bool,
+        dense: bool = False,
+        prequant: bool = False,
     ) -> torch.Tensor:
         """A gated MXFP8 MLP (the dense MLP, the shared expert): gate_up, SwiGLU-OAI (the dense MLP's on this target's
-        C++ op, ``_dense_swiglu``), down, no reduction."""
+        C++ op, ``_dense_swiglu``), down, no reduction. ``prequant``: the gate_up takes the CTX norm's MXFP8 copy of
+        ``h`` (the built-in CTX stack)."""
         core = self.core
-        gu, _ = _linear(core, h, f"{prefix}_gu_w", f"{prefix}_gu_s", low_m_gemm)
+        if prequant:
+            gu = _ctx_prequant_linear(core, h, f"{prefix}_gu_w", f"{prefix}_gu_s", low_m_gemm)
+        else:
+            gu, _ = _linear(core, h, f"{prefix}_gu_w", f"{prefix}_gu_s", low_m_gemm)
         if dense:
             act = _dense_swiglu(core, gu)
         else:
@@ -3055,14 +3350,54 @@ class PrefillTarget:
         if fused is not None:
             logits, x_fp4, x_sf = fused
             return _routed_experts(core, i, x_fp4, x_sf, logits, True)
-        return self._routed_chunks(i, h, _router_logits(core, i, h))
+        return self._routed_chunks(i, h, _context_router_logits(core, i, h))
 
-    def _moe(self, i: int, h: torch.Tensor, *, return_parts: bool):
+    def _ctx_moe(self, i: int, h: torch.Tensor, nvfp4: Optional[tuple]) -> torch.Tensor:
+        """The built-in MoE forward of a CTX-stack step (``MiniMaxM3MoE.forward``, the shared expert not folded): the
+        fixed-tile TF32 router; the routed experts on the CTX norm's NVFP4 input (``nvfp4``) in one runner call, else on
+        the bf16 activation in the MoE scheduler's chunks, each finalized by the runner; the shared expert beside them
+        (its gate_up on the CTX norm's MXFP8 copy); then the shared + routed add."""
+        core = self.core
+        shared_input = h
+        if isinstance(h, MxFp8QuantizedTensor):
+            h = h.unquantized()
+
+        def _routed():
+            logits = _context_router_logits(core, i, h)
+            if nvfp4 is not None:
+                return _routed_experts(core, i, nvfp4[0], nvfp4[1], logits, True)
+            return self._routed_chunks(i, h, logits)
+
+        routed_out, shared_out = maybe_execute_in_parallel(
+            _routed,
+            lambda: self._swiglu_mlp(shared_input, f"l{i}_sh", False, prequant=True),
+            core.moe_events[i][0],
+            core.moe_events[i][1],
+            None if flashinfer_mxfp8_autotune_active() else core.aux_stream_moe,
+            disable_on_compile=True,
+        )
+        taken(CTX_STACK_PATH, h.shape[0], "built-in MoE forward")
+        return shared_out.add_(routed_out)
+
+    def _moe(
+        self,
+        i: int,
+        h: torch.Tensor,
+        *,
+        return_parts: bool,
+        ctx: bool = False,
+        ctx_nvfp4: Optional[tuple] = None,
+    ):
         """The MoE block of layer ``i`` without its reduction. Returns ``(out, routed)``: with ``return_parts`` the
         shared and routed parts (routed None when the engine folded the shared expert in), else their sum in
-        ``out``."""
+        ``out``. ``ctx``: a CTX-stack step at the CTX norm's rows, the built-in MoE forward (``_ctx_moe``)."""
         core = self.core
+        shared_input = h
+        if isinstance(h, MxFp8QuantizedTensor):
+            h = h.unquantized()
         rows = h.shape[0] if h.dim() == 2 else 0
+        if ctx and not return_parts and h.dim() == 2:
+            return self._ctx_moe(i, shared_input, ctx_nvfp4), None
         if (
             h.dim() == 2
             and h.dtype == torch.bfloat16
@@ -3077,8 +3412,10 @@ class PrefillTarget:
                 return folded, None
         if not return_parts and _triton_finalize_rows(core, h):
             routed_parts, shared_out = maybe_execute_in_parallel(
-                lambda: _routed_experts(core, i, h, None, _router_logits(core, i, h), False),
-                lambda: self._swiglu_mlp(h, f"l{i}_sh", False),
+                lambda: _routed_experts(
+                    core, i, h, None, _context_router_logits(core, i, h), False
+                ),
+                lambda: self._swiglu_mlp(shared_input, f"l{i}_sh", False),
                 core.moe_events[i][0],
                 core.moe_events[i][1],
                 None if flashinfer_mxfp8_autotune_active() else core.aux_stream_moe,
@@ -3087,7 +3424,7 @@ class PrefillTarget:
             return _triton_finalize(rows, routed_parts, shared_out), None
         routed_out, shared_out = maybe_execute_in_parallel(
             lambda: self._routed(i, h),
-            lambda: self._swiglu_mlp(h, f"l{i}_sh", False),
+            lambda: self._swiglu_mlp(shared_input, f"l{i}_sh", False),
             core.moe_events[i][0],
             core.moe_events[i][1],
             # The warmup tuning pass profiles the shared expert's GEMMs: keep it on the main stream, between the
@@ -3112,6 +3449,20 @@ class PrefillTarget:
             x = x.add_(x2)
         return _native_allreduce_norm(core, x, residual, norm_w)
 
+    def _boundary(self, i: int, x, x2, residual, capture_layer: bool = False):
+        """The boundary of layer ``i`` into the next layer's input norm (the final norm after the last layer). At the
+        CTX norm's rows a boundary into a next decoder layer is the built-in CTX one (the next QKV takes its MXFP8
+        copy), on the shared + routed sum; otherwise ``_generic_boundary``. An Eagle3 capture layer keeps the generic
+        boundary, as the built-in turns its post-feed-forward fusion off there."""
+        core = self.core
+        if i != core.num_layers - 1 and not capture_layer and _ctx_norm_rows(x):
+            if x2 is not None:
+                x, x2 = x.add_(x2), None
+            fused = _ctx_reduce_norm(core, x, residual, _next_norm(core, i))
+            if fused is not None:
+                return fused[0], fused[1]
+        return self._generic_boundary(x, x2, residual, _next_norm(core, i))
+
     def _layer(self, i: int, position_ids, hidden, residual, step, spec_metadata, capture):
         """Layer ``i`` in its generic form: input norm (first layer without the fused embedding), attention, the
         attention boundary, the MoE (or the dense MLP) and the boundary into the next layer's input norm, every
@@ -3122,7 +3473,18 @@ class PrefillTarget:
             residual = hidden
             hidden = flashinfer_rmsnorm(hidden, core.w[f"l{i}_in_norm"], core.rms_eps)
         hidden, _ = self._attention(i, position_ids, hidden, step)
-        if _can_mc(hidden):
+        moe_layer = i in core.moe_layers
+        ctx_norm = (
+            _ctx_reduce_norm(
+                core, hidden, residual, core.w[f"l{i}_post_norm"], i if moe_layer else None
+            )
+            if _ctx_norm_rows(hidden)
+            else None
+        )
+        ctx_nvfp4 = None
+        if ctx_norm is not None:
+            hidden, residual, ctx_nvfp4 = ctx_norm
+        elif _can_mc(hidden):
             fused = _mc_allreduce_norm(core, hidden, None, residual, core.w[f"l{i}_post_norm"])
             hidden, residual = (
                 fused
@@ -3133,21 +3495,34 @@ class PrefillTarget:
             hidden, residual = _native_allreduce_norm(
                 core, hidden, residual, core.w[f"l{i}_post_norm"]
             )
-        if i in core.moe_layers:
+        if moe_layer:
             # Row ranges at this dispatch: 9..48 rows take the decode target's generic MC finalize boundary (as the agg
             # canon's generic layer does on every step, context rows included: the MoE unfinalized, its finalize +
             # shared expert in the multicast all-reduce + residual + next norm); the CTX stack starts at 4096 rows.
-            folded = core._decode._generic_mc_finalize(i, hidden, residual, _next_norm(core, i))
+            folded = (
+                core._decode._generic_mc_finalize(i, hidden, residual, _next_norm(core, i))
+                if ctx_norm is None
+                else None
+            )
             if folded is not None:
                 if spec_metadata is not None and spec_metadata.is_layer_capture(i):
                     capture(spec_metadata, i, folded[1], None)
                 return folded
-            out, routed = self._moe(i, hidden, return_parts=_can_mc(hidden, folded=True))
+            out, routed = self._moe(
+                i,
+                hidden,
+                return_parts=_can_mc(hidden, folded=True),
+                ctx=_ctx_stack_step(step, hidden.shape[0]) and _ctx_norm_rows(hidden),
+                ctx_nvfp4=ctx_nvfp4,
+            )
         else:
-            out = self._swiglu_mlp(hidden, f"l{i}_mlp", True, dense=True)
+            out = self._swiglu_mlp(
+                hidden, f"l{i}_mlp", True, dense=True, prequant=ctx_norm is not None
+            )
             routed = None
-        normed, updated = self._generic_boundary(out, routed, residual, _next_norm(core, i))
-        if spec_metadata is not None and spec_metadata.is_layer_capture(i):
+        capture_layer = spec_metadata is not None and spec_metadata.is_layer_capture(i)
+        normed, updated = self._boundary(i, out, routed, residual, capture_layer)
+        if capture_layer:
             capture(spec_metadata, i, updated, None)
         return normed, updated
 
@@ -3174,8 +3549,10 @@ class PrefillTarget:
                     "(fuse_qkv_index_projection)"
                 )
             return self._unfused_sparse_attention(i, position_ids, hidden, step)
-        packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
         if is_in_breakable_cuda_graph():
+            # A captured bucket: the projection is captured, the producer + core run in the eager boundary. The CTX
+            # stack never runs here (``_ctx_stack_step`` is eager-only).
+            packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
             output = packed.new_empty(
                 (packed.shape[0], core.heads * core.head_dim), dtype=torch.bfloat16
             )
@@ -3183,6 +3560,16 @@ class PrefillTarget:
                 packed, position_ids, None, None, None, None, output, self._bcg_key, i
             )
             return _linear(core, output, f"l{i}_o_w", f"l{i}_o_s", True)
+        ctx = _ctx_stack_step(step, hidden.shape[0])
+        if ctx:
+            horizontal = _ctx_fused_qkv(core, i, hidden, position_ids, step)
+            if horizontal is not None:
+                q, idx_q = horizontal
+                if _ctx_ops.P5A_COMBINE_MXFP8:
+                    return self._ctx_core_then_o_proj(i, q, idx_q, step, "p5a"), False
+                o = self._attention_core(i, q, None, None, idx_q, step)
+                return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
+        packed, _ = _linear(core, hidden, f"l{i}_qkv_w", f"l{i}_qkv_s", True)
         horizontal = _sparse_qkv_producer(
             core,
             i,
@@ -3198,8 +3585,30 @@ class PrefillTarget:
                 "pool with an FP8 index-K cache)"
             )
         q, idx_q = horizontal
+        if ctx:
+            return self._ctx_core_then_o_proj(i, q, idx_q, step, "horizontal"), False
         o = self._attention_core(i, q, None, None, idx_q, step)
         return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
+
+    def _ctx_core_then_o_proj(self, i: int, q, idx_q, step: dict, site: str) -> torch.Tensor:
+        """Pass a complete eager combine's call-owned MXFP8 result to its projection."""
+        from tensorrt_llm._torch.attention.backends.fmha import msa_combine_mxfp8
+        from tensorrt_llm._torch.modules.linear import ctx_eager_only
+
+        core = self.core
+        padded = getattr(step["metadata"], "padded_num_tokens", None) is not None
+        if not ctx_eager_only() or padded:
+            o = self._attention_core(i, q, None, None, idx_q, step)
+            return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)[0]
+        accepts_mxfp8 = not _mx_mode(core.mxfp8).decode_graph
+        request = MiniMaxM3BackendForwardArgs(
+            mxfp8_output=accepts_mxfp8, mxfp8_skip_bf16=accepts_mxfp8
+        )
+        output = self._attention_core(i, q, None, None, idx_q, step, request)
+        projection_input = request.mxfp8_result if request.mxfp8_result is not None else output
+        projected = _ctx_prequant_linear(core, projection_input, f"l{i}_o_w", f"l{i}_o_s", True)
+        msa_combine_mxfp8.log_consumed(projection_input)
+        return projected
 
     def _unfused_sparse_attention(self, i: int, position_ids, hidden, step):
         """A sparse layer without the five-way projection (``fuse_qkv_index_projection=False``): the QKV projection
@@ -3216,7 +3625,10 @@ class PrefillTarget:
             return fused.split([core.q_size, core.kv_size, core.kv_size], dim=-1)
 
         def _index():
-            idx_qk = m3_bf16_linear(hidden, core.w[f"l{i}_idx_w"])
+            index_input = (
+                hidden.unquantized() if isinstance(hidden, MxFp8QuantizedTensor) else hidden
+            )
+            idx_qk = m3_bf16_linear(index_input, core.w[f"l{i}_idx_w"])
             return _fp8_index_qk_norm_rope(
                 core, i, idx_qk, position_ids, step["msa_idx_k_cache"], step["msa_out_cache_loc"]
             )
@@ -3232,7 +3644,16 @@ class PrefillTarget:
         o = self._attention_core(i, q, k, v, idx_q, step)
         return _linear(core, o, f"l{i}_o_w", f"l{i}_o_s", True)
 
-    def _attention_core(self, i: int, q, k, v, idx_q, step) -> torch.Tensor:
+    def _attention_core(
+        self,
+        i: int,
+        q,
+        k,
+        v,
+        idx_q,
+        step,
+        mxfp8_output: Optional[MiniMaxM3BackendForwardArgs] = None,
+    ) -> torch.Tensor:
         """The attention core over the step's live tokens (a padded step's pad rows are left as allocated): the MSA
         backend (``m3_msa_attention``: the KV write unless a producer wrote the caches, the sparse layers' top-k block
         selection, the FMHA over the context rows and any generation rows beside them)."""
@@ -3242,7 +3663,7 @@ class PrefillTarget:
             # The live row count is a host value of the step: read at every replay inside the eager boundary.
             _prefill_attention_eager(None, None, q, k, v, idx_q, output, self._bcg_key, i)
         else:
-            _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output)
+            _msa_attention_live(core, i, q, k, v, idx_q, step["metadata"], output, mxfp8_output)
         return output
 
 

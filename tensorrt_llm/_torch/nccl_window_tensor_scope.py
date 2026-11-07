@@ -80,6 +80,7 @@ def _cuda_tensors(
     elif isinstance(value, MxFp8QuantizedTensor):
         _cuda_tensors(value.fp8_tensor, tensors, visited, include_dataclasses)
         _cuda_tensors(value.scaling_factor, tensors, visited, include_dataclasses)
+        _cuda_tensors(value.unquantized_hidden_states, tensors, visited, include_dataclasses)
     elif is_dataclass(value) and not isinstance(value, type):
         if not include_dataclasses:
             return
