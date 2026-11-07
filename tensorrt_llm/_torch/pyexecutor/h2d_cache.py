@@ -207,11 +207,14 @@ def copy_h2d_pool_shared(dst: torch.Tensor, src: torch.Tensor, pack: bool = Fals
     Every graph key's metadata takes its buffers from one pool, which hands the same block to each key that asks
     for the same buffer name, and the captured graphs write some of those blocks on the device at every replay. The
     host shadow therefore does not describe the device contents, so such a copy is never skipped. ``pack``: as for
-    ``copy_h2d_if_changed``, the copy may join the open ``step_inputs`` pack when a cache is active.
+    ``copy_h2d_if_changed``, the copy may join the open ``step_inputs`` pack.
     """
     cache = _active.get()
     if cache is None:
-        dst.copy_(src, non_blocking=True)
+        if pack:
+            step_inputs.copy_(dst, src)
+        else:
+            dst.copy_(src, non_blocking=True)
         return True
     if SKIP_POOL_SHARED_UPLOADS:
         return cache.copy(dst, src, pack)

@@ -11,7 +11,11 @@ import torch
 
 from tensorrt_llm._torch.pyexecutor import h2d_cache, step_inputs
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner, KeyType
-from tensorrt_llm._torch.pyexecutor.h2d_cache import H2DSkipCache, copy_h2d_if_changed
+from tensorrt_llm._torch.pyexecutor.h2d_cache import (
+    H2DSkipCache,
+    copy_h2d_if_changed,
+    copy_h2d_pool_shared,
+)
 from tensorrt_llm._torch.pyexecutor.step_inputs import StepInputPack
 
 
@@ -511,12 +515,13 @@ def test_skip_cache_copies_join_the_active_pack(pack):
     assert dst.tolist() == [4, 5, 6]
 
 
+@pytest.mark.parametrize("copy", [copy_h2d_if_changed, copy_h2d_pool_shared])
 @pytest.mark.parametrize("pack_copy", [True, False])
-def test_copy_h2d_if_changed_without_a_cache_follows_pack(pack, pack_copy):
+def test_copy_h2d_without_a_cache_follows_pack(pack, pack_copy, copy):
     dst = _zeros(3)
 
     step_inputs.begin()
-    assert copy_h2d_if_changed(dst, _host([4, 5, 6]), pack=pack_copy) is True
+    assert copy(dst, _host([4, 5, 6]), pack=pack_copy) is True
     torch.cuda.synchronize()
     assert dst.tolist() == ([0, 0, 0] if pack_copy else [4, 5, 6])
     step_inputs.flush()
