@@ -114,11 +114,11 @@ class NGramPoolManager(BaseResourceManager):
                     # 1. the pattern does not exist in the pool
                     # 2. only one match is kept, and the new match is longer (MRU)
                     pool[pattern] = OrderedSet((new_match, ))
-                elif new_match not in pool[pattern]:
+                elif self.is_keep_all and new_match not in pool[pattern]:
                     # Update the matches if the pattern is already existed:
                     # TODO: need a strategy to maintain the short candidates, now we just remove them
                     # Drop all existed matches with small length
-                    for match in pool[pattern]:
+                    for match in list(pool[pattern]):
                         if len(match) < len(new_match):
                             pool[pattern].remove(match)
                     pool[pattern].add(new_match)
