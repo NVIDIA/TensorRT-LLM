@@ -1,8 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/baaedfdb2d3f1d70b7dbcde08b083abfe6017a92/tests/utils.py
 import os
 import subprocess
-import sys
 import tempfile
 import time
 from typing import List, Optional
@@ -88,7 +89,9 @@ class RemoteOpenAIServer:
             self.log_file = open(self.log_path, "w+")
             return self.log_file
         else:
-            return sys.stdout
+            # Inherit process descriptors; pytest's sys.stdout capture wrapper
+            # may not provide the fileno() required by subprocess.Popen.
+            return None
 
     def __enter__(self):
         return self

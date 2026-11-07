@@ -40,6 +40,40 @@ def mod():
     return module
 
 
+@pytest.mark.parametrize("quote", ["", "'", '"'])
+def test_collect_multinode_yaml_entries(mod, tmp_path, quote):
+    path = tmp_path / "multinode.yml"
+    path.write_text(
+        "tests:\n"
+        f"  - case: {quote}accuracy/test_model.py::TestModel::test_accuracy[baseline]{quote}\n"
+        "    launch:\n"
+        "      mode: mpi\n"
+        "      world_size: 16\n"
+        f"  - case: {quote}test_e2e.py::test_disagg{quote}\n"
+        "    launch:\n"
+        "      mode: per_node\n"
+        "      nodes: 2\n"
+        "      tasks_per_node: 1\n"
+        "      gpus_per_node: 4\n",
+        encoding="utf-8",
+    )
+    entries, malformed = mod.collect_entries(str(tmp_path))
+    assert not malformed
+    assert dict(entries) == {
+        ("accuracy/test_model.py", "TestModel", "test_accuracy", "baseline"): [f"{path}:2"],
+        ("test_e2e.py", None, "test_disagg", None): [f"{path}:6"],
+    }
+
+
+@pytest.mark.parametrize("value", ["", "   ", "''", '""', "'   '", '"   "'])
+def test_collect_multinode_yaml_blank_case(mod, tmp_path, value):
+    path = tmp_path / "multinode.yml"
+    path.write_text(f"tests:\n  - case: {value}\n", encoding="utf-8")
+    entries, malformed = mod.collect_entries(str(tmp_path))
+    assert not entries
+    assert malformed == [f"{path}:2: case: {value}".rstrip()]
+
+
 def _index(mod, tmp_path, src: str, name: str = "mod_under_test.py"):
     """Write ``src`` to a temp file and return build_ast_index's result."""
     p = tmp_path / name
@@ -365,6 +399,31 @@ def test_verify_qa_test_lists_clears_stale_file(mod, tmp_path, monkeypatch):
     result = (llm_src / "qa_test.txt").read_text().splitlines()
     assert "accuracy/test_old.py::test_stale[b]" not in result
     assert result == ["accuracy/test_new.py::test_current[a]"]
+
+
+def test_verify_qa_yaml_membership_and_waives(mod, tmp_path, monkeypatch):
+    qa_dir = tmp_path / "tests" / "integration" / "test_lists" / "qa"
+    qa_dir.mkdir(parents=True)
+    case = "accuracy/test_llm_api_pytorch.py::TestQwen3_8_2_4T_A95B::test_fp8_tp16_mtp3_trtllm"
+    (qa_dir / "multinode.yml").write_text(
+        f"defaults:\n  launch:\n    mode: mpi\n    world_size: 16\ntests:\n  - case: '{case}'\n",
+        encoding="utf-8",
+    )
+    (qa_dir / "other.yml").write_text("other: []\n", encoding="utf-8")
+    (qa_dir.parent / "waives.txt").write_text(f"{case} SKIP reason\n", encoding="utf-8")
+    collected = []
+
+    def collect(llm_src, path):
+        collected.extend(Path(path).read_text().splitlines())
+
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "_run_collection_pytest", collect)
+    mod.verify_qa_test_lists(str(tmp_path))
+    assert collected == [case]
+    assert (tmp_path / "qa_test.txt").read_text().splitlines() == [case]
+    assert mod.load_collectable_entries(str(tmp_path)) == {mod.parse_test_entry(case)}
+    mod.verify_waive_list(str(tmp_path), mod.argparse.Namespace(l0=False, qa=True))
+    assert not (tmp_path / "nonexits_cases.json").exists()
 
 
 # --------------------------------------------------------------------------
