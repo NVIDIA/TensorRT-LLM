@@ -147,6 +147,7 @@ class PeriodicJUnitXML:
 
         # LogXML will be created only when generating reports
         self.logxml: Optional[LogXML] = None
+        self._serialized_testcases: dict[object, str] = {}
         self.config = None
 
     def _log_info(self, message):
@@ -193,6 +194,7 @@ class PeriodicJUnitXML:
             return
 
         # Initialize the LogXML plugin (pytest's built-in junitxml reporter)
+        self._serialized_testcases.clear()
         self.logxml = LogXML(
             self.xmlpath,
             None,  # prefix
@@ -365,13 +367,27 @@ class PeriodicJUnitXML:
                     hostname=platform.node(),
                 )
 
-                # Add all test cases using pytest's node reporters
+                # Finalized reporters are immutable. Reports from other xdist
+                # workers can still update active test cases between saves.
+                active_reporters = set(self.logxml.node_reporters.values())
+                testcase_xml = []
                 for node_reporter in self.logxml.node_reporters_ordered:
-                    suite_node.append(node_reporter.to_xml())
+                    serialized = self._serialized_testcases.get(node_reporter)
+                    if serialized is None:
+                        serialized = ET.tostring(node_reporter.to_xml(),
+                                                 encoding="unicode")
+                        if node_reporter not in active_reporters:
+                            self._serialized_testcases[
+                                node_reporter] = serialized
+                    testcase_xml.append(serialized)
 
-                testsuites = ET.Element("testsuites")
-                testsuites.append(suite_node)
-                logfile.write(ET.tostring(testsuites, encoding="unicode"))
+                suite_xml = ET.tostring(suite_node,
+                                        encoding="unicode",
+                                        short_empty_elements=False)
+                logfile.write("<testsuites>")
+                logfile.write(suite_xml.removesuffix("</testsuite>"))
+                logfile.write("".join(testcase_xml))
+                logfile.write("</testsuite></testsuites>")
 
             # Atomic rename to final location
             os.replace(temp_file, output_file)
