@@ -189,6 +189,10 @@ def test_fp8_config_preserves_mtp_exclusions(tmp_path: Path, language_model_only
                 "model.visual.blocks.0.attn.qkv",
                 "mtp.layers.0.mlp.shared_expert.down_proj",
                 "mtp.layers.0.self_attn.q_proj",
+                "mtp.fc_embedding",
+                "mtp.fc_hidden",
+                "mtp.hyper_connection_mixer.input_mix_weight_down",
+                "mtp.hyper_connection_mixer.input_mix_weight_up",
             ],
         },
     }
@@ -214,6 +218,15 @@ def test_fp8_config_preserves_mtp_exclusions(tmp_path: Path, language_model_only
     assert quant_config.is_module_excluded_from_quantization(
         f"model.layers.{mtp_layer}.self_attn.q_proj"
     )
+    for module_name in (
+        "fc_embedding",
+        "fc_hidden",
+        "shared_head.hyper_connection_mixer.input_mix_weight_down",
+        "shared_head.hyper_connection_mixer.input_mix_weight_up",
+    ):
+        assert quant_config.is_module_excluded_from_quantization(
+            f"model.layers.{mtp_layer}.{module_name}"
+        )
 
 
 def test_vision_attention_does_not_inherit_text_sparse_config(monkeypatch) -> None:
