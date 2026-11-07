@@ -15,10 +15,12 @@
 """Tests for tunable FP4 quantization (TRTLLM vs FlashInfer backends)."""
 
 import unittest
+from unittest.mock import patch
 
 import pytest
 import torch
 from parameterized import parameterized
+from torch._subclasses.fake_tensor import FakeTensorMode
 from utils.util import skip_pre_blackwell_unittest, unittest_name_func
 
 import tensorrt_llm
@@ -39,6 +41,74 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
         tensorrt_llm.logger.set_level("warning")
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
+
+    @parameterized.expand(
+        [
+            (num_rows, num_columns, input_dtype, is_sf_swizzled_layout)
+            for num_rows, num_columns, is_sf_swizzled_layout in (
+                (1, 512, False),
+                (128, 512, False),
+                (128, 512, True),
+                (256, 3840, False),
+                (256, 3840, True),
+                (1344, 3840, False),
+            )
+            for input_dtype in (torch.bfloat16, torch.float16)
+        ],
+        name_func=unittest_name_func,
+    )
+    @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
+    def test_forced_flashinfer_dispatch_preserves_layout(
+        self,
+        num_rows: int,
+        num_columns: int,
+        input_dtype: torch.dtype,
+        is_sf_swizzled_layout: bool,
+    ) -> None:
+        """Preserve activation rows and the requested scale-factor layout."""
+        from tensorrt_llm._torch.custom_ops import torch_custom_ops
+
+        input_tensor = torch.randint(-4, 5, (num_rows, num_columns), device="cuda").to(input_dtype)
+        input_tensor[:, ::16] = 6
+        block_scales = torch.exp2(
+            torch.randint(-2, 3, (num_rows, num_columns // 16), device="cuda").float()
+        )
+        input_tensor.mul_(block_scales.repeat_interleave(16, dim=1))
+        input_scale = torch.ones((), dtype=torch.float32, device="cuda")
+        expected_values, expected_scales = torch.ops.trtllm.fp4_quantize(
+            input_tensor, input_scale, 16, False, is_sf_swizzled_layout
+        )
+
+        with patch.object(
+            torch_custom_ops,
+            "_flashinfer_nvfp4_quantize",
+            wraps=torch_custom_ops._flashinfer_nvfp4_quantize,
+        ) as flashinfer_quantize:
+            actual_values, actual_scales = torch_custom_ops._fp4_quantize_dispatch(
+                input_tensor,
+                input_scale,
+                16,
+                False,
+                is_sf_swizzled_layout,
+                torch_custom_ops.Fp4QuantTactic.FLASHINFER,
+            )
+
+        flashinfer_quantize.assert_called_once()
+        torch.testing.assert_close(actual_values, expected_values, atol=0, rtol=0)
+        torch.testing.assert_close(actual_scales, expected_scales, atol=0, rtol=0)
+
+    @parameterized.expand([(False, 32), (True, 4096)], name_func=unittest_name_func)
+    def test_fake_quantizer_scale_layout(
+        self, is_sf_swizzled_layout: bool, expected_scale_size: int
+    ) -> None:
+        with FakeTensorMode():
+            input_tensor = torch.empty((1, 512), dtype=torch.bfloat16, device="cuda")
+            input_scale = torch.empty((), dtype=torch.float32, device="cuda")
+            quantized, scales = torch.ops.trtllm.tunable_fp4_quantize(
+                input_tensor, input_scale, 16, False, is_sf_swizzled_layout
+            )
+        self.assertEqual(quantized.shape, (1, 256))
+        self.assertEqual(scales.shape, (expected_scale_size,))
 
     @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
     @parameterized.expand(
