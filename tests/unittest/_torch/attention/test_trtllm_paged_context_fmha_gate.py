@@ -172,6 +172,8 @@ def _make_dispatch_inputs(num_contexts):
     forward_args = SimpleNamespace(
         sparse_runtime_params=SimpleNamespace(block_sparse_inputs=None),
         attention_mask=PredefinedAttentionMask.CAUSAL,
+        variable_window_token_starts=None,
+        variable_window_token_ends=None,
         update_kv_cache=True,
         kv_append=None,
     )
