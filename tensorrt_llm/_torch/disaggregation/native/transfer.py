@@ -4467,6 +4467,7 @@ class TransferWorkerConfig:
 
 class TransferWorker:
     def __init__(self, config: TransferWorkerConfig):
+        self._shutdown_prepared = False
         self._config = config
         self._retirement_watchdog = None
         if config.quiescence_fatal_callback is not None:
@@ -4655,8 +4656,9 @@ class TransferWorker:
         assert self._rank_info is not None
         return self._rank_info.page_table
 
-    def shutdown(self):
-        if getattr(self, "_shutdown", False):
+    def prepare_shutdown(self) -> None:
+        """Drain transfers and stop listeners while retaining registered memory."""
+        if getattr(self, "_shutdown_prepared", False):
             return
         self.request_shutdown()
         watchdog = getattr(self, "_retirement_watchdog", None)
@@ -4676,6 +4678,12 @@ class TransferWorker:
             receiver.shutdown()
         if rank_info_server is not None:
             rank_info_server.shutdown()
+        self._shutdown_prepared = True
+
+    def shutdown(self):
+        if getattr(self, "_shutdown", False):
+            return
+        self.prepare_shutdown()
         self._shutdown = True
         # Deregister NIXL memory before agent.shutdown so pinned GPU memory is released
         # (e.g. when the KV cache manager is recreated after profiling).
