@@ -203,14 +203,20 @@ def test_glm52_high_throughput_matches(_on_sm107, monkeypatch, mode, draft_len, 
 
 
 @pytest.mark.parametrize(
-    "mapping_overrides, kv_dtype, backend, index_n_heads",
+    "mapping_overrides, kv_dtype, backend, index_n_heads, missed",
     [
-        (dict(enable_attention_dp=False), "nvfp4", "MEGAMOE_CUTEDSL", 32),
-        (dict(moe_ep_size=1, moe_tp_size=16), "nvfp4", "MEGAMOE_CUTEDSL", 32),
-        (dict(world_size=8, tp_size=8, moe_ep_size=8), "nvfp4", "MEGAMOE_CUTEDSL", 32),
-        (dict(), "fp8", "MEGAMOE_CUTEDSL", 32),
-        (dict(), "nvfp4", "CUTLASS", 32),
-        (dict(), "nvfp4", "MEGAMOE_CUTEDSL", 64),
+        (dict(enable_attention_dp=False), "nvfp4", "MEGAMOE_CUTEDSL", 32, "attention_dp=False"),
+        (dict(moe_ep_size=1, moe_tp_size=16), "nvfp4", "MEGAMOE_CUTEDSL", 32, r"moe_ep=1\b"),
+        (
+            dict(world_size=8, tp_size=8, moe_ep_size=8),
+            "nvfp4",
+            "MEGAMOE_CUTEDSL",
+            32,
+            "world_size=8",
+        ),
+        (dict(), "fp8", "MEGAMOE_CUTEDSL", 32, r"KV cache .*FP8"),
+        (dict(), "nvfp4", "CUTLASS", 32, "moe_backend=CUTLASS"),
+        (dict(), "nvfp4", "MEGAMOE_CUTEDSL", 64, "index_n_heads=64"),
     ],
     ids=[
         "no-attention-dp",
@@ -222,20 +228,29 @@ def test_glm52_high_throughput_matches(_on_sm107, monkeypatch, mode, draft_len, 
     ],
 )
 def test_glm52_high_throughput_near_misses(
-    _on_sm107, mapping_overrides, kv_dtype, backend, index_n_heads
-):
+    _on_sm107,
+    mapping_overrides: dict,
+    kv_dtype: str,
+    backend: str,
+    index_n_heads: int,
+    missed: str,
+) -> None:
     config = _model_config(
         _glm52_config(index_n_heads=index_n_heads), **dict(_DEP16, **mapping_overrides)
     )
     config.moe_backend = backend
     kwargs = dict(kv_cache_config=KvCacheConfig(dtype=kv_dtype))
     assert modeling_v2_resolve(config, _llm_args("auto", **kwargs)) is None
-    with pytest.raises(ValueError, match="high-throughput"):
+    with pytest.raises(ValueError, match=missed):
         modeling_v2_resolve(config, _llm_args("require", **kwargs))
 
 
-def test_glm52_high_throughput_declines_sm103():
+def test_glm52_high_throughput_declines_sm103() -> None:
     config = _model_config(_glm52_config(index_n_heads=32), **_DEP16)
     config.moe_backend = "MEGAMOE_CUTEDSL"
     args = _llm_args("auto", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
     assert modeling_v2_resolve(config, args) is None
+    with pytest.raises(ValueError, match=r"compute capability \(10, 3\)"):
+        modeling_v2_resolve(
+            config, _llm_args("require", kv_cache_config=KvCacheConfig(dtype="nvfp4"))
+        )

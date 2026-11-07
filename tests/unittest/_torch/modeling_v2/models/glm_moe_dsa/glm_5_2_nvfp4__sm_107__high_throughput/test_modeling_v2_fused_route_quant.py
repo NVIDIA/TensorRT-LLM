@@ -8,7 +8,6 @@ import pytest
 import torch
 
 import tensorrt_llm  # noqa: F401
-from tensorrt_llm._torch._experimental.modeling_v2._router_index import NoTarget
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 7),
@@ -17,14 +16,11 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(scope="module")
-def native_ops():
-    try:
-        target = import_module(
-            "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
-            "glm_5_2_nvfp4__sm_107__high_throughput"
-        )
-    except NoTarget as error:
-        pytest.skip(str(error))
+def native_ops() -> torch._ops._OpNamespace:
+    target = import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.glm_moe_dsa."
+        "glm_5_2_nvfp4__sm_107__high_throughput"
+    )
     return target.native_ops
 
 

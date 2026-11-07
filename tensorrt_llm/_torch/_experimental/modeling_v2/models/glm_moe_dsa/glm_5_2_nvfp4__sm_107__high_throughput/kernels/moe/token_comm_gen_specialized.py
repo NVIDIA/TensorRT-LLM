@@ -94,6 +94,7 @@ from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.helpers.utils import (
 )
 from tensorrt_llm._torch.moe.kernels.cutedsl_megamoe.quant_def import QuantKind
 
+from .constants import GEN_TOKEN_BUCKETS
 from .ptx import ld_relaxed_sys_b64, st_relaxed_sys_b64
 
 
@@ -330,7 +331,7 @@ class GenphaseTokenComm(KernelComponent):
         self.refine_participant_groups = impl_desc["refine_participant_groups"]
         self.refine_output_stages = impl_desc["refine_output_stages"]
         self.smem_limit_bytes = impl_desc.get("smem_limit_bytes", self.default_smem_limit_bytes)
-        mid_batch = self.max_tokens_per_rank in (32, 64, 128, 192)
+        mid_batch = self.max_tokens_per_rank in GEN_TOKEN_BUCKETS
         # One system-scope publication per step on that shape: one CTA sends the top-k plane to every peer and
         # publishes all ready flags after a single system fence, and the pushers count their drains on a GPU-scope
         # counter so that one of them publishes the payload flags for all of them after a single system fence.

@@ -32,7 +32,6 @@
 
 import copy
 import math
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -757,8 +756,8 @@ class Glm52DecoderLayer(DecoderLayer):
         )
 
         self.fusion_config = EagerFusionConfig()
-        self.enable_fusion = os.environ.get("TRTLLM_DEEPSEEK_EAGER_FUSION_DISABLED", "0") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
+        # This target requires attention DP, whose ranks process different tokens.
+        self.enable_fusion = False
 
         quant_config = self._get_decoder_layer_quant_config(model_config, layer_idx)
         # For MIXED_PRECISION, the global quant_algo doesn't map to a single

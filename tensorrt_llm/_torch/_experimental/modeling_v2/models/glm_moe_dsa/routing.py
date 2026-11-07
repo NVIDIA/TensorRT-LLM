@@ -168,6 +168,7 @@ def route(
 
         return ModelingV2Glm52Nvfp4Sm107LowLatency
 
+    # Replicated attention and expert-sharded MoE across 4 or 16 ranks.
     dep4_or_16 = (
         mapping.world_size == mapping.tp_size == mapping.moe_ep_size
         and mapping.world_size in (4, 16)
@@ -287,6 +288,7 @@ def route(
         f"quantization {quantization}, "
         f"world_size={mapping.world_size} tp={mapping.tp_size} moe_ep={mapping.moe_ep_size} "
         f"moe_tp={mapping.moe_tp_size} attention_dp={mapping.enable_attention_dp} "
+        f"moe_backend={getattr(model_config, 'moe_backend', None)} "
         f"pp={mapping.pp_size} cp={mapping.cp_size}, speculative decoding {spec}; "
         f"KV cache {kv_cache_quant_algo or 'bf16'}; "
         "the glm_moe_dsa targets are GLM-5.2-NVFP4 on sm107, TP4/TP8/TP16 (4/8/16 ranks, "
