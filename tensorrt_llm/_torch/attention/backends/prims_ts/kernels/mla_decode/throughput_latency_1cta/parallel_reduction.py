@@ -353,17 +353,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
                     cutlass.const_expr(lane_slot_i == 0)
                     or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
                 ):
-                    stats_split_idx = lane_idx + Int32(
+                    weight_split_idx = lane_idx + Int32(
                         lane_slot_i * GMEM_REDUCTION_WARP_LANES
                     )
-                    if stats_split_idx < split_limit:
+                    if weight_split_idx < split_limit:
                         stats_weight = normalized_lse_weight(
                             lane_lse[lane_slot_i], global_lse
                         )
                         if cutlass.const_expr(finalize_attention):
                             stats_weight *= stats_sink_scale
                         smem_scale[
-                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
+                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + weight_split_idx
                         ] = stats_weight
 
     prims.barrier_cta_sync(
