@@ -214,6 +214,16 @@ inline bool requiresTwoAccessScaleGroup(ar_fusion::AllReduceFusionPattern patter
         || pattern == ar_fusion::AllReduceFusionPattern::kARResidualRMSNormOutFP4Quant;
 }
 
+// Packed accesses that share one scale and must not straddle a CTA: two for NVFP4, four (one 1x32 group) for MXFP8.
+inline int accessScaleGroupSize(ar_fusion::AllReduceFusionPattern pattern)
+{
+    if (pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8)
+    {
+        return 4;
+    }
+    return requiresTwoAccessScaleGroup(pattern) ? 2 : 1;
+}
+
 // A helper function to tune the grid configuration for fused oneshot and RMSNorm kernels.
 // Return (block_size, cluster_size, loads_per_thread).
 template <bool UseCluster>
@@ -337,6 +347,7 @@ struct MnnvlAllReduceKernelParams
     uint32_t* bufferFlags;
     bool waitForResults;
     QuantizationSFLayout layout;
+    bool earlyState = false;
 };
 
 template <typename PackedType, typename T>
@@ -539,6 +550,58 @@ inline __device__ void quantizeEpilogue(PackedVec<PackedType, T> const& value,
         }
         reinterpret_cast<PackedQuantizedType*>(params.quantOutPtr)[packedAccessIdx] = quantized;
     }
+    else if constexpr (ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kMXFP8)
+    {
+        // The FP8 block-scale low-M GEMM's MXFP8 quantization (fp8_block_scale_low_m_gemm.py), so a GEMM that
+        // takes this operand projects bitwise like one that quantizes the BF16 rows itself: per 1x32 group (four
+        // consecutive threads of one warp, see accessScaleGroupSize) the UE8M0 exponent e of 2^ceil(log2(amax / 448))
+        // with amax floored at 0x38D2, and E4M3 codes satfinite_rn(x * 2^(127 - e)). Scales in the R128c4 layout.
+        static_assert(std::is_same_v<T, __nv_bfloat16> && kELTS_PER_THREAD == 8, "MXFP8 quant expects BF16 x 8.");
+        uint32_t const* words = reinterpret_cast<uint32_t const*>(&value.packed);
+        uint32_t amax;
+        uint32_t const groupMask = 0xFu << ((threadIdx.x & 31u) & ~3u);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        asm("{\n.reg .b32 m0, m1;\nmax.xorsign.abs.bf16x2 m0, %1, %2;\nmax.xorsign.abs.bf16x2 m1, %3, %4;\n"
+            "max.xorsign.abs.bf16x2 %0, m0, m1;\n}"
+            : "=r"(amax)
+            : "r"(words[0]), "r"(words[1]), "r"(words[2]), "r"(words[3]));
+#pragma unroll
+        for (int off = 1; off < 4; off <<= 1)
+        {
+            uint32_t const other = __shfl_xor_sync(groupMask, amax, off, 4);
+            asm("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(amax) : "r"(amax), "r"(other));
+        }
+#else
+        amax = 0;
+        __trap();
+#endif
+        uint32_t const absBits = max(max(amax & 0x7FFFu, (amax >> 16) & 0x7FFFu), 0x38D2u);
+        uint32_t const ue8m0 = (absBits >> 7) - 8 + ((absBits & 0x7Fu) > 0x60u ? 1u : 0u);
+        // 2^(127 - ue8m0) is a power of two: the BF16 product of the exact FP32 product rounds once, as
+        // mul.rn.bf16x2 does, and its E4M3 conversion is the satfinite round-to-nearest one.
+        float const invScale = __uint_as_float((254u - ue8m0) << 23);
+
+        union
+        {
+            uint2 pack;
+            __nv_fp8_e4m3 v[kELTS_PER_THREAD];
+        } codes;
+
+#pragma unroll
+        for (int i = 0; i < kELTS_PER_THREAD; ++i)
+        {
+            float const scaled = __bfloat162float(__float2bfloat16_rn(__bfloat162float(value.elements[i]) * invScale));
+            codes.v[i] = __nv_fp8_e4m3(scaled);
+        }
+        reinterpret_cast<uint2*>(params.quantOutPtr)[packedAccessIdx] = codes.pack;
+        if ((accessIdInToken & 3) == 0)
+        {
+            int const group = accessIdInToken >> 2;
+            size_t const sfOffset = (static_cast<size_t>(token >> 7) * (params.tokenDim / 128) + (group >> 2)) * 512
+                + (token & 31) * 16 + ((token & 127) >> 5) * 4 + (group & 3);
+            reinterpret_cast<uint8_t*>(params.scaleOutPtr)[sfOffset] = static_cast<uint8_t>(ue8m0);
+        }
+    }
     else
     {
         static_assert(ar_fusion::GetQuantType<Pattern> == ar_fusion::QuantType::kNone, "Invalid quant type");
@@ -590,7 +653,10 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     int token = blockIdx.x;
     int threadOffset = token * params.tokenDim + packedIdx * kELTS_PER_THREAD;
 
-    cudaGridDependencySynchronize();
+    if (!params.earlyState)
+    {
+        cudaGridDependencySynchronize();
+    }
 #else
     int packedIdx = blockIdx.y * blockDim.x + threadIdx.x;
     int token = blockIdx.x;
@@ -605,6 +671,18 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
     T* stagePtrLocal = reinterpret_cast<T*>(flag.getCurLamportBuf(params.inputPtrs[params.rank], 0));
     bool const inBounds = packedIdx * kELTS_PER_THREAD < params.tokenDim;
 
+    if (params.earlyState)
+    {
+        // The previous call on the workspace completed before the input's producer released this grid (the caller's
+        // guarantee), so the rotation state is final and nobody polls the dirty buffer: read the state, count the CTA
+        // and re-arm that buffer while the producer still runs.
+        flag.ctaArrive();
+        flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaGridDependencySynchronize();
+#endif
+    }
+
     // ==================== Broadcast tokens to each rank =============================
     PackedVec<PackedType, T> val;
     if (inBounds)
@@ -617,10 +695,13 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
             = val.packed;
     }
 
-    flag.ctaArrive();
-    // ======================= Lamport Sync and clear the output buffer from previous iteration
-    // =============================
-    flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+    if (!params.earlyState)
+    {
+        flag.ctaArrive();
+        // ======================= Lamport Sync and clear the output buffer from previous iteration
+        // =============================
+        flag.clearDirtyLamportBuf(params.inputPtrs[params.rank], -1);
+    }
 
     if (!inBounds)
     {
@@ -740,17 +821,21 @@ __global__ void __launch_bounds__(1024) oneshotAllreduceFusionKernel(MnnvlAllRed
 }
 
 using detail::adjustGridConfig;
-using detail::requiresTwoAccessScaleGroup;
+using detail::accessScaleGroupSize;
 
 void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8)
+    {
+        TLLM_CHECK_WITH_INFO(params.tokenDim % 256 == 0, "[MNNVL] MXFP8 quant needs tokenDim %% 256 == 0");
+    }
 
     static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL AllReduceOneShot] requires SM 90 or newer.");
     int const numTokens = params.numTokens;
     int const tokenDim = params.tokenDim;
     int const eltsPerThread = sizeof(float4) / getDTypeSize(params.dType);
-    int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
+    int const accessGroupSize = accessScaleGroupSize(params.pattern);
 
     auto [blockSize, clusterSize, loadsPerThread]
         = adjustGridConfig<true>(numTokens, tokenDim, eltsPerThread, accessGroupSize);
@@ -826,6 +911,17 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
     {                                                                                                                  \
         LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNorm);                         \
     }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8)                                     \
+    {                                                                                                                  \
+        if constexpr (std::is_same_v<T, __nv_bfloat16>)                                                                \
+        {                                                                                                              \
+            LAUNCH_ALLREDUCE_KERNEL(WORLD_SIZE, T, ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8);                \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] MXFP8 quant needs BF16 input.");                     \
+        }                                                                                                              \
+    }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \
         TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceOneShot] Unsupported fusion pattern.");                           \
@@ -844,7 +940,7 @@ void oneshotAllreduceFusionOp(AllReduceFusionParams const& params)
         MnnvlAllReduceKernelParams<T> kernelParams{output, residualOut, input, residualIn, gamma, ucPtrs,
             reinterpret_cast<T*>(params.bufferPtrLocal), mcPtr, params.quantOut, params.scaleOut, params.scaleFactor,
             numTokens, tokenDim, params.nRanks, params.rank, static_cast<float>(params.epsilon), params.bufferFlags,
-            false, params.layout};
+            false, params.layout, params.earlyState};
 
         switch (params.nRanks)
         {
@@ -1441,6 +1537,10 @@ __global__ __launch_bounds__(1024) void rmsNormLamport(MnnvlAllReduceKernelParam
 
 void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
 {
+    if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8)
+    {
+        TLLM_CHECK_WITH_INFO(params.tokenDim % 256 == 0, "[MNNVL] MXFP8 quant needs tokenDim %% 256 == 0");
+    }
     static int const kSMVersion = tensorrt_llm::common::getSMVersion();
     TLLM_CHECK_WITH_INFO(kSMVersion >= 90, "[MNNVL AllReduceTwoShot] requires SM 90 or newer.");
     int const numTokens = params.numTokens;
@@ -1531,7 +1631,7 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     // Launch the rmsnorm lamport kernel if fusion is enabled
     if (params.rmsNormFusion)
     {
-        int const accessGroupSize = requiresTwoAccessScaleGroup(params.pattern) ? 2 : 1;
+        int const accessGroupSize = accessScaleGroupSize(params.pattern);
         auto gridConfig = adjustGridConfig<true>(numTokens, tokenDim, numEltsPerThread, accessGroupSize);
         int rnBlockSize = std::get<0>(gridConfig);
         int rnClusterSize = std::get<1>(gridConfig);
@@ -1644,6 +1744,17 @@ void twoshotAllreduceFusionOp(AllReduceFusionParams const& params)
     else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNorm)                                          \
     {                                                                                                                  \
         RUN_RMSNORM_KERNEL(T, ar_fusion::AllReduceFusionPattern::kARRMSNorm, USE_CGA, LOADS_PER_THREAD);               \
+    }                                                                                                                  \
+    else if (params.pattern == ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8)                                     \
+    {                                                                                                                  \
+        if constexpr (std::is_same_v<T, __nv_bfloat16>)                                                                \
+        {                                                                                                              \
+            RUN_RMSNORM_KERNEL(T, ar_fusion::AllReduceFusionPattern::kARRMSNormMXFP8, USE_CGA, LOADS_PER_THREAD);      \
+        }                                                                                                              \
+        else                                                                                                           \
+        {                                                                                                              \
+            TLLM_CHECK_WITH_INFO(false, "[MNNVL AllReduceTwoShot] MXFP8 quant needs BF16 input.");                     \
+        }                                                                                                              \
     }                                                                                                                  \
     else                                                                                                               \
     {                                                                                                                  \

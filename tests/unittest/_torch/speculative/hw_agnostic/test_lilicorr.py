@@ -100,6 +100,9 @@ def test_worker_normalizes_full_vocabulary(tp_size: int) -> None:
     expected_values, expected_ids = logits.topk(3, dim=-1)
     for rank, shard in enumerate(shards):
         worker = DFlashWorker.__new__(DFlashWorker)
+        worker._ctx_helix = None
+        worker._ctx_store_stream = None
+        worker._ctx_store_operands = ()
         worker.mapping = SimpleNamespace(tp_size=tp_size, tp_rank=rank, enable_attention_dp=False)
         worker._d2t = None
 
@@ -168,6 +171,9 @@ def test_partial_acceptance_selects_normalized_target_row() -> None:
 
 def test_worker_rejects_unsupported_layout_before_collectives() -> None:
     worker = DFlashWorker.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker.mapping = SimpleNamespace(tp_size=2, tp_rank=0, enable_attention_dp=False)
     worker._d2t = None
     model = SimpleNamespace(
@@ -218,6 +224,9 @@ def _startup_worker(
     max_draft_len: int = 3, target_layer_ids: list[int] | None = None
 ) -> DFlashWorker:
     worker = DFlashWorker.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker.spec_config = DFlashDecodingConfig(
         max_draft_len=max_draft_len,
         target_layer_ids=target_layer_ids,

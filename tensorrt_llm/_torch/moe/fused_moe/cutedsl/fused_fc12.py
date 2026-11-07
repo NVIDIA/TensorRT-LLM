@@ -23,16 +23,39 @@ round-trips through global memory.
 Uses the grouped-GEMM NVFP4 weight layout (``NVFP4CuteDslFusedMoEMethod``),
 ``NvFp4WeightView``, ``quantize_input_nvfp4`` and ``CuteDslFusedMoENvfp4Runner``
 (narrowed to the fused kernel's tiles) without inheriting from that leaf. No
-locality-domain (uGPU) support.
+locality-domain (uGPU) partitioned execution.
+
+Calls of at most ``small_batch_max_tokens`` tokens (SiTU layers without
+all-to-all) run the small-batch kernel
+(``trtllm::cute_dsl_nvfp4_small_batch_moe_rubin``) instead: FC1, SiTU, NVFP4
+requantization, FC2 and the combine in one persistent grid on the same weights
+and ``moe_sort`` tables, with a token-indexed FC1 output on MoE-TP slices. When
+the model opts in (``allow_die_major_weights``), the device has two locality
+domains and the weights stay where they are loaded (no EPLB, no DWDP),
+``post_load_weights`` places the expert weights die-major (each domain homes
+one half of every expert); both kernels read them and claim their work per
+domain.
 """
 
 import torch
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ....autotuner import AutoTuner
+from ....distributed.ops import LamportWorkspaceView
+from ....locality_domain.placement import sm_locality_domains, split_domain_copy
+from ....locality_domain_utils import is_locality_domain_enabled
 from ....model_config import ModelConfig
 from ....utils import ActivationType, AuxStreamType, EventType
+from ...custom_ops.cute_dsl_small_batch_moe_custom_op import (
+    SMALL_BATCH_MOE_MAX_TOKENS,
+    die_major_layout,
+    new_small_batch_moe_counters,
+    small_batch_moe_route_word,
+    small_batch_moe_supports,
+    small_batch_moe_takes_published,
+)
 from ..activation import (
     DEFAULT_MOE_ACTIVATION,
     ActivationParamShape,
@@ -49,6 +72,7 @@ from ..impl_contract import (
     MoERunContext,
     MoESortTables,
     MoEStaticCapability,
+    PublishedSortTables,
     require_comm_plan,
 )
 from ..impl_environment import MoEDep
@@ -98,6 +122,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     # ConfigurableMoE reads this off the backend type: the fused kernel takes
     # per-tile expert ranges, so EP need not divide the expert count.
     _supports_non_divisible_ep: bool = True
+    # Set by allow_die_major_weights (a model's opt-in at construction).
+    _die_major_allowed: bool = False
 
     descriptor = MoEImplDescriptor(
         identity=MoEImplId(PROVIDER_TRTLLM, TECHNIQUE_CUTEDSL, KERNEL_FUSED_FC12, "nvfp4"),
@@ -235,6 +261,23 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         self.scaling_vector_size = 16
         # SMs the fused kernel leaves free (``reserve_sms_for_concurrent_kernels``).
         self._concurrent_sm_reserve = 0
+        # Largest call the small-batch kernel serves (0: none); it implements the SiTU epilogue.
+        self.small_batch_max_tokens = (
+            SMALL_BATCH_MOE_MAX_TOKENS
+            if self.activation_type == ActivationType.SiTu
+            and small_batch_moe_supports(self.intermediate_size_per_partition, self.hidden_size)
+            else 0
+        )
+        # Whether a routing kernel may publish this rank's top-k for the small-batch kernel
+        # (published_routing_word).
+        self._small_batch_takes_published = bool(
+            self.small_batch_max_tokens
+        ) and small_batch_moe_takes_published(self.expert_size_per_partition)
+        # Created by the first small-batch call (warmup runs before any graph capture); every
+        # launch leaves it zero.
+        self._small_batch_counters: torch.Tensor | None = None
+        # Set by post_load_weights.
+        self.weights_die_major = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
@@ -270,11 +313,17 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
 
     def reserve_sms_for_concurrent_kernels(self, num_sms: int) -> int:
         """The fused kernel's persistent grid launches enough whole clusters fewer to leave
-        ``num_sms`` SMs without an FC12 CTA (``reserved_sms`` of the op)."""
+        ``num_sms`` SMs without an FC12 CTA, and the small-batch kernel's grid that many CTAs
+        fewer (``reserved_sms`` of the fused op, ``sm_reserve`` of the small-batch op)."""
         if num_sms < 0:
             raise ValueError(f"num_sms must be non-negative, got {num_sms}")
         self._concurrent_sm_reserve = num_sms
         return num_sms
+
+    def allow_die_major_weights(self) -> None:
+        """Both kernels read die-major weights; ``post_load_weights`` places them where
+        ``_die_major_applies``."""
+        self._die_major_allowed = True
 
     def consumes_sort_tables(self) -> bool:
         """``run_moe_nvfp4`` runs on the routing kernel's tables when they match
@@ -289,6 +338,88 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         dwdp_handle_collector = getattr(self, "dwdp_handle_collector", None)
         if dwdp_handle_collector is not None:
             dwdp_handle_collector.register_weights(self)
+
+    def post_load_weights(self) -> None:
+        super().post_load_weights()
+        if not self.weights_die_major and self._die_major_allowed:
+            unmet = self._die_major_unmet()
+            if unmet is None:
+                self._place_weights_die_major()
+            else:
+                logger.info_once(
+                    f"The MoE expert weights keep the loaded layout, not die-major: {unmet}",
+                    key="fc12_die_major_off",
+                )
+        if self.small_batch_max_tokens and self._small_batch_counters is None:
+            self._small_batch_counters = new_small_batch_moe_counters(self.w3_w1_weight.device)
+
+    def output_push_max_tokens(self) -> int:
+        """The small-batch kernel pushes its output rows at the token counts it serves."""
+        return self.small_batch_max_tokens
+
+    def published_routing_word(self, num_tokens: int) -> torch.Tensor | None:
+        """The small-batch kernel's routing word where it serves ``num_tokens`` tokens in the
+        token-indexed layout (MoE-TP slices): it then builds its tables from the published
+        top-k."""
+        if (
+            not 1 <= num_tokens <= self.small_batch_max_tokens
+            or not self._small_batch_takes_published
+            or self.tp_size <= 1
+            or self._small_batch_counters is None
+        ):
+            return None
+        return small_batch_moe_route_word(self._small_batch_counters)
+
+    def pre_reload_weights(self) -> None:
+        super().pre_reload_weights()
+        # The reloaded bytes arrive in the default layout; post_load_weights places them again.
+        self.weights_die_major = False
+
+    def _die_major_applies(self) -> bool:
+        """Die-major weights need the model's opt-in and every condition of
+        ``_die_major_unmet``."""
+        return self._die_major_allowed and self._die_major_unmet() is None
+
+    def _die_major_unmet(self) -> str | None:
+        """The first unmet condition of die-major weights besides the opt-in, None when all hold:
+        halves of whole 128-row blocks (the FC12 tactics then keep to N tiles that divide a half),
+        weights that stay where they are loaded (no EPLB, no DWDP) and two locality domains."""
+        from ....pyexecutor.dwdp import get_global_dwdp_manager
+
+        if (2 * self.intermediate_size_per_partition) % 256 or self.hidden_size % 256:
+            return "the expert halves are not whole 128-row blocks"
+        if self._using_load_balancer():
+            return "EPLB migrates the expert weights"
+        if get_global_dwdp_manager() is not None:
+            return "DWDP rebinds the expert weights"
+        if not is_locality_domain_enabled():
+            return (
+                "no two locality domains (is_locality_domain_enabled: SM107, a build with "
+                "CUDA >= 13.4, a driver reporting two domains, DISABLE_LOCALITY_DOMAINS unset)"
+            )
+        return None
+
+    def _place_weights_die_major(self) -> None:
+        """Re-home the expert weights and block scales die-major (same parameter shapes, new
+        bytes); keeps the default placement when the device has no localized allocations."""
+        params = (self.w3_w1_weight, self.w3_w1_weight_scale, self.w2_weight, self.w2_weight_scale)
+        copies = []
+        for param in params:
+            layout = die_major_layout(param.data)
+            copy = split_domain_copy(layout, layout.numel() * layout.element_size() // 2)
+            if copy is None:
+                logger.warning_once(
+                    "Localized allocations are unavailable: the MoE expert weights keep the "
+                    "default placement",
+                    key="fc12_die_major_unavailable",
+                )
+                return
+            copies.append(copy)
+        for param, copy in zip(params, copies):
+            param.data = copy.view(param.data.shape)
+        self.weights_die_major = True
+        # measured here, ahead of CUDA graph capture
+        sm_locality_domains(self.w3_w1_weight.device.index)
 
     def _build_local_weight_view(self) -> NvFp4WeightView:
         """Build the weight view from this backend's per-layer weights."""
@@ -311,6 +442,13 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
     quantize_input = quantize_input_nvfp4
     prequantized_nvfp4_input_scale = prequantized_nvfp4_input_scale
 
+    def _join_pending_x_ready(self) -> None:
+        """Wait for the input-ready event handed to ``run_moe_nvfp4`` (once per forward)."""
+        event = getattr(self, "_pending_x_ready_event", None)
+        if event is not None:
+            event.wait()
+            self._pending_x_ready_event = None
+
     def run_moe(self, ctx: MoERunContext, *, workspace: dict | None = None) -> torch.Tensor:
         del workspace  # the fused kernel allocates its own intermediates
         plan = require_comm_plan(self, ctx)
@@ -323,6 +461,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             enable_alltoall=plan.enable_alltoall,
             weight_view=self._build_local_weight_view(),
             sort_tables=ctx.sort_tables,
+            x_ready_event=ctx.x_ready_event,
+            output_push=ctx.output_push,
         )
 
     # Fused-kernel dispatch, with its own autotuner key and outer runner so
@@ -336,7 +476,9 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
         moe_output: torch.Tensor | None = None,
         enable_alltoall: bool = False,
         weight_view: NvFp4WeightView | None = None,
-        sort_tables: MoESortTables | None = None,
+        sort_tables: MoESortTables | PublishedSortTables | None = None,
+        x_ready_event: torch.cuda.Event | None = None,
+        output_push: LamportWorkspaceView | None = None,
     ) -> torch.Tensor:
         assert self.has_nvfp4
         assert weight_view is not None
@@ -350,10 +492,40 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert moe_output.size() == (token_final_scales.size(0), self.hidden_size)
             assert moe_output.dtype == output_dtype
 
+        num_tokens = token_selected_experts.size(0)
+        small_batch = num_tokens <= self.small_batch_max_tokens and not enable_alltoall
+        if output_push is not None and not (num_tokens >= 1 and small_batch):
+            raise RuntimeError(
+                f"an output push needs the small-batch kernel, not {num_tokens} tokens"
+                f"{' with all-to-all' if enable_alltoall else ''}"
+            )
+
+        # Join before the fused kernel reads x, or before returning an empty batch.
+        self._pending_x_ready_event = x_ready_event
+
         # Empty micro-batches: skip autotuning (synthetic grouped-GEMM inputs
         # require at least one output row).
         if token_selected_experts.size(0) == 0:
+            self._join_pending_x_ready()
             return moe_output
+
+        published = isinstance(sort_tables, PublishedSortTables)
+        if published and not (small_batch and self.tp_size > 1):
+            raise RuntimeError(
+                "published routing needs the token-indexed small-batch kernel (MoE-TP), not "
+                f"{num_tokens} tokens{' with all-to-all' if enable_alltoall else ''}"
+            )
+        if small_batch:
+            return self._run_small_batch(
+                x,
+                token_selected_experts,
+                token_final_scales,
+                x_sf,
+                moe_output,
+                weight_view,
+                sort_tables,
+                output_push,
+            )
 
         effective_top_k = token_selected_experts.size(-1)
         tuner = AutoTuner.get()
@@ -386,6 +558,96 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
                 sort_tables=sort_tables,
             )
         return runner(inputs, tactic=best_tactic)
+
+    def _sort_routing(
+        self,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor | None,
+        weight_view: NvFp4WeightView,
+        tile_size: int,
+    ) -> tuple[torch.Tensor, ...]:
+        """``moe_sort``'s tables of this rank's experts for tiles of ``tile_size`` rows."""
+        return torch.ops.trtllm.moe_sort(
+            token_selected_experts=token_selected_experts,
+            token_final_scales=token_final_scales,
+            num_experts=self.num_slots,
+            top_k=token_selected_experts.size(1),
+            local_expert_offset=weight_view.slot_start,
+            local_num_experts=weight_view.expert_size_per_partition,
+            tile_tokens_dim=tile_size,
+        )
+
+    def _run_small_batch(
+        self,
+        x: torch.Tensor,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        x_sf: torch.Tensor,
+        moe_output: torch.Tensor,
+        weight_view: NvFp4WeightView,
+        sort_tables: MoESortTables | PublishedSortTables | None = None,
+        push: LamportWorkspaceView | None = None,
+    ) -> torch.Tensor:
+        """The small-batch kernel; it writes every element of ``moe_output`` (and pushes it into
+        ``push``)."""
+        published = isinstance(sort_tables, PublishedSortTables)
+        if published:
+            # the kernel builds the tables from the published top-k ids
+            tile_idx_to_expert_idx = tile_idx_to_mn_limit = permuted_idx_to_expanded_idx = None
+            num_non_exiting_tiles = None
+            expanded_idx_to_permuted_idx = token_selected_experts.reshape(-1)
+        else:
+            if sort_tables is not None and sort_tables.tile_size == 128:
+                sort_outputs = sort_tables.outputs
+            else:
+                sort_outputs = self._sort_routing(
+                    token_selected_experts, token_final_scales, weight_view, 128
+                )
+            (
+                tile_idx_to_expert_idx,
+                tile_idx_to_mn_limit,
+                expanded_idx_to_permuted_idx,
+                permuted_idx_to_expanded_idx,
+                _total_num_padded_tokens,
+                num_non_exiting_tiles,
+            ) = sort_outputs
+        self._join_pending_x_ready()
+        if self._small_batch_counters is None:
+            self._small_batch_counters = new_small_batch_moe_counters(x.device)
+        situ_beta, situ_linear_beta = self._situ_betas()
+        torch.ops.trtllm.cute_dsl_nvfp4_small_batch_moe_rubin(
+            input=x.view(torch.float4_e2m1fn_x2),
+            input_scale=x_sf.view(torch.uint8),
+            fc1_weight=weight_view.w3_w1_weight.view(torch.float4_e2m1fn_x2),
+            fc1_weight_scale=weight_view.fc1_weight_scale.view(torch.uint8),
+            fc1_alpha=weight_view.fc1_global_scale,
+            fc2_weight=weight_view.w2_weight.view(torch.float4_e2m1fn_x2),
+            fc2_weight_scale=weight_view.fc2_weight_scale.view(torch.uint8),
+            fc2_alpha=weight_view.fc2_global_scale,
+            output=moe_output,
+            tile_idx_to_group_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            global_sf=self.fc2_input_scale,
+            token_final_scales=token_final_scales,
+            counters=self._small_batch_counters,
+            top_k=token_selected_experts.size(1),
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            # MoE-TP ranks hold a slice of every expert's intermediate
+            token_indexed=self.tp_size > 1,
+            die_major=self.weights_die_major,
+            published_routing=published,
+            expert_offset=weight_view.slot_start,
+            push_mc=push.mc_base if push is not None else 0,
+            push_flags=push.flags if push is not None else None,
+            push_rank=push.rank if push is not None else 0,
+            push_world=push.world if push is not None else 0,
+            sm_reserve=self._concurrent_sm_reserve,
+        )
+        return moe_output
 
     def _situ_betas(self) -> tuple[float, float]:
         """``(situ_beta, situ_linear_beta)`` for the fused op; -1 disables them.
@@ -439,14 +701,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             assert sort_tables.tile_size == tile_size
             sort_outputs = sort_tables.outputs
         else:
-            sort_outputs = torch.ops.trtllm.moe_sort(
-                token_selected_experts=token_selected_experts,
-                token_final_scales=token_final_scales,
-                num_experts=self.num_slots,
-                top_k=effective_top_k,
-                local_expert_offset=slot_start,
-                local_num_experts=esp,
-                tile_tokens_dim=tile_size,
+            sort_outputs = self._sort_routing(
+                token_selected_experts, token_final_scales, weight_view, tile_size
             )
         (
             tile_idx_to_expert_idx,
@@ -456,6 +712,8 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             total_num_padded_tokens,
             num_non_exiting_tiles,
         ) = sort_outputs
+
+        self._join_pending_x_ready()
 
         # One fused op: gather + FC1 GEMM + gated act (SwiGLU or SiTU) + requant
         # + FC2 GEMM + finalize (scatter-add into moe_output = a2a combine
@@ -497,5 +755,6 @@ class TrtllmCutedslFusedFc12Nvfp4Impl(MoEImplBase):
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             reserved_sms=self._concurrent_sm_reserve,
+            die_major=self.weights_die_major,
         )
         return moe_output

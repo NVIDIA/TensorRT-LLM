@@ -2910,6 +2910,30 @@ class DecoderInputPreparer:
             )
         return gathered[:, 0].tolist()
 
+    @property
+    def overlap_scheduler_enabled(self) -> bool:
+        """Whether the overlap scheduler runs, so preprocess_inputs corrects the step on device."""
+        return not self._config.disable_overlap_scheduler
+
+    @staticmethod
+    def spec_decode_kv_range(attn_metadata: AttentionMetadata) -> tuple[int, int]:
+        """``(first sequence, count)`` whose KV lengths a speculative step corrects: the
+        generation requests, or the context requests they run as when they extend a context
+        (``num_chunked_ctx_requests``)."""
+        num_ctx = attn_metadata.num_contexts
+        num_chunked = attn_metadata.num_chunked_ctx_requests
+        if num_ctx >= num_chunked and num_chunked > 0:
+            return num_ctx - num_chunked, num_chunked
+        return num_ctx, attn_metadata.num_generations
+
+    @property
+    def spec_decode_offsets(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The previous step's per-token position and per-sequence KV-length corrections."""
+        return (
+            self._buffers.previous_pos_id_offsets_cuda,
+            self._buffers.previous_kv_lens_offsets_cuda,
+        )
+
     def _kv_lens_corrected_in_preprocess(
         self, inputs: dict[str, Any], enable_spec_decode: bool
     ) -> bool:
@@ -2992,20 +3016,10 @@ class DecoderInputPreparer:
                     )
 
                 if has_kv_lens_correction:
-                    if fused_offsets:
-                        pass
-                    elif (
-                        num_ctx_requests >= num_chunked_ctx_requests
-                        and num_chunked_ctx_requests > 0
-                    ):
-                        # The generation requests with draft_tokens are treated as chunked context
-                        # requests when extend_ctx returns True.
-                        inputs["attn_metadata"].kv_lens_cuda[
-                            num_ctx_requests - num_chunked_ctx_requests : num_ctx_requests
-                        ] += self._buffers.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
-                    else:
-                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] += (
-                            self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
+                    if not fused_offsets:
+                        kv_start, num_kv = self.spec_decode_kv_range(inputs["attn_metadata"])
+                        inputs["attn_metadata"].kv_lens_cuda[kv_start : kv_start + num_kv] += (
+                            self._buffers.previous_kv_lens_offsets_cuda[:num_kv]
                         )
                     inputs["attn_metadata"].on_update_kv_lens()
                 # TRTLLM uses `kv_lens_cuda` above; FlashInfer exposes this backend-specific
@@ -3060,8 +3074,6 @@ class DecoderInputPreparer:
         """
         if enable_spec_decode and not self._config.disable_overlap_scheduler:
             if inputs["attn_metadata"].kv_cache_manager is not None:
-                num_seqs = inputs["attn_metadata"].num_seqs
-                num_ctx_requests = inputs["attn_metadata"].num_contexts
                 num_gen_requests = inputs["attn_metadata"].num_generations
                 num_ctx_tokens = inputs["attn_metadata"].num_ctx_tokens
                 num_chunked_ctx_requests = inputs["attn_metadata"].num_chunked_ctx_requests
@@ -3077,17 +3089,10 @@ class DecoderInputPreparer:
 
                 # Only TrtllmAttentionMetadata has kv_lens_cuda.
                 if isinstance(inputs["attn_metadata"], TrtllmAttentionMetadata):
-                    if (
-                        num_ctx_requests >= num_chunked_ctx_requests
-                        and num_chunked_ctx_requests > 0
-                    ):
-                        inputs["attn_metadata"].kv_lens_cuda[
-                            num_ctx_requests - num_chunked_ctx_requests : num_ctx_requests
-                        ] -= self._buffers.previous_kv_lens_offsets_cuda[:num_chunked_ctx_requests]
-                    else:
-                        inputs["attn_metadata"].kv_lens_cuda[num_ctx_requests:num_seqs] -= (
-                            self._buffers.previous_kv_lens_offsets_cuda[:num_gen_requests]
-                        )
+                    kv_start, num_kv = self.spec_decode_kv_range(inputs["attn_metadata"])
+                    inputs["attn_metadata"].kv_lens_cuda[kv_start : kv_start + num_kv] -= (
+                        self._buffers.previous_kv_lens_offsets_cuda[:num_kv]
+                    )
                 # Restore the FlashInfer-specific logical KV lengths through the same optional hook
                 # used by `preprocess_inputs`.
                 elif hasattr(inputs["attn_metadata"], "apply_spec_decode_kv_lens_offsets"):

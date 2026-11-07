@@ -204,6 +204,15 @@ sbatch examples/kimi_k3/run_eval_kimi_k3.sbatch \
 Block reuse stays off by default because suffix-automaton speculative
 decoding is incompatible with KV-cache block reuse.
 
+`kv_cache_config.pool_ratio` lists the NVFP4 KV cache's layer groups in
+registration order: recurrent state, FP4 MLA, FP8 MLA fallback layers, MLA
+HP tail, for example `[0.14, 0.635, 0.205, 0.02]`. With the DSpark drafter
+the draft group's share is inserted after the FP8 group; a five-entry list
+names it explicitly. The resolved split is logged at startup
+(`kv_cache_config.pool_ratio by layer group: ...`), and a list that leaves
+the FP4 MLA group at its one-request floor while the FP8 group gets several
+times more blocks is rejected.
+
 ## Suffix-automaton speculative decoding
 
 Suffix-automaton (SA) speculation is supported for aggregated serving: set

@@ -444,9 +444,10 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     sf_per_token: int,
     sf_per_page: int,
     rotary_cos_sin: torch.Tensor,
-    q_pe: torch.Tensor,
-    q_rope_out: torch.Tensor,
-    q_quant_input: torch.Tensor,
+    num_q_heads: int,
+    q_pe: Optional[torch.Tensor],
+    q_rope_out: Optional[torch.Tensor],
+    q_quant_input: Optional[torch.Tensor],
     q_fp4_out: torch.Tensor,
     q_sf_out: torch.Tensor,
     v_packed_base: Optional[torch.Tensor],
@@ -454,6 +455,9 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     helix_position_offsets: Optional[torch.Tensor],
     helix_is_inactive_rank: Optional[torch.Tensor],
 ) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """The generation KV update; also the query rows of ``num_q_heads`` heads from ``q_pe`` /
+    ``q_rope_out`` / ``q_quant_input``, or none when those are None (the caller writes them)."""
+    write_q_rows = q_pe is not None
     num_contexts = metadata.num_contexts
     num_seqs = metadata.num_seqs
     num_gen = num_seqs - num_contexts
@@ -476,10 +480,10 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     # aliases already match). As the first FP4 MLA kernel of the step, the same
     # launch also writes the packed split plan the decode layers reuse.
     plan_geometry = None
-    if q_pe.ndim == 3 and q_pe.shape[1] > 0:
+    if num_q_heads > 0:
         plan_geometry = _fp4_mla_packed_plan_geometry(
             metadata,
-            num_heads=q_pe.shape[1],
+            num_heads=num_q_heads,
             query_len=num_tokens // num_gen,
             num_requests=num_gen,
             device=latent_cache.device,
@@ -603,24 +607,25 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             "Fused FP4 MLA K RoPE requires a same-device FP32 rotary "
             f"table with rows of {rope_dim * 2} values."
         )
-    if (
-        q_pe is None
-        or q_rope_out is None
+    if num_q_heads <= 0:
+        raise ValueError(
+            f"FP4 MLA generation needs a positive query head count, got {num_q_heads}."
+        )
+    if write_q_rows and (
+        q_rope_out is None
+        or q_quant_input is None
         or q_pe.dtype != torch.bfloat16
         or q_rope_out.dtype != torch.bfloat16
         or q_pe.device != latent_cache.device
         or q_rope_out.device != latent_cache.device
         or q_pe.ndim != 3
         or q_rope_out.shape != q_pe.shape
-        or q_pe.shape[0] != num_tokens
-        or q_pe.shape[1] <= 0
-        or q_pe.shape[2] != rope_dim
+        or tuple(q_pe.shape) != (num_tokens, num_q_heads, rope_dim)
     ):
         raise ValueError(
             "Fused FP4 MLA Q RoPE requires same-device BF16 q_pe and "
-            f"q_rope_out tensors shaped [tokens, heads, {rope_dim}]."
+            f"q_rope_out tensors shaped [tokens, {num_q_heads}, {rope_dim}]."
         )
-    num_q_heads = q_pe.shape[1]
     q_head_blocks = _ceil_div(num_q_heads, block_q_heads)
     q_rows_per_seq = _fp4_mla_packed_rows_per_seq(num_q_heads, max_gen_len)
     if q_rows_per_seq and q_fp4_out.shape[0] < num_gen * q_rows_per_seq:
@@ -631,9 +636,10 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
     max_gen_tiles = _ceil_div(max_gen_len + FP4_BLOCK_SIZE - 1, FP4_BLOCK_SIZE)
     rotary_table = rotary_cos_sin
     q_global_scale = _get_fp4_mla_q_global_scale(metadata, latent_cache.device)
-    q_pe_input = q_pe
-    q_rope_output = q_rope_out
-    q_full_input = q_quant_input
+    # Without query rows the kernel reads none of the three; any device tensor fills their slots.
+    q_pe_input = q_pe if write_q_rows else latent_cache
+    q_rope_output = q_rope_out if write_q_rows else latent_cache
+    q_full_input = q_quant_input if write_q_rows else latent_cache
     q_fp4_output = q_fp4_out
     q_sf_output = q_sf_out
     write_v_packed = v_packed_base is not None
@@ -649,7 +655,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
         num_gen,
         max(
             kv_work_blocks,
-            max_gen_len * q_head_blocks * q_work_blocks,
+            max_gen_len * q_head_blocks * q_work_blocks if write_q_rows else 0,
         ),
     )
     store_k_residual = _fp4_mla_attention_backend() in _FP4_MLA_K_RESIDUAL_BACKENDS
@@ -708,12 +714,12 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             v_sf.stride(1),
             v_packed_s0,
             v_packed_s1,
-            q_pe_input.stride(0),
-            q_pe_input.stride(1) if q_pe_input.ndim > 1 else 0,
-            q_pe_input.stride(2) if q_pe_input.ndim > 2 else 0,
-            q_rope_output.stride(0),
-            q_rope_output.stride(1) if q_rope_output.ndim > 1 else 0,
-            q_rope_output.stride(2) if q_rope_output.ndim > 2 else 0,
+            q_pe_input.stride(0) if write_q_rows else 0,
+            q_pe_input.stride(1) if write_q_rows else 0,
+            q_pe_input.stride(2) if write_q_rows else 0,
+            q_rope_output.stride(0) if write_q_rows else 0,
+            q_rope_output.stride(1) if write_q_rows else 0,
+            q_rope_output.stride(2) if write_q_rows else 0,
             HEAD_D=hp_head_dim,
             V_HEAD_D=v_head_dim,
             HP_BLOCK=FP4_BLOCK_SIZE,
@@ -743,6 +749,7 @@ def _scatter_fp4_mla_kv_cache_2d_generation(
             WRITE_Q=True,
             Q1_KV_BLOCKS_PER_PROGRAM=q1_kv_blocks_per_program_variant,
             Q_ROWS_PER_SEQ=q_rows_per_seq,
+            WRITE_Q_ROWS=write_q_rows,
             maxnreg=56,
         )
 
@@ -779,6 +786,7 @@ def scatter_fp4_mla_kv_cache(
     helix_is_inactive_rank: Optional[torch.Tensor] = None,
     q_context: Optional[torch.Tensor] = None,
     q_nope_head_dim: Optional[int] = None,
+    external_q_heads: Optional[int] = None,
 ) -> bool:
     """Quantize MLA latent tokens and scatter them into the paged FP4 cache.
 
@@ -809,8 +817,18 @@ def scatter_fp4_mla_kv_cache(
     pool. When ``q_quant_input`` is supplied, the generation kernel also emits
     backend-ready residual FP4 Q. The return value reports whether the current
     phase updated the HP pool.
+
+    With ``external_q_heads`` (generation only, instead of ``q_pe`` /
+    ``q_rope_out`` / ``q_quant_input``) the Q buffers of a query of that many
+    heads are prepared and recorded on ``metadata`` as usual, but the kernel
+    leaves them to the caller (``k3_mla_q_fused`` writes them): it updates the
+    KV cache only.
     """
+    if external_q_heads is not None and phase != "generation":
+        raise ValueError("FP4 MLA external_q_heads applies to the generation phase only.")
     if phase == "generation":
+        # The first FP4 MLA kernel of a step: it reads the step's metadata.
+        metadata.fp4_mla_state.join_generation_metadata()
         metadata.fp4_mla_state.generation_cache_scattered = False
         metadata.fp4_mla_state.prequantized_q = None
         metadata.fp4_mla_state.prequantized_q_sf = None
@@ -911,27 +929,36 @@ def scatter_fp4_mla_kv_cache(
                 "FP4 MLA Helix position-offset and inactive-rank metadata "
                 "must be provided together."
             )
-        if not all(arg is not None for arg in generation_inputs):
-            raise ValueError(
-                "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
-                "and q_quant_input for fused RoPE, cache update, and Q quantization."
-            )
-        if not can_fuse_fp4_mla_q_quant(metadata, q_quant_input, q_pe, latent_cache):
-            raise ValueError(
-                "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
-                "scale mode, or backend."
-            )
+        if external_q_heads is not None:
+            if rotary_cos_sin is None or any(
+                arg is not None for arg in (q_pe, q_rope_out, q_quant_input)
+            ):
+                raise ValueError(
+                    "FP4 MLA generation with external query rows requires rotary_cos_sin "
+                    "and no q_pe, q_rope_out or q_quant_input."
+                )
+            num_q_heads = external_q_heads
+        else:
+            if not all(arg is not None for arg in generation_inputs):
+                raise ValueError(
+                    "FP4 MLA generation requires rotary_cos_sin, q_pe, q_rope_out, "
+                    "and q_quant_input for fused RoPE, cache update, and Q quantization."
+                )
+            if not can_fuse_fp4_mla_q_quant(metadata, q_quant_input, q_pe, latent_cache):
+                raise ValueError(
+                    "Fused FP4 MLA Q quantization received an unsupported shape, dtype, "
+                    "scale mode, or backend."
+                )
+            num_q_heads = q_quant_input.shape[1]
         num_gen_for_q = metadata.num_seqs - metadata.num_contexts
         q_rows_per_seq = 0
         if num_gen_for_q > 0 and num_tokens % num_gen_for_q == 0:
-            q_rows_per_seq = _fp4_mla_packed_rows_per_seq(
-                q_quant_input.shape[1], num_tokens // num_gen_for_q
-            )
+            q_rows_per_seq = _fp4_mla_packed_rows_per_seq(num_q_heads, num_tokens // num_gen_for_q)
         q_fp4_out, q_sf_out, q_batch_capacity = _prepare_fp4_mla_q_buffers(
             metadata,
             num_tokens,
-            q_quant_input.shape[1],
-            q_quant_input.device,
+            num_q_heads,
+            latent_cache.device,
             rows_per_seq=q_rows_per_seq,
         )
         metadata.fp4_mla_state.prequantized_q = q_fp4_out
@@ -1049,6 +1076,7 @@ def scatter_fp4_mla_kv_cache(
             sf_per_token=sf_per_token,
             sf_per_page=sf_per_page,
             rotary_cos_sin=rotary_cos_sin,
+            num_q_heads=num_q_heads,
             q_pe=q_pe,
             q_rope_out=q_rope_out,
             q_quant_input=q_quant_input,

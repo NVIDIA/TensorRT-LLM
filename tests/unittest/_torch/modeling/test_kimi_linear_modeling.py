@@ -25,6 +25,7 @@ def test_kimi_linear_model_builds_shared_aux_stream_registry(
         def __init__(self, _model_config, _config, _layer_idx, aux_stream_dict) -> None:
             super().__init__()
             self.token_sliced = False
+            self.is_kda = True
             layer_aux_stream_dicts.append(aux_stream_dict)
 
     monkeypatch.setattr(torch.cuda, "Stream", lambda: next(stream_iter))
@@ -86,3 +87,17 @@ def test_kimi_k3_routed_expert_exclusion_outranks_the_checkpoint_entry() -> None
     assert excluded.kv_cache_quant_algo == QuantAlgo.FP8
 
     assert resolve(model_config, 4) is per_layer
+
+
+@pytest.mark.parametrize("min_latency", [False, True])
+def test_kimi_k3_packs_step_inputs_under_enable_min_latency(min_latency: bool) -> None:
+    """``enable_min_latency`` arms the packed decode-step input uploads, the sampler's Philox
+    uploads included; the step head stays."""
+    model = object.__new__(modeling_kimi_linear.KimiLinearForCausalLM)
+    object.__setattr__(model, "model_config", ModelConfig(enable_min_latency=min_latency))
+
+    hooks = model.runtime_hooks
+
+    assert hooks.pack_step_inputs is min_latency
+    assert hooks.pack_spec_rng_uploads is min_latency
+    assert hooks.decode_prologue is modeling_kimi_linear.spec_decode_head

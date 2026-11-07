@@ -243,6 +243,49 @@ def test_kimi_k3_fine_m_tuning_uses_hybrid_buckets():
     )
 
 
+@pytest.mark.skipif(
+    getSMVersion() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+    reason="needs SM107 and SM107 CuTe DSL support",
+)
+@pytest.mark.parametrize("m", [16, 256, 512])
+def test_kimi_k3_mxfp8_tactic_space(m):
+    """The K3 MXFP8 runner profiles the SM107 MXFP8 tactics without the 1-CTA b-reuse tile,
+    with prefetch only on the unswapped 2-CTA b-reuse tile and split-K only up to M 256."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLKimiK3MXFP8RubinLinear,
+        CuteDSLMXFP8RubinLinear,
+    )
+
+    n, k = 2048, 7168
+    inputs = [
+        torch.empty((m, k), device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty((n, k), device="cuda", dtype=torch.float8_e4m3fn),
+        torch.empty((m * k // 32,), device="cuda", dtype=torch.uint8),
+        torch.empty((n * k // 32,), device="cuda", dtype=torch.uint8),
+        torch.ones((), device="cuda", dtype=torch.float32),
+    ]
+
+    def fields(tactic):
+        """(mma_m, swap_ab, use_prefetch, split_k) of a base or mixed-cluster tactic."""
+        mma_m = (tactic[1][0], tactic[2][0])
+        if tactic[0] == "base":
+            return mma_m, tactic[4], tactic[5], tactic[8]
+        return mma_m, tactic[5], tactic[6], 1
+
+    def profiled(tactic):
+        mma_m, swap_ab, use_prefetch, split_k = fields(tactic)
+        return (
+            mma_m != (256, 128)
+            and (not use_prefetch or (not swap_ab and mma_m == (512, 256)))
+            and (split_k == 1 or m <= 256)
+        )
+
+    full = CuteDSLMXFP8RubinLinear(output_dtype=torch.bfloat16).get_valid_tactics(inputs, None)
+    k3 = CuteDSLKimiK3MXFP8RubinLinear(output_dtype=torch.bfloat16).get_valid_tactics(inputs, None)
+    assert k3 and len(k3) < len(full)
+    assert k3 == [tactic for tactic in full if profiled(tactic)]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @pytest.mark.skipif(getSMVersion() not in (100, 103, 107), reason="needs SM100/SM103/SM107")
 @pytest.mark.parametrize("m", [1, 16, 17, 64, 96, 97, 256])
@@ -276,10 +319,10 @@ def test_forward_nvfp4_matches_gemm_then_fp4_quantize(m):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 @RUBIN
 @pytest.mark.parametrize("rows", [1, 64, 128, 129, 170, 256])
-def test_takes_prequantized_input_caps_at_one_scale_block(rows):
-    """``takes_prequantized_input`` hands over at most one 128-row R128c4 scale block: the
-    prequantized kernel's folded scale load does not advance to a second row block, so a
-    wider forward keeps handing BF16 rows to ``forward``."""
+def test_takes_prequantized_input_covers_the_low_m_gemm_range(rows):
+    """``takes_prequantized_input`` hands over the MXFP8 operand wherever ``forward`` runs the
+    low-M GEMM, mid-M included: the mid-M GEMM reads one R128c4 scale block per 128 rows, so
+    rows past the first block take the operand too."""
     _, linear = _make(3584, 7168, seed=11)
-    expected = 1 <= rows <= min(128, linear._low_m.kernel_max_m)
+    expected = 1 <= rows <= linear._low_m.max_m
     assert linear.takes_prequantized_input(rows) == expected

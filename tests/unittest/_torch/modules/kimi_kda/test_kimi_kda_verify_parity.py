@@ -214,6 +214,7 @@ def _prefill_metadata(
         query_start_loc_long=cu_seqlens,
         has_initial_states=torch.zeros(batch, dtype=torch.bool, device=slot_indices.device),
         use_initial_states=False,
+        kda_inforward_snapshot=None,
     )
     cache_manager = SimpleNamespace(mamba_layer_cache=lambda _: layer_cache)
     return SimpleNamespace(

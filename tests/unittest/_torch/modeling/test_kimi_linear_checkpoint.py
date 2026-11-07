@@ -269,6 +269,8 @@ def _model(
     )
     layer = nn.Module()
     layer.is_kda, layer.is_moe = kda, False
+    # The attention keeps its (local) output all-reduce: o_proj is built without one.
+    layer.attention_output_reduction = lambda: (None, 0)
     # These tests inspect rank-local loading and GEMMs on one GPU. No
     # collective is executed, so avoid allocating multi-GPU IPC workspaces.
     with (
@@ -411,8 +413,8 @@ def test_kda_load_preserves_checkpoint_shards_and_fused_outputs(tp_size, tp_rank
         actual_bfa[:, : expected_bfa.shape[1]], expected_bfa, rtol=0.02, atol=0.02
     )
     assert attention._bfa_proj_weight.dtype == torch.bfloat16
-    # The loader tells the mixer for which row counts the fused projection takes an MXFP8 input.
-    assert attention._qkvg_takes_prequantized == attention.qkvg_proj.takes_prequantized_input
+    # The loader has the mixer take MXFP8 inputs through the fused projection.
+    assert attention._qkvg_prequantized is attention.qkvg_proj
     for name in _KDA_PROJECTIONS[:4]:
         assert (
             getattr(attention, name).weight.untyped_storage().data_ptr()

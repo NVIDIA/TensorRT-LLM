@@ -39,6 +39,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tensorrt_llm._torch.modules.projection_capabilities import PrequantizedInputProjection
+
 _HAVE_DEPS = True
 _DEP_ERR = None
 try:
@@ -194,16 +196,31 @@ def _promote_sequential(layer_cache, conv_pool, ssm_pool, accept):
     ssm_pool.copy_(layer_cache.intermediate_ssm[rows, accept])
 
 
+def _fused_fb_call(kwargs):
+    """The kwargs of a ``mtp_verify_fused_fb`` launch (the f_a-mode verify, which computes the
+    forget gate from ``f_a``) with the ``mtp_verify`` flags that op implies: packed rows, fused
+    output norm, BF16 output."""
+    return dict(
+        kwargs, packed_token_layout=True, cu_seqlens=None, fuse_output_norm=True, mxfp8_output=False
+    )
+
+
 def _capture_mtp_verify(runtime):
-    """Record the kwargs of every fused verify launch, then run it."""
+    """Record the kwargs of every fused verify launch (either op), then run it."""
     calls = []
     mtp_verify = runtime._dispatch.mtp_verify
+    mtp_verify_fused_fb = runtime._dispatch.mtp_verify_fused_fb
 
     def _capturing_mtp_verify(**kwargs):
         calls.append(kwargs)
         return mtp_verify(**kwargs)
 
+    def _capturing_mtp_verify_fused_fb(**kwargs):
+        calls.append(_fused_fb_call(kwargs))
+        return mtp_verify_fused_fb(**kwargs)
+
     runtime._dispatch.mtp_verify = _capturing_mtp_verify
+    runtime._dispatch.mtp_verify_fused_fb = _capturing_mtp_verify_fused_fb
     return calls
 
 
@@ -554,15 +571,20 @@ def test_fused_verify_multi_wave_runs_two_cta_kernel(monkeypatch, state_dtype):
             world_cache.prev_num_accepted_tokens.copy_(accept)
 
 
-class _PrequantizedProjectionStub(torch.nn.Module):
-    """o_proj stand-in that records the prequantized pair it receives."""
+class _PrequantizedProjectionStub(PrequantizedInputProjection):
+    """o_proj stand-in that records the prequantized pair it receives; ``low_m``: whether it
+    runs its low-M GEMM on the verify rows (``takes_prequantized_input``)."""
 
     supports_prequantized_input = True
 
-    def __init__(self, out_features):
+    def __init__(self, out_features, low_m=False):
         super().__init__()
         self.out_features = out_features
+        self.low_m = low_m
         self.calls = []
+
+    def takes_prequantized_input(self, num_rows):
+        return self.low_m
 
     def forward(self, x):
         return x.new_zeros(x.shape[0], self.out_features)
@@ -576,13 +598,21 @@ class _PrequantizedProjectionStub(torch.nn.Module):
 
 @torch.no_grad()
 @pytest.mark.parametrize("allow, with_output", [(True, False), (False, False), (True, True)])
-def test_fused_verify_mxfp8_output_gating(allow, with_output):
-    """MXFP8 output only when allowed, unbuffered and accepted by o_proj."""
+@pytest.mark.parametrize(
+    "low_m, use_pdl", [(False, True), (True, True), (True, False)], ids=["mid_m", "low_m", "no_pdl"]
+)
+def test_fused_verify_mxfp8_output_gating(allow, with_output, low_m, use_pdl):
+    """MXFP8 output only when allowed, unbuffered and accepted by o_proj, and not where the
+    one-wave BF16 verify runs as a PDL launch in front of o_proj's low-M GEMM."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import v2_verify_applies
+
     batch = 2
     rows = batch * (M + 1)
+    assert v2_verify_applies(H, batch, M, torch.device("cuda"))
     runtime = _make_runtime(seed=9)
     runtime.finalize_decode_weights()
-    stub = _PrequantizedProjectionStub(HIDDEN)
+    runtime._use_pdl = use_pdl
+    stub = _PrequantizedProjectionStub(HIDDEN, low_m=low_m)
     runtime.o_proj = stub
     calls = []
 
@@ -593,7 +623,11 @@ def test_fused_verify_mxfp8_output_gating(allow, with_output):
             return activation, torch.zeros(128 * H * 4, dtype=torch.uint8, device="cuda")
         return torch.zeros(1, rows, H, K, dtype=torch.bfloat16, device="cuda")
 
+    def _fake_mtp_verify_fused_fb(**kwargs):
+        return _fake_mtp_verify(**_fused_fb_call(kwargs))
+
     runtime._dispatch.mtp_verify = _fake_mtp_verify
+    runtime._dispatch.mtp_verify_fused_fb = _fake_mtp_verify_fused_fb
     x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16, device="cuda")
     output = x.new_empty(rows, H, K) if with_output else None
     core = _run_one_verify_round(
@@ -601,9 +635,10 @@ def test_fused_verify_mxfp8_output_gating(allow, with_output):
     )
     out = runtime._project_output(core)
 
-    expect_mxfp8 = allow and not with_output
+    expect_mxfp8 = allow and not with_output and not (low_m and use_pdl)
     assert calls[-1]["fuse_output_norm"]
     assert calls[-1]["mxfp8_output"] is expect_mxfp8
+    assert calls[-1]["use_pdl"] is (use_pdl and not expect_mxfp8)
     assert len(stub.calls) == int(expect_mxfp8)
     assert out.shape == (rows, HIDDEN)
     if with_output:
@@ -616,7 +651,8 @@ def test_fused_verify_mxfp8_output_gating(allow, with_output):
     reason="the MXFP8 verify epilogue feeds the Rubin (SM107) CuTe MXFP8 GEMM",
 )
 def test_fused_verify_mxfp8_output_matches_bf16_projection():
-    """SM107: epilogue-quantized o_proj input matches the BF16 core path."""
+    """SM107: epilogue-quantized o_proj input matches the BF16 core path, which a one-wave PDL
+    verify hands the low-M o_proj GEMM even where the MXFP8 output is allowed."""
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
     from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
 
@@ -627,14 +663,21 @@ def test_fused_verify_mxfp8_output_matches_bf16_projection():
     runtime.finalize_decode_weights()
     runtime.o_proj = _Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
     assert runtime.o_proj.supports_prequantized_input
+    assert runtime.o_proj.takes_prequantized_input(batch * (M + 1))
     calls = _capture_mtp_verify(runtime)
     x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
 
-    bf16_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=12))
+    runtime._use_pdl = True
+    bf16_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
+    bf16_out = runtime._project_output(bf16_core)
+    # Without PDL the two-CTA kernel's MXFP8 epilogue costs no programmatic launch.
+    runtime._use_pdl = False
     mxfp8_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
     mxfp8_out = runtime._project_output(mxfp8_core)
 
     assert [call["mxfp8_output"] for call in calls] == [False, True]
+    assert calls[0]["use_pdl"]
+    assert isinstance(bf16_core, torch.Tensor)
     assert mxfp8_core.activation.dtype is torch.float8_e4m3fn
     assert mxfp8_core.scale.dtype is torch.uint8
     assert _rep("mxfp8 vs bf16 o_proj input", mxfp8_out, bf16_out)

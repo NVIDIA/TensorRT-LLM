@@ -55,6 +55,10 @@ from .mla_helpers import (LOG2_E, MAX_SPLITS, MLAStaticTileScheduler,
                           create_mla_static_tile_scheduler_params,
                           get_variable_query_tile_info)
 
+# Split-KV partials the reduction kernel loads per round before it accumulates
+# them; the sum order is that of one split at a time, so the output is the same.
+REDUCE_UNROLL = 8
+
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, "../.."))
@@ -146,6 +150,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_d_tiles: int = 1,
         reducer_max_splits: int = MAX_SPLITS,
         emit_softmax_stats: bool = False,
+        reduce_rows_per_cta: int = 1,
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -188,6 +193,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param emit_softmax_stats: Whether to fuse Helix softmax-statistics
             stores into the attention epilogue.
         :type emit_softmax_stats: bool
+        :param reduce_rows_per_cta: Work items (one D band of one output row)
+            per block of the split-KV reduction, one 128-thread group each
+            (1..8); the arithmetic of every item is the same for any value.
+        :type reduce_rows_per_cta: int
         """
 
         self.latent_dim = 512
@@ -212,6 +221,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 "variable split-KV requires the generic reducer capacity "
                 f"of {MAX_SPLITS}, got {reducer_max_splits}")
         self.reducer_max_splits = reducer_max_splits
+        if not 1 <= reduce_rows_per_cta <= 8:
+            raise ValueError(
+                f"reduce_rows_per_cta must be in 1..8, got {reduce_rows_per_cta}"
+            )
+        self.reduce_rows_per_cta = reduce_rows_per_cta
         # ``seq_len_q`` is the compile-time query capacity.  Fixed-query
         # specializations use it as the request length; variable-query
         # specializations obtain each request's actual length from its indptr.
@@ -1148,14 +1162,20 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                     cum_seq_lens_q,
                     block_split_kvs,
                 )
+            rows_per_cta = self.reduce_rows_per_cta
             reduction_kernel.launch(
                 grid=(
-                    o_unpacked.shape[0] * self.reducer_d_tiles,
+                    cute.ceil_div(o_unpacked.shape[0] * self.reducer_d_tiles,
+                                  rows_per_cta),
                     self.seq_len_q,
                     runtime_batch_size,
                 ),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=self.reducer_max_splits * self.acc_dtype.width // 8,
+                block=[
+                    self.threads_per_warp * self.num_compute_warps *
+                    rows_per_cta, 1, 1
+                ],
+                smem=rows_per_cta * self.reducer_max_splits *
+                self.acc_dtype.width // 8,
                 stream=stream,
                 min_blocks_per_mp=1,
             )
@@ -2061,9 +2081,17 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        # Reducer blocks cover one D band of one logical output row.
-        d_tile_idx = bidx % self.reducer_d_tiles
-        head_idx = bidx // self.reducer_d_tiles
+        # A work item is one D band of one logical output row; a block runs
+        # reduce_rows_per_cta items, one 128-thread group each.
+        work_idx = bidx
+        group_threads = self.threads_per_warp * self.num_compute_warps
+        group = 0
+        if cutlass.const_expr(self.reduce_rows_per_cta > 1):
+            group = tidx // group_threads
+            tidx = tidx % group_threads
+            work_idx = bidx * self.reduce_rows_per_cta + group
+        d_tile_idx = work_idx % self.reducer_d_tiles
+        head_idx = work_idx // self.reducer_d_tiles
         q_begin = cutlass.Int32(0)
         q_len = cutlass.Int32(self.seq_len_q)
         is_active = True
@@ -2080,8 +2108,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # Inactive variable-Q CTAs do not touch workspace or outputs.
         smem = utils.SmemAllocator()
         storage = smem.allocate(
-            self.reducer_max_splits * self.acc_dtype.width // 8, 16)
+            self.reduce_rows_per_cta * self.reducer_max_splits *
+            self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
+        if cutlass.const_expr(self.reduce_rows_per_cta > 1):
+            lse_scale_ptr = lse_scale_ptr + group * self.reducer_max_splits
         smem_lse_scale = cute.make_tensor(
             lse_scale_ptr, cute.make_layout(self.reducer_max_splits))
 
@@ -2112,9 +2143,15 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             reduce_row = cutlass.Boolean(True)
             if cutlass.const_expr(self.is_var_split_kv):
                 reduce_row = local_split_kv != 1
+            if cutlass.const_expr(self.reduce_rows_per_cta > 1):
+                # Groups of the last block past the last work item.
+                if head_idx >= mO.shape[0]:
+                    reduce_row = cutlass.Boolean(False)
             if reduce_row:
                 gLSE = mAccLSE[q_tile_row, None, q_tile, bidz]
                 warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+                if cutlass.const_expr(self.reduce_rows_per_cta > 1):
+                    warp_idx = warp_idx % self.num_compute_warps
                 if warp_idx == 0:
                     # calculate the global lse and exp ^ (local_lse - global_lse)
                     lse_per_thread = cute.ceil_div(self.reducer_max_splits,
@@ -2176,7 +2213,14 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                             smem_lse_scale[split_kv_idx] = cute.math.exp2(
                                 local_lse[i] - global_lse, fastmath=True)
 
-                pipeline.sync(barrier_id=4)
+                if cutlass.const_expr(self.reduce_rows_per_cta == 1):
+                    pipeline.sync(barrier_id=4)
+                else:
+                    # Each group syncs its own threads (named barriers 4..11).
+                    for g in cutlass.range_constexpr(self.reduce_rows_per_cta):
+                        if group == g:
+                            cute.arch.barrier(barrier_id=4 + g,
+                                              number_of_threads=group_threads)
 
                 elements_per_thread = cute.ceil_div(
                     self.reducer_d_tile,
@@ -2194,7 +2238,25 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
                 rO = cute.make_rmem_tensor(cute.make_layout(fragment_elements),
                                            self.o_dtype)
                 rAccO.fill(0.0)
-                for i in range(local_split_kv):
+                # Load REDUCE_UNROLL splits' partials, then accumulate them in
+                # split order: a round's loads are in flight together, and
+                # every row still sums its splits one after the other.
+                rBuf = cute.make_rmem_tensor(
+                    cute.make_layout((REDUCE_UNROLL, elements_per_thread)),
+                    self.acc_dtype)
+                full = local_split_kv // REDUCE_UNROLL * REDUCE_UNROLL
+                for i0 in cutlass.range(0, full, REDUCE_UNROLL, unroll=1):
+                    for u in cutlass.range_constexpr(REDUCE_UNROLL):
+                        for j in cutlass.range_constexpr(elements_per_thread):
+                            element_idx = (d_tile_idx * self.reducer_d_tile +
+                                           tidx + j * self.threads_per_warp *
+                                           self.num_compute_warps)
+                            rBuf[u, j] = gAccO[i0 + u, element_idx]
+                    for u in cutlass.range_constexpr(REDUCE_UNROLL):
+                        scale = smem_lse_scale[i0 + u]
+                        for j in cutlass.range_constexpr(elements_per_thread):
+                            rAccO[j] += rBuf[u, j] * scale
+                for i in cutlass.range(full, local_split_kv, 1, unroll=1):
                     for j in cutlass.range_constexpr(elements_per_thread):
                         element_idx = (
                             d_tile_idx * self.reducer_d_tile + tidx +

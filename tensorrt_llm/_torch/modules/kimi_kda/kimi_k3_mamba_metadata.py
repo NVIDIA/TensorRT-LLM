@@ -3,6 +3,7 @@
 """Host-prepared scheduling metadata for packed FlashInfer KDA prefill."""
 
 from itertools import accumulate
+from typing import NamedTuple, Optional
 
 import torch
 
@@ -11,10 +12,22 @@ from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
 from tensorrt_llm._utils import prefer_pinned
 
 
+class KdaInforwardSnapshot(NamedTuple):
+    """One step's in-forward snapshots of the KDA layers (``KimiK3MambaMetadata``)."""
+
+    rows: torch.Tensor  # int32 [N]: staging row of context sequence b, -1 for none
+    chunks: torch.Tensor  # int32 [N]: P lies 64 * chunks[b] tokens into sequence b's chunk
+    live: torch.Tensor  # int64 [k]: live state slots of the k snapshotted sequences
+    stage_rows: torch.Tensor  # int64 [k]: their staging rows
+    conv_win: torch.Tensor  # int64 [k * (W - 1)]: positions of the conv window ending at P
+
+
 class KimiK3MambaMetadata(Mamba2Metadata):
     """Reuse stable int32 slots/starts and int64 offsets from Mamba metadata."""
 
     prefill_chunk_alignment = 16
+    # This step's in-forward snapshots (None: none).
+    kda_inforward_snapshot: Optional[KdaInforwardSnapshot] = None
 
     def __init__(self, max_batch_size: int, chunk_size: int, max_num_tokens: int) -> None:
         super().__init__(max_batch_size, chunk_size, max_num_tokens)
@@ -40,6 +53,7 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             f"Expected positive context lengths, got {context_lengths}"
         )
 
+        self.kda_inforward_snapshot = None
         super().prepare(attn_metadata)
 
         self.generation_state_indices = None
@@ -74,3 +88,56 @@ class KimiK3MambaMetadata(Mamba2Metadata):
             pin_memory=prefer_pinned(),
         )
         self._kda_schedule.copy_(host_schedule, non_blocking=True)
+
+    def _prepare_inforward_split(
+        self, attn_metadata: AttentionMetadata, kv_cache_manager, plan, num_contexts, batch_size
+    ) -> None:
+        """The KDA form of the in-forward snapshots: no split. The prefill kernel stores the
+        state at P into the request's staging row in its pass over the whole chunk, and the
+        layer then swaps it with the live chunk-end state (``KimiKDALinearAttention``)."""
+        from ...custom_ops.cute_dsl_kimi_k3_custom_ops import KDA_PREFILL_SNAPSHOT_CHUNK
+
+        if batch_size != num_contexts:
+            raise RuntimeError(
+                "In-forward KDA snapshot planned for a batch with generation requests"
+            )
+        width = kv_cache_manager.conv_state_shape[-1]
+        rows, chunks, live, stage_rows, conv_win = [], [], [], [], []
+        start = 0
+        request_ids = attn_metadata.request_ids[:num_contexts]
+        for rid, length in zip(request_ids, attn_metadata.seq_lens[:num_contexts].tolist()):
+            entry = plan.get(rid)
+            if entry is None:
+                rows.append(-1)
+                chunks.append(0)
+            else:
+                before = entry.num_before
+                if (
+                    before + entry.num_after != length
+                    or before < width
+                    or before % KDA_PREFILL_SNAPSHOT_CHUNK
+                ):
+                    raise RuntimeError(
+                        f"In-forward KDA snapshot: request {rid} chunk of {length} tokens does "
+                        f"not match the plan ({before} + {entry.num_after}, window {width})"
+                    )
+                rows.append(entry.row)
+                chunks.append(before // KDA_PREFILL_SNAPSHOT_CHUNK)
+                live.append(kv_cache_manager.state_index(rid))
+                stage_rows.append(entry.row)
+                conv_win.extend(range(start + before - width, start + before))
+            start += length
+        if not live:
+            return
+        # Fresh pinned sources: no later host write can race the copies.
+        pinned = prefer_pinned()
+        rows_chunks = torch.tensor([rows, chunks], dtype=torch.int32, pin_memory=pinned).to(
+            "cuda", non_blocking=True
+        )
+        indices = torch.tensor(
+            live + stage_rows + conv_win, dtype=torch.int64, pin_memory=pinned
+        ).to("cuda", non_blocking=True)
+        k = len(live)
+        self.kda_inforward_snapshot = KdaInforwardSnapshot(
+            rows_chunks[0], rows_chunks[1], indices[:k], indices[k : 2 * k], indices[2 * k :]
+        )

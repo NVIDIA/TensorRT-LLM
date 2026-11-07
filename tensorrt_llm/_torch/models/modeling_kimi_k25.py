@@ -32,6 +32,7 @@ import copy
 import logging
 import math
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
@@ -291,6 +292,141 @@ _MEDIA_PLACEHOLDER_TOKEN_ID = 163605
 
 # Default vocabulary size for K2.5
 _VOCAB_SIZE = 163840
+
+# Set to 0 to tokenize text-only prompts through ``tokenizer.__call__`` even
+# when ``_FastTextTokenizer`` accepts the tokenizer.
+_FAST_TEXT_TOKENIZE_ENV = "TRTLLM_KIMI_FAST_TEXT_TOKENIZE"
+
+
+def _fast_text_tokenize_enabled() -> bool:
+    return os.environ.get(_FAST_TEXT_TOKENIZE_ENV, "1") != "0"
+
+
+class _FastTextTokenizer:
+    """Token ids equal to ``tokenizer(text, return_tensors="pt").input_ids[0].tolist()``.
+
+    The Kimi ``TikTokenTokenizer`` (``trust_remote_code``) is a slow (Python)
+    tokenizer. Its ``__call__`` splits the text on the added tokens with a
+    per-character Python trie, turns every tiktoken id into a byte-level token
+    string and maps it back through ``convert_tokens_to_ids``, then builds a
+    tensor: about 0.5 s of host time for a 128K-token prompt. This class runs
+    the same steps without the per-character and per-token Python work:
+
+    1. the same added-token split, as a regex over the trie's tokens (longest
+       first, leftmost match, as ``Trie.split``);
+    2. the same per-piece ``tokenizer.encode`` that the tokenizer's
+       ``_tokenize`` calls;
+    3. the id -> token string -> id mapping of ``convert_tokens_to_ids`` as a
+       precomputed table (skipped when it is the identity, as for the Kimi
+       vocabulary);
+    4. ``build_inputs_with_special_tokens``, as ``add_special_tokens=True``.
+
+    ``create`` returns None, and callers keep ``tokenizer.__call__``, unless the
+    tokenizer is a slow tokenizer whose tokenize, id conversion and model-input
+    methods are the transformers ones, no added token strips whitespace or
+    matches single words, special tokens are not split, and a probe string
+    that mixes scripts, emoji, whitespace and every added token gives the same
+    ids as ``__call__``.
+    """
+
+    _PROBE = "Hello, 世界! 🙂 tab\there\r\n  x{}y   end"
+    _REQUIRED_ATTRS = (
+        "decoder",
+        "tokens_trie",
+        "_added_tokens_encoder",
+        "_added_tokens_decoder",
+        "_convert_token_to_id_with_added_voc",
+    )
+    _TRANSFORMERS_METHODS = (
+        "tokenize",
+        "convert_tokens_to_ids",
+        "_convert_token_to_id_with_added_voc",
+        "prepare_for_tokenization",
+        "_encode_plus",
+        "prepare_for_model",
+        "__call__",
+    )
+
+    def __init__(self, tokenizer, split_re, no_split, special_ids, remap):
+        self._tokenizer = tokenizer
+        self._split_re = split_re
+        self._no_split = no_split
+        self._special_ids = special_ids
+        self._remap = remap
+
+    @staticmethod
+    def _call_ids(tokenizer, text: str) -> List[int]:
+        return tokenizer(text, return_tensors="pt").input_ids[0].to(torch.int32).tolist()
+
+    @classmethod
+    def create(cls, tokenizer) -> Optional["_FastTextTokenizer"]:
+        """``tokenizer`` is what the input processor calls: an HF tokenizer or a
+        wrapper whose ``.tokenizer`` is one (``TransformersTokenizer``)."""
+        wrapped = tokenizer
+        if not hasattr(tokenizer, "tokens_trie"):
+            tokenizer = getattr(tokenizer, "tokenizer", None)
+            if tokenizer is None:
+                return None
+        tok_cls = type(tokenizer)
+        if not all(hasattr(tokenizer, name) for name in cls._REQUIRED_ATTRS):
+            return None
+        if getattr(tokenizer, "split_special_tokens", False) or getattr(
+            tokenizer, "do_lower_case", False
+        ):
+            return None
+        for name in cls._TRANSFORMERS_METHODS:
+            module = getattr(getattr(tok_cls, name, None), "__module__", "") or ""
+            if not module.startswith("transformers."):
+                return None
+        encode_module = getattr(tok_cls.encode, "__module__", "") or ""
+        if encode_module.startswith("transformers."):
+            return None
+        added = list(tokenizer._added_tokens_decoder.values())
+        if any(t.lstrip or t.rstrip or t.single_word for t in added):
+            return None
+        trie_tokens = sorted(getattr(tokenizer.tokens_trie, "_tokens", ()), key=len, reverse=True)
+        if not trie_tokens:
+            return None
+        split_re = re.compile("(" + "|".join(re.escape(t) for t in trie_tokens) + ")")
+        no_split = set(tokenizer._added_tokens_encoder.keys()) | set(tokenizer.all_special_tokens)
+        special_ids = {t: tokenizer._convert_token_to_id_with_added_voc(t) for t in no_split}
+        size = max(tokenizer.decoder) + 1
+        remap = [
+            tokenizer._convert_token_to_id_with_added_voc(tokenizer.decoder[i])
+            if i in tokenizer.decoder
+            else i
+            for i in range(size)
+        ]
+        if all(r == i for i, r in enumerate(remap)):
+            remap = None
+        fast = cls(tokenizer, split_re, no_split, special_ids, remap)
+        probe = cls._PROBE.format("".join(t.content for t in added))
+        try:
+            ok = fast(probe) == cls._call_ids(wrapped, probe)
+        except (AttributeError, IndexError, KeyError, RuntimeError, TypeError, ValueError) as e:
+            logger.warning("Fast text tokenization probe failed (%r); using tokenizer.__call__", e)
+            return None
+        if not ok:
+            logger.warning(
+                "Fast text tokenization probe ids differ from tokenizer.__call__; using it instead"
+            )
+            return None
+        return fast
+
+    def __call__(self, text: str) -> List[int]:
+        tokenizer = self._tokenizer
+        remap = self._remap
+        ids: List[int] = []
+        for piece in self._split_re.split(text):
+            if not piece:
+                continue
+            if piece in self._no_split:
+                ids.append(self._special_ids[piece])
+            elif remap is None:
+                ids.extend(tokenizer.encode(piece))
+            else:
+                ids.extend(remap[i] for i in tokenizer.encode(piece))
+        return tokenizer.build_inputs_with_special_tokens(ids)
 
 
 # ---------------------------------------------------------------------------
@@ -1106,6 +1242,10 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
             config, "media_placeholder_token_id", _MEDIA_PLACEHOLDER_TOKEN_ID
         )
 
+        # Built on the first text-only prompt (see _fast_text_tokenizer).
+        self._fast_text: Optional[_FastTextTokenizer] = None
+        self._fast_text_checked = False
+
     @property
     def config(self) -> PretrainedConfig:
         return self._config
@@ -1125,6 +1265,19 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
     @property
     def dtype(self) -> torch.dtype:
         return self._dtype
+
+    def _fast_text_tokenizer(self) -> Optional[_FastTextTokenizer]:
+        """The exact fast path for text-only prompts, or None for ``tokenizer.__call__``."""
+        if not _fast_text_tokenize_enabled():
+            return None
+        if not getattr(self, "_fast_text_checked", False):
+            self._fast_text = _FastTextTokenizer.create(self._tokenizer)
+            self._fast_text_checked = True
+            logger.info(
+                "Text-only prompts: %s",
+                "fast tokenization path" if self._fast_text is not None else "tokenizer.__call__",
+            )
+        return self._fast_text
 
     def get_vocab_size(self) -> int:
         """Return the K2.5 vocabulary size (163840)."""
@@ -1253,6 +1406,10 @@ class KimiK25InputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyInp
 
         # Text-only path
         if not images and not videos:
+            if isinstance(text_prompt, str):
+                fast = self._fast_text_tokenizer()
+                if fast is not None:
+                    return fast(text_prompt), {}
             token_ids = self._tokenizer(text_prompt, return_tensors="pt").input_ids[0]
             return token_ids.to(torch.int32).tolist(), {}
 

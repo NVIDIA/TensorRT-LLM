@@ -9,6 +9,7 @@ gives the same prefix and normalized mix, bit for bit, as materializing it first
 """
 
 import functools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -71,7 +72,7 @@ def _close_to_cpp(actual: torch.Tensor, expected: torch.Tensor, what=None):
 # The kernel itself is compared with the C++ ops over its full range in
 # kernels/parallel/test_kimi_k3_attn_res_decode.py; this checks the model-side wrappers.
 @pytest.mark.parametrize("snapshots", [1, 4, 11])
-@pytest.mark.parametrize("m", [1, 64])
+@pytest.mark.parametrize("m", [1, 192])
 @torch.no_grad()
 def test_dispatch_matches_cpp(m: int, snapshots: int):
     proj, norm, out_norm = _modules(m + snapshots)
@@ -108,10 +109,10 @@ def test_attn_res_topology_switch(monkeypatch, raw: str, persistent: bool):
 
 
 def test_fused_max_tokens_env(monkeypatch):
-    """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default 64 (the decode
-    kernel's range); anything else fails loudly."""
+    """``KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS``: a positive integer, default the decode kernel's
+    range (192); anything else fails loudly."""
     monkeypatch.delenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, raising=False)
-    assert mkl._read_fused_attn_res_max_tokens() == 64 == _max_tokens()
+    assert mkl._read_fused_attn_res_max_tokens() == 192 == _max_tokens()
     monkeypatch.setenv(mkl.KIMI_K3_FUSED_ATTN_RES_MAX_TOKENS_ENV, "1")
     assert mkl._read_fused_attn_res_max_tokens() == 1
     for bad in ("0", "-3", "1.5", "all"):
@@ -132,7 +133,7 @@ def test_selector_token_ceiling(monkeypatch, persistent: bool):
     K = mkl._AttnResKernel
     above = K.PERSISTENT if persistent else K.UNFUSED
     monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
-    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.DECODE, K.DECODE, above]
+    assert [_kernel_for(m) for m in (1, 192, 193)] == [K.DECODE, K.DECODE, above]
     monkeypatch.setattr(mkl, "_FUSED_ATTN_RES_MAX_TOKENS", 1)
     assert [_kernel_for(m) for m in (1, 2, 64)] == [K.DECODE, above, above]
     assert mkl._defers_moe_residual(_rows(1, HIDDEN), 5)
@@ -148,7 +149,7 @@ def test_selector_falls_back_to_cpp_per_token_ops(monkeypatch, persistent: bool)
     monkeypatch.setattr(mkl, "_decode_attn_res_on_device", lambda device_index: False)
     monkeypatch.setattr(mkl, "_PERSISTENT_ATTN_RES_ENABLED", persistent)
     above = K.PERSISTENT if persistent else K.UNFUSED
-    assert [_kernel_for(m) for m in (1, 64, 65)] == [K.PER_TOKEN, K.PER_TOKEN, above]
+    assert [_kernel_for(m) for m in (1, 192, 193)] == [K.PER_TOKEN, K.PER_TOKEN, above]
     assert _kernel_for(8, num_candidates=12) is K.PER_TOKEN
     assert not mkl._defers_moe_residual(_rows(8, HIDDEN), 5)
 
@@ -190,14 +191,27 @@ class _PlainKdaMixer:
         return (h.float() * 0.75).to(torch.bfloat16)
 
 
+# Attention metadata of a generation-only batch (the decoder asks it for the MoE tail).
+_GENERATION = SimpleNamespace(num_contexts=0)
+
+
 class _FakeMoE(nn.Module):
     """Stands in for ``KimiK3MoERuntime``: routed/shared outputs derived from the input."""
 
-    def forward(self, hidden_states, all_rank_num_tokens=None, return_parts=False):
+    def forward(
+        self,
+        hidden_states,
+        all_rank_num_tokens=None,
+        return_parts=False,
+        column_parallel_tail=False,
+    ):
         assert return_parts
         routed = (hidden_states.float() * 0.5).to(torch.bfloat16)
         shared = (hidden_states.float() * -0.25).to(torch.bfloat16)
         return routed, shared
+
+    def moe_front_releases_early(self, like):
+        return False
 
 
 def _fake_layer(layer_idx: int, seed: int):
@@ -221,9 +235,9 @@ def _fake_layer(layer_idx: int, seed: int):
     return layer
 
 
-# 65: one row above the decode kernel's limit, where the next mix is not the decode kernel and the
+# 193: one row above the decode kernel's limit, where the next mix is not the decode kernel and the
 # MoE layer must not defer its residual update.
-@pytest.mark.parametrize("m", [7, 32, 64, 65])
+@pytest.mark.parametrize("m", [7, 32, 64, 128, 192, 193])
 @torch.no_grad()
 def test_decoder_layers_with_deferred_moe_residual(m: int):
     """Two decoder layers: the MoE residual update folded into the next mix equals materializing
@@ -236,7 +250,7 @@ def test_decoder_layers_with_deferred_moe_residual(m: int):
     def run(defer: bool):
         h, snaps = hidden, 3
         for layer in layers:
-            h, snaps = layer(h, bank, snaps, None, defer_moe_residual=defer)
+            h, snaps = layer(h, bank, snaps, _GENERATION, defer_moe_residual=defer)
         return h
 
     deferred = run(defer=True)
@@ -248,50 +262,84 @@ def test_decoder_layers_with_deferred_moe_residual(m: int):
     assert torch.equal(deferred, materialized)
 
 
+@pytest.mark.parametrize("m", [7, 32])
+@torch.no_grad()
+def test_output_mix_folds_last_moe_residual(m: int):
+    """The model's output mix folds the last MoE layer's deferred residual update in: the same
+    prefix and normed output, bit for bit, as materializing it and running the mix; with no
+    snapshot the update is materialized and the mix left to the caller."""
+    layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    bank = _rows(8, m, HIDDEN)
+    h, snaps = _rows(m, HIDDEN), 3
+    for layer in layers:
+        h, snaps = layer(h, bank, snaps, _GENERATION, defer_moe_residual=True)
+    assert isinstance(h, mkl._DeferredMoEResidual)
+    proj, norm, out_norm = _modules(30)
+    prefix, output = mkl._fold_moe_residual(h, bank[:snaps], proj, norm, out_norm)
+    materialized = h.materialize()
+    ref = mkl._apply_attn_res_and_rmsnorm(materialized, bank[:snaps], proj, norm, out_norm)
+    assert torch.equal(prefix, materialized)
+    assert torch.equal(output, ref)
+    prefix, output = mkl._fold_moe_residual(h, bank[:0], proj, norm, out_norm)
+    assert output is None and torch.equal(prefix, materialized)
+
+
 class _FakeKdaMixer:
     """Stands in for the KDA mixer: records the MXFP8 hand-off it is given for each call."""
 
-    def __init__(self):
+    def __init__(self, stages_weights: bool = False):
         self.seen = []
+        self.stages_weights = stages_weights
 
     def takes_prequantized_input(self, num_rows, attn_metadata):
         return attn_metadata.num_contexts == 0
+
+    def qkvg_stages_weights(self, num_rows):
+        return self.stages_weights
 
     def __call__(self, h, attn_metadata, prequantized_input=None):
         self.seen.append((h, prequantized_input))
         return (h.float() * 0.75).to(torch.bfloat16)
 
 
+@pytest.mark.parametrize("attention", ["kda", "kda_staged", "mla"])
 @pytest.mark.parametrize("m", [7, 32])
 @torch.no_grad()
-def test_decoder_layers_mxfp8_handoff(m: int):
-    """A KDA layer whose pre-attention mix folds in the previous MoE residual hands the mixer the
-    MXFP8 form of the normed mix, bitwise the FP8 low-M GEMM's quantization of the BF16 rows; the
-    layer outputs do not change, and context batches get no hand-off."""
+def test_decoder_layers_mxfp8_handoff(m: int, attention: str):
+    """A KDA or MLA layer whose pre-attention mix folds in the previous MoE residual hands the
+    attention the MXFP8 form of the normed mix, bitwise the FP8 low-M GEMM's quantization of the
+    BF16 rows; the layer outputs do not change, and context batches get no hand-off. A KDA
+    projection that stages its weights gets the mix released at kernel entry: the same bits."""
     from types import SimpleNamespace
 
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
     layers = [_fake_layer(1, 10), _fake_layer(2, 20)]
+    mixers = []
     for layer in layers:
-        layer.linear_attn = _FakeKdaMixer()
+        mixers.append(_FakeKdaMixer(stages_weights=attention == "kda_staged"))
+        layer.is_kda = attention != "mla"
+        if layer.is_kda:
+            layer.linear_attn = mixers[-1]
+        else:
+            layer.self_attn = mixers[-1]
     bank = _rows(8, m, HIDDEN)
     hidden = _rows(m, HIDDEN)
 
     def run(num_contexts):
         metadata = SimpleNamespace(num_contexts=num_contexts)
-        for layer in layers:
-            layer.linear_attn.seen.clear()
+        for mixer in mixers:
+            mixer.seen.clear()
         h, snaps = hidden, 3
         for layer in layers:
             h, snaps = layer(h, bank, snaps, metadata)
         return h.materialize()
 
     ref = run(num_contexts=1)
-    assert all(x is None for layer in layers for _, x in layer.linear_attn.seen)
+    assert all(x is None for mixer in mixers for _, x in mixer.seen)
     assert torch.equal(run(num_contexts=0), ref)
     # The first layer's input is a plain row (no deferred MoE update), the second one's is not.
-    (_, first), (rows, handoff) = layers[0].linear_attn.seen[0], layers[1].linear_attn.seen[0]
+    (_, first), (rows, handoff) = mixers[0].seen[0], mixers[1].seen[0]
     assert first is None and handoff is not None
     ref_q, ref_s = low_m.mxfp8_quantize_reference(rows)
     xq, xs = handoff
@@ -302,14 +350,26 @@ def test_decoder_layers_mxfp8_handoff(m: int):
     assert torch.equal(xs[offsets], ref_s)
 
 
-def _kda_mixer_taking_mxfp8(max_rows: int):
+def _kda_mixer_taking_mxfp8(max_rows: int, max_staged_rows: int = 0):
+    """A mixer stand-in and a fused q/k/v/g projection that takes MXFP8 inputs of up to
+    ``max_rows`` rows and stages its weights for up to ``max_staged_rows``; installing the
+    projection is left to the test."""
     from tensorrt_llm._torch.modules.kimi_kda import KimiKDALinearAttention
+    from tensorrt_llm._torch.modules.projection_capabilities import PrequantizedInputProjection
+
+    class _Projection(PrequantizedInputProjection):
+        def takes_prequantized_input(self, num_rows: int) -> bool:
+            return 1 <= num_rows <= max_rows
+
+        def stages_weights(self, num_rows: int) -> bool:
+            return self.takes_prequantized_input(num_rows) and num_rows <= max_staged_rows
 
     mixer = KimiKDALinearAttention.__new__(KimiKDALinearAttention)
     nn.Module.__init__(mixer)
     mixer.register_to_config = False
-    mixer._qkvg_takes_prequantized = None
-    return mixer, lambda num_rows: 1 <= num_rows <= max_rows
+    mixer.qkvg_proj = None
+    mixer._qkvg_prequantized = None
+    return mixer, _Projection()
 
 
 def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
@@ -318,7 +378,7 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
     fused q/k/v/g projection was not declared to take one, nor a padded batch."""
     from types import SimpleNamespace
 
-    mixer, takes = _kda_mixer_taking_mxfp8(max_rows=32)
+    mixer, projection = _kda_mixer_taking_mxfp8(max_rows=32)
 
     def metadata(num_contexts: int, num_tokens: int, num_requests: int):
         return SimpleNamespace(
@@ -327,7 +387,8 @@ def test_kda_mixer_takes_mxfp8_only_for_verify_batches():
 
     verify = metadata(0, 16, 4)
     assert not mixer.takes_prequantized_input(16, verify)
-    mixer.accept_prequantized_qkvg_input(takes)
+    mixer.qkvg_proj = projection
+    mixer.accept_prequantized_qkvg_input()
     assert mixer.takes_prequantized_input(16, verify)
     assert not mixer.takes_prequantized_input(64, metadata(0, 64, 8))
     assert not mixer.takes_prequantized_input(4, metadata(0, 4, 4))
@@ -443,3 +504,17 @@ def test_prewarm_compiles_what_the_mixes_launch(monkeypatch):
         mkl._apply_attn_res_add_and_rmsnorm(prefix, addend, block, proj, norm, out_norm)
     torch.cuda.synchronize()
     assert kimi_k3_attn_res._compiled.cache_info().misses == misses
+
+
+def test_kda_mixer_qkvg_stages_weights_only_where_declared():
+    """A mixer stages its q/k/v/g weights (and lets the mix release the projection at entry) only
+    for the row counts its fused projection declared."""
+    mixer, projection = _kda_mixer_taking_mxfp8(max_rows=32)
+    assert not mixer.qkvg_stages_weights(16)
+    mixer.qkvg_proj = projection
+    mixer.accept_prequantized_qkvg_input()
+    assert not mixer.qkvg_stages_weights(16)
+    mixer.qkvg_proj = _kda_mixer_taking_mxfp8(max_rows=32, max_staged_rows=16)[1]
+    mixer.accept_prequantized_qkvg_input()
+    assert mixer.qkvg_stages_weights(16)
+    assert not mixer.qkvg_stages_weights(32)

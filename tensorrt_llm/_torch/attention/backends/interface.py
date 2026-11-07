@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from ...speculative.spec_tree_manager import SpecTreeManager
     from ..kernels.sage_quant import SageQuantized
     from .fmha.gqa_decode import KvAppendPlan
+    from .fp4_mla.fp4_mla_packed_reduce import PackedSplitPartials
 
 from tensorrt_llm._utils import get_hf_rope_theta, maybe_pin_memory
 from tensorrt_llm.functional import (AttentionMaskType, PositionEmbeddingType,
@@ -1122,6 +1123,12 @@ class AttentionForwardArgs:
     output_gate_applied: bool = False
     # Paged FP8 query / K / V the caller already wrote for this generation-only call (fmha/gqa_decode.py).
     kv_append: Optional["KvAppendPlan"] = None
+    # Generation-only MLA decode, a request every backend may decline: one that would merge
+    # split-KV partials (the FP4 MLA decode) sets split_partials to its unreduced split state
+    # instead, for a caller that folds them itself; one that stores final rows (no split, or an
+    # in-kernel reduction) leaves it None, which the caller must accept.
+    defer_split_reduce: bool = False
+    split_partials: Optional["PackedSplitPartials"] = None
     # Optional normalized diffusion timestep for timestep-varying sparse attention.
     timestep: Optional[Union[torch.Tensor, float]] = None
     # Dense-prefix (0) or sparse (1) phase of a timestep-scheduled sparse

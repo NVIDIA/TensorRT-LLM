@@ -190,6 +190,10 @@ class DecoderRunner(ScheduledModelRunner):
             )
         self._model_caller = model_caller
         self._mapping = mapping
+        # Vocabulary-sharded spec-worker logits are the target LM head's TP
+        # shard, gathered over the head's TP group: under helix the repurposed
+        # tp*cp group, not the executor mapping's TP group.
+        self._vocab_shard_mapping = getattr(getattr(model, "lm_head", None), "mapping", mapping)
         self._dist = dist
         self._agreement = WarmupAgreement(dist, mapping)
         self._moe_load_balancer = moe_load_balancer
@@ -1047,25 +1051,26 @@ class DecoderRunner(ScheduledModelRunner):
             return
 
         if outputs.get("logits_vocab_shard", False):
-            # The spec worker kept the logits vocabulary-sharded (this TP
-            # rank's columns). A post-processor sees the whole vocabulary, so
-            # gather them first, only when a request has one. Every TP rank
-            # schedules the same requests, so all of them take the gather;
-            # under attention DP they would not.
-            if self._mapping.enable_attention_dp:
-                raise RuntimeError(
-                    "vocabulary-sharded spec-worker logits need every TP rank "
-                    "to schedule the same requests, which attention DP does "
-                    "not"
-                )
+            # The spec worker kept the logits vocabulary-sharded (this rank's
+            # LM-head columns). A post-processor sees the whole vocabulary, so
+            # gather them first, only when a request has one.
             if not any(
                 getattr(request, "py_logits_post_processors", None)
                 for request in scheduled_requests.all_requests()
             ):
                 return
+            # Every rank of the LM head's TP group takes the gather, so they
+            # must all schedule the same requests: attention DP splits them,
+            # unless that group is one helix CP group.
+            if not self._vocab_shard_mapping.tp_group_shares_requests:
+                raise RuntimeError(
+                    "vocabulary-sharded spec-worker logits need every rank of "
+                    "the LM head's TP group to schedule the same requests, "
+                    "which attention DP does not"
+                )
             from tensorrt_llm._torch.distributed import allgather
 
-            logits_tensor = allgather(logits_tensor, self._mapping, dim=-1).float()
+            logits_tensor = allgather(logits_tensor, self._vocab_shard_mapping, dim=-1).float()
             # Drop the vocabulary's TP padding, as the LM head's own gather
             # does.
             vocab_size = getattr(getattr(self._model, "lm_head", None), "num_embeddings", None)

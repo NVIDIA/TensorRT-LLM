@@ -1488,6 +1488,23 @@ def _poll_gen(ranks) -> list:
     return _lockstep(ranks, lambda _i, t: t.check_gen_transfer_status(0))
 
 
+@pytest.mark.parametrize(
+    "gen_need_sync, enable_attention_dp, pp_size, cp_size, applies",
+    [
+        (True, False, 1, 1, True),  # TP
+        (True, False, 1, 8, True),  # helix CP: CP admission is aligned every iteration
+        (True, True, 1, 1, False),  # attention DP: ranks own different requests
+        (True, False, 2, 1, False),  # PP: stages receive in different iterations
+        (False, False, 1, 1, False),  # one rank: no collective to skip
+    ],
+)
+def test_gen_idle_skip_applies(gen_need_sync, enable_attention_dp, pp_size, cp_size, applies):
+    mapping = SimpleNamespace(
+        enable_attention_dp=enable_attention_dp, pp_size=pp_size, cp_size=cp_size
+    )
+    assert KvCacheTransceiverV2._gen_idle_poll_skip_applies(mapping, gen_need_sync) is applies
+
+
 def test_gen_idle_skip_session_on_one_rank_keeps_every_rank_polling() -> None:
     collective, ranks = _make_gen_ranks(2)
     # Rank 0 still holds a receive session (e.g. a cancel retired rank 1's first).

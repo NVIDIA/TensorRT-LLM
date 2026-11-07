@@ -245,6 +245,11 @@ class DwdpManager:
     adopts.
     """
 
+    # Device memory a DWDP worker keeps outside the PyTorch cap: its peer
+    # weight gathers and the KV cache manager's copy launches allocate through
+    # the driver while serving, next to context chunks that fill the cap.
+    DRIVER_MEMORY_RESERVE = 1024**3
+
     def __init__(
         self,
         config: DwdpConfig,

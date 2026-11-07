@@ -52,6 +52,9 @@ struct AllReduceFusionParams
     ar_fusion::AllReduceFusionPattern pattern
         = ar_fusion::AllReduceFusionPattern::kAllReduce; //!< Fused epilogue pattern
     bool fp8Payload = false; //!< Two-shot residual RMSNorm calls exchange E4M3 (lossy; see twoshotAllreduceFusionOp)
+    //! One-shot: read the Lamport state and re-arm the previous call's buffer before the grid dependency wait. Only
+    //! where the previous call on the workspace has completed whenever the input's producer releases the kernel.
+    bool earlyState = false;
 
     //! @}
 

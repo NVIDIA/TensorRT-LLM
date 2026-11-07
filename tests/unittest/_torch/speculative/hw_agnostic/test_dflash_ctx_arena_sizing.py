@@ -49,6 +49,9 @@ class _Stop(Exception):
 def _worker():
     """A worker carrying only what the sizing path reads before it allocates."""
     worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker._validate_draft_attention_backend = MagicMock()
     worker._ctx_buf_inited = False
     worker._ctx_kv_manager = None

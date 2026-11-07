@@ -513,6 +513,18 @@ _UNSEEDED_RNG_WINDOW_KEY = "unseeded"
 _RNG_SLOT_SPAN = 32
 
 
+def _upload_host_values(dst: torch.Tensor, values: list,
+                        dtype: torch.dtype) -> None:
+    """Write ``values`` into the leading elements of ``dst``.
+
+    Joins an open ``step_inputs`` pack: the sampling buffers are read only by
+    the forward's sampling or after it, never before the graph replay.
+    """
+    step_inputs.copy_(
+        dst[:len(values)],
+        torch.tensor(values, dtype=dtype, pin_memory=prefer_pinned()))
+
+
 @dataclass
 class SpecMetadata:
     """
@@ -1213,6 +1225,19 @@ class SpecMetadata:
             return
         onehot_vocab = (self.draft_probs_last_dim if self.draft_probs_last_dim
                         > 0 else self.draft_probs_vocab_size)
+        bad = [
+            s for s in padding_slot_ids
+            if s is None or s < 0 or s >= self.draft_probs.shape[0]
+        ]
+        if bad:
+            # Writing a different row would leave the real slot's distribution
+            # stale and break lossless acceptance, so fail loudly instead.
+            raise RuntimeError(
+                f"rejection sampling: padding slot ids {bad[:8]} outside "
+                f"draft_probs rows [0, {self.draft_probs.shape[0]}) "
+                f"(num_seq_slots={self.num_seq_slots}, "
+                f"max_num_requests={self.max_num_requests}, "
+                f"is_cuda_graph={self.is_cuda_graph})")
         slots = torch.tensor(padding_slot_ids,
                              dtype=torch.long,
                              device=self.draft_probs.device)
@@ -1540,12 +1565,8 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling
                 or self.enable_penalty) and self.batch_slot_ids is not None:
-            self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
-                torch.tensor(per_request_slot_ids,
-                             dtype=torch.long,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            _upload_host_values(self.batch_slot_ids, per_request_slot_ids,
+                                torch.long)
 
         # Penalties are independent of the greedy/advanced split -- they rewrite the
         # logits before sampling, so an all-greedy batch is penalized too (its argmax
@@ -1583,30 +1604,15 @@ class SpecMetadata:
                 if fill_min_p:
                     request_min_ps.append(mp_val)
 
-            self.request_temperatures[:len(request_temperatures)].copy_(
-                torch.tensor(request_temperatures,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True)
-            self.request_top_ks[:len(request_top_ks)].copy_(
-                torch.tensor(request_top_ks,
-                             dtype=torch.int32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
-            self.request_top_ps[:len(request_top_ps)].copy_(
-                torch.tensor(request_top_ps,
-                             dtype=torch.float32,
-                             pin_memory=prefer_pinned()),
-                non_blocking=True,
-            )
+            _upload_host_values(self.request_temperatures, request_temperatures,
+                                torch.float32)
+            _upload_host_values(self.request_top_ks, request_top_ks,
+                                torch.int32)
+            _upload_host_values(self.request_top_ps, request_top_ps,
+                                torch.float32)
             if fill_min_p:
-                self.request_min_ps[:len(request_min_ps)].copy_(
-                    torch.tensor(request_min_ps,
-                                 dtype=torch.float32,
-                                 pin_memory=prefer_pinned()),
-                    non_blocking=True,
-                )
+                _upload_host_values(self.request_min_ps, request_min_ps,
+                                    torch.float32)
 
             # Pre-compute top_k_max on the CPU so CUDA-graph capture does not
             # encounter boolean-tensor indexing (dynamic size) or .item()
@@ -1630,19 +1636,11 @@ class SpecMetadata:
                 if fill_min_p:
                     min_ps.extend(mp_val for _ in range(num_tokens))
 
-            self.temperatures[:len(temperatures)].copy_(torch.tensor(
-                temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                        non_blocking=True)
-            self.top_ks[:len(top_ks)].copy_(torch.tensor(
-                top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
-            self.top_ps[:len(top_ps)].copy_(torch.tensor(
-                top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                            non_blocking=True)
+            _upload_host_values(self.temperatures, temperatures, torch.float32)
+            _upload_host_values(self.top_ks, top_ks, torch.int32)
+            _upload_host_values(self.top_ps, top_ps, torch.float32)
             if fill_min_p:
-                self.min_ps[:len(min_ps)].copy_(torch.tensor(
-                    min_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
-                                                non_blocking=True)
+                _upload_host_values(self.min_ps, min_ps, torch.float32)
 
     def _sampling_params_buffers_need_update(
         self, per_request_normalized: list[tuple[float, int, float, float, int]]
@@ -1906,12 +1904,12 @@ class SpecWorkerBase(nn.Module, ABC):
         A worker whose acceptance reads another layout overrides this. If its
         ``forward`` then returns this TP rank's vocabulary shard as
         ``"logits"``, it also returns ``"logits_vocab_shard": True``, and the
-        engine gathers the logits (on every TP rank together, so not under
-        attention DP) before any logits post-processor sees them; the
-        post-processors get a read-only view, since the acceptance already
-        ran inside ``forward``. Such a worker applies a guided decoder's
-        bitmask to its shard at the shard's column offset, or rejects guided
-        decoding.
+        engine gathers the logits over the LM head's TP group (whose ranks
+        must schedule the same requests) before any logits post-processor
+        sees them; the post-processors get a read-only view, since the
+        acceptance already ran inside ``forward``. Such a worker applies a
+        guided decoder's bitmask to its shard at the shard's column offset, or
+        rejects guided decoding.
         """
         return logits_processor.forward(hidden_states, lm_head, attn_metadata,
                                         True)

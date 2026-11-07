@@ -715,6 +715,11 @@ def _reapply_current_thread_affinity_to_all_threads() -> tuple[int, int]:
     return _set_affinity_all_threads(cpus)
 
 
+# TLLM_NUMA_AWARE_WORKER_AFFINITY value: the policy of ``1``, and the executor
+# loop thread gets a core of its own (tensorrt_llm/_torch/pyexecutor/executor_thread.py).
+NUMA_AFFINITY_PIN_EXECUTOR = "pin_executor"
+
+
 def configure_cpu_affinity(device_id: int) -> None:
     """Probe and configure the CPU affinity of the calling process based on NUMA topology.
 
@@ -732,6 +737,9 @@ def configure_cpu_affinity(device_id: int) -> None:
                    and deleted if it is constrained externally by the user.
             TLLM_NUMA_AWARE_WORKER_AFFINITY = 1
                 -> Affinity is unconditionally auto-configured.
+            TLLM_NUMA_AWARE_WORKER_AFFINITY = pin_executor
+                -> As 1; the executor loop thread is then pinned to one core
+                   of that set, which the other threads leave free.
             TLLM_NUMA_AWARE_WORKER_AFFINITY = 0 or any other value
                 -> Affinity is unconditionally _not_ auto-configured.
     """
@@ -765,7 +773,7 @@ def configure_cpu_affinity(device_id: int) -> None:
     # prohibited it or the user has explicitly requested it, choose the
     # optimal affinity based upon the NUMA topology
     if ((numa_aware_affinity is None and not constrained_affinity)
-            or (numa_aware_affinity == "1")):
+            or (numa_aware_affinity in ("1", NUMA_AFFINITY_PIN_EXECUTOR))):
         bound, attempted = _set_affinity_all_threads(
             get_numa_aware_cpu_affinity(device_id))
         if bound == 0:

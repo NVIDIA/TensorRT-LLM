@@ -435,6 +435,22 @@ def test_selection_rule():
         mod.validate_mid_tactic(n, k, mod.default_mid_tactic(128, n, k))
 
 
+def test_all_reduce_push_selection():
+    """The all-reduce push is selected over the GEMM's range and, for a measured shape, above
+    it (the mid-M push; never gated there); 0 where the GEMM is never selected."""
+    mod = _kernel_module()
+    sms = torch.cuda.get_device_properties(0).multi_processor_count
+    assert mod.all_reduce_push_max_m_for((sms + 1) * 128, 1280) == 0
+    for n, k in [(7168, 768), (7168, 1536), (3072, 7168)]:
+        assert mod.all_reduce_push_max_m_for(n, k) >= mod.max_m_for(n, k)
+    max_m, push_max = mod.max_m_for(7168, 1536), mod.all_reduce_push_max_m_for(7168, 1536)
+    assert push_max == (192 if _is_sm107() and max_m else max_m)
+    for m in range(max_m + 1, push_max + 1):
+        assert mod.all_reduce_push_applies(m, 7168, 1536)
+        assert not mod.all_reduce_push_applies(m, 7168, 1536, gated=True)
+    assert not mod.all_reduce_push_applies(push_max + 1, 7168, 1536)
+
+
 @sm100_only
 @pytest.mark.parametrize("m", [1, 32, 64, 128, 129, 256])
 def test_fp8_block_scales_linear_selects_low_m_gemm(m):
@@ -867,6 +883,25 @@ def _mxfp8_operand(x):
     return xq, xs
 
 
+@pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168), (6144, 7168)])
+@pytest.mark.parametrize("m", [65, 96, 128, 129, 160, 200, 256])
+def test_prequantized_mid_m_matches_bf16_gemm(m, n, k):
+    """Above the low-M kernel's range the prequantized GEMM is the mid-M GEMM without its
+    quantization kernel (R128c4 scales, also across two 128-row blocks): bitwise the GEMM of
+    the BF16 rows."""
+    mod = _kernel_module()
+    if m <= mod.low_m_max_for(n, k):
+        pytest.skip("in the low-M kernel's range")
+    w_pad, scale = _make_weight(n, k, seed=n + k)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    x = _make_activation(m, k, seed=m)
+    xq, xs = _mxfp8_operand(x)
+    out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed)
+    ref = _run(x, w, packed)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
 @pytest.mark.parametrize(
     "n, k", [(3072, 7168), (3584, 7168), (7168, 768), (2112, 7168), (18432, 1536), (384, 1280)]
 )
@@ -940,16 +975,99 @@ def test_prequantized_cuda_graph(m):
     assert torch.equal(out, eager)
 
 
+#: KDA fused q/k/v/g of the helix8 (6144 rows) and helix16 (3072) shards, MLA q_a | kv_a (2112).
+STAGED_SHAPES = [(6144, 7168), (3072, 7168), (2112, 7168)]
+
+
+@pytest.mark.parametrize("n, k", STAGED_SHAPES)
+@pytest.mark.parametrize("m", [1, 8, 13, 16, 28, 32, 48, 64])
+def test_prequantized_staged_weights_are_bitwise(m, n, k):
+    """Weights held in tensor memory change where the MMAs read A from, not the MMAs or their
+    order: ``stage_weights`` gives the unstaged kernel's bits in both prequantized ranges."""
+    mod = _kernel_module()
+    w_pad, scale = _make_weight(n, k, seed=n + k)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    xq, xs = _mxfp8_operand(_make_activation(m, k, seed=m))
+    if mod.weights_on_chip(m, n, k):
+        staged = mod.staged_prequantized_tactic(m, n, k)
+        base = (
+            mod.default_mid_tactic(m, n, k)
+            if m > mod.low_m_max_for(n, k)
+            else mod.default_prequantized_tactic(m, n, k)
+        )
+        assert (staged.mma_n, staged.split_k, staged.b_stages) == (
+            base.mma_n,
+            base.split_k,
+            base.b_stages,
+        )
+    ref = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed)
+    out = torch.ops.trtllm.fp8_block_scale_low_m_gemm_prequantized(xq, xs, w, packed, True)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("n, k", STAGED_SHAPES)
+@pytest.mark.parametrize("m", [8, 16, 32])
+def test_staged_tactic_keeps_the_slice_on_chip(m, n, k):
+    """The staged tactic stays within the shared-memory budget that lets a CTA land beside an
+    attn_res CTA, and ``weights_on_chip`` holds exactly where its ring plus tensor-memory tiles
+    cover every K tile of a CTA (the split-K of the architecture's tables decides that: GB300
+    runs the helix8 q/k/v/g at split-K 2, 28 K tiles a CTA, more than fit on chip)."""
+    mod = _kernel_module()
+    t = mod.staged_prequantized_tactic(m, n, k)
+    fold = m <= mod.low_m_max_for(n, k)
+    kt_max = -(-(k // 128) // t.split_k)
+    assert mod.mid_smem_bytes(n, k, t, fold_weight_scale=fold) <= mod.STAGED_SMEM_BYTES
+    assert mod.weights_on_chip(m, n, k) == (t.a_stages + t.tmem_tiles >= kt_max)
+    if t.a_stages < kt_max:
+        assert t.tmem_tiles > 0
+
+
+@pytest.mark.parametrize("a_stages, tmem_tiles", [(12, 1), (12, 4), (2, 12), (1, 5)])
+def test_prequantized_explicit_staging_is_bitwise(a_stages, tmem_tiles):
+    """A 256-column allocation (up to 4 tiles), staged tiles that pass through a ring that wraps
+    before the wait (more staged tiles than ring stages), and a slice that still streams tiles
+    after the staged ones."""
+    mod = _kernel_module()
+    m, n, k = 8, 6144, 7168
+    w_pad, scale = _make_weight(n, k, seed=5)
+    w, packed = w_pad[:n].contiguous(), _pack(scale, n, k)
+    xq, xs = _mxfp8_operand(_make_activation(m, k, seed=9))
+    base = mod.default_prequantized_tactic(m, n, k)
+    a_stages = min(a_stages, mod.max_mid_a_stages(n, k, base, fold_weight_scale=True))
+    tactic = dataclasses.replace(base, a_stages=a_stages, tmem_tiles=tmem_tiles)
+    mod.validate_mid_tactic(n, k, tactic, fold_weight_scale=True)
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty_like(ref)
+    mod.run_low_m_gemm_prequantized(xq, xs, w, packed, ref, tactic=base)
+    mod.run_low_m_gemm_prequantized(xq, xs, w, packed, out, tactic=tactic)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+def test_validate_rejects_too_many_staged_tiles():
+    mod = _kernel_module()
+    base = mod.MidMTactic(mma_n=8, split_k=3, a_stages=4, b_stages=19)
+    with pytest.raises(ValueError):
+        # 64 accumulator / scale columns + 15 tiles x 32 columns > 512
+        mod.validate_mid_tactic(6144, 7168, dataclasses.replace(base, tmem_tiles=15), True)
+    with pytest.raises(ValueError):
+        # 56 K tiles over 8 ranks: every rank owns 7
+        mod.validate_mid_tactic(
+            6144, 7168, dataclasses.replace(base, split_k=8, b_stages=7, tmem_tiles=8), True
+        )
+
+
 @pytest.mark.parametrize("n, k", [(3072, 7168), (2112, 7168)])
-@pytest.mark.parametrize("m", [1, 7, 32, 64, 65])
+@pytest.mark.parametrize("m", [1, 7, 32, 64, 65, 96, 128, 129, 192])
 def test_weight_read_linear_forward_prequantized(m, n, k):
-    """``forward_prequantized`` on the MXFP8 form of the rows is bitwise ``forward`` where
-    ``takes_prequantized_input``."""
+    """``forward_prequantized`` on the MXFP8 form of the rows (R128c4 scales) is bitwise
+    ``forward`` where ``takes_prequantized_input``: wherever forward runs the low-M GEMM."""
     linear = _bf16_weight_read_linear(n, k)
     x = _make_activation(m, k, seed=m)
     takes = linear.takes_prequantized_input(m)
     mod = _kernel_module()
-    assert takes == (m <= min(mod.max_m_for(n, k), mod.low_m_max_for(n, k)))
+    assert takes == (m <= mod.max_m_for(n, k))
     if not takes:
         return
     out = linear.forward_prequantized(*_mxfp8_operand(x))

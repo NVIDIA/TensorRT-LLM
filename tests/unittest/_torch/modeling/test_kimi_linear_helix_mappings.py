@@ -224,10 +224,9 @@ def test_setup_helix_mappings_dual_mapping_swap_restore():
     assert model_config.mapping.tp_size == repurposed_tp
     assert model_config.mapping.cp_size == 1
 
-    # _helix_mapping_with_cp is the deep-copied CP original
-    assert hasattr(model_config, "_helix_mapping_with_cp")
-    assert model_config._helix_mapping_with_cp.tp_size == original_tp_size
-    assert model_config._helix_mapping_with_cp.cp_size == original_cp_size
+    # mapping_with_cp is the deep-copied CP original
+    assert model_config.mapping_with_cp.tp_size == original_tp_size
+    assert model_config.mapping_with_cp.cp_size == original_cp_size
 
     # self.mapping_with_cp equals the CP original
     assert obj.mapping_with_cp is not None

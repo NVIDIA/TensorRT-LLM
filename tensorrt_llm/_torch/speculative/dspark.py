@@ -685,6 +685,7 @@ class DSv4DSparkWorker(SpecWorkerBase):
                 warmup_fused_dsv4_dspark_attention(
                     block_size,
                     eps=float(draft_model._attn_params["eps"]),
+                    num_heads=int(draft_model._attn_params["n_heads"]),
                 )
         self._attention_warmup_attempted = True
 
@@ -1308,9 +1309,10 @@ class DSparkWorker(DFlashWorker):
         checkpoint at max_draft_len=7, which is how both published DSpark
         drafters are meant to run.
         """
-        return self.block_width_for(
-            self.spec_config, shift_label=getattr(draft_model, "_dspark_shift_label", False)
-        )
+        return self.block_width_for(self.spec_config, shift_label=draft_model.shift_label)
+
+    def _draft_first_slot(self, draft_model) -> int:
+        return 0 if draft_model.shift_label else 1
 
     def _draft_slot_ids(
         self, draft_model, num_gens: int, block_size: int, num_draft_tokens: int
@@ -1321,9 +1323,8 @@ class DSparkWorker(DFlashWorker):
         draft model rather than assumed: a DSpark drafter trained with the
         legacy DFlash slot layout keeps the base class' slots 1..K.
         """
-        shift_label = getattr(draft_model, "_dspark_shift_label", False)
         return dflash_draft_slot_ids(
-            num_gens, block_size, num_draft_tokens, shift_label, device="cuda"
+            num_gens, block_size, num_draft_tokens, draft_model.shift_label, device="cuda"
         )
 
     def _vocab_parallel_draft_tokens(self, draft_model) -> Optional[VocabParallelDraftTokens]:
@@ -1331,13 +1332,17 @@ class DSparkWorker(DFlashWorker):
         draft_tokens = super()._vocab_parallel_draft_tokens(draft_model)
         if draft_tokens is None or not getattr(draft_model, "has_markov_head", False):
             return draft_tokens
+        self._vocab_parallel.head.bind_markov_head(draft_model.markov_w1, draft_model.markov_w2)
         return self._markov_block_tokens
 
     def _markov_block_tokens(
         self, draft_model, local_block: torch.Tensor, inputs: dict
     ) -> torch.Tensor:
         return self._vocab_parallel.head.markov_tokens(
-            local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
+            local_block,
+            inputs["first_prev_tokens"],
+            draft_model.markov_w1,
+            draft_model.markov_w2,
         )
 
     def _refine_block_logits(

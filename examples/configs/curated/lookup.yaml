@@ -135,6 +135,12 @@
   scenario: Max Throughput
   gpu_compatibility: "B200, GB200"
   disagg: true
+- model: nvidia/Kimi-K3-NVFP4
+  arch: KimiK3ForConditionalGeneration
+  config_path: examples/configs/curated/kimi-k3-helix16-low-latency-gen.yaml
+  scenario: Disaggregated Generation (Min Latency, 1-4 requests)
+  gpu_compatibility: "VR200"
+  disagg: true
 - model: MiniMaxAI/MiniMax-M3-MXFP8
   arch: MiniMaxM3SparseForConditionalGeneration
   config_path: examples/configs/curated/minimax-m3-throughput.yaml

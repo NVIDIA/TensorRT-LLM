@@ -202,20 +202,19 @@ class PeerRegistrar:
                 "both peers must use the same speculative decoding KV cache layout; "
                 "set TRTLLM_DISAGG_SHARED_DRAFT_KV identically on both workers."
             )
-        if self._ri.num_draft_layers:
-            if self._ri.tp_size != peer_ri.tp_size:
-                raise ValueError(
-                    "PeerRegistrar: a shared draft KV cache needs equal tp_size "
-                    f"(local={self._ri.tp_size}, peer={peer_ri.tp_size}); "
-                    "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or use the same TP on both workers."
-                )
-            if self._ri.attention.enable_attention_dp != peer_ri.attention.enable_attention_dp:
-                raise ValueError(
-                    "PeerRegistrar: a shared draft KV cache needs the same attention DP "
-                    f"setting (local={self._ri.attention.enable_attention_dp}, "
-                    f"peer={peer_ri.attention.enable_attention_dp}); unset "
-                    "TRTLLM_DISAGG_SHARED_DRAFT_KV or match it on both workers."
-                )
+        # Draft layers carry the target's KV heads per rank, so they move with
+        # the target's head mapping only when both sides shard heads alike. A
+        # K-only (MLA) cache keeps the whole latent on every rank.
+        if (
+            self._ri.num_draft_layers
+            and not (self._ri.attention.is_mla and peer_ri.attention.is_mla)
+            and self._ri.tp_size_per_dp_group != peer_ri.tp_size_per_dp_group
+        ):
+            raise ValueError(
+                "PeerRegistrar: a shared draft KV cache needs the same attention TP size "
+                f"(local={self._ri.tp_size_per_dp_group}, peer={peer_ri.tp_size_per_dp_group}); "
+                "unset TRTLLM_DISAGG_SHARED_DRAFT_KV or shard attention alike on both workers."
+            )
         self.validate_view_head_geometry(peer_ri)
 
         self_layers = sum(self._ri.layer_num_per_pp)

@@ -98,6 +98,7 @@ def make_batch(
         state_indices=indices,
         query_start_loc=cu.to(torch.int32),
         query_start_loc_long=cu,
+        kda_inforward_snapshot=None,
         kda_max_seqlen=max(lengths, default=0),
         _arange_buffer=torch.arange(n + 1, dtype=torch.int32, device="cuda"),
     )

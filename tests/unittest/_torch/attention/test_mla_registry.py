@@ -91,6 +91,7 @@ class _OutputGateStub:
         attn_metadata: object,
         attn_output: list[torch.Tensor],
         latent_cache_gen: object = None,
+        prequantized_input: object = None,
     ) -> None:
         attn_output[0].fill_(2.0)
 
@@ -100,14 +101,21 @@ class _OutputGateStub:
         position_ids: object,
         attn_output: list[torch.Tensor],
         latent_cache_gen: object,
+        prequantized_input: object = None,
     ) -> None:
         attn_output[0].fill_(2.0)
 
-    def _apply_output_gate(
-        self, hidden_states: torch.Tensor, attn_output: torch.Tensor
+    def _gate_and_project_output(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: list[torch.Tensor],
+        position_ids: object,
+        attn_metadata: object,
+        all_reduce_params: object,
     ) -> torch.Tensor:
-        self.gate_calls.append((hidden_states, attn_output.clone()))
-        return attn_output * 5.0
+        self.gate_calls.append((hidden_states, attn_output[0].clone()))
+        attn_output[0] = attn_output[0] * 5.0
+        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def _project_output(
         self,
@@ -120,10 +128,17 @@ class _OutputGateStub:
         return attn_output[0]
 
 
-def test_base_output_gate_is_identity() -> None:
-    attn_output = torch.randn(2, 4)
+def test_base_output_stage_projects_ungated_output() -> None:
+    attn_output = [torch.randn(2, 4)]
+    projected = torch.randn(2, 8)
+    mla_layer = SimpleNamespace(_project_output=Mock(return_value=projected))
 
-    assert MLA._apply_output_gate(None, torch.randn(2, 4), attn_output) is attn_output
+    output = MLA._gate_and_project_output(
+        mla_layer, torch.randn(2, 4), attn_output, None, "metadata", "params"
+    )
+
+    assert output is projected
+    mla_layer._project_output.assert_called_once_with(attn_output, None, "metadata", "params")
 
 
 @pytest.mark.parametrize("register_to_config", [False, True])
@@ -149,10 +164,15 @@ def test_output_gate_runs_between_attention_and_output_projection(
 
 def test_output_gate_override_rejected_with_sparse_hooks() -> None:
     class _GatedMLA(MLA):
-        def _apply_output_gate(
-            self, hidden_states: torch.Tensor, attn_output: torch.Tensor
+        def _gate_and_project_output(
+            self,
+            hidden_states: torch.Tensor,
+            attn_output: list[torch.Tensor],
+            position_ids: object,
+            attn_metadata: object,
+            all_reduce_params: object,
         ) -> torch.Tensor:
-            return attn_output * 2.0
+            return attn_output[0] * 2.0
 
     config = ModelConfig(skip_create_weights_in_init=True)
     with (
@@ -164,7 +184,7 @@ def test_output_gate_override_rejected_with_sparse_hooks() -> None:
             "tensorrt_llm._torch.attention.mla.get_sparse_mla_hooks",
             return_value=Mock(),
         ),
-        pytest.raises(NotImplementedError, match="_apply_output_gate"),
+        pytest.raises(NotImplementedError, match="_gate_and_project_output"),
     ):
         _make_mla(config, cls=_GatedMLA)
 

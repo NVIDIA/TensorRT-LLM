@@ -1815,6 +1815,20 @@
       "path": "speculative_config.confidence_min_predicted_gain"
     },
     {
+      "allowed_values": [
+        "auto",
+        "fp8"
+      ],
+      "capture_policy": "literal",
+      "kind": "categorical",
+      "path": "speculative_config.context_kv_dtype"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "speculative_config.context_kv_only"
+    },
+    {
       "capture_policy": "int|none",
       "kind": "value",
       "path": "speculative_config.context_recompute_tail"

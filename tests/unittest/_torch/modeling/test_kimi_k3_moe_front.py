@@ -14,7 +14,8 @@
 # limitations under the License.
 """Issue order of the Kimi-K3 MoE front: up to ``_ROUTER_FIRST_MAX_TOKENS`` tokens the router GEMM
 is issued on the main stream before latent_down on the latent stream, with the latent fork event
-recorded before both.
+recorded before both. On the enable_min_latency tail, the persistent shared expert's push is
+issued on its own stream and joined after the one-kernel tail.
 
 The modules are stand-ins (elementwise ops on the GPU), so the test checks the plumbing: the
 issue order and streams, the token-count bound, the result, and CUDA graph capture.
@@ -70,6 +71,18 @@ class _RoutedExperts:
 
 def _runtime(log):
     runtime = KimiK3MoERuntime.__new__(KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     main = {}
 
@@ -164,3 +177,136 @@ def test_router_first_graph_capture():
             torch.cuda.synchronize()
             torch.testing.assert_close(routed, static * 3.0 + (static + 1.0), rtol=0, atol=0)
             torch.testing.assert_close(shared, static * 2.0, rtol=0, atol=0)
+
+
+class _PushedAllReduce:
+    """Stand-in for the shared expert's all-reduce: ``push_input`` copies the partial into the
+    call's buffer (a kernel on the issuing stream) and logs that stream."""
+
+    def __init__(self, log, main):
+        self.log, self.main = log, main
+
+    def push_input(self, target, value, columns=None):
+        self.log.append(("shared_push", torch.cuda.current_stream() == self.main["stream"]))
+        target.buffer.copy_(value)
+
+    def finish_push(self, target):
+        return target
+
+
+class _PushingRoutedExperts:
+    """Stand-in for routed experts that push their output (``output_push``): ``3 x``."""
+
+    all_reduce = None
+
+    def __init__(self, log, main):
+        self.log, self.main = log, main
+
+    def __call__(self, value, router_logits, all_rank_num_tokens=None, **kwargs):
+        assert kwargs["output_push"] is not None
+        self.log.append(("experts", torch.cuda.current_stream() == self.main["stream"]))
+        return value * 3.0
+
+
+def _min_latency_runtime(log, num_tokens, ag_follows):
+    """A runtime on the enable_min_latency column-parallel tail: the sharded front (head, fork,
+    route), the persistent shared expert and the one-kernel tail are stand-ins that log their
+    order and stream; the all-gather call and the latent all-reduce share their rotation state
+    with ``ag_follows``."""
+    runtime, main = _runtime(log)
+    runtime.hidden_size = HIDDEN
+    runtime._min_latency = True
+    runtime._reduce_routed_output = True
+    runtime.latent_up_rows = (0, HIDDEN)
+    runtime.routed_experts = _PushingRoutedExperts(log, main)
+    runtime.shared_experts.down_proj.all_reduce = _PushedAllReduce(log, main)
+    runtime.routed_expert_up_proj.weight = torch.empty(1, device="cuda")
+    runtime.routed_expert_norm.weight = torch.empty(1, device="cuda")
+    runtime.routed_expert_norm.variance_epsilon = 1e-6
+    flags = torch.zeros(9, dtype=torch.int32, device="cuda")
+    latent = SimpleNamespace(view=SimpleNamespace(world=4, uc_local=0, flags=flags))
+    ag = SimpleNamespace(
+        view=SimpleNamespace(
+            world=4, mc_base=0, flags=flags if ag_follows else torch.zeros_like(flags)
+        ),
+        buffer=torch.zeros(num_tokens, HIDDEN, device="cuda"),
+    )
+    runtime._shared_world = 4
+    runtime._moe_front_applies = lambda value: True
+    runtime.runs_column_parallel_tail = lambda n: True
+    runtime._min_latency_tail_targets = lambda n: (ag, latent)
+    runtime._latent_all_reduce = lambda n: None
+    runtime._min_latency_shared_applies = lambda n: True
+
+    def moe_front(value, after_head):
+        log.append(("front_head", torch.cuda.current_stream() == main["stream"]))
+        after_head()
+        log.append(("front_route", torch.cuda.current_stream() == main["stream"]))
+        return value * 1.0, None
+
+    def min_latency_shared(identity, push=None):
+        log.append(("shared_expert", torch.cuda.current_stream() == main["stream"]))
+        if push is None:
+            return identity * 2.0
+        # The kernel's output push: the partial straight into the call's slots.
+        log.append(("shared_push", torch.cuda.current_stream() == main["stream"]))
+        push.buffer.copy_(identity * 2.0)
+        return None
+
+    runtime._moe_front = moe_front
+    runtime._min_latency_shared = min_latency_shared
+    real_event = runtime.moe_shared_event
+
+    def join():
+        log.append(("join", torch.cuda.current_stream() == main["stream"]))
+        real_event.wait()
+
+    runtime.moe_shared_event = SimpleNamespace(record=real_event.record, wait=join)
+    return runtime, main, ag
+
+
+@pytest.mark.parametrize("ag_follows", [False, True])
+@pytest.mark.parametrize("capture", [False, True])
+def test_min_latency_shared_push_beside_tail(monkeypatch, ag_follows, capture):
+    """enable_min_latency: the persistent shared expert stores its partial into the tail's
+    all-gather call itself (output push) on the shared expert's stream, no copy push, and the
+    main stream joins that stream only after the one-kernel tail; where the call follows the
+    latent all-reduce on its workspace (its rotation state is the tail's to advance) the kernel
+    returns the partial and its copy push stays on the main stream after the tail. Eager and
+    under CUDA graph capture (which rejects an unjoined stream)."""
+    from tensorrt_llm._torch.kernels.blackwell import kimi_k3_moe_tail
+
+    log = []
+    num_tokens = 8
+    runtime, main, ag = _min_latency_runtime(log, num_tokens, ag_follows)
+    monkeypatch.setattr(
+        kimi_k3_moe_tail,
+        "run_moe_tail",
+        lambda **kwargs: log.append(("tail", torch.cuda.current_stream() == main["stream"])),
+    )
+    hidden = torch.randn(num_tokens, HIDDEN, device="cuda")
+    with torch.inference_mode(), with_multi_stream(True):
+        if capture:
+            # The shared expert's stream exists before capture; its work joins the capture.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                main["stream"] = torch.cuda.current_stream()
+                result = runtime(hidden, return_parts=True, column_parallel_tail=True)
+            graph.replay()
+        else:
+            main["stream"] = torch.cuda.current_stream()
+            result = runtime(hidden, return_parts=True, column_parallel_tail=True)
+    torch.cuda.synchronize()
+
+    assert result == (ag, None)
+    torch.testing.assert_close(ag.buffer, hidden * 2.0, rtol=0, atol=0)
+    names = [name for name, _ in log]
+    on_main = dict(log)
+    assert names.count("shared_push") == 1 and names.count("join") == 1
+    assert not on_main["shared_expert"] and on_main["tail"] and on_main["join"]
+    if ag_follows:
+        assert names.index("join") < names.index("tail") < names.index("shared_push")
+        assert on_main["shared_push"]
+    else:
+        assert names.index("shared_push") < names.index("tail") < names.index("join")
+        assert not on_main["shared_push"]

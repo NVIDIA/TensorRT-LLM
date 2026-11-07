@@ -338,6 +338,32 @@ class MoEImplBase(
         """
         return 0
 
+    def allow_die_major_weights(self) -> None:
+        """Let the backend place its expert weights die-major (each locality domain homes one
+        half of every expert) on a device with two locality domains.
+
+        Called once, at construction, by a model whose MoE layers opt in. The default keeps the
+        loaded layout; overriding this is how a backend opts in.
+        """
+
+    def published_routing_word(self, num_tokens: int) -> "torch.Tensor | None":
+        """An int32 word into which a routing kernel that runs right before
+        ``run_moe`` may publish each routed token of a forward of ``num_tokens``
+        tokens (its ids and weights stored, then a GPU-scope release add of 1),
+        so that ``run_moe`` builds its tables from them while the routing grid
+        still runs (``PublishedSortTables``); or ``None``. Declining is the
+        default; overriding this is how a backend opts in.
+        """
+        return None
+
+    def output_push_max_tokens(self) -> int:
+        """The most tokens of a forward whose ``run_moe`` takes ``MoERunContext.output_push``:
+        it then also pushes its output rows into slot ``(token, view.rank)`` of that one-shot
+        MNNVL all-reduce, for a consumer that finishes it. Fixed at construction; declining
+        (0) is the default, overriding this is how a backend opts in.
+        """
+        return 0
+
     def try_route_with_sort(
         self, router_logits: "torch.Tensor"
     ) -> "tuple[torch.Tensor, torch.Tensor, MoESortTables] | None":

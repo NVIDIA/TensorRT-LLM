@@ -71,6 +71,12 @@ from .utils import log_attention_failure_context
 _SKIP_CORRECTION_SUPPORTED_SMS = frozenset((100, 103))
 
 
+def _has_fp8_context_mla_fmha(sm_version: int) -> bool:
+    """Whether MLA context attention with an FP8 or NVFP4 KV cache runs the op's
+    FP8 context MLA FMHA on this SM (``mFP8ContextMLA`` in thop/attentionOp.cpp)."""
+    return sm_version == 90 or is_sm_100f(sm_version) or is_sm_120f(sm_version)
+
+
 def _resolve_skip_correction_threshold(threshold: float,
                                        sm_version: int,
                                        *,
@@ -282,8 +288,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # recompute_helix_spec_buffers for the derivation.
     helix_local_slots: Optional[torch.Tensor] = None
     helix_kv_bounds: Optional[torch.Tensor] = None
+    helix_zero_kv_tokens: Optional[torch.Tensor] = None
     helix_owned_new_tokens_cpu: Optional[torch.Tensor] = None
     _helix_spec_tokens_valid: bool = False
+
+    @property
+    def helix_spec_tokens_valid(self) -> bool:
+        """Whether the per-token helix buffers above describe this step's verify groups."""
+        return self._helix_spec_tokens_valid
 
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
@@ -685,6 +697,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             #   helix_kv_bounds[t]: number of rank-local KV entries token t
             #     may attend to, i.e. local_len(pos_t + 1) (consumed by the
             #     CuTe DSL MLA decode mask and the helix stats identity).
+            #   helix_zero_kv_tokens[t]: helix_kv_bounds[t] == 0, the tokens
+            #     whose partial output the helix combine must ignore (shared
+            #     by every layer of the step).
             # Filled by recompute_helix_spec_buffers() on the spec path only.
             self.helix_local_slots = self.get_empty(
                 buffers,
@@ -698,6 +713,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 (self.max_num_tokens, ),
                 cache_name="helix_kv_bounds",
                 dtype=torch.int,
+                capture_graph=capture_graph,
+            )
+            self.helix_zero_kv_tokens = self.get_empty(
+                buffers,
+                (self.max_num_tokens, ),
+                cache_name="helix_zero_kv_tokens",
+                dtype=torch.bool,
                 capture_graph=capture_graph,
             )
             # Host-side per-sequence count of this step's new tokens owned by
@@ -771,15 +793,15 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             num_tokens = len(helix_position_offsets)
             self.helix_position_offsets_cpu[:num_tokens].copy_(
                 torch.tensor(helix_position_offsets, dtype=torch.int))
-            self.helix_position_offsets[:num_tokens].copy_(
-                self.helix_position_offsets_cpu[:num_tokens], non_blocking=True)
+            step_inputs.copy_(self.helix_position_offsets[:num_tokens],
+                              self.helix_position_offsets_cpu[:num_tokens])
 
         if helix_is_inactive_rank is not None and self.helix_is_inactive_rank is not None:
             batch_size = len(helix_is_inactive_rank)
             self.helix_is_inactive_rank_cpu[:batch_size].copy_(
                 torch.tensor(helix_is_inactive_rank, dtype=torch.bool))
-            self.helix_is_inactive_rank[:batch_size].copy_(
-                self.helix_is_inactive_rank_cpu[:batch_size], non_blocking=True)
+            step_inputs.copy_(self.helix_is_inactive_rank[:batch_size],
+                              self.helix_is_inactive_rank_cpu[:batch_size])
 
         self._helix_spec_tokens_valid = False
         if helix_owned_new_tokens is not None:
@@ -881,6 +903,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             tokens_per_block=self.kv_cache_manager.tokens_per_block,
             cp_size=self.mapping.cp_size,
             cp_rank=self.mapping.cp_rank)
+        # The tokens whose partial output the helix combine must ignore, shared
+        # by every layer of the step. Allocation-free like the launch above.
+        torch.eq(self.helix_kv_bounds[:num_gen_tokens],
+                 0,
+                 out=self.helix_zero_kv_tokens[:num_gen_tokens])
 
     def _bind_runtime_views(
         self,
@@ -2064,6 +2091,13 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return (self.is_mla_enable and self.has_fp4_kv_cache
                 and self.sparse_params is None)
 
+    @property
+    def has_fp8_context_mla(self) -> bool:
+        """Whether MLA context attention with an FP8 KV cache runs the op's FP8
+        context MLA FMHA, which reads FP8 Q, K and V."""
+        return (self.is_mla_enable and self.has_fp8_kv_cache
+                and _has_fp8_context_mla_fmha(get_sm_version()))
+
     def update_quant_config(self, new_quant_config: Optional[QuantConfig]):
         self.quant_config = new_quant_config or QuantConfig()
         self.quant_mode = self.quant_config.layer_quant_mode
@@ -2171,12 +2205,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             if fp8_fallback_layers and fp8_fallback_layers.intersection(
                     mapping.pp_layers(config.num_hidden_layers)):
                 nvfp4_uses_fp8_context = True
-        sm_version = get_sm_version()
         fp8_context_mla = (quant_mode is not None
                            and (quant_mode.has_fp8_kv_cache()
                                 or nvfp4_uses_fp8_context)
-                           and (sm_version == 90 or is_sm_100f(sm_version)
-                                or is_sm_120f(sm_version)))
+                           and _has_fp8_context_mla_fmha(get_sm_version()))
         if not fp8_context_mla:
             return 0
         # Attention-DP runs the full head set per rank; otherwise heads shard across TP (mirror
@@ -3654,6 +3686,49 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         if not hp_pool_updated:
             raise RuntimeError(
                 "Fused FP4 MLA RoPE/cache scatter did not update the HP pool.")
+
+    def fp4_mla_kv_append_generation(
+        self,
+        latent_cache: torch.Tensor,
+        metadata: TrtllmAttentionMetadata,
+        num_q_heads: int,
+    ) -> None:
+        """The KV half of ``_fp4_mla_rope_generation``: append this step's latent rows to the
+        FP4 cache and HP pool, and prepare the packed-Q buffers of ``num_q_heads`` heads on
+        ``metadata`` for the decode, without writing the query rows (the caller writes them).
+        The cache bytes are the full update's."""
+        assert self.kv_lora_rank is not None
+        assert self.qk_rope_head_dim is not None
+        if not self.uses_fp4_mla_attention:
+            raise RuntimeError(
+                "The FP4 MLA KV append requires FP4 MLA attention.")
+        self._ensure_rope_table_size(metadata.max_seq_len)
+        if latent_cache.shape[-1] != self.kv_lora_rank + self.qk_rope_head_dim:
+            raise RuntimeError(
+                "FP4 MLA latent_cache last dimension must be "
+                f"{self.kv_lora_rank + self.qk_rope_head_dim}, got "
+                f"{latent_cache.shape[-1]}.")
+        if (self.rotary_cos_sin is None or latent_cache.dtype != torch.bfloat16
+                or self.rotary_cos_sin.dtype != torch.float32):
+            raise RuntimeError(
+                "FP4 MLA generation requires a BF16 latent cache and an FP32 "
+                "rotary table.")
+        hp_pool_updated = scatter_fp4_mla_kv_cache(
+            metadata,
+            latent_cache,
+            self.layer_idx,
+            token_offset=getattr(metadata, "num_ctx_tokens", 0),
+            phase="generation",
+            local_layer=self.get_fp4_mla_local_layer_idx(metadata),
+            v_head_dim=self.kv_lora_rank,
+            rotary_cos_sin=self.rotary_cos_sin,
+            helix_position_offsets=metadata.helix_position_offsets,
+            helix_is_inactive_rank=metadata.helix_is_inactive_rank,
+            external_q_heads=num_q_heads,
+        )
+        if not hp_pool_updated:
+            raise RuntimeError(
+                "FP4 MLA generation KV append did not update the HP pool.")
 
     def can_fuse_fp4_mla_q_quant(
         self,

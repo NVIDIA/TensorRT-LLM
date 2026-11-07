@@ -360,7 +360,7 @@ def test_v41_stage_collapses_with_previous_not_current_mix(monkeypatch):
         model_config=SimpleNamespace(mapping=SimpleNamespace(enable_attention_dp=False, tp_size=1)),
     )
     monkeypatch.setattr(
-        modeling_dspark, "dspark_attention_forward", Mock(return_value=attention_output)
+        modeling_dspark, "_dspark_attention_forward_legacy", Mock(return_value=attention_output)
     )
     result, next_pre = modeling_dspark.DSv4DSparkDraftModel._forward_stage(
         model,

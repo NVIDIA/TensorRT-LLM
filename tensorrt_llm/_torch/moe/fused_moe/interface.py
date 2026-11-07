@@ -919,9 +919,14 @@ class MoE(MoEExecutionContractMixin, MoEWeightOwnerMixin,
                     "adapter pointers). Disable `register_to_config`/"
                     "torch.compile for this model, or remove the MoE modules "
                     "from `lora_config.lora_target_modules`.")
-            if kwargs.get("prerouted") is not None:
+            if (kwargs.get("prerouted") is not None
+                    or kwargs.get("sorted_routing") is not None):
                 raise NotImplementedError(
-                    "the `trtllm::moe_custom_op` graph path cannot carry prerouted routing"
+                    "the `trtllm::moe_custom_op` graph path cannot carry caller-supplied routing"
+                )
+            if kwargs.get("output_push") is not None:
+                raise NotImplementedError(
+                    "the `trtllm::moe_custom_op` graph path cannot carry an output push"
                 )
             hidden_states = x.fp4_tensor if isinstance(
                 x, Fp4QuantizedTensor) else x

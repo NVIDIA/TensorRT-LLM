@@ -291,3 +291,60 @@ def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
     metadata.prepare(attn_metadata)
 
     assert metadata.generation_state_indices is None
+
+
+def test_inforward_snapshot_plan_becomes_kernel_rows_and_layer_indices() -> None:
+    """A planned request gets its staging row and 64-token chunk count for the prefill kernel,
+    its live slot / staging row for the layer's swap, and the conv window that ends at P."""
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import InforwardSnapshotEntry
+
+    metadata = KimiK3MambaMetadata(max_batch_size=4, chunk_size=128, max_num_tokens=1024)
+    attn_metadata = _make_attention_metadata([100, 300, 200])
+    attn_metadata.request_ids = [7, 8, 9]
+    slots = {7: 5, 8: 2, 9: 6}
+    manager = SimpleNamespace(conv_state_shape=[384, 3], state_index=slots.__getitem__)
+    plan = {
+        8: InforwardSnapshotEntry(1, 1000, 256, 44),
+        9: InforwardSnapshotEntry(0, 2000, 64, 136),
+    }
+    metadata._prepare_inforward_split(attn_metadata, manager, plan, 3, 3)
+    snapshot = metadata.kda_inforward_snapshot
+    assert snapshot.rows.tolist() == [-1, 1, 0]
+    assert snapshot.chunks.tolist() == [0, 4, 1]
+    assert snapshot.live.tolist() == [2, 6]
+    assert snapshot.stage_rows.tolist() == [1, 0]
+    assert snapshot.conv_win.tolist() == [353, 354, 355, 461, 462, 463]
+    assert snapshot.rows.dtype == torch.int32 and snapshot.rows.is_contiguous()
+
+    with pytest.raises(RuntimeError, match="does not match the plan"):
+        metadata._prepare_inforward_split(
+            attn_metadata, manager, {9: InforwardSnapshotEntry(0, 2000, 100, 100)}, 3, 3
+        )
+
+
+def test_inforward_snapshot_swap_leaves_point_state_live() -> None:
+    """After the layer's swap the live slot holds the state and conv window at P and the
+    staging row the chunk-end ones (the in-forward snapshot contract of the cache manager)."""
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_k3_mamba_metadata import KdaInforwardSnapshot
+    from tensorrt_llm._torch.modules.kimi_kda.kimi_kda_mixer import _swap_inforward_snapshot
+
+    channels, width = 6, 3
+    ssm_pool = torch.arange(4 * 2 * 4, dtype=torch.float32, device="cuda").view(4, 2, 2, 2)
+    conv_pool = torch.zeros(4, channels, width, dtype=torch.bfloat16, device="cuda")
+    conv_pool[2] = 7
+    stage_ssm = torch.full((2, 2, 2, 2), -1.0, device="cuda")
+    stage_conv = torch.zeros(2, channels, width, dtype=torch.bfloat16, device="cuda")
+    ssm_end, ssm_point = ssm_pool[2].clone(), stage_ssm[1].clone()
+    window = torch.arange(width * channels, dtype=torch.bfloat16, device="cuda").view(width, -1)
+    snapshot = KdaInforwardSnapshot(
+        rows=None,
+        chunks=None,
+        live=torch.tensor([2], device="cuda"),
+        stage_rows=torch.tensor([1], device="cuda"),
+        conv_win=None,
+    )
+    _swap_inforward_snapshot(conv_pool, ssm_pool, snapshot, (stage_ssm, stage_conv), window)
+    assert torch.equal(ssm_pool[2], ssm_point) and torch.equal(stage_ssm[1], ssm_end)
+    assert torch.equal(stage_conv[1], torch.full_like(stage_conv[1], 7))
+    assert torch.equal(conv_pool[2], window.t())
+    assert torch.equal(stage_ssm[0], torch.full_like(stage_ssm[0], -1.0))

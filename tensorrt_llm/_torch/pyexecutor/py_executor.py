@@ -92,6 +92,8 @@ from .error_classification import ErrorBudget
 from .executor_request_queue import (PREFIX_LOAD_COMPLETION_REQUEST_ID,
                                      ExecutorRequestQueue,
                                      RequestAdmissionState, RequestQueueItem)
+from .executor_thread import (PIN_EXECUTOR_AFFINITY, ExecutorThreadPin,
+                              executor_switch_interval)
 from .gpu_keepalive import GpuKeepalive
 from .guided_decoder import GuidedDecoder
 from .handle_additional_outputs import HandleAdditionalOutputs
@@ -1940,7 +1942,9 @@ class PyExecutor:
             enable_profiler = bool(os.environ.get(
                 "TLLM_LINE_PROFILER_PATH")) and not self.is_warmup
             with host_profiler_context(enable=enable_profiler), \
-                 customized_gc_thresholds(self.garbage_collection_gen0_threshold):
+                 customized_gc_thresholds(self.garbage_collection_gen0_threshold), \
+                 executor_switch_interval(
+                     getattr(self.llm_args, "enable_min_latency", False)):
                 self.event_loop()
         except Exception as e:
             # A raise AFTER the loop reached its own normal-exit `break` (from
@@ -2086,8 +2090,8 @@ class PyExecutor:
                 # after configure_cpu_affinity(). Refresh the existing-thread
                 # snapshot immediately before launching executor threads.
                 # Explicit affinity opt-out must remain a true opt-out.
-                if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (None,
-                                                                         "1"):
+                if os.environ.get("TLLM_NUMA_AWARE_WORKER_AFFINITY") in (
+                        None, "1", PIN_EXECUTOR_AFFINITY):
                     _reapply_current_thread_affinity_to_all_threads()
                 if self.dist.pp_size > 1:
                     self.executed_batch_queue: Queue[BatchStatePP] = Queue(
@@ -6199,9 +6203,12 @@ class PyExecutor:
             iter_start_time = time.time()
             iter_stats = None
             can_forward = not self.is_benchmark_disagg
+            executor_pin = ExecutorThreadPin.create()
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                if executor_pin is not None:
+                    executor_pin.maybe_refresh(self.iter_counter)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 
@@ -7218,9 +7225,12 @@ class PyExecutor:
             iter_stats = None
             previous_tensors_device = None
             can_forward = not self.is_benchmark_disagg
+            executor_pin = ExecutorThreadPin.create()
             while True:
                 self.hang_detector.checkpoint()
                 profile_step()
+                if executor_pin is not None:
+                    executor_pin.maybe_refresh(self.iter_counter)
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
 

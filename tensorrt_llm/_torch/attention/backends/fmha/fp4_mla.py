@@ -372,7 +372,7 @@ class Fp4MlaFmha(PhasedFmha):
         prequantized_q_sf = getattr(metadata.fp4_mla_state, "prequantized_q_sf", None)
         q_batch_capacity = getattr(metadata.fp4_mla_state, "q_batch_capacity", None)
         try:
-            run_fp4_mla_attention_decode(
+            forward_args.split_partials = run_fp4_mla_attention_decode(
                 metadata,
                 attn.layer_idx,
                 local_layer,
@@ -384,7 +384,8 @@ class Fp4MlaFmha(PhasedFmha):
                 prequantized_q=prequantized_q,
                 prequantized_q_sf=prequantized_q_sf,
                 q_batch_capacity=q_batch_capacity,
-                softmax_stats_tensor=params.fwd.softmax_stats_tensor,
+                softmax_stats_tensor=forward_args.softmax_stats_tensor,
+                defer_split_reduce=forward_args.defer_split_reduce,
             )
         finally:
             metadata.fp4_mla_state.prequantized_q = None

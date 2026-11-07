@@ -20,7 +20,9 @@ all-reduce) and fuses each layer's all-reduce with the residual add and
 RMSNorm. Those change the rounding, not the math: the projected context and the
 block decode stay within bf16 noise of the single-GPU drafter, which runs
 neither fusion. A drafter that does not declare them keeps the unsplit
-projection and the unfused norm under TP.
+projection and the unfused norm under TP. Over a helix-sharded context the
+drafter projects every head's query on every rank and matches the single-GPU
+drafter over the whole context.
 """
 
 import pickle
@@ -59,6 +61,7 @@ V_DIM = 128
 LAYERS = 2
 BLOCK = 3
 LATENT = KV_LORA + ROPE
+PAGE = 32
 
 
 def _config():
@@ -209,12 +212,14 @@ def _project(drafter, captured):
         return drafter.project_target_hidden(captured).clone()
 
 
-def _drafter(mapping, weights=None):
+def _drafter(mapping, weights=None, backend="VANILLA", helix_mapping=None):
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
     model_config = ModelConfig(pretrained_config=_config(), mapping=mapping, attn_backend="TRTLLM")
-    drafter = MLADSparkForCausalLM(model_config, dflash_attention_backend="VANILLA").to("cuda")
+    drafter = MLADSparkForCausalLM(
+        model_config, dflash_attention_backend=backend, helix_mapping=helix_mapping
+    ).to("cuda")
     drafter.load_weights(_weights() if weights is None else weights)
     return drafter
 
@@ -270,6 +275,19 @@ def _check(tp):
         gathered = MPI.COMM_WORLD.allgather(out.float().cpu())
         assert all(torch.equal(o, gathered[0]) for o in gathered)
 
+        # The side-stream projection reduces on its own workspace where the shared all-reduce
+        # is MNNVL, and matches the main-stream one (both one-shot at 8 rows).
+        side = sharded._ctx_side_all_reduce
+        assert single.projects_context_beside(8)
+        assert sharded.projects_context_beside(8) == (side is not None)
+        assert not sharded.projects_context_beside(33)
+        if side is not None:
+            assert side.mnnvl_allreduce.own_workspace is not None
+            rows = captured[0, :8]
+            with discard_nccl_window_tensor_outputs(rows), torch.inference_mode():
+                beside = sharded.project_target_hidden_beside(rows).clone()
+            assert torch.equal(beside, _project(sharded, rows))
+
         # An fc input width that does not split over tp_size keeps the whole fc
         # and projects exactly as the unsharded drafter does.
         weights = _weights()
@@ -281,6 +299,119 @@ def _check(tp):
         odd = torch.randn(40, HIDDEN * NUM_CAPTURE + 1, device="cuda", generator=g)
         odd = (odd * 0.5).to(torch.bfloat16)
         assert torch.equal(_project(unsplit, odd), _project(_drafter(Mapping(), weights), odd))
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@torch.inference_mode()
+def _paged_block_decode(drafter, latents, noise, shard=None):
+    """Block decode over paged context latents (one ``[ctx, LAYERS, LATENT]`` per request).
+
+    With a helix ``shard`` the pool holds only that rank's pages: global page ``g``
+    of a request is its local page ``g // cp_size`` on rank ``g % cp_size``.
+    """
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    owner = shard if shard is not None else HelixDraftShard(1, 0, PAGE)
+    span = PAGE * owner.cp_size
+    ctx_lens = [lat.shape[0] for lat in latents]
+    local_pages = [-(-(n + BLOCK) // span) for n in ctx_lens]
+    pool = [
+        torch.zeros(sum(local_pages), 1, 1, PAGE, LATENT, dtype=torch.bfloat16, device="cuda")
+        for _ in range(LAYERS)
+    ]
+    table = torch.zeros(len(latents), max(local_pages), dtype=torch.int32, device="cuda")
+    start = 0
+    for b, n in enumerate(local_pages):
+        table[b, :n] = torch.arange(start, start + n, dtype=torch.int32, device="cuda")
+        for k in range(n):
+            first = (k * owner.cp_size + owner.cp_rank) * PAGE
+            rows = latents[b][first : first + PAGE]
+            for layer in range(LAYERS):
+                pool[layer][start + k, 0, 0, : rows.shape[0]] = rows[:, layer]
+        start += n
+    with discard_nccl_window_tensor_outputs((noise,)):
+        out = drafter.dflash_forward(
+            noise_embedding=noise,
+            query_positions=torch.stack(
+                [torch.arange(n, n + BLOCK, device="cuda") for n in ctx_lens]
+            ),
+            num_ctx_per_req=torch.tensor(ctx_lens, device="cuda"),
+            ctx_k_cache=pool[0],
+            ctx_v_cache=None,
+            ctx_cache_batch_idx=torch.arange(len(latents), device="cuda"),
+            ctx_kv_cache=pool,
+            ctx_page_table=table,
+            ctx_helix_shard=shard,
+        )
+        return out.clone()
+
+
+def _check_helix(tp):
+    """A drafter over a helix-sharded context projects every head's query itself.
+
+    q_b_proj and kv_b_proj hold all heads on every rank and o_proj keeps the
+    rank's heads, so the decode over the rank's own pages needs no query
+    gather, and the merged output matches the single-GPU drafter over the
+    whole context. Over a replicated context (no shard) the same drafter
+    attends with the rank's heads only.
+    """
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+    from tensorrt_llm.mapping import CpType
+
+    rank = tensorrt_llm.mpi_rank()
+    torch.cuda.set_device(rank)
+    try:
+        helix = Mapping(world_size=tp, rank=rank, cp_size=tp, cp_config={"cp_type": CpType.HELIX})
+        repurposed = helix.repurpose_helix_cp_to_tp()
+        weights = _weights()
+
+        # Only the CUTEDSL decode reads a helix-sharded context; others keep the TP split.
+        vanilla = _drafter(repurposed, backend="VANILLA", helix_mapping=helix)
+        assert not vanilla.reads_helix_sharded_ctx_pages
+        assert vanilla._num_query_heads == vanilla._num_heads == HEADS // tp
+
+        drafter = _drafter(repurposed, backend="CUTEDSL", helix_mapping=helix)
+        assert drafter.reads_helix_sharded_ctx_pages
+        assert drafter._num_query_heads == HEADS and drafter._num_heads == HEADS // tp
+        for i, layer in enumerate(drafter.model.layers):
+            attn = layer.self_attn
+            p = f"layers.{i}.self_attn."
+            assert torch.equal(attn.q_b_proj.weight.cpu(), weights[p + "q_b_proj.weight"])
+            assert torch.equal(attn.kv_b_proj.weight.cpu(), weights[p + "kv_b_proj.weight"])
+            assert attn.o_proj.weight.shape[1] == HEADS * V_DIM // tp
+            assert attn.heads_tp_cp_offset == rank * (HEADS // tp)
+        single = _drafter(Mapping(), backend="CUTEDSL")
+
+        g = torch.Generator(device="cuda").manual_seed(44)
+        # Unequal lengths, each crossing a page boundary, so both ranks hold context.
+        ctx_lens = (40, 75)
+        latents = []
+        with discard_nccl_window_tensor_outputs(()):
+            for n in ctx_lens:
+                captured = torch.randn(n, HIDDEN * NUM_CAPTURE, device="cuda", generator=g)
+                projected = single.project_target_hidden((captured * 0.5).to(torch.bfloat16))
+                latent, _ = single.precompute_context_kv(projected, torch.arange(n, device="cuda"))
+                latents.append(latent[:, :, 0].clone())
+        noise = torch.randn(len(ctx_lens), BLOCK, HIDDEN, device="cuda", generator=g)
+        noise = (noise * 0.5).to(torch.bfloat16)
+
+        ref = _paged_block_decode(single, latents, noise)
+        out = _paged_block_decode(drafter, latents, noise, HelixDraftShard(tp, rank, PAGE))
+        # The TP fusions' rounding and another KV split: bf16 noise.
+        torch.testing.assert_close(out, ref, rtol=3e-2, atol=3e-2)
+        gathered = MPI.COMM_WORLD.allgather(out.float().cpu())
+        assert all(torch.equal(o, gathered[0]) for o in gathered)
+
+        # A replicated context (no shard): the rank's heads only.
+        captured = torch.randn(3, 20, HIDDEN * NUM_CAPTURE, device="cuda", generator=g)
+        captured = (captured * 0.5).to(torch.bfloat16)
+        noise = (torch.randn(3, BLOCK, HIDDEN, device="cuda", generator=g) * 0.5).to(torch.bfloat16)
+        _, ref_out = _block_decode(single, captured, noise)
+        _, out = _block_decode(drafter, captured, noise)
+        torch.testing.assert_close(out, ref_out, rtol=3e-2, atol=3e-2)
     except Exception:
         traceback.print_exc()
         raise
@@ -323,6 +454,19 @@ def _check_undeclared(tp):
 def test_tp_sharded_mla_drafter_matches_single_gpu(mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(_check, [tp] * tp)
+    assert all(results)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_helix_mla_drafter_projects_every_head_query(mpi_pool_executor):
+    from tensorrt_llm._torch.models.modeling_dspark import cute_dsl_mla_decode_unavailability_reason
+
+    reason = cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_check_helix, [tp] * tp)
     assert all(results)
 
 

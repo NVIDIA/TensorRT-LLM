@@ -30,9 +30,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 # isort: off
 from tensorrt_llm.llmapi.llm_args import (
     CacheTransceiverConfig, CapacitySchedulerPolicy, ContextSchedulingPolicy,
-    KVEventsConfig, KvCacheCompressionConfig, KvCacheConfig,
-    MultimodalEncoderSchedulingPolicy, PeftCacheConfig, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
+    DSparkDecodingConfig, KVEventsConfig, KvCacheCompressionConfig,
+    KvCacheConfig, MultimodalEncoderSchedulingPolicy, PeftCacheConfig,
+    SchedulerConfig, SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs,
+    WaitingQueuePolicy)
 # isort: on
 from tensorrt_llm._torch.peft.lora.config import (
     LoraConfig, get_default_trtllm_modules_to_hf_modules)
@@ -124,6 +125,38 @@ def _get_num_reserved_index_slots(spec_config: Optional[SpeculativeConfig],
 
 def ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
+
+
+def _cuda_tensor_attributes(obj) -> List[torch.Tensor]:
+    """CUDA tensors stored directly as attributes of ``obj``.
+
+    For an ``nn.Module`` these are the tensors it keeps outside its registered
+    parameters and buffers, e.g. tables derived from its weights.
+    """
+    return [
+        value for value in vars(obj).values()
+        if isinstance(value, torch.Tensor) and value.is_cuda
+    ]
+
+
+def _unique_cuda_storage_bytes(tensors: List[torch.Tensor],
+                               exclude: set[int]) -> int:
+    """Bytes of the distinct CUDA storages behind ``tensors``.
+
+    Views of one storage count once; storages whose data pointer is in
+    ``exclude`` do not count.
+    """
+    seen = set(exclude)
+    total = 0
+    for tensor in tensors:
+        if not tensor.is_cuda:
+            continue
+        storage = tensor.untyped_storage()
+        if storage.data_ptr() in seen:
+            continue
+        seen.add(storage.data_ptr())
+        total += storage.nbytes()
+    return total
 
 
 def _get_initial_lora_data_type(
@@ -1081,6 +1114,7 @@ class KvCacheCreator:
                     "ranks only in the chunked-context path. Set "
                     "enable_chunked_prefill=True on a GPU that supports it "
                     "for MLA.")
+        self._validate_context_kv_only()
         self._disable_overlap_scheduler = llm_args.disable_overlap_scheduler
         self._draft_config = draft_config
         self._skip_est = skip_est
@@ -1088,6 +1122,15 @@ class KvCacheCreator:
         # covers, computed in configure_kv_cache_capacity and carried to the KV manager so the scheduler
         # reads it directly instead of re-deriving it from pool layout. None until reserved (or w == 0).
         self._fp8_ctx_mla_kv_len_cap = None
+
+    def _validate_context_kv_only(self) -> None:
+        """A drafter that never drafts belongs on a disaggregated context server."""
+        if (isinstance(self._speculative_config, DSparkDecodingConfig)
+                and self._speculative_config.context_kv_only
+                and not self._is_disagg):
+            raise ValueError(
+                "speculative_config.context_kv_only is for the context servers "
+                "of disaggregated serving.")
 
     def _get_model_kv_cache_manager_cls(
         self,
@@ -1439,6 +1482,47 @@ class KvCacheCreator:
                         include_request_cost=include_request_cost))
         return None
 
+    def _get_context_server_spec_reserve(self, fraction: float) -> int:
+        """KV budget that keeps a context-KV-only drafter out of PyTorch's headroom.
+
+        The drafter's weights, derived tables and capture buffers are in the
+        profiled peak, and ``fraction`` of the memory left after the peak goes
+        to the KV cache, so each resident byte costs the KV cache ``fraction``
+        of a byte and the PyTorch headroom the rest. Taking the remainder from
+        the KV budget as well leaves a context server's headroom, which absorbs
+        attention over long reused prefixes, untouched by the drafter.
+
+        Returns:
+            ``(1 - fraction)`` times the bytes of the CUDA tensors held by the
+            draft model (minus storage shared with the target) and the
+            speculative metadata; 0 unless ``speculative_config.context_kv_only``.
+        """
+        if not (isinstance(self._speculative_config, DSparkDecodingConfig)
+                and self._speculative_config.context_kv_only):
+            return 0
+        model = self._model_engine.model
+        draft_model = getattr(model, "draft_model", None)
+        tensors = []
+        if draft_model is not None:
+            tensors.extend(draft_model.parameters())
+            tensors.extend(draft_model.buffers())
+            for module in draft_model.modules():
+                tensors.extend(_cuda_tensor_attributes(module))
+        spec_metadata = getattr(self._model_engine, "spec_metadata", None)
+        if spec_metadata is not None:
+            tensors.extend(_cuda_tensor_attributes(spec_metadata))
+        shared = {
+            tensor.untyped_storage().data_ptr()
+            for name, tensor in (
+                *model.named_parameters(remove_duplicate=False),
+                *model.named_buffers(remove_duplicate=False),
+            ) if tensor.is_cuda and not name.startswith("draft_model.")
+        }
+        resident = _unique_cuda_storage_bytes(tensors, exclude=shared)
+        logger.info(f"Context-KV-only drafter: {resident / GB:.2f} GiB of "
+                    "resident CUDA tensors.")
+        return int((1.0 - fraction) * resident)
+
     def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
                         allocated_bytes: int) -> int:
         """
@@ -1738,7 +1822,8 @@ class KvCacheCreator:
         if self._is_kv_cache_manager_v2:
             unified_layer_specs = self._build_unified_dflash_layer_specs(
                 self._kv_cache_config)
-            if unified_layer_specs:
+            if unified_layer_specs and not issubclass(
+                    self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
                 # Target and draft layers can differ in page size and life
                 # cycle, so the group count comes from the combined layout.
                 num_pool_groups = _get_num_storage_pool_groups(
@@ -1750,6 +1835,10 @@ class KvCacheCreator:
                     self._model_engine.max_seq_len,
                     self._kv_cache_config,
                 )
+                if unified_layer_specs:
+                    # A hybrid manager's appended draft layers.
+                    num_pool_groups += _get_num_storage_pool_groups(
+                        unified_layer_specs, self._tokens_per_block)
         num_cache_blocks *= num_pool_groups
 
         # Dummy context requests use the configured maximum beam width. Scale
@@ -2044,6 +2133,15 @@ class KvCacheCreator:
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
                                                    total_gpu_memory, fraction,
                                                    allocated_bytes)
+        spec_reserve = self._get_context_server_spec_reserve(fraction)
+        if spec_reserve > 0:
+            budget_before = kv_cache_max_memory
+            kv_cache_max_memory = int(budget_before - spec_reserve)
+            logger.info(
+                f"Reserving {spec_reserve / GB:.2f} GiB of PyTorch headroom for "
+                "the context-KV-only drafter's resident tensors: KV cache budget "
+                f"{budget_before / GB:.2f} -> {kv_cache_max_memory / GB:.2f} GiB."
+            )
 
         # Estimation uses inferred pool sizing; the final manager uses the
         # user-provided configuration.
@@ -2315,10 +2413,47 @@ class KvCacheCreator:
             backend = getattr(draft_model, "dflash_attention_backend", None)
         return backend
 
+    def _loaded_standalone_dspark_drafter(self):
+        """The loaded standalone DSpark drafter, whose declarations decide how
+        it reads its context, or None (DFlash keeps its configured backend)."""
+        spec_dec_mode = self._speculative_config.spec_dec_mode
+        if spec_dec_mode.is_dflash() or not spec_dec_mode.is_dspark():
+            return None
+        return getattr(self._model_engine.model, "draft_model", None)
+
+    def _unified_drafter_reads_paged_kv(self, backend: Optional[str]) -> bool:
+        """Whether the drafter's block attention reads its context KV from the
+        manager's pages at this run's page size.
+
+        A loaded DSpark drafter declares it; otherwise only TRTLLM pages of 16,
+        32 or 64 tokens.
+        """
+        drafter = self._loaded_standalone_dspark_drafter()
+        if drafter is None:
+            return (backend == "TRTLLM"
+                    and self._tokens_per_block in (16, 32, 64))
+        return drafter.reads_managed_ctx_pages(self._tokens_per_block)
+
+    def _unified_drafter_reads_helix_pages(self) -> bool:
+        """Whether the loaded drafter reads a context sharded over helix CP."""
+        drafter = self._loaded_standalone_dspark_drafter()
+        return drafter is not None and drafter.reads_helix_sharded_ctx_pages
+
+    def _unified_target_manager_cls_supported(self) -> bool:
+        """Whether the target's manager class can hold the drafter's layers.
+
+        Hybrid managers describe their own target layers and append the
+        drafter's after them when they opt in.
+        """
+        cls = self._kv_cache_manager_cls
+        return cls is KVCacheManagerV2 or (
+            issubclass(cls, MambaHybridCacheManagerV2)
+            and cls.accepts_appended_draft_layers)
+
     def _unified_drafter_block_width(self) -> int:
         """Use the loaded checkpoint's slot convention for sizing and allocation."""
         draft_model = getattr(self._model_engine.model, "draft_model", None)
-        shift_label = getattr(draft_model, "_dspark_shift_label", False)
+        shift_label = draft_model is not None and draft_model.shift_label
         return get_draft_block_width(self._speculative_config,
                                      shift_label=shift_label)
 
@@ -2358,10 +2493,10 @@ class KvCacheCreator:
         if spec_config is None:
             return "speculative decoding is not enabled"
         backend = self._unified_drafter_attention_backend()
-        if backend != "TRTLLM":
-            return f"the drafter attention_backend is {backend}, not TRTLLM"
-        if self._tokens_per_block not in (16, 32, 64):
-            return f"tokens_per_block is {self._tokens_per_block}, not 16, 32, or 64"
+        if not self._unified_drafter_reads_paged_kv(backend):
+            return (f"the drafter's {backend} block attention does not read "
+                    "paged draft KV from a KV cache manager at "
+                    f"tokens_per_block={self._tokens_per_block}")
         if not spec_config._allow_separate_draft_kv_cache:
             return "a separate draft KV cache is not allowed for this configuration"
         if spec_config.draft_len_schedule is not None:
@@ -2370,8 +2505,11 @@ class KvCacheCreator:
             return "there is no draft model config"
         if self._mapping.pp_size != 1:
             return f"pipeline_parallel_size is {self._mapping.pp_size}, not 1"
-        if self._mapping.cp_size != 1:
-            return f"context_parallel_size is {self._mapping.cp_size}, not 1"
+        if self._mapping.cp_size != 1 and not (
+                self._mapping.has_cp_helix()
+                and self._unified_drafter_reads_helix_pages()):
+            return (f"context_parallel_size is {self._mapping.cp_size} and the "
+                    "drafter does not read a helix-sharded context")
         if self._llm_args.attn_backend != "TRTLLM":
             return f"the target attn_backend is {self._llm_args.attn_backend}, not TRTLLM"
         if _has_variable_kv_cache_geometry(
@@ -2384,8 +2522,9 @@ class KvCacheCreator:
             return "KV cache compression is enabled"
         # Specialized managers add cache roles and lifecycle protocols that an
         # external drafter cannot yet describe. Keep their existing fallback.
-        if self._kv_cache_manager_cls is not KVCacheManagerV2:
-            return "the target does not use KVCacheManagerV2"
+        if not self._unified_target_manager_cls_supported():
+            return (f"the target's {self._kv_cache_manager_cls.__name__} "
+                    "cannot hold draft layers")
         target_layout = self._dflash_kv_layout(
             self._model_engine.model.model_config,
             self._model_engine.model.config.torch_dtype)
@@ -2440,15 +2579,16 @@ class KvCacheCreator:
         per-layer bytes over the rank's KV-head count, so dtype and head_dim
         may differ. The KV-head count and K-only flag come from the rank's
         single AttentionInfo and must match. NVFP4 adds block-scale views, so
-        an NVFP4 side is only paired with an identical layout.
+        an NVFP4 side is only paired with an identical layout, unless both are
+        K-only: every rank holds the whole latent, so no view is head-sliced.
         """
         target_heads, _, target_dtype, target_k_only = target_layout
         draft_heads, _, draft_dtype, draft_k_only = draft_layout
         if (target_heads, target_k_only) != (draft_heads, draft_k_only):
             return False
         nvfp4 = tensorrt_llm.bindings.DataType.NVFP4
-        return target_dtype == draft_dtype or nvfp4 not in (target_dtype,
-                                                            draft_dtype)
+        return (target_k_only or target_dtype == draft_dtype
+                or nvfp4 not in (target_dtype, draft_dtype))
 
     def _dflash_kv_layout(
             self, model_config: ModelConfig,
@@ -2507,9 +2647,16 @@ class KvCacheCreator:
     def _build_unified_dflash_layer_specs(
             self,
             kv_cache_config: KvCacheConfig) -> tuple[KVCacheLayerSpec, ...]:
-        """Build the rank-local target+DFlash storage layout used by cost and allocation."""
+        """Build the rank-local target+DFlash storage layout used by cost and allocation.
+
+        A hybrid target manager describes its own layers, so it gets only the
+        drafter's.
+        """
         if not self._should_unify_dflash_kv_cache():
             return ()
+        draft_specs = self._build_unified_draft_layer_specs(kv_cache_config)
+        if issubclass(self._kv_cache_manager_cls, MambaHybridCacheManagerV2):
+            return draft_specs
 
         target_model_config = self._model_engine.model.model_config
         target_config = target_model_config.pretrained_config
@@ -2532,20 +2679,6 @@ class KvCacheCreator:
             target_local_ids,
         )
 
-        draft_model_config = self._get_draft_kv_model_config()
-        draft_config = draft_model_config.pretrained_config
-        draft_layers = int(draft_config.num_hidden_layers)
-        draft_local_ids = list(self._mapping.pp_layers(draft_layers))
-        draft_heads, draft_head_dim, draft_dtype, draft_k_only = (
-            self._dflash_kv_layout(draft_model_config,
-                                   draft_config.torch_dtype))
-        draft_windows = _resolve_v2_max_attention_window_vec(
-            self._get_draft_max_attention_window(self._max_seq_len,
-                                                 kv_cache_config),
-            self._max_seq_len,
-            draft_local_ids,
-        )
-
         specs = [
             KVCacheLayerSpec(
                 global_layer_id=layer_id,
@@ -2559,7 +2692,28 @@ class KvCacheCreator:
                 reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(target_local_ids, target_windows)
         ]
-        specs.extend(
+        return (*specs, *draft_specs)
+
+    def _build_unified_draft_layer_specs(
+            self,
+            kv_cache_config: KvCacheConfig) -> tuple[KVCacheLayerSpec, ...]:
+        """Rank-local storage of the drafter's layers, after the target's."""
+        target_layers = int(self._model_engine.model.model_config.
+                            pretrained_config.num_hidden_layers)
+        draft_model_config = self._get_draft_kv_model_config()
+        draft_config = draft_model_config.pretrained_config
+        draft_layers = int(draft_config.num_hidden_layers)
+        draft_local_ids = list(self._mapping.pp_layers(draft_layers))
+        draft_heads, draft_head_dim, draft_dtype, draft_k_only = (
+            self._dflash_kv_layout(draft_model_config,
+                                   draft_config.torch_dtype))
+        draft_windows = _resolve_v2_max_attention_window_vec(
+            self._get_draft_max_attention_window(self._max_seq_len,
+                                                 kv_cache_config),
+            self._max_seq_len,
+            draft_local_ids,
+        )
+        return tuple(
             KVCacheLayerSpec(
                 global_layer_id=target_layers + layer_id,
                 owner=KVCacheLayerOwner.DRAFT,
@@ -2571,7 +2725,6 @@ class KvCacheCreator:
                 sliding_window_size=window,
                 reuse_policy=ReusePolicy.REQUIRED,
             ) for layer_id, window in zip(draft_local_ids, draft_windows))
-        return tuple(specs)
 
     def _joint_reuse_supported(self) -> bool:
         """Span half of the pairing decision; ``build_managers`` ANDs it with
@@ -2649,6 +2802,11 @@ class KvCacheCreator:
         spec_dec_mode = self._speculative_config.spec_dec_mode
         if not (spec_dec_mode.is_dflash() or spec_dec_mode.is_dspark()):
             return effective_draft_config
+        if (isinstance(self._speculative_config, DSparkDecodingConfig)
+                and self._speculative_config.context_kv_dtype == "fp8"):
+            # speculative_config.context_kv_dtype: FP8 E4M3 drafter latents.
+            return self._get_unquantized_kv_model_config(
+                effective_draft_config, kv_cache_quant_algo=QuantAlgo.FP8)
         quant_config = getattr(effective_draft_config, "quant_config", None)
         if quant_config is None or not quant_config.quant_mode.has_kv_cache_quant(
         ):
@@ -2660,13 +2818,20 @@ class KvCacheCreator:
 
     @staticmethod
     def _get_unquantized_kv_model_config(
-            model_config: ModelConfig) -> ModelConfig:
-        """Describe a model-dtype KV pool without changing the model config."""
+            model_config: ModelConfig,
+            kv_cache_quant_algo: Optional[QuantAlgo] = None) -> ModelConfig:
+        """Describe a model-dtype KV pool (or one stored as
+        ``kv_cache_quant_algo``) without changing the model config."""
         quant_config = model_config.quant_config
-        if quant_config is None or quant_config.kv_cache_quant_algo is None:
+        if quant_config is None:
+            if kv_cache_quant_algo is None:
+                return model_config
+            from tensorrt_llm.models.modeling_utils import QuantConfig
+            quant_config = QuantConfig()
+        elif quant_config.kv_cache_quant_algo == kv_cache_quant_algo:
             return model_config
         neutral_quant = copy.copy(quant_config)
-        neutral_quant.kv_cache_quant_algo = None
+        neutral_quant.kv_cache_quant_algo = kv_cache_quant_algo
         # QuantConfig.quant_mode and .layer_quant_mode are both cached_property
         # and the copy carries the already-computed caches, so BOTH must be
         # dropped for the mutation to take: _create_kv_cache_manager reads
@@ -5227,7 +5392,9 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
     return num_experts
 
 
-def _adjust_torch_mem_fraction():
+def _adjust_torch_mem_fraction(safety_margin: int = 32 * 1024**2):
+    # ``safety_margin`` is device memory kept outside the PyTorch cap for
+    # driver allocations made after setup.
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.
@@ -5265,7 +5432,6 @@ def _adjust_torch_mem_fraction():
         return
     mem_reserved = torch.cuda.memory_reserved()
     mem_free, mem_total = torch.cuda.mem_get_info()
-    safety_margin = 32 * 1024**2
     mem_torch_max = mem_free + mem_reserved - safety_margin
     mem_torch_fraction = mem_torch_max / mem_total
     logger.info(

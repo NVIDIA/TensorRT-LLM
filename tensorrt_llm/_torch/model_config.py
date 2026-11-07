@@ -256,6 +256,10 @@ def hf_remote_code_lock(timeout: int = 10) -> Iterator[None]:
 class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
+    # Helix: the CP mapping of a model that builds its non-attention modules on
+    # ``mapping`` with the CP ranks repurposed as TP ranks; its attention layers
+    # and a drafter that shards like them read it. None outside Helix.
+    mapping_with_cp: Optional[Mapping] = None
 
     # Quantization configs
     quant_config: QuantConfig = field(default_factory=QuantConfig)
@@ -317,7 +321,7 @@ class ModelConfig(Generic[TConfig]):
     # Batch sizes of the generation CUDA graphs (empty without them).
     cuda_graph_batch_sizes: Tuple[int, ...] = ()
 
-    # If true, enable min-latency mode. Currently only used for Llama4.
+    # If true, enable min-latency mode (Llama4; Kimi K3 lossy few-row decode kernels).
     enable_min_latency: bool = False
 
     # Allow models to select op according to whether CUDA Graphs are used.

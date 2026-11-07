@@ -143,7 +143,7 @@ def assert_close_to_cpp(actual: torch.Tensor, expected: torch.Tensor, what=None)
 
 @pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize("n", [2, 3, 4, 5, 9, 12])
-@pytest.mark.parametrize("m", [1, 7, 16, 17, 32, 56, 64])
+@pytest.mark.parametrize("m", [1, 7, 16, 17, 32, 56, 64, 96, 128, 144, 192])
 def test_against_cpp(m: int, n: int, mode: int):
     """Both cluster sizes :func:`cluster_size` picks (eight CTAs for up to 16 tokens with four or
     more candidates, else four)."""
@@ -201,11 +201,13 @@ def r128c4_offsets(m: int, k: int) -> torch.Tensor:
     return ((r // 128) * (k // 128) + c // 4) * 512 + (r % 32) * 16 + (r % 128) // 32 * 4 + c % 4
 
 
+@pytest.mark.parametrize("entry_trigger", [False, True])
 @pytest.mark.parametrize("n", [2, 6, 12])
-@pytest.mark.parametrize("m", [1, 7, 14, 32, 64])
-def test_mxfp8_side_output(m: int, n: int):
+@pytest.mark.parametrize("m", [1, 7, 14, 32, 64, 128, 144, 192])
+def test_mxfp8_side_output(m: int, n: int, entry_trigger: bool):
     """The MXFP8 op returns the plain op's BF16 results and the MXFP8 form of the normalized
-    output that the FP8 low-M GEMM's in-kernel quantization makes of it."""
+    output that the FP8 low-M GEMM's in-kernel quantization makes of it; releasing the dependent
+    at kernel entry changes no bit."""
     from tensorrt_llm._torch.kernels.blackwell import fp8_block_scale_low_m_gemm as low_m
 
     t = _inputs(m, n, 1.0, seed=m + n)
@@ -213,7 +215,7 @@ def test_mxfp8_side_output(m: int, n: int):
     ops = torch.ops.trtllm
     ref = ops.kimi_k3_attn_res_moe_add_rmsnorm(t["layer"], t["addend"], t["shared"], t["block"], *w)
     prefix, out, xq, xs = ops.kimi_k3_attn_res_moe_add_rmsnorm_mxfp8(
-        t["layer"], t["addend"], t["shared"], t["block"], *w
+        t["layer"], t["addend"], t["shared"], t["block"], *w, entry_trigger
     )
     assert _mismatches(prefix, ref[0]) == 0 and _mismatches(out, ref[1]) == 0
     ref_q, ref_s = low_m.mxfp8_quantize_reference(ref[1])
@@ -236,6 +238,40 @@ def test_mxfp8_side_output_other_hidden_sizes(hidden: int):
     ref_q, ref_s = low_m.mxfp8_quantize_reference(out)
     assert torch.equal(xq.view(torch.uint8), ref_q.view(torch.uint8))
     assert torch.equal(xs[r128c4_offsets(m, hidden)], ref_s)
+
+
+@pytest.mark.parametrize("n", [2, 9])
+@pytest.mark.parametrize("m", [1, 7, 14, 64, 128, 192])
+def test_in_place_all_reduce_addend(m: int, n: int):
+    """The addend read in place from a pushed all-reduce's workspace (a one-rank stand-in: the
+    result rows in the broadcast stage of the state's dirty buffer) gives the results of the
+    tensor addend, also when the rows land while the kernel polls."""
+    _kernel()
+    t = _inputs(m, n, 1.0, seed=3 * m + n)
+    w = _weights(t)
+    stage_bytes = m * HIDDEN * 2
+    nbytes = 2 * stage_bytes  # two-shot: scatter and broadcast stage
+    dirty = 1
+    # Every 32-bit word starts as the empty-slot sentinel 0x80000000.
+    workspace = torch.full((3 * nbytes // 4,), -(2**31), dtype=torch.int32, device="cuda")
+    flags = torch.tensor(
+        [(dirty + 1) % 3, dirty, nbytes, 2, 0, 0, 0, 0, 0], dtype=torch.uint32, device="cuda"
+    )
+    start = ((dirty * 2 + 1) * stage_bytes) // 2
+    rows = workspace.view(torch.bfloat16)[start : start + m * HIDDEN].view(m, HIDDEN)
+    ref_updated, ref_out = torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm(
+        t["layer"], t["addend"], t["block"], *w
+    )
+    torch.cuda.synchronize()
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(1_000_000)
+        rows.copy_(t["addend"])
+    updated, out = torch.ops.trtllm.kimi_k3_attn_res_add_rmsnorm_in_place_addend(
+        t["layer"], workspace, flags, t["block"], *w
+    )
+    torch.cuda.synchronize()
+    assert _mismatches(updated, ref_updated) == 0 and _mismatches(out, ref_out) == 0
 
 
 def test_can_run():

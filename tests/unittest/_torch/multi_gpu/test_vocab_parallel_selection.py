@@ -279,6 +279,98 @@ def _markov_check(rank, tp, mnnvl):
         assert torch.equal(out, expected)
 
 
+def _assert_markov_near_ties(full, anchors, w1, w2, tokens, atol):
+    """``tokens`` equal the reference chain except where a token's biased logit
+    ties the reference winner's to within ``atol`` (then the chains part ways)."""
+    from tensorrt_llm._torch.models.modeling_speculative import dspark_markov_step_bias
+
+    expected = _markov_reference(full, anchors, w1, w2)
+    mismatches = 0
+    for req in range(full.shape[0]):
+        prev = anchors[req : req + 1]
+        for step in range(full.shape[1]):
+            biased = full[req, step].float() + dspark_markov_step_bias(prev, w1, w2)[0].float()
+            got, want = int(tokens[req, step]), int(expected[req, step])
+            if got != want:
+                mismatches += 1
+                assert abs(float(biased[got]) - float(biased[want])) <= atol, (req, step)
+                break
+            prev = tokens[req, step : step + 1].long()
+    assert mismatches <= max(1, tokens.shape[0] // 8)
+
+
+@torch.inference_mode()
+def _markov_v3_check(rank, tp, mnnvl):
+    """The CuTe DSL one-launch chain follows the reference chain for 1-16
+    requests and 1-16 positions (int32 and int64 anchors, out-of-vocab anchors)
+    up to near-ties of the bias rounding, across launches that rotate the
+    exchange sets and under CUDA-graph replay; with a zero bias it equals the
+    reference, ties, NaN and -inf rows included."""
+    head, vocab = _make_head(rank, tp, mnnvl)
+    gen = torch.Generator(device="cuda").manual_seed(17)
+    w1 = torch.randn(vocab, 256, device="cuda", generator=gen).to(torch.bfloat16)
+    w2 = (torch.randn(vocab, 256, device="cuda", generator=gen) * 0.1).to(torch.bfloat16)
+    assert head.bind_markov_head(w1, w2)
+    cases = ((1, 1), (1, 7), (2, 6), (3, 7), (4, 7), (8, 7), (9, 5), (16, 7), (16, 16), (5, 16))
+    for _ in range(2):
+        for num_reqs, block in cases:
+            full = (torch.randn(num_reqs, block, vocab, device="cuda", generator=gen) * 3).to(
+                torch.bfloat16
+            )
+            anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+            if num_reqs > 1:
+                anchors[0] = -1  # out-of-vocab anchors: zero bias
+            if num_reqs > 2:
+                anchors[-1] = vocab
+            local = _shard(full, rank)
+            v3 = head.markov_tokens(local, anchors, w1, w2)
+            _assert_markov_near_ties(full, anchors, w1, w2, v3, atol=0.05)
+            v3_32 = head.markov_tokens(local, anchors.to(torch.int32), w1, w2)
+            assert torch.equal(v3_32, v3), (num_reqs, block)
+    # The rank's state holds the next launch's set, not a launch count that wraps.
+    from tensorrt_llm._torch.kernels.blackwell.dspark_markov_greedy import NUM_SETS
+
+    state = head._exchange.markov_exchange()[2]
+    assert int(state[0]) == (2 * 2 * len(cases)) % NUM_SETS
+    gathered = MPI.COMM_WORLD.allgather(v3.cpu())
+    assert all(torch.equal(g, gathered[0]) for g in gathered)
+    # Zero bias: exact against the reference, with cross-shard ties, a NaN
+    # row (the lowest NaN index wins) and an all -inf row (index 0).
+    full = torch.randint(0, 3, (16, 6, vocab), device="cuda", generator=gen).to(torch.bfloat16)
+    full[2, 1, vocab - 1] = float("nan")
+    full[2, 1, SHARD + 5] = float("nan")
+    full[3, 0] = -float("inf")
+    full[4, 2] = 0.0
+    full[4, 2, vocab - 1] = 2.0
+    full[4, 2, 1] = 2.0
+    anchors = torch.randint(0, vocab, (16,), device="cuda", generator=gen)
+    zero_w2 = torch.zeros_like(w2)
+    assert torch.equal(
+        head.markov_tokens(_shard(full, rank), anchors, w1, zero_w2),
+        _markov_reference(full, anchors, w1, zero_w2),
+    )
+    # CUDA graph replay: several launches of different widths per replay.
+    cases = []
+    for num_reqs in (2, 11, 2):
+        full = (torch.randn(num_reqs, 7, vocab, device="cuda", generator=gen) * 3).to(
+            torch.bfloat16
+        )
+        local = _shard(full, rank)
+        anchors = torch.randint(0, vocab, (num_reqs,), device="cuda", generator=gen)
+        cases.append((local, anchors, head.markov_tokens(local, anchors, w1, w2)))
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outs = [head.markov_tokens(local, anchors, w1, w2) for local, anchors, _ in cases]
+    for _ in range(5):
+        graph.replay()
+        torch.cuda.synchronize()
+        for out, (_, _, expected) in zip(outs, cases):
+            assert torch.equal(out, expected)
+    # Rank 16 needs two k-steps per ldmatrix load: not served.
+    w1_16 = w1[:, :16].contiguous()
+    assert not head.bind_markov_head(w1_16, w1_16)
+
+
 @torch.inference_mode()
 def _worker_accept_check(rank, tp, mnnvl):
     """Strict acceptance on shard logits equals acceptance on gathered logits."""
@@ -341,6 +433,19 @@ def test_vocab_parallel_selection_tp2(check, mnnvl, mpi_pool_executor):
 def test_vocab_parallel_selection_tp4(check, mnnvl, mpi_pool_executor):
     tp = mpi_pool_executor.num_workers
     results = mpi_pool_executor.map(_run, *zip(*[(_CHECKS[check], tp, mnnvl)] * tp))
+    assert all(results)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs")
+@pytest.mark.skipif(
+    torch.cuda.device_count() == 0 or torch.cuda.get_device_capability()[0] != 10,
+    reason="the CuTe DSL Markov chain needs an SM100-family GPU",
+)
+@pytest.mark.parametrize("mnnvl", [_MNNVL])
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_vocab_parallel_markov_v3(mnnvl, mpi_pool_executor):
+    tp = mpi_pool_executor.num_workers
+    results = mpi_pool_executor.map(_run, *zip(*[(_markov_v3_check, tp, mnnvl)] * tp))
     assert all(results)
 
 

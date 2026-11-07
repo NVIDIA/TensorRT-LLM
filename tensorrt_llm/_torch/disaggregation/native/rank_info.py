@@ -22,6 +22,7 @@ from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBufferMeta
 from tensorrt_llm._torch.disaggregation.native.mixers.attention.spec import AttentionInfo
 from tensorrt_llm._torch.disaggregation.resource.kv_extractor import build_page_table_from_manager
 from tensorrt_llm._torch.disaggregation.resource.page import KVCachePageTable
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import get_size_in_bytes
 
@@ -94,6 +95,11 @@ class RankInfo:
             if bytes_for_eight_elements % 8 == 0
             else bytes_for_eight_elements / 8
         )
+        # Explicit draft layers (layer specs) ride the target's pages and
+        # requests; folded MTP/Eagle layers travel as ordinary layers.
+        shares_draft_layers = (
+            isinstance(kvm, KVCacheManagerV2) and kvm.get_draft_kv_cache_view() is kvm
+        )
         return cls(
             instance_name=instance_name,
             instance_rank=m.rank,
@@ -121,9 +127,7 @@ class RankInfo:
             aux_meta=aux_buffer_meta,
             page_table=build_page_table_from_manager(kvm),
             bounded_replay_on_generation=getattr(kvm, "bounded_replay_on_generation", False),
-            num_draft_layers=(
-                len(kvm.draft_layer_ids) if getattr(kvm, "layer_specs", None) is not None else 0
-            ),
+            num_draft_layers=len(kvm.draft_layer_ids) if shares_draft_layers else 0,
         )
 
     @classmethod

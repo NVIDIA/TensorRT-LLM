@@ -85,6 +85,7 @@ def _mixed_metadata(num_ctx_tokens: int, num_decodes: int) -> SimpleNamespace:
         kda_chunk_indices=torch.tensor([[0, 0]], device=device, dtype=torch.long),
         kda_varlen_is_aligned=num_ctx_tokens % 64 == 0,
         kda_single_sequence_length=num_ctx_tokens,
+        kda_inforward_snapshot=None,
         _arange_buffer=torch.arange(batch + 1, dtype=torch.int32, device=device),
     )
     return SimpleNamespace(

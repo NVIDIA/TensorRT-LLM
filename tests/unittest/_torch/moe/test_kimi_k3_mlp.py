@@ -250,8 +250,12 @@ def test_kimi_k3_shared_expert_parallel_construction(
     from tensorrt_llm.models.modeling_utils import QuantConfig
 
     class _FakeAllReduce(nn.Module):
-        def __init__(self, *args, **kwargs):
+        def __init__(self, mapping=None, *args, **kwargs):
             super().__init__()
+            self.mapping = mapping
+
+        def mnnvl_runs_fusion(self, fusion_op, hidden_size):
+            return False
 
     class _FakeMoE(ConfigurableMoE):
         def __init__(self, sm_reserve_ceiling: int = 0):
@@ -288,6 +292,8 @@ def test_kimi_k3_shared_expert_parallel_construction(
         tp_size=tp_size,
         enable_attention_dp=attention_dp,
     )
+    # The column-parallel tail reads the routed all-reduce's group at construction.
+    fake_moe.all_reduce.mapping = mapping
     model_config = ModelConfig(
         mapping=mapping,
         quant_config=QuantConfig(),
@@ -352,6 +358,68 @@ def test_kimi_k3_shared_expert_parallel_construction(
         fake_moe.routes_with_sort_tables = lambda num_tokens: True
         plan = runtime._front_plan(128)
         assert plan.shared_first is (expected_shared_sms == 0)
+
+
+@pytest.mark.parametrize("min_latency", [False, True], ids=["default", "min_latency"])
+def test_kimi_k3_min_latency_kernels_follow_enable_min_latency(monkeypatch, min_latency):
+    """The lossy few-row MoE tail and persistent shared expert are prepared only under
+    ``enable_min_latency``, read once at construction."""
+    from tensorrt_llm._torch import distributed
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.moe.fused_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.interface import MoESchedulerKind
+    from tensorrt_llm.mapping import Mapping
+    from tensorrt_llm.models.modeling_utils import QuantConfig
+
+    class _FakeAllReduce(nn.Module):
+        def __init__(self, mapping=None, *args, **kwargs):
+            super().__init__()
+            self.mapping = mapping
+
+        def mnnvl_runs_fusion(self, fusion_op, hidden_size):
+            return False
+
+    class _FakeMoE(ConfigurableMoE):
+        def __init__(self):
+            nn.Module.__init__(self)
+            self.backend = SimpleNamespace(
+                initial_local_expert_ids=[0, 1, 2, 3],
+                scheduler_kind=MoESchedulerKind.EXTERNAL_COMM,
+            )
+            self.comm = None
+            self.layer_load_balancer = None
+            self.all_reduce = _FakeAllReduce()
+
+    fake_moe = _FakeMoE()
+    monkeypatch.setenv("KIMI_K3_ROUTER_BF16", "0")
+    monkeypatch.setattr(modeling_kimi_linear, "create_moe", lambda **kwargs: fake_moe)
+    monkeypatch.setattr(distributed, "AllReduce", _FakeAllReduce)
+    monkeypatch.setattr(torch.cuda, "Event", lambda: object())
+    mapping = Mapping(world_size=4, rank=0, tp_size=4)
+    fake_moe.all_reduce.mapping = mapping
+    model_config = ModelConfig(
+        mapping=mapping,
+        quant_config=QuantConfig(),
+        moe_backend="CUTLASS",
+        enable_min_latency=min_latency,
+    )
+    runtime = modeling_kimi_linear.KimiK3MoERuntime(
+        model_config, _runtime_config(), layer_idx=1, aux_stream_dict=_make_aux_stream_dict()
+    )
+    assert runtime.latent_up_rows is not None
+    # The column-parallel tail needs the MNNVL all-reduces this stand-in does not have.
+    runtime._column_parallel_tail_supported = True
+
+    # Past the gate the preparation reads the shared expert's BF16 weights; stop it there.
+    prepared = []
+    monkeypatch.setattr(modeling_kimi_linear, "SituAndMul", nn.Module)
+    monkeypatch.setattr(
+        modeling_kimi_linear, "_bf16_weight", lambda linear: prepared.append(linear) or None
+    )
+    runtime._prepare_min_latency_tail()
+    assert bool(prepared) is min_latency
+    assert runtime._moe_tail_wexp is None and runtime._shared_frags is None
 
 
 @pytest.mark.cpu_only
@@ -452,6 +520,18 @@ def test_kimi_k3_shared_allreduce_ordering(
             return self.down_proj.all_reduce(partial)
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
     runtime.routed_experts = routed_experts
@@ -509,6 +589,143 @@ def test_kimi_k3_shared_allreduce_ordering(
         elif defer:
             assert calls.index(("routed_moe", "main")) < allreduce
         torch.testing.assert_close(output, torch.full((2, 4), 10.0))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_tokens", [2, 165], ids=["own_workspace", "shared_workspace"])
+def test_kimi_k3_latent_all_reduce_own_workspace_before_shared_join(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    """The routed latent all-reduce runs on its own MNNVL workspace where that is one-shot (up to
+    164 rows of the 3584-wide latent at 8 ranks), issued with latent_up before the main stream
+    joins the shared expert's stream; above that it runs after the join on the routed experts'
+    all-reduce."""
+    from tensorrt_llm._torch.models import modeling_kimi_linear
+    from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+
+    calls = []
+    current_stream = "main"
+    aux_stream = object()
+
+    class _Event:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def record(self) -> None:
+            calls.append((f"{self.name}_record", current_stream))
+
+        def wait(self) -> None:
+            calls.append((f"{self.name}_wait", current_stream))
+
+    @contextmanager
+    def use_stream(stream: object) -> Iterator[None]:
+        nonlocal current_stream
+        assert stream is aux_stream
+        previous_stream, current_stream = current_stream, "aux"
+        try:
+            yield
+        finally:
+            current_stream = previous_stream
+
+    class _AllReduce:
+        def __init__(self, name: str, tp_size: int = 8) -> None:
+            self.name = name
+            self.mapping = SimpleNamespace(tp_size=tp_size)
+
+        def mnnvl_runs_one_shot(self, num_tokens: int, hidden_dim: int) -> bool:
+            limit = modeling_kimi_linear._LATENT_ALL_REDUCE_ONE_SHOT_MAX_ROWS
+            return num_tokens * self.mapping.tp_size <= limit
+
+        def __call__(self, value: torch.Tensor, all_reduce_params=None) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value
+
+    class _Routed:
+        all_reduce = _AllReduce("shared_ws_latent_ar")
+
+        def __call__(self, value: torch.Tensor, logits: torch.Tensor, **kwargs) -> torch.Tensor:
+            calls.append(("routed_moe", current_stream))
+            return value
+
+    class _Projection(nn.Module):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+            self.weight = torch.ones(4)
+            self.variance_epsilon = 1e-6
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            calls.append((self.name, current_stream))
+            return value
+
+    class _Shared(nn.Module):
+        def forward(self, value: torch.Tensor, final_all_reduce_params=None) -> torch.Tensor:
+            calls.append(("shared", current_stream))
+            return value
+
+    runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
+    nn.Module.__init__(runtime)
+    runtime.gate = SimpleNamespace(compute_logits=lambda value: value)
+    runtime.routed_experts = _Routed()
+    runtime.routed_expert_down_proj = _Projection("routed_down")
+    runtime.routed_expert_norm = _Projection("routed_norm")
+    runtime.routed_expert_up_proj = _Projection("routed_up")
+    runtime.shared_experts = _Shared()
+    runtime.moe_hidden_size = 3584
+    runtime._reduce_routed_output = True
+    runtime._defer_shared_allreduce = False
+    runtime._own_latent_all_reduce = _AllReduce("own_ws_latent_ar")
+    runtime.shared_expert_stream = aux_stream
+    runtime.moe_main_event = _Event("fork")
+    runtime.moe_shared_event = _Event("shared_done")
+    runtime.moe_routed_event = None
+    runtime.latent_down_stream = None
+    runtime.moe_latent_fork_event = None
+    runtime.moe_latent_ready_event = None
+
+    monkeypatch.setattr(torch.cuda, "stream", use_stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
+    monkeypatch.setattr(
+        modeling_kimi_linear, "maybe_execute_in_parallel_deferred_join", _deferred_join_stand_in
+    )
+
+    with with_multi_stream(True):
+        runtime(torch.ones(num_tokens, 4), return_parts=True)
+    join = calls.index(("shared_done_wait", "main"))
+    assert calls.index(("shared", "aux")) < calls.index(("shared_done_record", "aux"))
+    if num_tokens == 2:
+        assert ("shared_ws_latent_ar", "main") not in calls
+        assert calls.index(("own_ws_latent_ar", "main")) < calls.index(("routed_up", "main")) < join
+    else:
+        assert ("own_ws_latent_ar", "main") not in calls
+        assert (
+            join < calls.index(("shared_ws_latent_ar", "main")) < calls.index(("routed_up", "main"))
+        )
+
+
+def _deferred_join_stand_in(fn0, fn1, event0, event1, aux_stream, disable_on_compile=False):
+    """``maybe_execute_in_parallel_deferred_join`` on the stand-in events and streams."""
+    event0.record()
+    result0 = fn0()
+    with torch.cuda.stream(aux_stream):
+        event0.wait()
+        result1 = fn1()
+        event1.record()
+    return result0, result1, event1
 
 
 @pytest.mark.cpu_only
@@ -591,6 +808,18 @@ def test_kimi_k3_latent_down_projection_overlaps_routing(
         return value
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(compute_logits=compute_logits)
     runtime.routed_experts = _RoutedExperts()
@@ -918,6 +1147,18 @@ def test_kimi_k3_router_down_fusion_gate(
             self.bias = None
 
     runtime = modeling_kimi_linear.KimiK3MoERuntime.__new__(modeling_kimi_linear.KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     nn.Module.__init__(runtime)
     runtime.gate = SimpleNamespace(
         weight=torch.empty(num_experts, hidden_size, device=device, dtype=torch.bfloat16)

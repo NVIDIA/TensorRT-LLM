@@ -24,7 +24,7 @@ from tensorrt_llm._torch.models.modeling_dflash import (
 )
 from tensorrt_llm._torch.models.modeling_dspark import GQADSparkForCausalLM
 from tensorrt_llm._torch.speculative.dflash_attention import (
-    DFLASH_CONTEXT_LOWERING,
+    DFLASH_FOLDED_DECODE_LOWERING,
     validate_dflash_trtllm_gen_runtime,
 )
 
@@ -106,6 +106,53 @@ def test_merge_matches_the_non_causal_oracle(block_size, window, heads):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("causal", [False, True])
+def test_windowed_decode_and_merge_use_cache_precision(cache_dtype, causal):
+    """Check the decode boundary and future-block merge against rounded cache values."""
+    torch.manual_seed(17)
+    batch, block_size, num_heads, num_kv_heads, head_dim = 2, 3, 4, 2, 8
+    query = torch.randn(batch, block_size, num_heads, head_dim, dtype=torch.bfloat16)
+    block_key = torch.randn(batch, block_size, num_kv_heads, head_dim, dtype=torch.bfloat16)
+    block_value = torch.randn_like(block_key)
+    keys = block_key.to(cache_dtype).float().unbind()
+    values = block_value.to(cache_dtype).float().unbind()
+    context_lengths = [0] * batch
+    causal_out, causal_lse = _oracle(query, keys, values, context_lengths, 1, 0, causal=True)
+    expected, _ = _oracle(query, keys, values, context_lengths, 1, 1, causal=causal)
+    cache = torch.empty(1, 2, num_kv_heads, 4, head_dim, dtype=cache_dtype)
+    out = torch.empty_like(causal_out)
+
+    def decode(**kwargs):
+        assert kwargs["query"].dtype == query.dtype
+        assert kwargs["kv_cache"][0].dtype == cache_dtype
+        torch.testing.assert_close(
+            kwargs["query"].float(), query.float().reshape_as(kwargs["query"])
+        )
+        kwargs["out"].copy_(causal_out)
+        if kwargs["return_lse"]:
+            return kwargs["out"], causal_lse / math.log(2.0)
+        return kwargs["out"]
+
+    dflash_trtllm_windowed_block_attention(
+        SimpleNamespace(batch_decode_with_kv_cache=decode),
+        query,
+        block_key,
+        block_value,
+        cache,
+        torch.zeros(batch, 1, dtype=torch.int32),
+        torch.full((batch,), block_size, dtype=torch.int32),
+        4,
+        causal,
+        (1, 0 if causal else 1),
+        torch.empty(0),
+        torch.empty(0),
+        out,
+    )
+    torch.testing.assert_close(out, expected, atol=1e-5, rtol=1e-5)
+
+
 def _wrapper(cls, config, layer_windows=(), backend="TRTLLM"):
     wrapper = cls.__new__(cls)
     torch.nn.Module.__init__(wrapper)
@@ -143,7 +190,7 @@ def test_dspark_unwindowed_layers_stay_non_causal():
     config = SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2)
     wrapper = _wrapper(GQADSparkForCausalLM, config)
     assert wrapper._resolve_block_attention(0) == (False, (-1, -1))
-    assert wrapper.validate_block_attention_windows() == ["non-causal context"] * 2
+    assert wrapper.validate_block_attention_windows() == ["non-causal folded decode"] * 2
 
 
 @pytest.mark.cpu_only
@@ -182,25 +229,22 @@ def test_dspark_causal_metadata_applies_to_a_use_swa_only_window(metadata):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("head_dim", [72, 80, 96])
-def test_windowed_layers_are_not_held_to_the_context_kernel_head_sizes(head_dim):
-    """Regression: a windowed non-causal layer is lowered to the block decode,
-    so the context kernel's head-size limits must not reject it; an unwindowed
-    non-causal layer still is."""
+def test_decode_layers_are_not_held_to_context_kernel_head_sizes(head_dim: int) -> None:
+    """Windowed and folded non-causal layers both use the decode kernel."""
     windowed = _wrapper(GQADSparkForCausalLM, _minimax_like_config(num_layers=2, window=512))
     lowerings = windowed.validate_block_attention_windows()
-    assert DFLASH_CONTEXT_LOWERING not in lowerings
+    assert DFLASH_FOLDED_DECODE_LOWERING not in lowerings
     unwindowed = _wrapper(
         GQADSparkForCausalLM,
         SimpleNamespace(num_hidden_layers=2, layer_types=["full_attention"] * 2),
     )
-    assert DFLASH_CONTEXT_LOWERING in unwindowed.validate_block_attention_windows()
+    assert DFLASH_FOLDED_DECODE_LOWERING in unwindowed.validate_block_attention_windows()
     shape = dict(
         dtype=torch.bfloat16, num_heads=16, num_kv_heads=2, head_dim=head_dim, tokens_per_block=32
     )
     with patch("tensorrt_llm._torch.speculative.dflash_attention.get_dflash_trtllm_gen_ops"):
-        validate_dflash_trtllm_gen_runtime(
-            **shape, has_context_attention=DFLASH_CONTEXT_LOWERING in lowerings
-        )
+        validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=False)
+        validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=False)
         with pytest.raises(RuntimeError, match="head dimension"):
             validate_dflash_trtllm_gen_runtime(**shape, has_context_attention=True)
 
@@ -424,3 +468,88 @@ def test_trtllm_windowed_non_causal_replays_under_cuda_graph():
     graph.replay()
     expected, _ = _oracle(case.query, case.keys, case.values, new_ctx, 4095, 4095, causal=False)
     torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.cpu_only
+def test_windowed_decode_preserves_query_precision() -> None:
+    query = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+    block_kv = torch.randn(1, 2, 1, 8, dtype=torch.bfloat16)
+    cache = torch.empty(1, 2, 1, 16, 8, dtype=torch.float8_e4m3fn)
+    out = torch.empty(2, 4, 8, dtype=torch.bfloat16)
+    seen = []
+
+    def decode(**kwargs):
+        seen.append(kwargs["query"])
+        kwargs["out"].zero_()
+        return kwargs["out"]
+
+    dflash_trtllm_windowed_block_attention(
+        SimpleNamespace(batch_decode_with_kv_cache=decode),
+        query,
+        block_kv,
+        block_kv,
+        cache,
+        torch.zeros(1, 1, dtype=torch.int32),
+        torch.tensor([2], dtype=torch.int32),
+        16,
+        True,
+        (7, 0),
+        torch.empty(0),
+        torch.empty(0),
+        out,
+    )
+    assert seen[0].dtype == torch.bfloat16
+    torch.testing.assert_close(seen[0], query.reshape_as(seen[0]))
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("backend", ["TRTLLM", "FA4"])
+@pytest.mark.parametrize("cache_as_list", [False, True])
+@pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float16, torch.float8_e4m3fn])
+def test_dflash_paged_cache_dtype_is_validated_before_allocation(
+    backend, cache_as_list, cache_dtype
+):
+    from tensorrt_llm._torch.models.modeling_dflash import DFlashForCausalLM
+
+    class ReachedAllocation(Exception):
+        pass
+
+    def allocation_boundary(*args, **kwargs):
+        raise ReachedAllocation
+
+    wrapper = DFlashForCausalLM.__new__(DFlashForCausalLM)
+    torch.nn.Module.__init__(wrapper)
+    wrapper.dflash_attention_backend = backend
+    wrapper._dflash_trtllm_gen_ops = None
+    wrapper._dflash_fa4_fwd = None
+    wrapper._dflash_paged_append = None
+    wrapper._fused_kv_weight = object()
+    wrapper._has_qk_norm = False
+    wrapper._use_fused_qk_norm_rope = False
+    wrapper.model = SimpleNamespace(
+        layers=[
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    q_size=32, kv_size=8, head_dim=8, num_heads=4, num_key_value_heads=1
+                )
+            )
+        ]
+    )
+    wrapper._get_rope_cos_sin = lambda *args, **kwargs: (torch.empty(0), torch.empty(0))
+    wrapper._prepare_dflash_trtllm_gen_buffers = allocation_boundary
+    wrapper._prepare_dflash_index_buffers = allocation_boundary
+    layer_cache = torch.empty(1, 2, 1, 16, 8, dtype=cache_dtype)
+    cache = [layer_cache] if cache_as_list else layer_cache.unsqueeze(0)
+    expected = ReachedAllocation if cache_dtype == torch.bfloat16 else ValueError
+    match = None if cache_dtype == torch.bfloat16 else "draft activation dtype"
+    with pytest.raises(expected, match=match):
+        wrapper.dflash_forward(
+            noise_embedding=torch.zeros(1, 2, 32, dtype=torch.bfloat16),
+            query_positions=torch.tensor([[0, 1]]),
+            num_ctx_per_req=torch.tensor([0]),
+            ctx_k_cache=torch.empty(0),
+            ctx_v_cache=torch.empty(0),
+            ctx_cache_batch_idx=torch.tensor([0]),
+            ctx_kv_cache=cache,
+            ctx_page_table=torch.zeros(1, 1, dtype=torch.int32),
+        )

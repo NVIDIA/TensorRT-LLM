@@ -30,18 +30,20 @@ from typing import Any, ClassVar
 
 import torch
 
-from ...._utils import is_blackwell_datacenter
-from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from ...._utils import get_sm_version, is_blackwell_datacenter
+from ...cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE, IS_CUTLASS_DSL_RUBIN_AVAILABLE
 
 
 def is_supported() -> bool:
     """Whether the kernels run on the current device: SM 10.0 / 10.3 (B200 / GB200 / B300 / GB300) with the
-    CuTe DSL installed.
+    CuTe DSL installed, or SM 10.7 (Rubin) with a CuTe DSL that targets it.
 
     The kernels are plain SIMT code (thread and block indices, global loads and stores), with nothing specific to an
     architecture; other architectures keep the torch path.
     """
-    return IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available() and is_blackwell_datacenter()
+    if not (IS_CUTLASS_DSL_AVAILABLE and torch.cuda.is_available()):
+        return False
+    return is_blackwell_datacenter() or (get_sm_version() == 107 and IS_CUTLASS_DSL_RUBIN_AVAILABLE)
 
 
 def _is_i32(t: torch.Tensor) -> bool:

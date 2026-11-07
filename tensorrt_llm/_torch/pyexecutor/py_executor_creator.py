@@ -1477,7 +1477,10 @@ def _create_py_executor(
             py_executor.shutdown()
             raise
 
-    _adjust_torch_mem_fraction()
+    if dwdp_manager is not None:
+        _adjust_torch_mem_fraction(DwdpManager.DRIVER_MEMORY_RESERVE)
+    else:
+        _adjust_torch_mem_fraction()
 
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
