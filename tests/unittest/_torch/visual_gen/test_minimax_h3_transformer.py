@@ -1580,6 +1580,8 @@ def test_prefix_backend_rejects_interior_padding(backend: str) -> None:
         assert FA4_AVAILABLE
     config = _make_model_config(num_layers=1, num_refiner_layers=1, attention_head_dim=128)
     config.attention = AttentionConfig(backend=backend)
+    if backend == "TRTLLM":
+        config.attention_metadata_state = create_attention_metadata_state()
     model = h3.MiniMaxH3Transformer3DModel(config).to("cuda").eval()
     _initialize_weights(model)
     inputs = _model_inputs("cuda")
