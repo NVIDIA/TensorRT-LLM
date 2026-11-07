@@ -109,6 +109,7 @@ class MetricsCollector:
             trtllm_avg_decoded_tokens_per_iter
             trtllm_spec_decode_num_draft_tokens_total
             trtllm_spec_decode_num_accepted_tokens_total
+            trtllm_spec_decode_num_drafts_total
             trtllm_spec_decode_acceptance_length
             trtllm_spec_decode_draft_overhead
             trtllm_prefill_batch_occupancy
@@ -168,6 +169,31 @@ class MetricsCollector:
         registry: "Optional[CollectorRegistry]" = None,
         gauge_multiprocess_mode: str = "all",
     ) -> None:
+        """Register request and iteration metrics for one serving label set.
+
+        Args:
+            labels: Metadata attached to every metric produced by this collector.
+            e2e_request_latency_buckets: End-to-end latency upper bounds in seconds.
+                None selects the default buckets.
+            time_to_first_token_buckets: First-token latency upper bounds in seconds.
+                None selects the default buckets.
+            time_per_output_token_buckets: Per-token latency upper bounds in seconds.
+                None selects the default buckets.
+            request_queue_time_buckets: Queue-time upper bounds in seconds.
+                None selects the default buckets.
+            request_prefill_time_buckets: Prefill-time upper bounds in seconds.
+                None selects the default buckets.
+            request_decode_time_buckets: Decode-time upper bounds in seconds.
+                None selects the default buckets.
+            request_inference_time_buckets: Inference-time upper bounds in seconds.
+                None selects the default buckets.
+            registry: Destination registry, or None for the default registry.
+            gauge_multiprocess_mode: Prometheus multiprocess aggregation mode
+                applied to gauges.
+
+        Raises:
+            ValueError: A supplied bucket list is empty or not strictly increasing.
+        """
         from prometheus_client import REGISTRY, Counter, Gauge, Histogram
         self._registry = REGISTRY if registry is None else registry
         self._gauge_multiprocess_mode = gauge_multiprocess_mode
@@ -475,11 +501,21 @@ class MetricsCollector:
             name=self.metric_prefix + "spec_decode_num_draft_tokens_total",
             documentation="Total number of draft tokens in speculative decoding",
             labelnames=self.labels.keys())
+        self.counter_spec_decode_num_draft_tokens.labels(**self.labels)
         self.counter_spec_decode_num_accepted_tokens = Counter(
             name=self.metric_prefix + "spec_decode_num_accepted_tokens_total",
             documentation=
             "Total number of accepted tokens in speculative decoding",
             labelnames=self.labels.keys())
+        self.counter_spec_decode_num_accepted_tokens.labels(**self.labels)
+        self.counter_spec_decode_num_drafts = Counter(
+            name=self.metric_prefix + "spec_decode_num_drafts_total",
+            documentation=(
+                "Total request verification rounds with draft tokens. "
+                "Use with spec_decode_num_accepted_tokens_total to compute "
+                "mean acceptance length: 1 + accepted / rounds."),
+            labelnames=self.labels.keys())
+        self.counter_spec_decode_num_drafts.labels(**self.labels)
         self.spec_decode_acceptance_length = Gauge(
             name=self.metric_prefix + "spec_decode_acceptance_length",
             documentation="Acceptance length in speculative decoding",
@@ -1031,6 +1067,10 @@ class MetricsCollector:
 
         # Speculative decoding stats are copied from rank 0 by ADP fanout.
         if spec_stats := iteration_stats.get("specDecodingStats"):
+            rounds = spec_stats.get("numRequestsWithDraftTokens", 0)
+            if rounds > 0:
+                self._log_counter(self.counter_spec_decode_num_drafts, {},
+                                  rounds)
             if "numDraftTokens" in spec_stats:
                 draft_tokens = spec_stats["numDraftTokens"]
                 if draft_tokens > 0:
