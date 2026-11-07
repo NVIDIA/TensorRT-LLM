@@ -124,6 +124,12 @@ def _write_qwen35_dense_vl_config(tmp_path: Path, **extra_config) -> Path:
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("language_model_only", [False, True])
 def test_qwen35_dense_fp8_mlp_exclusions(tmp_path: Path, language_model_only: bool) -> None:
+    """Normalize dense FP8 MLP exclusions idempotently in both checkpoint loader modes.
+
+    Args:
+        tmp_path: Directory for the synthetic checkpoint configuration.
+        language_model_only: Whether to load only the checkpoint's text model.
+    """
     config_path = _write_qwen35_dense_vl_config(
         tmp_path,
         language_model_only=language_model_only,

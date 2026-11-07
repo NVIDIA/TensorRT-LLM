@@ -162,6 +162,12 @@ def test_composite_config_preserves_vision_without_remote_code(tmp_path) -> None
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("language_model_only", [False, True])
 def test_fp8_config_preserves_mtp_exclusions(tmp_path: Path, language_model_only: bool) -> None:
+    """Preserve layer and top-level MTP exclusions in both checkpoint loader modes.
+
+    Args:
+        tmp_path: Directory for the synthetic checkpoint configuration.
+        language_model_only: Whether to load only the checkpoint's text model.
+    """
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_qwen3_5 import _normalize_qwen35_exclude_modules
     from tensorrt_llm.quantization.mode import QuantAlgo
