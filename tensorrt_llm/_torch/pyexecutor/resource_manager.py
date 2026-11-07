@@ -231,6 +231,15 @@ class BaseResourceManager(ABC):
         """
         return None
 
+    def get_request_kv_page_index_budget(
+            self, request: LlmRequest) -> Optional[Tuple[int, int]]:
+        """Return per-beam logical index demand and fixed row capacity.
+
+        This is independent of physical KV allocation and its cost model.
+        ``None`` leaves validation to managers with another index layout.
+        """
+        return None
+
     def kv_block_budget_applies(self) -> bool:
         """Whether ``get_request_kv_block_budget`` reports a budget at all.
 
@@ -3212,6 +3221,20 @@ class ResourceManager:
                     f"Resource manager {resource_type} does not provide a per-request KV block budget",
                     key=f"missing_kv_block_budget:{resource_type.value}",
                 )
+        return budgets
+
+    def get_request_kv_page_index_budgets(
+            self,
+            request: LlmRequest) -> List[Tuple[ResourceManagerType, int, int]]:
+        budgets = []
+        for resource_type in self._KV_BUDGET_RESOURCE_TYPES:
+            manager = self.get_resource_manager(resource_type)
+            if manager is None:
+                continue
+            budget = manager.get_request_kv_page_index_budget(request)
+            if budget is not None:
+                required, capacity = budget
+                budgets.append((resource_type, required, capacity))
         return budgets
 
     def get_unchecked_kv_block_budget_pools(self) -> List[ResourceManagerType]:

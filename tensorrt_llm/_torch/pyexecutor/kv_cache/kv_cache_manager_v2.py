@@ -1940,6 +1940,7 @@ class KVCacheManagerV2(BaseResourceManager):
         shared_draft_block_width: Optional[int] = None,
         **kwargs,
     ) -> None:
+        """Initialize rank-local cache pools, request mappings, and page tables."""
         self.mapping = mapping
         self.dtype = dtype
         self._declared_target_layer_count = num_layers
@@ -2660,12 +2661,12 @@ class KVCacheManagerV2(BaseResourceManager):
             # stay int.
             self.max_seq_len = int(max_num_tokens)
 
-        # Pad max_blocks_per_seq to next multiple of 4 (copy_block_offsets kernel).
         # Include the same maximum generation lead used by allocation and sizing.
         max_seq_capacity = self.max_seq_len + self._generation_kv_capacity_headroom
         self.max_blocks_per_seq = (
             max_seq_capacity + self._ledger_tokens_per_block - 1
         ) // self._ledger_tokens_per_block
+        # Pad to a multiple of four for the block-offset copy kernel.
         if self.max_blocks_per_seq % 4 != 0:
             self.max_blocks_per_seq = ((self.max_blocks_per_seq + 3) // 4) * 4
 
@@ -4826,6 +4827,82 @@ class KVCacheManagerV2(BaseResourceManager):
             clamped = min(clamped, self._gpu_max_tokens - extra_tokens)
         return clamped
 
+    def kv_block_budget_applies(self) -> bool:
+        """Whether this manager has the dense, full-attention admission cost model."""
+        return (
+            type(self) is KVCacheManagerV2
+            and self.kv_cache_type in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY)
+            and not self.is_draft
+            and not self.is_disagg
+            and not self.is_estimating_kv_cache
+            and self.mapping.cp_size == 1
+            and not self.kv_compression_manages_history
+            and self.sparse_metadata_batch is None
+            and self.mixed_precision_low_dtype is None
+            and all(window is None for window in self.max_attention_window_vec)
+        )
+
+    def get_request_kv_block_budget(self, request: LlmRequest) -> tuple[int, int] | None:
+        """Return beam-aware demand and permanent GPU capacity in ledger blocks.
+
+        Full prompt blocks are shared; the partial prompt block and generation
+        tail are private to each beam. Count every lifecycle sharing a physical
+        pool, and exclude permanent guard pages without counting live requests
+        against capacity. A busy pool is a scheduling failure, not an admission
+        failure.
+        """
+        if not self.kv_block_budget_applies():
+            return None
+
+        block_size = self._ledger_tokens_per_block
+        shared_blocks, prompt_tail = divmod(request.orig_prompt_len, block_size)
+        private_tokens = (
+            prompt_tail
+            + request.max_new_tokens
+            + self.num_extra_kv_tokens
+            + self._kv_reserve_draft_tokens
+        )
+        required = (
+            shared_blocks
+            + ((private_tokens + block_size - 1) // block_size) * request.py_beam_width
+        )
+
+        slots_per_block: dict[int, int] = defaultdict(int)
+        for pool_id in self.impl.get_life_cycle_pool_group_indices(GPU_LEVEL):
+            slots_per_block[int(pool_id)] += 1
+        stats = self._get_storage_statistics(GPU_LEVEL)
+        capacity = min(
+            (int(stats[pool_id].total) // count for pool_id, count in slots_per_block.items()),
+            default=0,
+        )
+        reserved_blocks = sum(
+            int(cache.num_blocks)
+            for request_id, cache in self.kv_cache_map.items()
+            if request_id in _RESERVED_REQUEST_IDS
+        )
+        return required, max(0, capacity - reserved_blocks)
+
+    def get_request_kv_page_index_budget(self, request: LlmRequest) -> tuple[int, int] | None:
+        """Bound absolute per-beam ledger indices independently of physical KV cost.
+
+        Windowed and mixed-precision caches can release physical pages while
+        retaining absolute logical block ordinals. Their fixed index rows must
+        still cover the requested sequence and the configured generation lead.
+        Managers that rebase context capacity must supply their own check.
+        """
+        if type(self).resize_context is not KVCacheManagerV2.resize_context:
+            return None
+        if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
+            return None
+        capacity = (
+            request.orig_prompt_len
+            + request.max_new_tokens
+            + self.num_extra_kv_tokens
+            + self._kv_reserve_draft_tokens
+        )
+        required = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
+        return required, self.max_blocks_per_seq
+
     def get_num_free_blocks(self) -> int:
         """Estimate warmup block capacity when only permanent reservations remain.
 
@@ -5509,7 +5586,12 @@ class KVCacheManagerV2(BaseResourceManager):
             else None
         )
         history = reservation.end if reservation is not None else None
-        success = (
+        # External page-index spans are fixed at construction. Refuse growth
+        # beyond their aligned ledger width before the native resize mutates KV.
+        required_blocks = (
+            capacity + self._ledger_tokens_per_block - 1
+        ) // self._ledger_tokens_per_block
+        success = required_blocks <= self.max_blocks_per_seq and (
             kv_cache.resize(capacity, history) if history is not None else kv_cache.resize(capacity)
         )
         if not success:

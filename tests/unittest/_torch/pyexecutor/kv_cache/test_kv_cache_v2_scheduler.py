@@ -26,10 +26,16 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    DataType,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp
+from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    CacheTypeCpp,
+    ResourceManager,
+    ResourceManagerType,
+)
 from tensorrt_llm._torch.pyexecutor.scheduler.prefix_wait_planner import (
     MAX_WAIT_PASSES,
     MIN_GAIN_BLOCKS,
@@ -42,6 +48,268 @@ from tensorrt_llm.llmapi.llm_args import (
 )
 
 pytestmark = pytest.mark.cpu_only
+
+
+def make_dense_budget_manager() -> KVCacheManagerV2:
+    """Construct a dense manager with eight physical blocks and no free pages."""
+    manager = object.__new__(KVCacheManagerV2)
+    manager.mapping = SimpleNamespace(cp_size=1)
+    manager.kv_cache_type = CacheTypeCpp.SELF
+    manager.is_draft = False
+    manager.is_disagg = False
+    manager.is_estimating_kv_cache = False
+    manager.kv_compression_manages_history = False
+    manager.sparse_metadata_batch = None
+    manager.mixed_precision_low_dtype = None
+    manager.max_attention_window_vec = [None]
+    manager._ledger_tokens_per_block = 32
+    manager.max_blocks_per_seq = 8
+    manager.num_extra_kv_tokens = 0
+    manager._kv_reserve_draft_tokens = 0
+    manager.impl = Mock()
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0]
+    manager._get_storage_statistics = Mock(return_value=[SimpleNamespace(total=8, available=0)])
+    manager.kv_cache_map = {}
+    return manager
+
+
+@pytest.mark.parametrize(
+    "prompt,new_tokens,beams,extra,reserve,required",
+    [
+        (224, 32, 1, 0, 0, 8),
+        (225, 32, 1, 0, 0, 9),
+        (32, 1, 2, 0, 0, 3),
+        (31, 1, 2, 0, 0, 2),
+        (33, 32, 2, 0, 0, 5),
+        (29, 2, 1, 0, 0, 1),
+        (29, 2, 1, 1, 1, 2),
+    ],
+)
+def test_dense_v2_admission_accounts_for_shared_beams_and_reserves(
+    prompt: int, new_tokens: int, beams: int, extra: int, reserve: int, required: int
+) -> None:
+    manager = make_dense_budget_manager()
+    manager.num_extra_kv_tokens = extra
+    manager._kv_reserve_draft_tokens = reserve
+    # Live requests may consume all pages without changing permanent feasibility.
+    manager.kv_cache_map[42] = Mock(num_blocks=8)
+    request = SimpleNamespace(
+        orig_prompt_len=prompt, max_new_tokens=new_tokens, py_beam_width=beams
+    )
+    assert manager.get_request_kv_block_budget(request) == (required, 8)
+
+
+def test_dense_v2_admission_counts_shared_pool_lifecycles_and_guard() -> None:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import _GUARD_PAGE_REQUEST_ID
+
+    manager = make_dense_budget_manager()
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0, 0, 1]
+    manager._get_storage_statistics.return_value = [
+        SimpleNamespace(total=18, available=0),
+        SimpleNamespace(total=8, available=0),
+    ]
+    manager.kv_cache_map[_GUARD_PAGE_REQUEST_ID] = Mock(num_blocks=1)
+    request = SimpleNamespace(orig_prompt_len=224, max_new_tokens=1, py_beam_width=1)
+    assert manager.get_request_kv_block_budget(request) == (8, 7)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("kv_cache_type", CacheTypeCpp.CROSS),
+        ("is_draft", True),
+        ("is_disagg", True),
+        ("is_estimating_kv_cache", True),
+        ("mapping", SimpleNamespace(cp_size=2)),
+        ("kv_compression_manages_history", True),
+        ("sparse_metadata_batch", object()),
+        ("mixed_precision_low_dtype", DataType.NVFP4),
+        ("max_attention_window_vec", [64]),
+    ],
+)
+def test_dense_v2_admission_does_not_estimate_other_cost_models(field: str, value: object) -> None:
+    manager = make_dense_budget_manager()
+    setattr(manager, field, value)
+    assert not manager.kv_block_budget_applies()
+    assert manager.get_request_kv_block_budget(Mock()) is None
+    manager._get_storage_statistics.assert_not_called()
+
+
+def test_dense_v2_admission_does_not_charge_full_history_to_mixed_precision() -> None:
+    manager = make_dense_budget_manager()
+    manager.mixed_precision_low_dtype = DataType.NVFP4
+    manager.mixed_precision_high_layers = {0: 1}
+    manager.first_n, manager.last_n = 0, 31
+    # The appended high layer retains a window but is absent from this vector.
+    assert manager.max_attention_window_vec == [None]
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0, 1]
+    manager._get_storage_statistics.return_value = [
+        SimpleNamespace(total=32, available=32),
+        SimpleNamespace(total=2, available=2),
+    ]
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+        _validate_encoder_output_len=Mock(),
+    )
+    request = SimpleNamespace(orig_prompt_len=128, max_new_tokens=128, py_beam_width=1)
+    PyExecutor._validate_request_budget(executor, request)
+    manager._get_storage_statistics.assert_not_called()
+
+
+@pytest.mark.parametrize("first_chunk", [False, True])
+def test_dense_v2_resize_preserves_state_beyond_page_table_and_can_retry(first_chunk: bool) -> None:
+    manager = make_dense_budget_manager()
+    manager._has_cp_helix = False
+    manager.max_blocks_per_seq = 4
+    manager._connector_reservations_enabled = Mock(return_value=False)
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    cache = Mock(capacity=32, history_length=32)
+    cache.resize.return_value = True
+    manager.kv_cache_map[1] = cache
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_disagg_generation_init_state=False,
+        context_current_position=32,
+        is_first_context_chunk=first_chunk,
+    )
+    assert not manager.resize_context(request, 128)
+    cache.resize.assert_not_called()
+    assert (cache.capacity, cache.history_length) == (32, 32)
+    assert cache.suspend.call_count == int(first_chunk)
+    assert manager.resize_context(request, 32)
+    cache.resize.assert_called_once_with(64)
+
+
+@pytest.mark.parametrize("mode", ["disaggregated", "mixed_precision", "windowed", "cp"])
+@pytest.mark.parametrize("temporarily_full", [False, True])
+def test_page_index_admission_rejects_excluded_long_request_and_schedules_short(
+    mode: str, temporarily_full: bool
+) -> None:
+    manager = make_dense_budget_manager()
+    if mode == "disaggregated":
+        manager.is_disagg = True
+    elif mode == "mixed_precision":
+        manager.mixed_precision_low_dtype = DataType.NVFP4
+    elif mode == "windowed":
+        manager.max_attention_window_vec = [64]
+    else:
+        manager.mapping.cp_size = 2
+    assert not manager.kv_block_budget_applies()
+    long, short = make_ctx_request(1, 8192), make_ctx_request(2, 32)
+    for request in (long, short):
+        request.orig_prompt_len = request.prompt_len
+        request.max_new_tokens = 1
+        request.py_beam_width = 1
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+        _validate_encoder_output_len=Mock(),
+        _mm_encoder_item_scheduling_enabled=False,
+        _fetch_new_requests=Mock(return_value=[long, short]),
+        _handle_errors=Mock(),
+        waiting_queue=[],
+        active_requests=[],
+        is_shutdown=False,
+    )
+    executor._validate_request = lambda req: PyExecutor._validate_request_budget(executor, req)
+    accepted = PyExecutor._fetch_and_activate_new_requests(executor)
+    assert accepted == executor.active_requests == [short]
+    error = executor._handle_errors.call_args
+    assert "fixed page-index capacity of 8" in error.args[0]
+    assert error.kwargs == {"requests": [long], "charge_budget": False}
+    allocation_manager = make_kv_cache_manager(tokens_per_block=32)
+    allocation_manager.resize_context.side_effect = [False, True] if temporarily_full else [True]
+    scheduler = make_scheduler(allocation_manager, max_num_tokens=8192)
+    output = scheduler.schedule_request(accepted, set())
+    if temporarily_full:
+        assert output.context_requests == []
+        output = scheduler.schedule_request(accepted, set())
+    assert output.context_requests == [short]
+    assert scheduler._stalled_schedules == 0
+    assert not executor.is_shutdown
+    manager._get_storage_statistics.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "new_tokens,extra,reserve,required", [(223, 0, 0, 8), (224, 1, 0, 9), (223, 0, 1, 9)]
+)
+def test_page_index_budget_covers_generation_and_reserves_without_beam_multiplication(
+    new_tokens: int, extra: int, reserve: int, required: int
+) -> None:
+    manager = make_dense_budget_manager()
+    manager.num_extra_kv_tokens, manager._kv_reserve_draft_tokens = extra, reserve
+    manager.max_attention_window_vec = [64]
+    request = SimpleNamespace(orig_prompt_len=33, max_new_tokens=new_tokens, py_beam_width=4)
+    assert manager.get_request_kv_page_index_budget(request) == (required, 8)
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+        _validate_encoder_output_len=Mock(),
+    )
+    if required > 8:
+        with pytest.raises(ValueError, match="fixed page-index capacity"):
+            PyExecutor._validate_request_budget(executor, request)
+    else:
+        PyExecutor._validate_request_budget(executor, request)
+
+
+def test_page_index_budget_leaves_rebased_context_managers_to_their_own_check() -> None:
+    class RebasedManager(KVCacheManagerV2):
+        def resize_context(self, request, num_tokens):
+            return True
+
+    manager = object.__new__(RebasedManager)
+    assert manager.get_request_kv_page_index_budget(Mock()) is None
+
+
+def test_dense_v2_admission_requires_subclasses_to_opt_in() -> None:
+    class SpecializedManager(KVCacheManagerV2):
+        pass
+
+    manager = object.__new__(SpecializedManager)
+    assert not manager.kv_block_budget_applies()
+    assert manager.get_request_kv_block_budget(Mock()) is None
+
+
+@pytest.mark.parametrize("temporarily_full", [False, True])
+def test_never_fit_admission_fails_only_long_request_and_short_context_runs(
+    temporarily_full: bool,
+) -> None:
+    budget_manager = make_dense_budget_manager()
+    long = make_ctx_request(1, 8192)
+    short = make_ctx_request(2, 32)
+    for request in (long, short):
+        request.orig_prompt_len = request.prompt_len
+        request.max_new_tokens = 1
+        request.py_beam_width = 1
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: budget_manager}),
+        _validate_encoder_output_len=Mock(),
+        waiting_queue=[],
+        active_requests=[],
+        is_shutdown=False,
+        _mm_encoder_item_scheduling_enabled=False,
+        _fetch_new_requests=Mock(return_value=[long, short]),
+        _handle_errors=Mock(),
+    )
+    executor._validate_request = lambda req: PyExecutor._validate_request_budget(executor, req)
+    accepted = PyExecutor._fetch_and_activate_new_requests(executor)
+    assert accepted == executor.active_requests == [short]
+    executor._handle_errors.assert_called_once()
+    error = executor._handle_errors.call_args
+    assert "exceeds its GPU-primary capacity of 8 blocks" in error.args[0]
+    assert error.kwargs == {"requests": [long], "charge_budget": False}
+
+    manager = make_kv_cache_manager(tokens_per_block=32, has_cache_tier_below_gpu=False)
+    manager.resize_context.side_effect = [False, True] if temporarily_full else [True]
+    scheduler = make_scheduler(manager, max_num_tokens=8192, ctx_chunk_config=(None, 32))
+    output = scheduler.schedule_request(accepted, set())
+    if temporarily_full:
+        assert output.context_requests == []
+        output = scheduler.schedule_request(accepted, set())
+    assert output.context_requests == [short]
+    assert scheduler._stalled_schedules == 0
+    assert not executor.is_shutdown
+    assert all(call.args[0] is short for call in manager.resize_context.call_args_list)
 
 
 @pytest.mark.parametrize("active", [False, True])
