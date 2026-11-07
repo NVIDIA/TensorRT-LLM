@@ -561,7 +561,7 @@ class TestServingChatTemplateGather:
         """Stub what _create_input_tokens calls; capture the render kwargs."""
         import tensorrt_llm.serve.responses_utils as ru
 
-        async def fake_create_input_messages(request, prev_msgs):
+        async def fake_create_input_messages(request, prev_msgs, extension=None):
             return [{"role": "user", "content": "hi"}]
 
         async def fake_mm_coroutine():

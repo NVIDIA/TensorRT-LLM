@@ -3457,8 +3457,16 @@ class OpenAIServer(_VideoRoutesMixin):
                     "but not enforced; the model may still emit several tool "
                     "calls in one turn.",
                     key="responses_parallel_tool_calls_unenforced")
-            if not self.use_harmony and request.tool_choice not in ("auto",
-                                                                    "none"):
+            # "required" is enforced where the model's template renders it
+            # from the kwargs its serving extension derives; elsewhere the
+            # value is accepted and said once per process.
+            template_enforces_required = (
+                request.tool_choice == "required" and bool(request.tools)
+                and RenderResources.from_server(
+                    self).extension.required_tool_choice_mode() == "template")
+            if (not self.use_harmony
+                    and request.tool_choice not in ("auto", "none")
+                    and not template_enforces_required):
                 logger.warning_once(
                     "Responses API: 'tool_choice' values other than 'auto' "
                     "and 'none' are accepted but not enforced on this model "
