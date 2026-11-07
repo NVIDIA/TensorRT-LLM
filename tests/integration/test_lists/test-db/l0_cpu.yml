@@ -82,6 +82,7 @@ l0_cpu:
   # compute capability, no device. The default targets' shard tests: small CPU
   # tensors and the CPU block_scale_interleave. The rest of unittest/_torch/modeling_v2
   # needs a GPU.
+  - unittest/_torch/modeling_v2/models/beam/test_component_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
@@ -363,3 +364,6 @@ l0_cpu:
   - unittest/utils/test_confidential_compute.py
   - unittest/utils/test_llm_data.py
   - unittest/visual_gen/test_output.py
+
+  # Beam baseline diagnostic checks (no checkpoints or GPU).
+  - unittest/_torch/modeling_v2/models/beam/test_diagnostic_mode.py
