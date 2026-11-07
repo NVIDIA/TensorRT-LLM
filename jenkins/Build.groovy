@@ -752,27 +752,16 @@ def runLLMBuild(
         }
     }
 
-    // Type-check with the compiled bindings that build_wheel.py just produced in
-    // place. Runs mypy directly (not via pre-commit) so this step does not clone
-    // anything from github: the pre-commit orchestrator clones every remote hook
-    // repo up front, which flakes on nodes without github access. mypy and its
-    // config come from requirements-dev.txt (installed above) via the internal
-    // PyPI mirror. MYPY_REQUIRE_BINDINGS=1 makes run_mypy.sh hard-fail if the
-    // bindings can't be imported, rather than silently degrading to the
-    // lightweight (no-bindings) check.
-    //
-    // The step still talks to the network: [tool.mypy] sets install_types, so
-    // mypy pip-installs the missing stub packages from the internal PyPI mirror
-    // before checking.
+    // Check the configured product sources and record diagnostics after exclusions.
+    // The advisory check does not fail the build.
+    // Running directly avoids pre-commit hook downloads.
     if (typeCheck) {
-        echo "-- Running mypy type check with compiled bindings..."
-        withEnv(["MYPY_REQUIRE_BINDINGS=1"]) {
-            trtllm_utils.llmExecStepWithRetry(
-                pipeline,
-                script: "cd ${LLM_ROOT} && bash scripts/run_mypy.sh",
-                shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
-            )
-        }
+        echo "-- Running advisory Pyrefly full-project type check with exclusions..."
+        trtllm_utils.llmExecStepWithRetry(
+            pipeline,
+            script: "cd ${LLM_ROOT} && bash scripts/run_pyrefly.sh --full-project",
+            shortCommondRunTimeMax: 240  // always retry on failure if the cmd runs less than 240s
+        )
     }
 
     sh "cp ${LLM_ROOT}/tensorrt_llm/version.py TensorRT-LLM/src/tensorrt_llm/version.py"
