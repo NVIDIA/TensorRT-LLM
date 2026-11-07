@@ -17,6 +17,7 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
+import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -46,6 +47,7 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
 
+from .vae_decoder_fp8 import convert_decoder_linears_fp8
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -78,6 +80,31 @@ from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
+
+# Opt-in switches for the work outside the transformer steps.
+#   H3_L14_SCHED=1    schedule only, bit-identical: the per-step velocity check is reduced on
+#                     device and read back once after the loop, the per-step row-timestep plan
+#                     moves to the device in one transfer, and the audio decode runs on a side
+#                     stream overlapped with the video decode.
+#   H3_L14_VAE_FP8=1  the VAE ViT decoder's Linears run as FP8 per-tensor GEMMs
+#                     (vae_decoder_fp8.py); changes the decoded pixels.
+#   H3_L14_VAE_TILE=HxW[xO]  VAE decoder spatial tile geometry in pixels (tile height x width x
+#                     minimum overlap, default overlap 32; the default geometry is 256x256x64).
+#                     The decoder's RoPE is normalised per tile, so this changes the decoded pixels.
+_L14_SCHED = os.environ.get("H3_L14_SCHED") == "1"
+_L14_VAE_FP8 = os.environ.get("H3_L14_VAE_FP8") == "1"
+_L14_VAE_TILE = os.environ.get("H3_L14_VAE_TILE", "")
+
+
+def _l14_tile_geometry() -> tuple[int, int, int] | None:
+    if not _L14_VAE_TILE:
+        return None
+    parts = [int(p) for p in _L14_VAE_TILE.lower().split("x")]
+    if len(parts) == 2:
+        parts.append(32)
+    if len(parts) != 3:
+        raise ValueError(f"H3_L14_VAE_TILE must be HxW or HxWxO, got {_L14_VAE_TILE!r}")
+    return parts[0], parts[1], parts[2]
 
 
 def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
@@ -127,6 +154,10 @@ def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
     # Reduce both conditions on device and read them back together, so the
     # check costs one sync per call rather than one per condition.
     finite, nonzero = torch.stack([torch.isfinite(velocity).all(), velocity.any()]).tolist()
+    _raise_denoise_check(finite, nonzero, name, step)
+
+
+def _raise_denoise_check(finite: bool, nonzero: bool, name: str, step: int) -> None:
     if not finite:
         raise RuntimeError(
             f"MiniMax-H3 {name} velocity is not finite at denoising step {step}; "
@@ -160,6 +191,20 @@ class _MiniMaxH3TextEncoderMapping(MpiTopology):
     @property
     def tp_group_name(self) -> str:
         return self.tp_group_pg.group_name
+
+
+def _denoise_check_flags(velocity: torch.Tensor) -> torch.Tensor:
+    """Device-side ``[finite, nonzero]`` for the deferred velocity check (no host sync)."""
+    return torch.stack([torch.isfinite(velocity).all(), velocity.any()])
+
+
+def _raise_deferred_denoise_checks(pending: list[tuple[str, int, torch.Tensor]]) -> None:
+    """One read-back for every step's flags, raising for the first failing step like the eager check."""
+    if not pending:
+        return
+    flags = torch.stack([f for _, _, f in pending]).tolist()
+    for (name, step, _), (finite, nonzero) in zip(pending, flags):
+        _raise_denoise_check(bool(finite), bool(nonzero), name, step)
 
 
 @register_pipeline(
@@ -574,7 +619,21 @@ class MiniMaxH3Pipeline(BasePipeline):
         if self.audio_scheduler is not None:
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
         if self.vae is not None and self.device.type == "cuda":
+            tile = _l14_tile_geometry()
+            if tile is not None:
+                # Before the decoder calibration, which measures one tile of this geometry.
+                self.vae.enable_tiling(
+                    tile_sample_min_height=tile[0],
+                    tile_sample_min_width=tile[1],
+                    tile_sample_min_overlap_height=tile[2],
+                    tile_sample_min_overlap_width=tile[2],
+                )
+                logger.info(
+                    f"MiniMax-H3 VAE decoder tiles {tile[0]}x{tile[1]} px, min overlap {tile[2]}"
+                )
             _prepare_vae_decoder(self.vae)
+            if _L14_VAE_FP8:
+                convert_decoder_linears_fp8(self.vae.decoder)
 
     def torch_compile(self) -> None:
         super().torch_compile()
@@ -1104,6 +1163,38 @@ class MiniMaxH3Pipeline(BasePipeline):
             )[0]
         return audio.float().permute(1, 0, 2)
 
+    def _decode_latents_overlapped(
+        self,
+        latents: torch.Tensor,
+        decode_video: Any,
+        audio_latents: torch.Tensor,
+        decode_audio: Any,
+    ) -> tuple[Any, Any]:
+        """``decode_latents`` with the audio decode on a side stream, overlapped with the video decode.
+
+        Same rank rule as ``BasePipeline.decode_latents`` (parallel-VAE ranks or rank 0 decode,
+        the others return ``None``); the audio decoder's kernels are unchanged, so the result is
+        bit-identical to the serial path.
+        """
+        if self._parallel_vae_enabled:
+            decode_ranks = set(self.pipeline_config.visual_gen_mapping.vae_ranks)
+        else:
+            decode_ranks = {0}
+        if self.rank not in decode_ranks:
+            return None, None
+        side = getattr(self, "_l14_audio_stream", None)
+        if side is None:
+            side = torch.cuda.Stream(device=self.device)
+            self._l14_audio_stream = side
+        main = torch.cuda.current_stream(self.device)
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            audio = decode_audio(audio_latents)
+        video = decode_video(latents)
+        main.wait_stream(side)
+        audio.record_stream(main)
+        return video, audio
+
     @torch.inference_mode()
     def forward(
         self,
@@ -1228,22 +1319,36 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"{len(self.scheduler.timesteps)} vs "
                 f"{len(self.audio_scheduler.timesteps)} steps."
             )
-        row_timestep_plan = [
-            tuple(
-                tensor.to(self.device)
-                for tensor in build_row_timesteps(
-                    layout,
-                    float(video_timestep),
-                    float(audio_timestep),
-                    max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),
-                    1.0,
-                )
+        if _L14_SCHED:
+            # Two read-backs for the whole schedule instead of one float() sync per step and stream.
+            timestep_pairs = zip(
+                self.scheduler.timesteps.tolist(), self.audio_scheduler.timesteps.tolist()
             )
-            for video_timestep, audio_timestep in zip(
-                self.scheduler.timesteps,
-                self.audio_scheduler.timesteps,
+        else:
+            timestep_pairs = zip(self.scheduler.timesteps, self.audio_scheduler.timesteps)
+        host_plan = [
+            build_row_timesteps(
+                layout,
+                float(video_timestep),
+                float(audio_timestep),
+                max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),
+                1.0,
             )
+            for video_timestep, audio_timestep in timestep_pairs
         ]
+        if _L14_SCHED:
+            # One transfer per tensor kind instead of two per step (bit-identical values).
+            unique_sizes = [int(plan[0].numel()) for plan in host_plan]
+            unique_all = torch.cat([plan[0] for plan in host_plan]).to(self.device)
+            indices_all = torch.stack([plan[1] for plan in host_plan]).to(self.device)
+            row_timestep_plan = [
+                (unique, indices_all[index])
+                for index, unique in enumerate(unique_all.split(unique_sizes))
+            ]
+        else:
+            row_timestep_plan = [
+                tuple(tensor.to(self.device) for tensor in plan) for plan in host_plan
+            ]
         with self.offloader.context_if_requested("transformer"):
             static_context = self.transformer.prepare_static_context(
                 prompt_embeds,
@@ -1295,11 +1400,20 @@ class MiniMaxH3Pipeline(BasePipeline):
             # video with silent audio.  The cause was never reproduced, so fail
             # loudly at the step that produced it instead of shipping the
             # corruption downstream.
-            _check_denoise_step(video_velocity[:, condition_rows:], "video", index)
             audio_velocity = audio_velocity[:, audio_condition_rows:]
-            _check_denoise_step(audio_velocity, "audio", index)
+            if _L14_SCHED:
+                # Reduce on device now, read every step's flags back once after the loop:
+                # the result is still refused, without a host sync per step.
+                pending_checks.append(
+                    ("video", index, _denoise_check_flags(video_velocity[:, condition_rows:]))
+                )
+                pending_checks.append(("audio", index, _denoise_check_flags(audio_velocity)))
+            else:
+                _check_denoise_step(video_velocity[:, condition_rows:], "video", index)
+                _check_denoise_step(audio_velocity, "audio", index)
             return video_velocity[:, condition_rows:].float(), {"audio": audio_velocity.float()}
 
+        pending_checks: list[tuple[str, int, torch.Tensor]] = []
         timer.mark_denoise_start()
         with self.offloader.context_if_requested("transformer"):
             generated_latents, extra_latents = self.denoise(
@@ -1311,22 +1425,28 @@ class MiniMaxH3Pipeline(BasePipeline):
                 extra_streams={"audio": (audio_latents[None], self.audio_scheduler)},
                 extra_stream_timesteps={"audio": self.audio_scheduler.timesteps},
             )
+        _raise_deferred_denoise_checks(pending_checks)
         latents = torch.cat((condition_prefix, generated_latents), dim=1)[0]
         audio_latents = extra_latents["audio"][0]
         timer.mark_post_start()
-        video, audio = self.decode_latents(
-            latents,
-            decode_fn=lambda rows: self._decode_video(
-                rows,
-                layout.num_condition_video_rows,
-                num_latent_frames,
-                latent_height,
-                latent_width,
-            ),
-            extra_latents={
-                "audio": (audio_latents, lambda rows: self._decode_audio(rows, num_audio_latents))
-            },
+        decode_video = lambda rows: self._decode_video(  # noqa: E731
+            rows,
+            layout.num_condition_video_rows,
+            num_latent_frames,
+            latent_height,
+            latent_width,
         )
+        decode_audio = lambda rows: self._decode_audio(rows, num_audio_latents)  # noqa: E731
+        if _L14_SCHED:
+            video, audio = self._decode_latents_overlapped(
+                latents, decode_video, audio_latents, decode_audio
+            )
+        else:
+            video, audio = self.decode_latents(
+                latents,
+                decode_fn=decode_video,
+                extra_latents={"audio": (audio_latents, decode_audio)},
+            )
         timer.mark_end()
         logger.info(f"MiniMax-H3 inference completed in {time.time() - pipeline_start:.2f}s")
         return timer.fill(
