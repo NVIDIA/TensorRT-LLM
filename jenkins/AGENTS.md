@@ -46,3 +46,28 @@ Scope: this directory and its descendants. Supplements the repository-root
 - Distinguish a reproduced failure from preventive consistency work. Do not claim
   that another option has the same bug without a failing case. Avoid unrelated
   command rewrites while applying this convention.
+
+## Slurm/Pyxis environment variables
+
+- With normal Slurm export settings, exported job variables inherit into the
+  container by default. `--container-env` is not a transmission allowlist: it
+  gives the named job variables priority over values defined by the image.
+  Do not add an override solely to pass an exported variable into the container.
+- Export values separately; `--container-env` takes variable names, not
+  `NAME=value` assignments. Put all required overrides in one comma-separated
+  option, for example `--container-env=BASH_ENV,OTHER_IMAGE_OVERRIDE`. Repeating
+  `--container-env` causes only the last option value to reach the compute nodes.
+- The Jenkins sbatch path needs `--container-env=BASH_ENV` to override the CI
+  image's Bash startup hook. Preserve that override when changing the caller or
+  a downstream command generator; do not append another `--container-env`.
+  Image initialization can still reset variables after inheritance, so the
+  profiler wrapper applies its policy after normal initialization on each Bash
+  startup.
+- Check the final generated `srun` arguments across ordinary and PerfSanity
+  roles, including optional prechecks. For environment changes, distinguish
+  default inheritance from image-value overrides and verify the required values
+  inside the container, including reuse and role changes where applicable.
+- `scripts/perf/local/submit.py` still contains legacy repeated
+  `--container-env` declarations. Do not copy that pattern into new code or
+  assume the CI fix also covers the local launcher. Validate local behavior
+  separately when changing it.
