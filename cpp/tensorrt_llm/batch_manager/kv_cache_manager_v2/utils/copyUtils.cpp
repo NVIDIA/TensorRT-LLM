@@ -53,7 +53,9 @@ bool loopedReadWrite(Func&& func, ssize_t size) noexcept
             {
                 continue; // Retry on interrupt
             }
-            TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(errno));
+            int const err = errno;
+            TLLM_LOG_ERROR("Disk read/write failed: %s\n", strerror(err));
+            errno = err;
             return false;
         }
         count += bytes;
@@ -159,7 +161,8 @@ std::atomic<size_t> gAsyncDiskIoThreads{0};
 // number can be reused for another file.
 struct DirectFdEntry
 {
-    int direct = 0; // direct fd + 1; 0 = not opened, -1 = open failed
+    int direct = 0;        // direct fd + 1; 0 = not opened, -1 = open failed
+    bool rejected = false; // the file system rejected an aligned O_DIRECT write
     dev_t dev = 0;
     ino_t ino = 0;
 };
@@ -197,7 +200,7 @@ int directFd(int fd) noexcept
         {
             ::close(entry.direct - 1);
         }
-        entry.direct = 0;
+        entry = DirectFdEntry{};
     }
     if (entry.direct == 0)
     {
@@ -213,7 +216,19 @@ int directFd(int fd) noexcept
                 strerror(errno));
         }
     }
-    return entry.direct > 0 ? entry.direct - 1 : -1;
+    return entry.direct > 0 && !entry.rejected ? entry.direct - 1 : -1;
+}
+
+// Other workers may still be using the direct fd, so it stays open until releaseDiskFile().
+void rejectDirectFd(int fd) noexcept
+{
+    std::lock_guard<std::mutex> lock(directFdMutex());
+    auto& table = directFdTable();
+    if (static_cast<size_t>(fd) < table.size() && !table[fd].rejected)
+    {
+        table[fd].rejected = true;
+        TLLM_LOG_WARNING("[kvCacheManagerV2Utils] O_DIRECT write to fd %d rejected; using buffered I/O", fd);
+    }
 }
 
 constexpr uintptr_t kDirectAlign = 4096;
@@ -230,7 +245,15 @@ bool writePiece(int fd, ssize_t pos, void const* data, ssize_t size) noexcept
     {
         if (int const direct = directFd(fd); direct >= 0)
         {
-            return writeAll(direct, pos, data, size);
+            if (writeAll(direct, pos, data, size))
+            {
+                return true;
+            }
+            if (errno != EINVAL)
+            {
+                return false;
+            }
+            rejectDirectFd(fd);
         }
     }
     return writeAll(fd, pos, data, size);
