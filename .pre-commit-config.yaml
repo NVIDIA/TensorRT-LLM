@@ -1596,6 +1596,11 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+    -   id: no-make-block-ptr
+        name: Disallow tl.make_block_ptr and tl.advance (removed in Triton 3.9)
+        entry: '\btl\.(make_block_ptr|advance)\('
+        language: pygrep
+        files: ^tensorrt_llm/.*\.py$
     -   id: check-skill-naming-convention
         name: Check Claude Code skill naming convention
         entry: python scripts/check_skill_naming_convention.py

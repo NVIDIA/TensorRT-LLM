@@ -40,7 +40,7 @@ def solve_tril_16x16_kernel(
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
             tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -51,6 +51,8 @@ def solve_tril_16x16_kernel(
     offset = (i_t * 16) % BT
     o_i = tl.arange(0, 16)
     o_t = i_t * 16 + o_i
+    # Columns stay inside the BT-wide row (offset + 16 <= BT), so only rows
+    # need masking.
     m_t = (o_t < T)[:, None]
     p_A = A + o_t[:, None] * (H * BT) + offset + o_i[None, :]
     p_Ai = Ad + o_t[:, None] * (H * 16) + o_i[None, :]
@@ -97,7 +99,7 @@ def merge_16x16_to_32x32_inverse_kernel(
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
             tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -108,6 +110,8 @@ def merge_16x16_to_32x32_inverse_kernel(
 
     o_i = tl.arange(0, 16)
     o_t = i_t * 32 + o_i
+    # Each 16-wide column block ends at or before BT, so columns stay inside
+    # the BT-wide row and only rows need masking.
     m_1 = o_t[:, None] < T
     m_2 = o_t[:, None] + 16 < T
     p_A_21 = A + (o_t[:, None] + 16) * (H * 32) + o_i[None, :]
@@ -116,6 +120,7 @@ def merge_16x16_to_32x32_inverse_kernel(
     p_Ai_11 = Ai + o_t[:, None] * (H * 32) + o_i[None, :]
     p_Ai_22 = Ai + (o_t[:, None] + 16) * (H * 32) + o_i[None, :] + 16
     p_Ai_21 = Ai + (o_t[:, None] + 16) * (H * 32) + o_i[None, :]
+    p_Ai_12 = Ai + o_t[:, None] * (H * 32) + o_i[None, :] + 16
 
     A_21 = tl.load(p_A_21, mask=m_2, other=0.0).to(tl.float32)
     Ai_11 = tl.load(p_Ad_11, mask=m_1, other=0.0).to(tl.float32)
@@ -137,6 +142,12 @@ def merge_16x16_to_32x32_inverse_kernel(
         p_Ai_21,
         Ai_21.to(p_Ai_21.dtype.element_ty, fp_downcast_rounding="rtne"),
         mask=m_2,
+    )
+    tl.store(
+        p_Ai_12,
+        tl.zeros((16, 16), dtype=tl.float32).to(p_Ai_12.dtype.element_ty,
+                                                fp_downcast_rounding="rtne"),
+        mask=m_1,
     )
 
 
@@ -167,7 +178,7 @@ def merge_16x16_to_64x64_inverse_kernel(
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
             tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
@@ -178,6 +189,8 @@ def merge_16x16_to_64x64_inverse_kernel(
 
     o_i = tl.arange(0, 16)
     o_t = i_t * 64 + o_i
+    # Each 16-wide column block ends at or before BT, so columns stay inside
+    # the BT-wide row and only rows need masking.
     m_1 = o_t[:, None] < T
     m_2 = o_t[:, None] + 16 < T
     m_3 = o_t[:, None] + 32 < T

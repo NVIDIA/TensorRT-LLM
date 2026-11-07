@@ -49,13 +49,14 @@ def recompute_w_u_fwd_kernel(
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(
             tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int64)
         bos, eos = tl.load(cu_seqlens + i_n).to(
-            tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+            tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
         T = eos - bos
     else:
         bos, eos = i_b * T, i_b * T + T
     o_t = i_t * BT + tl.arange(0, BT)
     o_A = tl.arange(0, BT)
     m_t = o_t < T
+    # The columns span exactly the BT-wide row, so only rows need masking.
     m_A = m_t[:, None]
     p_beta = beta + bos * H + i_h + o_t * H
     p_g = g + (bos * H + i_h) + o_t * H
