@@ -410,6 +410,12 @@ class FP8MQALogitsRowSplitKernel:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.num_math_threads + 32
         )
+        # All math warps rendezvous on this barrier before math warp 0
+        # deallocates TMEM, so no math warp can still have a tcgen05.ld in
+        # flight on the freed columns.
+        tmem_dealloc_barrier = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=self.num_math_threads
+        )
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
@@ -766,6 +772,13 @@ class FP8MQALogitsRowSplitKernel:
                 q_pipeline.consumer_release(q_cons_state)
                 q_cons_state.advance()
 
+            # TMEM dealloc: math warp 0 is the allocator, every math warp a
+            # consumer. Each math thread has already waited for its own loads
+            # (fence_view_async_tmem_load after the tcgen05.ld); the barrier
+            # orders the other math warps' last loads before warp 0's
+            # tcgen05.dealloc.
+            cute.arch.fence_view_async_tmem_load()
+            tmem_dealloc_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(tmem_ptr)
 
