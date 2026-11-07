@@ -705,8 +705,9 @@ class PrimsTSFmha(PhasedFmha):
         page_size: int,
         mask_type: str,
         window_left: int,
-        softmax_scale: float,
+        softmax_scale: float | torch.Tensor,
         output_dtype: torch.dtype,
+        output_scale: float | torch.Tensor = 1.0,
     ) -> "BatchPrefillPagedTSWrapper":
         wrapper = self._context_wrappers.get(batch_size)
         if wrapper is not None:
@@ -734,7 +735,7 @@ class PrimsTSFmha(PhasedFmha):
             mask_type=mask_type,
             window_left=window_left,
             softmax_scale=softmax_scale,
-            output_scale=1.0,
+            output_scale=output_scale,
             # Preprocessing establishes this invariant for every context
             # request admitted by this adapter.
             paged_v_tail_is_zero=True,
@@ -758,6 +759,8 @@ class PrimsTSFmha(PhasedFmha):
         output_dtype: torch.dtype,
         mask_type: str,
         window_left: int,
+        softmax_scale: float | torch.Tensor | None = None,
+        output_scale: float | torch.Tensor = 1.0,
     ) -> "BatchDecodePagedTSWrapper":
         if batch_size <= 0:
             raise RuntimeError("PrimTS decode requires a positive batch size.")
@@ -785,7 +788,8 @@ class PrimsTSFmha(PhasedFmha):
             mask_type=mask_type,
             window_left=window_left,
             workspace_buffer=workspace_buffer,
-            use_device_scales=QuantMode(self.attn.quant_mode).has_fp8_kv_cache(),
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
         )
         self._decode_wrappers[batch_size] = wrapper
         return wrapper
@@ -1250,6 +1254,8 @@ class PrimsTSFmha(PhasedFmha):
         use_fp8 = QuantMode(attn.quant_mode).has_fp8_kv_cache()
         if use_fp8:
             q_processed = self._view_fp8_query(q_processed, params.num_tokens)
+        softmax_scale = bmm1_scale.reshape(-1)[:1] if use_fp8 else self._get_bmm1_scale(attn)
+        output_scale = bmm2_scale.reshape(-1)[:1] if use_fp8 else 1.0
         mask_type = self._get_prims_mask_type(fwd)
         wrapper = self._get_or_plan_context_wrapper(
             q_processed,
@@ -1261,7 +1267,8 @@ class PrimsTSFmha(PhasedFmha):
             page_size=params.tokens_per_block,
             mask_type=mask_type,
             window_left=window_left,
-            softmax_scale=self._get_bmm1_scale(attn),
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             output_dtype=params.output.dtype,
         )
         wrapper.run(
@@ -1271,8 +1278,8 @@ class PrimsTSFmha(PhasedFmha):
             cu_q_seqlens,
             block_tables=fixed_block_tables,
             seq_lens_kv=seq_lens_kv,
-            scale_softmax_log2=bmm1_scale.reshape(-1)[1:2] if use_fp8 else None,
-            output_scale=bmm2_scale.reshape(-1)[:1] if use_fp8 else None,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             out=params.output,
             validate=False,
         )
@@ -1435,6 +1442,8 @@ class PrimsTSFmha(PhasedFmha):
             output = output[:, 0]
         mask_type = self._get_prims_mask_type(fwd)
         decode_workspace = self._get_decode_workspace(params.workspace)
+        softmax_scale = bmm1_scale.reshape(-1)[:1] if use_fp8 else self._get_bmm1_scale(attn)
+        output_scale = bmm2_scale.reshape(-1)[:1] if use_fp8 else 1.0
         wrapper = self._get_or_plan_decode_wrapper(
             decode_workspace,
             batch_size=batch_size,
@@ -1449,6 +1458,8 @@ class PrimsTSFmha(PhasedFmha):
             output_dtype=output.dtype,
             mask_type=mask_type,
             window_left=window_left,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
         )
         plan_state = wrapper._plan_state
         if plan_state is None:
@@ -1467,8 +1478,8 @@ class PrimsTSFmha(PhasedFmha):
             (k_cache, v_cache),
             seq_lens,
             block_tables=fixed_block_tables,
-            bmm1_scale=bmm1_scale.reshape(-1)[:1] if use_fp8 else self._get_bmm1_scale(attn),
-            bmm2_scale=bmm2_scale.reshape(-1)[:1] if use_fp8 else 1.0,
+            softmax_scale=softmax_scale,
+            output_scale=output_scale,
             out=output,
             validate=False,
         )

@@ -1068,8 +1068,8 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
         "page_size": 32,
         "mask_type": "causal",
         "window_left": -1,
-        "softmax_scale": pytest.approx(1.0 / math.sqrt(attn.head_dim)),
-        "output_scale": 1.0,
+        "softmax_scale": bmm1[:1] if fp8 else pytest.approx(1.0 / math.sqrt(attn.head_dim)),
+        "output_scale": bmm2[:1] if fp8 else 1.0,
         "paged_v_tail_is_zero": True,
     }
     wrapper.run.assert_called_once()
@@ -1080,7 +1080,7 @@ def test_context_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert context_preprocess.call_args.args[35] is fp8
     assert context_postprocess.call_args.args[32] is fp8
     if fp8:
-        assert run_kwargs["scale_softmax_log2"].data_ptr() == bmm1[1:].data_ptr()
+        assert run_kwargs["softmax_scale"].data_ptr() == bmm1.data_ptr()
         assert run_kwargs["output_scale"].data_ptr() == bmm2.data_ptr()
     k_cache, v_cache = run_args[1], run_args[2]
     assert k_cache.shape == v_cache.shape == (6, attn.num_kv_heads, 32, attn.head_dim)
@@ -1288,10 +1288,11 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert {key: value for key, value in plan_kwargs.items() if key != "workspace_buffer"} == {
         "max_q_len": 1,
         "packed_query": False,
-        "use_device_scales": fp8,
-        "q_data_type": kernel_dtype,
-        "kv_data_type": kernel_dtype,
-        "o_data_type": torch.bfloat16,
+        "softmax_scale": bmm1[:1] if fp8 else fmha._get_bmm1_scale(attn),
+        "output_scale": bmm2[:1] if fp8 else 1.0,
+        "q_dtype": kernel_dtype,
+        "kv_dtype": kernel_dtype,
+        "out_dtype": torch.bfloat16,
         "mask_type": "causal",
         "window_left": 15,
     }
@@ -1304,11 +1305,11 @@ def test_generation_wrapper_plans_once_and_reads_live_fixed_metadata(
     assert run_args[0].dtype == kernel_dtype
     assert generation_preprocess.call_args.args[35] is fp8
     if fp8:
-        assert run_kwargs["bmm1_scale"].data_ptr() == bmm1.data_ptr()
-        assert run_kwargs["bmm2_scale"].data_ptr() == bmm2.data_ptr()
+        assert run_kwargs["softmax_scale"].data_ptr() == bmm1.data_ptr()
+        assert run_kwargs["output_scale"].data_ptr() == bmm2.data_ptr()
     else:
-        assert run_kwargs["bmm1_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
-        assert run_kwargs["bmm2_scale"] == 1.0
+        assert run_kwargs["softmax_scale"] == pytest.approx(1.0 / math.sqrt(attn.head_dim))
+        assert run_kwargs["output_scale"] == 1.0
     k_cache, v_cache = run_args[1]
     assert k_cache.shape == v_cache.shape == (6, attn.num_kv_heads, 32, attn.head_dim)
     assert v_cache.storage_offset() - k_cache.storage_offset() == 6 * math.prod(kv_pool.shape[1:])
