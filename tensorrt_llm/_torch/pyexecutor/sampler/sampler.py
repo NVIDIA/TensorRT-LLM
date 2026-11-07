@@ -207,6 +207,13 @@ class _SamplingGroup:
 
 
 class Sampler(ABC, Generic[GenericSampleState]):
+    def warmup(self, *, vocab_size: int) -> None:
+        """Prepare sampling work before serving starts.
+
+        Called once at executor startup, after model warmup and before any
+        request is admitted. ``vocab_size`` is the width of the logits rows.
+        """
+
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests) -> None:
         pass
 
@@ -804,6 +811,20 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     @property
     def _use_beam_search(self) -> bool:
         return self.max_beam_width > 1
+
+    @override
+    @torch.inference_mode()
+    def warmup(self, *, vocab_size: int) -> None:
+        """Run the beam-search step once per warmup shape; see ``BeamSearchHandler.warmup``."""
+        if not self._use_beam_search:
+            return
+        log_probs_store = self.store.log_probs_store
+        self._beam_search.warmup(
+            vocab_size=vocab_size,
+            log_probs_store=log_probs_store,
+            new_log_probs=log_probs_store.sampled_log_probs[..., DEFAULT_STEP_IDX],
+            end_ids_cuda=self._finish_reasons_handler.store.end_ids_cuda,
+        )
 
     @staticmethod
     def _request_rewrites_logits(request: LlmRequest) -> bool:

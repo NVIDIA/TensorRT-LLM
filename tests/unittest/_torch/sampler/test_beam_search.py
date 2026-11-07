@@ -40,10 +40,12 @@ from tensorrt_llm._torch.pyexecutor.sampler import (BeamHistory,
                                                     SampleStateTorch,
                                                     TorchSampler)
 from tensorrt_llm._torch.pyexecutor.sampler.beam_search import (
-    BEAM_SEARCH_PAD_TOKEN, BeamSearchEarlyStop, BeamSearchMetadata,
-    BeamSearchParams, BeamSearchStep, CBAGroupHost, CBAState,
-    _assemble_final_beams, _gather_beam_path, _prepare_beam_history_cba,
-    beam_search_sampling_batch_cba, finalize_beam)
+    BEAM_SAMPLER_GRAPH_ENV, BEAM_SEARCH_PAD_TOKEN, BeamSearchEarlyStop,
+    BeamSearchHandler, BeamSearchMetadata, BeamSearchParams, BeamSearchStep,
+    BeamSearchStore, CBAGroupHost, CBAState, _assemble_final_beams,
+    _gather_beam_path, _prepare_beam_history_cba,
+    beam_search_sampling_batch_cba, finalize_beam, prepare_beam_search)
+from tensorrt_llm._torch.pyexecutor.sampler.logprobs import LogProbsStore
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.bindings.internal.batch_manager import \
     LlmRequest as CppLlmRequest
@@ -1092,6 +1094,211 @@ def _with_cba(meta: BeamSearchMetadata,
                                        dtype=torch.float32),
                                    max_seq_len=width,
                                ))
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_beam_search_sampler_cuda_graph_matches_eager(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """CUDA-graph replay of the beam step reproduces the eager op.
+
+    Startup warmup lets most step shapes be captured on first use, but a shape
+    it does not cover runs eagerly twice before it is captured. Three
+    identical generate calls make every step of a request replay a graph
+    either way; the third call's beams must match the eager run token for
+    token.
+    """
+    beam_width = 8
+    input_prompts = [[1, 2, 3], [4, 5, 6]]
+    sampling_params = SamplingParams(
+        max_tokens=6,
+        n=beam_width,
+        best_of=beam_width,
+        use_beam_search=True,
+        beam_search_diversity_rate=0.5,
+        end_id=-1,
+    )
+
+    def run(graph_enabled: bool):
+        monkeypatch.setenv("TLLM_BEAM_SAMPLER_CUDA_GRAPH",
+                           "1" if graph_enabled else "0")
+        gc.collect(2)
+        with _single_process_context():
+            # LLM.shutdown resets the loader's config_loader, so each run
+            # needs its own checkpoint loader.
+            llm = LLM(
+                model=_pl.Path("dummy_path"),
+                checkpoint_loader=HfCheckpointLoader(
+                    weight_loader=DummyWeightLoader(),
+                    config_loader=DummyConfigLoader(),
+                ),
+                max_beam_width=beam_width,
+                max_batch_size=beam_width * len(input_prompts),
+                max_seq_len=64,
+                kv_cache_config=KvCacheConfig(max_tokens=10000),
+                disable_overlap_scheduler=True,
+                cuda_graph_config=None,
+            )
+            with llm:
+                outputs = None
+                for _ in range(3 if graph_enabled else 1):
+                    outputs = llm.generate(
+                        deepcopy(input_prompts),
+                        sampling_params=deepcopy(sampling_params))
+        return [
+            [tuple(beam.token_ids) for beam in out.outputs]  # type: ignore
+            for out in outputs  # type: ignore
+        ]
+
+    eager = run(False)
+    graphed = run(True)
+    assert graphed == eager
+
+
+def _copy_store_tensors(src: Any, dst: Any) -> None:
+    """Copy every tensor of a store dataclass (and its nested ones) in place."""
+    for f in dataclasses.fields(src):
+        src_value, dst_value = getattr(src, f.name), getattr(dst, f.name)
+        if isinstance(src_value, torch.Tensor):
+            dst_value.copy_(src_value)
+        elif dataclasses.is_dataclass(src_value):
+            _copy_store_tensors(src_value, dst_value)
+
+
+def _assert_store_tensors_equal(actual: Any, expected: Any) -> None:
+    for f in dataclasses.fields(actual):
+        actual_value = getattr(actual, f.name)
+        expected_value = getattr(expected, f.name)
+        if isinstance(actual_value, torch.Tensor):
+            # Unused slots hold uninitialized floats, which may be NaN.
+            torch.testing.assert_close(actual_value,
+                                       expected_value,
+                                       rtol=0,
+                                       atol=0,
+                                       equal_nan=True,
+                                       msg=f"{f.name} differs")
+        elif dataclasses.is_dataclass(actual_value):
+            _assert_store_tensors_equal(actual_value, expected_value)
+
+
+@_kernel_test
+@pytest.mark.threadleak(enabled=False)
+@torch.inference_mode()
+def test_beam_search_warmup_captures_new_shape_on_first_use(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """After startup warmup, unseen step shapes are captured on first use.
+
+    The batch size and the later snapshot widths here are outside the warmup
+    grid. Each step must still replay a graph captured the first time it ran,
+    without eager runs, and leave the same tokens and store state as the
+    eager op. Runs under inference mode, like the sampler, which allocates
+    the CBA tensors as inference tensors.
+    """
+    beam_width, vocab_size, end_id = 4, 128, 7
+    max_num_sequences, max_seq_len = 6, 32
+    batch_size, prompt_len, num_gen_steps = 5, 3, 3
+
+    def make(graph_enabled: bool):
+        monkeypatch.setenv(BEAM_SAMPLER_GRAPH_ENV,
+                           "1" if graph_enabled else "0")
+        store = BeamSearchStore.create(
+            cache_indirection_shape=(max_num_sequences, beam_width,
+                                     max_seq_len),
+            max_num_sequences=max_num_sequences,
+            max_beam_width=beam_width,
+        )
+        log_probs_shape = (max_num_sequences, beam_width, 1)
+        log_probs_store = LogProbsStore(
+            sampled_log_prob_indices=torch.zeros(log_probs_shape,
+                                                 dtype=torch.int32),
+            sampled_log_probs=torch.zeros(log_probs_shape, dtype=torch.float32),
+            sampled_log_prob_ranks=torch.zeros(log_probs_shape,
+                                               dtype=torch.int32),
+            topk_indices=torch.zeros((0, ), dtype=torch.int32),
+            topk_vals=torch.zeros((0, ), dtype=torch.float32),
+        )
+        handler = BeamSearchHandler(
+            store=store,
+            max_seq_len=max_seq_len,
+            max_num_sequences=max_num_sequences,
+            use_speculative_d2h=False,
+            has_multi_token_stop_words=lambda _: False,
+            copy_to_host=lambda t: t,
+            make_side_stream_copier=nullcontext,  # type: ignore
+        )
+        end_ids = torch.full((max_num_sequences, ), end_id, dtype=torch.int32)
+        new_log_probs = log_probs_store.sampled_log_probs[..., 0]
+        handler.warmup(vocab_size=vocab_size,
+                       log_probs_store=log_probs_store,
+                       new_log_probs=new_log_probs,
+                       end_ids_cuda=end_ids)
+        return store, log_probs_store, handler, end_ids, new_log_probs
+
+    graphed = make(graph_enabled=True)
+    eager = make(graph_enabled=False)
+    runner = graphed[2]._graph_runner
+    assert runner is not None and eager[2]._graph_runner is None
+    # The warmup ran the same steps on both stores; start from equal state.
+    _copy_store_tensors(graphed[0], eager[0])
+    _copy_store_tensors(graphed[1], eager[1])
+
+    slots = torch.arange(batch_size, dtype=torch.int64)
+    for store, log_probs_store, *_ in (graphed, eager):
+        prepare_beam_search(
+            store,
+            log_probs_store,
+            seq_slots_long=slots,
+            max_prompt_len=prompt_len,
+            prompt_lens_cuda=torch.full((batch_size, ),
+                                        prompt_len,
+                                        dtype=torch.int32),
+            beam_caps_cuda=torch.full((batch_size, ),
+                                      beam_width,
+                                      dtype=torch.int32),
+        )
+
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    for step in range(num_gen_steps + 1):
+        seq_len = prompt_len + step
+        beam_width_in = 1 if step == 0 else beam_width
+        requests = [
+            types.SimpleNamespace(max_beam_num_tokens=seq_len,
+                                  py_prompt_len=prompt_len)
+        ] * batch_size
+        logits = torch.randn((batch_size * beam_width_in, vocab_size),
+                             generator=generator)
+        tokens = []
+        for _, _, handler, end_ids, new_log_probs in (graphed, eager):
+            seq_lens = torch.full((batch_size, ), seq_len, dtype=torch.int32)
+            beam_step = BeamSearchStep(beam_width_in,
+                                       beam_width,
+                                       beam_width_in,
+                                       temperature=None,
+                                       length_penalty=None,
+                                       diversity_rate=None,
+                                       early_stopping=BeamSearchEarlyStop.TRUE)
+            step_tokens, _ = beam_step.sample(
+                logits.clone(),
+                metadata=handler.build_metadata(
+                    requests=cast(list[LlmRequest], requests),
+                    group_req_indices=torch.arange(batch_size, device="cpu"),
+                    seq_slots=slots.cpu(),
+                    seq_lens=seq_lens.cpu(),
+                    seq_slots_cuda=slots,
+                    seq_lens_cuda=seq_lens,
+                    num_requests=batch_size,
+                    new_log_probs=new_log_probs,
+                    end_ids_cuda=end_ids,
+                    stop_words_metadata_cuda=None,
+                ))
+            tokens.append(step_tokens.clone())
+        assert torch.equal(tokens[0], tokens[1]), f"step {step}"
+        entries = list(runner._entries.values())
+        assert len(entries) == step + 1
+        assert all(e.graph is not None and e.eager_runs == 0
+                   for e in entries), f"step {step} ran eagerly before capture"
+
+    _assert_store_tensors_equal(graphed[0], eager[0])
+    _assert_store_tensors_equal(graphed[1], eager[1])
 
 
 @_kernel_test

@@ -28,6 +28,8 @@ final once the winning path is known, so they are accumulated in
 :class:`BeamHistory` and emitted in one go by :func:`finalize_beam`.
 """
 
+import dataclasses
+import os
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from enum import IntEnum
@@ -39,6 +41,7 @@ from tensorrt_llm._torch.flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.executor.result import Logprob
+from tensorrt_llm.logger import logger
 
 from ..llm_request import LlmRequest, LlmRequestState
 from .logprobs import LogProbsStore
@@ -117,9 +120,14 @@ def _beam_topk(values: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor
     order; only the index order among equal values may differ, which torch.topk
     leaves unspecified anyway.
     """
-    if IS_FLASHINFER_AVAILABLE and values.size(-1) > 10000 and topk_module_ready():
+    if _beam_topk_uses_radix(values.size(-1)):
         return radix_topk_op(values, k)
     return torch.topk(values, k=k, dim=-1, sorted=True)
+
+
+def _beam_topk_uses_radix(width: int) -> bool:
+    """Whether :func:`_beam_topk` takes flashinfer's kernel for rows of ``width``."""
+    return IS_FLASHINFER_AVAILABLE and width > 10000 and topk_module_ready()
 
 
 @dataclass(kw_only=True)
@@ -372,6 +380,9 @@ class BeamSearchMetadata:
     cba: Optional[CBAState] = None
     """Candidate-Beams-Array state, present for every beam-search request
     regardless of its early_stopping mode; None until the first one."""
+    graph_runner: Optional["BeamStepGraphRunner"] = None
+    """Replays the beam step as a CUDA graph when set (see
+    :class:`BeamStepGraphRunner`); None runs the eager op."""
 
 
 def _update_cache_indirection_buffer(
@@ -781,8 +792,9 @@ def _cba_step_math(
     )
 
 
-# Compiled lazily on first use; the first CBA-mode request of a process pays
-# the inductor compile once (subsequent shapes are covered by the dynamic
+# Compiled on first use: at executor startup for the shapes
+# BeamSearchHandler.warmup runs, otherwise by the first request that needs a
+# new static combination (subsequent shapes are covered by the dynamic
 # batch/snapshot-length dims marked at the call site).
 #
 # Dynamo counts recompiles per code object for the lifetime of the process, and
@@ -1159,6 +1171,18 @@ class BeamSearchStep:
             # so it must cover every row the forward laid out.
             temperature = self.temperature.repeat_interleave(self._row_stride).unsqueeze(-1)
             logits = logits / temperature
+        if metadata.graph_runner is not None:
+            return metadata.graph_runner.run(
+                logits,
+                beam_width_in=self._beam_width_in,
+                beam_width_out=self._beam_width_out,
+                row_stride=self._row_stride,
+                beam_search_args=metadata,
+                early_stopping=self._early_stopping,
+                length_penalty=self._length_penalty,
+                diversity_rate=self._diversity_rate,
+                return_probs=self._computes_probs,
+            )
         return beam_search_sampling_batch_cba(
             logits,
             beam_width_in=self._beam_width_in,
@@ -1171,6 +1195,224 @@ class BeamSearchStep:
             diversity_rate=self._diversity_rate,
             return_probs=self._computes_probs,
         )
+
+
+BEAM_SAMPLER_GRAPH_ENV = "TLLM_BEAM_SAMPLER_CUDA_GRAPH"
+"""``0`` disables CUDA-graph replay of the beam-search step (default on)."""
+
+
+def beam_sampler_graph_enabled() -> bool:
+    return os.environ.get(BEAM_SAMPLER_GRAPH_ENV, "1") != "0"
+
+
+_WARMUP_BATCH_SIZES = (1, 2, 3)
+"""Batch sizes ``BeamSearchHandler.warmup`` runs. Batch sizes of 0 and 1 can
+be specialized by torch.compile, so the dynamic graph needs larger ones too."""
+
+_WARMUP_GEN_LENS = (2, 3, 4)
+"""``max_gen_len`` values ``BeamSearchHandler.warmup`` runs: the context step's
+(2) and enough later ones for the snapshot width to become dynamic."""
+
+
+@dataclass
+class _BeamStepGraphEntry:
+    eager_runs: int = 0
+    capture_failed: bool = False
+    """Set after a capture attempted without eager runs failed; the key then
+    takes the full eager warmup before its one retry."""
+    disabled: bool = False
+    graph: Optional[torch.cuda.CUDAGraph] = None
+    logits: Optional[torch.Tensor] = None
+    seq_slots: Optional[torch.Tensor] = None
+    seq_lens: Optional[torch.Tensor] = None
+    tokens: Optional[torch.Tensor] = None
+
+
+class BeamStepGraphRunner:
+    """CUDA-graph replay of :func:`beam_search_sampling_batch_cba`.
+
+    The beam step is ~50 small device ops plus the compiled CBA math, all
+    launched from Python; at wide beams that host time is on the critical
+    path of the first and last steps of a request. Everything the op touches
+    is either a persistent store tensor or derived from the step's logits,
+    sequence slots and lengths, so for a fixed step shape the launch sequence
+    can be recorded once and replayed.
+
+    A step shape is keyed by the logits shape, beam widths, row stride,
+    stopping mode, scalar penalties, the CBA snapshot width (which grows by
+    one per generated token) and the group size. A key is captured with
+    private static copies of the logits / slots / lengths and replayed.
+
+    Capture must not compile: the compiled math has to have compiled for the
+    shape and torch.compile's automatic-dynamic recompile has to have settled,
+    and lazily loaded kernels must already be loaded. Keys whose
+    :meth:`signature` was registered by :meth:`mark_prewarmed` (see
+    ``BeamSearchHandler.warmup``) are captured on first use. Other keys run
+    eagerly ``WARMUP_RUNS`` times first. If a capture without those eager runs
+    fails, the key takes them and retries once; any other failed capture
+    disables the key and falls back to eager for good.
+
+    Not used when the op must return probabilities, when a penalty is a
+    per-request tensor, or inside another capture.
+    """
+
+    WARMUP_RUNS = 2
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple, _BeamStepGraphEntry] = {}
+        self._prewarmed: set[tuple] = set()
+        self._pool = None
+
+    @staticmethod
+    def signature(
+        *,
+        logits_dtype: torch.dtype,
+        vocab_size: int,
+        beam_width_in: int,
+        beam_width_out: int,
+        early_stopping: int,
+        max_seq_len: int,
+        has_stop_words: bool,
+    ) -> tuple:
+        """What decides which compiled graphs and kernels a step runs.
+
+        Steps that share a signature differ only in batch size and snapshot
+        width, which the compiled math treats as dynamic once warmed up.
+        """
+        return (
+            logits_dtype,
+            _beam_topk_uses_radix(vocab_size),
+            beam_width_in,
+            beam_width_out,
+            int(early_stopping),
+            max_seq_len,
+            has_stop_words,
+        )
+
+    def mark_prewarmed(self, signature: tuple) -> None:
+        """Capture keys with this signature on first use, without eager runs."""
+        self._prewarmed.add(signature)
+
+    def run(
+        self,
+        logits: torch.Tensor,
+        *,
+        beam_width_in: int,
+        beam_width_out: int,
+        row_stride: int | None,
+        beam_search_args: "BeamSearchMetadata",
+        early_stopping: int,
+        length_penalty: "torch.Tensor | float | None",
+        diversity_rate: "torch.Tensor | float | None",
+        return_probs: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        def eager(logits_in: torch.Tensor, args: "BeamSearchMetadata"):
+            return beam_search_sampling_batch_cba(
+                logits_in,
+                beam_width_in=beam_width_in,
+                beam_width_out=beam_width_out,
+                row_stride=row_stride,
+                beam_search_args=args,
+                temperature=None,
+                early_stopping=early_stopping,
+                length_penalty=length_penalty,
+                diversity_rate=diversity_rate,
+                return_probs=return_probs,
+            )
+
+        cba = beam_search_args.cba
+        if (
+            return_probs
+            or cba is None
+            or not logits.is_cuda
+            or isinstance(length_penalty, torch.Tensor)
+            or isinstance(diversity_rate, torch.Tensor)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return eager(logits, beam_search_args)
+
+        key = (
+            tuple(logits.shape),
+            logits.dtype,
+            beam_width_in,
+            beam_width_out,
+            row_stride or beam_width_in,
+            int(early_stopping),
+            float(length_penalty or 0.0),
+            float(diversity_rate or 0.0),
+            cba.max_gen_len,
+            cba.max_seq_len,
+            beam_search_args.seq_slots.shape[0],
+            beam_search_args.stop_words_metadata is not None,
+        )
+        entry = self._entries.setdefault(key, _BeamStepGraphEntry())
+        if entry.disabled:
+            return eager(logits, beam_search_args)
+        signature = self.signature(
+            logits_dtype=logits.dtype,
+            vocab_size=logits.size(-1),
+            beam_width_in=beam_width_in,
+            beam_width_out=beam_width_out,
+            early_stopping=early_stopping,
+            max_seq_len=cba.max_seq_len,
+            has_stop_words=beam_search_args.stop_words_metadata is not None,
+        )
+        skip_eager_runs = signature in self._prewarmed and not entry.capture_failed
+        if not skip_eager_runs and entry.eager_runs < self.WARMUP_RUNS:
+            entry.eager_runs += 1
+            return eager(logits, beam_search_args)
+
+        if entry.graph is None:
+            entry.logits = torch.empty_like(logits, memory_format=torch.contiguous_format)
+            entry.seq_slots = torch.empty_like(beam_search_args.seq_slots)
+            entry.seq_lens = torch.empty_like(beam_search_args.seq_lens)
+            static_args = dataclasses.replace(
+                beam_search_args, seq_slots=entry.seq_slots, seq_lens=entry.seq_lens
+            )
+            self._copy_inputs(entry, logits, beam_search_args)
+            graph = torch.cuda.CUDAGraph()
+            if self._pool is None:
+                self._pool = torch.cuda.graph_pool_handle()
+            try:
+                # Recording only: nothing executes until the replay below, so
+                # a failed capture leaves the stores untouched.
+                with torch.cuda.graph(graph, pool=self._pool, capture_error_mode="thread_local"):
+                    tokens, _ = eager(entry.logits, static_args)
+            except Exception as exc:  # noqa: BLE001 - any capture failure falls back to eager
+                entry.logits = entry.seq_slots = entry.seq_lens = None
+                if skip_eager_runs:
+                    logger.warning(
+                        f"Beam-search sampler CUDA graph capture failed for prewarmed step "
+                        f"shape {key}; retrying after {self.WARMUP_RUNS} eager runs ({exc!r})."
+                    )
+                    entry.capture_failed = True
+                    # The eager fallback below is the first of those runs.
+                    entry.eager_runs = 1
+                else:
+                    logger.warning(
+                        f"Beam-search sampler CUDA graph capture failed for step shape {key}; "
+                        f"running this shape eagerly from now on ({exc!r})."
+                    )
+                    entry.disabled = True
+                return eager(logits, beam_search_args)
+            entry.graph = graph
+            entry.tokens = tokens
+        else:
+            self._copy_inputs(entry, logits, beam_search_args)
+
+        assert entry.graph is not None and entry.tokens is not None
+        entry.graph.replay()
+        return entry.tokens, None
+
+    @staticmethod
+    def _copy_inputs(
+        entry: _BeamStepGraphEntry, logits: torch.Tensor, args: "BeamSearchMetadata"
+    ) -> None:
+        assert entry.logits is not None and entry.seq_slots is not None
+        assert entry.seq_lens is not None
+        entry.logits.copy_(logits)
+        entry.seq_slots.copy_(args.seq_slots)
+        entry.seq_lens.copy_(args.seq_lens)
 
 
 BeamHistoryBuilder: TypeAlias = Callable[[], BeamHistory | None]
@@ -1565,6 +1807,9 @@ class BeamSearchHandler:
         # Stop-word length check lives with finish-reason handling, which also
         # uses it outside beam search; injected rather than duplicated here.
         self._has_multi_token_stop_words = has_multi_token_stop_words
+        self._graph_runner: Optional[BeamStepGraphRunner] = (
+            BeamStepGraphRunner() if store is not None and beam_sampler_graph_enabled() else None
+        )
 
     def build_metadata(
         self,
@@ -1606,18 +1851,49 @@ class BeamSearchHandler:
             group_seq_lens_cuda = seq_lens[group_req_indices].to(
                 device="cuda", non_blocking=True
             )  # Should be on device for beam search
+        max_gen_len = 0
+        if store.cba is not None:
+            max_gen_len = max(
+                (
+                    requests[i].max_beam_num_tokens + 2 - requests[i].py_prompt_len
+                    for i in group_req_indices.tolist()
+                ),
+                default=0,
+            )
+        return self._make_metadata(
+            seq_slots_cuda=group_seq_slots_cuda,
+            seq_lens_cuda=group_seq_lens_cuda,
+            new_log_probs=new_log_probs,
+            end_ids_cuda=end_ids_cuda,
+            stop_words_metadata_cuda=stop_words_metadata_cuda,
+            max_gen_len=max_gen_len,
+        )
+
+    def _make_metadata(
+        self,
+        *,
+        seq_slots_cuda: torch.Tensor,
+        seq_lens_cuda: torch.Tensor,
+        new_log_probs: torch.Tensor,
+        end_ids_cuda: torch.Tensor,
+        stop_words_metadata_cuda: torch.Tensor | None,
+        max_gen_len: int,
+    ) -> BeamSearchMetadata:
+        store = self._store
+        assert store is not None
         return BeamSearchMetadata(
             cache_indirection=store.cache_indirection,
             cache_indirection_buffer=store.cache_indirection_buffer,
             cum_log_probs=store.cum_log_probs,
             new_log_probs=new_log_probs,
-            seq_slots=group_seq_slots_cuda,
-            seq_lens=group_seq_lens_cuda,
+            seq_slots=seq_slots_cuda,
+            seq_lens=seq_lens_cuda,
             finished_beams=store.first_finish_reasons,
             pending_harvest=store.pending_harvest,
             predecessor_beams=store.predecessor_beams,
             beam_idx_arange=store.beam_idx_arange,
             stop_words_metadata=stop_words_metadata_cuda,
+            graph_runner=self._graph_runner,
             # None unless a beam-search request has been
             # admitted; the CBA tensors are not allocated before that.
             cba=None
@@ -1639,15 +1915,106 @@ class BeamSearchHandler:
                 cba_log_probs=store.cba.cba_log_probs,
                 cba_caps=store.cba.cba_caps,
                 max_seq_len=self._max_seq_len,
-                max_gen_len=max(
-                    (
-                        requests[i].max_beam_num_tokens + 2 - requests[i].py_prompt_len
-                        for i in group_req_indices.tolist()
-                    ),
-                    default=0,
-                ),
+                max_gen_len=max_gen_len,
             ),
         )
+
+    def warmup(
+        self,
+        *,
+        vocab_size: int,
+        log_probs_store: LogProbsStore,
+        new_log_probs: torch.Tensor,
+        end_ids_cuda: torch.Tensor,
+    ) -> None:
+        """Run the default beam-search step before any request arrives.
+
+        Compiles the CBA step math and loads the top-k kernels at startup
+        rather than on the first beam-search request. The step runs for the
+        context and generation beam widths of ``max_beam_width``, in the
+        default ``early_stopping`` mode, over enough batch sizes and snapshot
+        widths for torch.compile to settle on dynamic-shape graphs. Those
+        signatures are then marked prewarmed, so the graph runner captures
+        their steps on first use. Steps with other beam widths or stopping
+        modes, or with multi-token stop words, still warm up lazily.
+
+        Uses the leading sequence slots, which no request holds yet: admission
+        resets every slot field the step reads (see ``prepare_beam_search``).
+        ``new_log_probs`` and ``end_ids_cuda`` are the tensors the sampler
+        passes to :meth:`build_metadata`.
+        """
+        store = self._store
+        assert store is not None
+        store.ensure_cba()
+        max_num_sequences, max_beam_width = store.cum_log_probs.shape
+        early_stopping = BeamSearchEarlyStop.TRUE
+        prompt_len = 1
+        batch_sizes = [b for b in _WARMUP_BATCH_SIZES if b <= max_num_sequences]
+        # A step at max_gen_len g holds prompt_len + g - 2 tokens (see
+        # build_metadata) and writes at that position.
+        gen_lens = [
+            g
+            for g in _WARMUP_GEN_LENS
+            if g <= self._max_seq_len and prompt_len + g - 2 < self._max_seq_len
+        ]
+        generator = torch.Generator(device="cuda").manual_seed(0)
+        # (beam_width_in, beam_width_out): the context step expands one row per
+        # request, later steps keep max_beam_width beams.
+        step_widths = ((1, max_beam_width), (max_beam_width, max_beam_width))
+        for beam_width_in, beam_width_out in step_widths:
+            for batch_size in batch_sizes:
+                slots = torch.arange(batch_size, device="cuda", dtype=torch.int64)
+                for gen_len in gen_lens:
+                    prepare_beam_search(
+                        store,
+                        log_probs_store,
+                        seq_slots_long=slots,
+                        max_prompt_len=prompt_len,
+                        prompt_lens_cuda=torch.full(
+                            (batch_size,), prompt_len, device="cuda", dtype=torch.int32
+                        ),
+                        beam_caps_cuda=torch.full(
+                            (batch_size,), max_beam_width, device="cuda", dtype=torch.int32
+                        ),
+                    )
+                    seq_len = prompt_len + gen_len - 2
+                    metadata = self._make_metadata(
+                        seq_slots_cuda=slots,
+                        seq_lens_cuda=torch.full(
+                            (batch_size,), seq_len, device="cuda", dtype=torch.int32
+                        ),
+                        new_log_probs=new_log_probs,
+                        end_ids_cuda=end_ids_cuda,
+                        stop_words_metadata_cuda=None,
+                        max_gen_len=gen_len,
+                    )
+                    logits = torch.randn(
+                        (batch_size * beam_width_in, vocab_size),
+                        generator=generator,
+                        device="cuda",
+                        dtype=torch.float32,
+                    )
+                    beam_search_sampling_batch_cba(
+                        logits,
+                        beam_width_in=beam_width_in,
+                        beam_width_out=beam_width_out,
+                        beam_search_args=metadata,
+                        temperature=None,
+                        early_stopping=early_stopping,
+                        return_probs=False,
+                    )
+            if self._graph_runner is not None:
+                self._graph_runner.mark_prewarmed(
+                    BeamStepGraphRunner.signature(
+                        logits_dtype=torch.float32,
+                        vocab_size=vocab_size,
+                        beam_width_in=beam_width_in,
+                        beam_width_out=beam_width_out,
+                        early_stopping=early_stopping,
+                        max_seq_len=self._max_seq_len,
+                        has_stop_words=False,
+                    )
+                )
 
     def clear_slot(self, slot: int) -> None:
         """Drop stale predictor state from a prior occupant of ``slot``."""

@@ -1317,6 +1317,7 @@ class PyExecutor:
                 self.model_engine.warmup(self.resource_manager)
                 if self.draft_model_engine is not None:
                     self.draft_model_engine.warmup(self.resource_manager)
+                self._warmup_sampler()
                 self._initialize_remote_tail_adp()
 
             # Ensure the default stream waits for execution_stream to complete
@@ -4997,6 +4998,19 @@ class PyExecutor:
             and getattr(self, "kv_cache_transceiver", None) is None
             and getattr(self, "drafter", None) is None
             and getattr(self, "_pp_rebalance_drain_iters", None) is None)
+
+    def _warmup_sampler(self) -> None:
+        """Let the sampler prepare its kernels before any request arrives.
+
+        Skipped when the model has no LM head on this rank to give the logits
+        width.
+        """
+        model = getattr(self.model_engine, "model", None)
+        vocab_size = getattr(model, "vocab_size_padded", None)
+        if vocab_size is None:
+            return
+        with _StartupTimer("sampler_warmup"):
+            self.sampler.warmup(vocab_size=vocab_size)
 
     def _initialize_remote_tail_adp(self) -> None:
         """Reserve the execution-only idle row after final KV/graph warmup."""
