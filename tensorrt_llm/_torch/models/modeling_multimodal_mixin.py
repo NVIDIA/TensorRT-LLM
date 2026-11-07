@@ -49,6 +49,7 @@ from tensorrt_llm.inputs.multimodal import (
 )
 from tensorrt_llm.logger import logger
 
+from ..hostfunc import hostfuncs_pending
 from ..nccl_window_tensor_scope import discard_nccl_window_tensor_outputs
 from ..pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS, RuntimeHooks, runtime_hooks_of
 from .modeling_multimodal_utils import (
@@ -1809,6 +1810,10 @@ def maybe_prefetch_mm_encoder_for_next_iter(
     if max_prefetch_ahead is None:
         max_prefetch_ahead = 0
     if max_prefetch_ahead <= 0:
+        return 0
+    # The encoder can hold the GIL while it waits on the device. While host functions of a replayed
+    # graph are pending, these requests are encoded when scheduled instead, after a drain.
+    if hostfuncs_pending():
         return 0
 
     aux_stream = _get_mm_aux_stream(max_prefetch_ahead)

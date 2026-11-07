@@ -28,15 +28,27 @@ CUDA graph is being captured (a host wait is illegal there, and the captured
 host nodes do not run until replay), and for the non-capturable decoder, which
 runs its build inline and enqueues no callback. They also pin that every
 worker-side guided-decoding path goes through the drained methods.
+
+Host functions of a replayed CUDA graph are drained before multimodal encoder
+work. An eager forward with no constrained request enqueues none, still drains
+a replayed graph, and cannot be captured.
 """
 
+from queue import Queue
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.guided_decoder import CapturableGuidedDecoder, GuidedDecoder
+from tensorrt_llm._torch import hostfunc
+from tensorrt_llm._torch.models import modeling_multimodal_utils
+from tensorrt_llm._torch.pyexecutor.guided_decoder import (
+    CapturableGuidedDecoder,
+    GuidedDecoder,
+    GuidedRequests,
+)
 from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 class _Worker(SpecWorkerBase):
@@ -72,6 +84,7 @@ def _decoder(cls):
     decoder.token_event = MagicMock(name="token_event")
     decoder.bitmask_event = MagicMock(name="bitmask_event")
     decoder.requests = []
+    decoder.active = True
     decoder.max_num_draft_tokens = 1
     for name in (
         "fetch_batch",
@@ -140,6 +153,102 @@ def test_no_drain_while_capturing_a_cuda_graph(method):
     _run(_call(decoder, method), capturing=True)
 
     decoder.bitmask_event.synchronize.assert_not_called()
+
+
+@pytest.mark.parametrize("method", _ENQUEUE_METHODS)
+def test_inactive_forward_enqueues_nothing(method):
+    """An inactive forward enqueues no host function but still drains a replayed graph."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.active = False
+
+    with patch("tensorrt_llm._torch.pyexecutor.guided_decoder.drain_captured_hostfuncs") as drain:
+        result = _run(_call(decoder, method), capturing=False)
+
+    for name in ("fetch_batch", "fetch_draft_batch", "fetch_accepted_batch", "build"):
+        getattr(decoder, name).assert_not_called()
+    decoder.bitmask_event.record.assert_not_called()
+    decoder.bitmask_event.synchronize.assert_not_called()
+    drain.assert_called_once_with()
+    assert result in (None, [])
+
+
+@pytest.mark.parametrize("method", _ENQUEUE_METHODS)
+def test_capturing_an_inactive_forward_raises(method):
+    """A graph captured from an inactive forward would replay without guided decoding."""
+    decoder = _decoder(CapturableGuidedDecoder)
+    decoder.active = False
+
+    with pytest.raises(
+        RuntimeError, match="Cannot capture a CUDA graph while guided decoding is inactive"
+    ):
+        _run(_call(decoder, method), capturing=True)
+
+    decoder.fetch_batch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "is_cuda_graph,constrained",
+    [(False, False), (False, True), (True, False), (True, True)],
+)
+def test_add_batch_activates_for_cuda_graphs_and_constrained_batches(is_cuda_graph, constrained):
+    """A graph replays the guided work it captured, whatever the batch holds."""
+    decoder = object.__new__(CapturableGuidedDecoder)
+    decoder.max_num_draft_tokens = 1
+    decoder.queue = Queue()
+    snapshot = MagicMock(name="guided_requests")
+    snapshot.valid_requests.side_effect = lambda: iter([object()] if constrained else [])
+
+    with patch.object(GuidedRequests, "from_scheduled_requests", return_value=snapshot):
+        decoder.add_batch(MagicMock(name="scheduled_requests"), is_cuda_graph=is_cuda_graph)
+
+    expected = is_cuda_graph or constrained
+    assert decoder.active == expected
+    assert decoder.queue.qsize() == int(expected)
+
+
+@pytest.mark.parametrize("capturing", [False, True])
+def test_drain_waits_for_the_last_replay_outside_capture(monkeypatch, capturing):
+    """The drain waits on the replay event, except during stream capture."""
+    event = MagicMock(name="replay_event")
+    monkeypatch.setattr(hostfunc, "_replay_event", event)
+
+    with patch("torch.cuda.is_current_stream_capturing", return_value=capturing):
+        hostfunc.drain_captured_hostfuncs()
+
+    assert event.synchronize.call_count == int(not capturing)
+    assert hostfunc._replay_event is (event if capturing else None)
+
+
+@pytest.mark.parametrize(
+    "replayed,completed,expected",
+    [(False, False, False), (True, False, True), (True, True, False)],
+)
+def test_hostfuncs_pending_until_the_replay_completes(monkeypatch, replayed, completed, expected):
+    event = MagicMock(name="replay_event")
+    event.query.return_value = completed
+    monkeypatch.setattr(hostfunc, "_replay_event", event if replayed else None)
+
+    assert hostfunc.hostfuncs_pending() is expected
+
+
+_IMAGE = {"image": {"pixel_values": torch.zeros(1)}}
+_EMBEDDING = {"multimodal_embedding": torch.zeros(1, 4)}
+
+
+@pytest.mark.parametrize(
+    "multimodal_data,expected",
+    [
+        ([], False),
+        ([{}], False),
+        ([_EMBEDDING], False),
+        ([_IMAGE], True),
+        ([_EMBEDDING, _IMAGE], True),
+    ],
+)
+def test_needs_multimodal_encoder(multimodal_data, expected):
+    """Only a param with content and no attached embedding needs the encoder."""
+    params = [MultimodalParams(multimodal_data=data) for data in multimodal_data]
+    assert modeling_multimodal_utils.needs_multimodal_encoder(params) is expected
 
 
 def test_no_drain_for_the_non_capturable_decoder():

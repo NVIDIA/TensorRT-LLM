@@ -541,6 +541,40 @@ def test_item_encoder_classifies_output_count_contract_error() -> None:
         mm_item_scheduler.forward_items([request], {request.request_id: [0]})
 
 
+def test_item_encoder_drains_replayed_host_functions_first() -> None:
+    """The item path drains replayed host functions before it runs the encoder."""
+    calls = []
+
+    class _Model(MultimodalModelMixin):
+        def prepare_multimodal_encoder_inputs(
+            self, _: Sequence[tuple[MultimodalParams, int]]
+        ) -> list[tuple[SimpleNamespace, list[int], str]]:
+            encoder_input = SimpleNamespace(to_device=lambda *_args, **_kwargs: None)
+            return [(encoder_input, [1], "image")]
+
+        def forward_multimodal_encoder_items(
+            self, _: Sequence[tuple[MultimodalParams, Sequence[int], str]]
+        ) -> list[torch.Tensor]:
+            calls.append("encode")
+            return []
+
+    mm_item_scheduler = bare_mm_item_scheduler(_Model())
+    request = make_mm_request(1, [4])
+    _bind_items(mm_item_scheduler, request)
+
+    with (
+        patch(
+            "tensorrt_llm._torch.pyexecutor.engine.multimodal.drain_captured_hostfuncs",
+            side_effect=lambda: calls.append("drain"),
+        ),
+        # The empty output ends the forward right after the encoder call.
+        pytest.raises(MultimodalEncoderRequestError, match="one output per item"),
+    ):
+        mm_item_scheduler.forward_items([request], {request.request_id: [0]})
+
+    assert calls == ["drain", "encode"]
+
+
 @pytest.mark.parametrize("failure_stage", ["prepare", "forward"])
 def test_item_encoder_translates_model_contract_errors(failure_stage: str) -> None:
     class _Model(MultimodalModelMixin):
