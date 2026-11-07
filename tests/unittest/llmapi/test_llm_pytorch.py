@@ -7,7 +7,7 @@ import pathlib
 import random
 import time
 from contextlib import contextmanager, nullcontext
-from typing import Optional
+from typing import Generator, Optional
 
 import pytest
 
@@ -19,7 +19,7 @@ from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, SchedulerConfig,
                                           WaitingQueuePolicy)
 from tensorrt_llm.metrics import MetricNames
-from tensorrt_llm.sampling_params import SamplingParams
+from tensorrt_llm.sampling_params import EmbeddingBias, SamplingParams
 
 # isort: off
 from .lora_test_utils import (create_mock_nemo_lora_checkpoint,
@@ -139,41 +139,36 @@ def test_llm_abort_request(sampling_params):
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
-@contextmanager
-def _validate_invalid_token_error_scope():
-    with pytest.raises(RuntimeError) as exc_info:
-        yield
-    assert "Token ID out of range" in str(exc_info.value)
-
-
 @force_ampere
 @pytest.mark.part1
-def test_llm_invalid_input_token():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
-    prompts = [
-        [-1],
-    ]
-    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
-    #     to a traceback which outlives the scope of 'exc_info' and prevents
-    #     deletion of 'llm'. However, using the context manager protocol is
-    #     anyways more robust than delegating cleanup to __del__.
-    with llm:
-        with _validate_invalid_token_error_scope():
+class TestLlmInputValidation:
+
+    @pytest.fixture(scope="class")
+    def llm(self) -> Generator[LLM, None, None]:
+        with LLM(model=llama_model_path,
+                 kv_cache_config=global_kvcache_config) as llm:
+            yield llm
+
+    @staticmethod
+    @contextmanager
+    def _validate_invalid_token_error_scope():
+        with pytest.raises(RuntimeError) as exc_info:
+            yield
+        assert "Token ID out of range" in str(exc_info.value)
+
+    @pytest.mark.threadleak(enabled=False)
+    def test_llm_invalid_input_token(self, llm: LLM):
+        prompts = [
+            [-1],
+        ]
+        with self._validate_invalid_token_error_scope():
             llm.generate(
                 prompts,
                 sampling_params=SamplingParams(max_tokens=5),
             )
 
-
-@force_ampere
-@pytest.mark.part0
-def test_llm_invalid_input_token_async():
-    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
-    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
-    #     to a traceback which outlives the scope of 'exc_info' and prevents
-    #     deletion of 'llm'. However, using the context manager protocol is
-    #     anyways more robust than delegating cleanup to __del__.
-    with llm:
+    @pytest.mark.threadleak(enabled=False)
+    def test_llm_invalid_input_token_async(self, llm: LLM):
         prompts = [
             [-1],
             [42],
@@ -189,13 +184,43 @@ def test_llm_invalid_input_token_async():
                     ) for submit_idx in submit_order
                 ]
                 for collect_idx in collect_order:
-                    with _validate_invalid_token_error_scope(
+                    with self._validate_invalid_token_error_scope(
                     ) if submit_order[collect_idx] in fail_idx else nullcontext(
                     ):
                         print(
                             f"collect order {collect_order}, collecting {collect_idx}"
                         )
                         futures[collect_idx].result()
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "embedding_bias_in",
+        [
+            # NB: Tensors with fewer elements than vocab_size are currently implicitly zero-padded
+            torch.tensor([1] * 32001, dtype=torch.float32),  # invalid length
+            [1] * 32001,  # invalid length
+            ((42, -0.5), (-1, -2.5)),  # out of vocabulary
+            ((42, -0.5), (999999, -2.5)),  # out of vocabulary
+        ],
+    )
+    def test_llm_invalid_embedding_bias(
+        self,
+        embedding_bias_in: torch.Tensor | list[float] | EmbeddingBias,
+        llm: LLM,
+    ):
+        prompts = [
+            [0],
+        ]
+        with pytest.raises(
+                RuntimeError,
+                match=
+                ".*Embedding bias index must be in \\[0, vocab_size - 1\\].*",
+        ):
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(
+                    max_tokens=5, embedding_bias=embedding_bias_in),
+            )
 
 
 @skip_ray
@@ -296,9 +321,7 @@ def test_embedding_bias_with_torch_sampler_strategies():
     """Test embedding bias application in TorchSampler."""
     tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
-    vocab_size_padded = 32000
-    embedding_bias = torch.zeros(vocab_size_padded)
-    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+    embedding_bias = ((biased_word_id, torch.finfo(torch.float32).max), )
 
     sampling_kwargs = {
         "max_tokens": 6,

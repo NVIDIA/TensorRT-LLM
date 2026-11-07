@@ -47,6 +47,7 @@ import torch
 
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
+from tensorrt_llm.sampling_params import EmbeddingBias
 
 from ..llm_request import LlmRequest
 from .sampler_common import DEFAULT_BEAM_IDX
@@ -496,11 +497,8 @@ def apply_embedding_bias(
         _next_bias_index += 1
         return bias_index
 
-    # Indices of unique bias tensors
-    #
-    # NB: hash(torch.Tensor) is equivalent to id(torch.Tensor), and does not
-    #     depend on tensor contents, cf. https://github.com/pytorch/pytorch/issues/2569
-    bias_to_index: dict[torch.Tensor, int] = defaultdict(provision_bias_index)
+    # Indices of unique bias rows
+    bias_to_index: dict[EmbeddingBias, int] = defaultdict(provision_bias_index)
 
     # Source indices for bias application
     bias_gather_indices: list[int] = []
@@ -523,10 +521,6 @@ def apply_embedding_bias(
 
     if not bias_to_index:
         return
-    # NB: take the reference shape from the collected biases rather than from the
-    #     loop variable: that holds the *last* request's bias, which is None
-    #     whenever a biased request is followed by an unbiased one.
-    bias_tensors = tuple(bias_to_index)
 
     bias_gather_indices_cuda = torch.tensor(
         bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
@@ -534,16 +528,39 @@ def apply_embedding_bias(
     logits_bias_mask_cuda = torch.tensor(
         logits_bias_masks, pin_memory=prefer_pinned(), dtype=torch.bool
     ).to(logits.device, non_blocking=True)
-    biases_tensor = torch.empty(
-        (len(bias_tensors), *bias_tensors[0].shape), pin_memory=prefer_pinned()
-    )
-    biases_tensor = torch.stack(
-        bias_tensors,
-        out=biases_tensor,
-    )
-    biases_tensor_cuda = biases_tensor.to(logits.device, non_blocking=True)
 
-    biases_tensor_cuda = torch.index_select(biases_tensor_cuda, 0, bias_gather_indices_cuda)
+    vocab_size = logits.size(-1)
+    unique_biases_tensor_cuda = torch.zeros(
+        (len(bias_to_index), vocab_size),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    unique_biases_flat_idx_cuda = torch.tensor(
+        [
+            vocab_size * unique_bias_idx + logit_idx
+            for sparse_bias, unique_bias_idx in bias_to_index.items()
+            for (logit_idx, bias_value) in sparse_bias
+        ],
+        pin_memory=prefer_pinned(),
+        dtype=torch.int32,
+    ).to(logits.device, non_blocking=True)
+    unique_biases_flat_values_cuda = torch.tensor(
+        [
+            bias_value
+            for sparse_bias, unique_bias_idx in bias_to_index.items()
+            for (logit_idx, bias_value) in sparse_bias
+        ],
+        pin_memory=prefer_pinned(),
+        dtype=logits.dtype,
+    ).to(logits.device, non_blocking=True)
+    unique_biases_tensor_cuda.view(-1).scatter_(
+        dim=0,
+        index=unique_biases_flat_idx_cuda,
+        src=unique_biases_flat_values_cuda,
+    )
+
+    biases_tensor_cuda = torch.index_select(unique_biases_tensor_cuda, 0, bias_gather_indices_cuda)
+
     # NB: Avoiding logits[bias_scatter_indices] += biases_tensor (and torch.Tensor.scatter_add_), because it
     #     is unclear if this allows for repeated indices, cf.
     #         https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.index_put_.html#torch-tensor-index-put
