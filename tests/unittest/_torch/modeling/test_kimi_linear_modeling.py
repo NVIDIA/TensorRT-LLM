@@ -91,11 +91,13 @@ def test_kimi_k3_routed_expert_exclusion_outranks_the_checkpoint_entry() -> None
 
 @pytest.mark.parametrize("min_latency", [False, True])
 def test_kimi_k3_packs_step_inputs_under_enable_min_latency(min_latency: bool) -> None:
-    """``enable_min_latency`` arms the packed decode-step input uploads; the step head stays."""
+    """``enable_min_latency`` arms the packed decode-step input uploads, the sampler's Philox
+    uploads included; the step head stays."""
     model = object.__new__(modeling_kimi_linear.KimiLinearForCausalLM)
     object.__setattr__(model, "model_config", ModelConfig(enable_min_latency=min_latency))
 
     hooks = model.runtime_hooks
 
     assert hooks.pack_step_inputs is min_latency
+    assert hooks.pack_spec_rng_uploads is min_latency
     assert hooks.decode_prologue is modeling_kimi_linear.spec_decode_head

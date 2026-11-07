@@ -4617,13 +4617,16 @@ class KimiLinearForCausalLM(SpecDecOneEngineForCausalLM[KimiLinearModel, Any]):
     def runtime_hooks(self) -> RuntimeHooks:
         """The base hooks plus the speculative decode step head in one kernel.
 
-        With ``enable_min_latency`` the decode step's small input uploads also go out as one
-        upload and one scatter at the graph replay (``pack_step_inputs``).
+        With ``enable_min_latency`` the decode step's small input uploads, the one-model
+        sampler's Philox seeds and offsets included, also go out as one upload and one scatter at
+        the graph replay (``pack_step_inputs``, ``pack_spec_rng_uploads``).
         """
+        min_latency = self.model_config.enable_min_latency
         return replace(
             super().runtime_hooks or DEFAULT_RUNTIME_HOOKS,
             decode_prologue=spec_decode_head,
-            pack_step_inputs=self.model_config.enable_min_latency,
+            pack_step_inputs=min_latency,
+            pack_spec_rng_uploads=min_latency,
         )
 
     def __init__(self, model_config: ModelConfig):
