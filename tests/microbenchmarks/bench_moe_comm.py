@@ -816,6 +816,16 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable Programmatic Dependent Launch (sets TRTLLM_ENABLE_PDL=1).",
     )
+    parser.add_argument(
+        "--lamport",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help=(
+            "NVLINK_ONE_SIDED Lamport transport for small steps (sets "
+            "TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT): auto = on where supported, on = ask for it, "
+            "off = fence only."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -944,6 +954,7 @@ def _run_benchmark_worker_under_current_mpi(
         "device_count": torch.cuda.device_count(),
         "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
+        "lamport": args.lamport,
         "payload_in_workspace": not bool(args.no_payload_in_workspace),
         "cupti_enabled": cupti_ctx is not None,
         "warning": cupti_warning,
@@ -1092,10 +1103,21 @@ def _run_benchmark_worker_under_current_mpi(
                 combine_times_us = detailed_stats["combine_us_kernel_span"]
 
             # Prepare output
+            uses_lamport = getattr(backend, "use_lamport_for_dispatch", None)
             output = {
                 "backend": backend_name,
                 "payload_in_workspace": payload_in_workspace,
                 "local_batch_size": int(local_num_tokens),
+                "lamport": bool(
+                    uses_lamport
+                    and uses_lamport(
+                        max(all_rank_num_tokens),
+                        hidden_states,
+                        hidden_states_sf,
+                        token_final_scales,
+                        None,
+                    )
+                ),
                 "dispatch_us": _gather_per_rank(dispatch_times_us, iter_stats=iter_stats),
                 "combine_us": _gather_per_rank(combine_times_us, iter_stats=iter_stats),
             }
@@ -1220,6 +1242,9 @@ def main() -> None:
 
     _worker_env = dict(_WORKER_ENV)
     _worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
+    _worker_env["TRTLLM_NVLINK_ONE_SIDED_A2A_LAMPORT"] = {"auto": "", "on": "1", "off": "0"}[
+        args.lamport
+    ]
 
     world_size = mpi_world_size()
     if world_size > 1:
