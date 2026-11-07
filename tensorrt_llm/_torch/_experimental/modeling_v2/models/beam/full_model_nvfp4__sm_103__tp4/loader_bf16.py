@@ -26,7 +26,7 @@ import os
 import struct
 import threading
 from collections import OrderedDict
-from typing import Mapping, Optional
+from typing import Generator, Mapping, Optional, Sequence
 
 import torch
 
@@ -48,7 +48,9 @@ class Entry:
 
     __slots__ = ("name", "path", "dtype", "shape", "begin", "end")
 
-    def __init__(self, name, path, dtype, shape, begin, end):
+    def __init__(
+        self, name: str, path: str, dtype: str, shape: Sequence[int], begin: int, end: int
+    ) -> None:
         self.name, self.path, self.dtype, self.shape = name, path, dtype, tuple(shape)
         self.begin, self.end = begin, end
 
@@ -83,7 +85,7 @@ def _read_header(path: str) -> tuple:
 class SafetensorsCatalog:
     """Index and headers of a caller-supplied checkpoint directory; metadata only."""
 
-    def __init__(self, checkpoint_dir: str):
+    def __init__(self, checkpoint_dir: str) -> None:
         self.checkpoint_dir = os.fspath(checkpoint_dir)
         index_path = os.path.join(self.checkpoint_dir, INDEX_FILE)
         try:
@@ -179,7 +181,7 @@ class TileReader:
     completed. Counts the bytes read and the peak staging footprint.
     """
 
-    def __init__(self, tile_bytes: int = TILE_BYTES, pin: bool = True):
+    def __init__(self, tile_bytes: int = TILE_BYTES, pin: bool = True) -> None:
         self.tile_bytes = tile_bytes
         self.buffers = [
             torch.empty(tile_bytes, dtype=torch.uint8, pin_memory=pin) for _ in range(2)
@@ -217,7 +219,9 @@ class TileReader:
             self.bytes_read += length
             self.reads += 1
 
-    def tiles(self, entry: Entry, row_start: int, row_stop: int):
+    def tiles(
+        self, entry: Entry, row_start: int, row_stop: int
+    ) -> Generator[tuple[int, int, torch.Tensor], None, None]:
         row_bytes = entry.row_bytes
         if row_bytes > self.tile_bytes:
             raise CheckpointFormatError(f"{entry.name}: one row ({row_bytes} B) exceeds the tile")
@@ -259,20 +263,22 @@ class TileReader:
 
 
 class _Prefetch(threading.Thread):
-    def __init__(self, reader, buf, fd, offset, length):
+    def __init__(
+        self, reader: TileReader, buf: torch.Tensor, fd: int, offset: int, length: int
+    ) -> None:
         super().__init__(daemon=True)
         self.args = (buf, fd, offset, length)
         self.reader = reader
-        self.error = None
+        self.error: BaseException | None = None
 
-    def run(self):
+    def run(self) -> None:
         try:
             self.reader._read(*self.args)
         except BaseException as exc:  # Worker boundary: tiles() re-raises on the consumer.
             self.error = exc
 
 
-def _decode_tile(raw: torch.Tensor, entry: Entry, rows: int, device) -> torch.Tensor:
+def _decode_tile(raw: torch.Tensor, entry: Entry, rows: int, device: torch.device) -> torch.Tensor:
     """Host tile bytes -> device tensor ``[rows, ...]`` in the stored dtype."""
     dev = raw.to(device, non_blocking=True)
     return dev.view(_TORCH_DTYPE[entry.dtype]).view(rows, *entry.shape[1:])

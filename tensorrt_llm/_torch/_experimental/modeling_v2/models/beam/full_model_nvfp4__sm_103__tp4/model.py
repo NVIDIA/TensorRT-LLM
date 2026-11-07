@@ -37,7 +37,7 @@ component's router agreement and expert dispatch synchronize per sparse layer.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, Sequence
 
 import torch
 
@@ -50,6 +50,9 @@ from tensorrt_llm.mapping import Mapping as ParallelMapping
 
 from .. import _attention
 
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+
 #: Logical decoder layers, all executed by every call.
 NUM_LAYERS = 52
 #: Tokens per call of the supported deployment (its native ``max_num_tokens``).
@@ -57,7 +60,7 @@ MAX_NUM_TOKENS = 8192
 #: KV cache page size of the supported deployment.
 TOKENS_PER_BLOCK = 32
 
-LogitRows = Union[None, str, Sequence[int]]
+LogitRows = Literal["all"] | Sequence[int] | None
 
 
 class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
@@ -73,24 +76,24 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
         self,
         config: Mapping[str, Any],
         mapping: ParallelMapping,
-        device: Optional[torch.device] = None,
+        device: torch.device | None = None,
         *,
         max_tokens: int = MAX_NUM_TOKENS,
-    ):
+    ) -> None:
         super().__init__(config, mapping, layers=None, device=device, max_tokens=max_tokens)
         if self.layers != tuple(range(NUM_LAYERS)):
             raise ValueError(f"the full model holds logical layers 0..{NUM_LAYERS - 1}")
         self.vocab_size = config["vocab_size"]
         self._checked_manager = None
 
-    def attention_windows(self, max_seq_len: int) -> list:
+    def attention_windows(self, max_seq_len: int) -> list[int]:
         """Per logical layer: the attention window its cache must keep (512 or ``max_seq_len``)."""
         return [
             self.window if self.schedule.is_sliding(layer) else max_seq_len
             for layer in range(NUM_LAYERS)
         ]
 
-    def check_cache_manager(self, manager) -> None:
+    def check_cache_manager(self, manager: KVCacheManagerV2) -> None:
         """Raise ValueError unless ``manager`` holds every logical layer as this model needs.
 
         Required: BF16, ``head_dim`` 128, 2 kv heads per rank on every layer, logical layers
@@ -134,7 +137,7 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
                     f"{window} (max_seq_len {manager.max_seq_len})"
                 )
 
-    def _select_rows(self, logit_rows: LogitRows, spans: Sequence[tuple]) -> list:
+    def _select_rows(self, logit_rows: LogitRows, spans: Sequence[tuple[int, int]]) -> list[int]:
         num_tokens = sum(n for _, n in spans)
         if logit_rows is None:
             ends, end = [], 0
@@ -162,9 +165,9 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
     def check_call(
         self,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
         attn_metadata: TrtllmAttentionMetadata,
-    ) -> tuple:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[tuple[int, int]]]:
         """Validate one call; return the flat ids, the flat positions and the request spans.
 
         ``input_ids``: ``[T]`` or ``[1, T]`` torch.int64 ids in ``[0, vocab)`` on the model's
@@ -233,12 +236,12 @@ class BeamFullModelNvfp4Sm103Tp4(BeamCheckpointLayoutNvfp4Sm103Tp4):
     def forward(
         self,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
         attn_metadata: TrtllmAttentionMetadata,
         *,
         logit_rows: LogitRows = None,
-        layer_capture: Optional[Callable[[int], Optional[dict]]] = None,
-        trace: Optional[list] = None,
+        layer_capture: Callable[[int], dict | None] | None = None,
+        trace: list[dict] | None = None,
     ) -> torch.Tensor:
         """One engine step through all 52 layers; FP32 softcapped logits ``[R, vocab]``.
 
