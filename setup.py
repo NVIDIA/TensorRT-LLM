@@ -15,11 +15,14 @@
 import os
 import platform
 import re
+import stat
 import subprocess
 import sys
 from pathlib import Path
 
 from setuptools import find_namespace_packages, find_packages, setup
+from setuptools.command.build_py import build_py
+from setuptools.command.install_lib import install_lib
 from setuptools.dist import Distribution
 
 
@@ -152,6 +155,104 @@ class BinaryDistribution(Distribution):
 
     def has_ext_modules(self):
         return True
+
+
+def hard_link(src: str, dst: str, keep_mode: bool = True) -> bool:
+    """Make ``dst`` a hard link to ``src``.
+
+    A file already at ``dst`` is removed first, never written in place, so no
+    write reaches another file that shares its inode.
+
+    Args:
+        keep_mode: False when ``dst`` must get the mode of a new file. A link
+            shares the mode of ``src``, so ``src`` is then linked only when it
+            already has that mode.
+
+    Returns:
+        False when ``src`` and ``dst`` cannot be linked, for example because
+        they are on different filesystems or ``keep_mode`` forbids it. The
+        caller then copies the file.
+    """
+    src_stat = os.lstat(src)
+    if stat.S_ISLNK(src_stat.st_mode):
+        # os.link does not follow a symlinked src on every platform, so we get
+        # its real path first.
+        src = os.path.realpath(src)
+        src_stat = os.stat(src)
+    if keep_mode:
+        linkable = True
+    else:
+        # os.umask() is the only way to read the umask, and it also sets a new
+        # one, so we set the old one back.
+        umask = os.umask(0)
+        os.umask(umask)
+        linkable = stat.S_IMODE(src_stat.st_mode) == 0o666 & ~umask
+    try:
+        dst_stat = os.lstat(dst)
+    except FileNotFoundError:
+        pass
+    else:
+        if linkable and os.path.samestat(src_stat, dst_stat):
+            return True
+        if dst_stat.st_dev != src_stat.st_dev:
+            return False
+        os.unlink(dst)
+    if not linkable:
+        return False
+    try:
+        os.link(src, dst)
+    except OSError:
+        return False
+    return True
+
+
+class HardLinkBuildPy(build_py):
+    """Hard-links package files into build/lib instead of copying them."""
+
+    def copy_file(self,
+                  infile: str,
+                  outfile: str,
+                  preserve_mode: bool = True,
+                  preserve_times: bool = True,
+                  link: str | None = None,
+                  level: int = 1) -> tuple[str, bool]:
+        # Editable installs pass their own link mode. Modules are copied with
+        # preserve_mode=False, which gives them the mode of a new file.
+        if link is None and hard_link(infile, outfile, keep_mode=preserve_mode):
+            return outfile, True
+        return super().copy_file(infile, outfile, preserve_mode, preserve_times,
+                                 link, level)
+
+
+class HardLinkInstallLib(install_lib):
+    """Hard-links build/lib into the folder bdist_wheel zips."""
+
+    def copy_tree(self, infile: str, outfile: str, *args,
+                  **kwargs) -> list[str]:
+        bdist_wheel = self.distribution.get_command_obj("bdist_wheel",
+                                                        create=False)
+        # Only bdist_wheel's folder, which it deletes after zipping, gets
+        # links. Other installs, and ones that leave out namespace-package
+        # files, copy as setuptools does.
+        if (bdist_wheel is None or self.get_exclusions()
+                or not Path(outfile).resolve().is_relative_to(
+                    Path(bdist_wheel.bdist_dir).resolve())):
+            return super().copy_tree(infile, outfile, *args, **kwargs)
+        outfiles = []
+        for root, _, files in os.walk(infile, followlinks=True):
+            dst_root = os.path.normpath(
+                os.path.join(outfile, os.path.relpath(root, infile)))
+            self.mkpath(dst_root)
+            for name in files:
+                # Like setuptools, skip NFS placeholders of deleted open files.
+                if name.startswith(".nfs"):
+                    continue
+                src_file = os.path.join(root, name)
+                dst_file = os.path.join(dst_root, name)
+                if not hard_link(src_file, dst_file):
+                    self.copy_file(src_file, dst_file)
+                outfiles.append(dst_file)
+        return outfiles
 
 
 on_windows = platform.system() == "Windows"
@@ -699,6 +800,10 @@ setup(
         "Programming Language :: Python :: 3.12",
     ],
     distclass=BinaryDistribution,
+    cmdclass={
+        "build_py": HardLinkBuildPy,
+        "install_lib": HardLinkInstallLib,
+    },
     options=get_build_state_options(),
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
