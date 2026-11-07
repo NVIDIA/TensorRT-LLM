@@ -745,10 +745,6 @@
     "D411": 2,
     "D415": 2
   },
-  "tests/integration/defs/perf/sanity_perf_check.py": {
-    "D205": 2,
-    "D212": 3
-  },
   "tests/integration/defs/perf/session_data_writer.py": {
     "D200": 2,
     "D205": 2,
