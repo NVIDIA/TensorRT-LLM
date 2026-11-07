@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 232" width="1000" height="232">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker><marker id="ahg" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#76B900" stroke-width="1"/></marker><marker id="ahb" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2F80ED" stroke-width="1"/></marker><marker id="ahi" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2d3142" stroke-width="1"/></marker></defs>
+<rect width="1000" height="232" fill="#f5f5f5"/>
+<text x="20" y="32" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">One token in one layer: 360 bytes</text>
+<rect x="20" y="92" width="768" height="52" fill="#eef6e0" stroke="#76B900" stroke-width="1.2"/>
+<text x="404" y="115" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="middle">NoPE base</text>
+<text x="404" y="133" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="middle">512 channels · 256 B</text>
+<rect x="788" y="92" width="96" height="52" fill="#eef6e0" stroke="#76B900" stroke-width="1.2"/>
+<text x="836" y="115" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="middle">RoPE base</text>
+<text x="836" y="133" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="middle">64 · 32 B</text>
+<rect x="884" y="92" width="96" height="52" fill="#e6f0fd" stroke="#2F80ED" stroke-width="1.2"/>
+<text x="932" y="115" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="middle">Residual</text>
+<text x="932" y="133" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="middle">64 · 32 B</text>
+<line x1="20" y1="76" x2="980" y2="76" stroke="#76B900" stroke-width="1.2"/>
+<line x1="20" y1="76" x2="20" y2="83" stroke="#76B900" stroke-width="1.2"/>
+<line x1="980" y1="76" x2="980" y2="83" stroke="#76B900" stroke-width="1.2"/>
+<text x="500" y="69" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">K for BMM1 (QK): all 640 channels in one FP4 MMA</text>
+<line x1="20" y1="160" x2="788" y2="160" stroke="#2F80ED" stroke-width="1.2"/>
+<line x1="20" y1="160" x2="20" y2="153" stroke="#2F80ED" stroke-width="1.2"/>
+<line x1="788" y1="160" x2="788" y2="153" stroke="#2F80ED" stroke-width="1.2"/>
+<text x="404" y="177" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#2d3142" text-anchor="middle">V for BMM2 (PV): NoPE only</text>
+<text x="20" y="214" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">+ 40 B of E4M3 block scales in the BMM1 layout: NoPE 32 B, RoPE 4 B, residual 4 B</text>
+<text x="980" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#76B900" text-anchor="end">360 B</text>
+</svg>

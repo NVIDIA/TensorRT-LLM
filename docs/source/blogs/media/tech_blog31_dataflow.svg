@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 322" width="1000" height="322">
+<defs><marker id="ah" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#4f5d75" stroke-width="1"/></marker><marker id="ahg" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#76B900" stroke-width="1"/></marker><marker id="ahb" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2F80ED" stroke-width="1"/></marker><marker id="ahi" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0,0.5 L7,4 L0,7.5" fill="none" stroke="#2d3142" stroke-width="1"/></marker></defs>
+<rect width="1000" height="322" fill="#f5f5f5"/>
+<rect x="20" y="172" width="140" height="104" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="32" y="190" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">INPUT</text>
+<text x="32" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Queries Q</text>
+<text x="32" y="229" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">NVFP4, 1×16 blocks</text>
+<rect x="185.6" y="172" width="124" height="104" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="197.6" y="190" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">BMM1 · FP4</text>
+<text x="197.6" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">QK</text>
+<text x="197.6" y="229" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">FP32 accumulate</text>
+<rect x="335.2" y="172" width="186" height="104" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="347.2" y="190" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">FUSED</text>
+<text x="347.2" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Online softmax</text>
+<text x="347.2" y="231" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">+ FP4 quantization</text>
+<text x="347.2" y="246" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">FP4 weights P</text>
+<text x="347.2" y="261" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">FP32 row max and sum</text>
+<rect x="546.8" y="172" width="124" height="104" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="558.8" y="190" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">BMM2 · FP4</text>
+<text x="558.8" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">PV</text>
+<text x="558.8" y="229" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">FP32 accumulate</text>
+<rect x="696.4" y="172" width="138" height="104" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="708.4" y="190" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">EPILOGUE · FP32</text>
+<text x="708.4" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Normalize</text>
+<text x="708.4" y="229" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">divide by row sum</text>
+<rect x="860" y="172" width="120" height="104" rx="6" fill="#ffffff" stroke="#bfc0c0" stroke-width="1"/>
+<text x="872" y="190" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#7a8399" text-anchor="start">OUTPUT</text>
+<text x="872" y="214" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">BF16 output</text>
+<path d="M162,209 L183.6,209" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M311.6,209 L333.2,209" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M523.2,209 L544.8,209" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M672.8,209 L694.4,209" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M836.4,209 L858,209" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="145.6" y="20" width="204" height="86" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="157.6" y="38" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">KV CACHE</text>
+<text x="157.6" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">Shared NVFP4 cache</text>
+<text x="157.6" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">NoPE + RoPE + RoPE residual</text>
+<text x="157.6" y="92" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">16×16 blocks for NoPE</text>
+<path d="M247.6,108 L247.6,170" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<rect x="508.8" y="20" width="200" height="86" rx="6" fill="#ffffff" stroke="#76B900" stroke-width="1"/>
+<text x="520.8" y="38" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="9" font-weight="500" letter-spacing="1.4" fill="#76B900" text-anchor="start">BMM2 OPERAND</text>
+<text x="520.8" y="62" font-family="'Geist','Inter',system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" font-weight="600" fill="#2d3142" text-anchor="start">NoPE view for PV</text>
+<text x="520.8" y="77" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">same FP4 values and scales</text>
+<text x="520.8" y="92" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">no requantization</text>
+<path d="M608.8,108 L608.8,170" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<path d="M351.6,58 L506.8,58" fill="none" stroke="#4f5d75" stroke-width="1" marker-end="url(#ah)"/>
+<text x="429.2" y="50" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="middle">transposed view</text>
+<text x="255.6" y="143" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">NoPE + RoPE + residual</text>
+<text x="616.8" y="143" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="start">NoPE</text>
+<text x="500" y="306" font-family="'Geist Mono','SFMono-Regular',Menlo,Consolas,monospace" font-size="10.5" font-weight="500" fill="#4f5d75" text-anchor="middle">NVFP4 operands: E2M1 values with E4M3 block scales; both BMMs are FP4 MMAs with FP32 accumulation.</text>
+</svg>
