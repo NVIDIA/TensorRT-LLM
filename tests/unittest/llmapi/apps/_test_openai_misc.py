@@ -93,6 +93,14 @@ def test_model(client: openai.OpenAI, model_name: str):
     assert model.id == model_name.split('/')[-1]
 
 
+def test_model_metadata(server: RemoteOpenAIServer):
+    response = requests.get(server.url_for("v1", "models"))
+    assert response.status_code == 200
+    assert response.json()["data"][0]["metadata"] == {
+        "speculative_config": None
+    }
+
+
 def test_tokenize(server: RemoteOpenAIServer):
     tokenize_url = server.url_for("_internal", "tokenize")
 
