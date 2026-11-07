@@ -471,8 +471,8 @@ def _make_manager_for_cache_tier_test(
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("available_tokens", [TOKENS_PER_BLOCK, MAX_SEQ_LEN])
-def test_page_index_capacity_covers_configured_sequence_length(available_tokens: int) -> None:
-    """Keep aligned page indices large enough even when pool capacity clamps the sequence."""
+def test_page_index_capacity_tracks_allocatable_sequence_length(available_tokens: int) -> None:
+    """Bound aligned page-index staging by the pool's allocatable sequence length."""
     manager, _ = _make_manager_for_cache_tier_test(
         KvCacheConfig(max_gpu_total_bytes=16 << 20, host_cache_size=0),
         [Mock()],
@@ -481,10 +481,9 @@ def test_page_index_capacity_covers_configured_sequence_length(available_tokens:
     try:
         assert manager.max_seq_len == available_tokens
         required_blocks = (
-            MAX_SEQ_LEN + manager._generation_kv_capacity_headroom + TOKENS_PER_BLOCK - 1
+            available_tokens + manager._generation_kv_capacity_headroom + TOKENS_PER_BLOCK - 1
         ) // TOKENS_PER_BLOCK
-        assert manager.max_blocks_per_seq >= required_blocks
-        assert manager.max_blocks_per_seq % 4 == 0
+        assert manager.max_blocks_per_seq == ((required_blocks + 3) // 4) * 4
     finally:
         manager.shutdown()
 
@@ -3416,8 +3415,8 @@ def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> boo
     return True
 
 
-def test_context_larger_than_kv_pool_returns_false_and_can_retry() -> None:
-    """Reject an oversized allocation without mutating cache state and allow a smaller retry."""
+def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits() -> None:
+    """Reject a never-fit context before allocation and keep the pool usable."""
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     torch.cuda.init()
@@ -3442,17 +3441,37 @@ def test_context_larger_than_kv_pool_returns_false_and_can_retry() -> None:
     request = _ContextRequest(1, list(range(max_seq_len)), max_seq_len, "small-pool")
     try:
         assert 0 < manager.max_seq_len < max_seq_len
+        budget_request = SimpleNamespace(
+            orig_prompt_len=max_seq_len, max_new_tokens=1, py_beam_width=1
+        )
+        required, capacity = manager.get_request_kv_block_budget(budget_request)
+        assert required > capacity
+        assert request.py_request_id not in manager.kv_cache_map
+
+        request = _ContextRequest(2, list(range(32)), 32, "short")
+        budget_request.orig_prompt_len = 32
+        required, capacity = manager.get_request_kv_block_budget(budget_request)
+        assert required <= capacity
         assert manager.prepare_context(request)
+        assert manager.resize_context(request, 32)
         cache = manager.kv_cache_map[request.py_request_id]
-        capacity, history = cache.capacity, cache.history_length
-
-        assert not manager.resize_context(request, max_seq_len)
-        assert (cache.capacity, cache.history_length) == (capacity, history)
-        assert not cache.is_active
-
-        assert manager.prepare_context(request)
-        assert manager.resize_context(request, manager.tokens_per_block)
         assert cache.capacity == manager.tokens_per_block + manager.num_extra_kv_tokens
+
+        manager.free_resources(request)
+        boundary = (
+            capacity * manager.tokens_per_block
+            - manager.num_extra_kv_tokens
+            - manager._kv_reserve_draft_tokens
+            - 1
+        )
+        budget_request.orig_prompt_len = boundary
+        assert manager.get_request_kv_block_budget(budget_request) == (capacity, capacity)
+        request = _ContextRequest(3, list(range(boundary)), boundary, "boundary")
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, boundary)
+        budget_request.orig_prompt_len += 1
+        required, capacity = manager.get_request_kv_block_budget(budget_request)
+        assert required > capacity
     finally:
         manager.free_resources(request)
         manager.shutdown()
