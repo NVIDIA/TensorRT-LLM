@@ -8,6 +8,7 @@ import cutlass.pipeline as pipeline
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import Boolean, Int32, extract_mlir_values, new_from_mlir_values
 
+from ...helpers.cluster_pipeline import producer_tail_cluster
 from ...helpers.device_workspace import DeviceWorkspace
 from ...helpers.smem_workspace import SmemWorkspace
 from .non_clc_mixed_cga import NonClcMixedCgaConfig
@@ -125,7 +126,11 @@ class ClcMixedCgaSchedulerWorker:
         """Leader waits for the cluster's final release, since peers release on rank 0's empty barrier."""
         work_id_state = self._work_id_state
         if self._work_id_state.is_leader_cta:
-            self._work_id_state.cluster_pipeline.producer_tail(self._work_id_state.producer_state)
+            producer_tail_cluster(
+                self._work_id_state.cluster_pipeline,
+                self._work_id_state.producer_state,
+                self._work_id_state.cluster_size,
+            )
         else:
             self._work_id_state = work_id_state
 

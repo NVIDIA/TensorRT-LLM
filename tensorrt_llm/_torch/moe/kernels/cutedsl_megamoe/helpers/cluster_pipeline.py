@@ -1,0 +1,167 @@
+"""Cluster-scope waits and releases for pipelines whose stage is handed between CTAs.
+
+A ``cutlass.pipeline`` stage that one CTA publishes into another CTA's shared memory
+(``st.async`` or ``cp.async.bulk`` with ``mbarrier::complete_tx``) is released at cluster
+scope by a thread of the publishing CTA. The pipeline's default ``consumer_wait`` acquires at
+CTA scope, and its default ``consumer_release`` arrives on the publisher's empty barrier with
+a CTA-scope release that the publisher's default ``producer_acquire`` acquires at CTA scope.
+Under the PTX memory model a release and an acquire synchronize only when each scope includes
+the other thread, so neither half of such a handoff is ordered without cluster scope.
+
+The helpers here keep the pipeline object and its state and change only the scope: the full
+and empty barriers, stage index and phase are the pipeline's own. For a static single-CTA
+cluster they fall back to the pipeline's default operations, which are correct and cheaper.
+"""
+
+from typing import Optional, Union
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.pipeline as pipeline
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import nvvm as _nvvm
+from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
+
+# The suspend hint of the pipeline's default wait (``cute.arch.mbarrier_wait``).
+_WAIT_TIME_LIMIT_NS = 10_000_000
+
+
+def _is_static_single_cta(cluster_size: Union[int, Int32, None]) -> bool:
+    return isinstance(cluster_size, int) and cluster_size == 1
+
+
+@dsl_user_op
+def mbarrier_try_wait_acquire_cluster(
+    mbar_ptr: cute.Pointer,
+    phase: Int32,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> Boolean:
+    """Test one phase of this CTA's mbarrier with ``.acquire.cluster`` semantics.
+
+    Emits ``mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64`` through the NVVM
+    dialect, with the default wait's suspend hint. Returns whether the phase completed.
+    """
+    return Boolean(
+        _nvvm.mbarrier_try_wait_parity_timelimit(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            Int32(_WAIT_TIME_LIMIT_NS).ir_value(loc=loc, ip=ip),
+            scope=_nvvm.MBarrierScopeKind.CLUSTER,
+            order=_nvvm.MemOrderKind.ACQUIRE,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@cute.jit
+def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int32) -> None:
+    """Wait for a phase of this CTA's mbarrier with ``.acquire.cluster`` semantics.
+
+    Use it where the phase is completed by a thread of another CTA: a peer's ``st.async``
+    complete-tx or a peer's remote arrive. The default ``.acquire.cta`` wait does not
+    synchronize with those releases, so shared memory they wrote would be read unordered.
+    """
+    phase_complete = mbarrier_try_wait_acquire_cluster(mbar_ptr, phase)
+    while not phase_complete:
+        phase_complete = mbarrier_try_wait_acquire_cluster(mbar_ptr, phase)
+
+
+@cute.jit
+def consumer_wait_cluster(
+    pipe: pipeline.PipelineAsync,
+    state: pipeline.PipelineState,
+    cluster_size: Union[int, Int32, None] = None,
+) -> None:
+    """``consumer_wait`` for a stage another CTA publishes into this CTA's shared memory.
+
+    Waits on the pipeline's full barrier for ``state`` with ``.acquire.cluster`` semantics,
+    so the read of the published stage is ordered after the publisher's cluster-scope
+    release. ``cluster_size`` may be passed to keep the default wait for a static
+    single-CTA cluster.
+    """
+    if cutlass.const_expr(_is_static_single_cta(cluster_size)):
+        pipe.consumer_wait(state)
+    else:
+        mbarrier_wait_acquire_cluster(pipe.sync_object_full.get_barrier(state.index), state.phase)
+
+
+@cute.jit
+def consumer_release_cluster(
+    pipe: pipeline.PipelineAsync,
+    state: pipeline.PipelineState,
+    cluster_size: Union[int, Int32, None] = None,
+    publisher_cta_rank: int = 0,
+) -> None:
+    """``consumer_release`` for a stage that the publishing CTA will overwrite.
+
+    Arrives on the publisher's empty barrier for ``state`` with ``.release.cluster``
+    semantics, so this CTA's read of the stage is ordered before the publisher's next
+    store into it. ``cluster_size`` may be passed to keep the default arrive for a static
+    single-CTA cluster.
+    """
+    if cutlass.const_expr(_is_static_single_cta(cluster_size)):
+        pipe.sync_object_empty.arrive(state.index, Int32(publisher_cta_rank))
+    else:
+        cute.arch.mbarrier_arrive(
+            pipe.sync_object_empty.get_barrier(state.index),
+            Int32(publisher_cta_rank),
+            scope=_nvvm.MemScopeKind.CLUSTER,
+        )
+
+
+@cute.jit
+def producer_acquire_cluster(
+    pipe: pipeline.PipelineAsync,
+    state: pipeline.PipelineState,
+    cluster_size: Union[int, Int32, None] = None,
+) -> None:
+    """``producer_acquire`` for a stage that consumers in other CTAs release.
+
+    Waits on the pipeline's empty barrier for ``state`` with ``.acquire.cluster`` semantics,
+    so the next store into the stage is ordered after every consumer's cluster-scope release,
+    then runs the pipeline's own ``producer_acquire`` with the wait skipped (for a CLC fetch
+    pipeline that is the arrive with transaction count on every CTA's full barrier).
+    ``cluster_size`` may be passed to keep the default acquire for a static single-CTA
+    cluster.
+    """
+    if cutlass.const_expr(_is_static_single_cta(cluster_size)):
+        pipe.producer_acquire(state)
+    else:
+        mbarrier_wait_acquire_cluster(pipe.sync_object_empty.get_barrier(state.index), state.phase)
+        pipe.producer_acquire(state, try_acquire_token=True)
+
+
+@cute.jit
+def producer_tail_cluster(
+    pipe: pipeline.PipelineAsync,
+    state: pipeline.PipelineState,
+    cluster_size: Union[int, Int32, None] = None,
+) -> None:
+    """``producer_tail`` for a stage that consumers in other CTAs release.
+
+    Drains every stage's empty barrier before the producer exits, as the pipeline's own
+    ``producer_tail`` does, with ``.acquire.cluster`` waits to match the consumers'
+    cluster-scope releases. ``cluster_size`` may be passed to keep the default tail for a
+    static single-CTA cluster.
+    """
+    if cutlass.const_expr(_is_static_single_cta(cluster_size)):
+        pipe.producer_tail(state)
+    else:
+        for _ in cutlass.range_constexpr(pipe.num_stages):
+            mbarrier_wait_acquire_cluster(
+                pipe.sync_object_empty.get_barrier(state.index), state.phase
+            )
+            state.advance()
+
+
+__all__ = [
+    "consumer_release_cluster",
+    "consumer_wait_cluster",
+    "mbarrier_try_wait_acquire_cluster",
+    "mbarrier_wait_acquire_cluster",
+    "producer_acquire_cluster",
+    "producer_tail_cluster",
+]
