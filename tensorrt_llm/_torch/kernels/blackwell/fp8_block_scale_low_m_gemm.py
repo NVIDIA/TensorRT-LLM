@@ -603,6 +603,30 @@ def _mbarrier_arrive_remote(local_mbar, peer, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _mbarrier_try_wait_cluster(mbar, parity, *, loc=None, ip=None):
+    """Try-wait on a local mbarrier with a cluster-scope acquire; 1 once the phase completed.
+
+    The mailbox barriers are completed by peer CTAs (``cp.async.bulk`` / ``st.async`` with
+    ``mbarrier::complete_tx``), which is a release at cluster scope. The default wait acquires
+    at CTA scope only and does not synchronize with it (PTX ISA, ``mbarrier.try_wait`` scope).
+    """
+    return Int32(
+        _asm(
+            T.i32(),
+            [_iv(mbar, loc=loc, ip=ip), _iv(parity, loc=loc, ip=ip)],
+            "{\n"
+            ".reg .pred p;\n"
+            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n"
+            "selp.u32 $0, 1, 0, p;\n"
+            "}",
+            "=r,r,r,~{memory}",
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
 def _s2t_partition_sf(sSF: cute.Tensor, tSF: cute.Tensor):
     """S2T (SMEM -> TMEM) copy of a scale-factor operand, partitioned for one thread."""
     tCsSF_compact = cute.filter_zeros(sSF)
@@ -1656,7 +1680,11 @@ class Fp8BlockScaleLowMGemmKernel(_Nvfp4OutputMixin):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(mbox_full, 0)
+                # The peers' bulk copies complete mbox_full with a cluster-scope release:
+                # acquire at cluster scope before reading their partials.
+                ready = _mbarrier_try_wait_cluster(mbar_addr, 0)
+                while ready == 0:
+                    ready = _mbarrier_try_wait_cluster(mbar_addr, 0)
                 for c in cutlass.range_constexpr(nchunks):
                     _, col0 = tTR_cAcc[4 * c]
                     if col0 < m:
@@ -2789,7 +2817,11 @@ class Fp8BlockScaleMidMGemmKernel(_Nvfp4OutputMixin):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         storage.mbox_full, my_chunks * ((S - 1) * MMA_M * 16)
                     )
-                cute.arch.mbarrier_wait(storage.mbox_full, 0)
+                # The peers' st.async stores complete mbox_full with a cluster-scope release:
+                # acquire at cluster scope before reading their partials.
+                ready = _mbarrier_try_wait_cluster(mbar_addr, 0)
+                while ready == 0:
+                    ready = _mbarrier_try_wait_cluster(mbar_addr, 0)
                 for i in cutlass.range_constexpr(self.chunks_cap):
                     if i < my_chunks:
                         acc = [rOwn[i * 4 + v] for v in range(4)]

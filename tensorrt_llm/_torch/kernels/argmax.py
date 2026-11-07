@@ -115,6 +115,30 @@ if IS_CUTLASS_DSL_AVAILABLE:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
+    @dsl_user_op
+    def mbarrier_try_wait_cluster(
+        mbar_ptr: cute.Pointer, phase: Int, *, loc=None, ip=None
+    ) -> Int32:
+        """Try-wait with a cluster-scope acquire; returns 1 once ``phase`` has completed.
+
+        ``store_shared_remote`` from a peer CTA completes the barrier with a release at
+        cluster scope, which the default (CTA-scope) wait does not synchronize with.
+        """
+        mbar_ptr_i32 = mbar_ptr.toint(loc=loc, ip=ip).ir_value()
+        return Int32(
+            llvm.inline_asm(
+                T.i32(),
+                [mbar_ptr_i32, Int32(phase).ir_value(loc=loc, ip=ip)],
+                "{\n\t.reg .pred p;\n\t"
+                "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n\t"
+                "selp.u32 $0, 1, 0, p;\n}",
+                "=r,r,r,~{memory}",
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
+        )
+
     @cute.jit
     def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
         tApA = cute.make_rmem_tensor(
@@ -525,7 +549,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         peer_cta_rank_in_cluster=lane_idx,
                     )
 
-                cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+                # The peers' st.async complete the barrier with a cluster-scope release:
+                # acquire at cluster scope before reading their values.
+                ready = mbarrier_try_wait_cluster(mbar_ptr, 0)
+                while ready == 0:
+                    ready = mbarrier_try_wait_cluster(mbar_ptr, 0)
                 block_reduce_val = -tXsX.element_type.inf
                 block_reduce_argmax = Int32(0xFFFFFFFF)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)

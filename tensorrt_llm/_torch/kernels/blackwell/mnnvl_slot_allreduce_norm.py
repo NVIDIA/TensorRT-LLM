@@ -122,11 +122,14 @@ def _mbar_expect_tx(addr: Int32, nbytes: Int32, *, loc=None, ip=None) -> None:
 
 @dsl_user_op
 def _mbar_try_wait(addr: Int32, parity: Int32, *, loc=None, ip=None) -> Int32:
+    """Try-wait with a cluster-scope acquire: the barrier is completed by the peers' ``st.async``
+    (a release at cluster scope), which the default CTA-scope wait does not synchronize with."""
     return Int32(
         llvm.inline_asm(
             T.i32(),
             [Int32(addr).ir_value(loc=loc, ip=ip), Int32(parity).ir_value(loc=loc, ip=ip)],
-            "{\n\t.reg .pred p;\n\tmbarrier.try_wait.parity.shared::cta.b64 p, [$1], $2;\n\t"
+            "{\n\t.reg .pred p;\n\t"
+            "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 p, [$1], $2;\n\t"
             "selp.u32 $0, 1, 0, p;\n\t}",
             "=r,r,r,~{memory}",
             has_side_effects=True,
