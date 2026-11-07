@@ -34,6 +34,8 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheM
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.quantization.mode import QuantMode
 
+pytestmark = pytest.mark.cpu_only
+
 _FLASHINFER_TRTLLM_GEN_MODULE = "tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen"
 
 
@@ -63,7 +65,6 @@ def test_flashinfer_fp8_mode_remains_implementation_local() -> None:
         (1, 0, torch.float16, False),
     ],
 )
-@pytest.mark.cpu_only
 @pytest.mark.parametrize("page_size,paged_context", [(32, False), (128, True)])
 def test_small_context_fallback_preserves_mixed_batch_generation(
     monkeypatch: pytest.MonkeyPatch,
