@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+// Test-only: load the companion Slurm agent fix for GCP validation.
+@Library(['bloom-jenkins-shared-lib@dev-yanchaol-slurm-agent-profiler', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -2501,7 +2502,7 @@ def findCachedPLCSourceScanResult(commit) {
     return [result: buildInfo.result, url: buildInfo.url]
 }
 
-def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:]) {
+def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additionalParameters = [:], boolean propagateFailure = true) {
     def parameters = getCommonParameters()
     // Build a local copy to avoid racey growth from shared parallel mutations.
     // In particular, CACHED_CHANGED_FILE_LIST can become very large and may
@@ -2546,15 +2547,16 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
     // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
     // not a failure: throwing here is exactly what trips the per-arch failFast and
     // cancels the healthy sibling architecture, so do NOT throw. Mark the build
-    // UNSTABLE (visible + re-runnable) and let the sibling finish. FAILURE and
-    // ABORTED still throw below, so real failures fail-fast exactly as before.
+    // UNSTABLE (visible + re-runnable) and let the sibling finish. With default
+    // propagation, FAILURE and ABORTED still throw below; callers opting out
+    // inspect and handle those returned statuses themselves.
     if (buildStatus == "UNSTABLE") {
         catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
             error "Downstream job ${jobName} is infra-incomplete (UNSTABLE); sibling not cancelled"
         }
         return buildStatus
     }
-    if (buildStatus != "SUCCESS") {
+    if (buildStatus != "SUCCESS" && propagateFailure) {
         error "Downstream job did not succeed"
     }
     return buildStatus
@@ -3100,6 +3102,8 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 def imageBuildStatus
+                // Nightly scans can inspect published images even when later build checks fail.
+                def scanAfterImageBuildFailure = runContainerScanning && runMode == "nightly_release" && !enableFailFast
                 def testStageName = "[Build-Docker-Images] Remote Run"
                 stage(testStageName) {
                     try {
@@ -3169,7 +3173,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         if (params.release_type_id) {
                             additionalParameters['release_type_id'] = params.release_type_id
                         }
-                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters)
+                        // Inspect the result before deciding whether nightly scans may continue.
+                        imageBuildStatus = launchJob(pipeline, "/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, additionalParameters, false)
+                        if (!(imageBuildStatus in ["SUCCESS", "UNSTABLE"])) {
+                            error "Build-Docker-Images job returned ${imageBuildStatus}"
+                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -3179,12 +3187,18 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                                 stageResult: 'FAILURE') {
                                 error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
                             }
+                        } else if (scanAfterImageBuildFailure && imageBuildStatus == "FAILURE") {
+                            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', catchInterruptions: false) {
+                                throw e
+                            }
                         } else {
                             throw e
                         }
                     }
                 }
-                if (!runContainerScanning || imageBuildStatus != "SUCCESS") {
+                def canScanImages = imageBuildStatus == "SUCCESS" ||
+                    (scanAfterImageBuildFailure && imageBuildStatus in ["FAILURE", "UNSTABLE"])
+                if (!runContainerScanning || !canScanImages) {
                     return
                 }
                 stage("[NGC-Container-Compliance-Check] Run") {

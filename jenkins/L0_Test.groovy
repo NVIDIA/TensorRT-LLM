@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+// Test-only: load the companion Slurm agent fix for GCP validation.
+@Library(['bloom-jenkins-shared-lib@dev-yanchaol-slurm-agent-profiler', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -523,7 +524,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--test-list=${singleTestFile}"]
         isolateTestCmdLine += ["--test-prefix=${stageName}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-        isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+        isolateTestCmdLine += ["--periodic-junit-xmlpath=${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
             sh """
@@ -684,7 +685,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
         "--group ${splitId}",
     ]
     if (durationsPath) {
-        testListCmd += ["--durations-path ${durationsPath}"]
+        testListCmd += ["--durations-path=${durationsPath}"]
     }
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
@@ -1845,8 +1846,7 @@ def getPytestBaseCommandLine(
     String pytestUtil = "",
     List<String> extraArgs = [],
     int containerPortStart = 0,
-    int containerPortNum = 0,
-    String clusterName = ""
+    int containerPortNum = 0
 ) {
     def extraInternalEnv = ""
     def pytestTestTimeout = "3600"
@@ -1858,10 +1858,6 @@ def getPytestBaseCommandLine(
     extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
     // Enable NCCL debug information for multi-GPU tests
     extraInternalEnv += " NCCL_DEBUG=INFO"
-    // GB200 stages run on multiple clusters; only gcp-iad needs the gIB NCCL network plugin over IB.
-    if (stageName.startsWith("GB200") && clusterName == "gcp-iad") {
-        extraInternalEnv += " NCCL_IB_DISABLE=0 NCCL_NET=gIB NCCL_PROFILER_PLUGIN=none"
-    }
     // Pass stage name to perf sanity tests for OpenSearch tracking
     extraInternalEnv += " stageName=${stageName}"
     // Let the test fixtures install optional media deps (opencv / av / ffmpeg).
@@ -1924,7 +1920,8 @@ def getPytestBaseCommandLine(
         // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
-        "--periodic-junit-xmlpath ${outputPath}/results.xml",
+        // Keep an existing report path out of pytest's initial collection-path discovery.
+        "--periodic-junit-xmlpath=${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
         // Reruns redirect --periodic-junit-xmlpath elsewhere but inherit this
@@ -2190,6 +2187,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
             def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
             def scriptFetchHelperPathNode = "${jobWorkspace}/${jobUID}-fetch_build_artifact.sh"
+            def scriptProfilerEnvLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_profiler_env.sh"
+            def scriptProfilerEnvPathNode = "${jobWorkspace}/${jobUID}-slurm_profiler_env.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def waivesListPathLocal = infraDryRun
@@ -2238,6 +2237,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 }
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
                 def llmTarfile = llmTarfileLocation.tokenize(" ")[0]
+
+                Utils.exec(pipeline, script: "echo \"Script for Slurm profiler environment: \" && cat ${scriptProfilerEnvLocalPath}")
+                Utils.copyFileToRemoteHost(
+                    pipeline,
+                    remote,
+                    scriptProfilerEnvLocalPath,
+                    scriptProfilerEnvPathNode,
+                    true
+                )
 
                 Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
                 Utils.copyFileToRemoteHost(
@@ -2468,7 +2476,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
                     def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
-                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                    clusterDurationsArgsNode = ["--durations-path=${clusterDurationsPathNode}"]
                 }
                 def extraArgs = [
                     "--test-list=$testListPathNode",
@@ -2492,9 +2500,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "$jobWorkspace/.coveragerc",
                     pytestUtil,
                     extraArgs,
-                    0,
-                    0,
-                    partition.clusterName,
                 )
                 pytestCommandParts += getInfraDryRunPytestTargets(testListPathLocal)
                 def pytestCommand = pytestCommandParts.join(" ")
@@ -2620,27 +2625,18 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'gitlabCommit',
                     'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
-                def envVarsToExport = [:]
-                envVarNames.each { varName ->
-                    envVarsToExport[varName] = env."${varName}"
-                }
-
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
-                    "--container-env=NVIDIA_IMEX_CHANNELS",
-                    "--container-env=SKIP_INSTALL"
+                    // Other CI variables inherit the exported job environment.
+                    // BASH_ENV must override the CI image's /etc/bash.bashrc default.
+                    // Put any image overrides in one comma-separated --container-env option;
+                    // Repeating --container-env forwards only the last value.
+                    "--container-env=BASH_ENV"
                 ]
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
-                    srunArgs.add("--container-env=S3_SECRET_KEY")
-                }
-                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
-                envVarsToExport.each { varName, varValue ->
-                    srunArgs.add("--container-env=${varName}")
-                }
 
                 def exemptionComment = ""
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
@@ -2652,8 +2648,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
                 }
 
-                def envExportStatements = envVarsToExport.collect { varName, varValue ->
-                    def escapedValue = varValue?.toString() ?: ''
+                def envExportStatements = envVarNames.collect { varName ->
+                    def escapedValue = env."${varName}"?.toString() ?: ''
                     escapedValue = escapedValue
                         .replace('\\', '\\\\')    // Backslash
                         .replace('"', '\\"')      // Double quote
@@ -2677,6 +2673,10 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
                     echo "Starting Slurm job \$SLURM_JOB_ID on \$SLURM_NODELIST"
                     export jobWorkspace=$jobWorkspace
+                    # Inherited SSH markers can make fresh bash -c processes skip
+                    # BASH_ENV and use startup files that re-enable the image profiler.
+                    unset SSH_CLIENT SSH2_CLIENT
+                    export BASH_ENV="$scriptProfilerEnvPathNode"
                     export tarName=$tarName
                     export llmTarArtifactPath=$llmTarArtifactPath
                     export LLM_ARTIFACTS_PRIMARY=${llmArtifactsPrimary()}
@@ -2772,6 +2772,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     scriptPrepareBodyPathNode,
                     scriptBashUtilsPathNode,
                     scriptFetchHelperPathNode,
+                    scriptProfilerEnvPathNode,
                     artifactoryNetrcPathNode,
                     fatArtifactoryNetrcPathNode,
                     scriptLaunchPathNode,
@@ -5208,7 +5209,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         newTestCmdLine += [
             "--test-list=${currentRerunTestList}",
             "--csv=${rerunDir}/rerun_report_${times}.csv",
-            "--periodic-junit-xmlpath ${xmlFile}",
+            "--periodic-junit-xmlpath=${xmlFile}",
             "--reruns ${times - 1}"
         ]
         def rerunProgressTar = "results-${stageName}${postTag}-progress.tar.gz"
@@ -5865,7 +5866,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
             clusterNameForDurations = clusterKey
             clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
-            clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
+            clusterDurationsArgs = ["--durations-path=${clusterDurationsPath}"]
         }
 
         def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
@@ -7117,24 +7118,25 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     SBSATestConfigs = cbtsResizeSplits(SBSATestConfigs)
     fullSet += SBSATestConfigs.keySet()
 
+    // Test-only: keep GB200 stages on GCP to exercise both profiler launch paths.
     SBSASlurmTestConfigs = [
         // [platform, testList, splitId, splits, gpuCount, nodeCount?, runWithSbatch?, useClusterDurations?]
         // useClusterDurations=true: record actual test times so each cluster builds its own
         // .test_durations_<clusterName> baseline for load-balanced sharding.
-        "GB200-4_GPUs-PyTorch-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-3": ["auto:gb200-x4", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-4": ["auto:gb200-x4", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-5": ["auto:gb200-x4", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus", 1, 2, 4, 1, false, true],
-        "GB200-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus", 2, 2, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 1, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-2": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 2, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-3": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 3, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-4": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 4, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-5": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 5, 5, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 1, 2, 4, 1, false, true],
+        "GB200-4_GPUs-PyTorch-Post-Merge-2": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus", 2, 2, 4, 1, false, true],
         "GB10-PyTorch-Post-Merge-1": ["gb10x-single", "l0_gb10", 1, 1],
         "GB300-4_GPUs-PyTorch-1": ["auto:gb300-x4", "l0_gb300", 1, 1, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus", 1, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus", 2, 3, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus", 3, 3, 4, 1, true, false],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["gb200-x4-gcp-iad", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 1, 7, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 2, 7, 4, 1, true, false],
         "GB300-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb300-x4", "l0_gb300_multi_gpus_perf_sanity", 3, 7, 4, 1, true, false],
@@ -7148,12 +7150,12 @@ def launchTestJobs(pipeline, testFilter, globalVars)
 
     multiNodesSBSAConfigs = [
         // Each GB200 testcase below uses 8 GPUs and 2 nodes.
-        // https://nvbugs/5598863 (uncorrectable NVLink error detected during the execution) may not exist in OCI machines.
-        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 2, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["auto:gb200-flex", "l0_gb200_multi_nodes", 1, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
+        // Test-only: keep the multi-node GB200 stages on the same GCP target.
+        "GB200-8_GPUs-2_Nodes-PyTorch-1": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 1, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-2": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 2, 2, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 1, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 2, 3, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-flex-gcp-iad", "l0_gb200_multi_nodes", 3, 3, 8, 2],
         // GB300 accuracy post-merge aggregated (4 GPUs per node). One test list per topology,
         // spelled out here rather than via buildStageConfigs: test_to_stage_mapping.py resolves
         // stage <-> test by list name with a line-based parser, so a shared list or a helper's
@@ -7165,7 +7167,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
         2,
         8,
@@ -7175,7 +7177,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
         2,
         8,
@@ -7184,7 +7186,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
         2,
         12,
@@ -7193,7 +7195,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
     // gen_only_no_context: gen1 (2 nodes, 8 GPUs), no ctx fleet = 8 GPUs
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-GEN1-NODE2-GPU8-Post-Merge",
-        "auto:gb200-flex",
+        "gb200-flex-gcp-iad",
         "l0_gb200_multi_nodes_perf_sanity_gen1_node2_gpu8",
         1,
         8,
