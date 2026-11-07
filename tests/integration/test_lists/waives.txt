@@ -90,6 +90,7 @@ full:CPU/unittest/scripts/test_subprocess_timeouts.py::test_every_subprocess_run
 full:DGX_B200/accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False-v2_kv_cache=True] SKIP (https://nvbugs/6633268)
 full:DGX_B200/unittest/tools/test_layer_wise_benchmarks.py::test_performance_alignment[1] SKIP (https://nvbugs/6669275)
 full:DGX_H100/disaggregated/test_disaggregated.py::test_disaggregated_context_first_bf16_ownership SKIP (https://nvbugs/7051902)
+full:DGX_H100/unittest/_torch/modeling/test_modeling_qwen3_5_vl.py::test_qwen35_dense_vl_preserves_w4a16_nvfp4_behavior SKIP (https://nvbugs/7061740)
 full:DGX_H100/unittest/_torch/ray_orchestrator/multi_gpu/test_accuracy_with_allreduce_strategy.py::test_accuracy_with_allreduce_strategy[NCCL-Qwen3/Qwen3-8B] SKIP (https://nvbugs/6908275)
 full:DGX_H100/unittest/disaggregated/test_kv_transfer_mp.py::test_context_first_bf16_owned_transfer SKIP (https://nvbugs/7051902)
 full:DGX_H100/unittest/disaggregated/test_transfer_lifecycle_gpu.py::test_context_first_bf16_lifecycle_gpu SKIP (https://nvbugs/7051902)
