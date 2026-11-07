@@ -12467,6 +12467,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         _MMA_TILE_M = 128
         _MAX_SPLIT_KV = 32
+        # Batches below this many requests keep the occupancy-derived split
+        # under a ``max_split_kv`` cap: at 1K-4K KV, one request still runs
+        # 3-21% faster split 32 ways than unsplit on Rubin. It must stay a
+        # power of two because it is compared against the power-of-two tuning
+        # bucket.
+        _SPLIT_CAP_MIN_BATCH = 16
         # CTA waves the split targets: with one wave, the longest request of a
         # skewed decode batch sets the kernel time.
         _SPLIT_KV_WAVES = 8
@@ -12479,7 +12485,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
             page_size: int,
             max_batch_size: int = 0,
             emit_softmax_stats: bool = False,
+            max_split_kv: int = 0,
         ):
+            """``max_split_kv`` caps the uniform ``split_kv`` of batches of at
+            least ``_SPLIT_CAP_MIN_BATCH`` requests; 0 means no cap.
+
+            The default split is sized for a target model's long-KV decode.
+            When the KV stays short, as in the DSpark MLA drafter, which
+            attends only to the tokens decoded on its worker, most of the
+            decode time goes to writing and reducing the per-split partial
+            outputs.
+            """
             super().__init__()
             kernel_class = self.__class__._KERNEL_CLASS_BY_DTYPE.get(in_dtype)
             if kernel_class is None:
@@ -12487,6 +12503,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     f"CuteDSLNVMlaDecodeBlackwellRunner: unsupported "
                     f"in_dtype={in_dtype}. Supported: "
                     f"{list(self.__class__._KERNEL_CLASS_BY_DTYPE.keys())}")
+            if max_split_kv < 0:
+                raise ValueError(
+                    "CuteDSLNVMlaDecodeBlackwellRunner: max_split_kv must be "
+                    f">= 0 (0 = no cap), got {max_split_kv}")
             self.in_dtype = in_dtype
             self.kernel_class = kernel_class
             self.num_heads = num_heads
@@ -12494,6 +12514,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.page_size = page_size
             self.max_batch_size = max_batch_size
             self.emit_softmax_stats = emit_softmax_stats
+            self.max_split_kv = max_split_kv
 
         def unique_id(self):
             # seq_len_q is part of the id: each decode variant (the MTP
@@ -12506,7 +12527,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 self.seq_len_q,
                 self.page_size,
             )
-            return base_id + (True, ) if self.emit_softmax_stats else base_id
+            if self.emit_softmax_stats:
+                base_id += (True, )
+            # A split cap changes which tactics run, so it is part of the id
+            # when set; an uncapped runner keeps its id.
+            if self.max_split_kv:
+                base_id += (self.max_split_kv, self._SPLIT_CAP_MIN_BATCH)
+            return base_id
+
+        def _capped_split_kv(self, split_kv: int, batch_size: int) -> int:
+            """Return ``split_kv`` capped by ``max_split_kv`` for a batch of
+            ``batch_size`` requests (a tuning bucket)."""
+            if not self.max_split_kv or batch_size < self._SPLIT_CAP_MIN_BATCH:
+                return split_kv
+            return min(split_kv, self.max_split_kv)
 
         @classmethod
         def _get_max_active_blocks(cls) -> int:
@@ -12685,9 +12719,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 ((128, 128), (128, 256)),
             ]
             max_active_blocks = self._get_max_active_blocks()
-            split_candidates = self.get_split_kv_candidates(
-                batch_size, self.get_num_q_tiles(h, seq_len_q),
-                max_active_blocks)
+            split_candidates = sorted({
+                self._capped_split_kv(split_kv, batch_size)
+                for split_kv in self.get_split_kv_candidates(
+                    batch_size, self.get_num_q_tiles(h, seq_len_q),
+                    max_active_blocks)
+            })
             persistent_candidates = self.get_is_persistent_candidates()
 
             valid = []
@@ -12871,10 +12908,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             mma_pv_tiler_mn = (128, 256)
             max_active_blocks = self._get_max_active_blocks()
             bucketed_batch_size = last_positive_power_of_2(batch_size)
-            split_kv = self.get_default_split_kv(
-                bucketed_batch_size,
-                self.get_num_q_tiles(self.num_heads, self.seq_len_q),
-                max_active_blocks)
+            split_kv = self._capped_split_kv(
+                self.get_default_split_kv(
+                    bucketed_batch_size,
+                    self.get_num_q_tiles(self.num_heads, self.seq_len_q),
+                    max_active_blocks), bucketed_batch_size)
             return (mma_qk_tiler_mn, mma_pv_tiler_mn, split_kv, False)
 
         def forward(
@@ -13341,6 +13379,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
         block_split_kvs: Optional[torch.Tensor] = None,
+        max_split_kv: int = 0,
     ) -> None:
         """CuTe DSL FP16/BF16 MLA decode (Blackwell SM100/SM103/SM107).
 
@@ -13348,6 +13387,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         attention bounds of shape (B * seq_len_q,), int32.
         block_split_kvs: optional per-request split-KV counts of shape (B,),
         int32, planned on the device for the step's KV lengths.
+        max_split_kv: cap on the uniform split_kv for batches of at least
+        ``CuteDSLNVMlaDecodeBlackwellRunner._SPLIT_CAP_MIN_BATCH`` requests,
+        0 for none (see the runner).
         """
         if (sm_version := get_sm_version()) not in (100, 103, 107):
             raise ValueError(
@@ -13380,6 +13422,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             page_size=page_size,
             max_batch_size=max_batch_size,
             emit_softmax_stats=softmax_stats is not None,
+            max_split_kv=max_split_kv,
         )
         inputs = [
             q_latent, q_rope, c_latent, c_rope, page_table, cache_seqs, o,
@@ -13425,6 +13468,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         softmax_stats: Optional[torch.Tensor],
         kv_bounds: Optional[torch.Tensor],
         block_split_kvs: Optional[torch.Tensor] = None,
+        max_split_kv: int = 0,
     ) -> None:
         return None
 

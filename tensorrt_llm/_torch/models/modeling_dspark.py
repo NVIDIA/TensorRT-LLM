@@ -2493,6 +2493,34 @@ _DSPARK_HEAD_WEIGHT_ALIASES = {
 # flashinfer sizes its own scratch from this; the MLA decode path is the only
 # consumer here and 256 MiB is what the DFlash TRTLLM buffers already reserve.
 _MLA_DECODE_WORKSPACE_BYTES = 256 * 1024 * 1024
+_DSPARK_MLA_MAX_SPLIT_KV_ENV = "TLLM_DSPARK_MLA_MAX_SPLIT_KV"
+
+
+def _dspark_mla_max_split_kv() -> int:
+    """Read the drafter attention's split-KV cap from ``TLLM_DSPARK_MLA_MAX_SPLIT_KV``.
+
+    0 or unset keeps the CuTe DSL kernel's occupancy-derived split, which is sized
+    for a target model's long KV. The drafter attends only to the tokens decoded on
+    this worker, so at large batches its split mostly writes and reduces partial
+    outputs: a cap of 1 cut the drafter backbone time by 28-30% at 40-64 requests
+    on Rubin. Batches below ``CuteDSLNVMlaDecodeBlackwellRunner._SPLIT_CAP_MIN_BATCH``
+    requests keep the split either way. The cap only changes FP32 rounding, so
+    draft tokens can differ in near-ties.
+
+    Raises:
+        ValueError: the value is negative or not an integer.
+    """
+    value = os.environ.get(_DSPARK_MLA_MAX_SPLIT_KV_ENV, "").strip()
+    try:
+        cap = int(value) if value else 0
+    except ValueError:
+        cap = -1
+    if cap < 0:
+        raise ValueError(
+            f"{_DSPARK_MLA_MAX_SPLIT_KV_ENV} must be a non-negative integer (0 = no cap), "
+            f"got {value!r}"
+        )
+    return cap
 
 
 class _MLABlockFixup(NamedTuple):
@@ -2984,6 +3012,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
         self._mla_freqs = None
         self._mla_freqs_cap = None
         self._cute_dsl_checked_shape = None
+        self._mla_max_split_kv = _dspark_mla_max_split_kv()
         # HF DeepSeek folds YaRN's attention scaling into the softmax scale:
         # softmax_scale = mscale^2 / sqrt(qk_nope + qk_rope). NOT 1/sqrt(576) --
         # the absorbed product reproduces the 192-dim un-absorbed score.
@@ -3186,6 +3215,7 @@ class MLADSparkForCausalLM(_DSparkHeadMixin, DFlashForCausalLM):
             None,
             # Every block token sees the whole block, not just its causal prefix.
             fixup.kv_bounds_i32,
+            max_split_kv=self._mla_max_split_kv,
         )
         return out
 
