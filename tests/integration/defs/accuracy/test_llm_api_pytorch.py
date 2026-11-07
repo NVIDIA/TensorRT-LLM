@@ -52,8 +52,8 @@ from ..deepseek_v41_gsm8k import GSM8K_TEST_TIMEOUT, evaluate_gsm8k
 # isort: off
 from .accuracy_core import (
     GSM8K, MMLU, CnnDailymail, GPQADiamond, GSM8KInferenceX, JsonModeEval,
-    LlmapiAccuracyTestHarness, LongBenchV1, LongBenchV2,
-    assert_acceptance_length, assert_acceptance_length_for_llm,
+    QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS, LlmapiAccuracyTestHarness, LongBenchV1,
+    LongBenchV2, assert_acceptance_length, assert_acceptance_length_for_llm,
     assert_guided_decoding_regex, assert_kv_cache_reuse_for_llm,
     compute_acceptance_length)
 
@@ -5233,11 +5233,7 @@ class TestLagunaXS_2_1(LlmapiAccuracyTestHarness):
 
 class TestQwen3_5_4B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen/Qwen3.5-4B"
-    EXTRA_EVALUATOR_KWARGS = dict(
-        apply_chat_template=True,
-        fewshot_as_multiturn=True,
-        chat_template_kwargs=dict(enable_thinking=False),
-    )
+    EXTRA_EVALUATOR_KWARGS = QWEN3_5_4B_GSM8K_EVALUATOR_KWARGS
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8,
                                     enable_block_reuse=False)
     cuda_graph_config = CudaGraphConfig(enable_padding=True, max_batch_size=32)
