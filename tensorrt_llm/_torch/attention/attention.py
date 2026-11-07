@@ -208,7 +208,15 @@ def _helix_sanitize_empty_kv(
     return partial_o, softmax_stats
 
 
-# Distinct input specializations the NCCL reformat helpers below have been
+# Dynamo counts recompiles per code object for the lifetime of the process and,
+# past the limit (8 by default), runs the frame eagerly without raising. The
+# compiled NCCL reformat helpers below specialize once per CUDA-graph batch
+# shape, and a server can capture more batch sizes than that, so give them
+# their own headroom. The cap exists to catch runaway recompilation, not as a
+# correctness property.
+_HELIX_NCCL_RECOMPILE_LIMIT = 256
+
+# Distinct input specializations the compiled NCCL reformat helpers have been
 # asked to compile. ``dynamic=False`` specializes on the input shapes and
 # ``cp_size``, so this set tracks the same thing dynamo's per-frame cache does.
 _HELIX_NCCL_SHAPES: set = set()
@@ -218,12 +226,12 @@ _HELIX_NCCL_LIMIT_REPORTED = False
 def _helix_note_nccl_specialization(partial_o: torch.Tensor,
                                     softmax_stats: torch.Tensor,
                                     cp_size: int) -> None:
-    """Warn once if the Helix NCCL reformat is past dynamo's recompile budget.
+    """Warn once if the compiled Helix NCCL reformat is past its recompile budget.
 
-    Past ``cache_size_limit`` dynamo stops compiling and runs the frame eagerly
-    without raising, which silently gives back the fusion these helpers exist
-    for. Report it once per process so the regression is visible in the log
-    instead of only in a kernel trace.
+    Past ``_HELIX_NCCL_RECOMPILE_LIMIT`` dynamo stops compiling and runs the
+    frame eagerly without raising, which silently gives back the fusion these
+    helpers exist for. Report it once per process so the regression is visible
+    in the log instead of only in a kernel trace.
     """
     global _HELIX_NCCL_LIMIT_REPORTED
     if _HELIX_NCCL_LIMIT_REPORTED:
@@ -232,24 +240,17 @@ def _helix_note_nccl_specialization(partial_o: torch.Tensor,
     if key in _HELIX_NCCL_SHAPES:
         return
     _HELIX_NCCL_SHAPES.add(key)
-    try:
-        import torch._dynamo as _dynamo
-        limit = getattr(_dynamo.config, "cache_size_limit", None)
-    except ImportError:
-        limit = None
-    if limit is None or len(_HELIX_NCCL_SHAPES) <= limit:
+    if len(_HELIX_NCCL_SHAPES) <= _HELIX_NCCL_RECOMPILE_LIMIT:
         return
     _HELIX_NCCL_LIMIT_REPORTED = True
     logger.warning(
-        "Helix NCCL all-to-all reformat has seen %d distinct input "
-        "specializations, above torch._dynamo.config.cache_size_limit=%d. "
-        "Dynamo stops recompiling past that limit and runs these helpers "
-        "eagerly without raising, losing the sanitize/transpose fusion. "
-        "Reduce the number of CUDA-graph batch buckets or raise "
-        "cache_size_limit.", len(_HELIX_NCCL_SHAPES), limit)
+        "Helix NCCL all-to-all reformat has seen %d distinct CUDA-graph input "
+        "specializations, above its recompile limit of %d. Dynamo stops "
+        "recompiling past that limit and runs these helpers eagerly without "
+        "raising, losing the sanitize/transpose fusion.",
+        len(_HELIX_NCCL_SHAPES), _HELIX_NCCL_RECOMPILE_LIMIT)
 
 
-@torch.compile(dynamic=False)
 def _helix_nccl_pre_alltoall(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
@@ -258,21 +259,10 @@ def _helix_nccl_pre_alltoall(
 ) -> List[torch.Tensor]:
     """Sanitize zero-local-KV rows and reformat into the alltoall send layout.
 
-    ``_helix_sanitize_empty_kv`` followed by the transpose and split
-    ``_helix_post_process`` used to do inline. Both live in one compiled region
-    so inductor folds the fill into the transposed store instead of writing
-    ``partial_o`` and reading it straight back. Dynamo inlines the call, so the
-    sanitize has exactly one definition and the fusion is unaffected.
-
-    ``dynamic=False`` is deliberate. With dynamic shapes inductor emits a much
-    slower transposed store, and picks different grids on different ranks for
-    the same shape, which cancels the win at the collective.
-
-    The cost is one specialization per CUDA-graph batch bucket. Exceeding
-    dynamo's ``cache_size_limit`` falls back to eager SILENTLY -- the symptom is
-    ``triton_poi_fused_*`` disappearing from the trace, not an error, so
-    ``_helix_note_nccl_specialization`` counts the distinct shapes at the call
-    site and says so once.
+    When compiled, inductor folds the fill into the transposed store instead of
+    writing ``partial_o`` and reading it straight back. Dynamo inlines the
+    sanitize call, so it has exactly one definition and the fusion is
+    unaffected.
     """
     partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o,
                                                         softmax_stats,
@@ -284,11 +274,34 @@ def _helix_nccl_pre_alltoall(
     return chunks
 
 
-@torch.compile(dynamic=False)
 def _helix_nccl_post_alltoall(
         gathered: List[torch.Tensor]) -> List[torch.Tensor]:
     """Reformat the gathered partials into the helix_post_process layout."""
     return [t.transpose(1, 2).contiguous() for t in gathered]
+
+
+def _compile_helix_nccl_reformat(fn):
+    """Compile an NCCL reformat helper for CUDA-graph batches.
+
+    ``dynamic=False`` is deliberate. With dynamic shapes inductor emits a much
+    slower transposed store, and picks different grids on different ranks for
+    the same shape, which cancels the win at the collective. The cost is one
+    specialization per captured batch shape, compiled during graph warmup.
+    """
+    compiled_fn = torch.compile(fn, dynamic=False)
+
+    def wrapper(*args):
+        with torch._dynamo.config.patch(
+                recompile_limit=_HELIX_NCCL_RECOMPILE_LIMIT):
+            return compiled_fn(*args)
+
+    return wrapper
+
+
+_helix_nccl_pre_alltoall_compiled = _compile_helix_nccl_reformat(
+    _helix_nccl_pre_alltoall)
+_helix_nccl_post_alltoall_compiled = _compile_helix_nccl_reformat(
+    _helix_nccl_post_alltoall)
 
 
 def _helix_post_process(
@@ -300,6 +313,7 @@ def _helix_post_process(
     aux_stream: Optional[torch.cuda.Stream] = None,
     ln_events: Optional[list] = None,
     zero_kv_mask: Optional[torch.Tensor] = None,
+    is_cuda_graph: bool = False,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -315,6 +329,12 @@ def _helix_post_process(
       fifo v2  in the all-to-all sender, while the entry is in shared memory
       fifo v1  here, via _helix_sanitize_empty_kv
 
+    is_cuda_graph selects the compiled NCCL reformat. CUDA-graph batches are
+    padded to the captured batch sizes, so all of their compiles happen during
+    graph warmup. Any other batch, such as a mixed context and generation
+    batch, carries an arbitrary generation-token count, so it runs the same
+    reformat eagerly instead of compiling a new variant mid-serving.
+
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
@@ -322,12 +342,17 @@ def _helix_post_process(
     if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL path. Sanitize is folded into _helix_nccl_pre_alltoall so
         # inductor can fuse it into the reformat.
-        _helix_note_nccl_specialization(partial_o, softmax_stats,
-                                        mapping.cp_size)
-        chunks = _helix_nccl_pre_alltoall(partial_o, softmax_stats,
-                                          zero_kv_mask, mapping.cp_size)
-        gathered = alltoall_helix(chunks, mapping.cp_group)
-        gathered = _helix_nccl_post_alltoall(gathered)
+        if is_cuda_graph:
+            _helix_note_nccl_specialization(partial_o, softmax_stats,
+                                            mapping.cp_size)
+            pre_alltoall = _helix_nccl_pre_alltoall_compiled
+            post_alltoall = _helix_nccl_post_alltoall_compiled
+        else:
+            pre_alltoall = _helix_nccl_pre_alltoall
+            post_alltoall = _helix_nccl_post_alltoall
+        chunks = pre_alltoall(partial_o, softmax_stats, zero_kv_mask,
+                              mapping.cp_size)
+        gathered = post_alltoall(alltoall_helix(chunks, mapping.cp_group))
         return torch.ops.trtllm.helix_post_process(gathered[0], gathered[1],
                                                    1.0)
     else:
@@ -970,7 +995,8 @@ class Attention(nn.Module):
                                    self.mapping,
                                    self.num_heads_tp_cp,
                                    self.head_dim,
-                                   zero_kv_mask=zero_kv_mask)
+                                   zero_kv_mask=zero_kv_mask,
+                                   is_cuda_graph=attn_metadata.is_cuda_graph)
 
     def _attn_impl(
         self,
