@@ -39,6 +39,17 @@ def _tiny_config(*, fp8: bool = True) -> SimpleNamespace:
     )
 
 
+def _tiny_nvfp4_config() -> SimpleNamespace:
+    config = _tiny_config()
+    config.quantization_config = {
+        "quant_method": "modelopt",
+        "quant_algo": "NVFP4",
+        "ignore": ["*.ple.*"],
+    }
+    config.ple_embedding_dtype = "float8_e4m3fn"
+    return config
+
+
 @pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_pinned_lookup_masks_rows_outside_local_shard(table_dtype) -> None:
     embedding = Qwen4ExpPinnedHostEmbedding(
@@ -98,18 +109,18 @@ def test_fp8_lookup_fuses_scale_and_preserves_table_address() -> None:
     assert module.ngram_embedding.weight.device.type == "cpu"
 
 
-@pytest.mark.parametrize("use_fp8", [False, True])
-def test_mapper_loads_pinned_table_in_place(use_fp8, monkeypatch) -> None:
+@pytest.mark.parametrize("use_fp8, nvfp4_config", [(False, False), (True, False), (True, True)])
+def test_mapper_loads_pinned_table_in_place(use_fp8, nvfp4_config, monkeypatch) -> None:
     from tensorrt_llm._torch.models.checkpoints.hf.qwen4_exp_weight_mapper import (
         Qwen4ExpHfWeightMapper,
     )
 
-    module = Qwen4ExpNGramEmbedding(
-        _tiny_config(fp8=use_fp8), embedding_dim=2, dtype=torch.bfloat16
-    ).to("cuda")
+    config = _tiny_nvfp4_config() if nvfp4_config else _tiny_config(fp8=use_fp8)
+    module = Qwen4ExpNGramEmbedding(config, embedding_dim=2, dtype=torch.bfloat16).to("cuda")
     table = module.ngram_embedding.weight
     table_ptr = table.data_ptr()
     source_dtype = torch.float8_e4m3fn if use_fp8 else torch.bfloat16
+    assert table.dtype == source_dtype
     source = torch.tensor([[-4.0, 7.0], [-8.0, 6.0], [-3.0, 3.0], [-2.0, 5.0]], dtype=source_dtype)
     leaves = {
         "ngram_embedding.shard_1.weight": source[2:],
