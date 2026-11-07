@@ -244,7 +244,7 @@
 /cpp/tensorrt_llm/batch_manager/cacheTransferLayer* @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/disagg* @NVIDIA/trt-llm-disagg-devs
 /examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
-/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-perf-devs
+/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/_torch/disaggregation @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
@@ -316,6 +316,10 @@
 /cpp/tests/unit_tests/kernels/ropeTest.cu @NVIDIA/trt-llm-torch-attention-devs
 /cpp/tests/unit_tests/kernels/sparseAttentionKernelsTest.cpp @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
+# The sparse-attention cache managers belong to the KV cache manager team. This
+# rule must stay below the directory rule above, so it cannot live in the KV
+# CACHE MANAGER section.
+/tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
 /tensorrt_llm/_torch/modules/fla @NVIDIA/trt-llm-torch-attention-devs
 /tests/microbenchmarks/cute_dsl_kernels/paged_mqa_logits @NVIDIA/trt-llm-torch-attention-devs
 /tests/unittest/_torch/attention @NVIDIA/trt-llm-torch-attention-devs
@@ -328,6 +332,17 @@
 # top_k (still topk-devs, below), and the test followed it out of thop/. Attention
 # keeps the test because Attention is its primary consumer. See PR #19275.
 /tests/unittest/_torch/kernels/parallel/test_indexer_topk.py @NVIDIA/trt-llm-torch-attention-devs
+# Kernel tests co-owned by the kernels and Attention teams.
+/tests/unittest/_torch/kernels/parallel/test_kda_decode.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_horizontal_producer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_indexer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_fp8_main_kv_insert.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/parallel_hw_agnostic/test_minimax_m3_nvfp4_horizontal_producer.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/kernels/serial/test_sparse_kv_cache_compact.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+# The fused QK-norm, RoPE and gate kernel and its test are co-owned by the
+# kernels and Attention teams.
+/tensorrt_llm/_torch/attention/kernels/fused_qk_norm_rope_gate.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
+/tests/unittest/_torch/attention/kernels/test_fused_qk_norm_rope_gate.py @NVIDIA/trt-llm-kernels-devs @NVIDIA/trt-llm-torch-attention-devs
 
 # ===== MoE =====
 /cpp/tensorrt_llm/deep_ep @NVIDIA/trt-llm-moe-devs
@@ -382,38 +397,6 @@
 /tensorrt_llm/scaffolding @WeiHaocheng @dc3671
 /tests/unittest/scaffolding @WeiHaocheng @dc3671
 
-## TensorRT-LLM LLM Disaggregated
-/examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
-/examples/disaggregated/slurm/benchmark @NVIDIA/trt-llm-disagg-devs @NVIDIA/trtllm-bench-reviewers
-/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheFormatter.h @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.h @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiver.h @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
-/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
-/tensorrt_llm/serve/openai_disagg_server.py @NVIDIA/trt-llm-disagg-devs
-
-## TensorRT-LLM - KV Cache Manager
-/cpp/tensorrt_llm/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/kvCacheEventManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/kvCacheTransferManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/batch_manager/evictionPolicy.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheEventManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/kvCacheTransferManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/include/tensorrt_llm/batch_manager/evictionPolicy.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tests/unit_tests/batch_manager/kvCacheManagerTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tests/unit_tests/batch_manager/kvCacheUtilsTest.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/attention/backends/sparse/*/cache_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/kv_cache @NVIDIA/trt-llm-kv-cache-manager-devs
-/tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.h @NVIDIA/trt-llm-kv-cache-manager-devs
-/cpp/tensorrt_llm/nanobind/batch_manager/kvCacheManager.cpp @NVIDIA/trt-llm-kv-cache-manager-devs
-
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
 # This approval is mandatory regardless of other approvals the PR may have received. Without approval
@@ -422,6 +405,81 @@
 /tests/unittest/api_stability/references_committed/ @NVIDIA/trt-llm-committed-api-review-committee
 /tests/unittest/dynamo/ @NVIDIA/trt-llm-dynamo-devs
 /triton_backend @NVIDIA/trt-llm-triton-backend-devs
+
+# ===== FILE-LEVEL OWNERSHIP EXCEPTIONS =====
+# Files whose owners differ from those the directory rules above give them.
+# Each line overrides those rules, so this section must stay below them;
+# files added to these directories later follow the directory rules.
+/cpp/tensorrt_llm/kernels/moe/cuteDsl/CMakeLists.txt @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_grouped_gemm.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_pointer_expand.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_problem_builder.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tensorrt_llm/kernels/moe/cutlass/include/moe_lora_slot_expand.h @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/blockScaleMoeActivationTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/blockScaleMoeFinalizeTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/fusedMoeCommKernelTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/mixtureOfExpertsTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoadBalanceKernelTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoraPointerExpandTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoraProblemBuilderTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/moeLoraSlotExpandTest.cu @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingCustomTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingDeepSeekTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingLlama4Test.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingTest.cpp @NVIDIA/trt-llm-kernels-devs
+/cpp/tests/unit_tests/kernels/moe/routing/routingTest.h @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark/attention_kernel.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/dspark_rmsnorm_rope.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp16.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_decode_fp8.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/blackwell/mla/mla_helpers.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/clc_tile_scheduler.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/attention/kernels/rubin/dsv4_qb_fusion/kernel.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/blackwell/blockscaled_contiguous_grouped_gemm_swiglu_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/custom_pipeline.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/inline_ptx.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/manual_mma_128dp.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_gather_grouped_blockscaled_gemm_act_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_gather_grouped_gemm_swiglu_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_blockscaled_gemm_fused_fc12.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/rubin_contiguous_grouped_gemm_finalize_fusion.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/moe/kernels/rubin/utils.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_blockscaled_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_gemm_persistent_dynamic_preferred_cluster.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/conv/dense_implicit_gemm_fprop.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/__init__.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/pertoken_adaln.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/_torch/visual_gen/kernels/blackwell/pertoken_adaln/reduce.py @NVIDIA/trt-llm-kernels-devs
+/tensorrt_llm/executor/ray/stub.py @NVIDIA/trt-llm-devs
+/tensorrt_llm/executor/ray/utils.py @NVIDIA/trt-llm-devs
+/tests/unittest/_torch/disaggregation/fake_kv_cache_transceiver.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/disaggregation/test_async_transfer_manager.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/disaggregation/test_kv_cache_transceiver_contract.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/disaggregation/test_kv_cache_transceiver_creation.py @NVIDIA/trt-llm-kv-cache-manager-devs
+/tests/unittest/_torch/kernels/fused_ops/test_gelu_tanh_mul_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_fp4_quant.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/kernels/fused_ops/test_rmsnorm_residual_add.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/kernels/test_custom_pipeline.py @NVIDIA/trt-llm-devs
+/tests/unittest/_torch/moe/test_ep_group_health.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_block_offset_overlap_race.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_cache_manager_v2_device_page_table.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_kvv2_host_tier_sizing.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/pyexecutor/kv_cache/test_per_layer_head_dim.py @NVIDIA/trt-llm-runtime-devs
+/tests/unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_gate_resid_norm_shift_scale.py @NVIDIA/trt-llm-kernels-devs
+/tests/unittest/_torch/visual_gen/kernels/parallel/test_fused_dit_layernorm_shift_scale.py @NVIDIA/trt-llm-kernels-devs
+/tests/unittest/_torch/visual_gen/kernels/test_nvfp4_conv3d.py @NVIDIA/trt-llm-devs
 
 # ===== DISAGG BLAST-RADIUS CO-OWNS (Tier-1) =====
 # Last-match cross-cutting: adds disagg-devs to shared files that can silently break disagg e2e.
@@ -434,12 +492,17 @@
 # ===== COMPATIBILITY FORWARDING MODULES =====
 # Definition-free re-export modules left at a retired import path so external
 # callers keep working through the migration window (Epic TRTLLM-14558).  Each
-# one keeps the owner its pre-move path had -- without these lines the paths
-# fall through to the repository default, which would be an ownership change
-# nobody asked for.  Removed together with the modules themselves.
+# one is owned by the owners of the module it forwards to; a forwarding module
+# whose surrounding rules already give it those owners is not listed.  Removed
+# together with the modules themselves.
+/tensorrt_llm/_torch/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/visual_gen/attention_backend/__init__.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
+/tensorrt_llm/_torch/visual_gen/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs @NVIDIA/trt-llm-torch-visual-gen-devs
 /tensorrt_llm/lora_helper.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-runtime-devs
 /tensorrt_llm/prompt_adapter_manager.py @NVIDIA/trt-llm-runtime-devs
+/tensorrt_llm/serialization.py @NVIDIA/trt-llm-runtime-devs
 
 # ===== GOVERNANCE / LEGAL GATES =====
 /.github/CODEOWNERS @NVIDIA/trt-llm-infra-devs @NVIDIA/trt-llm-oss-compliance
