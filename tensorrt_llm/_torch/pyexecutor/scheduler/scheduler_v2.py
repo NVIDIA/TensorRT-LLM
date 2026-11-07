@@ -342,6 +342,7 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         # Registered by PyExecutor; see set_async_transfer_manager.
         self._async_transfer_manager = None
+        self._retiring_gen_receives_probe: Callable[[], bool] = lambda: False
         # Registered by PyExecutor; see set_disagg_transfer_admission_controller.
         self._disagg_transfer_controller = None
 
@@ -388,6 +389,17 @@ class KVCacheV2Scheduler(RequestScheduler):
         see those pages and reports a false deadlock.
         """
         self._async_transfer_manager = mgr
+
+    def set_retiring_gen_receives_probe(self, probe: Callable[[], bool]) -> None:
+        """Expose current rank-local receive ownership to the deadlock detector.
+
+        Args:
+            probe: Whether logically cancelled receives still retain local resources.
+                Read current ownership, not the previous iteration's fleet-wide
+                snapshot: remote retention cannot explain this rank's allocation stall.
+                Retirement and its deadline remain the transfer layer's responsibility.
+        """
+        self._retiring_gen_receives_probe = probe
 
     @property
     def ctx_demote_uncached_tokens(self) -> int:
@@ -2312,12 +2324,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         # The active_requests scan covers senders still on the list and the
         # generation-side receiver. The transfer manager covers finished
         # senders that have already left active_requests (see
-        # set_async_transfer_manager).
-        transfer_holding = any(
-            req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests
-        ) or (
-            self._async_transfer_manager is not None
-            and self._async_transfer_manager.has_any_inflight_requests()
+        # set_async_transfer_manager). Logically cancelled receivers also leave
+        # that list while the coordinator retains their physical ownership.
+        transfer_holding = (
+            any(req.state_value in self._TRANSFER_HOLDING_STATE_VALUES for req in active_requests)
+            or (
+                self._async_transfer_manager is not None
+                and self._async_transfer_manager.has_any_inflight_requests()
+            )
+            or self._retiring_gen_receives_probe()
         )
         if transfer_holding:
             if self._stalled_schedules:
@@ -2432,7 +2447,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"states={dict(states)}; sample_ids={sample_ids}; "
             f"kv_connector={has_connector}; "
             f"cache_tier_below_gpu={self.kv_cache_manager.has_cache_tier_below_gpu}; "
-            f"transfers_in_flight={transfers_in_flight}"
+            f"transfers_in_flight={transfers_in_flight}; "
+            f"local_retiring_gen_receives={self._retiring_gen_receives_probe()}"
         )
 
     def _free_kv_caches(self, req: LlmRequest) -> None:
