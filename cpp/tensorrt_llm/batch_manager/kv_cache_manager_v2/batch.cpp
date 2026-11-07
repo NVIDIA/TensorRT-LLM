@@ -439,6 +439,8 @@ Batch::~Batch()
     // mScratch only points into mDeviceArena, so it needs no release of its own.
     mSparseArenas.clear();
     mDeviceArena.reset();
+    mHitMiss.reset();
+    mCopyDesc.reset();
     mDeviceStaging.reset();
     mMirror.reset();
     mIndexTableDescs.reset();
