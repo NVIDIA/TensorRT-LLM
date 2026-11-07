@@ -1227,8 +1227,9 @@ def test_kimi_k3_reasoning_parser_non_thinking(text: str, content: str,
         (["a<|clo", "x"], ["", ""], ["a", "<|clox"]),
         # Structural close/open pair arriving as one delta.
         ([f"r{K3_CLOSE}think{K3_SEP}{K3_OPEN}response{K3_SEP}c"], ["c"], ["r"]),
-        # tools_pass: `<|close|>tools<|sep|>` has an internal `<`, so the
-        # suffix hold must consider mid-marker splits like `...<|close|>to`.
+        # A tools tag that no call follows is text. `<|close|>tools<|sep|>`
+        # has an internal `<`, so the suffix hold must consider mid-marker
+        # splits like `...<|close|>to`.
         ([
             f"r{K3_CLOSE}think{K3_SEP}{K3_OPEN}response{K3_SEP}",
             f"{K3_OPEN}tools{K3_SEP}CALL{K3_CLOSE}to",
@@ -1286,6 +1287,91 @@ def test_kimi_k3_reasoning_parser_stream_matches_parse(chunk_size: int,
 
     assert "".join(content) == oneshot.content
     assert "".join(reasoning) == oneshot.reasoning_content
+
+
+def _k3_parse_every_chunking(text: str, thinking: bool = True):
+    """The one-shot parse of `text`, once every chunking has streamed it.
+
+    Whole, per character, fixed sizes and every two-way split must each give
+    the content and reasoning `parse` gives.
+    """
+    kwargs = None if thinking else {"thinking": False}
+    whole = ReasoningParserFactory.create_reasoning_parser("kimi_k3",
+                                                           kwargs).parse(text)
+    chunkings = [[text], list(text)]
+    chunkings += [[text[i:i + size] for i in range(0, len(text), size)]
+                  for size in (2, 3, 7)]
+    chunkings += [[text[:i], text[i:]] for i in range(1, len(text))]
+    for chunks in chunkings:
+        parser = ReasoningParserFactory.create_reasoning_parser(
+            "kimi_k3", kwargs)
+        results = [parser.parse_delta(chunk) for chunk in chunks]
+        results.append(parser.finish())
+        assert "".join(r.content for r in results) == whole.content, chunks
+        assert "".join(r.reasoning_content
+                       for r in results) == whole.reasoning_content, chunks
+    return whole
+
+
+def test_kimi_k3_text_outside_any_channel_is_content():
+    """Text after the think channel closes, with no response tag, is content."""
+    result = _k3_parse_every_chunking(
+        f"t{K3_CLOSE}think{K3_SEP}Answer.{K3_MSG_END}")
+
+    assert (result.reasoning_content, result.content) == ("t", "Answer.")
+
+
+def test_kimi_k3_text_after_a_tools_section_is_content():
+    result = _k3_parse_every_chunking(
+        _k3_completion("t", "Checking.", K3_TOOLS_SECTION + "Done."))
+
+    assert result.reasoning_content == "t"
+    assert result.content == "Checking." + K3_TOOLS_SECTION + "Done."
+
+
+def test_kimi_k3_think_block_inside_a_tools_section_is_reasoning():
+    """The body of a think block between two calls is reasoning content."""
+    call = (f'{K3_OPEN}call tool="get_weather" index="1"{K3_SEP}'
+            f'{K3_OPEN}argument key="location" type="string"{K3_SEP}NYC'
+            f'{K3_CLOSE}argument{K3_SEP}{K3_CLOSE}call{K3_SEP}')
+    think = f"{K3_OPEN}think{K3_SEP}reconsidering{K3_CLOSE}think{K3_SEP}"
+    tools = f"{K3_OPEN}tools{K3_SEP}"
+    tools_end = f"{K3_CLOSE}tools{K3_SEP}"
+
+    result = _k3_parse_every_chunking(
+        _k3_completion("t", "", tools + call + think + call + tools_end))
+
+    assert result.reasoning_content == "treconsidering"
+    assert result.content == tools + call + call + tools_end
+
+
+@pytest.mark.parametrize(
+    "prose",
+    [
+        f"The stop token is {K3_EOM} and after it comes more text.",
+        f"A literal {K3_OPEN} marker, then more prose that matters.",
+        f"An unknown tag {K3_OPEN}note{K3_SEP} is just text.",
+        f"Messages end with {K3_CLOSE}message{K3_SEP} and then more.",
+        f"Sections look like {K3_OPEN}tools{K3_SEP}...{K3_CLOSE}tools{K3_SEP}"
+        " in prose.",
+        # A close tag of a channel that is not open is not a transition.
+        f"Closing {K3_CLOSE}think{K3_SEP} twice is text.",
+    ])
+def test_kimi_k3_literal_markup_in_prose_is_content(prose: str):
+    """A tag is structure only where the grammar allows it."""
+    result = _k3_parse_every_chunking(_k3_completion("t", prose))
+
+    assert (result.reasoning_content, result.content) == ("t", prose)
+
+
+def test_kimi_k3_whitespace_between_tags_is_formatting():
+    """Whitespace between two tags is dropped; channel text stays verbatim."""
+    text = (f"t{K3_CLOSE}think{K3_SEP}\n{K3_OPEN}response{K3_SEP}\n Hi.\n"
+            f"{K3_CLOSE}response{K3_SEP}\n{K3_CLOSE}message{K3_SEP}\n{K3_EOM}")
+
+    result = _k3_parse_every_chunking(text)
+
+    assert (result.reasoning_content, result.content) == ("t", "\n Hi.\n")
 
 
 def test_kimi_k3_needs_raw_special_tokens():
