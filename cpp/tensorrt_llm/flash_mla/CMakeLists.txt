@@ -64,7 +64,7 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
   list(APPEND SUPPORT_ARCHS "90")
 endif()
 if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
-  list(APPEND SUPPORT_ARCHS "100" "103")
+  list(APPEND SUPPORT_ARCHS "100" "103" "107")
 endif()
 
 # Find intersection of supported and requested architectures
