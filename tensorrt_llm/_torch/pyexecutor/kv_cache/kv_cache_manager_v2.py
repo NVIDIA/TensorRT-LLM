@@ -5680,6 +5680,27 @@ class KVCacheManagerV2(BaseResourceManager):
         )
         return required, max(0, capacity - reserved_blocks)
 
+    def get_request_kv_page_index_budget(self, request: LlmRequest) -> tuple[int, int] | None:
+        """Bound absolute per-beam ledger indices independently of physical KV cost.
+
+        Windowed and mixed-precision caches can release physical pages while
+        retaining absolute logical block ordinals. Their fixed index rows must
+        still cover the requested sequence and the configured generation lead.
+        Managers that rebase context capacity must supply their own check.
+        """
+        if type(self).resize_context is not KVCacheManagerV2.resize_context:
+            return None
+        if self.kv_cache_type not in (CacheTypeCpp.SELF, CacheTypeCpp.SELFKONLY):
+            return None
+        capacity = (
+            request.orig_prompt_len
+            + request.max_new_tokens
+            + self.num_extra_kv_tokens
+            + self._kv_reserve_draft_tokens
+        )
+        required = (capacity + self._ledger_tokens_per_block - 1) // self._ledger_tokens_per_block
+        return required, self.max_blocks_per_seq
+
     def get_num_free_blocks(self) -> int:
         """Estimate warmup block capacity when only permanent reservations remain.
 

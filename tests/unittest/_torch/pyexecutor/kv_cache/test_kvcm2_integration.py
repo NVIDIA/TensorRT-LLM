@@ -4092,7 +4092,8 @@ def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits(
         )
         if is_disagg:
             assert manager.get_request_kv_block_budget(budget_request) is None
-            PyExecutor._validate_request_budget(executor, budget_request)
+            with pytest.raises(ValueError, match="fixed page-index capacity"):
+                PyExecutor._validate_request_budget(executor, budget_request)
             capacity = (
                 manager.max_seq_len + manager.num_extra_kv_tokens
             ) // manager.tokens_per_block
