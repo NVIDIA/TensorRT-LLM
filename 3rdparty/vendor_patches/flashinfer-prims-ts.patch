@@ -405,6 +405,19 @@ index 6787e8ab5b566849ccc5ba228da220ed55898ea7..c11e9d211020c646a5a71cd309074d6b
  from ..fmha_decode_config import FmhaDecodeConfig
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
+diff --git a/kernels/mla_decode/helpers/nvfp4_kv.py b/kernels/mla_decode/helpers/nvfp4_kv.py
+index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921ca77d3c3 100644
+--- a/kernels/mla_decode/helpers/nvfp4_kv.py
++++ b/kernels/mla_decode/helpers/nvfp4_kv.py
+@@ -28,7 +28,7 @@ from cutlass.base_dsl.arch import Arch
+ from cutlass.cutlass_dsl import BaseDSL
+ from cutlass.experimental import cuda, primitives as prims
+ 
+-from ......cute_dsl.availability import is_rubin_cute_dsl_available
++from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
+ from ...tensor_map import create_tensor_map_tiled_from_view
+ from .gather import _address, gather4, select_gather_map
+ from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
 diff --git a/mla_decode.py b/mla_decode.py
 index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7bf4e50862 100644
 --- a/mla_decode.py

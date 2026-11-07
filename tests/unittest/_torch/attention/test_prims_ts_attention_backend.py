@@ -1517,9 +1517,7 @@ def test_prims_ts_cache_free_fp8_recipes(
                 * dequant_scale(inputs["new_k"])
                 / math.sqrt(case.head_dim)
             )
-            torch.testing.assert_close(
-                run_kwargs["softmax_scale"], expected, rtol=1e-2, atol=0.0
-            )
+            torch.testing.assert_close(run_kwargs["softmax_scale"], expected, rtol=1e-2, atol=0.0)
         else:
             assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     # The second sample's output is ``outlier`` times larger. Normalize it before comparing.

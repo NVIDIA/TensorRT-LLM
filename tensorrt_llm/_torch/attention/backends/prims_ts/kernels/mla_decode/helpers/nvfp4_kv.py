@@ -28,7 +28,7 @@ from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 from cutlass.experimental import cuda, primitives as prims
 
-from ......cute_dsl.availability import is_rubin_cute_dsl_available
+from flashinfer.cute_dsl.availability import is_rubin_cute_dsl_available
 from ...tensor_map import create_tensor_map_tiled_from_view
 from .gather import _address, gather4, select_gather_map
 from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
