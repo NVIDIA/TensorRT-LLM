@@ -35,7 +35,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from tensorrt_llm._utils import nvtx_range, prefer_pinned
+from tensorrt_llm._utils import async_tensor_h2d, nvtx_range, prefer_pinned
 
 from ..llm_request import LlmRequest
 from .ops.vanilla import Fusions, occurrence_penalized_logits
@@ -414,15 +414,20 @@ class PenaltyHandler:
         # One conversion for the whole prompt; the split point is just
         # prompt_ignore_length, so the two groups are plain slices.
         base_row = slot * self._max_beam_width
-        tokens = self._to_device(prompt, torch.int64)
-        prefix_tokens = tokens[: state.prompt_ignore_length]
-        counted_tokens = tokens[state.prompt_ignore_length :]
+        tokens = torch.tensor(prompt, dtype=torch.int64)
+        ignore = state.prompt_ignore_length
 
         # Multimodal models place placeholder ids >= vocab_size in the prompt (see
         # _torch/models/modeling_multimodal_utils.py), so out-of-range ids reach us
-        # here and must be dropped before they index the workspace.
-        counted_tokens = counted_tokens[(counted_tokens >= 0) & (counted_tokens < vocab_size)]
-        prefix_tokens = prefix_tokens[(prefix_tokens >= 0) & (prefix_tokens < vocab_size)]
+        # here and must be dropped before they index the workspace. Drop them on
+        # the host, so that the host does not wait for the GPU to count the kept ids.
+        in_vocab = (tokens >= 0) & (tokens < vocab_size)
+        prefix_tokens = async_tensor_h2d(
+            tokens[:ignore][in_vocab[:ignore]], torch.int64, self._device
+        )
+        counted_tokens = async_tensor_h2d(
+            tokens[ignore:][in_vocab[ignore:]], torch.int64, self._device
+        )
 
         Fusions.update_occurrence_workspace(
             counts_cuda,
@@ -1020,7 +1025,9 @@ def seed_prompt(
         return
 
     vocab_size = spec_metadata.vocab_size
-    tokens = prompt_tokens.to(device=prompt_mask.device, dtype=torch.int64)
+    # Filter and deduplicate on the host, so that the host does not wait for the
+    # GPU to count the kept ids; only the kept ids are copied to the device.
+    tokens = prompt_tokens.to(device="cpu", dtype=torch.int64)
     ignore = max(0, min(prompt_ignore_length, tokens.numel()))
     ignored, counted = tokens[:ignore], tokens[ignore:]
 
@@ -1030,7 +1037,7 @@ def seed_prompt(
         # bits, so the reduction has to be a bitwise OR. scatter_reduce_ has no OR
         # mode and 'amax' would keep only the larger bit; over unique ids the bits
         # within a word are disjoint, so a plain sum IS their bitwise OR.
-        unique = torch.unique(ignored)
+        unique = async_tensor_h2d(torch.unique(ignored), torch.int64, prompt_mask.device)
         row = torch.zeros_like(prompt_mask[slot])
         row.scatter_add_(
             0,
@@ -1043,6 +1050,7 @@ def seed_prompt(
     if counted.numel():
         # Counted like generated tokens: repeats must accumulate, so this is a real
         # count rather than a bitmask.
+        counted = async_tensor_h2d(counted, torch.int64, counts.device)
         counts[slot].scatter_add_(0, counted, torch.ones_like(counted, dtype=counts.dtype))
 
 

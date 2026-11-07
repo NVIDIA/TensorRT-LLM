@@ -468,7 +468,8 @@ def apply_embedding_bias(
 
     # Track which logits require logit bias application
     request_steps_list = request_steps.tolist()
-    logits_bias_masks = [False] * logits.size(0)
+    # Rows of 'logits' that receive a bias, in increasing order.
+    bias_row_indices: list[int] = []
     _next_bias_index = 0
 
     def provision_bias_index() -> int:
@@ -488,7 +489,7 @@ def apply_embedding_bias(
 
     # Collect bias information
     #
-    # NB: the mask indexes rows of 'logits', not requests: a request contributes
+    # NB: 'bias_row_indices' holds rows of 'logits', not requests: a request contributes
     #     'steps' consecutive rows (> 1 under speculative decoding), so the offset
     #     has to accumulate 'steps' rather than track the request index. It must
     #     stay in step with 'bias_gather_indices', which is built in row order.
@@ -496,8 +497,7 @@ def apply_embedding_bias(
     for req, steps in zip(requests, request_steps_list):
         req_bias = req.py_embedding_bias
         if req_bias is not None:
-            for j in range(row_offset, row_offset + steps):
-                logits_bias_masks[j] = True
+            bias_row_indices.extend(range(row_offset, row_offset + steps))
             req_bias_index = bias_to_index[req_bias]
             bias_gather_indices.extend(repeat(req_bias_index, steps))
         row_offset += steps
@@ -512,8 +512,10 @@ def apply_embedding_bias(
     bias_gather_indices_cuda = torch.tensor(
         bias_gather_indices, pin_memory=prefer_pinned(), dtype=torch.int32
     ).to(logits.device, non_blocking=True)
-    logits_bias_mask_cuda = torch.tensor(
-        logits_bias_masks, pin_memory=prefer_pinned(), dtype=torch.bool
+    # Send row indices instead of a boolean mask: indexing with a device mask
+    # makes the host wait for the GPU to count the selected rows.
+    bias_row_indices_cuda = torch.tensor(
+        bias_row_indices, pin_memory=prefer_pinned(), dtype=torch.int64
     ).to(logits.device, non_blocking=True)
     biases_tensor = torch.empty(
         (len(bias_tensors), *bias_tensors[0].shape), pin_memory=prefer_pinned()
@@ -529,8 +531,8 @@ def apply_embedding_bias(
     #     is unclear if this allows for repeated indices, cf.
     #         https://docs.pytorch.org/docs/2.8/generated/torch.Tensor.index_put_.html#torch-tensor-index-put
     #     and thus introduces read-after-write dependencies (including possible false
-    #     sharing).
-    logits[logits_bias_mask_cuda] += biases_tensor_cuda
+    #     sharing). 'bias_row_indices' holds each row at most once, so it has no repeated indices.
+    logits[bias_row_indices_cuda] += biases_tensor_cuda
 
 
 # --------------------------------------------------------------------------
