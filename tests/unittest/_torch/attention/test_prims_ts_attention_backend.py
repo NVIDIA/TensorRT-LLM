@@ -1710,10 +1710,11 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             head_dim,
             page_size,
             max_kv_len,
-            q_data_type=q.dtype,
-            o_data_type=output_dtype,
+            q_dtype=q.dtype,
+            out_dtype=output_dtype,
             mask_type="causal",
-            use_device_scales=use_device_scales,
+            softmax_scale=bmm1 if use_device_scales else bmm1.item(),
+            output_scale=bmm2 if use_device_scales else bmm2.item(),
         )
         return wrapper
 
@@ -1730,8 +1731,8 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             lengths,
             table,
             out=output,
-            bmm1_scale=bmm1,
-            bmm2_scale=bmm2,
+            softmax_scale=bmm1,
+            output_scale=bmm2,
             validate=False,
         )
 
@@ -1759,8 +1760,8 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             (k, v),
             lengths,
             table,
-            bmm1_scale=bmm1.item(),
-            bmm2_scale=bmm2.item(),
+            softmax_scale=bmm1.item(),
+            output_scale=bmm2.item(),
             validate=False,
         )
         torch.testing.assert_close(output.float(), fp16_output.float(), atol=0.0005, rtol=0.008)
@@ -1772,8 +1773,8 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
             (k, v),
             lengths,
             table,
-            bmm1_scale=bmm1.item(),
-            bmm2_scale=bmm2.item(),
+            softmax_scale=bmm1.item(),
+            output_scale=bmm2.item(),
             validate=False,
         )
         torch.testing.assert_close(
@@ -1788,8 +1789,8 @@ def test_prims_ts_fp8_decode_bf16_device_scales(
         lengths,
         table,
         out=output,
-        bmm1_scale=bmm1,
-        bmm2_scale=bmm2,
+        softmax_scale=bmm1,
+        output_scale=bmm2,
         validate=True,
     )
     torch.cuda.synchronize()
