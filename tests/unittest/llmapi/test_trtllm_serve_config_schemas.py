@@ -264,6 +264,50 @@ def schemas(tmp_path_factory: pytest.TempPathFactory) -> dict[str, dict]:
             },
             False,
         ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"cache_backend": "seacache"}}, True),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {
+                "cache_config": {
+                    "cache_backend": "seacache",
+                    "threshold": 0.3,
+                    "max_warmup_steps": 4,
+                    "max_continuous_cached_steps": -1,
+                }
+            },
+            True,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "threshold": 0}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "threshold": -0.1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_continuous_cached_steps": -2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_warmup_steps": -1}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "max_consecutive_cached_steps": 2}},
+            False,
+        ),
+        (
+            generator.VISUAL_GEN_SCHEMA,
+            {"cache_config": {"cache_backend": "seacache", "thresh": 0.2}},
+            False,
+        ),
+        (generator.VISUAL_GEN_SCHEMA, {"cache_config": {"cache_backend": "seacach"}}, False),
     ],
 )
 def test_config_validation(
