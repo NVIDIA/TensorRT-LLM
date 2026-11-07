@@ -145,6 +145,7 @@ l0_cpu:
   - unittest/_torch/misc/test_xgrammar_structural_tag.py
   - unittest/_torch/misc/test_grammar_matcher.py
   - unittest/_torch/models/checkpoints
+  - unittest/_torch/models/test_qwen3_5_dense_mlp_quant.py
   - unittest/_torch/modules
   - unittest/_torch/moe
   - unittest/_torch/multimodal
