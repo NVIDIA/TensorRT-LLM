@@ -119,6 +119,112 @@ def test_a_failed_check_wakes_the_planner_with_the_evidence(tmp_path):
     assert "FAILED core:accuracy[gsm8k]@tp1" in turns[1].evaluation.render()
 
 
+def _moving_target(plan, moves, work=None):
+    """Services whose target moves to the commit ``moves`` names as each named task lands.
+
+    Every check passes and names the commit it measured; ``services.ran`` lists each
+    check run with that commit, in the order they started.
+    """
+    tree = {"commit": "1" * 40}
+    ran = []
+
+    def landing(task):
+        decision = work(task) if work is not None else "UNIT_READY"
+        tree["commit"] = moves.get(task.id, tree["commit"])
+        return decision
+
+    def check(chk):
+        ran.append((chk.key, tree["commit"]))
+        return SimpleNamespace(name=chk.gate, member=chk.member, passed=True, detail="",
+                               tree_state="", imported=(tree["commit"],))  # fmt: skip
+
+    services = Services(
+        plan=plan,
+        work=landing,
+        check=check,
+        free_gpus=lambda: 4,
+        marker=lambda: f"m-{tree['commit'][:4]}",
+    )
+    services.ran = ran  # type: ignore[attr-defined]
+    return services
+
+
+def test_a_landing_that_leaves_a_pass_stale_runs_nothing_while_required_work_is_open(tmp_path):
+    """The checks ``core`` passed go stale when ``tweak`` lands; none runs while ``late`` works."""
+    seen = {}
+
+    def work(task):
+        if task.id == "late":
+            time.sleep(0.5)  # the loop goes round meanwhile
+            seen["ran"] = list(services.ran)
+            evaluation = c.evaluate(
+                _orchestrator_CONTRACT, c.ContractStatus.load(tmp_path), marker="m-2222"
+            )
+            seen["standing"] = c.standing(evaluation, tmp_path, "m-2222")
+        return "UNIT_READY"
+
+    services = _moving_target(
+        _plan_once(
+            _task("core", "assemble", _KEYS),
+            _task("tweak", "assemble", deps=["core"]),
+            _task("late", "assemble", deps=["tweak"]),
+        ),
+        {"tweak": "2" * 40},
+        work,
+    )
+    assert _orchestrator_orchestrator(tmp_path, services).run() == "delivered"
+    # Only core's own claims ran, on the tree it landed; its serve waits for delivery.
+    assert sorted(seen["ran"]) == [
+        ("core:accuracy[gsm8k]@tp1", "1" * 40),
+        ("core:boot@tp1", "1" * 40),
+    ]
+    # The planner reads where each stale check last passed, to diff from there.
+    assert "MISSING core:boot@tp1 (last passed at 1111111111)" in seen["standing"]
+
+
+def test_the_final_round_runs_each_stale_check_once_on_the_final_tree_delivery_last(tmp_path):
+    services = _moving_target(
+        _plan_once(
+            _task("core", "assemble", _KEYS),
+            _task("tweak", "assemble", deps=["core"]),
+        ),
+        {"tweak": "2" * 40},
+    )
+    assert _orchestrator_orchestrator(tmp_path, services).run() == "delivered"
+    final = [key for key, commit in services.ran if commit == "2" * 40]
+    assert sorted(final[:2]) == ["core:accuracy[gsm8k]@tp1", "core:boot@tp1"]
+    assert final[2:] == ["core:serve@tp1"]
+    assert [key for key, _ in services.ran].count("core:serve@tp1") == 1
+    evaluation = c.evaluate(_orchestrator_CONTRACT, c.ContractStatus.load(tmp_path), "m-2222")
+    assert evaluation.holds
+
+
+def test_a_check_task_may_rehearse_a_delivery_tier_check(tmp_path):
+    """The planner rehearses delivery while the core's accuracy is still owed (by ``late``)."""
+    seen = {}
+
+    def work(task):
+        seen.setdefault(task.id, list(services.ran))
+        return "UNIT_READY"
+
+    rehearse = replace(
+        _task("rehearse", "check", ["core:serve@tp1"], deps=["core"], touches=[]), gpus=0
+    )
+    services = _moving_target(
+        _plan_once(
+            _task("core", "assemble", ["core:boot@tp1"]),
+            rehearse,
+            _task("late", "assemble", ["core:accuracy[gsm8k]@tp1"], deps=["rehearse"]),
+        ),
+        {},
+        work,
+    )
+    assert _orchestrator_orchestrator(tmp_path, services).run() == "delivered"
+    assert ("core:serve@tp1", "1" * 40) in seen["late"]
+    # Current on the final tree, it does not run again before delivery.
+    assert [key for key, _ in services.ran].count("core:serve@tp1") == 1
+
+
 @pytest.mark.parametrize(
     "decision, retried",
     [("raised TimeoutError: no answer from the driver", True), ("BLOCKED", False)],

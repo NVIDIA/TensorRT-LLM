@@ -27,7 +27,6 @@ Every stage checkpoints before advancing, so a crash resumes where it was.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import shutil
 import threading
@@ -61,7 +60,6 @@ from ..checks import verdict as check_result
 from ..infra.compute.commands import CommandExecutor
 from ..infra.compute.environment import RunEnvironment
 from ..infra.compute.rebuild import LIBRARY_PATTERNS
-from ..infra.files import write_text_atomic
 from ..infra.git import CommitPolicy, git_output
 from ..spec.task_schema import load_and_validate_task_yaml
 from ..tune import stage as tune_stage
@@ -654,22 +652,15 @@ class TrtllmModelingV2Workflow:
         words = (self._git(repo, "rev-parse", "HEAD") or "").split() if repo else []
         return words[0] if words else ""
 
-    def _commit_marker(self, head: str, reads: Collection[str] | None = None) -> str:
+    def _commit_marker(self, head: str) -> str:
         """Commit ``head``'s marker, as :meth:`_target_marker` describes it.
 
         The native libraries are the checkout's: every snapshot links them
         in. ``""`` when git cannot list the commit.
-
-        With ``reads``, the marker narrowed to what a check read: every Python
-        file not in ``reads`` is left out, since the Python a check's processes
-        imported is all the Python that ran, while a file of any other kind (a
-        header, a config, a table) may be read by code no import names, so each
-        stays in.
         """
         repo = str(self.task_data.get("trtllm_repo_path") or "")
         if not repo or not head:
             return ""
-        wanted = None if reads is None else set(reads)
         policy = CommitPolicy.from_task(self.task_data, workspace=self.workspace)
         try:
             committed = self._committed_blobs(repo, head)
@@ -679,63 +670,13 @@ class TrtllmModelingV2Workflow:
             blobs = {
                 path: blob
                 for path, blob in committed.items()
-                if (wanted is None or not path.endswith(".py") or path in wanted)
-                and gate_relevant(path, keep=keep, denied=policy.denied_paths)
+                if gate_relevant(path, keep=keep, denied=policy.denied_paths)
             }
             libraries = native_libraries(Path(repo))
         except (OSError, ValueError):
             # Unreadable, or a name git printed that is not text: unknown, not unchanged.
             return ""
         return fingerprint(blobs, libraries)
-
-    def _narrowed(self, result: Any) -> tuple[str, str]:
-        """What ``result`` read of the tree, as a verdict records it: its list's id and marker.
-
-        The list is kept once under ``reads/<id>.json`` in the workspace. ``("", "")``
-        when the result names no one commit it measured or did not say what it read.
-        """
-        reads = tuple(getattr(result, "reads", ()) or ())
-        commits = {str(c) for c in getattr(result, "imported", ()) or ()}
-        if not reads or len(commits) != 1 or getattr(result, "void", ""):
-            return "", ""
-        text = "\n".join(sorted(reads))
-        ident = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
-        path = self.workspace / READS_DIRNAME / f"{ident}.json"
-        try:
-            if not path.is_file():
-                path.parent.mkdir(parents=True, exist_ok=True)
-                write_text_atomic(path, json.dumps(sorted(reads)))
-        except OSError:
-            return "", ""
-        marker = self._commit_marker(commits.pop(), reads)
-        return (ident, marker) if marker else ("", "")
-
-    def _verdict_holds(self, verdict: contract_mod.Verdict, workspace: Path | None = None) -> bool:
-        """Whether ``verdict`` holds on the target as it is.
-
-        What it read of the tree is unchanged: its narrowed marker (:meth:`_commit_marker`
-        with ``reads``) on the checkout's ``HEAD`` is the one it recorded. ``workspace``
-        holds the verdict's list of what it read: this run's by default, or the run that
-        recorded it. Asked once per head, list, workspace and native build: a rebuild changes
-        the marker without a commit.
-        """
-        head = self._head()
-        if not head or not verdict.reads or not verdict.reads_marker:
-            return False
-        repo = str(self.task_data.get("trtllm_repo_path") or "")
-        lists = (workspace or self.workspace) / READS_DIRNAME
-        libraries = tuple(native_libraries(Path(repo))) if repo else ()
-        key = (head, verdict.reads, str(lists), libraries)
-        cache = self.__dict__.setdefault("_narrowed_now", {})
-        if key not in cache:
-            try:
-                reads = json.loads((lists / f"{verdict.reads}.json").read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                reads = None
-            if len(cache) > 256:
-                cache.clear()
-            cache[key] = self._commit_marker(head, reads) if reads else ""
-        return bool(cache[key]) and cache[key] == verdict.reads_marker
 
     def _committed_blobs(self, repo: str, head: str) -> dict[str, str] | None:
         """Every path in ``head``'s tree and its object id; the last head asked is kept."""
@@ -1175,9 +1116,6 @@ class _TurnStart:
 
 
 # ----------------------------------------------------------- the target's fingerprint
-
-#: Under the workspace: each list of files a verdict read of the tree (``_narrowed``).
-READS_DIRNAME = "reads"
 
 
 def gate_relevant(path: str, *, keep: Collection[str] = (), denied: Sequence[str] = ()) -> bool:

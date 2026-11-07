@@ -15,17 +15,13 @@ What a check imported is read from what its commands print
 imported the package from, and the engine driver names it once per engine. A
 file inside a snapshot names that snapshot's commit; any other names a tree no
 commit pins. A check whose commands imported more than one tree, or a tree no
-commit pins, is void. What each process imported of the tree is read too (the
-rank hook's reads files): a verdict holds on a later commit whose Python files
-it read, and every file of the tree that is not Python, are unchanged
-(``run/workflow.py:_commit_marker``).
+commit pins, is void.
 """
 
 from __future__ import annotations
 
 import contextlib
 import fcntl
-import json
 import os
 import re
 import shlex
@@ -60,11 +56,6 @@ SPEC_BLOCKS: tuple[str, ...] = ("accuracy", "runtime", "variants", "environment"
 
 _LEASES, _LOCKS = ".leases", ".locks"
 _COMMIT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
-#: Beside the snapshots: per command, the directory its processes write what they read to.
-READS_DIRNAME = ".reads"
-#: Where the rank hook (``checks/harness/rankhook``) writes each process's reads, and of which tree.
-READS_DIR_ENV = "MV2FLOW_READS_DIR"
-TREE_ENV = "MV2FLOW_TREE"
 #: ``[mv2flow-resolve] pid=.. rank=.. module=<module> origin=<file>``, as the resolve hook prints it.
 _RESOLVED = re.compile(r"\[mv2flow-resolve\][^\n]*?\bmodule=(\S+) origin=([^\n]*)")
 
@@ -262,10 +253,6 @@ class CheckTree:
     #: What each command imported, in order: per command, the commit of each
     #: snapshot, or the path of each checkout, its processes imported from.
     commands: list[tuple[str, ...]] = field(default_factory=list)
-    #: The tree's Python files the commands' processes imported, relative to it
-    #: (the rank hook's ``MV2FLOW_READS`` files); ``None`` once a command that
-    #: ran left none, so what the check read is not known.
-    reads: set[str] | None = field(default_factory=set)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     # --------------------------------------------------------------- the spec
@@ -311,46 +298,15 @@ class CheckTree:
     def runner(self, runner: Callable[..., Any]) -> Callable[..., Any]:
         """``runner``, run from inside the snapshot (``check_runtime.in_tree``), noting what each imported."""
         inside = check_runtime.in_tree(runner, self.tree)
+        hook = shlex.quote(str(check_runtime.RANK_HOOK_DIR))
+        prefix = f'export PYTHONPATH={hook}"${{PYTHONPATH:+:$PYTHONPATH}}" && '
 
         def run(command: str, env: Mapping[str, str] | None = None, timeout: int = 1800) -> Any:
-            reads = self.tree.parent / READS_DIRNAME / uuid.uuid4().hex
-            hook = shlex.quote(str(check_runtime.RANK_HOOK_DIR))
-            prefix = (
-                f"export {READS_DIR_ENV}={shlex.quote(str(reads))} "
-                f"{TREE_ENV}={shlex.quote(str(Path(self.tree).resolve()))} "
-                f'PYTHONPATH={hook}"${{PYTHONPATH:+:$PYTHONPATH}}" && '
-            )
-            try:
-                result = inside(prefix + command, env, timeout)
-                output = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}"
-                if self.observe(output):
-                    self.read(reads)
-            finally:
-                shutil.rmtree(reads, ignore_errors=True)
+            result = inside(prefix + command, env, timeout)
+            self.observe(f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}")
             return result
 
         return run
-
-    def read(self, directory: Path) -> None:
-        """Add what one command's processes imported of the tree (``directory``'s files).
-
-        Asked of a command that imported the package: one that left no file
-        makes what the check read unknown, as its processes may have imported
-        anything.
-        """
-        found: set[str] = set()
-        files = sorted(directory.glob("*.json")) if directory.is_dir() else []
-        for path in files:
-            try:
-                found.update(str(p) for p in json.loads(path.read_text(encoding="utf-8")))
-            except (OSError, ValueError, TypeError):
-                files = []
-                break
-        with self._lock:
-            if not files or self.reads is None:
-                self.reads = None
-            else:
-                self.reads |= found
 
     def observe(self, output: str) -> bool:
         """Note what one command's ``output`` says its processes imported; whether it said."""
@@ -412,7 +368,6 @@ class CheckTree:
             imported=self.imported(),
             void=self.void(),
             warnings=warnings,
-            reads=tuple(sorted(self.reads)) if self.reads else (),
         )
 
     @cached_property
@@ -433,7 +388,6 @@ class CheckTree:
         for attempt in range(VOID_RERUNS + 1):
             with self._lock:
                 self.commands.clear()
-                self.reads = set()
             result = self.stamp(measure())
             if not result.void or attempt == VOID_RERUNS:
                 return result

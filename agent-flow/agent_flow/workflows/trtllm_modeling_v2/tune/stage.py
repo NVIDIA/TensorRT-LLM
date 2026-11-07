@@ -1607,12 +1607,10 @@ def tested_source(wf: Any, workspace: Path) -> str:
     marker = wf._commit_marker(head) if head else ""
     contract = getattr(wf, "_contract", None)
     if contract is not None and marker:
-        holds = getattr(wf, "_verdict_holds", None)
         evaluation = contract_mod.evaluate(
             contract_mod.Contract(contract_mod.core_checks(contract)),
             wf._contract_status() if own else contract_mod.ContractStatus.load(workspace),
             marker=marker,
-            holds=None if holds is None else (lambda verdict: holds(verdict, workspace)),
         )
         if evaluation.holds:
             return head

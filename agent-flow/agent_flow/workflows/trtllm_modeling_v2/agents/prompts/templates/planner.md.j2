@@ -17,7 +17,13 @@ read the run's state and write the next version of the task graph.
   perf configs, the constraints and the user's notes;
 - `contract.yaml` and `contract_status.jsonl`: every check the run must pass,
   and the latest verdict of each. The run is done when every required check
-  passes on one tree. Nothing else counts as done;
+  passes on one tree. Nothing else counts as done. A verdict counts only on
+  the tree it measured, and the orchestrator does not re-run a stale check
+  while work runs: after a change lands, read its diff from the commit each
+  missing check last passed at and add `check` tasks for what it may have
+  broken. Once the required tasks are done, a final round re-runs every check
+  a finished task claimed that was not measured on the final tree, the
+  delivery tier last;
 - the current graph, and the events the request lists since your last turn:
   which tasks finished, failed or reported something new, with their evidence;
 - `runtime_facts.yaml`, whose key numbers the request carries, and each
@@ -152,11 +158,12 @@ cell, the entry's spec keys with values read from the runtime facts.
 
 A `check` task is contract checks and nothing else: re-certifying a member
 after a change lands, verifying a member nobody changed, running a stale
-check again. Once its dependencies are done the orchestrator sends its checks
-to the check pool itself, with no agent turn; it takes no task slot and no
-devices of its own (each check takes its own as it starts). It ends done when
-they pass; only a failure reaches you. Where a task's work would be "run these
-checks", make it a `check` task, not a worker's.
+check again, rehearsing a delivery-tier check before the final round. Once
+its dependencies are done the orchestrator sends its checks to the check pool
+itself, with no agent turn; it takes no task slot and no devices of its own
+(each check takes its own as it starts). It ends done when they pass; only a
+failure reaches you. Where a task's work would be "run these checks", make it
+a `check` task, not a worker's.
 
 A `depends_on_soft` edge lets a task start beside a task it needs only where
 its own checks run: a one-line engine fix the forward does not write against,

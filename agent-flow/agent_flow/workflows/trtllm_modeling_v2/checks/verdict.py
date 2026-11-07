@@ -75,9 +75,6 @@ class GateResult:
     #: commands imported more than one tree, or a tree no commit pins, or no
     #: snapshot could be made. A void verdict never passes.
     void: str = ""
-    #: The tree's Python files the gate's processes imported, relative to it;
-    #: empty where a command did not say (``run/workspace/snapshots.py:CheckTree.read``).
-    reads: tuple[str, ...] = ()
     #: The per-prompt numbers behind ``measured``, where a gate has them.
     breakdown: str = ""
     #: The accuracy floor the measurement was held to, and the binomial
@@ -153,7 +150,6 @@ def measured_on(
     imported: Sequence[str] = (),
     void: str = "",
     warnings: Sequence[str] = (),
-    reads: Sequence[str] = (),
 ) -> GateResult:
     """``result`` as measured on one pinned tree: what it is, its marker, and what was imported.
 
@@ -165,7 +161,6 @@ def measured_on(
         "marker": marker,
         "imported": tuple(imported),
         "warnings": (*result.warnings, *warnings),
-        "reads": tuple(reads),
     }
     if void:
         detail = f"{void}; what it measured: {result.detail}" if result.detail else void
