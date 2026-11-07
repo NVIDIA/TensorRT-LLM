@@ -42,6 +42,7 @@ from tensorrt_llm.serve.tool_parser.glm47_parser import Glm47ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k2_tool_parser import KimiK2ToolParser
 from tensorrt_llm.serve.tool_parser.kimi_k3_tool_parser import KimiK3ToolParser
 from tensorrt_llm.serve.tool_parser.minimax_m2_parser import MiniMaxM2ToolParser
+from tensorrt_llm.serve.tool_parser.minimax_m3_parser import MiniMaxM3ToolParser
 from tensorrt_llm.serve.tool_parser.poolside_v1_parser import \
     PoolsideV1ToolParser
 from tensorrt_llm.serve.tool_parser.qwen3_coder_parser import \
@@ -4925,6 +4926,73 @@ class TestToolParserIntegration:
 
         assert result1.calls[0].name == "get_weather"
         assert result2.calls[0].name == "search_web"
+
+
+# ============================================================================
+# MiniMaxM3ToolParser Streaming Tests
+# ============================================================================
+
+M3_NS = "]<]minimax[>["
+
+
+def _m3_call(name, location):
+    return (f'{M3_NS}<tool_call>\n{M3_NS}<invoke name="{name}">\n'
+            f"{M3_NS}<location>{location}{M3_NS}</location>\n"
+            f"{M3_NS}</invoke>\n{M3_NS}</tool_call>")
+
+
+class TestMiniMaxM3StreamingBlockBoundaries:
+    """A chunk can end one tool-call block and start the next."""
+
+    @staticmethod
+    def _stream(chunks, tools):
+        parser = MiniMaxM3ToolParser()
+        results = [parser.parse_streaming_increment(c, tools) for c in chunks]
+        text = "".join(r.normal_text for r in results)
+        calls = [(c.tool_index, c.name, c.parameters) for r in results
+                 for c in r.calls]
+        return text, calls
+
+    def test_second_block_split_across_chunks_is_not_leaked_as_text(
+            self, sample_tools):
+        first, second = _m3_call("get_weather", "Paris"), _m3_call(
+            "search_web", "Rome")
+        cut = second.index("<invoke")
+        chunks = [first + "\n" + second[:cut], second[cut:]]
+
+        text, calls = self._stream(chunks, sample_tools)
+
+        assert M3_NS not in text
+        assert [(index, name) for index, name, _ in calls] == [
+            (0, "get_weather"), (1, "search_web")
+        ]
+
+    def test_every_split_matches_one_shot_parse(self, sample_tools):
+        whole = ("Checking. " + _m3_call("get_weather", "Paris") + "\n" +
+                 _m3_call("search_web", "Rome") + " Done.")
+        expected = MiniMaxM3ToolParser().detect_and_parse(whole, sample_tools)
+        assert len(expected.calls) == 2
+
+        for cut in range(1, len(whole)):
+            text, calls = self._stream([whole[:cut], whole[cut:]],
+                                       sample_tools)
+            assert calls == [(c.tool_index, c.name, c.parameters)
+                             for c in expected.calls], (
+                                 f"calls differ when split at {cut}")
+            # Only the spacing around the prose may differ between a
+            # one-shot and a streamed parse.
+            assert "".join(text.split()) == "".join(
+                expected.normal_text.split()), f"text differs at {cut}"
+
+    def test_two_whole_blocks_in_one_chunk_keep_their_order(
+            self, sample_tools):
+        parser = MiniMaxM3ToolParser()
+        result = parser.parse_streaming_increment(
+            _m3_call("get_weather", "Paris") + _m3_call("search_web", "Rome"),
+            sample_tools)
+
+        assert [(c.tool_index, c.name) for c in result.calls
+                ] == [(0, "get_weather"), (1, "search_web")]
 
 
 # ============================================================================

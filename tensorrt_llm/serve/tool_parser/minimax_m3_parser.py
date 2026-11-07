@@ -207,14 +207,37 @@ class MiniMaxM3ToolParser(BaseToolParser):
             # Still inside an open tool-call block; wait for the closer.
             return StreamingParseResult()
 
-        try:
-            result = self.detect_and_parse(current_text, tools)
-        except Exception as exc:
-            logger.error(f"Error in MiniMaxM3 parse_streaming_increment: {exc}")
-            return StreamingParseResult(normal_text=current_text)
+        # One chunk can carry the end of a block and the start of the next
+        # (a large stream interval, speculative decoding). Parse one
+        # finished block at a time and keep whatever follows the last
+        # closer, so a half-received next block is not flushed as text.
+        texts: List[str] = []
+        calls: List[ToolCallItem] = []
+        while self.eot_token in self._buffer:
+            end = self._buffer.index(self.eot_token) + len(self.eot_token)
+            block, self._buffer = self._buffer[:end], self._buffer[end:]
+            try:
+                result = self.detect_and_parse(block, tools)
+            except Exception as exc:
+                logger.error(f"Error in MiniMaxM3 parse_streaming_increment: {exc}")
+                texts.append(block)
+                continue
+            if result.normal_text:
+                texts.append(result.normal_text)
+            for call in result.calls:
+                # Clients use the index to tell calls apart across increments, so
+                # it counts calls over the whole stream, not within one increment.
+                self.current_tool_id += 1
+                call.tool_index = self.current_tool_id
+                calls.append(call)
 
-        self._buffer = ""
-        return result
+        rest = self._buffer
+        if rest and not self.has_tool_call(rest):
+            if not self._ends_with_partial_token(rest, self.bot_token):
+                self._buffer = ""
+                if rest.strip():
+                    texts.append(rest.strip())
+        return StreamingParseResult(normal_text=" ".join(texts), calls=calls)
 
     def supports_structural_tag(self) -> bool:
         """Structural-tag-driven decoding is not implemented for M3 yet."""
