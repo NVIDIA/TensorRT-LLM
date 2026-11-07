@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING
 
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo,
@@ -14,11 +14,13 @@ from tensorrt_llm.quantization.modelopt_config import (
 from ..._router_index import NoTarget, engine_kv_cache_quant_algo, routes
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
-def _quant_algo(pretrained_config: Any) -> Optional[str]:
+def _quant_algo(pretrained_config: PretrainedConfig | None) -> str | None:
     quant = getattr(pretrained_config, "quantization_config", None)
     if isinstance(quant, dict):
         if "quantization" in quant or "quant_method" in quant or "producer" in quant:
@@ -27,7 +29,7 @@ def _quant_algo(pretrained_config: Any) -> Optional[str]:
     return canonicalize_quant_algo(getattr(quant, "quant_algo", None))
 
 
-def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
+def engine_refusal(llm_args: TorchLlmArgs | None) -> str | None:
     """Report engine options this eager target cannot implement."""
     if llm_args is None:
         return None
@@ -59,7 +61,7 @@ def engine_refusal(llm_args: Optional[Any]) -> Optional[str]:
 
 @routes("BeamForCausalLM")
 def route(
-    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: Tuple[int, int]
+    model_config: ModelConfig, llm_args: TorchLlmArgs, compute_capability: tuple[int, int]
 ) -> type:
     """Return the target class for this deployment, or raise ``NoTarget`` saying why none fits.
 

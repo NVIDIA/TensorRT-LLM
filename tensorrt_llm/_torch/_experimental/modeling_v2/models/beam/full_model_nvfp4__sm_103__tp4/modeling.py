@@ -28,7 +28,7 @@ not supported.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -37,10 +37,16 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm.logger import logger
 
 from .layout import check_checkpoint, checkpoint_dir_of
-from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4
+from .model import MAX_NUM_TOKENS, NUM_LAYERS, BeamFullModelNvfp4Sm103Tp4, LogitRows
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
+    from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
+    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
 
-def _checkpoint_config(pretrained_config) -> tuple:
+def _checkpoint_config(pretrained_config: PretrainedConfig | None) -> tuple[str, dict]:
     """The checkpoint directory and its ``config.json`` mapping, read as stored and validated.
 
     ``layout.check_checkpoint`` is the validator routing applies too, so a checkpoint routing
@@ -74,11 +80,17 @@ class _Target:
 
     phase = ""
 
-    def __init__(self, model: BeamFullModelNvfp4Sm103Tp4):
+    def __init__(self, model: BeamFullModelNvfp4Sm103Tp4) -> None:
         self.model = model
-        self.traced = set()
+        self.traced: set[str] = set()
 
-    def _run(self, attn_metadata, input_ids, position_ids, logit_rows) -> torch.Tensor:
+    def _run(
+        self,
+        attn_metadata: TrtllmAttentionMetadata,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        logit_rows: LogitRows,
+    ) -> torch.Tensor:
         kind = "batched" if attn_metadata.num_seqs > 1 else "single-request"
         trace = None if kind in self.traced else []
         logits = self.model(
@@ -97,13 +109,13 @@ class PrefillTarget(_Target):
 
     def forward(
         self,
-        attn_metadata,
+        attn_metadata: TrtllmAttentionMetadata,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
         *,
         return_context_logits: bool,
     ) -> torch.Tensor:
-        rows = "all" if return_context_logits else None
+        rows: LogitRows = "all" if return_context_logits else None
         return self._run(attn_metadata, input_ids, position_ids, rows)
 
 
@@ -114,9 +126,9 @@ class DecodeTarget(_Target):
 
     def forward(
         self,
-        attn_metadata,
+        attn_metadata: TrtllmAttentionMetadata,
         input_ids: torch.Tensor,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None,
         *,
         return_context_logits: bool,
     ) -> torch.Tensor:
@@ -126,7 +138,7 @@ class DecodeTarget(_Target):
 class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
     """The engine-facing Beam NVFP4 full model (one rank of four)."""
 
-    def __init__(self, model_config: ModelConfig):
+    def __init__(self, model_config: ModelConfig) -> None:
         super().__init__()
         self.model_config = model_config
         mapping = model_config.mapping
@@ -139,14 +151,14 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         )
         self._prefill = PrefillTarget(self.model)
         self._decode = DecodeTarget(self.model)
-        self.load_record: Optional[dict] = None
+        self.load_record: dict | None = None
         logger.info(
             f"[modeling_v2] {type(self).__name__}: {NUM_LAYERS} layers, rank {mapping.rank} of "
             f"{mapping.world_size}, max {MAX_NUM_TOKENS} tokens per call"
         )
 
     @property
-    def config(self):
+    def config(self) -> PretrainedConfig | None:
         return self.model_config.pretrained_config
 
     @property
@@ -163,7 +175,7 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
         self.load_record = self.model.load(checkpoint_dir)
         return self.load_record
 
-    def validate_request(self, request) -> None:
+    def validate_request(self, request: LlmRequest) -> None:
         """Reject invalid requests at admission, before they can fail a shared batch."""
         vocab_size = self.model.vocab_size
         end_id = request.py_end_id
@@ -183,12 +195,12 @@ class ModelingV2BeamFullModelNvfp4Sm103Tp4(nn.Module):
 
     def forward(
         self,
-        attn_metadata,
-        input_ids: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
+        attn_metadata: TrtllmAttentionMetadata,
+        input_ids: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         return_context_logits: bool = False,
-        **kwargs,
+        **kwargs: object,
     ) -> torch.Tensor:
         if inputs_embeds is not None or input_ids is None:
             raise ValueError("the Beam NVFP4 target takes token ids, not input embeddings")

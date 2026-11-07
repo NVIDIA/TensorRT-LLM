@@ -14,7 +14,20 @@ the HF loader's; everything else is the HF checkpoint loader's own behavior.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Self, TypedDict, Unpack
+
+if TYPE_CHECKING:
+    import torch
+
+    from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
+    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
+    from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import BaseWeightMapper
+
+    class _LoaderOptions(TypedDict, total=False):
+        weight_loader: BaseWeightLoader | None
+        weight_mapper: BaseWeightMapper | None
+        config_loader: BaseConfigLoader | None
+
 
 from tensorrt_llm._torch.models.checkpoints.hf.checkpoint_loader import HfCheckpointLoader
 from tensorrt_llm.mapping import Mapping
@@ -23,15 +36,17 @@ from tensorrt_llm.mapping import Mapping
 class BeamNvfp4CheckpointLoader(HfCheckpointLoader):
     """Preload the Beam NVFP4 full-model target from its checkpoint directory."""
 
-    def __init__(self, **loaders):
+    def __init__(self, **loaders: Unpack[_LoaderOptions]) -> None:
         super().__init__(**loaders)
         self._preloaded = False
 
-    def __reduce__(self):
+    def __reduce__(self) -> tuple[type[Self], tuple[()]]:
         # Workers rebuild the loader from its class: it carries no state before a load.
         return (type(self), ())
 
-    def load_weights(self, checkpoint_dir: str, mapping: Mapping, **kwargs) -> dict[str, Any]:
+    def load_weights(
+        self, checkpoint_dir: str, mapping: Mapping, **kwargs: object
+    ) -> dict[str, torch.Tensor]:
         from .modeling import ModelingV2BeamFullModelNvfp4Sm103Tp4
 
         model = kwargs.get("model")
