@@ -52,6 +52,9 @@ l0_gr100:
   - unittest/_torch/attention/test_flashinfer_trtllm_gen_sm107_p128.py
   - unittest/_torch/kernels/parallel/test_nvfp4_quant.py
   - unittest/_torch/moe/kernels/parallel/test_triton_nvfp4_input_quant.py
+  # CuteDSL MoE locality-domain split (NVFP4/BF16 grouped GEMM): module lifecycle and forward.
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_correctness_rubin
+  - unittest/_torch/moe/kernels/parallel/test_cute_dsl_moe.py::test_moe_module_locality_domain_lifecycle_and_forward_rubin
   - unittest/_torch/modeling/test_kimi_k3_mla.py::test_k3_mla_nvfp4_kv_with_fp8_kv_b_matches_huggingface
   - unittest/_torch/modules/kimi_kda/test_kda_flashinfer_prefill.py::test_auto_prefill_stays_finite_on_repeated_token_with_mixed_decay
   - unittest/_torch/modules/mamba/test_flashinfer_chunk_gdn.py
