@@ -70,10 +70,10 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
-                                                get_steady_clock_now_in_seconds,
-                                                guard_responses_stream,
-                                                stream_error_event)
+from tensorrt_llm.serve.responses_utils import (
+    STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, ResponsesStreamingProcessor,
+    ServerArrivalTimeMiddleware, get_steady_clock_now_in_seconds,
+    guard_responses_stream, rejected_responses_stream, stream_error_event)
 from tensorrt_llm.serve.router import Router
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
@@ -212,6 +212,43 @@ def _upstream_error_message(error: aiohttp.ClientResponseError) -> str:
     # Not a body this server recognises. Report the status only: anything else
     # in `raw` may still carry the upstream URL.
     return f"context worker rejected the request with status {error.status}"
+
+
+def _context_length_exceeded_message(
+        response: Optional[Response]) -> Optional[str]:
+    """The message of a worker's ``context_length_exceeded`` envelope, else None.
+
+    ``_handle_exception`` answers that rejection, and only that one, with the
+    worker's 4xx error envelope as a JSONResponse; every other failure raises,
+    or returns None for a ``CppExecutorError``.
+    """
+    if not isinstance(response, JSONResponse):
+        return None
+    if not 400 <= response.status_code < 500:
+        return None
+    body = json.loads(response.body)
+    if isinstance(body, dict) and body.get(
+            "code") == CONTEXT_LENGTH_EXCEEDED_CODE:
+        return str(body.get("message", ""))
+    return None
+
+
+def _context_length_exceeded_stream(request: ResponsesRequest,
+                                    message: str) -> StreamingResponse:
+    """Fail a streamed Responses request in-stream, as an aggregated server does.
+
+    The context phase never streams, so its worker rejects an over-length
+    prompt with a 400. The snapshot names the model the client asked for; the
+    frontend does not know the served name.
+    """
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name=request.model,
+        use_harmony=False)
+    return StreamingResponse(content=rejected_responses_stream(
+        processor, STREAM_TERMINATION_CONTEXT_LENGTH_EXCEEDED, message),
+                             media_type="text/event-stream")
 
 
 class OpenAIDisaggServer:
@@ -462,7 +499,16 @@ class OpenAIDisaggServer:
             except Exception as e:
                 # Usually raises; returns a Response for worker errors that
                 # carry a machine-readable code (context_length_exceeded).
-                return self._handle_exception(e)
+                error_response = self._handle_exception(e)
+                if isinstance(req, ResponsesRequest) and req.stream:
+                    # The handler, which a subclass may override, has ruled
+                    # on the failure. Only its context-length envelope is
+                    # re-shaped: a streamed Responses request is answered
+                    # in-stream, as on an aggregated server.
+                    message = _context_length_exceeded_message(error_response)
+                    if message is not None:
+                        return _context_length_exceeded_stream(req, message)
+                return error_response
         return wrapper
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
