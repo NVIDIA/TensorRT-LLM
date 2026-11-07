@@ -33,6 +33,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.models.modeling_qwen4_exp import Qwen4ExpModel
+from tensorrt_llm._torch.modules.qwen4_exp import ple as ple_module
 from tensorrt_llm._torch.modules.qwen4_exp.ple import (
     PLEMetadata,
     Qwen4ExpNGramEmbedding,
@@ -704,9 +706,222 @@ def test_ple_mixed_batch_bounds_short_conv_workspace(monkeypatch) -> None:
     ]
 
 
-def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> None:
-    from tensorrt_llm._torch.modules.qwen4_exp import ple as qwen4_exp_ple
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("context_lengths", [[17, 5], [2, 1]])
+@pytest.mark.parametrize("generation_lengths", [[4, 4, 4], [1, 3, 4]])
+def test_ple_mixed_speculative_workspace_and_rollback(
+    monkeypatch, device, context_lengths, generation_lengths
+) -> None:
+    """Mixed verification must match per-sequence accepted-prefix execution."""
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    channels, state_len = 8, 9
+    module = object.__new__(Qwen4ExpPLE)
+    torch.nn.Module.__init__(module)
+    module.conv_channels = channels
+    module.short_conv_state_len = state_len
+    module.short_conv_dilation = 3
+    module.conv1d = torch.nn.Conv1d(
+        channels, channels, 4, groups=channels, dilation=3, bias=False, device=device
+    )
+    module._pending_conv_states = None
+    module._pending_ngram_contexts = None
+    lengths = context_lengths + generation_lengths
+    slots = torch.tensor([5, 1, 4, 0, 3], device=device)
+    tokens = torch.arange(sum(lengths), device=device)
+    metadata = PLEMetadata.build(
+        tokens,
+        torch.tensor(lengths, device=device),
+        slots,
+        is_decode=False,
+        eos_token_id=EOS_TOKEN_ID,
+        num_contexts=2,
+        use_spec_decoding=True,
+        host_seq_lens=lengths,
+    )
+    assert metadata.context_row_width == max(context_lengths)
+    assert metadata.generation_row_width == max(generation_lengths)
+    values = torch.randn(sum(lengths), channels, device=device)
+    initial_state = torch.randn(7, channels, state_len, device=device)
+    initial_context = torch.arange(14, device=device).reshape(7, 2)
+    state = initial_state.clone()
+    context = initial_context.clone()
+    shapes = []
+    original_conv1d = F.conv1d
 
+    def record_conv1d(input_tensor, *args, **kwargs):
+        shapes.append(tuple(input_tensor.shape))
+        return original_conv1d(input_tensor, *args, **kwargs)
+
+    monkeypatch.setattr(F, "conv1d", record_conv1d)
+    actual = module._short_conv(values, metadata, state)
+    combined = torch.cat((context[slots], metadata.padded_tokens), dim=1)
+    module._commit_ngram_context(combined, metadata, context)
+    width = max(generation_lengths)
+    assert shapes == [
+        (2, channels, state_len + max(context_lengths)),
+        (3, channels, state_len + width),
+    ]
+    for entry, shape in [
+        (module._pending_conv_states, (3, width, channels, state_len)),
+        (module._pending_ngram_contexts, (3, width, 2)),
+    ]:
+        candidates = entry[3]
+        assert tuple(candidates.shape) == shape
+        assert (
+            candidates.untyped_storage().nbytes() == candidates.numel() * candidates.element_size()
+        )
+
+    accepted = context_lengths + [1, 2, 4]
+    module.commit_speculative_states(torch.tensor(accepted, device=device), slots, 2)
+    expected_state = initial_state.clone()
+    expected_context = initial_context.clone()
+    outputs = []
+    start = 0
+    for row, (length, keep) in enumerate(zip(lengths, accepted)):
+        slot = slots[row]
+        conv_input = torch.cat((initial_state[slot], values[start : start + length].T), dim=1)
+        outputs.append(
+            F.silu(
+                original_conv1d(
+                    conv_input.unsqueeze(0), module.conv1d.weight, dilation=3, groups=channels
+                )
+            )
+            .squeeze(0)
+            .T
+        )
+        expected_state[slot] = conv_input[:, keep : keep + state_len]
+        token_history = torch.cat((initial_context[slot], tokens[start : start + length]))
+        expected_context[slot] = token_history[keep : keep + 2]
+        start += length
+    torch.testing.assert_close(actual, torch.cat(outputs))
+    torch.testing.assert_close(state, expected_state)
+    torch.testing.assert_close(context, expected_context)
+    assert module._pending_conv_states is None
+    assert module._pending_ngram_contexts is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-4), (torch.bfloat16, 6e-2)])
+def test_model_mixed_mtp_step_matches_per_sequence_execution(monkeypatch, dtype, tol) -> None:
+    """A model-built mixed context + MTP step must match isolated per-sequence steps."""
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(20261106)
+    module = Qwen4ExpPLE(_make_config(), dtype=dtype, ple_layer_index=0, layer_id=1).to(device)
+    module.eval()
+    _init_module_weights(module, gen, device, dtype)
+    model = object.__new__(Qwen4ExpModel)
+    torch.nn.Module.__init__(model)
+    model.has_ple = True
+    model.ple_layer_index = 0
+    model.layers = [SimpleNamespace(ple=module)]
+    model.eos_token_id = EOS_TOKEN_ID
+
+    # A fresh 6-token context, a 2-token continuation chunk, and three
+    # verification rows (golden token + three drafts) that accept 1, 2, 4.
+    lengths = [6, 2, 4, 4, 4]
+    accepted = [6, 2, 1, 2, 4]
+    slots = torch.tensor([5, 1, 4, 0, 3], device=device)
+    num_slots, num_contexts, padding = 7, 2, 3
+    initial_conv = torch.randn(
+        num_slots, CONV_CHANNELS, SHORT_CONV_STATE_LEN, generator=gen, device=device
+    ).to(dtype)
+    initial_context = torch.randint(
+        0, VOCAB_SIZE, (num_slots, NGRAM_CONTEXT_LEN), generator=gen, device=device
+    )
+    # The fresh context starts from the empty recurrent state.
+    initial_conv_after_reset = initial_conv.clone()
+    initial_conv_after_reset[slots[0]] = 0
+    initial_context_after_reset = initial_context.clone()
+    initial_context_after_reset[slots[0]] = EOS_TOKEN_ID
+
+    tokens = torch.randint(0, VOCAB_SIZE, (sum(lengths) + padding,), generator=gen, device=device)
+    hidden = torch.randn(sum(lengths) + padding, CONV_CHANNELS, generator=gen, device=device).to(
+        dtype
+    )
+    conv_state = initial_conv.clone()
+    ngram_context = initial_context.clone()
+    attn_metadata = SimpleNamespace(
+        num_contexts=num_contexts,
+        num_seqs=len(lengths),
+        seq_lens=torch.tensor(lengths, dtype=torch.int32),
+        seq_lens_cuda=None,
+        num_tokens=sum(lengths) + padding,
+        all_rank_num_tokens=None,
+        is_cuda_graph=False,
+        kv_cache_manager=None,
+        max_num_requests=num_slots,
+        qwen4_exp_ple_state={0: (conv_state, ngram_context)},
+    )
+    mamba_metadata = SimpleNamespace(
+        state_indices=slots.int(),
+        state_indices_long=slots,
+        has_initial_states=torch.tensor([False, True], device=device),
+    )
+    spec_metadata = SimpleNamespace(runtime_draft_len=3)
+
+    metadata, conv_pool, context_pool = model._prepare_ple_state(
+        attn_metadata, tokens, mamba_metadata, spec_metadata
+    )
+    assert conv_pool is conv_state and context_pool is ngram_context
+    assert metadata.use_spec_decoding and not metadata.is_decode
+    assert metadata.num_contexts == num_contexts
+    assert metadata.context_tokens == sum(lengths[:num_contexts])
+    assert metadata.context_row_width == max(lengths[:num_contexts])
+    assert metadata.generation_row_width == 4
+    packed_calls = []
+    packed_short_conv = ple_module.ple_packed_short_conv
+
+    def record_packed_short_conv(*args):
+        packed_calls.append(args[2].shape[0])
+        return packed_short_conv(*args)
+
+    monkeypatch.setattr(ple_module, "ple_packed_short_conv", record_packed_short_conv)
+    with torch.no_grad():
+        actual = module.forward(hidden, metadata, conv_state, ngram_context)
+    # Only BF16 context rows qualify for the packed kernel; verification rows
+    # keep the eager path that records rollback candidates.
+    assert packed_calls == ([metadata.context_tokens] if dtype == torch.bfloat16 else [])
+    module.commit_speculative_states(
+        torch.tensor(accepted, device=device), slots, num_contexts=num_contexts
+    )
+
+    # Independent reference: each request alone through the eager path.
+    monkeypatch.setattr(ple_module, "can_use_ple_packed_short_conv", lambda *args: False)
+    expected = torch.zeros_like(actual)
+    expected_conv = initial_conv_after_reset.clone()
+    expected_context = initial_context_after_reset.clone()
+    start = 0
+    for slot, length, keep in zip(slots.tolist(), lengths, accepted):
+        rows = slice(start, start + length)
+        index = torch.tensor([slot], device=device)
+        for count, record in [(length, True), (keep, False)]:
+            conv = initial_conv_after_reset.clone()
+            context = initial_context_after_reset.clone()
+            single = PLEMetadata.build(
+                tokens[start : start + count],
+                torch.tensor([count], device=device),
+                index,
+                is_decode=False,
+                eos_token_id=EOS_TOKEN_ID,
+            )
+            with torch.no_grad():
+                output = module.forward(hidden[start : start + count], single, conv, context)
+            if record:
+                expected[rows] = output
+            else:
+                expected_conv[slot] = conv[slot]
+                expected_context[slot] = context[slot]
+        start += length
+
+    assert _metrics(actual, expected)[0] <= tol
+    assert _metrics(conv_state, expected_conv)[0] <= tol
+    assert torch.equal(ngram_context, expected_context)
+    assert module._pending_conv_states is None
+    assert module._pending_ngram_contexts is None
+
+
+def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> None:
     config = _make_config()
     mapping = SimpleNamespace(tp_size=2, tp_rank=0, cp_size=1, enable_attention_dp=True)
     module = Qwen4ExpNGramEmbedding(
@@ -755,8 +970,8 @@ def test_ple_attention_dp_row_shard_preserves_local_token_order(monkeypatch) -> 
         torch.testing.assert_close(partial, expected_partial)
         return full_weight[gathered_ids[:3]]
 
-    monkeypatch.setattr(qwen4_exp_ple, "allgather", fake_allgather)
-    monkeypatch.setattr(qwen4_exp_ple, "reducescatter", fake_reducescatter)
+    monkeypatch.setattr(ple_module, "allgather", fake_allgather)
+    monkeypatch.setattr(ple_module, "reducescatter", fake_reducescatter)
 
     output = module.embed(
         local_ids,
