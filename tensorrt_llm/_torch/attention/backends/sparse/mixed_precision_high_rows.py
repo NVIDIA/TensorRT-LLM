@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Mixed-precision high pool for sparse MLA backends that keep the history in an NVFP4 pool.
+"""Mixed-precision high pool of the sparse MLA backends and the cold-page window.
 
-Each new token is also written to the mixed-precision high pool. After the top-k gather, rows
-the mixed-precision high pool still holds overwrite the dequantized rows in the FP8 scratch.
-Mixed-precision high page table: a page index if the token is held there, else -1.
+New tokens are written to the high pool as well; with an NVFP4 history its rows overwrite the
+dequantized scratch after the top-k gather, with a plain history (cold-page window) the held
+positions are read from its rows in place. High page table: the page index if held, else -1.
 """
 
 from typing import TYPE_CHECKING
@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING
 import torch
 import triton
 import triton.language as tl
+
+from ..mixed_precision_rows import _copy_rows
 
 if TYPE_CHECKING:
     from ..trtllm import TrtllmAttention
@@ -72,32 +74,6 @@ def _store_mixed_precision_high_rows_kernel(
             row.to(kv_cache_ptr.dtype.element_ty),
             mask=mask,
         )
-
-
-@triton.jit
-def _copy_rows(
-    kv_cache_ptr,
-    slot,
-    scratch_ptr,
-    scratch_row,
-    valid,
-    scale_ptr,
-    APPLY_SCALE: tl.constexpr,
-    ROW_WIDTH: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    """Copy mixed-precision high pool rows `slot` to scratch rows `scratch_row` (FP8)."""
-    src = kv_cache_ptr + slot[:, None] * ROW_WIDTH
-    dst = scratch_ptr + scratch_row.to(tl.int64)[:, None] * ROW_WIDTH
-    if APPLY_SCALE:
-        scale = tl.load(scale_ptr)
-    for start in range(0, ROW_WIDTH, BLOCK_W):
-        cols = start + tl.arange(0, BLOCK_W)
-        mask = valid[:, None] & (cols < ROW_WIDTH)[None, :]
-        row = tl.load(src + cols[None, :], mask=mask)
-        if APPLY_SCALE:
-            row = row.to(tl.float32) * scale
-        tl.store(dst + cols[None, :], row.to(scratch_ptr.dtype.element_ty), mask=mask)
 
 
 # The epoch changes every call: keep it out of the specialization key.
@@ -499,3 +475,39 @@ def overlay_mixed_precision_high_rows(
             BLOCK_R=block_rows,
             BLOCK_W=128,
         )
+
+
+def mixed_precision_high_row_indices(
+    metadata: "DSAtrtllmAttentionMetadata",
+    attention: "TrtllmAttention",
+    topk_indices: torch.Tensor,
+    topk_indices_global: torch.Tensor,
+    requests: torch.Tensor,
+) -> torch.Tensor:
+    """Point the selected positions the mixed-precision high pool holds at its rows, in place.
+
+    `topk_indices` are the selected KV positions (-1 for none), `topk_indices_global` their pool
+    rows (rewritten and returned), `requests` the batch index of each query row.
+    """
+    block_table = metadata.mixed_precision_high_block_table
+    if isinstance(block_table, dict):
+        # DeepSeek-V4: one page table per compression ratio.
+        block_table = block_table.get(attention.compress_ratio)
+    if block_table is None:
+        return topk_indices_global
+    manager = metadata.kv_cache_manager
+    local = manager.layer_offsets[attention.layer_idx]
+    layer_offset = manager.mixed_precision_high_layer_offsets.get(local)
+    if layer_offset is None:
+        # No mixed-precision high pool (e.g. an Eagle3 drafter layer): a plain cache.
+        return topk_indices_global
+    num_rows, topk = topk_indices.shape
+    if num_rows == 0 or topk == 0:
+        return topk_indices_global
+    assert topk_indices.stride(1) == 1
+    rows_per_page = manager._mixed_precision_rows_per_page(local)
+    # The page table already carries the page scale, so a page is one block of rows.
+    high_rows = torch.ops.trtllm.convert_req_index_to_global(
+        requests, block_table, topk_indices, rows_per_page, topk, rows_per_page, layer_offset
+    )
+    return torch.where(high_rows >= 0, high_rows, topk_indices_global, out=topk_indices_global)

@@ -3,11 +3,13 @@
 """GPU tests for mixed-precision KV allocation, pool sizing, reuse and transfer."""
 
 from contextlib import closing
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
-from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._utils import binding_to_torch_dtype
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.internal.batch_manager import CacheType
@@ -66,6 +68,32 @@ def make_manager():
     yield create
     for manager in reversed(managers):
         manager.shutdown()
+
+
+class _ColdPageProvider:
+    """Cold-page codec provider stand-in: the manager reads only its first/last-N window."""
+
+    config = SimpleNamespace(algorithm="quantization_for_cold_page")
+
+    def __init__(self, first_n=1, last_n=65):
+        self.mixed_precision_high_window = (first_n, last_n)
+        self.calls = []
+
+    def create_cold_page_codec(self, cache_config, **kwargs):
+        self.calls.append(dict(cache_config=cache_config, **kwargs))
+        return None
+
+
+def cold_page_config(**overrides):
+    """A reuse-enabled plain-dtype config; the first/last-N window comes from the provider."""
+    options = dict(
+        max_tokens=65536,
+        enable_block_reuse=True,
+        block_reuse_config={"policy": "per_request"},
+        pool_ratio=[5 / 6, 1 / 6],
+    )
+    options.update(overrides)
+    return KvCacheConfig(**options)
 
 
 def pool_pages(manager, layer_idx=0):
@@ -233,6 +261,116 @@ def test_disagg_exports_both_pools_and_pairs_sink_tail(make_manager):
     )
     assert source.tolist() == [4, 7]
     assert destination.tolist() == [2, 6]
+
+
+@pytest.mark.parametrize("dtype", (DataType.FP8, DataType.BF16))
+def test_cold_page_window_keeps_history_pool_native(make_manager, dtype):
+    """first/last-N from the cold-page codec adds the high group; the history pool stays native."""
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(), dtype=dtype, cold_page_codec_provider=provider
+    )
+    assert manager.mixed_precision_low_dtype == dtype
+    assert (manager.first_n, manager.last_n) == (1, 65)
+    assert manager.mixed_precision_high_layers == {0: 1}
+    # The codec never sees the high layer, so its pages migrate unchanged.
+    assert [
+        [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
+    ] == [[0]]
+    element_size = 1 if dtype == DataType.FP8 else 2
+    low = manager.get_buffers(0, "NHD", mixed_precision_pool="low")
+    high = manager.get_buffers(0, "NHD", mixed_precision_pool="high")
+    assert low.dtype == torch.uint8 and low.shape[1:] == (2, 128, 2, 64 * element_size)
+    assert high.dtype == binding_to_torch_dtype(dtype) and high.shape[1:] == (2, 128, 2, 64)
+    # Native bytes per token: the cold-page codec sees an ordinary KV layer.
+    assert manager.get_layer_bytes_per_token(0, Role.KEY) == 2 * 64 * element_size
+    config = manager.kv_cache_manager_py_config
+    assert config.initial_pool_ratio == pytest.approx([5 / 6, 1 / 6])
+    assert (config.layers[1].num_sink_tokens, config.layers[1].sliding_window_size) == (1, 66)
+    assert [buffer.size for buffer in config.layers[1].buffers] == [
+        buffer.size for buffer in config.layers[0].buffers
+    ]
+    # A high page is a page of the layer's own pool with the layer's slot layout.
+    assert manager.mixed_precision_high_layer_offsets == {0: 0}
+    assert manager.mixed_precision_high_block_deltas == {0: 0}
+
+
+def test_cold_page_mixed_precision_is_per_layer_and_skips_sliding_window_layers(make_manager):
+    """First/last-N mixed precision is per layer: a sliding-window layer gets no high layer and
+    stays an ordinary cold-page layer of the codec."""
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(max_attention_window=[1024, 513], pool_ratio=[0.5, 0.25, 0.25]),
+        num_layers=2,
+        cold_page_codec_provider=provider,
+    )
+    # Only the full-attention layer 0 takes the first/last-N mixed precision; its high layer is
+    # appended as layer 2.
+    assert manager.mixed_precision_high_layers == {0: 2}
+    config = manager.kv_cache_manager_py_config
+    assert config.layers[1].sliding_window_size == 513
+    assert (config.layers[2].num_sink_tokens, config.layers[2].sliding_window_size) == (1, 66)
+    # The codec quantizes both model layers, the sliding-window layer included, never the high layer.
+    assert [
+        [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
+    ] == [[0, 1]]
+
+
+def test_mixed_precision_warns_when_no_layer_takes_it(make_manager):
+    """When every attention layer has a sliding window, neither way of asking for mixed precision
+    reaches a layer; the manager says so instead of staying silent."""
+    from tensorrt_llm.logger import logger
+
+    with patch.object(logger, "warning") as warning:
+        hot = make_manager(
+            config=mixed_config(pool_ratio=None, max_attention_window=[64]), num_layers=2
+        )
+    assert hot.mixed_precision_high_layers == {}
+    assert any("has no effect" in str(call.args[0]) for call in warning.call_args_list)
+    with patch.object(logger, "warning") as warning:
+        cold = make_manager(
+            config=cold_page_config(pool_ratio=None, max_attention_window=[64]),
+            num_layers=2,
+            cold_page_codec_provider=_ColdPageProvider(),
+        )
+    assert cold.mixed_precision_high_layers == {}
+    assert any("has no effect" in str(call.args[0]) for call in warning.call_args_list)
+
+
+def test_cold_page_mixed_precision_rejects_a_pool_with_a_layer_that_takes_none(make_manager):
+    """A layer whose KV cache another layer shares takes no mixed precision but sits in the pool of
+    layers that do; dense attention would redirect its block offsets without copying its rows
+    back, so the manager refuses the model and names the layer."""
+    options = dict(
+        num_layers=4,
+        pretrained_config=type(
+            "Config",
+            (),
+            dict(
+                num_hidden_layers=4,
+                num_kv_shared_layers=1,
+                layer_types=["full_attention"] * 4,
+            ),
+        )(),
+    )
+    # Two layer groups: the full-attention layers (the shared source among them) and the high group.
+    with pytest.raises(
+        ValueError, match="takes no first/last-N mixed precision but shares KV cache pool"
+    ):
+        make_manager(
+            config=cold_page_config(pool_ratio=[0.75, 0.25]),
+            cold_page_codec_provider=_ColdPageProvider(),
+            **options,
+        )
+
+
+def test_cold_page_window_skips_the_codec_while_estimating(make_manager):
+    provider = _ColdPageProvider(first_n=0, last_n=65)
+    manager = make_manager(
+        config=cold_page_config(), cold_page_codec_provider=provider, is_estimating_kv_cache=True
+    )
+    assert manager.mixed_precision_high_layers == {0: 1}
+    assert provider.calls == []
 
 
 def test_mixed_precision_rejects_custom_managers():
@@ -509,6 +647,66 @@ def test_dsa_prepare_fills_the_mixed_precision_high_page_table():
         manager.shutdown()
 
 
+@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
+def test_cold_page_window_appended_draft_layers(make_manager, drafter):
+    """Every drafter layer appended to the target cache keeps its first/last tokens: its group's
+    pages must keep the high layers' geometry for them to share the pool."""
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+    spec_config = (
+        MTPDecodingConfig(num_nextn_predict_layers=1)
+        if drafter == "mtp"
+        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
+    )
+    provider = _ColdPageProvider()
+    manager = make_manager(
+        config=cold_page_config(pool_ratio=None),
+        num_layers=2,
+        spec_config=spec_config,
+        cold_page_codec_provider=provider,
+    )
+    assert manager.pp_layers == [0, 1, 2]
+    assert manager.mixed_precision_high_layers == {0: 3, 1: 4, 2: 5}
+    assert manager.mixed_precision_high_block_deltas == {0: 0}
+    # The codec sees the model's layers only, never a mixed-precision high layer.
+    assert [
+        [int(layer.layer_id) for layer in call["cache_config"].layers] for call in provider.calls
+    ] == [[0, 1, 2]]
+
+
+@pytest.mark.parametrize("drafter", ["mtp", "eagle3"])
+def test_cold_page_window_separate_draft_manager(make_manager, drafter):
+    """A separate MTP draft manager takes the cold-page window; another drafter keeps a plain cache.
+
+    The target's pool_ratio is fitted like the mixed-precision draft manager's: dropped for the
+    MTP manager with its mixed-precision high pool, collapsed to [1.0] for a plain one-group cache.
+    """
+    from tensorrt_llm._torch.pyexecutor._util import _fit_draft_pool_ratio
+    from tensorrt_llm.llmapi import Eagle3DecodingConfig, MTPDecodingConfig
+
+    spec_config = (
+        MTPDecodingConfig(num_nextn_predict_layers=1)
+        if drafter == "mtp"
+        else Eagle3DecodingConfig(max_draft_len=1, speculative_model="draft-model")
+    )
+    provider = _ColdPageProvider()
+    config = cold_page_config()
+    _fit_draft_pool_ratio(config, mixed_precision_high_window=drafter == "mtp")
+    assert config.pool_ratio == (None if drafter == "mtp" else [1.0])
+    manager = make_manager(
+        config=config,
+        num_layers=1,
+        layer_mask=[False, False, True],
+        spec_config=spec_config,
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+        is_draft=True,
+        cold_page_codec_provider=provider,
+    )
+    assert manager.pp_layers == [2]
+    assert manager.mixed_precision_high_layers == ({0: 1} if drafter == "mtp" else {})
+    assert [call["is_draft"] for call in provider.calls] == [True]
+
+
 def test_mixed_mtp_draft_manager_with_target_pool_ratio(make_manager):
     """A target pool_ratio sizes the target; the mixed MTP draft manager still builds."""
     from types import SimpleNamespace
@@ -573,3 +771,181 @@ def test_mixed_precision_high_window_covers_every_draft_step(make_manager):
             history += 1 + rng.randint(0, draft)
         # The window is tight: pages well before the last_n tokens were released.
         assert pages[2] == kv.BAD_PAGE_INDEX
+
+
+def test_deepseek_v4_cold_page_window_high_layers_share_the_compress_pools():
+    """With the cold-page window a DeepSeek-V4 high layer copies its COMPRESS page into that
+    ratio's pool, where the backend reads it by row."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+
+    ratios = [1, 4, 128]
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=cold_page_config(pool_ratio=None),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=512,
+        tokens_per_block=128,
+        max_seq_len=4096,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        vocab_size=1000,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        sparse_attn_config=DeepSeekV4SparseAttentionConfig(
+            index_head_dim=128, window_size=128, compress_ratios=ratios
+        ),
+        pretrained_config=SimpleNamespace(num_hidden_layers=3),
+        cold_page_codec_provider=_ColdPageProvider(),
+    )
+    try:
+        # Only the compressed layers (ratios 4 and 128) get a high layer; the manager checked at
+        # init that each sits in its ratio's COMPRESS pool at the compress layer's slot.
+        assert sorted(manager.mixed_precision_high_layers) == [1, 2]
+        assert sorted(manager.mixed_precision_high_layer_offsets) == [1, 2]
+        assert set(manager.mixed_precision_high_block_deltas.values()) == {0}
+        layers = manager.kv_cache_manager_py_config.layers
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            compress_layer = manager._layer_attn_to_layer_id[
+                local, DeepseekV4AttentionType.COMPRESS
+            ]
+            assert [b.size for b in layers[high_layer].buffers] == [
+                b.size for b in layers[compress_layer].buffers
+            ]
+    finally:
+        manager.shutdown()
+
+
+def test_deepseek_v4_cold_page_window_redirects_rows_into_the_high_layer():
+    """The redirected compressed rows read the high layer's pages through the COMPRESS pool."""
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.cache_manager import (
+        DeepseekV4CacheManager,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.metadata import (
+        DeepseekV4TrtllmAttentionMetadata,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.deepseek_v4.params import (
+        DeepseekV4AttentionType,
+    )
+    from tensorrt_llm._torch.attention.backends.sparse.mixed_precision_high_rows import (
+        mixed_precision_high_row_indices,
+    )
+    from tensorrt_llm._torch.metadata import KVCacheParams
+    from tensorrt_llm.llmapi.llm_args import DeepSeekV4SparseAttentionConfig
+
+    ratios = [1, 4, 128]
+    sparse_config = DeepSeekV4SparseAttentionConfig(
+        index_head_dim=128, window_size=128, compress_ratios=ratios
+    )
+    manager = DeepseekV4CacheManager(
+        kv_cache_config=cold_page_config(pool_ratio=None, enable_block_reuse=False),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=3,
+        num_kv_heads=1,
+        head_dim=512,
+        tokens_per_block=128,
+        max_seq_len=4096,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        vocab_size=1000,
+        max_input_len=4096,
+        max_num_tokens=8192,
+        sparse_attn_config=sparse_config,
+        pretrained_config=SimpleNamespace(num_hidden_layers=3),
+        # The high layer holds the first page and a 128-token window: the last two pages here.
+        cold_page_codec_provider=_ColdPageProvider(first_n=128, last_n=127),
+    )
+    try:
+        request_ids, cached = [0, 1], [600, 700]
+        assert manager.add_dummy_requests(request_ids, [n + 1 for n in cached], is_gen=True)
+        metadata = DeepseekV4TrtllmAttentionMetadata(
+            max_num_requests=2,
+            max_num_tokens=2,
+            kv_cache_manager=manager,
+            sparse_attention_config=sparse_config,
+            seq_lens=torch.tensor([1, 1], dtype=torch.int),
+            num_contexts=0,
+            request_ids=request_ids,
+            prompt_lens=cached,
+            kv_cache_params=KVCacheParams(use_cache=True, num_cached_tokens_per_seq=cached),
+            mapping=Mapping(),
+        )
+        metadata.prepare()
+        for layer_idx, ratio in ((1, 4), (2, 128)):
+            local = manager.layer_offsets[layer_idx]
+            rows_per_page = manager.compressed_block_sizes[layer_idx]
+            high_table = metadata.mixed_precision_high_block_table[ratio].cpu()
+            # Compressed rows of request 1: pages 0 (sink), 4 and 5 (window) are held, 1-3 are not.
+            held_pages = [page for page, entry in enumerate(high_table[1].tolist()) if entry >= 0]
+            assert held_pages == [0, 4, 5], held_pages
+            positions = torch.arange(6 * rows_per_page, dtype=torch.int32, device="cuda")
+            pool_rows = torch.full_like(positions, -7)
+            rows = mixed_precision_high_row_indices(
+                metadata,
+                SimpleNamespace(layer_idx=layer_idx, compress_ratio=ratio),
+                positions[None],
+                pool_rows[None],
+                torch.ones(1, dtype=torch.int32, device="cuda"),
+            )[0]
+            # Mark every held row through the high-pool view: value = row position.
+            high = manager._get_mixed_precision_buffers(local, "NHD", "high")
+            high = high.view(high.shape[0], rows_per_page, -1).view(torch.uint8)
+            for position in range(6 * rows_per_page):
+                page, row = divmod(position, rows_per_page)
+                if page in held_pages:
+                    high[int(high_table[1, page]), row].fill_(position % 251)
+            # The COMPRESS pool, read at the redirected rows, shows the markers.
+            pool = manager.get_buffers(layer_idx, DeepseekV4AttentionType.COMPRESS)
+            pool = pool.reshape(-1, pool.shape[-1]).view(torch.uint8)
+            for position in range(6 * rows_per_page):
+                page = position // rows_per_page
+                row = int(rows[position])
+                if page in held_pages:
+                    assert torch.all(pool[row] == position % 251), (ratio, position, row)
+                else:
+                    assert row == -7, (ratio, position, row)
+    finally:
+        manager.shutdown()
+
+
+def test_dsa_cold_page_window_high_layers_share_the_pool():
+    """On a plain DSA pool a mixed-precision high layer mirrors its layer's buffers, in one pool."""
+    from tensorrt_llm._torch.attention.backends.sparse.dsa.cache_manager import DSACacheManagerV2
+    from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
+
+    manager = DSACacheManagerV2(
+        kv_cache_config=cold_page_config(pool_ratio=None),
+        kv_cache_type=CacheType.SELFKONLY,
+        num_layers=2,
+        num_kv_heads=1,
+        head_dim=576,
+        tokens_per_block=64,
+        max_seq_len=1024,
+        max_batch_size=2,
+        mapping=Mapping(),
+        dtype=DataType.FP8,
+        sparse_attention_config=DeepSeekSparseAttentionConfig(index_head_dim=128),
+        pretrained_config=SimpleNamespace(num_hidden_layers=2),
+        cold_page_codec_provider=_ColdPageProvider(),
+    )
+    try:
+        assert manager.mixed_precision_high_layers == {0: 2, 1: 3}
+        layers = manager.kv_cache_manager_py_config.layers
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            assert [(b.role, b.size) for b in layers[high_layer].buffers] == [
+                (b.role, b.size) for b in layers[local].buffers
+            ]
+        assert manager.get_unique_primary_pool().shape[1] == 2
+        # Checked at init: each high layer sits in the K pool at its layer's slot.
+        assert manager.mixed_precision_high_layer_offsets == {0: 0, 1: 1}
+        assert manager.mixed_precision_high_block_deltas == {0: 0}
+    finally:
+        manager.shutdown()

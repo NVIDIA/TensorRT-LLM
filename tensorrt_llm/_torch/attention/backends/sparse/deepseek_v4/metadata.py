@@ -317,23 +317,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
             for compress_ratio in self._compress_ratios_sorted
             if is_compress_layer(compress_ratio)
         }
-        # One mixed-precision high page table per compression ratio; -1 = not in the high pool.
-        manager = self.kv_cache_manager
-        if manager.mixed_precision_high_layers:
-            self._mixed_precision_high_table_layers = {}
-            for local, high_layer in manager.mixed_precision_high_layers.items():
-                ratio = manager._compress_ratios[manager.pp_layers[local]]
-                self._mixed_precision_high_table_layers.setdefault(ratio, high_layer)
-            self.mixed_precision_high_block_table = {
-                compress_ratio: self.get_empty(
-                    self.cuda_graph_buffers,
-                    compress_block_table_shape,
-                    cache_name=f"mixed_precision_high_block_table_{compress_ratio}",
-                    dtype=torch.int32,
-                    capture_graph=capture_graph,
-                )
-                for compress_ratio in self._mixed_precision_high_table_layers
-            }
         self._init_sparse_offload_state()
 
         # sparse_mla_topk_lens: actual token count per token for each compress_ratio (SWA + compressed)
@@ -545,13 +528,6 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
                 num_contexts=self.num_contexts,
                 num_seqs=self.num_seqs,
             )
-        for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
-            # Any mixed-precision high layer of this ratio shares the pool.
-            self._fill_mixed_precision_high_block_table(
-                self.kv_cache_manager,
-                self._mixed_precision_high_table_layers[compress_ratio],
-                high_table,
-            )
 
     def prepare_for_deepseek_v4_indices(self, token_positions=None):
         """Prepare SWA/compressed local indices and sparse_mla_topk_lens."""
@@ -729,6 +705,35 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         "sparse_mla_base_ptrs",
         "swa_buffer_ptrs",
     )
+
+    def _create_mixed_precision_high_block_tables(self, buffers, capture_graph: bool) -> None:
+        """One mixed-precision high page table per compression ratio; -1 = not in the high pool."""
+        manager = self.kv_cache_manager
+        if not manager.mixed_precision_high_layers:
+            return
+        self._mixed_precision_high_table_layers = {}
+        for local, high_layer in manager.mixed_precision_high_layers.items():
+            ratio = manager._compress_ratios[manager.pp_layers[local]]
+            self._mixed_precision_high_table_layers.setdefault(ratio, high_layer)
+        self.mixed_precision_high_block_table = {
+            compress_ratio: self.get_empty(
+                buffers,
+                (self.max_num_sequences, manager.max_blocks_per_seq),
+                cache_name=f"mixed_precision_high_block_table_{compress_ratio}",
+                dtype=torch.int32,
+                capture_graph=capture_graph,
+            )
+            for compress_ratio in self._mixed_precision_high_table_layers
+        }
+
+    def _fill_mixed_precision_high_block_tables(self) -> None:
+        for compress_ratio, high_table in (self.mixed_precision_high_block_table or {}).items():
+            # Any mixed-precision high layer of this ratio shares the pool.
+            self._fill_mixed_precision_high_block_table(
+                self.kv_cache_manager,
+                self._mixed_precision_high_table_layers[compress_ratio],
+                high_table,
+            )
 
     def prepare_for_draft_forward(self) -> dict | None:
         """Repoint sparse fields to the draft buffers for a draft forward."""

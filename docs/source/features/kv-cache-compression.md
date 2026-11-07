@@ -240,6 +240,56 @@ kv_cache_compression_config:
   skip_rope_quantization: true
 ```
 
+#### Keeping the First and Last Tokens Unquantized
+
+Cold-page quantization stores every page that leaves the GPU in the compact
+format selected by `quant`. The first tokens of a sequence, which attention
+uses as anchors, and its most recent tokens are the ones generation is most
+sensitive to. `mixed_precision_first_n` and `mixed_precision_last_n` take them
+out of the quantization: the leading N and the most recent N tokens of every
+sequence are stored in the cold tiers at the runtime KV type, and only the
+tokens in between are stored in the compact format. This first/last-N mixed
+precision applies per attention layer: full-attention layers take it;
+sliding-window layers do not take part, as with the mixed-precision KV cache,
+and their pages are stored as ordinary cold pages.
+
+This is the same split as the
+[mixed-precision KV cache](kvcache.md#mixed-precision-kv-cache-prototype),
+which keeps the first/last tokens at the runtime KV type while the rest of the
+GPU KV cache is NVFP4. The difference is where the compact format lives. With
+`dtype: mixed_nvfp4_*` the GPU history itself is compact. With the cold-page
+option the GPU keeps the whole history at the runtime KV type, and only pages in
+the Host or Disk tier are compact. Both keep the first/last tokens in whole
+cache pages, and the two options cannot be combined.
+
+The runtime KV type is the one `kv_cache_config.dtype` resolves to: FP8 in the
+example below, or the checkpoint's KV type under the default `auto`.
+
+```yaml
+kv_cache_config:
+  dtype: fp8
+  host_cache_size: 8589934592
+kv_cache_compression_config:
+  algorithm: quantization_for_cold_page
+  quant: nvfp4
+  mixed_precision_first_n: 256
+  mixed_precision_last_n: 256
+```
+
+The cost is one extra GPU copy of the first/last tokens per attention layer,
+sized by `mixed_precision_first_n + mixed_precision_last_n`, and the full-size
+storage of those tokens in the cold tiers. Attention kernels are unchanged: the
+page tables point the first/last tokens at that copy, and each step's new tokens
+are copied into the history pages as well.
+
+The option is a prototype and has the limits of the mixed-precision KV cache:
+the TRTLLM attention backend, the standard KV cache manager, the hybrid Mamba
+manager and the DSA and DeepSeek-V4 sparse backends, single-beam decoding,
+speculative decoding except dynamic-tree drafting, no KV connector, and not the
+`fp8_ds_mla` cache layout. Drafter layers appended to the target cache (MTP,
+Eagle3) keep their first/last tokens like the target layers; a separate drafter
+with its own architecture keeps a plain cache.
+
 ### TriAttention
 
 [TriAttention](https://arxiv.org/abs/2604.04921) (ICML 2026) periodically scores

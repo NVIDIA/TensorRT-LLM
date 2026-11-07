@@ -63,6 +63,7 @@ from .interface import (AttentionBackend, AttentionForwardArgs,
                         KVCacheParams, MLAParams, PositionalEmbeddingParams,
                         PredefinedAttentionMask, RopeParams,
                         merge_attention_forward_args)
+from .mixed_precision_rows import store_mixed_precision_low_rows
 from .sparse.hooks import prepare_sparse_runtime_params
 from .sparse.params import BlockSparseForwardInputs, SparseParams
 from .sparse.skip_softmax import SkipSoftmaxParams
@@ -289,6 +290,14 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
+    # Cold-page window: the high page table (-1 = not held) and the block
+    # offsets before the redirect.
+    mixed_precision_high_block_table: Optional[Any] = None
+    draft_mixed_precision_high_block_table: Optional[Any] = None
+    mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
+    draft_mixed_precision_low_block_offsets: Optional[torch.Tensor] = None
+    # The sparse backends redirect selected rows instead of block offsets.
+    mixed_precision_block_offsets_redirect: ClassVar[bool] = True
     # Active block-ID buffers, defaulting to the target cache. Separate draft
     # storage lets CUDA graphs bind stable target and draft addresses.
     block_ids_per_seq: Optional[torch.Tensor] = None
@@ -543,6 +552,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+
+            self._create_mixed_precision_high_block_tables(
+                buffers, capture_graph)
 
             if self.enable_flash_mla:
                 self.block_ids_per_seq = self.get_empty(
@@ -985,6 +997,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # MTP layers of a mixed-precision draft manager run on its own
             # staging copy.
             self.swap_for_draft("mixed_precision_staging", draft)
+        # MTP layers of a cold-page draft manager use its mixed-precision high page table.
+        self.swap_for_draft("mixed_precision_high_block_table",
+                            self.draft_mixed_precision_high_block_table)
+        self.swap_for_draft("mixed_precision_low_block_offsets",
+                            self.draft_mixed_precision_low_block_offsets)
         return None
 
     def restore_after_draft_forward(self, saved_state: dict | None) -> None:
@@ -1227,6 +1244,99 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # Native BF16 paged-context FMHA reads 32-token pages.
             self.prepare_mixed_precision_kv(
                 "HND", min(self.kv_cache_manager.tokens_per_block, 32))
+        self._fill_mixed_precision_high_block_tables()
+
+    @property
+    def redirects_mixed_precision_block_offsets(self) -> bool:
+        """Dense attention: the block offsets of held blocks point at the high layer's blocks."""
+        return (self.mixed_precision_high_block_table is not None
+                and self.mixed_precision_block_offsets_redirect)
+
+    def _create_mixed_precision_high_block_tables(self, buffers,
+                                                  capture_graph: bool) -> None:
+        """Allocate the high page tables and, for dense attention, the block-offset copies."""
+        redirect_block_offsets = self.mixed_precision_block_offsets_redirect
+        for prefix, manager in (("", self.kv_cache_manager),
+                                ("draft_", self.draft_kv_cache_manager)):
+            if not getattr(manager, "mixed_precision_high_layers", None):
+                continue
+            if redirect_block_offsets and not manager.mixed_precision_high_layer_offsets:
+                continue  # NVFP4 history: dense attention runs on the staging copy
+            if redirect_block_offsets and manager._use_per_layer_page_tables:
+                raise NotImplementedError(
+                    "The cold-page first/last-N window needs one block-offset "
+                    "table per pool")
+            shapes = {
+                "mixed_precision_high_block_table":
+                [self.max_num_sequences, manager.max_blocks_per_seq]
+            }
+            if redirect_block_offsets:
+                shapes["mixed_precision_low_block_offsets"] = [
+                    manager.num_attention_op_pools, self.max_num_sequences, 2,
+                    manager.max_blocks_per_seq
+                ]
+            for name, shape in shapes.items():
+                setattr(
+                    self, prefix + name,
+                    self.get_empty(buffers,
+                                   shape,
+                                   cache_name=prefix + name,
+                                   dtype=torch.int32,
+                                   capture_graph=capture_graph))
+
+    def _fill_mixed_precision_high_block_table(
+            self, manager, high_layer: int, high_table: torch.Tensor) -> None:
+        """Refresh a high page table over its full width; the draft loop writes past this step."""
+        host_table = torch.full((self.num_seqs, high_table.shape[1]),
+                                -1,
+                                dtype=torch.int32,
+                                pin_memory=prefer_pinned())
+        manager._fill_page_table(high_layer, self.request_ids,
+                                 host_table.numpy())
+        high_table[:self.num_seqs].copy_(host_table, non_blocking=True)
+
+    def _fill_mixed_precision_high_block_tables(self) -> None:
+        """Refresh the high page tables; dense attention also points held blocks at the high layer's blocks."""
+        num_seqs = self.num_seqs
+        for prefix, manager in (("", self.kv_cache_manager),
+                                ("draft_", self.draft_kv_cache_manager)):
+            high_table = getattr(self,
+                                 f"{prefix}mixed_precision_high_block_table")
+            if high_table is None:
+                continue
+            # All layers share one mixed-precision high pool, so one table serves them all.
+            self._fill_mixed_precision_high_block_table(
+                manager,
+                next(iter(manager.mixed_precision_high_layers.values())),
+                high_table)
+            low_offsets = getattr(self,
+                                  f"{prefix}mixed_precision_low_block_offsets")
+            if low_offsets is None:
+                continue
+            block_offsets = getattr(self, f"{prefix}kv_cache_block_offsets")
+            low_offsets[:, :num_seqs].copy_(block_offsets[:, :num_seqs])
+            # A block is held when the high page table has a page for it.
+            held_blocks = high_table[:num_seqs] >= 0
+            for pool_id, high_block_delta in manager.mixed_precision_high_block_deltas.items(
+            ):
+                if high_block_delta is None:
+                    raise NotImplementedError(
+                        "The cold-page first/last-N window needs every mixed-precision "
+                        "high layer of a pool at the same block distance from its layer"
+                    )
+                # Point the held blocks of this pool at the high layer's blocks, K and V.
+                pool_block_offsets = block_offsets[pool_id, :num_seqs]
+                high_block_offsets = high_table[:num_seqs] * manager.kv_factor + high_block_delta
+                torch.where(held_blocks,
+                            high_block_offsets,
+                            pool_block_offsets[:, 0],
+                            out=pool_block_offsets[:, 0])
+                if manager.kv_factor == 2:
+                    torch.where(held_blocks,
+                                high_block_offsets +
+                                int(manager.kv_offset[pool_id]),
+                                pool_block_offsets[:, 1],
+                                out=pool_block_offsets[:, 1])
 
     def _on_mixed_precision_kv_prepared(self, view) -> None:
         """Lay out the staging pages as TRTLLM block offsets for this batch."""
@@ -1265,6 +1375,27 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         """Undo _swap_mixed_precision_kv, block offsets included."""
         super()._restore_mixed_precision_kv(saved[:2])
         self.kv_cache_block_offsets = saved[2]
+
+    def _layer_takes_mixed_precision(self, layer_idx: int) -> bool:
+        """Whether this attention layer has a mixed-precision high layer in the current manager."""
+        manager = self.kv_cache_manager
+        return manager.layer_offsets[
+            layer_idx] in manager.mixed_precision_high_layers
+
+    @contextlib.contextmanager
+    def mixed_precision_kv_staging(self, layer_idx: int):
+        """Cold-page first/last-N mixed precision: a layer that takes it reads through its
+        redirected block offsets and copies the step's new rows back afterwards; a layer that
+        does not (a sliding-window layer, for example) runs untouched."""
+        if not self.redirects_mixed_precision_block_offsets:
+            with super().mixed_precision_kv_staging(layer_idx):
+                yield
+            return
+        if not self._layer_takes_mixed_precision(layer_idx):
+            yield
+            return
+        yield
+        store_mixed_precision_low_rows(self, layer_idx)
 
     def prepare_encoder_decoder_from_precomputed_lengths(
             self, prompt_lens: torch.Tensor, kv_lens: torch.Tensor,
@@ -1327,6 +1458,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 and not self.enable_context_mla_with_cached_kv
                 and self.fp4_mla_state is None
                 and not self._has_mixed_precision_staging()
+                and self.mixed_precision_high_block_table is None
                 and not self.kv_cache_params.use_full_generation_page_table)
 
     def key_prepared_block_offsets(self) -> None:
@@ -3355,7 +3487,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_orig_quant
+            # An FP8 pool quantizes with the per-tensor scale; NVFP4 uses its block scales.
+            self.kv_scale_orig_quant if self.has_fp8_kv_cache else None,
             0,  # residual_dim
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,

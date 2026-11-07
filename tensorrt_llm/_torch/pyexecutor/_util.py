@@ -977,17 +977,18 @@ def _derive_draft_max_attention_window(
     return None
 
 
-def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig) -> None:
+def _fit_draft_pool_ratio(draft_kv_config: KvCacheConfig,
+                          mixed_precision_high_window: bool = False) -> None:
     """Adapt the target's pool_ratio to a separate one-model draft manager's pools."""
     if draft_kv_config.pool_ratio is None:
         return
-    if draft_kv_config.mixed_precision_kv is not None:
-        # An MTP draft manager with mixed-precision KV has its own pool plus a
-        # mixed-precision high pool, so the target's pool_ratio does not fit it.
+    if (draft_kv_config.mixed_precision_kv is not None
+            or mixed_precision_high_window):
+        # A mixed-precision draft manager has a high pool too; the target's ratio does not fit.
         logger.warning(
             f"kv_cache_config.pool_ratio {draft_kv_config.pool_ratio} sizes the "
-            "target KV cache only; the mixed-precision MTP draft KV cache sizes "
-            "its pools automatically.")
+            "target KV cache only; the MTP draft KV cache with mixed-precision "
+            "high layers sizes its pools automatically.")
         draft_kv_config.pool_ratio = None
     elif (not uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window)
           and len(draft_kv_config.pool_ratio) != 1):
@@ -2784,7 +2785,12 @@ class KvCacheCreator:
                 draft_kv_config.max_attention_window,
                 spec_dec_layer_mask,
             ))
-        _fit_draft_pool_ratio(draft_kv_config)
+        _fit_draft_pool_ratio(
+            draft_kv_config,
+            mixed_precision_high_window=self._speculative_config.spec_dec_mode.
+            is_mtp_one_model()
+            and getattr(cold_page_codec_provider, "mixed_precision_high_window",
+                        None) is not None)
         if uses_vswa_kv_cache_layout(draft_kv_config.max_attention_window):
             logger.info(
                 f"Derived draft KV cache max_attention_window for separate "
@@ -3571,7 +3577,6 @@ class KvCacheCreator:
             compression_config,
             model_engine=self._model_engine,
             kv_cache_config=self_kv_cache_config,
-            estimating_kv_cache=estimating_kv_cache and not self._skip_est,
         )
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
@@ -4307,7 +4312,6 @@ def create_kv_cache_compression_manager(
     *,
     model_engine: ModelEngine,
     kv_cache_config: KvCacheConfig,
-    estimating_kv_cache: bool = False,
 ) -> Optional[KVCacheCompressionManager]:
     """Validate, select, and construct the configured manager before KVCM."""
     if config is None:
@@ -4321,8 +4325,6 @@ def create_kv_cache_compression_manager(
         if config.quant != "nvfp4":
             raise NotImplementedError(
                 f"Unsupported cold-page quantization format {config.quant!r}")
-        if estimating_kv_cache:
-            return None
         quant_config = model_engine.model.model_config.quant_config
         if (quant_config is not None and getattr(
                 quant_config, "kv_cache_quant_algo", None) == QuantAlgo.NVFP4):
