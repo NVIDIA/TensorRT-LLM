@@ -18,8 +18,10 @@ from tensorrt_llm._torch.disaggregation.native.transfer import (
     RankInfoAuthenticationError,
     RankInfoServer,
     Receiver,
+    SessionStatus,
     TransferWorker,
     TransferWorkerConfig,
+    WaitResult,
     _rank_info_auth_tag,
     _validate_rank_info_auth_key,
 )
@@ -177,15 +179,16 @@ def test_authentication_failure_fails_only_affected_task(ownership):
     receiver._rank_info_timeout_s = 60.0
     receiver._build_recv_req_info = Mock()
     receiver._get_sender_info = Mock(side_effect=RankInfoAuthenticationError("wrong key"))
-    receiver._enforce_physical_ownership = ownership
-    session = Mock()
+    session = Mock(lock=threading.Lock())
     receiver._get_session = Mock(return_value=session)
-    task = Mock()
+    task = Mock(_enforce_physical_ownership=ownership)
     receiver.dispatch_task(task)
     task.fail.assert_called_once()
     assert isinstance(task.fail.call_args.args[0], RankInfoAuthenticationError)
     if ownership:
         session.cancel_unpublished_task.assert_called_once_with(task)
+    else:
+        session.cancel_unpublished_task.assert_not_called()
 
 
 def test_full_cache_preserves_live_challenges():
@@ -400,7 +403,11 @@ def test_rank_info_admission_waits_for_asymmetric_receive_fences(
         fences[1].query.return_value = True
         poll_both()
 
-    assert histories == [[tuple, list] * 2, [tuple, list] * 2]
+    expected = [tuple, list, tuple]
+    if rejected_rank is None:
+        expected.append(dict)
+    expected.append(list)
+    assert histories == [expected, expected]
     for tc, req in zip(transceivers, requests):
         assert not tc._pending_rank_info_admissions
         if rejected_rank is None:
@@ -408,6 +415,131 @@ def test_rank_info_admission_waits_for_asymmetric_receive_fences(
         else:
             tc._start_async_receive.assert_not_called()
             assert req.state == LlmRequestState.DISAGG_TRANS_ERROR
+
+
+@pytest.mark.parametrize("failure_stage", ["extent", "open", "publish"])
+@pytest.mark.parametrize("failed_rank", [0, 1])
+@pytest.mark.parametrize("idle_skip", [False, True])
+@pytest.mark.parametrize("cancel_locally", [False, True])
+def test_receive_start_failure_preserves_collectives_and_ownership(
+    failure_stage, failed_rank, idle_skip, cancel_locally
+):
+    barrier = threading.Barrier(2, timeout=5)
+    payloads = [None, None]
+    histories = [[], []]
+    transceivers, requests, sessions = [], [], []
+
+    def gather(rank, payload):
+        histories[rank].append(type(payload))
+        payloads[rank] = payload
+        barrier.wait()
+        result = list(payloads)
+        barrier.wait()
+        return result
+
+    def make_transceiver(rank):
+        tc = object.__new__(KvCacheTransceiverV2)
+        tc._gen_need_sync = True
+        tc._init_gen_idle_poll(idle_skip)
+        tc._gen_allgather = lambda payload: gather(rank, payload)
+        tc._dist = SimpleNamespace(rank=rank)
+        tc._ever_had_recv_session = True
+        tc._recv_sessions, tc._recv_reqs = {}, {}
+        tc._wait_reqs, tc._send_sessions = {}, {}
+        tc._page_table = None
+        tc._request_kv_bytes = Mock(return_value=0)
+        rank_requests = {
+            rid: SimpleNamespace(
+                py_request_id=rid,
+                request_id=rid,
+                py_disaggregated_params=None,
+                state=LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS,
+            )
+            for rid in (7, 8)
+        }
+        tc._pending_rank_info_admissions = {rid: (req, None) for rid, req in rank_requests.items()}
+        rank_sessions = {}
+
+        def maybe_fail(req, stage):
+            if rank == failed_rank and req.request_id == 7 and stage == failure_stage:
+                raise ValueError("receive start failed")
+
+        def extent(req):
+            maybe_fail(req, "extent")
+            return SimpleNamespace(local=None)
+
+        def open_source(req):
+            maybe_fail(req, "open")
+            source = SimpleNamespace(session=None)
+
+            def fetch(_extent, *, expected_write_bytes):
+                session = Mock(
+                    _enforce_physical_ownership=True,
+                    status=SessionStatus.INIT,
+                    resources_drained=Mock(return_value=False),
+                    is_completed=Mock(return_value=False),
+                    has_failed=Mock(return_value=False),
+                    wait_complete=Mock(return_value=None),
+                    close=Mock(return_value=True),
+                )
+
+                def fail_admission(_error):
+                    session.status = SessionStatus.ERROR
+                    session.has_failed.return_value = True
+                    session.wait_complete.return_value = WaitResult.FAILED
+
+                session.fail_admission.side_effect = fail_admission
+                source.session = session
+                rank_sessions[req.request_id] = session
+                maybe_fail(req, "publish")
+
+            source.fetch = fetch
+            return source
+
+        tc._create_cache_extent = extent
+        tc._open_peer_source = Mock(side_effect=open_source)
+        requests.append(rank_requests)
+        sessions.append(rank_sessions)
+        return tc
+
+    transceivers = [make_transceiver(rank) for rank in range(2)]
+
+    def poll_both():
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(tc.check_gen_transfer_status, 0) for tc in transceivers]
+            return [future.result(timeout=10) for future in futures]
+
+    with patch(
+        "tensorrt_llm._torch.disaggregation.transceiver.disagg_diagnostics."
+        "DISAGG_TRANSFER_DIAGNOSTICS_ENABLED",
+        False,
+    ):
+        first = poll_both()
+        if cancel_locally:
+            tc = transceivers[failed_rank]
+            tc.cancel_request(requests[failed_rank][7])
+            assert 7 in tc._rank_info_start_failures
+        for rank, tc in enumerate(transceivers):
+            assert not first[rank].error_request_ids
+            assert not tc._pending_rank_info_admissions
+            assert 8 in tc._recv_sessions
+            assert requests[rank][7].state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+            for session in sessions[rank].values():
+                session.close.assert_not_called()
+                session.resources_drained.return_value = True
+        second = poll_both()
+
+    assert histories == [[tuple, dict, list, tuple, list]] * 2
+    for rank, tc in enumerate(transceivers):
+        assert second[rank].error_request_ids == [7]
+        assert requests[rank][7].state == LlmRequestState.DISAGG_TRANS_ERROR
+        assert not tc._rank_info_start_failures
+        assert 7 not in tc._recv_sessions
+        assert 7 not in tc._recv_reqs
+        assert 8 in tc._recv_sessions
+        sessions[rank][8].close.assert_not_called()
+        if 7 in sessions[rank]:
+            sessions[rank][7].close.assert_called_once()
 
 
 def test_cancel_pending_rank_info_admission_does_not_publish():

@@ -365,6 +365,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
     _gen_idle_agreed: bool = False
     _gen_deferred_receives: int = 0
     _pending_rank_info_admissions: Optional[dict[int, tuple[LlmRequest, Optional[str]]]] = None
+    _rank_info_start_failures: Optional[dict[int, LlmRequest]] = None
 
     @property
     def consumes_transfer_buffer(self) -> bool:
@@ -741,6 +742,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         self._recv_reqs.clear()
         if self._pending_rank_info_admissions is not None:
             self._pending_rank_info_admissions.clear()
+        self._rank_info_start_failures = None
         self._transfer_worker.shutdown()
         self._shutdown_complete = True
 
@@ -1000,7 +1002,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         # every participating rank has drained its local physical accessor.
         locally_retirable = []
         for rid in to_process:
-            session = self._recv_sessions[rid]
+            # A coordinated start failure may precede session creation on this rank.
+            session = self._recv_sessions.get(rid)
             if not self._retirement_blocked(session):
                 locally_retirable.append(rid)
         idle_skip = self._gen_idle_poll_skip
@@ -1621,6 +1624,8 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         admissions = [vote[1] for vote in votes]
         ready = set.intersection(*(set(vote) for vote in admissions))
         failed = []
+        started = {}
+        start_errors = {}
         for rid in sorted(ready):
             req, _ = pending.pop(rid)
             error = next((vote[rid] for vote in admissions if vote[rid] is not None), None)
@@ -1629,7 +1634,25 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 req.state = LlmRequestState.DISAGG_TRANS_ERROR
                 failed.append(rid)
             else:
-                self._start_async_receive(req)
+                started[rid] = req
+                try:
+                    self._start_async_receive(req)
+                except Exception as exc:
+                    start_errors[rid] = str(exc)
+                    req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+        if started:
+            # Every rank starts the same admitted IDs. Even a failure before session
+            # creation must reach this vote and the subsequent outcome collective.
+            errors_by_rank = self._gen_allgather(start_errors)
+            for rid in sorted(set().union(*(errors.keys() for errors in errors_by_rank))):
+                error = next(errors[rid] for errors in errors_by_rank if rid in errors)
+                logger.error(f"Receive start failed for request {rid}: {error}")
+                if self._rank_info_start_failures is None:
+                    self._rank_info_start_failures = {}
+                self._rank_info_start_failures[rid] = started[rid]
+                session = self._recv_sessions.get(rid)
+                if session is not None:
+                    session.fail_admission(RuntimeError(error))
         return done, failed
 
     def _start_async_receive(self, req: LlmRequest) -> None:
@@ -1845,9 +1868,18 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             0 if need_progress else wait_num,
             block_all,
         )
+        start_failures = self._rank_info_start_failures or {}
+        to_process = list(dict.fromkeys([*to_process, *start_failures]))
 
         completed, failed, cancelled = [], [], []
         for rid in to_process:
+            if rid in start_failures:
+                session = self._recv_sessions.get(rid)
+                if session is not None and self._retirement_blocked(session):
+                    session.notify_cancel()
+                    continue
+                failed.append(rid)
+                continue
             session = self._recv_sessions[rid]
             result = session.wait_complete(blocking=block_all)
             if session.status == SessionStatus.CANCELLED:
@@ -1950,6 +1982,11 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             for rid, req, session in failed_records:
                 self._emit_transfer_settled("gen", rid, req, session, "failed")
 
+        for rid in failed:
+            req = start_failures.pop(rid, None)
+            if req is not None:
+                req.state = LlmRequestState.DISAGG_TRANS_ERROR
+                self._recv_reqs.pop(rid, None)
         return GenTransferStatus(completed, failed + admission_failed, cancelled_reqs)
 
     def _poll_gen_sessions_for_poll_interval(self, wait_num: int) -> None:
