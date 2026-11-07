@@ -14,6 +14,7 @@ from ..infra.compute.commands import ended_early
 from ..infra.compute.environment import RunEnvironment
 from ..spec.task_schema import (
     BOOT_KEYS,
+    DEFAULT_BOOT_MAX_TOKENS,
     GATE_TIMEOUT_KEY,
     TaskSchemaError,
     load_prompts_file,
@@ -115,7 +116,7 @@ class BootSpec:
         "In one sentence, photosynthesis is",
     )
     keywords: tuple[str, ...] = ()
-    max_tokens: int = 32
+    max_tokens: int = DEFAULT_BOOT_MAX_TOKENS
     items: tuple[BootPrompt, ...] = ()
     #: Where the spec came from, named in a verdict.
     source: str = "the default boot prompts"

@@ -280,6 +280,10 @@ BENCHMARK_MEMBERS: tuple[str, ...] = (BENCHMARK_MEMBERS_EVERY,)
 # Boot workloads allow run-wide keys and per-unit overlays. Keywords match
 # generated text, never logs; absent multimodal images use the repository asset.
 BOOT_KEYS: tuple[str, ...] = ("prompts", "prompts_file", "keywords", "max_tokens")
+#: Tokens a boot prompt may generate when the spec states none, and the least the serve gate
+#: gives its answer to one: a chat-templated or reasoning model states a checked arithmetic
+#: answer (the GSM8K "Natalia" prompt's 72) only after some 50 tokens.
+DEFAULT_BOOT_MAX_TOKENS = 128
 # How long one boot gate, or one acceptance leg, may run: `timeout` at either level of
 # `accuracy.boot` and `accuracy.acceptance` (default 1800 s). Not a workload key: it
 # changes no verdict, only how long a slow load is waited for.

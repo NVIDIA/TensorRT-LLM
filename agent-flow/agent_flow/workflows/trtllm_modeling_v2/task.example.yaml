@@ -250,7 +250,9 @@ accuracy:
   #       keywords: ["72"]
   #   # prompts_file: boot_prompts.yaml   # or a YAML/JSON list of plain prompts
   #   keywords: [Paris]             # each must appear in some generated text
-  #   max_tokens: 32                # default
+  #   # Default 128: a chat-templated or reasoning model states the 72 above only after ~50
+  #   # tokens. Keep it at or above the length the checked answers need.
+  #   max_tokens: 128               # default
   #   multimodal:
   #     prompts:
   #       - prompt: "<|User|><image>What vegetable is this? One word.<|Assistant|>"
@@ -285,7 +287,7 @@ accuracy:
   # serve:
   #   enabled: true
   #   prompt: "The capital of France is"   # default
-  #   max_tokens: 32               # default
+  #   max_tokens: 128              # default; answers to boot prompts get at least boot's
   #   timeout: 1800                # default, seconds for /health
 
   # `trtllm-eval`'s own flags. Without `max_seq_len` the eval sizes its KV cache for the
