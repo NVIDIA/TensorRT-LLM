@@ -51,7 +51,10 @@ from utils.util import check_accuracy, skip_pre_blackwell
 
 from tensorrt_llm._torch.autotuner import AutoTuner, OptimizationProfile, autotune
 from tensorrt_llm._torch.custom_ops.trtllm_gen_custom_ops import _select_explicit_fallback_tactic
-from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+from tensorrt_llm._torch.cute_dsl_utils import (
+    IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE,
+    IS_CUTLASS_DSL_RUBIN_AVAILABLE,
+)
 from tensorrt_llm._torch.locality_domain.policy import LocalityDomainPolicy
 from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -73,11 +76,14 @@ from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
+    TrtllmCutedslFusedFc12Mxfp8Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
-from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
+from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12.nvfp4 import (
+    CuteDslFc12FusedMoENvfp4Runner,
+)
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutlass import (
     CUTLASS_LEAVES,
@@ -5054,6 +5060,7 @@ def should_skip_locality_domain_param(
     activation_type: ActivationType,
     swiglu_gptoss_style: bool,
     dtype: torch.dtype,
+    model_config: Optional[MoeModelConfig] = None,
 ) -> Optional[str]:
     """Return a static skip reason for locality domain MoE backend params."""
     if backend_type != MoeBackendType.CUTEDSL:
@@ -5067,6 +5074,12 @@ def should_skip_locality_domain_param(
         return "locality domain MoE backend test only supports SwiGLU"
     if swiglu_gptoss_style:
         return "locality domain MoE backend test does not cover GPT-OSS SwiGLU style"
+    # CuteDslLocalityDomainMixin._adjust_locality_domain_plan runs such shapes
+    # on the full-GPU kernels, so the locality-domain ops would not be tuned.
+    if model_config is not None and (
+        (2 * model_config.intermediate_size) % 256 != 0 or model_config.hidden_size % 256 != 0
+    ):
+        return "locality domain shards must be 128-row multiples"
     return None
 
 
@@ -5179,6 +5192,7 @@ def generate_test_params() -> List:
                 ActivationType.Swiglu,
                 swiglu_gptoss_style,
                 dtype,
+                model_config,
             )
             locality_domain_param_values = (
                 dtype,
@@ -6891,6 +6905,49 @@ def _forward_in_two_chunks(backend) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 @pytest.mark.cpu_only
+def test_mxfp8_fused_fc12_forward_routes_before_run_moe_without_comm():
+    """The MXFP8 fused FC12 op takes precomputed routing, so a single-rank
+    layer with no communication strategy and no attention DP must still route
+    before ``run_moe``; a routing method that would otherwise route inside the
+    kernel cannot change that."""
+    leaf = TrtllmCutedslFusedFc12Mxfp8Impl.__new__(TrtllmCutedslFusedFc12Mxfp8Impl)
+    torch.nn.Module.__init__(leaf)
+    leaf.apply_router_weight_on_input = False
+    calls = []
+
+    def quantize_input(x, post_quant_comm=True):
+        return x, torch.empty((x.shape[0], x.shape[1] // 32), dtype=torch.uint8)
+
+    def run_moe_mxfp8(
+        x, token_selected_experts, token_final_scales, x_sf, moe_output=None, enable_alltoall=False
+    ):
+        calls.append((token_selected_experts, token_final_scales))
+        return x * 2
+
+    leaf.quantize_input = quantize_input
+    leaf.run_moe_mxfp8 = run_moe_mxfp8
+    moe = _chunking_moe(leaf, num_chunks=1)
+    moe.routing_method.requires_separated_routing = False
+    moe._enable_perfect_router_expert_ids = False
+
+    x = torch.arange(8 * 64, dtype=torch.bfloat16).reshape(8, 64)
+    out = ExternalCommMoEScheduler(moe).forward(
+        x,
+        torch.zeros((8, 4)),
+        do_finalize=True,
+        output_dtype=torch.bfloat16,
+        all_rank_num_tokens=None,
+        use_dp_padding=None,
+    )
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert len(calls) == 1
+    token_selected_experts, token_final_scales = calls[0]
+    assert token_selected_experts is not None and token_selected_experts.shape == (8, 1)
+    assert token_final_scales is not None and token_final_scales.dtype == torch.float32
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize(
     "leaf_cls", [CuteDslB12xNvfp4FusedMoE, CuteDslB12xW4a16Nvfp4FusedMoE], ids=["nvfp4", "w4a16"]
 )
@@ -6922,6 +6979,24 @@ def test_multi_chunk_forward_overlaps_chunks_of_a_backend_that_allocates_its_out
 
     torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
     assert backend.streams == [_AUX_STREAM, _MAIN_STREAM]
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_fused_fc12_multi_chunk_forward_runs_chunks_on_one_stream(monkeypatch):
+    """The MXFP8 fused FC12 kernel is a persistent grid whose FC2 tiles wait
+    on FC1 tiles of the same launch, so two chunks in flight on the main and
+    aux streams could each hold part of the GPU and wait forever. The leaf
+    declares this, and the scheduler then runs both chunks on the main stream."""
+    requirement = TrtllmCutedslFusedFc12Mxfp8Impl.descriptor.input_requirement
+    assert requirement.run_moe_requires_coresident_grid
+    assert not requirement.run_moe_reuses_buffers
+    backend = _FreshOutputBackend(_record_streams(monkeypatch))
+    backend.input_requirement = requirement
+
+    x, out = _forward_in_two_chunks(backend)
+
+    torch.testing.assert_close(out, x * 2, rtol=0, atol=0)
+    assert backend.streams == [_MAIN_STREAM, _MAIN_STREAM]
 
 
 @pytest.mark.cpu_only
@@ -6977,3 +7052,194 @@ def test_configurable_moe_exposes_the_backend_lora_state():
     assert getattr(moe, "_moe_lora_enabled", False) is True
     moe.backend = SimpleNamespace()
     assert getattr(moe, "_moe_lora_enabled", False) is False
+
+
+# ============================================================================
+# CuTeDSL MXFP8 fused FC12: accuracy A/B against the MXFP8 reference module
+# ============================================================================
+
+
+def _error_stats(a: torch.Tensor, b: torch.Tensor) -> dict:
+    """Scale-invariant error statistics of ``a`` against ``b``."""
+    a = a.float().flatten()
+    b = b.float().flatten()
+    diff = (a - b).abs()
+    return {
+        "rms_rel": (diff.norm() / (b.norm() + 1e-12)).item(),
+        "cos": torch.nn.functional.cosine_similarity(a, b, dim=0).item(),
+        "max_abs": diff.max().item(),
+        "mean_abs": diff.mean().item(),
+    }
+
+
+def _mxfp8_fp32_oracle(
+    x_q: torch.Tensor,
+    x_sf: torch.Tensor,
+    weights: dict,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    num_experts: int,
+    hidden_size: int,
+) -> torch.Tensor:
+    """fp32 MoE on the dequantized MXFP8 activations/weights with an fp32 intermediate.
+
+    This is the exact-math target both MXFP8 implementations approximate: the only error
+    either one adds on top is its own requantization of the FC1 intermediate before FC2.
+    """
+    from tensorrt_llm._torch.modules.mxfp8_utils import dequant_mxfp8_weight
+
+    a = dequant_mxfp8_weight(x_q, x_sf.view(x_q.shape[0], hidden_size // 32))
+    out = torch.zeros(x_q.shape[0], hidden_size, dtype=torch.float32, device=a.device)
+    tse = token_selected_experts.long()
+    tfs = token_final_scales.float()
+    for expert in range(num_experts):
+        mask = tse == expert
+        if not mask.any():
+            continue
+        tokens, slots = mask.nonzero(as_tuple=True)
+        w1 = dequant_mxfp8_weight(
+            weights[f"{expert}.w1.weight"], weights[f"{expert}.w1.weight_scale"]
+        )
+        w3 = dequant_mxfp8_weight(
+            weights[f"{expert}.w3.weight"], weights[f"{expert}.w3.weight_scale"]
+        )
+        w2 = dequant_mxfp8_weight(
+            weights[f"{expert}.w2.weight"], weights[f"{expert}.w2.weight_scale"]
+        )
+        xa = a[tokens]
+        h = torch.nn.functional.silu(xa @ w1.t()) * (xa @ w3.t())
+        out.index_add_(0, tokens, (h @ w2.t()) * tfs[tokens, slots][:, None])
+    return out
+
+
+@pytest.mark.parametrize(
+    "num_experts,top_k,hidden_size,intermediate_size,seq_len",
+    [
+        (60, 4, 2048, 1408, 128),  # Qwen1.5-MoE-A2.7B
+        (128, 10, 4096, 1024, 128),  # Qwen3.5-397B experts as seen by one EP4 rank
+    ],
+    ids=["e60_k4_h2048_i1408", "e128_k10_h4096_i1024"],
+)
+def test_cutedsl_mxfp8_fused_fc12_accuracy_ab(
+    num_experts: int, top_k: int, hidden_size: int, intermediate_size: int, seq_len: int
+):
+    """A/B the fused MXFP8 FC12 CuTeDSL MoE against independent references on identical inputs.
+
+    Three legs consume the SAME MXFP8 activations and e4m3/UE8M0 weights:
+      fused  -- TrtllmCutedslFusedFc12Mxfp8Impl (one fused FC1+SwiGLU+MXFP8-requant+FC2+finalize kernel)
+      ref    -- the repo's MXFP8 reference module (per-expert MXFP8 Linear layers, BF16 intermediate)
+      oracle -- fp32 math on the dequantized tensors with an fp32 intermediate (no requant)
+
+    Both MXFP8 implementations sit ~2.7% RMS from the oracle (the inherent cost of requantizing
+    the FC1 intermediate); the fused kernel must not add error beyond that noise floor. Measured
+    on Rubin: fused-vs-oracle 2.66-2.70% vs ref-vs-oracle 2.69-2.71%, fused-vs-ref ~1.8%,
+    cosine >= 0.9996. The statistics are logged so drifts are visible in the test report.
+    """
+    backend_type = MoeBackendType.CUTEDSL
+    # Same gate as TrtllmCutedslFusedFc12Mxfp8Impl.can_implement: the fused
+    # FC1+FC2 kernel needs Rubin and a CuTE DSL internal build with the fused
+    # FC12 submodules.
+    if get_sm_version() != 107:
+        pytest.skip(f"CuteDSL MXFP8 fused FC12 requires SM107 (Rubin), got SM{get_sm_version()}")
+    if not IS_CUTLASS_DSL_MXFP8_FUSED_FC12_AVAILABLE:
+        pytest.skip("MXFP8 on SM107 requires a CuTE DSL internal build with the fused FC12 kernel")
+    dtype = torch.bfloat16
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        AutoTuner.get().setup_distributed_state(mapping)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            QuantAlgo.MXFP8, x, backend_type
+        )
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+        )
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        )
+        assert type(backend).__name__ == "TrtllmCutedslFusedFc12Mxfp8Impl"
+        assert type(backend.quant_method).__name__ == "MXFP8CuteDslFusedMoEMethod"
+        weights = quantize_util.create_weights(**quant_kwargs)
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([weights])
+        ref_fused_moe.cuda()
+
+        token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+        x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+
+        def run_fused():
+            return run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+
+        AutoTuner.get().clear_cache()
+        with torch.inference_mode(), autotune():
+            run_fused()
+        with torch.inference_mode():
+            fused = run_fused().float()
+            ref = ref_fused_moe.forward(x, router_logits).float()
+            oracle = _mxfp8_fp32_oracle(
+                x_quantized,
+                x_sf,
+                weights,
+                token_selected_experts,
+                token_final_scales,
+                num_experts,
+                hidden_size,
+            )
+        torch.cuda.synchronize()
+
+    fused_vs_ref = _error_stats(fused, ref)
+    fused_vs_oracle = _error_stats(fused, oracle)
+    ref_vs_oracle = _error_stats(ref, oracle)
+    for label, s in (
+        ("fused vs ref", fused_vs_ref),
+        ("fused vs oracle", fused_vs_oracle),
+        ("ref vs oracle", ref_vs_oracle),
+    ):
+        logger.info(
+            "[mxfp8 fused fc12 A/B] %s: rms_rel=%.4f%% cos=%.6f max_abs=%.3f mean_abs=%.4f",
+            label,
+            100 * s["rms_rel"],
+            s["cos"],
+            s["max_abs"],
+            s["mean_abs"],
+        )
+
+    # The fused kernel must be at least as close to exact math as the established reference
+    # (10% slack on the reference's own RMS error) and must agree tightly with it.
+    assert fused_vs_oracle["rms_rel"] <= 1.1 * ref_vs_oracle["rms_rel"] + 1e-3, (
+        f"fused kernel adds error beyond the MXFP8 reference: {fused_vs_oracle} vs {ref_vs_oracle}"
+    )
+    assert fused_vs_oracle["cos"] >= 0.999, fused_vs_oracle
+    assert fused_vs_ref["cos"] >= 0.999 and fused_vs_ref["rms_rel"] <= 0.05, fused_vs_ref
