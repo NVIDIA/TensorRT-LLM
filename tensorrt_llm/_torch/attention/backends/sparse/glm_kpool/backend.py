@@ -53,6 +53,7 @@ from .kernels import (
     kpool_score_fp8,
     kpool_update,
     verify_selection_rows,
+    verify_state_rows,
 )
 from .metadata import Glm5NextMamba2Metadata
 from .native_decode import GlmKpoolNativeDecode
@@ -619,7 +620,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         metadata,
         *,
         tail_extra: int,
-        advance_kv_lens: bool = False,
+        kv_add: int = 0,
     ) -> GlmKpoolDraftRows:
         """A single-token draft step's cache update and attention inputs in one launch.
 
@@ -628,7 +629,7 @@ class GlmKpoolSparseAttention(TrtllmAttention):
         ``kv_lens - 1``, :meth:`update_pool_keys` there, and :meth:`expand_selection`
         of ``selected`` with ``tail_extra``, already packed for the native decode
         together with the FP8 query (``query`` ``[N, heads, kv_lora_rank]``).
-        ``advance_kv_lens``: finally add one to the rows' live lengths (the next draft step's).
+        The rows' lengths are their live lengths plus ``kv_add``.
         """
         state = self._cache_state(metadata)
         tables, gen_lens = self._rows(state)
@@ -651,9 +652,43 @@ class GlmKpoolSparseAttention(TrtllmAttention):
             rows_per_slot=rows_per_slot,
             out_width=self.sparse_params.kernel_output_width,
             tail_extra=tail_extra,
-            advance=advance_kv_lens,
+            kv_add=kv_add,
         )
         return GlmKpoolDraftRows(rows=rows, lengths=lengths, nonempty=nonempty, query_fp8=query_fp8)
+
+    def append_verify_state(
+        self,
+        latent: torch.Tensor,
+        packed: torch.Tensor,
+        ape: torch.Tensor,
+        metadata,
+        *,
+        tokens_per_request: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The generation requests' verify rows in one launch.
+
+        Equals :meth:`append_paged_state` of ``latent`` / ``packed`` ``[requests * T, dim]``
+        (``T = tokens_per_request`` rows per request at its last ``T`` positions) followed by
+        :meth:`update_pool_keys` there, and returns those rows' ``(positions [requests, T],
+        visible, num_candidates, request_ids)`` (see :func:`verify_state_rows`).
+        """
+        state = self._cache_state(metadata)
+        gen = slice(state.num_contexts, None)
+        return verify_state_rows(
+            latent,
+            packed,
+            state.kv_lens[gen],
+            tokens_per_request,
+            state.block_tables,
+            state.latent_pool,
+            state.index_pool,
+            state.tokens_per_block,
+            self.kv_scale_orig_quant,
+            ape,
+            head_dim=self.sparse_params.index_head_dim,
+            kpool=self.sparse_params.index_kpool,
+            first_table=state.num_contexts,
+        )
 
     def prepare_verify_step(
         self,

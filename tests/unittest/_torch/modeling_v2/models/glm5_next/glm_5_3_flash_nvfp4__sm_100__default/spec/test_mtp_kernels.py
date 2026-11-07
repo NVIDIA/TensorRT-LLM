@@ -77,7 +77,8 @@ def test_mtp_commit_matches_cache_manager_update(n, strided):
     accepted = (num_accepted - 1).to(torch.int32).clamp(min=0)
     want_prev[state_indices.long()] = torch.where(dummy, current, accepted)
     rows = mtp_commit(batch_indices, num_accepted, width, state_indices, dummy, prev)
-    assert torch.equal(rows, drafting_rows(batch_indices, num_accepted, width))
+    assert rows.dtype == torch.int32
+    assert torch.equal(rows.long(), drafting_rows(batch_indices, num_accepted, width))
     assert torch.equal(pool, want_pool)
 
 

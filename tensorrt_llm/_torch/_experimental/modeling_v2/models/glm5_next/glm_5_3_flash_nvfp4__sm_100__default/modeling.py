@@ -3094,16 +3094,21 @@ class _FusedMtpDraftStep:
 
         ctx = build_glm5_next_runtime_context(attn_metadata)
         tokens_per_request = ctx.gen_tokens_per_request
-        batch = m0 // tokens_per_request
-        rows = ctx.generation_rows(indexer.index_kpool)
         backend = attn.attn_backend
-        backend.append_paged_state(
-            w["latent"][:m0].view(batch, tokens_per_request, -1),
-            w["packed"][:m0].view(batch, tokens_per_request, -1),
-            rows.positions,
+        # One launch: the verify rows' schedule, their cache state and their pools' keys.
+        positions, visible, num_candidates, request_ids = backend.append_verify_state(
+            w["latent"][:m0],
+            w["packed"][:m0],
+            indexer.index_kpool_compress_ape,
             ctx.metadata,
+            tokens_per_request=tokens_per_request,
         )
-        backend.update_pool_keys(rows.positions, indexer.index_kpool_compress_ape, ctx.metadata)
+        rows = Glm5NextGenerationRows(
+            positions=positions,
+            visible=visible,
+            num_candidates=num_candidates,
+            request_ids=request_ids,
+        )
         scores = backend.score_pools(
             q_index,
             index_weights,
@@ -3172,10 +3177,10 @@ class _FusedMtpDraftStep:
         step_hidden: torch.Tensor,
         attn_metadata: AttentionMetadata,
         vocab_head: "_NcclVocabParallelHead",
-        advance_kv_lens: bool = False,
+        kv_add: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``(hidden [rows, hidden], tokens [rows] int32)`` of draft step ``step`` (see :meth:`applies`).
-        ``advance_kv_lens``: also add one to the rows' live KV lengths once the attention has read them."""
+        ``kv_add``: the steps' length increments not yet applied to the metadata's live KV lengths."""
         ops = torch.ops.trtllm
         m = step_ids.shape[0]
         w = self._workspace()
@@ -3219,7 +3224,7 @@ class _FusedMtpDraftStep:
             query,
             ctx.metadata,
             tail_extra=step,
-            advance_kv_lens=advance_kv_lens,
+            kv_add=kv_add,
         )
         out_latent = backend.forward(
             query,
@@ -3726,8 +3731,11 @@ class Glm5NextMtpStep:
     ) -> torch.Tensor:
         """The ``K`` MTP steps of :meth:`_draft` from its step-0 inputs."""
         drafts = []
-        # Later steps' positions, built only when a module step needs them: the fused step reads the live lengths.
+        # Later steps' positions and KV-length increments, applied only when a module step needs them: the fused
+        # step takes the increments as an offset. The metadata's live lengths are not read after the chain (prepare
+        # rewrites them), so increments still pending at its end are dropped.
         pending_rows: list = []
+        kv_pending = 0
         for step in range(draft_len):
             if share is not None:
                 share.step = step
@@ -3736,14 +3744,13 @@ class Glm5NextMtpStep:
             # Either way the MoE sees one row per request.
             rows = step0_rows if step == 0 else slice(0, batch_size)
             fused_step = self.fused_draft_step
-            kv_lens_advanced = False
+            defer_kv = False
             if (
                 step > 0
                 and fused_step is not None
                 and fused_step.applies(mtp_layer, step_ids.shape[0], attn_metadata)
             ):
-                # One row per request: the step's own launch advances the lengths for the next step.
-                kv_lens_advanced = step_ids.shape[0] == batch_size
+                defer_kv = True
                 request_hidden, tokens = fused_step(
                     step,
                     mtp_layer,
@@ -3752,7 +3759,7 @@ class Glm5NextMtpStep:
                     step_hidden,
                     attn_metadata,
                     self.vocab_head,
-                    advance_kv_lens=kv_lens_advanced,
+                    kv_add=kv_pending,
                 )
             elif (
                 step == 0
@@ -3779,6 +3786,10 @@ class Glm5NextMtpStep:
                         else step_positions[..., pending]
                     ) + 1
                 pending_rows = []
+                if kv_pending:
+                    attn_metadata.kv_lens_cuda[:batch_size] += kv_pending
+                    attn_metadata.update_for_spec_dec()
+                    kv_pending = 0
                 request_hidden, tokens = self._module_step(
                     draft_model, mtp_layer, spec_metadata, attn_metadata, step_ids, step_positions,
                     step_hidden, step0_rows if step == 0 else None,
@@ -3790,8 +3801,10 @@ class Glm5NextMtpStep:
                 pending_rows.append(rows)
             self._advance_lengths(
                 attn_metadata, step, num_contexts, batch_size, draft_len, num_accepted_tokens,
-                kv_lens_advanced,
+                defer_kv,
             )  # fmt: skip
+            if defer_kv:
+                kv_pending += 1
         return torch.stack(drafts, dim=1)
 
     def _module_step(
@@ -3876,11 +3889,11 @@ class Glm5NextMtpStep:
         batch_size: int,
         draft_len: int,
         num_accepted_tokens: torch.Tensor,
-        kv_lens_advanced: bool = False,
+        defer_kv: bool = False,
     ) -> None:
         """Lengths for the next draft step. After step 0 every request feeds one row: a generation request's KV
         length drops its rejected drafts and a context request's grows by its first draft, then each step adds one
-        (``kv_lens_advanced``: the step's fused launch already did)."""
+        (``defer_kv``: the caller keeps that increment pending instead)."""
         if step == 0:
             attn_metadata._seq_lens[:batch_size].fill_(1)
             # on_update reads the host lengths (and num_contexts, still the target's); the device copy is
@@ -3919,7 +3932,7 @@ class Glm5NextMtpStep:
             attn_metadata.update_for_spec_dec()
             attn_metadata.use_spec_decoding = False
         else:
-            if not kv_lens_advanced:
+            if not defer_kv:
                 attn_metadata.kv_lens_cuda[:batch_size] += 1
             attn_metadata.update_for_spec_dec()
 

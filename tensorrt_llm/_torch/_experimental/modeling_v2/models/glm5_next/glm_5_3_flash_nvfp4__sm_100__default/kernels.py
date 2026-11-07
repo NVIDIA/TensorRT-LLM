@@ -140,7 +140,7 @@ def _mtp_commit_kernel(
     m = i < n
     b = tl.load(batch_indices_ptr + i, mask=m, other=0).to(tl.int64)
     a = tl.load(num_accepted_ptr + i, mask=m, other=1).to(tl.int64)
-    tl.store(rows_ptr + i, b * width + a - 1, mask=m)
+    tl.store(rows_ptr + i, (b * width + a - 1).to(rows_ptr.dtype.element_ty), mask=m)
     slot = tl.load(state_indices_ptr + i, mask=m, other=0).to(tl.int64)
     dummy = tl.load(dummy_ptr + i, mask=m, other=1) != 0
     accepted = tl.maximum(a - 1, 0).to(tl.int32)
@@ -155,14 +155,15 @@ def mtp_commit(
     dummy_mask: torch.Tensor,
     prev_num_accepted: torch.Tensor,
 ) -> torch.Tensor:
-    """:func:`drafting_rows` (returned) and the KDA replay record of each generation request in one launch: for
+    """:func:`drafting_rows` (returned as int32, the row index the fused draft step takes) and the KDA replay record of
+    each generation request in one launch: for
     every non-dummy request ``prev_num_accepted[state_indices[i]] = max(num_accepted[i] - 1, 0)`` (the accepted
     drafts the next verify replays; a dummy request's slot is left as is). ``prev_num_accepted`` may be strided
     (the cache manager's per-slot count is a column of its state pool)."""
     n = num_accepted.shape[0]
     assert batch_indices.shape[0] == n and state_indices.shape[0] == n and dummy_mask.shape[0] == n
     assert prev_num_accepted.dtype == torch.int32
-    out = torch.empty(n, dtype=torch.int64, device=num_accepted.device)
+    out = torch.empty(n, dtype=torch.int32, device=num_accepted.device)
     if n:
         _mtp_commit_kernel[(1,)](
             batch_indices,

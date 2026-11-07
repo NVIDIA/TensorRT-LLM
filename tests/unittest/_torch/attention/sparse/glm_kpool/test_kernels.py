@@ -26,6 +26,7 @@ from tensorrt_llm._torch.attention.backends.sparse.glm_kpool.kernels import (
     kpool_score_fp8,
     kpool_update,
     verify_selection_rows,
+    verify_state_rows,
 )
 from tensorrt_llm._utils import get_sm_version
 
@@ -1048,18 +1049,26 @@ def test_kpool_expand_tail_extra(tail_extra):
 
 @pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize("tail_extra", [1, 2])
-@pytest.mark.parametrize("advance", [False, True])
-def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, advance):
+@pytest.mark.parametrize("kv_add", [0, 2])
+@pytest.mark.parametrize("select_k", [8, 512], ids=["one_slice", "slices"])
+def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, kv_add, select_k):
     """One launch per draft step equals append_paged_state_rows, kpool_update, kpool_expand and
-    compact_sparse_rows at ``kv_lens - 1`` plus the saturating FP8 query cast, bit for bit; with
-    ``advance`` the live lengths end one longer."""
+    compact_sparse_rows at ``kv_lens + kv_add - 1`` plus the saturating FP8 query cast, bit for bit,
+    and leaves ``kv_lens`` as is; a large selection is expanded by several programs."""
     gen = torch.Generator(device="cuda").manual_seed(5)
-    n, pages, slots, select_k, latent_dim, heads = 7, 6, 64, 8, 512, 2
+    n, latent_dim, heads = 7, 512, 2
+    pages = 6 if select_k == 8 else 300
+    slots = n * pages + 8
     tables = _paged_tables(n, pages, slots, gen)
-    kv_lens = torch.randint(1, pages * TPB, (n,), generator=gen, device="cuda", dtype=torch.int32)
+    kv_lens = torch.randint(
+        1, pages * TPB - kv_add, (n,), generator=gen, device="cuda", dtype=torch.int32
+    )
     kv_lens[0] = 1  # a row with only its own token
-    kv_lens[1] = KPOOL  # its token completes the first pool
-    selected = torch.randint(-1, 12, (n, select_k), generator=gen, device="cuda", dtype=torch.int32)
+    kv_lens[1] = KPOOL - kv_add  # its token completes the first pool
+    num_pools = 12 if select_k == 8 else pages * TPB // KPOOL
+    selected = torch.randint(
+        -1, num_pools, (n, select_k), generator=gen, device="cuda", dtype=torch.int32
+    )
     latent = (torch.randn(n, latent_dim + 64, generator=gen, device="cuda") * 50).to(
         torch.bfloat16
     )[:, :latent_dim]
@@ -1069,7 +1078,8 @@ def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, a
         torch.bfloat16
     )
     scale = torch.tensor([0.7], device="cuda")
-    base_row, rows_per_slot, out_width = 2, TPB + 4, 64
+    base_row, rows_per_slot = 2, TPB + 4
+    out_width = -(-(select_k * KPOOL + KPOOL - 1 + tail_extra) // 64) * 64
 
     def pools():
         g = torch.Generator(device="cuda").manual_seed(9)
@@ -1080,14 +1090,15 @@ def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, a
         return latent_pool, index_pool
 
     want_latent, want_index = pools()
-    positions = (kv_lens - 1).unsqueeze(1)
+    live = kv_lens + kv_add
+    positions = (live - 1).unsqueeze(1)
     append_paged_state_rows(
         latent.unsqueeze(1), packed.unsqueeze(1), positions, tables, want_latent, want_index, TPB,
         scale,
     )  # fmt: skip
     kpool_update(want_index, tables, positions.squeeze(1), ape, TPB, head_dim=HD, kpool=KPOOL)
     expanded = kpool_expand(
-        selected, kv_lens, tables, TPB, base_row=base_row, rows_per_slot=rows_per_slot,
+        selected, live, tables, TPB, base_row=base_row, rows_per_slot=rows_per_slot,
         kpool=KPOOL, out_width=out_width, tail_extra=tail_extra,
     )  # fmt: skip
     want_rows, want_lengths, want_nonempty = compact_sparse_rows(expanded)
@@ -1099,7 +1110,7 @@ def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, a
     rows, lengths, nonempty, query_fp8 = draft_step_rows(
         latent, packed, lens, tables, got_latent, got_index, TPB, scale, ape, selected, query,
         head_dim=HD, kpool=KPOOL, base_row=base_row, rows_per_slot=rows_per_slot,
-        out_width=out_width, tail_extra=tail_extra, advance=advance,
+        out_width=out_width, tail_extra=tail_extra, kv_add=kv_add,
     )  # fmt: skip
     assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
     assert torch.equal(got_index, want_index)
@@ -1110,17 +1121,20 @@ def test_draft_step_rows_match_the_separate_launches(latent_dtype, tail_extra, a
         assert torch.equal(query_fp8.view(torch.uint8), want_query.view(torch.uint8))
     else:
         assert query_fp8 is None
-    assert torch.equal(lens, kv_lens + 1 if advance else kv_lens)
+    assert torch.equal(lens, kv_lens)
 
 
 @pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
 @pytest.mark.parametrize("first_table", [0, 2])
-def test_verify_selection_rows_match_expand_compact_and_keep(latent_dtype, first_table):
+@pytest.mark.parametrize("select_k", [8, 512], ids=["one_slice", "slices"])
+def test_verify_selection_rows_match_expand_compact_and_keep(latent_dtype, first_table, select_k):
     """Verify rows (T per request, rows of block table ``request_ids``) in one launch equal kpool_expand
     with per-row visible lengths, compact_sparse_rows, the saturating FP8 query cast and
     ``keep_out = selected[keep_rows]``, bit for bit."""
     gen = torch.Generator(device="cuda").manual_seed(13)
-    requests, t, pages, slots, select_k, heads, latent_dim = 3, 4, 6, 64, 8, 2, 512
+    requests, t, heads, latent_dim = 3, 4, 2, 512
+    pages = 6 if select_k == 8 else 300
+    slots = (first_table + requests) * pages + 8
     tables = _paged_tables(first_table + requests, pages, slots, gen)
     kv_lens = torch.randint(t, pages * TPB, (requests,), generator=gen, device="cuda")
     visible = ((kv_lens - t).unsqueeze(1) + torch.arange(1, t + 1, device="cuda")).reshape(-1)
@@ -1128,14 +1142,18 @@ def test_verify_selection_rows_match_expand_compact_and_keep(latent_dtype, first
         first_table, first_table + requests, dtype=torch.int32, device="cuda"
     ).repeat_interleave(t)
     n = requests * t
-    selected = torch.randint(-1, 12, (n, select_k), generator=gen, device="cuda", dtype=torch.int32)
+    num_pools = 12 if select_k == 8 else pages * TPB // KPOOL
+    selected = torch.randint(
+        -1, num_pools, (n, select_k), generator=gen, device="cuda", dtype=torch.int32
+    )
     query = (torch.randn(n, heads, latent_dim, generator=gen, device="cuda") * 300).to(
         torch.bfloat16
     )
     keep_rows = torch.arange(requests, device="cuda") * t + torch.randint(
         0, t, (requests,), generator=gen, device="cuda"
     )
-    base_row, rows_per_slot, out_width = 2, TPB + 4, 64
+    base_row, rows_per_slot = 2, TPB + 4
+    out_width = -(-(select_k * KPOOL + KPOOL - 1) // 64) * 64
 
     expanded = kpool_expand(
         selected, visible, tables, TPB, base_row=base_row, rows_per_slot=rows_per_slot,
@@ -1160,3 +1178,60 @@ def test_verify_selection_rows_match_expand_compact_and_keep(latent_dtype, first
         assert torch.equal(query_fp8.view(torch.uint8), want_query.view(torch.uint8))
     else:
         assert query_fp8 is None
+
+
+@pytest.mark.parametrize("latent_dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("tokens_per_request", [1, 2, 4])
+@pytest.mark.parametrize("first_table", [0, 2])
+def test_verify_state_rows_match_append_update_and_schedule(
+    latent_dtype, tokens_per_request, first_table
+):
+    """One launch per verify step equals append_paged_state_rows and kpool_update of each request's
+    last T positions (block-table rows from first_table), bit for bit, and returns their positions,
+    visible lengths, complete-pool counts and block-table rows."""
+    gen = torch.Generator(device="cuda").manual_seed(17)
+    t = tokens_per_request
+    n, pages, latent_dim = 5, 6, 512
+    slots = (first_table + n) * pages + 8
+    tables = _paged_tables(first_table + n, pages, slots, gen)
+    kv_lens = torch.randint(t, pages * TPB, (n,), generator=gen, device="cuda", dtype=torch.int32)
+    kv_lens[0] = t  # the first pool is still being filled
+    kv_lens[1] = KPOOL + t - 1  # the rows straddle a pool boundary
+    latent = (torch.randn(n * t, latent_dim + 64, generator=gen, device="cuda") * 50).to(
+        torch.bfloat16
+    )[:, :latent_dim]
+    packed = torch.randn(n * t, 2 * HD, generator=gen, device="cuda").to(torch.bfloat16)
+    ape = torch.randn(KPOOL, HD, generator=gen, device="cuda").to(torch.bfloat16)
+    scale = torch.tensor([0.7], device="cuda")
+
+    def pools():
+        g = torch.Generator(device="cuda").manual_seed(9)
+        latent_pool = torch.randn(slots, 2, TPB, latent_dim, generator=g, device="cuda").to(
+            latent_dtype
+        )[:, 0]
+        return latent_pool, _strided_index_pool(slots, g)
+
+    want_positions = (kv_lens.long() - t).unsqueeze(1) + torch.arange(t, device="cuda")
+    want_latent, want_index = pools()
+    gen_tables = tables[first_table:]
+    append_paged_state_rows(
+        latent.view(n, t, -1), packed.view(n, t, -1), want_positions, gen_tables, want_latent,
+        want_index, TPB, scale,
+    )  # fmt: skip
+    kpool_update(
+        want_index, gen_tables, want_positions if t > 1 else want_positions.squeeze(1), ape, TPB,
+        head_dim=HD, kpool=KPOOL,
+    )  # fmt: skip
+
+    got_latent, got_index = pools()
+    positions, visible, num_candidates, request_ids = verify_state_rows(
+        latent, packed, kv_lens, t, tables, got_latent, got_index, TPB, scale, ape,
+        head_dim=HD, kpool=KPOOL, first_table=first_table,
+    )  # fmt: skip
+    assert torch.equal(got_latent.view(torch.uint8), want_latent.view(torch.uint8))
+    assert torch.equal(got_index, want_index)
+    assert torch.equal(positions, want_positions)
+    assert torch.equal(visible, (want_positions + 1).reshape(-1))
+    assert torch.equal(num_candidates, ((want_positions + 1) // KPOOL).reshape(-1).to(torch.int32))
+    want_ids = torch.arange(first_table, first_table + n, dtype=torch.int32, device="cuda")
+    assert torch.equal(request_ids, want_ids.repeat_interleave(t))
