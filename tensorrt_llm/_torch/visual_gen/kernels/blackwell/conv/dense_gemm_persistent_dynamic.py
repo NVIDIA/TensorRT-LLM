@@ -25,9 +25,11 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass import testing
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.arch.smem import map_dsmem_ptr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.cpasync import CopyDsmemStoreOp
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import create_cute_tensor_for_fp8, is_fp8_dtype
 
@@ -105,6 +107,39 @@ Constraints are same as dense_gemm.py:
   Float16/BFloat16, and Int8/Uint8/Float8, respectively.
 * OOB tiles are not allowed when TMA store is disabled
 """
+
+
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: cute.Pointer,
+    phase: cutlass.Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' DSMEM stores complete the mailbox barrier with a release at cluster
+    scope. The default ``.acquire.cta`` wait does not synchronize with threads of
+    other CTAs, so the mailbox reads after it would not be ordered after the stores.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            cutlass.Int32(phase).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r,~{memory}",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def _compute_stages(
@@ -1222,7 +1257,9 @@ class PersistentDenseGemmKernel:
                         # Do not let local FULL waits move ahead of this CTA's
                         # remote DSMEM stores to peer mailboxes.
                         cute.arch.fence_acq_rel_cta()
-                        cute.arch.mbarrier_wait(dsmem_mailbox_full_mbar, dsmem_full_phase)
+                        # The peers' stores complete FULL at cluster scope, so the
+                        # wait must acquire at cluster scope to order the mailbox reads.
+                        _mbarrier_wait_acquire_cluster(dsmem_mailbox_full_mbar, dsmem_full_phase)
                         dsmem_full_phase = dsmem_full_phase ^ 1
 
                         # Reduce received shards into our own partial.
