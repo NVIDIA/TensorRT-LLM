@@ -489,13 +489,19 @@ class TmemCorrResource(DecodeGenResourceBase):
         # fast path; otherwise only lane 0 continues polling. The existing
         # correction-group barrier publishes lane 0's ready point before any
         # reducer lane reads the distributed-SMEM partials.
+        # The peers' st.async complete-tx releases at cluster scope, so the
+        # acquire must be at cluster scope too; the default CTA scope does not
+        # synchronize with a thread of another CTA.
         cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-            mbarrier, 0, time_limit=0
+            mbarrier, 0, time_limit=0, scope=prims.MBarrierScope.CLUSTER
         )
         if warp_grp_thread_idx == Int32(0):
             while not cluster_transaction_ready:
                 cluster_transaction_ready = prims.mbarrier_try_wait_parity(
-                    mbarrier, 0, time_limit=10_000_000
+                    mbarrier,
+                    0,
+                    time_limit=10_000_000,
+                    scope=prims.MBarrierScope.CLUSTER,
                 )
         prims.barrier_cta_sync(barrier_id, thread_count=barrier_threads)
 
