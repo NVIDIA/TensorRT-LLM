@@ -3599,6 +3599,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         correction_factor = rCor[2]
         no_correction = rCor_int[3]
 
+        # Wait for the tcgen05.ld above to complete before the stage is handed back
+        # to the softmax warps, which overwrite it with tcgen05.st next.
+        cute.arch.fence_view_async_tmem_load()
         common_params.p_cor_pipeline.consumer_release(p_cor_consumer_state)
         p_cor_consumer_state.advance()
         return p_cor_consumer_state, row_sum, row_max, correction_factor, no_correction
