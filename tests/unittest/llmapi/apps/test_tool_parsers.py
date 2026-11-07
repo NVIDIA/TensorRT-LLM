@@ -832,6 +832,7 @@ class TestKimiK2StreamingMatchesWholeTextParse:
         results = [
             parser.parse_streaming_increment(chunk, tools) for chunk in chunks
         ]
+        results.append(parser.parse_streaming_increment("", tools))
         results.append(parser.finish(tools))
         calls = {}
         for result in results:
@@ -5121,6 +5122,247 @@ class TestMiniMaxM2ToolParser:
             "unit": "celsius"
         }
         assert json.loads(arguments[1]) == {"query": "news"}
+
+    def test_finish_releases_text_after_completed_tool(self, sample_tools):
+        """Finish emits trailing ordinary text exactly once."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment(
+            '<minimax:tool_call><invoke name="get_weather">'
+            '<parameter name="location">Paris</parameter></invoke>'
+            '</minimax:tool_call> trailing answer', sample_tools)
+        assert [call.name for call in result.calls
+                if call.name] == ["get_weather"]
+        assert result.normal_text == ""
+        assert parser.finish(sample_tools).normal_text == " trailing answer"
+        assert parser.finish(sample_tools).normal_text == ""
+
+    def test_finish_releases_unmatched_opening_token_prefix(self, sample_tools):
+        """Finish releases an opening-token prefix that never became a call."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment("ordinary text <mini",
+                                                  sample_tools)
+        assert result.normal_text == ""
+        assert parser.finish(sample_tools).normal_text == "ordinary text <mini"
+
+    @staticmethod
+    def _collect_stream(parser, tools, text, chunk_size):
+        """Reassemble text and tool-call deltas as a streaming client would."""
+        chunks = (text[i:i + chunk_size]
+                  for i in range(0, len(text), chunk_size))
+        return TestMiniMaxM2ToolParser._collect_chunks(parser, tools, chunks)
+
+    @staticmethod
+    def _collect_chunks(parser, tools, chunks):
+        """Reassemble streamed deltas and verify finalization is idempotent."""
+        results = [
+            parser.parse_streaming_increment(chunk, tools) for chunk in chunks
+        ]
+        results.append(parser.finish(tools))
+        repeated_finish = parser.finish(tools)
+        assert repeated_finish.normal_text == ""
+        assert repeated_finish.calls == []
+
+        calls = {}
+        for result in results:
+            for call in result.calls:
+                item = calls.setdefault(call.tool_index, {
+                    "names": [],
+                    "arguments": ""
+                })
+                if call.name:
+                    item["names"].append(call.name)
+                item["arguments"] += call.parameters
+        return "".join(result.normal_text for result in results), calls
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_streaming_multiple_blocks_preserves_text_and_calls(
+            self, sample_tools, chunk_size):
+        """Separate completed blocks produce each call once and retain prose."""
+        text = ('Before '
+                '<minimax:tool_call><invoke name="get_weather">'
+                '<parameter name="location">Paris</parameter></invoke>'
+                '</minimax:tool_call>'
+                ' between '
+                '<minimax:tool_call><invoke name="search_web">'
+                '<parameter name="query">news</parameter></invoke>'
+                '</minimax:tool_call> trailing answer')
+        normal_text, calls = self._collect_stream(MiniMaxM2ToolParser(),
+                                                  sample_tools, text,
+                                                  chunk_size)
+
+        assert normal_text == "Before  between  trailing answer"
+        assert list(calls) == [0, 1]
+        assert calls[0]["names"] == ["get_weather"]
+        assert json.loads(calls[0]["arguments"]) == {"location": "Paris"}
+        assert calls[1]["names"] == ["search_web"]
+        assert json.loads(calls[1]["arguments"]) == {"query": "news"}
+
+    def test_multiple_blocks_at_every_split(self, sample_tools):
+        """Every two-chunk split preserves calls, indices, and surrounding text."""
+        text = ('Before <minimax:tool_call><invoke name="get_weather">'
+                '<parameter name="location">Paris</parameter></invoke>'
+                '</minimax:tool_call> between '
+                '<minimax:tool_call><invoke name="search_web">'
+                '<parameter name="query">news</parameter></invoke>'
+                '</minimax:tool_call> answer')
+        for split in range(len(text) + 1):
+            normal_text, calls = self._collect_chunks(
+                MiniMaxM2ToolParser(), sample_tools,
+                [text[:split], text[split:]])
+            assert normal_text == "Before  between  answer", split
+            assert list(calls) == [0, 1], split
+            assert calls[0]["names"] == ["get_weather"], split
+            assert json.loads(calls[0]["arguments"]) == {
+                "location": "Paris"
+            }, split
+            assert calls[1]["names"] == ["search_web"], split
+            assert json.loads(calls[1]["arguments"]) == {"query": "news"}, split
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    @pytest.mark.parametrize("tail,expected", [
+        ('<invoke name="get_weather">', {}),
+        ('<invoke name="get_weather"><parameter name="location">Par', {}),
+        ('<invoke name="get_weather"><parameter name="location">Paris'
+         '</parameter><parameter name="unit">cel', {
+             "location": "Paris"
+         }),
+        ('<invoke name="get_weather"><parameter name="location">Paris'
+         '</parameter><parameter name="unit">celsius</parameter>', {
+             "location": "Paris",
+             "unit": "celsius"
+         }),
+        ('<invoke name="get_weather"><parameter name="location">'
+         'München "Nord"</parameter>', {
+             "location": 'München "Nord"'
+         }),
+        ('<invoke name="get_weather"><parameter name="location">Paris'
+         '</parameter><parameter name="location">Berlin</parameter>'
+         '<parameter name="unit">cel', {
+             "location": "Berlin"
+         }),
+        ('<invoke name="get_weather"><parameter name="location">Paris'
+         '</parameter><parameter name="location">Berlin</parameter></invoke>', {
+             "location": "Berlin"
+         }),
+        ('<invoke name="get_weather"></invoke>', {}),
+        ('<invoke name="get_weather"><parameter name="location">Paris'
+         '</parameter></minimax:tool_call>', {
+             "location": "Paris"
+         }),
+    ])
+    def test_finish_closes_started_call_with_only_closed_parameters(
+            self, sample_tools, chunk_size, tail, expected):
+        """Truncated calls keep closed parameters and end with valid JSON."""
+        text = '<minimax:tool_call>' + tail
+        normal_text, calls = self._collect_stream(MiniMaxM2ToolParser(),
+                                                  sample_tools, text,
+                                                  chunk_size)
+        assert normal_text == ""
+        assert list(calls) == [0]
+        assert calls[0]["names"] == ["get_weather"]
+        assert json.loads(calls[0]["arguments"]) == expected
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_completed_block_then_truncated_call(self, sample_tools,
+                                                 chunk_size):
+        """A later truncated call keeps its index and already closed fields."""
+        text = ('<minimax:tool_call><invoke name="get_weather">'
+                '<parameter name="location">Paris</parameter></invoke>'
+                '</minimax:tool_call> then '
+                '<minimax:tool_call><invoke name="search_web">'
+                '<parameter name="query">news</parameter>'
+                '<parameter name="other">incomplete')
+        normal_text, calls = self._collect_stream(MiniMaxM2ToolParser(),
+                                                  sample_tools, text,
+                                                  chunk_size)
+        assert normal_text == " then "
+        assert list(calls) == [0, 1]
+        assert calls[0]["names"] == ["get_weather"]
+        assert json.loads(calls[0]["arguments"]) == {"location": "Paris"}
+        assert calls[1]["names"] == ["search_web"]
+        assert json.loads(calls[1]["arguments"]) == {"query": "news"}
+
+    @pytest.mark.parametrize("chunk_size", [1, 7, 10000])
+    def test_streaming_typed_parameters_match_whole_parse(self, chunk_size):
+        """Streamed arguments retain the same types as a complete parse."""
+        tools = [
+            ChatCompletionToolsParam(function=FunctionDefinition(
+                name="record",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "count": {
+                            "type": "integer"
+                        },
+                        "active": {
+                            "type": "boolean"
+                        },
+                        "options": {
+                            "type": "object"
+                        },
+                        "tags": {
+                            "type": "array"
+                        },
+                        "label": {
+                            "type": "string"
+                        },
+                    },
+                },
+            ))
+        ]
+        text = ('<minimax:tool_call><invoke name="record">'
+                '<parameter name="count">42</parameter>'
+                '<parameter name="active">true</parameter>'
+                '<parameter name="options">{"city": "München"}</parameter>'
+                '<parameter name="tags">["a", "b"]</parameter>'
+                '<parameter name="label">"42"</parameter>'
+                '</invoke></minimax:tool_call>')
+        whole = MiniMaxM2ToolParser().detect_and_parse(text, tools)
+        normal_text, calls = self._collect_stream(MiniMaxM2ToolParser(), tools,
+                                                  text, chunk_size)
+        assert normal_text == ""
+        assert list(calls) == [0]
+        assert calls[0]["names"] == ["record"]
+        assert json.loads(calls[0]["arguments"]) == json.loads(
+            whole.calls[0].parameters) == {
+                "count": 42,
+                "active": True,
+                "options": {
+                    "city": "München"
+                },
+                "tags": ["a", "b"],
+                "label": '"42"',
+            }
+
+    @pytest.mark.parametrize("split_after_invoke", [False, True])
+    def test_complete_invoke_collapses_repeated_parameters(
+            self, sample_tools, split_after_invoke):
+        """A call with no streamed arguments keeps the last value per name."""
+        parser = MiniMaxM2ToolParser()
+        start = '<minimax:tool_call><invoke name="get_weather">'
+        end = ('<parameter name="location">Paris</parameter>'
+               '<parameter name="location">Berlin</parameter>'
+               '</invoke></minimax:tool_call>')
+        chunks = [start, end] if split_after_invoke else [start + end]
+        results = [
+            parser.parse_streaming_increment(c, sample_tools) for c in chunks
+        ]
+        arguments = "".join(call.parameters for result in results
+                            for call in result.calls)
+        assert json.loads(arguments,
+                          object_pairs_hook=list) == [("location", "Berlin")]
+        assert parser.finish(sample_tools).calls == []
+
+    def test_finish_hides_unstarted_call_markup(self, sample_tools):
+        """An incomplete invoke header is never exposed as ordinary text."""
+        parser = MiniMaxM2ToolParser()
+        result = parser.parse_streaming_increment(
+            'prefix <minimax:tool_call><invoke name="get_wea', sample_tools)
+        assert result.normal_text == "prefix "
+        assert result.calls == []
+        final = parser.finish(sample_tools)
+        assert final.normal_text == ""
+        assert final.calls == []
 
     def test_supports_structural_tag(self, parser):
         """Test that supports_structural_tag returns False."""
