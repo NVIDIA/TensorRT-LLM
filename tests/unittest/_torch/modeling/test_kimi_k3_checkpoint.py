@@ -68,19 +68,30 @@ def _config(
 
 
 def load_mla_checkpoint(
-    model: KimiLinearForCausalLM, projections: dict[str, torch.Tensor], prefix: str
-) -> None:
-    # Supply a synthetic one-layer checkpoint through the public model loader.
+    model: KimiLinearForCausalLM,
+    projections: dict[str, torch.Tensor],
+    prefix: str,
+    *,
+    random_gate_up: bool = False,
+) -> dict[str, torch.Tensor]:
+    # Supply a synthetic one-layer checkpoint through the public model loader,
+    # and return it. Weights other than the given projections are zero, except
+    # that ``random_gate_up`` gives the dense MLP's gate_proj and up_proj
+    # different random values.
     name_map, _, _ = model.checkpoint_name_plan(prefix)
     config = model.model_config.pretrained_config
     params = dict(model.named_parameters())
+    generator = torch.Generator().manual_seed(7)
     weights = {}
     for name, key in name_map.items():
         param = params[name]
         if name.endswith("gate_up_proj.weight"):
             for source in ("gate_proj", "up_proj"):
-                weights[key.replace("gate_up_proj", source)] = torch.zeros(
-                    config.intermediate_size, config.hidden_size, dtype=param.dtype
+                shape = (config.intermediate_size, config.hidden_size)
+                weights[key.replace("gate_up_proj", source)] = (
+                    torch.randn(shape, generator=generator).to(param.dtype)
+                    if random_gate_up
+                    else torch.zeros(shape, dtype=param.dtype)
                 )
         else:
             shape = param.shape
@@ -93,6 +104,7 @@ def load_mla_checkpoint(
         {f"{prefix}model.layers.0.self_attn.{name}": value for name, value in projections.items()}
     )
     model.load_weights(weights)
+    return weights
 
 
 def _weights(fp8: bool, *, scale_name: str = "weight_scale") -> dict:
@@ -142,7 +154,7 @@ def test_checkpoint_loads_fp8_mla_values(
         )
     attention = model.model.layers[0].self_attn.mixer
     weights = _weights(fp8, scale_name=scale_name)
-    load_mla_checkpoint(model, weights, prefix)
+    checkpoint = load_mla_checkpoint(model, weights, prefix, random_gate_up=True)
     effective_tp = 1 if adp else tp
     tp_rank = 0 if adp else mapping.tp_rank
     heads = 8 // effective_tp
@@ -186,6 +198,19 @@ def test_checkpoint_loads_fp8_mla_values(
             else:
                 scale = scale[:, v_start:v_end]
             torch.testing.assert_close(getattr(attention, name).weight_scale.cpu(), scale)
+    # The dense MLP's fused gate_up_proj holds this rank's TP shard of the
+    # checkpoint's gate_proj rows, then the same shard of its up_proj rows.
+    gate_up = model.model.layers[0].mlp.gate_up_proj
+    rows = gate_up.weight.shape[0] // 2
+    shard = slice(gate_up.tp_rank * rows, (gate_up.tp_rank + 1) * rows)
+    (gate_key,) = (key for key in checkpoint if key.endswith(".mlp.gate_proj.weight"))
+    up_key = gate_key.replace("gate_proj", "up_proj")
+    torch.testing.assert_close(
+        gate_up.weight[:rows].cpu(), checkpoint[gate_key][shard], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        gate_up.weight[rows:].cpu(), checkpoint[up_key][shard], rtol=0, atol=0
+    )
     if fp8:
         assert attention.v_b_proj.dtype == torch.float8_e4m3fn
         expected_scale = (
