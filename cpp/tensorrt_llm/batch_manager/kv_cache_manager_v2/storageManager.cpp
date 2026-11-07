@@ -890,10 +890,6 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
     mLevels.at(level).storage->release(pg, std::move(slot));
 }
 
-// ---------------------------------------------------------------------------
-// Keep-disk-copy (DiskCacheTierConfig::keepCopyAfterRestore)
-// ---------------------------------------------------------------------------
-
 bool StorageManager::keepDiskCopyEnabled() const noexcept
 {
     return mKeepDiskCopy;
@@ -913,7 +909,6 @@ void StorageManager::addRetainedCopy(Page const& page, CacheLevel level, PoolGro
 {
     if (auto it = mRetainedByPage.find(&page); it != mRetainedByPage.end())
     {
-        // A page is at most in one disk slot; an older copy cannot exist while the page was on disk.
         TLLM_CHECK_DEBUG_WITH_INFO(false, "Page already has a retained copy");
         eraseRetainedCopy(it->second);
     }
@@ -952,9 +947,8 @@ bool StorageManager::pinRetainedCopy(Page const& page, CacheLevel level, bool pi
 
 void StorageManager::eraseRetainedCopy(RetainedCopyList::iterator iter)
 {
-    // A write-through may still be reading the page's host slot. Its completion lives only on this retained disk
-    // slot, so move the dependency onto the page before the entry goes: whoever later releases or reuses the host
-    // slot (migration, destruction, pool shrink) then waits for the write.
+    // A write-through may still be reading the page's host slot, and its completion is tracked only here. Move it
+    // onto the page so whoever later releases the host slot waits for it.
     if (mDiskWriteThrough)
     {
         Page const& page = *iter->page;
@@ -967,7 +961,6 @@ void StorageManager::eraseRetainedCopy(RetainedCopyList::iterator iter)
             }
         }
     }
-    // The slot's ready event covers the I/O that last used it, so the next user of the slot waits for it.
     mLevels.at(iter->level).storage->release(iter->pgIdx, std::move(iter->slot));
     --mNumRetainedCopies.at(iter->level).at(iter->pgIdx);
     mRetainedByPage.erase(iter->page);
@@ -1012,8 +1005,6 @@ void StorageManager::onPageDestroyed(Page const& page) noexcept
     KVCM2_POISON_ON_EXCEPT(
         [this, &page]()
         {
-            // The page's host slot is released right after this. eraseRetainedCopy moves a write-through still
-            // reading it onto the page's ready event, so the release waits for it.
             auto it = mRetainedByPage.find(&page);
             if (it != mRetainedByPage.end())
             {
@@ -1054,7 +1045,6 @@ void StorageManager::maybePrintKeepCopyStats()
 
 CachedCudaEvent StorageManager::pendingDiskWrite(Page const& page) const
 {
-    // Retained copies only exist on the disk level.
     auto it = mRetainedByPage.find(&page);
     if (it != mRetainedByPage.end() && !it->second->slot.readyEvent.isClosed()
         && !it->second->slot.readyEvent.queryComplete())
@@ -1088,7 +1078,7 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
         SlotCount free = poolGroup(diskLevel, pgIdx).numFreeSlots();
         if (free < wanted)
         {
-            // Older retained copies are duplicates; recycle them first. Never evict live disk pages for this.
+            // Recycle older retained copies (duplicates); never evict live disk pages for this.
             releaseRetainedCopies(diskLevel, pgIdx, wanted - free);
             free = poolGroup(diskLevel, pgIdx).numFreeSlots();
         }
@@ -1099,9 +1089,8 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
             continue;
         }
         batch.resize(take);
-        // Copy without moving. The page keeps its own ready event, so reads of the host page (e.g. a restore to GPU)
-        // do not wait for this write; the write's completion lives on the retained disk slot, and every release of
-        // the host slot merges it in (see pendingDiskWrite), so the slot is not reused while the write reads it.
+        // Copy without moving, and keep the page's ready event so host -> GPU restores don't wait for this write.
+        // The write's completion lives on the retained slot; releases of the host slot merge it in (pendingDiskWrite).
         std::vector<CachedCudaEvent> previousEvents;
         previousEvents.reserve(take);
         for (auto const& page : batch)
@@ -1735,7 +1724,6 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         if (dstPoolGroup.numFreeSlots() < numNewSlots)
             throw OutOfPagesError("Not enough free slots for migration");
         auto freshSlots = dstPoolGroup.allocateMultiple(numNewSlots);
-        // A15: allocated slot count must match the request.
         TLLM_CHECK_DEBUG_WITH_INFO(slotCountValueFromSize(freshSlots.size()) == numNewSlots, "dst_slots size mismatch");
         std::size_t nextFresh = 0;
         for (std::size_t i = 0; i < srcPages.size(); ++i)

@@ -2059,7 +2059,6 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     with pytest.raises(ValidationError):
         KvCacheConfig(disk_io_threads=-1)
 
-    # The C++ disk tier config the fields are passed to applies the same rules.
     from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
 
     tier = DiskCacheTierConfig(2048, str(tmp_path))
