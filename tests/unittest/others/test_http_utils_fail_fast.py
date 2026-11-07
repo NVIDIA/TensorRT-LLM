@@ -12,30 +12,45 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fail-fast + log-tail-dump behavior of wait_for_endpoint_ready (no GPU, no server)."""
+"""Fail-fast behavior for HTTP endpoint wait helpers without GPUs."""
 
+import errno
+import socket
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import requests
 from test_common.error_utils import check_error, report_error
-from test_common.http_utils import fail_if_proc_died, wait_for_endpoint_ready
+from test_common.http_utils import (
+    fail_if_proc_died,
+    wait_for_endpoint_down,
+    wait_for_endpoint_ready,
+)
 
 # The CPU-Generic CI stages select tests with `-m cpu_only`; without this
 # marker every test here is deselected and pytest exits with code 5.
 pytestmark = pytest.mark.cpu_only
 
-# Nothing listens here; connections are refused immediately.
-DEAD_URL = "http://127.0.0.1:9/health"
-
 
 @pytest.fixture(autouse=True)
 def _no_proxy(monkeypatch):
-    """A corporate HTTP proxy answering 200 would make DEAD_URL look ready."""
+    """A corporate HTTP proxy answering 200 would mask a local endpoint."""
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
     monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
     monkeypatch.delenv("HTTP_PROXY", raising=False)
     monkeypatch.delenv("http_proxy", raising=False)
+
+
+@pytest.fixture
+def dead_url() -> Iterator[str]:
+    """Keep a local port bound without a listener to force connection refusal."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe_socket:
+        probe_socket.bind(("127.0.0.1", 0))
+        port = probe_socket.getsockname()[1]
+        yield f"http://127.0.0.1:{port}/health"
 
 
 def _server_log(tmp_path, content):
@@ -44,42 +59,138 @@ def _server_log(tmp_path, content):
     return str(p)
 
 
-def test_dead_server_proc_fails_fast_and_dumps_log(tmp_path):
+def test_dead_server_proc_fails_fast_and_dumps_log(tmp_path, dead_url: str):
     log = _server_log(tmp_path, "loading weights...\nlast server words\n")
     proc = subprocess.Popen(["true"])
     proc.wait()
     with pytest.raises(RuntimeError) as e:
-        wait_for_endpoint_ready(DEAD_URL, timeout=30, check_files=[log], server_proc=proc)
+        wait_for_endpoint_ready(dead_url, timeout=30, check_files=[log], server_proc=proc)
     msg = str(e.value)
     assert "exited unexpectedly with code" in msg
     # The server-side story must land in the failure message (CI log).
     assert "last server words" in msg
 
 
-def test_error_keyword_in_server_log_fails_fast(tmp_path):
+def test_error_keyword_in_server_log_fails_fast(tmp_path, dead_url: str):
     log = _server_log(tmp_path, "starting\nRuntimeError: engine exploded\n")
     with pytest.raises(RuntimeError) as e:
-        wait_for_endpoint_ready(DEAD_URL, timeout=30, check_files=[log], check_interval=0.0)
+        wait_for_endpoint_ready(dead_url, timeout=30, check_files=[log], check_interval=0.0)
     msg = str(e.value)
     assert "Found error in server file" in msg
     assert "engine exploded" in msg
 
 
-def test_ready_timeout_dumps_log_tail(tmp_path):
+def test_ready_timeout_dumps_log_tail(tmp_path, dead_url: str):
     log = _server_log(tmp_path, "clean init so far, no error keywords\n")
     with pytest.raises(RuntimeError) as e:
         # check_interval > timeout so the error-scan never trips; we want the
         # timeout path itself.
-        wait_for_endpoint_ready(DEAD_URL, timeout=2, check_files=[log], check_interval=60.0)
+        wait_for_endpoint_ready(dead_url, timeout=2, check_files=[log], check_interval=60.0)
     msg = str(e.value)
     assert "did not become ready within" in msg
     assert "clean init so far" in msg
 
 
-def test_missing_check_file_does_not_crash_the_wait(tmp_path):
+@pytest.mark.parametrize(
+    ("timeout", "minimum_polls"),
+    [(0.02, 1), (2.5, 2)],
+    ids=["short-budget", "multiple-polls"],
+)
+def test_endpoint_down_wait_retries_a_read_timeout(
+    monkeypatch: pytest.MonkeyPatch, timeout: float, minimum_polls: int
+) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def monotonic() -> float:
+        return clock.now
+
+    def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    def get(url: str, timeout: float) -> SimpleNamespace:
+        calls.append(timeout)
+        raise requests.ReadTimeout("server is still responding")
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr(
+        "test_common.http_utils.time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
+    )
+    with pytest.raises(RuntimeError, match="did not become down"):
+        wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=timeout)
+
+    assert len(calls) >= minimum_polls
+    assert clock.now >= timeout
+    assert all(0 < poll_timeout <= timeout for poll_timeout in calls)
+
+
+def test_endpoint_down_wait_makes_one_request_per_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+
+    def monotonic() -> float:
+        return clock.now
+
+    def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    def get(url: str, timeout: float) -> SimpleNamespace:
+        calls.append(timeout)
+        if len(calls) == 1:
+            return SimpleNamespace(status_code=503)
+        raise requests.ConnectionError(OSError(errno.ECONNREFUSED, "Connection refused"))
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr(
+        "test_common.http_utils.time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
+    )
+    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2)
+
+    assert len(calls) == 2
+    assert all(0 < timeout <= 2 for timeout in calls)
+
+
+def test_endpoint_down_wait_retries_a_reset_before_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    clock = SimpleNamespace(now=0.0)
+    errors = [
+        requests.ConnectionError(OSError(errno.ECONNRESET, "Connection reset")),
+        requests.ConnectionError(OSError(errno.ECONNREFUSED, "Connection refused")),
+    ]
+
+    def monotonic() -> float:
+        return clock.now
+
+    def sleep(seconds: float) -> None:
+        clock.now += seconds
+
+    def get(url: str, timeout: float) -> SimpleNamespace:
+        calls.append(timeout)
+        raise errors.pop(0)
+
+    monkeypatch.setattr("test_common.http_utils.requests.get", get)
+    monkeypatch.setattr(
+        "test_common.http_utils.time",
+        SimpleNamespace(monotonic=monotonic, sleep=sleep),
+    )
+    wait_for_endpoint_down("http://127.0.0.1:8000/health", timeout=2)
+
+    assert len(calls) == 2
+    assert all(0 < timeout <= 2 for timeout in calls)
+
+
+def test_endpoint_down_wait_recognizes_real_connection_refused(dead_url: str) -> None:
+    wait_for_endpoint_down(dead_url, timeout=2)
+
+
+def test_missing_check_file_does_not_crash_the_wait(tmp_path, dead_url: str):
     missing = str(tmp_path / "not-written-yet.log")
     with pytest.raises(RuntimeError) as e:
-        wait_for_endpoint_ready(DEAD_URL, timeout=2, check_files=[missing], check_interval=0.0)
+        wait_for_endpoint_ready(dead_url, timeout=2, check_files=[missing], check_interval=0.0)
     # Reaches the timeout path (not a FileNotFoundError) and reports the
     # missing log in the dump.
     msg = str(e.value)
@@ -182,12 +293,14 @@ def test_pip_download_retry_does_not_fail_the_server_log_scan(tmp_path: Path, re
     [PIP_READ_TIMEOUT_RETRY, PIP_CONNECT_TIMEOUT_RETRY],
     ids=["read-timeout", "connect-timeout"],
 )
-def test_pip_download_retry_does_not_fail_the_readiness_wait(tmp_path: Path, retry: str) -> None:
+def test_pip_download_retry_does_not_fail_the_readiness_wait(
+    tmp_path: Path, retry: str, dead_url: str
+) -> None:
     log = _server_log(tmp_path, retry)
     with pytest.raises(RuntimeError) as exc_info:
         # The log is scanned on every poll, so a retry warning taken for an
         # error would end the wait early instead of at its timeout.
-        wait_for_endpoint_ready(DEAD_URL, timeout=2, check_files=[log], check_interval=0.0)
+        wait_for_endpoint_ready(dead_url, timeout=2, check_files=[log], check_interval=0.0)
     msg = str(exc_info.value)
     assert "did not become ready within" in msg
     assert "Found error in server file" not in msg
