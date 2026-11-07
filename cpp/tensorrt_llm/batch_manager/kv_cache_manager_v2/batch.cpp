@@ -25,6 +25,7 @@
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/math.h"
 
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -418,6 +419,9 @@ void Batch::setCudaStream(CUstream stream)
 
 Batch::~Batch()
 {
+    // As in ~KvCacheManager: the last reference may be dropped on a thread with no CUDA context,
+    // and the drain below waits on the driver.
+    CudaContextScope const context(mManager->cudaContext());
     // Both buffers are about to go, and transfers on the upload stream still name them.
     _drain();
     KVCM2_POISON_ON_EXCEPT(

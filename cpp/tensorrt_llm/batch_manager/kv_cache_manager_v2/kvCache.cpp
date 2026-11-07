@@ -24,6 +24,7 @@
 #include "kv_cache_manager_v2/kvCacheManager.h"
 #include "kv_cache_manager_v2/sparseCacheKernels.h"
 #include "kv_cache_manager_v2/storageManager.h"
+#include "kv_cache_manager_v2/utils/cudaContextScope.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/math.h"
 #include "kv_cache_manager_v2/utils/optionalGilRelease.h"
@@ -153,6 +154,11 @@ KvCache::~KvCache()
             {
                 mBatch->_detach(*this);
             }
+            // As in ~KvCacheManager: the last reference may be dropped on a thread with no CUDA
+            // context, and close() records the finish event that fences the page release. With
+            // no context to push (driver or context already gone) close() fails and poisons as
+            // before: skipping it would leave the manager's registry pointing at a freed cache.
+            CudaContextScope const context(mManager->cudaContext());
             close();
         });
 }
@@ -2669,6 +2675,8 @@ PlannedDropHandle::~PlannedDropHandle()
                 // GIL, but this path runs from tp_dealloc/GC with the GIL held, so release it
                 // here too.
                 OptionalGilRelease const gilRelease;
+                // As in ~KvCache: drop() releases pages, which records events.
+                CudaContextScope const context(mManager->cudaContext());
                 drop();
             });
     }
