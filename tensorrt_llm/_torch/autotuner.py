@@ -322,8 +322,10 @@ def autotune(tune_mode: bool = True,
     # record the old tuning mode
     old_mode = autotuner.is_tuning_mode
     old_skip = autotuner.skip_dynamic_tuning_buckets
+    old_tuned_excluded_ops = autotuner._tuned_excluded_ops
     autotuner.is_tuning_mode = tune_required
     autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
+    autotuner._tuned_excluded_ops = set()
     # Avoid making compiled AllReduce paths initialize or inspect AutoTuner.
     from tensorrt_llm._torch.distributed.ops import \
         set_allreduce_autotuner_tuning_mode
@@ -343,6 +345,7 @@ def autotune(tune_mode: bool = True,
     finally:
         autotuner.is_tuning_mode = old_mode
         autotuner.skip_dynamic_tuning_buckets = old_skip
+        autotuner._tuned_excluded_ops = old_tuned_excluded_ops
         set_allreduce_autotuner_tuning_mode(old_mode)
         if autotune_enabled:
             torch.ops.trtllm.set_fine_grained_sync_disabled_override(False)
@@ -957,6 +960,10 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self._primed_cached_tactics: set[tuple[str, str, str, str]] = set()
+        # exclude_from_cache ops whose profiles all have cache entries in the
+        # current autotune() context, keyed by op, runners, input shapes and
+        # profile settings.
+        self._tuned_excluded_ops: set[tuple] = set()
         self.is_tuning_mode = False
         self.skip_dynamic_tuning_buckets = False
 
@@ -1170,10 +1177,20 @@ class AutoTuner:
         # — in tuning mode — force the full profile path so the JIT
         # warmup actually runs even if a stale on-disk entry was loaded.
         # In inference mode we still consult the in-process cache, which
-        # was populated by this process's own warmup.
+        # was populated by this process's own warmup. Once this process has
+        # profiled every profile of the op for these shapes and profile
+        # settings in the current autotune() context, later calls use the
+        # in-process cache like any other op.
+        excluded_key = None
         if tuning_config.exclude_from_cache:
             self.profiling_cache.add_excluded_op(custom_op)
-        if tuning_config.exclude_from_cache and self.is_tuning_mode:
+            excluded_key = (custom_op,
+                            tuple(str(r.unique_id()) for r in runners),
+                            input_shapes, tuning_config.dynamic_tensor_specs,
+                            tuning_config.constraint_specs,
+                            tuning_config.tune_max_num_tokens)
+        if (excluded_key is not None and self.is_tuning_mode
+                and excluded_key not in self._tuned_excluded_ops):
             is_cache_hit = False
             best_runner_id, best_tactic, min_time = (
                 self.profiling_cache.fallback_entry())
@@ -1237,7 +1254,6 @@ class AutoTuner:
                 tuning_config.distributed_tuning_strategy):
             with self._shared_profile_graph_pool():
                 for p in profiles:
-                    tensors = self._prepare_input_tensors(p, inputs)
                     is_cache_hit, *_ = self.profiling_cache.search_cache(
                         custom_op,
                         runners,
@@ -1246,6 +1262,7 @@ class AutoTuner:
                         apply_map_to_tuning_buckets=False,
                     )
                     if not is_cache_hit:
+                        tensors = self._prepare_input_tensors(p, inputs)
                         # Initialize runner and tactic as None in case of no valid tactic or runners are found
                         with nvtx_range(
                                 f"{custom_op}, shape {p.get_opt_shapes()}"):
@@ -1256,6 +1273,15 @@ class AutoTuner:
 
         self._maybe_sync_cache_data(tuning_config.distributed_tuning_strategy,
                                     custom_op)
+        if excluded_key is not None and all(
+                self.profiling_cache.search_cache(
+                    custom_op,
+                    runners,
+                    p.get_opt_shapes(),
+                    tuning_config,
+                    apply_map_to_tuning_buckets=False,
+                )[0] for p in profiles):
+            self._tuned_excluded_ops.add(excluded_key)
         self._prime_cached_tactics(custom_op, runners, tuning_config, inputs,
                                    **kwargs)
 
