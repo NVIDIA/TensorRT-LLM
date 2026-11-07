@@ -2624,26 +2624,15 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     'gitlabCommit',
                     'TRTLLM_PERF_SANITY_CHECKPOINT_IO_POLICY'
                 ]
-                def envVarsToExport = [:]
-                envVarNames.each { varName ->
-                    envVarsToExport[varName] = env."${varName}"
-                }
-
-                // Slurm forwards only the last value of a repeated SPANK option.
-                // Keep BASH_ENV and the other overrides in one --container-env list.
-                def containerEnvNames = ['NVIDIA_IMEX_CHANNELS', 'BASH_ENV', 'SKIP_INSTALL']
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
-                    containerEnvNames.add('S3_SECRET_KEY')
-                }
-                containerEnvNames.add('GITHUB_CLONE_TOKEN')
-                containerEnvNames.addAll(envVarsToExport.keySet())
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
-                    "--container-env=${containerEnvNames.join(',')}"
+                    // Other CI variables inherit the exported job environment.
+                    // BASH_ENV must override the CI image's /etc/bash.bashrc default.
+                    "--container-env=BASH_ENV"
                 ]
 
                 def exemptionComment = ""
@@ -2656,8 +2645,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     echo "[INFRA-RETRY] ${stageName}: requesting SLURM retry placement exclusion: ${slurmExcludeArg}"
                 }
 
-                def envExportStatements = envVarsToExport.collect { varName, varValue ->
-                    def escapedValue = varValue?.toString() ?: ''
+                def envExportStatements = envVarNames.collect { varName ->
+                    def escapedValue = env."${varName}"?.toString() ?: ''
                     escapedValue = escapedValue
                         .replace('\\', '\\\\')    // Backslash
                         .replace('"', '\\"')      // Double quote
