@@ -32,6 +32,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
     MambaHybridCacheManagerV2,
 )
+from tensorrt_llm._utils import async_tensor_h2d
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import BufferConfig, DataRole
@@ -668,11 +669,7 @@ class KDAReplayState:
                 )
                 for slot in host_slots
             ]
-            self.rand_seed[slots] = torch.tensor(
-                seeds,
-                dtype=torch.int64,
-                device=self.rand_seed.device,
-            )
+            self.rand_seed[slots] = async_tensor_h2d(seeds, torch.int64, self.rand_seed.device)
 
     def relocate_slots(self, old_slots: list[int], new_slots: list[int]) -> None:
         if self.prev_num_accepted_tokens is None:
@@ -1172,20 +1169,20 @@ class KimiK3HybridCacheManager(MambaHybridCacheManagerV2):
         if not active_requests:
             return
         device = replay.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(
+        state_indices = async_tensor_h2d(
             [state_index_map[request.py_request_id] for request in active_requests],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
-        accepted_drafts = torch.tensor(
+        accepted_drafts = async_tensor_h2d(
             [request.py_num_accepted_draft_tokens for request in active_requests],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
-        is_dummy_request = torch.tensor(
+        is_dummy_request = async_tensor_h2d(
             [dummy_map.get(request.py_request_id, False) for request in active_requests],
-            dtype=torch.bool,
-            device=device,
+            torch.bool,
+            device,
         )
         replay.record_acceptance(state_indices, accepted_drafts, is_dummy_request)
 
