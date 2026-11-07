@@ -515,22 +515,28 @@ def _published_manifest(manifest: PoolManifest, paths: Sequence[str]) -> Iterato
     that outlives its master sends the next run's workers to a dead port.
     """
     record = json.dumps(manifest.to_json(), indent=2, sort_keys=True)
-    for path in paths:
-        directory = os.path.dirname(path)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
-        # Renamed into place so a reader never sees a partial manifest.
-        staging = f"{path}.partial"
-        with open(staging, "w") as handle:
-            handle.write(f"{record}\n")
-        os.replace(staging, path)
-        logger.warning(
-            f"mooncake-store: published the pool manifest to {path}: {manifest.describe()}"
-        )
+    published: list[str] = []
     try:
+        for path in paths:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            # Renamed into place so a reader never sees a partial manifest.
+            staging = f"{path}.partial"
+            try:
+                with open(staging, "w") as handle:
+                    handle.write(f"{record}\n")
+                os.replace(staging, path)
+                published.append(path)
+            finally:
+                with contextlib.suppress(OSError):
+                    os.remove(staging)
+            logger.warning(
+                f"mooncake-store: published the pool manifest to {path}: {manifest.describe()}"
+            )
         yield
     finally:
-        for path in paths:
+        for path in published:
             with contextlib.suppress(OSError):
                 os.remove(path)
                 logger.warning(f"mooncake-store: withdrew the pool manifest at {path}")
