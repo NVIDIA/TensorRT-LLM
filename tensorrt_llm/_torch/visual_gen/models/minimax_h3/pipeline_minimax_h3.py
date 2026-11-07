@@ -229,9 +229,14 @@ class MiniMaxH3Pipeline(BasePipeline):
                     "cfg_size=1, ring_size=1, attn2d_size=(1, 1), and "
                     "tp_size * ulysses_size=world_size."
                 )
-            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in ("VANILLA", "FA4"):
+            if vgm.ulysses_size > 1 and pipeline_config.attention.backend not in (
+                "VANILLA",
+                "FA4",
+                "TRTLLM",
+                "FLASHINFER",
+            ):
                 raise NotImplementedError(
-                    "MiniMax-H3 Ulysses requires VANILLA or FA4 attention. "
+                    "MiniMax-H3 Ulysses requires VANILLA, FA4, TRTLLM, or FLASHINFER attention. "
                     "Other attention backends do not support the required "
                     "packed-row padding mask."
                 )
