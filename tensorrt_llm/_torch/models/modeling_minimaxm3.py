@@ -76,13 +76,7 @@ from ..moe.fused_moe import MiniMaxM3MoeRoutingMethod, SwigluBiasActivation, cre
 from ..peft.lora.ownership import DecoderLoraOwner
 from ..pyexecutor.breakable_cuda_graph import eager_on_graph, is_in_breakable_cuda_graph
 from ..speculative import SpecMetadata
-from ..utils import (
-    AuxStreamType,
-    EventType,
-    get_model_extra_attrs,
-    is_nvfp4_marlin_supported_sm,
-    is_torch_compiling,
-)
+from ..utils import AuxStreamType, EventType, get_model_extra_attrs, is_torch_compiling
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .checkpoints.hf.minimaxm3_weight_mapper import MINIMAX_M3_PARAMS_MAP, MiniMaxM3HfWeightMapper
 from .checkpoints.hf.weight_mapper import convert_compressed_tensors_nvfp4_weights
@@ -2966,17 +2960,19 @@ class MiniMaxM3ForCausalLM(SpecDecOneEngineForCausalLM[MiniMaxM3Model, Pretraine
 
     @classmethod
     def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
-        """Run NVFP4 routed experts through Marlin on Ada/Hopper."""
+        """Run the NVFP4 routed experts through Marlin on Hopper.
+
+        Applies when the checkpoint reports MIXED_PRECISION (NVFP4 experts,
+        MXFP8 elsewhere) or MXFP8: the compressed-tensors packaging reports
+        MXFP8 here and gets its NVFP4 experts later, from
+        ``ModelConfig._build_minimax_m3_mxfp8_moe_quant_config``. CUTLASS W4A4
+        needs Blackwell, so Hopper runs these experts as W4A16 on Marlin.
+        """
         defaults = super().get_model_defaults(llm_args)
-        quant_config = getattr(llm_args, "quant_config", None)
-        # MXFP8 included: the compressed-tensors packaging declares its NVFP4
-        # experts beside quant_method mxfp8 and is expanded after this point.
-        if getattr(quant_config, "quant_algo", None) in (
-            QuantAlgo.NVFP4,
-            QuantAlgo.MXFP8,
-            QuantAlgo.MIXED_PRECISION,
-        ) and is_nvfp4_marlin_supported_sm(get_sm_version()):
-            # CUTLASS W4A4 requires Blackwell; use Marlin's W4A16 path instead.
+        if (
+            llm_args.quant_config.quant_algo in (QuantAlgo.MXFP8, QuantAlgo.MIXED_PRECISION)
+            and get_sm_version() == 90
+        ):
             defaults["moe_config"] = {"backend": "MARLIN"}
         return defaults
 
