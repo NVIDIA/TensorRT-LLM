@@ -1415,11 +1415,13 @@ def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPat
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("sequence_length", [1, 7, 8, 9, 16])
-@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("inference_mode", [False, True])
 def test_ulysses_refiner_masks_padding_and_restores_sequence(
     world_size: int,
     sequence_length: int,
     backend: str,
+    inference_mode: bool,
 ) -> None:
     hidden = torch.arange(2 * sequence_length * 4, dtype=torch.float32).reshape(
         2, sequence_length, 4
@@ -1453,6 +1455,8 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
                     assert key_padding_mask is None
                 else:
                     torch.testing.assert_close(key_padding_mask, expected_mask)
+                    assert not key_padding_mask.is_inference()
+                    assert key_padding_mask._version >= 0
                 return tensor + 1
 
         refiner = h3.MiniMaxH3TokenRefiner.__new__(h3.MiniMaxH3TokenRefiner)
@@ -1462,17 +1466,20 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
         refiner.sharder = RankSharder()
         refiner.refiner_blocks = nn.ModuleList([MaskedBlock()])
         refiner.final_norm = nn.Identity()
-        torch.testing.assert_close(refiner(hidden), hidden + 1)
+        with torch.inference_mode(inference_mode):
+            torch.testing.assert_close(refiner(hidden), hidden + 1)
 
 
 @requires_cuda
 @pytest.mark.parametrize("world_size", [2, 4, 8])
 @pytest.mark.parametrize("existing_padding", [False, True])
-@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM"])
+@pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FLASHINFER"])
+@pytest.mark.parametrize("inference_mode", [False, True])
 def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
     world_size: int,
     existing_padding: bool,
     backend: str,
+    inference_mode: bool,
 ) -> None:
     """Exercise each rank's H3 forward; emulate only the collective transport."""
     model = h3.MiniMaxH3Transformer3DModel(_make_model_config()).to("cuda")
@@ -1545,6 +1552,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
                     assert key_padding_mask is None
                 elif pad or existing_padding:
                     torch.testing.assert_close(key_padding_mask, full_mask)
+                    assert not key_padding_mask.is_inference()
+                    assert key_padding_mask._version >= 0
                 else:
                     assert key_padding_mask is None
                 return hidden_states
@@ -1556,7 +1565,8 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
         model.sharder = RankSharder()
         model.transformer_blocks = nn.ModuleList([CaptureBlock()])
         handle = model.norm_out.register_forward_pre_hook(check_norm_indices)
-        actual = model(**inputs)
+        with torch.inference_mode(inference_mode):
+            actual = model(**inputs)
         handle.remove()
         torch.testing.assert_close(actual.sample, expected.sample, rtol=0, atol=0)
         torch.testing.assert_close(actual.audio_sample, expected.audio_sample, rtol=0, atol=0)

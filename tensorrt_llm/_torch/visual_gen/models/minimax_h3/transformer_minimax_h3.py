@@ -531,8 +531,12 @@ class MiniMaxH3TokenRefiner(nn.Module):
                     "use VANILLA, FA4, TRTLLM or FLASHINFER."
                 )
             if self._attn_backend != "TRTLLM":
-                valid = hidden_states.new_ones((hidden_states.shape[0], seq_len), dtype=torch.bool)
-                key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
+                # Attention caches use the mask version to detect changes.
+                with torch.inference_mode(False):
+                    valid = hidden_states.new_ones(
+                        (hidden_states.shape[0], seq_len), dtype=torch.bool
+                    )
+                    key_padding_mask = _pad_tensor_dim(valid, 1, pad, False)
             hidden_states = _pad_tensor_dim(hidden_states, 1, pad)
         hidden_states = self.sharder.shard(hidden_states, dim=1)
         for block in self.refiner_blocks:
@@ -1051,11 +1055,13 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
                     f"{self._attn_backend} requires trailing packed-row padding; use VANILLA for interior padding."
                 )
             if self._attn_backend != "TRTLLM":
-                key_padding_mask = (
-                    (token_tags_for_mask >= 0)
-                    .unsqueeze(0)
-                    .expand(packed_hidden_states.shape[0], -1)
-                )
+                # Attention caches use the mask version to detect changes.
+                with torch.inference_mode(False):
+                    key_padding_mask = (
+                        (token_tags_for_mask >= 0)
+                        .unsqueeze(0)
+                        .expand(packed_hidden_states.shape[0], -1)
+                    )
 
         padded_sequence_length = packed_hidden_states.shape[1]
         packed_hidden_states = self.sharder.shard(packed_hidden_states, dim=1)
