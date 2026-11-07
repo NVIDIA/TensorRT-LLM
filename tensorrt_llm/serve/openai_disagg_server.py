@@ -21,8 +21,8 @@ import signal
 import socket
 import traceback
 import uuid
-from contextlib import asynccontextmanager
-from typing import Callable, Optional
+from contextlib import aclosing, asynccontextmanager
+from typing import AsyncGenerator, Callable, Optional
 
 import aiohttp
 import uvicorn
@@ -420,11 +420,16 @@ class OpenAIDisaggServer:
                 conversation_id=f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
-    def _wrap_entry_point(self, entry_point: Callable, request_type: type = UCompletionRequest) -> Callable:
+    def _wrap_entry_point(self,
+                          entry_point: Callable,
+                          request_type: type = UCompletionRequest,
+                          hold_headers_until_first_chunk: bool = True) -> Callable:
         # Bind the concrete request model per route so FastAPI validates against it.
         # The bare Union UCompletionRequest (no discriminator) makes Pydantic try
         # CompletionRequest first and 400 every chat body, so override the wrapper's
         # annotation with request_type (as openai_server.py does).
+        # hold_headers_until_first_chunk=False returns a stream at once, for a
+        # caller that keeps it alive until the first chunk (/v1/messages pings).
         @tracing.trace_span("disaggregated_request")
         async def wrapper(req: request_type, raw_req: Request) -> Response:
             try:
@@ -445,17 +450,24 @@ class OpenAIDisaggServer:
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
                 response_or_generator = await entry_point(req, hooks)
-                self._perf_metrics_collector.total_responses.inc()
                 if req.stream:
                     stream = response_or_generator
                     if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails early ends with
-                        # an `error` event; other protocols end on a sentinel.
+                        # A relayed Responses stream that fails ends with an
+                        # `error` event, even before its first frame.
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
+                    # Hold the headers until the first chunk: a chat or
+                    # completion stream that fails before it (e.g. a generation
+                    # server's KV-cache transfer error) becomes an HTTP error,
+                    # not a 200 whose body is cut off.
+                    if hold_headers_until_first_chunk:
+                        stream = await self._start_stream(stream, raw_req)
+                    self._perf_metrics_collector.total_responses.inc()
                     return StreamingResponse(
                         content=stream,
                         media_type="text/event-stream")
+                self._perf_metrics_collector.total_responses.inc()
                 # by_alias: e.g. text.format.schema goes out under its wire name.
                 return JSONResponse(
                     content=response_or_generator.model_dump(by_alias=True))
@@ -464,6 +476,71 @@ class OpenAIDisaggServer:
                 # carry a machine-readable code (context_length_exceeded).
                 return self._handle_exception(e)
         return wrapper
+
+    @staticmethod
+    async def _start_stream(
+            stream: AsyncGenerator[str | bytes, None],
+            raw_request: Request) -> AsyncGenerator[str | bytes, None]:
+        """Pull a relayed stream's first chunk before the response headers go out.
+
+        A worker that fails before its first chunk then raises here and becomes an
+        HTTP error response instead of a 200 whose body is cut off. The returned
+        relay is already started, so closing it before its first chunk still closes
+        ``stream`` and releases the request's routing state.
+
+        Args:
+            stream: The relayed response stream from the disaggregated service.
+            raw_request: The client request whose disconnect cancels the wait.
+
+        Returns:
+            ``stream`` itself when it is already exhausted; otherwise a started
+            relay that yields the first chunk and then the rest of ``stream``.
+        """
+        async def wait_for_disconnect() -> None:
+            while True:
+                message = await raw_request.receive()
+                if message["type"] == "http.disconnect":
+                    return
+
+        first_chunk_task = asyncio.ensure_future(anext(stream))
+        disconnect_task = asyncio.create_task(wait_for_disconnect())
+        handed_off = False
+        try:
+            done, _ = await asyncio.wait(
+                (first_chunk_task, disconnect_task),
+                return_when=asyncio.FIRST_COMPLETED)
+            if disconnect_task in done:
+                disconnect_task.result()
+                raise asyncio.CancelledError
+            try:
+                first_chunk = first_chunk_task.result()
+            except StopAsyncIteration:
+                return stream
+
+            disconnect_task.cancel()
+            await asyncio.gather(disconnect_task, return_exceptions=True)
+
+            async def relay() -> AsyncGenerator[str | bytes, None]:
+                async with aclosing(stream):
+                    yield b""  # Consumed below to enter the cleanup scope.
+                    yield first_chunk
+                    async for chunk in stream:
+                        yield chunk
+
+            relayed = relay()
+            await anext(relayed)
+            handed_off = True
+            return relayed
+        finally:
+            if not handed_off:
+                for task in (first_chunk_task, disconnect_task):
+                    if not task.done():
+                        task.cancel()
+                # A generator cannot be closed while its first anext is running.
+                await asyncio.gather(first_chunk_task,
+                                     disconnect_task,
+                                     return_exceptions=True)
+                await stream.aclose()
 
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
@@ -475,8 +552,12 @@ class OpenAIDisaggServer:
                                             400)
 
         try:
+            # The reframed stream pings until the first chunk, so its headers go
+            # out at once; a failure before that chunk ends in an error event.
             openai_response = await self._wrap_entry_point(
-                self._service.openai_chat_completion)(chat_request, raw_request)
+                self._service.openai_chat_completion,
+                hold_headers_until_first_chunk=False)(chat_request,
+                                                      raw_request)
         except HTTPException as e:
             error_type = ("invalid_request_error"
                           if 400 <= e.status_code < 500 else "api_error")
