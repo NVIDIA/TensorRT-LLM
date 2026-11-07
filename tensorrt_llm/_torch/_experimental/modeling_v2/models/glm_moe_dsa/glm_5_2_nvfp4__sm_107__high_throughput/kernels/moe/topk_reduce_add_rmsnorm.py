@@ -28,9 +28,9 @@ the residual and normalizes. ``TopkReduceAddRMSNormKernel`` computes, per token 
 with the rounding points of those three kernels: TopkReduce's FP32 slot-order sum (no top-k
 weights), PyTorch's BF16 add, and FlashInfer's CuTe DSL ``FusedAddRMSNormKernel`` for the norm. The
 sum of squares runs FlashInfer's ``row_reduce_sum_multirow`` over the per-thread column sets of that
-kernel (64 threads per row, 8-element vectors, the same column order per thread) and the remaining
-statements are FlashInfer's, so the outputs are bit-identical to the three-kernel sequence where
-FlashInfer runs that kernel with one CTA per row.
+kernel (64 threads per row, 8-element vectors, the same column order per thread). The normalization
+follows that kernel's one-CTA-per-row layout. Signed-zero bits can differ from the three-kernel
+sequence.
 
 One CTA owns one token row. Each thread loads whole 8-element vectors of every input, so the K
 plane rows of a vector are in flight together. ``h`` goes through shared memory to the 64 threads

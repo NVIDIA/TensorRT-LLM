@@ -182,7 +182,8 @@ class RubinMTPEagleWorker(MTPEagleWorker):
                     metadata.on_update()
                     metadata.num_contexts = 0
                     self._prepare_flash_mla_generation_layout(metadata, 0, batch_size)
-                # Preserve main's DSA metadata rebuild and current cache interfaces.
+                # Refresh attention metadata after every draft token so cache mappings
+                # and lengths match the next step, including when TopK is reused.
                 metadata.update_for_spec_dec()
                 if step == 0:
                     metadata.use_spec_decoding = False

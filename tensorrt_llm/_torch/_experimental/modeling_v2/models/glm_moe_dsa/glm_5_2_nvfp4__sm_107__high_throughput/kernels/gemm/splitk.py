@@ -5,10 +5,8 @@
 # license.  Original file: flashinfer/gemm/kernels/dense_bf16_gemm_sm100_splitk.py
 # Original copyright: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 #
-# TODO(TRTLLM-15304): This file is a vendored copy of the FlashInfer split-K kernel.
-# Once FlashInfer releases v0.6.18 (which packages these kernels as importable Python
-# modules), remove this file and import directly from flashinfer instead.
-# Tracking: https://github.com/flashinfer-ai/flashinfer/pull/4266
+# The high-throughput GEMM dispatchers use this module's target-specific
+# launch policies and fused row-RMS epilogues.
 """SM10x (Blackwell) low-M BF16/FP16 GEMM with an in-kernel cluster split-K reduction.
 
 Each cluster rank accumulates an exact K slice in FP32. Peers publish partials

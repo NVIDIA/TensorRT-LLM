@@ -278,9 +278,8 @@ class CuteDSLPagedMQALogitsRunner:
         early_kv = early_kv and fp8_logits_early_kv_supported(
             next_n, H, num_epi_subtiles, epi_dtype, acc_dtype, output_dtype
         )
-        # On the mid-batch attention-DP decode (decode_shape.py) the kernel
-        # loads the K cache (KV and scales) evict-first, so the logits it
-        # writes stay in L2 for the top-k.
+        # The full-query decode kernel loads the K cache (KV and scales)
+        # evict-first to favor keeping its output logits in L2 for top-k.
         kv_cache_policy = _L2_EVICT_FIRST_POLICY if True else None
         key = (
             compute_block_kv,
@@ -362,7 +361,7 @@ def cute_dsl_fp8_paged_mqa_logits(
             f"CuteDSL: SM version {get_sm_version()} is not supported. "
             f"CuteDSL FP8 Paged MQA Logits only supports SM 100 family."
         )
-    # Caller (dsa.py) prepares all tensors with metadata-guaranteed
+    # The indexer prepares all tensors with metadata-guaranteed
     # dtype/shape; skip per-call validation to keep decode-hot-path
     # latency low. Log inputs once for debugging.
     logger.info_once(
