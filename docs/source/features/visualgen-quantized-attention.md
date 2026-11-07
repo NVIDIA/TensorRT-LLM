@@ -28,7 +28,7 @@ A recipe is the tuple `(qk_dtype, v_dtype, (q_block_size, k_block_size, v_block_
 |---|---|---|---|---|
 | `TRTLLM` | `int8` | `fp8` | `(2, 16, 1)` | SageAttention (INT8 QK) for Hopper |
 | `TRTLLM` | `int8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (INT8 QK) for Blackwell |
-| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (FP8 QK) for Blackwell |
+| `TRTLLM` | `fp8` | `fp8` | `(1, 1, 1)`, `(1, 4, 1)`, `(1, 16, 1)` | SageAttention (FP8 QK) for Blackwell and Rubin |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 0)` | PrimTS QK16PV8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `fp8` | `fp8` | `(0, 0, 0)` | PrimTS FP8 for Blackwell (`TLLM_FMHA_LIBS=+prims_ts`) |
 | `TRTLLM` | `bf16` | `fp8` | `(0, 0, 1)` | VC-Attention-QK16 for Blackwell, V as E4M3 tile residuals with per-channel scales (`vc_attention: true`, `TLLM_FMHA_LIBS=+prims_ts`) |
@@ -121,11 +121,13 @@ attention_config:
 
 **Requirements and behavior.**
 
-- SageAttention is supported on H100/H200/H800/H20, B200/GB200, and B300/GB300 GPUs.
+- SageAttention is supported on H100/H200/H800/H20, B200/GB200, B300/GB300, and Rubin (SM107) GPUs.
 - On H100/H200/H800/H20, only one recipe with fixed `qk_dtype: "int8"` is supported.
 - On B200/GB200, it is recommended to use the `qk_dtype: "int8"` recipes.
-- On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200.
-- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. PrimTS runs on B200/GB200 and B300/GB300 only, so H100/H200/H800/H20 reject `smooth_v`.
+- On B300/GB300, use `qk_dtype: "fp8"` and evaluate output quality because it can be less accurate than the INT8 Q/K recipe on B200/GB200. INT8 SageAttention is unsupported and raises an error.
+- On Rubin (SM107), use `qk_dtype: "fp8"`, Q/V block size 1, and K block size 1, 4, or 16. INT8 SageAttention is unsupported and raises an error.
+- Recipe validation checks the backend, GPU architecture, formats, and block sizes. Execution also requires a compatible kernel for the model's head dimension and runtime shape. Head dimension 72 is unsupported by the native SageAttention path on SM100/SM103/SM107; unsupported shapes raise an error rather than falling back to unfused attention.
+- `smooth_v` needs a kernel that adds the V mean back to the output. The PrimTS kernels behind VSA and SOL do; with `smooth_v`, dense attention calls (dense layers and timesteps, or a dense model) also run on PrimTS where their shape allows. The trtllm-gen kernels quantize V without the mean and log a warning once. VisualGen currently enables `smooth_v` on B200/GB200 and B300/GB300 only; H100/H200/H800/H20 and Rubin reject it.
 
 **Configuration.**
 
@@ -138,7 +140,7 @@ args = VisualGenArgs(
     attention_config=AttentionConfig(
         backend="TRTLLM",
         quant_attention_config=QuantAttentionConfig(
-            qk_dtype="int8",
+            qk_dtype="fp8",
             v_dtype="fp8",
             q_block_size=1,
             k_block_size=16,
@@ -152,14 +154,17 @@ args = VisualGenArgs(
 attention_config:
   backend: TRTLLM
   quant_attention_config:
-    qk_dtype: int8
+    qk_dtype: fp8
     v_dtype: fp8
     q_block_size: 1
     k_block_size: 16
     v_block_size: 1
 ```
 
-For Hopper SageAttention, set `q_block_size` to `2`.
+These examples work on B200/GB200, B300/GB300, and Rubin. On B200/GB200,
+`qk_dtype: int8` with the same block sizes is recommended. For Hopper
+SageAttention, set `qk_dtype` to `int8` and `q_block_size` to `2`, keeping
+`k_block_size: 16` and `v_block_size: 1`.
 
 ## VC-Attention in the `TRTLLM` backend
 

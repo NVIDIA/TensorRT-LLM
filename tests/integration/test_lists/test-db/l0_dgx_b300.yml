@@ -18,6 +18,7 @@ l0_dgx_b300:
       stage: post_merge
       backend: pytorch
   tests:
+  - unittest/_torch/visual_gen/multi_gpu/test_ulysses_sage_attention.py
   # Single-GPU coverage of tests/unittest/_torch/attention/ on B300 comes from l0_b300
   # (pre_merge, same GPU), with two exceptions. cpu_only cases run only on CPU (l0_cpu,
   # pre_merge). The GPU cases of kernels/parallel_hw_agnostic/, which do not depend on the

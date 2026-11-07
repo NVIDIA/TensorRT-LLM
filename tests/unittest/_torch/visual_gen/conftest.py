@@ -2,9 +2,37 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared pytest configuration for the VisualGen unit tests."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from tensorrt_llm.visual_gen.args import AttentionConfig, QuantAttentionConfig
+
+
+@pytest.fixture
+def require_sage_recipe() -> Callable[["QuantAttentionConfig"], "AttentionConfig"]:
+    """Validate Sage recipes, skipping only the unsupported INT8 hardware case."""
+    from tensorrt_llm.visual_gen.args import AttentionConfig
+
+    def validate(quant_config: "QuantAttentionConfig") -> AttentionConfig:
+        try:
+            return AttentionConfig(backend="TRTLLM", quant_attention_config=quant_config)
+        except ValidationError as exc:
+            errors = exc.errors()
+            if (
+                quant_config.qk_dtype == "int8"
+                and len(errors) == 1
+                and errors[0]["msg"].startswith(
+                    "Value error, INT8 SageAttention is unsupported on SM"
+                )
+            ):
+                pytest.skip(errors[0]["msg"])
+            raise
+
+    return validate
 
 
 @pytest.fixture(scope="module")
