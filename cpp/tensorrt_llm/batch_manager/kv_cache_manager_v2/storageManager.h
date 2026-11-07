@@ -584,11 +584,8 @@ private:
     {
         uint64_t created{0};
         uint64_t reused{0};
-        uint64_t reusedBytes{0};
         uint64_t reclaimed{0};
         uint64_t dropped{0};
-        int64_t lastPrintNs{0};
-        int statsSec{0}; // TLLM_KVCM2_DISK_KEEP_COPY_STATS_SEC; 0 = off
     };
 
     void addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
@@ -597,7 +594,6 @@ private:
     void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
     void releaseAllRetainedCopies(std::optional<CacheLevel> level);
     void eraseRetainedCopy(RetainedCopyList::iterator iter);
-    void maybePrintKeepCopyStats();
 
     bool mKeepDiskCopy{false};
     // Oldest first.
@@ -612,8 +608,6 @@ private:
     [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
     bool mDiskWriteThrough{false};
     uint64_t mWriteThroughPages{0};
-    uint64_t mWriteThroughBytes{0};
-    uint64_t mWriteThroughSkipped{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
