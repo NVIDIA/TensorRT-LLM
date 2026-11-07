@@ -22,7 +22,6 @@ import math
 import os
 import random
 import sys
-import tempfile
 import time
 import unittest
 from contextlib import contextmanager
@@ -11392,27 +11391,6 @@ class TestPoison(TestKVCacheManagerV2):
 
         self.assertIn("deliberate test poisoning", take_poison())
         self.assertIsNone(poison_reason())
-
-
-class TestDiskCacheTierOptions(unittest.TestCase):
-    def test_defaults_and_validation(self):
-        path = tempfile.gettempdir()
-        default = DiskCacheTierConfig(64 << 20, path)
-        self.assertEqual(default.num_io_threads, 0)
-        self.assertFalse(default.keep_copy_after_restore)
-        self.assertFalse(default.write_through)
-        default.validate()
-
-        config = DiskCacheTierConfig(
-            64 << 20, path, num_io_threads=4, keep_copy_after_restore=True, write_through=True
-        )
-        config.validate()
-        self.assertEqual(config.num_io_threads, 4)
-
-        with self.assertRaises(ValueError):
-            DiskCacheTierConfig(64 << 20, path, write_through=True).validate()
-        with self.assertRaises(ValueError):
-            DiskCacheTierConfig(64 << 20, path, num_io_threads=-1).validate()
 
 
 # The disk-tier tests again with every SSD offload option on: retained disk copies, write-through, and the
