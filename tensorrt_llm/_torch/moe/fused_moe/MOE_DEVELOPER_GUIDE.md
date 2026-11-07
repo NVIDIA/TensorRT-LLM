@@ -292,7 +292,7 @@ Still on old path (standalone, with embedded communication):
 
 | File | Backend | Hardware | Scenario | Scheduler |
 |------|---------|----------|----------|-----------|
-| `cutlass/` (+ the `fused_moe_cutlass.py` alias module) | the abstract `CutlassFusedMoEBase` and its twelve leaves (`CUTLASS_LEAVES`): one per quantization format, two for FP8 block scales (see [CUTLASS leaves](#cutlass-leaves-fused_moecutlass)) | SM80+ | High throughput, the widest quant support; the fallback family | `EXTERNAL_COMM` |
+| `cutlass/` (+ the `fused_moe_cutlass.py` alias module) | the abstract `CutlassFusedMoEBase` and its thirteen leaves (`CUTLASS_LEAVES`): one per quantization format, two for FP8 block scales (see [CUTLASS leaves](#cutlass-leaves-fused_moecutlass)) | SM80+ | High throughput, the widest quant support; the fallback family | `EXTERNAL_COMM` |
 | `trtllm_gen/` (+ the `fused_moe_trtllm_gen.py` alias module) | the abstract `TrtllmGenFusedMoEBase` and its leaves (see [TRTLLM-Gen leaves](#trtllm-gen-leaves-fused_moetrtllm_gen)) | SM100/SM103/SM107 | Min-latency and high-throughput on Blackwell/Rubin; also serves unquantized BF16 through FlashInfer, on a gate of its own (`§` under [Quantization Support](#quantization-support)) | `EXTERNAL_COMM` |
 | `fused_moe_deepgemm.py` | `DeepgemmCudaFp8BlockScalesImpl` (aliased as `DeepGemmFusedMoE`) | SM100/SM103/SM107 | FP8 Block Scales on Blackwell/Rubin | `EXTERNAL_COMM` |
 | `cutedsl/dense_gemm.py` (+ the `fused_moe_densegemm.py` alias module) | `TrtllmCutedslDenseGemmNvfp4Impl` (aliased as `DenseGEMMFusedMoE`) | SM100/SM103 | NVFP4 min-latency; CuTe DSL dense GEMM packs all experts into one matrix (vs Cutlass per-expert scatter), efficient for small token counts | `EXTERNAL_COMM` |
@@ -347,6 +347,7 @@ parent of every leaf) and re-exports `raise_moe_lora_multichunk_unsupported`.
 | `w4a8_mxfp4_fp8` | `TrtllmCutlassW4a8Mxfp4Fp8Impl` | `trtllm.cutlass.grouped_gemm.w4a8_mxfp4_fp8` | Static per-tensor e4m3 input |
 | `w4a16_mxfp4` | `TrtllmCutlassW4a16Mxfp4Impl` | `trtllm.cutlass.grouped_gemm.w4a16_mxfp4` | Rounds hidden and intermediate up to 128 at construction; `run_moe` pads the activation to match |
 | `w4a8_awq` | `TrtllmCutlassW4a8AwqImpl` | `trtllm.cutlass.grouped_gemm.w4a8_awq` | — |
+| `w4a16` | `TrtllmCutlassW4a16Impl` | `trtllm.cutlass.grouped_gemm.w4a16` | — |
 | `w8a16` | `TrtllmCutlassW8a16Impl` | `trtllm.cutlass.grouped_gemm.w8a16` | — |
 
 - **A leaf declares; the base derives.** A leaf states its `descriptor`, its
@@ -736,6 +737,7 @@ Each backend's `can_implement(p, d)` classmethod declares what it supports. Sour
 | W4A8 MXFP4 MXFP8 | Y (SM100/103/107/120/121) | Y (SM100/103/107) | N | N | N | Y (SM100/103/107, requires `hidden_size % 512 == 0`) | N | N | N | N |
 | W8A8 MXFP8 MXFP8 | Y (SM100/103/107) | N | N | N | N | N | N | N | N | N |
 | W4A8 AWQ | Y (SM89/90) | N | N | N | N | N | N | N | N | N |
+| W4A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | W8A16 | Y (SM80+) | N | N | N | N | N | N | N | N | N |
 | INT4 WoQ (W4AFP8) | N | N | N | N | N | N | N | N | N | N |
 
@@ -944,8 +946,8 @@ bias plus filled `alpha` / `beta` / `limit`, summarized as
 TRTLLM-Gen and CUTLASS leaves admit it per format through
 `supports_gptoss_style` (on CUTLASS: unquantized, MXFP8, NVFP4 and the three
 MXFP4 formats). The kernel takes the three constants for every format; what
-limits the set is the weight methods. W8A16 and W4A8_AWQ keep a bias shape that
-is wrong for their transposed layouts, and NVFP4 sets
+limits the set is the weight methods. W8A16, W4A16 and W4A8_AWQ keep a bias
+shape that is wrong for their transposed layouts, and NVFP4 sets
 `rejects_gptoss_expert_bias` because its weight pad assumes 2-D, so MiniMax-M3
 (no expert bias) is in and a 1-D gpt-oss bias is out. Each way of getting the
 set wrong has a test that catches it:
