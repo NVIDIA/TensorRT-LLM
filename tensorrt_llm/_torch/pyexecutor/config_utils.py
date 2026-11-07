@@ -859,6 +859,19 @@ def match_nemotron_h_layer_types(model_config, layer_types):
 
 MINIMAX_DSPARK_DRAFT_ARCH = "DSparkMiniMaxDraftModel"
 
+
+def is_mla_dspark_drafter(config) -> bool:
+    """Whether a standalone DSpark drafter config selects the MLA block decode.
+
+    The MiniMax drafter is dispatched by architecture before the attention
+    shape is inspected, so its config never counts as MLA here.
+    """
+    architectures = getattr(config, "architectures", None) or []
+    if architectures and architectures[0] == MINIMAX_DSPARK_DRAFT_ARCH:
+        return False
+    return is_mla(config)
+
+
 # Keys of the standalone MiniMax DSpark drafter config.json that describe the
 # target checkpoint it was exported next to, not the drafter itself. The
 # drafter's MXFP8 linears are dequantized to the compute dtype at load, so the

@@ -229,6 +229,9 @@ def _reserve(req, *, local_end, offered_end, tail, tokens_per_block=4):
     mgr.tokens_per_block = tokens_per_block
     mgr._spec_recompute_tail = tail
     mgr.is_draft = False
+    mgr.context_reuse_claim_limit.side_effect = (
+        lambda r: KVCacheManagerV2.context_reuse_claim_limit(mgr, r)
+    )
     KVCacheManagerV2._prepare_connector_prefix_reservation(mgr, req)
     return connector
 

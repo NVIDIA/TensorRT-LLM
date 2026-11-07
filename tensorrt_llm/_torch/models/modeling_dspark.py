@@ -108,7 +108,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.mhc.hyper_connection import HCHead
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla
+from ..pyexecutor.config_utils import MINIMAX_DSPARK_DRAFT_ARCH, is_mla_dspark_drafter
 from ..speculative.interface import SpeculativeDecodingMode
 from ..speculative.spec_tail_kernels import DraftBlockPlacement
 from ..speculative.vocab_parallel import markov_chain_logits
@@ -3959,7 +3959,7 @@ def _build_dspark_draft(model_config, draft_config, lm_head, model):
     draft_arches = getattr(draft_config.pretrained_config, "architectures", None) or []
     if draft_arches and draft_arches[0] == MINIMAX_DSPARK_DRAFT_ARCH:
         drafter_cls = MiniMaxDSparkForCausalLM
-    elif is_mla(draft_config.pretrained_config):
+    elif is_mla_dspark_drafter(draft_config.pretrained_config):
         return MLADSparkForCausalLM(
             draft_config,
             dflash_attention_backend=model_config.spec_config.attention_backend,

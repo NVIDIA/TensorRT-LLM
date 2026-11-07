@@ -1340,6 +1340,102 @@ class DSparkWorker(DFlashWorker):
             local_block, inputs["first_prev_tokens"], draft_model.markov_w1, draft_model.markov_w2
         )
 
+    def _sample_block_draft_tokens(
+        self,
+        draft_model: torch.nn.Module,
+        gen_logits: torch.Tensor,
+        gen_hidden_states: torch.Tensor,
+        inputs: dict,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Draw sampled drafts ancestrally through the Markov head; argmax drafts keep the chain.
+
+        Position k is drawn by the seeded draft sampler from
+        ``base_k + bias(d_{k-1})`` under the request's draft sampling
+        parameters (:meth:`_draft_sampling_params`), ``d_{k-1}`` being the
+        token drawn before it (the anchor for k = 0), and that distribution is
+        stored as the position's proposal in ``draft_probs``. ``gen_logits`` are the
+        raw ``[num_gens, K, vocab]`` block logits. Returns the ``[num_gens, K]``
+        int32 draft tokens and the stored vocab width. Without a Markov head, or
+        for argmax drafts, the DFlash path (greedy-chained
+        :meth:`_refine_block_logits`, then the block sampler) applies.
+        """
+        if not (
+            getattr(draft_model, "has_markov_head", False)
+            and spec_metadata.wants_advanced_draft_sampling
+        ):
+            return super()._sample_block_draft_tokens(
+                draft_model,
+                gen_logits,
+                gen_hidden_states,
+                inputs,
+                spec_metadata,
+                num_contexts,
+                batch_size,
+            )
+        from ..models.modeling_speculative import markov_prev_embeddings
+
+        num_gens, num_drafts, _ = gen_logits.shape
+        # The chain indexes the full Markov table, and verification reads
+        # full-vocab proposals.
+        gen_logits = self.maybe_gather_sharded_draft_logits(gen_logits, spec_metadata)
+        vocab = gen_logits.shape[-1]
+        # CUDA-graph padding requests decode from uninitialized state; zero their
+        # rows, as advanced_sample_draft_block does, so every draw is legal.
+        gen_logits = self._zero_padding_rows(
+            gen_logits.reshape(num_gens * num_drafts, vocab),
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            num_drafts,
+        ).reshape(num_gens, num_drafts, vocab)
+        sampling_params = self._draft_sampling_params(spec_metadata, num_contexts, batch_size)
+        draft_probs = spec_metadata.draft_probs
+        slots = (
+            None if draft_probs is None else spec_metadata.batch_slot_ids[num_contexts:batch_size]
+        )
+
+        markov_w1, markov_w2 = draft_model.markov_w1, draft_model.markov_w2
+        # The K positions draw from consecutive RNG slots: one state per
+        # position, laid out [K, num_gens], instead of one launch per step.
+        seed = spec_metadata.request_seeds[num_contexts:batch_size]
+        offsets = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            repeat=num_drafts,
+            slot=spec_metadata.rng_draft_slot(0),
+        )[1]
+        offsets = offsets.view(num_gens, num_drafts).t().contiguous()
+        # Only the anchor can be out of vocab (-1 for a row with no accepted
+        # token); every token drawn below is a valid row of the table.
+        emb = markov_prev_embeddings(inputs["first_prev_tokens"], markov_w1)
+        drawn = []
+        for step in range(num_drafts):
+            # The add promotes the Markov head's (bf16) bias to the float32
+            # logits itself; the trailing cast only acts on a head wider than
+            # the logits, so no separate cast kernel runs otherwise.
+            step_logits = (gen_logits[:, step] + torch.nn.functional.linear(emb, markov_w2)).to(
+                gen_logits.dtype
+            )
+            tokens, probs = self._sample_from_logits_with_probs(
+                spec_metadata.advanced_sampling_mode,
+                step_logits,
+                *sampling_params,
+                seed=seed,
+                offset=offsets[step],
+            )
+            if slots is not None:
+                draft_probs[slots, step, :vocab] = probs
+            drawn.append(tokens)
+            if step + 1 < num_drafts:
+                emb = torch.nn.functional.embedding(tokens, markov_w1)
+        if draft_probs is not None:
+            spec_metadata.draft_probs_last_dim = vocab
+        return torch.stack(drawn, dim=1).to(torch.int32), vocab
+
     def _refine_block_logits(
         self,
         draft_model,
@@ -1370,8 +1466,7 @@ class DSparkWorker(DFlashWorker):
         logits, where prev_0 is the anchor (last accepted) token and prev_{i>0}
         is the greedy token from step i-1's biased logits. Greedy per-position
         argmax of the returned logits therefore reproduces the reference
-        sampled chain; the rejection-sampling path samples from the same
-        biased distributions (proposal conditioned on the greedy chain).
+        chain.
 
         A TP vocab-sharded draft lm_head yields this rank's vocab shard of the
         logits; the chain then takes each step's global argmax over the TP

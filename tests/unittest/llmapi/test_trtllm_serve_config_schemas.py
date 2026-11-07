@@ -298,6 +298,28 @@ def test_branch_snapshot_field_types(
 
 
 @pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
+@pytest.mark.parametrize(
+    ("value", "valid"),
+    [(None, True), (0, True), (-1, True), (4096, True), ("4096", False), (1.5, False)],
+)
+def test_dspark_context_recompute_tail_type(
+    schemas: dict[str, dict], filename: str, value: object, valid: bool
+) -> None:
+    config = {
+        "speculative_config": {
+            "decoding_type": "DSpark",
+            "max_draft_len": 7,
+            "speculative_model": "/path/to/drafter",
+            "context_recompute_tail": value,
+        }
+    }
+    if filename == generator.DISAGG_SCHEMA:
+        config = {"generation_servers": config}
+    errors = list(Draft202012Validator(schemas[filename]).iter_errors(config))
+    assert (not errors) == valid, [error.message for error in errors]
+
+
+@pytest.mark.parametrize("filename", [generator.SERVE_SCHEMA, generator.DISAGG_SCHEMA])
 @pytest.mark.parametrize(("value", "valid"), [(True, True), (False, True), ("invalid", False)])
 def test_dspark_device_reranking_field(
     schemas: dict[str, dict], filename: str, value: bool | str, valid: bool

@@ -207,6 +207,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -294,6 +301,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -812,6 +830,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -912,6 +937,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "skip_ctx_buffer_budget_check": {
           "default": false,
@@ -1101,6 +1137,19 @@
           "title": "Confidence Min Predicted Gain",
           "type": "number"
         },
+        "context_recompute_tail": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0,
+          "description": "Prompt-tail tokens to recompute through the target forward when a request takes a KV-cache prefix hit, so a standalone DSpark drafter gets context K/V for reused tokens; not needed when the draft KV pool is paired with the target's block reuse. 0 (default) disables it; -1 forces a full re-prefill on a hit; None resolves from the draft model config to the drafter's attention window when every layer's context attention is windowed, else -1 (0 for the embedded drafter). A smaller tail trades acceptance length for TTFT. The V2 KV cache manager requires the all_reusable block-reuse policy; the V1 manager requires chunked prefill and no sliding-window target layers; otherwise the managers disable it with a warning. On recurrent-state targets a positive tail becomes -1 (full re-prefill).",
+          "title": "Context Recompute Tail"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -1122,6 +1171,13 @@
           "default": null,
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
+        },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
         },
         "enable_confidence_scheduling": {
           "default": false,
@@ -1268,6 +1324,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -1782,6 +1849,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -1869,6 +1943,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -2227,6 +2312,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -2367,6 +2459,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "sa_config": {
           "anyOf": [
@@ -2512,6 +2615,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -2652,6 +2762,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 3,
@@ -3812,6 +3933,13 @@
           "title": "Draft Moe Dtype",
           "type": "string"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "dynamic_tree_max_topK": {
           "anyOf": [
             {
@@ -3932,6 +4060,17 @@
           "default": null,
           "description": "Number of MTP layers in the model checkpoint. Auto-populated from the target pretrained config, or from speculative_model's config.json when MTP heads are loaded separately. Do not set manually.",
           "title": "Num Nextn Predict Layers"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "relaxed_delta": {
           "default": 0.0,
@@ -4805,6 +4944,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -4917,6 +5063,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -5061,6 +5218,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "enable_penalty": {
           "default": false,
           "description": "If true, enables the occurrence penalties (repetition / presence / frequency) for one-model speculative decoding. Off by default because the penalties need a [num_seq_slots, vocab_size] occurrence-count workspace that is allocated up front (CUDA graphs capture fixed buffer addresses). While off, a request that asks for any of these penalties is rejected at admission rather than silently decoded without them.",
@@ -5161,6 +5325,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "sa_config": {
           "anyOf": [
@@ -5769,6 +5944,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "enable_global_pool": {
           "default": false,
           "description": "When True, each request searches all active SA states for the longest match, not just its own. Improves acceptance rates when requests share common patterns. Limitations: at most 1024 concurrent slots; suffix matching is capped at 64 tokens per request.",
@@ -5882,6 +6064,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "spec_dec_variant": {
           "default": 1,
@@ -6022,6 +6215,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "eagle3_layers_to_capture": {
           "anyOf": [
             {
@@ -6136,6 +6336,17 @@
         "output_directory": {
           "description": "Directory path where hidden states data files will be saved. The directory is created if it does not exist.",
           "title": "Output Directory",
+          "type": "string"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
           "type": "string"
         },
         "spec_dec_variant": {
@@ -6558,6 +6769,13 @@
           "description": "Developer interface: dynamically adjust draft length based on active batch size in runtime.Maps batch size to draft lengths.For example: draft_len_schedule = {4:4, 8:2, 32:1} - Batch sizes 1-4:   use draft_len=4 - Batch sizes 5-8:   use draft_len=2 - Batch sizes 9-32:  use draft_len=1 - Batch sizes 33+:   use draft_len=0 (implicit, speculation disabled). Mutually exclusive with max_concurrency since draft_len_schedule implicitly support max concurrency control.",
           "title": "Draft Len Schedule"
         },
+        "draft_temperature_only": {
+          "default": false,
+          "description": "If true, rejection-sampled drafts are drawn from the temperature-scaled draft distribution without the request's top-k / top-p / min-p filters; this changes the acceptance rate, not the output distribution. Requires use_rejection_sampling=True; not supported with the dynamic tree.",
+          "status": "prototype",
+          "title": "Draft Temperature Only",
+          "type": "boolean"
+        },
         "drafter": {
           "description": "A Drafter requires the Python LLM API.",
           "not": {}
@@ -6649,6 +6867,17 @@
           "default": null,
           "description": "MoE backend override for a neural draft model or embedded MTP layers on the PyTorch backend. None inherits the target model's backend. AUTO resolves from the draft checkpoint or embedded MTP layer quantization, and a concrete backend applies only to the draft model or layers. Resolution may fall back based on model, quantization, and hardware support. Replacement-head MTP checkpoints must inherit the target model's MoE backend; leave this option unset. Nemotron-H embedded MTP layers must inherit the target backend because their checkpoint mapper uses a shared backend-dependent layout. Decoding methods without a neural draft model ignore this option.",
           "title": "Moe Backend"
+        },
+        "rejection_sample_method": {
+          "default": "standard",
+          "description": "Verification rule of rejection sampling (use_rejection_sampling=True). 'standard': token-level rejection sampling. 'block': block verification (Sun et al., 2024), which judges the drafted block jointly; lossless, and accepts at least as many tokens in expectation. Linear-chain one-model paths only (not the dynamic tree, nor with relaxed thinking acceptance); ragged (confidence-scheduled) verification steps fall back to 'standard'.",
+          "enum": [
+            "standard",
+            "block"
+          ],
+          "status": "prototype",
+          "title": "Rejection Sample Method",
+          "type": "string"
         },
         "resource_manager": {
           "type": "null"

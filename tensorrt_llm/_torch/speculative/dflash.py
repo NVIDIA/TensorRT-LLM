@@ -1683,12 +1683,52 @@ class DFlashWorker(SpecWorkerBase):
                 "fell back to a private ctx arena, so a reused prefix's drafter K/V "
                 "stays unreachable and acceptance length drops as if unpaired."
             )
+        self._report_prefix_reuse(cache_manager)
 
         logger.info(
             f"DFlash: allocated ctx buffers: max_batch={max_batch}, "
             f"max_ctx={self._max_ctx}, dtype={dtype}, "
             f"dflash_attention_backend={self._dflash_attention_backend}, "
             f"reuse_addressable={self._ctx_reuse_addressable}"
+        )
+
+    def _report_prefix_reuse(self, target_cache_manager: Optional[BaseResourceManager]) -> None:
+        """Report how this drafter's context is served on KV-cache prefix hits.
+
+        Unless the draft pool is paired with the target's block reuse, the
+        target must recompute the prompt tail the drafter attends to
+        (``context_recompute_tail``), or a cache hit drafts from only the
+        uncached tail of the prompt.
+        """
+        if self._ctx_reuse_addressable or not getattr(
+            target_cache_manager, "enable_block_reuse", False
+        ):
+            return
+        tail = getattr(target_cache_manager, "_spec_recompute_tail", 0)
+        if tail:
+            logger.info(
+                f"DFlash: prefix-cache hits recompute a {tail}-token prompt tail for the "
+                "drafter (context_recompute_tail; -1 = whole prompt)."
+            )
+            return
+        # The target skips the reused prefix, so _store_prefill_context only
+        # ever sees the uncached tail; nothing else reports the loss.
+        requested = getattr(self.spec_config, "context_recompute_tail", 0)
+        if requested:
+            why = (
+                f"the KV cache manager disabled context_recompute_tail={requested} "
+                "(see its warning for why)"
+            )
+        else:
+            why = (
+                "context_recompute_tail is 0 (set it to the drafter's attention "
+                "window -- null resolves it -- or -1 to recompute on hits)"
+            )
+        logger.warning(
+            "DFlash: KV-cache block reuse is on, but the drafter's context K/V are "
+            f"not kept where a prefix-cache hit can hand them back, and {why}: a "
+            "cache-hit request drafts from only the uncached tail of its prompt, so "
+            "acceptance drops on every hit."
         )
 
     def _ctx_paged_index_args(self):
@@ -2389,37 +2429,14 @@ class DFlashWorker(SpecWorkerBase):
                     vocab_size = gen_logits.shape[-1]
                     gen_logits = gen_logits.reshape(num_gens, K, vocab_size)
 
-                    gen_logits = self._refine_block_logits(
-                        draft_model, gen_logits, inputs, spec_metadata
-                    )
-
-                    # DFlash 2: replace the independent per-position picks with
-                    # one coherent path through the block (absent for plain
-                    # DFlash).
-                    if getattr(draft_model, "lilicorr", None) is not None:
-                        gen_logits = self._apply_lilicorr(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["lilicorr_anchor"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-                    elif getattr(draft_model, "has_candidate_selector", False):
-                        gen_logits = self._apply_dflash2_selector(
-                            draft_model,
-                            gen_logits,
-                            gen_hidden_states.reshape(num_gens, K, -1),
-                            inputs["first_prev_tokens"],
-                            spec_metadata,
-                        )
-                        vocab_size = gen_logits.shape[-1]
-
-                    gen_draft_tokens = self.sample_draft_tokens(
+                    gen_draft_tokens, vocab_size = self._sample_block_draft_tokens(
+                        draft_model,
                         gen_logits,
+                        gen_hidden_states,
+                        inputs,
                         spec_metadata,
+                        num_contexts,
                         batch_size,
-                        num_contexts=num_contexts,
                     )
 
                 # Opt-in confidence-calibration recording (env-gated). The
@@ -2532,6 +2549,51 @@ class DFlashWorker(SpecWorkerBase):
         intra-block bias.
         """
         return gen_logits
+
+    def _sample_block_draft_tokens(
+        self,
+        draft_model: nn.Module,
+        gen_logits: torch.Tensor,
+        gen_hidden_states: torch.Tensor,
+        inputs: dict,
+        spec_metadata: SpecMetadata,
+        num_contexts: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, int]:
+        """Turn the raw ``[num_gens, K, vocab]`` block logits into ``[num_gens, K]`` int32 drafts.
+
+        Also returns the vocab width of the logits the stored proposals use.
+        Plain DFlash refines the logits (:meth:`_refine_block_logits`, the
+        DFlash 2 candidate scorers) and draws every position with the shared
+        block sampler; a family whose positions condition on the previous
+        draft overrides this (``DSparkWorker``).
+        """
+        num_gens, K = gen_logits.shape[:2]
+        gen_logits = self._refine_block_logits(draft_model, gen_logits, inputs, spec_metadata)
+
+        # DFlash 2: replace the independent per-position picks with one
+        # coherent path through the block (absent for plain DFlash).
+        if getattr(draft_model, "lilicorr", None) is not None:
+            gen_logits = self._apply_lilicorr(
+                draft_model,
+                gen_logits,
+                gen_hidden_states.reshape(num_gens, K, -1),
+                inputs["lilicorr_anchor"],
+                spec_metadata,
+            )
+        elif getattr(draft_model, "has_candidate_selector", False):
+            gen_logits = self._apply_dflash2_selector(
+                draft_model,
+                gen_logits,
+                gen_hidden_states.reshape(num_gens, K, -1),
+                inputs["first_prev_tokens"],
+                spec_metadata,
+            )
+
+        tokens = self.sample_draft_tokens(
+            gen_logits, spec_metadata, batch_size, num_contexts=num_contexts
+        )
+        return tokens, gen_logits.shape[-1]
 
     def _apply_dflash2_selector(
         self,
