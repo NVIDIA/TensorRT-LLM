@@ -114,6 +114,20 @@ def _xielu_float64(x: torch.Tensor, a_p: float, a_n: float, beta: float, eps: fl
     return torch.where(xd > 0, pos, neg)
 
 
+def _assert_within_one_ulp(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    """Adjacent or identical values of the 16-bit dtype; NaN only needs to be NaN in both."""
+    nan = torch.isnan(expected)
+    assert torch.equal(torch.isnan(actual), nan)
+
+    def ordered(t):
+        # Map the sign-magnitude bit patterns to integers that are ordered like the values.
+        bits = t.view(torch.int16).to(torch.int32)
+        return torch.where(bits < 0, -(bits & 0x7FFF), bits)
+
+    diff = (ordered(actual) - ordered(expected)).abs()[~nan]
+    assert diff.max().item() <= 1, f"max difference {diff.max().item()} ulp"
+
+
 def _xielu_test_input(dtype: torch.dtype, device: str) -> torch.Tensor:
     """Covers x > 0, x in (eps, 0], x <= eps, very negative x, and exact zeros."""
     parts = [
@@ -170,6 +184,8 @@ class TestXIELU(unittest.TestCase):
         x = _xielu_test_input(dtype, device)
         if dtype == torch.float16:
             x = x.clamp(-60000.0, 60000.0)
+            # The input where the kernel's expm1f lands on the other side of an fp16 tie.
+            x = torch.cat([x, torch.tensor([-22281], dtype=torch.int16, device=device).view(dtype)])
 
         out = act(x)
         self.assertEqual(out.dtype, dtype)
@@ -187,7 +203,13 @@ class TestXIELU(unittest.TestCase):
 
         # HF's fp32 Python path is the same expression. Its forward() may
         # dispatch to the optional xielu CUDA extension, which rounds differently.
-        torch.testing.assert_close(out, hf_act._xielu_python(x.float()).to(dtype), atol=0, rtol=0)
+        hf_out = hf_act._xielu_python(x.float()).to(dtype)
+        if dtype == torch.float16 and device == "cuda":
+            # CUDA's expm1f is accurate to 1 ulp, not correctly rounded, so near an
+            # fp16 tie the kernel can round to the neighbouring value.
+            _assert_within_one_ulp(out, hf_out)
+        else:
+            torch.testing.assert_close(out, hf_out, atol=0, rtol=0)
 
         # Exact zeros take the negative branch: a_n * expm1(eps) - 0 + 0.
         zero_out = act(torch.zeros(4, dtype=dtype, device=device)).float()
@@ -417,17 +439,17 @@ class TestApertus(unittest.TestCase):
         """The comparison above must fail if the checkpoint's xIELU coefficients are ignored."""
         saved = []
         for layer in model.model.layers:
-            act = layer.mlp.activation
-            saved.append((act.a_p, act.a_n))
-            act.a_p, act.a_n = 0.8, 0.8
+            coeffs = layer.mlp.activation.coeffs
+            saved.append(coeffs.clone())
+            coeffs[:2] = 0.8
         try:
             attn_metadata.prepare()
             wrong = model.forward(
                 input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
             )
         finally:
-            for layer, (a_p, a_n) in zip(model.model.layers, saved):
-                layer.mlp.activation.a_p, layer.mlp.activation.a_n = a_p, a_n
+            for layer, coeffs in zip(model.model.layers, saved):
+                layer.mlp.activation.coeffs.copy_(coeffs)
         with self.assertRaises(AssertionError):
             self._assert_logits_close(wrong, ref, "default xIELU coefficients")
 

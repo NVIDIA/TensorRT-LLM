@@ -22,6 +22,7 @@
 #include <ATen/Functions.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/cuda/CUDAGuard.h>
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -30,6 +31,39 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
+
+at::Tensor xielu(at::Tensor const& input, at::Tensor const& coeffs)
+{
+    CHECK_TH_CUDA(input);
+    TORCH_CHECK(coeffs.scalar_type() == at::ScalarType::Float && coeffs.numel() == 4 && coeffs.is_contiguous(),
+        "xielu: coeffs must be a contiguous fp32 tensor [a_p, a_n, beta, eps]");
+    TORCH_CHECK(coeffs.device() == input.device(), "xielu: coeffs must be on the same device as input");
+    c10::cuda::CUDAGuard const deviceGuard(input.device());
+    at::Tensor const in = input.contiguous();
+    at::Tensor output = at::empty(in.sizes(), in.options());
+    float const* coeffsPtr = coeffs.data_ptr<float>();
+    auto stream = at::cuda::getCurrentCUDAStream(in.get_device());
+
+    if (in.scalar_type() == at::ScalarType::Half)
+    {
+        kernels::invokeXielu<half>(reinterpret_cast<half const*>(in.data_ptr()),
+            reinterpret_cast<half*>(output.data_ptr()), in.numel(), coeffsPtr, stream);
+    }
+    else if (in.scalar_type() == at::ScalarType::BFloat16)
+    {
+#ifdef ENABLE_BF16
+        kernels::invokeXielu<__nv_bfloat16>(reinterpret_cast<__nv_bfloat16 const*>(in.data_ptr()),
+            reinterpret_cast<__nv_bfloat16*>(output.data_ptr()), in.numel(), coeffsPtr, stream);
+#else
+        C10_THROW_ERROR(NotImplementedError, "BFloat16 not enabled.");
+#endif
+    }
+    else
+    {
+        C10_THROW_ERROR(NotImplementedError, "xielu only supports fp16/bf16.");
+    }
+    return output;
+}
 
 std::tuple<at::Tensor, at::Tensor> fused_relu2_quantize(
     at::Tensor const& input, at::Tensor const& sf_scale, int64_t sf_vec_size)
@@ -85,10 +119,12 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    m.def("xielu(Tensor input, Tensor coeffs) -> Tensor");
     m.def("fused_relu2_quantize(Tensor input, Tensor sf_scale, int sf_vec_size=16) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
+    m.impl("xielu", &tensorrt_llm::torch_ext::xielu);
     m.impl("fused_relu2_quantize", &tensorrt_llm::torch_ext::fused_relu2_quantize);
 }
