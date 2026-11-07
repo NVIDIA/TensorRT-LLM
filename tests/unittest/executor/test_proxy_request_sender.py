@@ -710,7 +710,9 @@ def test_admission_after_an_unwritable_socket_does_not_wait_for_the_sender_threa
     # Regression: after one write found the socket unwritable, the sender
     # thread kept the queue across its retry wait. Callers then only queued
     # commands, so a descheduled sender thread starved a connected worker.
-    commands = _ObservedQueue(is_server=True, send_hwm=_RequestSender.MAX_INFLIGHT_BATCHES)
+    # The socket holds every command, so a slow libzmq I/O thread on a loaded
+    # host cannot leave commands that only the held-back sender would retry.
+    commands = _ObservedQueue(is_server=True, send_hwm=256)
     errors = queue.Queue()
     sender = _RequestSender(commands, errors, batching=False, direct_send=True)
     sender.MAX_PENDING_REQUESTS = 16
