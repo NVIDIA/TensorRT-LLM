@@ -510,6 +510,11 @@ class CapturableGuidedDecoder(GuidedDecoder):
         # self.requests_hostfunc should be accessed by hostfunc (CUDA callback).
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
+        # State for skipping no-op eager steps, see _skip_unguided_step.
+        self._no_guided_requests = False
+        self._step_skip: Optional[bool] = None
+        self._cur_step_eager = False
+        self._prev_step_eager = False
 
         self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
                                       self.max_num_sequences,
@@ -560,8 +565,46 @@ class CapturableGuidedDecoder(GuidedDecoder):
         if new_tokens is not None:
             self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
         self.queue.put((self.requests, new_tokens is not None))
+        self._prev_step_eager, self._cur_step_eager = (self._cur_step_eager,
+                                                       False)
+        self._no_guided_requests = not any(
+            req.guided_decoding_params is not None
+            for req in self.requests.requests)
+        self._step_skip = None
         # self.token_event.record() should be called inside CUDA graph capturing;
         # currently, it is in DecoderInputPreparer.preprocess_inputs.
+
+    def _skip_unguided_step(self) -> bool:
+        """Whether this eager step's guided-decoding calls are no-ops.
+
+        A batch without guided requests needs no grammar work: ``_build`` sets
+        ``token_mask`` only for guided rows, so the bitmask kernel leaves the
+        logits unchanged, and the host functions only touch guided requests.
+        Skipping also drops the ``_drain_host_functions`` waits, which empty
+        the GPU queue in every eager step.
+
+        Skipping is allowed only when the previous step's calls also ran
+        eagerly, so no host node of an earlier CUDA-graph step can still be
+        pending while this step continues without draining. The first eager
+        step after graph replays keeps the normal path.
+
+        The first eager call of a step decides for the whole step. A skipped
+        step consumes its own queue entry here (the newest one; older entries
+        belong to CUDA-graph host nodes that have not run yet and pop from the
+        front) instead of in ``fetch_batch``, so the queue stays aligned with
+        the steps.
+        """
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        self._cur_step_eager = True
+        if self._step_skip is None:
+            self._step_skip = (self._no_guided_requests
+                               and self._prev_step_eager)
+            if self._step_skip:
+                with self.queue.mutex:
+                    if self.queue.queue:
+                        self.queue.queue.pop()
+        return self._step_skip
 
     @hostfunc
     def fetch_batch(self) -> None:
@@ -586,6 +629,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
     def execute(self,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> List[Tuple[int, str]]:
+        if self._skip_unguided_step():
+            return []
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_batch()
@@ -617,6 +662,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
                         new_tokens: torch.Tensor,
                         num_accepted_tokens: torch.Tensor,
                         draft_step: int = 0) -> None:
+        if self._skip_unguided_step():
+            return
         batch_size = len(self.requests)
         assert new_tokens.size(0) == batch_size
         self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
@@ -659,6 +706,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
         Args:
             num_accepted_tokens: Int32 tensor of shape [batch_size].
         """
+        if self._skip_unguided_step():
+            return
         batch_size = len(self.requests)
         assert num_accepted_tokens.size(0) == batch_size
         self.num_accepted_tokens[:batch_size].copy_(num_accepted_tokens,
@@ -695,6 +744,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
             num_accepted_tokens: Int32 tensor of shape [batch_size], including
                 the bonus token in each verification count.
         """
+        if self._skip_unguided_step():
+            return
         self.add_accepted_batch(num_accepted_tokens)
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
@@ -709,6 +760,8 @@ class CapturableGuidedDecoder(GuidedDecoder):
                             logits: torch.Tensor,
                             d2t: Optional[torch.Tensor] = None,
                             draft_step: int = 0) -> List[Tuple[int, str]]:
+        if self._skip_unguided_step():
+            return []
         with torch.cuda.stream(self.stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.fetch_draft_batch(draft_step=draft_step)
