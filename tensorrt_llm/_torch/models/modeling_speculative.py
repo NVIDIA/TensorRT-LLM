@@ -28,6 +28,7 @@ from ..modules.embedding import Embedding, LMHead, get_masked_input_and_mask
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
+from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..pyexecutor.dwdp import get_global_dwdp_manager
@@ -36,6 +37,7 @@ from ..pyexecutor.runtime_hooks import RuntimeHooks
 from ..speculative import (SpecMetadata, get_spec_worker,
                            should_use_separate_draft_kv_cache)
 from ..speculative.interface import SpeculativeDecodingMode
+from ..speculative.logprobs import GATHER_IDS_KEY, HIDDEN_STATES_KEY
 from ..utils import AuxStreamType
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_auto import AutoModelForCausalLM
@@ -1912,6 +1914,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.lm_head if draft_lm_head is None else draft_lm_head,
                 self.model_config.mapping, self.spec_worker.key_exchange)
 
+    def project_speculative_logits(self,
+                                   hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project original target states for requested output scores after replay."""
+        return self.logits_processor.forward(hidden_states, self.lm_head, None,
+                                             True)
+
+    def supports_speculative_output_scores(self) -> bool:
+        """Whether the original head and processor return complete target rows."""
+        head = self.lm_head
+        return (type(head) is LMHead
+                and type(self.logits_processor) is LogitsProcessor and
+                (head.tp_size == 1 or (head.tp_mode == TensorParallelMode.COLUMN
+                                       and head.gather_output)))
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
@@ -1989,14 +2005,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_position_ids = spec_position_ids.contiguous()
 
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=spec_input_ids,
-                                    position_ids=spec_position_ids,
-                                    hidden_states=hidden_states,
-                                    logits=logits,
-                                    attn_metadata=attn_metadata,
-                                    spec_metadata=spec_metadata,
-                                    draft_model=self.draft_model,
-                                    resource_manager=resource_manager)
+            outputs = self.spec_worker(input_ids=spec_input_ids,
+                                       position_ids=spec_position_ids,
+                                       hidden_states=hidden_states,
+                                       logits=logits,
+                                       attn_metadata=attn_metadata,
+                                       spec_metadata=spec_metadata,
+                                       draft_model=self.draft_model,
+                                       resource_manager=resource_manager)
+            if self.spec_config.spec_dec_mode.is_dspark():
+                # Keep states rather than a full vocabulary tensor. The sampler
+                # projects only score-requesting rows after graph replay.
+                outputs[HIDDEN_STATES_KEY] = hidden_states
+                outputs[GATHER_IDS_KEY] = spec_metadata.gather_ids
+            return outputs
         else:
             logits = self.logits_processor.forward(
                 hidden_states,

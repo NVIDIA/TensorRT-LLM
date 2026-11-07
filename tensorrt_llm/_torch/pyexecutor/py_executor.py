@@ -10295,11 +10295,13 @@ class PyExecutor:
 
                 # A forward that sampled greedy tokens in place of the logits
                 # returns no logits; no request of such a batch asks for them.
-                HandleLogits()(scheduled_batch.context_requests,
-                               scheduled_batch.generation_requests,
-                               batch_outputs.get("logits"), beam_width,
-                               num_context_logits_prefix_sum,
-                               self.sampler.is_generation_model())
+                if not (isinstance(self.sampler, SpecSampler)
+                        and self.sampler.handles_logits):
+                    HandleLogits()(scheduled_batch.context_requests,
+                                   scheduled_batch.generation_requests,
+                                   batch_outputs.get("logits"), beam_width,
+                                   num_context_logits_prefix_sum,
+                                   self.sampler.is_generation_model())
 
                 HandleAdditionalOutputs()(scheduled_batch.context_requests,
                                           scheduled_batch.generation_requests,
