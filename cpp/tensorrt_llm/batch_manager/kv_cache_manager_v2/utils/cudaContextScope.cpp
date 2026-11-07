@@ -20,16 +20,6 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
-CUcontext CudaContextScope::current() noexcept
-{
-    CUcontext context = nullptr;
-    if (cuCtxGetCurrent(&context) != CUDA_SUCCESS)
-    {
-        return nullptr;
-    }
-    return context;
-}
-
 CudaContextScope::CudaContextScope(CUcontext context) noexcept
 {
     CUcontext before = nullptr;
@@ -39,23 +29,14 @@ CudaContextScope::CudaContextScope(CUcontext context) noexcept
         // The driver itself is gone, which no push can repair.
         return;
     }
-    if (context == nullptr || before == context)
+    if (before == context)
     {
-        mUsable = before != nullptr;
-        if (!mUsable)
-        {
-            mError = CUDA_ERROR_INVALID_CONTEXT;
-        }
         return;
     }
     // A context the thread already had is not a substitute: the owner's resources live in
     // `context`, and if that one cannot be made current they cannot be released from here.
     mError = cuCtxPushCurrent(context);
-    if (mError == CUDA_SUCCESS)
-    {
-        mPushed = true;
-        mUsable = true;
-    }
+    mPushed = mError == CUDA_SUCCESS;
 }
 
 CudaContextScope::~CudaContextScope()
@@ -63,8 +44,8 @@ CudaContextScope::~CudaContextScope()
     if (mPushed)
     {
         CUcontext popped = nullptr;
-        // Nothing to do on failure: the thread is being left, and a pop fails only once the
-        // driver is being torn down.
+        // A destructor cannot report a failed pop; the driver refuses one while it is being
+        // torn down, or if code inside the scope changed the context stack.
         cuCtxPopCurrent(&popped);
     }
 }

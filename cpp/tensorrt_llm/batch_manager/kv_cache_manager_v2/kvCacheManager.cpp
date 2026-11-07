@@ -144,7 +144,8 @@ KvCacheManager::KvCacheManager(KVCacheManagerConfig const& config, std::shared_p
         std::move(coldPageCodec), mConfig.swaScratchReuse, mConfig.typicalStep, mConfig.constraints,
         mConfig.initialPoolRatio, mEventSink, mConfig.maxUtilForResume, mConfig.coldTierOffloadMinPriority);
     // The context the storage above lives in; teardown pushes it on threads that have none.
-    mCudaContext = CudaContextScope::current();
+    cuCheck(cuCtxGetCurrent(&mCudaContext));
+    TLLM_CHECK_WITH_INFO(mCudaContext != nullptr, "KVCacheManagerV2 requires a current CUDA context");
 
     _computeSparseCacheShape();
 
@@ -166,11 +167,9 @@ KvCacheManager::~KvCacheManager()
     {
         return;
     }
-    // Finalised rather than shut down. Python's cyclic garbage collector, and a std::shared_ptr
-    // released on a helper thread, run this on whatever thread dropped the last reference, and
-    // that thread may have no CUDA context; every driver call in the teardown needs one. The
-    // manager's own context is pushed for the duration, and everything that needs it must be
-    // released inside shutdown(): the scope ends before the members are destroyed.
+    // Finalized rather than shut down, on a thread that may have no CUDA context. shutdown()
+    // makes every driver call of the teardown, so the scope only has to cover it: after
+    // shutdown() no member destructor touches the driver.
     CudaContextScope const context(mCudaContext);
     if (!context.usable())
     {
@@ -182,20 +181,22 @@ KvCacheManager::~KvCacheManager()
         // with the rest of the manager; the reference dangles but is unreachable, since no code
         // holds the leaked pointers and no destructor or method of theirs runs again.
         //
-        // A deinitialised driver means the process is exiting: a leak at that point costs nothing
+        // A deinitialized driver means the process is exiting: a leak at that point costs nothing
         // and is only worth a warning. Any other failure is a live process without its context.
+        char const* errorName = nullptr;
+        cuGetErrorName(context.error(), &errorName);
         if (context.error() == CUDA_ERROR_DEINITIALIZED)
         {
             TLLM_LOG_WARNING(
-                "KVCacheManagerV2 is being finalised after the CUDA driver was deinitialised; its memory is left "
+                "KVCacheManagerV2 is being finalized after the CUDA driver was deinitialized; its memory is left "
                 "to the exiting process. Call shutdown() before interpreter exit to release it explicitly.");
         }
         else
         {
             TLLM_LOG_ERROR(
-                "KVCacheManagerV2 is being finalised without a usable CUDA context (CUDA driver error %d); its "
-                "memory is leaked. Call shutdown() from the thread that drives the manager.",
-                static_cast<int>(context.error()));
+                "KVCacheManagerV2 is being finalized without a usable CUDA context (%s (%d)); its memory is leaked. "
+                "Call shutdown() from the thread that drives the manager.",
+                errorName != nullptr ? errorName : "unknown CUDA driver error", static_cast<int>(context.error()));
         }
         auto* const tree = new (std::nothrow) std::shared_ptr<BlockRadixTree>(std::move(mRadixTree));
         auto* const storage = new (std::nothrow) std::shared_ptr<StorageManager>(std::move(mStorage));
@@ -212,7 +213,7 @@ KvCacheManager::~KvCacheManager()
     if (context.pushed())
     {
         TLLM_LOG_WARNING(
-            "KVCacheManagerV2 is being finalised without shutdown() on a thread that does not have its CUDA context "
+            "KVCacheManagerV2 is being finalized without shutdown() on a thread that does not have its CUDA context "
             "current; call shutdown() from the thread that drives the manager. Tearing it down with its own "
             "context.");
     }

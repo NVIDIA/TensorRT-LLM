@@ -145,6 +145,10 @@ public:
 
     // ---- Lifecycle --------------------------------------------------------
 
+    //! Releases everything the manager holds with the driver. Call it with cudaContext() current,
+    //! after every KvCache is closed. Idempotent: a second call returns at once, and once it has
+    //! run the destructor has nothing left to do. The destructor calls it for a manager that
+    //! was never shut down, after making cudaContext() current itself.
     void shutdown();
 
     // Number of not-yet-destroyed managers in this process. A manager counts from the start of its
@@ -633,10 +637,10 @@ private:
     // this manager could leave behind exists, and dropped after ~KvCacheManager has run.
     PoisonHold mPoisonHold;
 
-    //! See cudaContext(). Null only if construction ran without one, which construction rejects.
+    //! See cudaContext(). Never null: construction rejects a thread without a current context.
     CUcontext mCudaContext = nullptr;
 
-    //! Set once shutdown() has released everything; the destructor then has nothing to do.
+    //! shutdown() has run; the destructor then has nothing to do.
     bool mShutDown = false;
 
     //! Guards all mutable state reachable from this manager. See the scope note above.

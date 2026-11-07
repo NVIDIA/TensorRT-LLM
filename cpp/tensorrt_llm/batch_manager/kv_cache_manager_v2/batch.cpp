@@ -419,8 +419,8 @@ void Batch::setCudaStream(CUstream stream)
 
 Batch::~Batch()
 {
-    // As in ~KvCacheManager: the last reference may be dropped on a thread with no CUDA context,
-    // and the drain below waits on the driver.
+    // _drain() waits on the upload stream, and the device and pinned buffers are freed with
+    // cuMemFree and cuMemFreeHost: all of it needs the manager's context current.
     CudaContextScope const context(mManager->cudaContext());
     // Both buffers are about to go, and transfers on the upload stream still name them.
     _drain();
@@ -435,6 +435,15 @@ Batch::~Batch()
                 }
             }
         });
+    // Released here, inside the scope, rather than by the member destructors that run after it.
+    // mScratch only points into mDeviceArena, so it needs no release of its own.
+    mSparseArenas.clear();
+    mDeviceArena.reset();
+    mDeviceStaging.reset();
+    mMirror.reset();
+    mIndexTableDescs.reset();
+    mIndexTableMemory.reset();
+    mStaging = StaticHostMem{};
 }
 
 size_t Batch::_rowElements() const noexcept

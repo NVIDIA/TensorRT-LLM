@@ -23,21 +23,21 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
 
 //! Makes a CUDA context current for the enclosing scope, for teardown that may run on a thread
-//! that has none: destructors run on whichever thread drops the last reference, and a thread
-//! that never touched CUDA has no current context, so the owner's context is pushed and popped
-//! again on exit, leaving the thread as it was found.
+//! that has none: destructors run on whichever thread drops the last reference (Python's cyclic
+//! garbage collector, a std::shared_ptr released on a helper thread), and a thread that never
+//! touched CUDA has no current context, while every driver call in a teardown needs one. The
+//! owner's context is pushed and popped again on exit, leaving the thread as it was found.
 //!
-//! usable() is false when no context could be made current: the thread has none and the owner
-//! recorded none, or the driver refused the push because the context, or the driver itself, is
-//! already gone (process exit).
+//! The scope covers only the statements that follow it: a member destroyed after the enclosing
+//! destructor's body has exited runs outside it, so whatever needs the context must be released
+//! inside the body.
+//!
+//! usable() is false when `context` could not be made current: the driver refused the push
+//! because the context, or the driver itself, is already gone (process exit).
 class CudaContextScope
 {
 public:
-    //! The calling thread's current context, or nullptr when it has none or the driver is gone.
-    [[nodiscard]] static CUcontext current() noexcept;
-
-    //! Pushes `context` unless it is already current. A null `context` pushes nothing, and the
-    //! scope is usable only if the thread has a context of its own.
+    //! Pushes `context`, which must not be null, unless it is already current.
     explicit CudaContextScope(CUcontext context) noexcept;
     ~CudaContextScope();
 
@@ -46,10 +46,10 @@ public:
     CudaContextScope(CudaContextScope&&) = delete;
     CudaContextScope& operator=(CudaContextScope&&) = delete;
 
-    //! A context is current on this thread for the scope's duration.
+    //! `context` is current on this thread for the scope's duration.
     [[nodiscard]] bool usable() const noexcept
     {
-        return mUsable;
+        return mError == CUDA_SUCCESS;
     }
 
     //! The context was pushed by this scope: the thread had none, or a different one.
@@ -66,7 +66,6 @@ public:
 
 private:
     bool mPushed = false;
-    bool mUsable = false;
     CUresult mError = CUDA_SUCCESS;
 };
 
