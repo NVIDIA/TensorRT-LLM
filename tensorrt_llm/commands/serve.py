@@ -830,15 +830,19 @@ def launch_server(
                 "--num_serve_frontends 1 to keep it.")
         os.environ["TRTLLM_RESPONSES_API_DISABLE_STORE"] = "1"
 
+    # port == 0 lets the kernel pick the port; the caller then needs a way
+    # to learn it, either by service discovery or by report_addr. Validate
+    # before getaddrinfo, which rejects negative ports with its own error.
+    if not (port > 0 or (port == 0 and
+                         (disagg_cluster_config is not None or report_addr))):
+        raise ValueError(
+            "Port must be a positive integer, or 0 to let the kernel pick "
+            "one when disagg cluster config or --report_addr is provided")
+
     address_family = _listener_address_family("server", host, port)
     port_lock = (_reserve_multi_frontend_port(host, port, address_family)
                  if multi_frontend.is_launcher else contextlib.nullcontext())
     with port_lock, socket.socket(address_family, socket.SOCK_STREAM) as s:
-        # port == 0 lets the kernel pick the port; the caller then needs a way
-        # to learn it, either by service discovery or by report_addr.
-        assert port > 0 or disagg_cluster_config is not None or report_addr, (
-            "Port must be specified unless disagg cluster config or "
-            "--report_addr is provided")
         # Without SO_REUSEADDR a restart is refused for the whole TIME_WAIT
         # window (~60s) by the tombstones of connections this server accepted.
         # The flag has to be set on the socket that owns the port first, since
