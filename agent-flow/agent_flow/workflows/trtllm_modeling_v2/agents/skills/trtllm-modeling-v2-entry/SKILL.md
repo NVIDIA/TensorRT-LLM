@@ -94,6 +94,10 @@ file is reported to the planner for ownership; it is not silently omitted.
   the `comm/` pattern: every rank asserts, a deadline, world size as an axis.
 - Assert CUDA availability (no skip), seed randomness, import the entry by
   its absolute path, and share no fixture with another entry's test.
+- A local entry's or variant's test counts toward its target's test budget
+  (10-15 modules, 20 at most). Import a helper the catalog's tests or the
+  target's already have (`_validating.py`, `_cells.py`, a `_`-prefixed module
+  beside the target's tests) instead of pasting another copy of it.
 - A normal cell fits **10 s / 40 GiB**. Boundary-sized probes use
   `spec.large=True` and `pytest.mark.large`; pre-merge excludes them. Report a
   missing marker registration rather than editing `tests/unittest/pytest.ini`.

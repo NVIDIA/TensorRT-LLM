@@ -441,10 +441,15 @@ pipeline.wake_up()
 ```
 
 `CPU` uses pageable host backing; `PINNED` uses pinned host backing. Host backups
-remain allocated after wake and are reused on later sleeps. Budget host RAM for
+remain allocated after wake by default and are reused on later sleeps. Budget host RAM for
 each instance's captured allocation pool, which can include cached loading and
 quantization buffers in addition to weights. This is process-local offload:
 the process, CUDA context, host memory, and node must remain alive.
+
+Set `sleep_release_host_backup=True` alongside `sleep_restore_mode` when loading
+to free the instance's host backups before wake returns. This synchronous cleanup
+can increase wake latency, and each subsequent sleep must allocate fresh backups.
+Host RAM must still hold the full backup while asleep. The default is `False`.
 
 Sleep rejects new generation and waits for the active call to finish before
 releasing memory. Sleep/wake transitions are serialized per instance; overlapping

@@ -3326,6 +3326,23 @@ class DecoderInputPreparer:
         """Return the one-model speculative worker when it is initialized."""
         return getattr(self.model, "spec_worker", None)
 
+    def _dspark_tp_rank0_rows(self):
+        """Return a hook that swaps this rank's confidence rows for TP rank 0's.
+
+        Without attention DP every TP rank runs one token layout, but confidence
+        can differ in the last bits between ranks. Returns None when each rank
+        owns its layout.
+        """
+        if self.mapping.tp_size <= 1 or self._config.enable_attention_dp:
+            return None
+        from tensorrt_llm._torch.distributed import allgather
+
+        def sync_rows(rows):
+            rows = rows.contiguous()
+            return allgather(rows, self.mapping, dim=0)[: rows.shape[0]]
+
+        return sync_rows
+
     def _apply_device_window_prologue(self, inputs, new_tensors_device) -> bool:
         """Re-rank this step's verify windows on device, with fresh confidence.
 
@@ -3417,6 +3434,7 @@ class DecoderInputPreparer:
             stamp=stamps,
             expected_stamp=expected_stamp,
             pad_len=pad_len_tok,
+            sync_rows=self._dspark_tp_rank0_rows(),
         )
 
         lens_buf[:padded_bs].copy_(result.verify_lens)
