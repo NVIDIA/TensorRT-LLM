@@ -135,6 +135,14 @@ inline bool allowsCheckpoint(LifeCycle const& lc)
     return reusePolicy(lc) == ReusePolicy::OPTIONAL || reusePolicy(lc) == ReusePolicy::SINK_REQUIRED_ONLY;
 }
 
+// Reuse policy that keys a lifecycle's pools. SINK_REQUIRED_ONLY pools with REQUIRED: the policy changes which pages a
+// prefix match requires, not where the pages live, and its pages already mix required sinks with an optional window.
+inline ReusePolicy poolReusePolicy(LifeCycle const& lc)
+{
+    auto const policy = reusePolicy(lc);
+    return policy == ReusePolicy::SINK_REQUIRED_ONLY ? ReusePolicy::REQUIRED : policy;
+}
+
 // Free function: compute stale range via std::visit.
 inline HalfOpenRange<BlockOrdinal> getStaleRange(LifeCycle const& lc, int historyLength, int tokensPerBlock)
 {
