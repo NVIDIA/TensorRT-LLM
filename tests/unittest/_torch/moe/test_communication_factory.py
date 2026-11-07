@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import sys
+from collections import namedtuple
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -61,6 +62,16 @@ def _make_model_config(
         use_low_precision_moe_combine=False,
         moe_load_balancer=None,
     )
+
+
+_REAL_DEVICE_API_PROBE = nccl_ep_utils.nccl_ep_device_api_supported
+
+
+@pytest.fixture(autouse=True)
+def _nccl_ep_device_api_supported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Default to a platform with NCCL Device API; tests override for the unsupported case."""
+    _REAL_DEVICE_API_PROBE.cache_clear()
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_device_api_supported", lambda _mapping: True)
 
 
 def _strategy_unavailable(*args, **kwargs):
@@ -704,3 +715,77 @@ def test_nccl_ep_handle_init_rejects_cuda_graph_capture(
         RuntimeError, match="dispatch handle must be initialized before CUDA graph capture"
     ):
         strategy._setup_handle(ctx, object(), 0)
+
+
+# ``nccl_ep_device_api_supported`` is memoized on the mapping, which must be hashable.
+_HashableMapping = namedtuple("_HashableMapping", ["pp_rank", "moe_ep_size", "moe_ep_rank"])
+
+
+class _FakeMpiComm:
+    def __init__(self):
+        self.freed = False
+
+    def Split(self, *_args):
+        return self
+
+    def Get_rank(self):
+        return 0
+
+    def Get_size(self):
+        return 2
+
+    def bcast(self, value, root=0):
+        return value
+
+    def allreduce(self, value, op=None):
+        return value
+
+    def Free(self):
+        self.freed = True
+
+
+def _install_fake_nccl_comm(monkeypatch: pytest.MonkeyPatch, device_api_support: bool):
+    """Install fake nccl.core / MPI so the real Device API probe runs without a GPU."""
+    import tensorrt_llm._utils as trtllm_utils
+
+    comm = SimpleNamespace(device_api_support=device_api_support, destroyed=False)
+    comm.destroy = lambda: setattr(comm, "destroyed", True)
+    fake_core = SimpleNamespace(
+        get_unique_id=lambda: b"uid",
+        Communicator=SimpleNamespace(init=lambda **_kwargs: comm),
+    )
+    monkeypatch.setitem(sys.modules, "nccl", SimpleNamespace(core=fake_core))
+    monkeypatch.setitem(sys.modules, "nccl.core", fake_core)
+    mpi = _FakeMpiComm()
+    monkeypatch.setattr(trtllm_utils, "mpi_disabled", lambda: False)
+    monkeypatch.setattr(trtllm_utils, "mpi_comm", lambda: mpi)
+    return comm, mpi
+
+
+@pytest.mark.parametrize("device_api_support", [True, False])
+def test_nccl_ep_device_api_probe(monkeypatch: pytest.MonkeyPatch, device_api_support: bool):
+    comm, mpi = _install_fake_nccl_comm(monkeypatch, device_api_support)
+    mapping = _HashableMapping(pp_rank=0, moe_ep_size=2, moe_ep_rank=0)
+
+    assert _REAL_DEVICE_API_PROBE(mapping) is device_api_support
+    # Probe communicator and MPI sub-communicator are released, and the result is cached.
+    assert comm.destroyed and mpi.freed
+    comm.device_api_support = not device_api_support
+    assert _REAL_DEVICE_API_PROBE(mapping) is device_api_support
+
+
+def test_nccl_ep_device_api_probe_failure_is_unsupported(monkeypatch: pytest.MonkeyPatch):
+    comm, _mpi = _install_fake_nccl_comm(monkeypatch, True)
+    sys.modules["nccl.core"].Communicator.init = Mock(side_effect=RuntimeError("init failed"))
+    mapping = _HashableMapping(pp_rank=0, moe_ep_size=2, moe_ep_rank=0)
+
+    assert _REAL_DEVICE_API_PROBE(mapping) is False
+
+
+def test_nccl_ep_rejected_without_device_api(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(nccl_ep_utils, "is_nccl_ep_installed", lambda: True)
+    monkeypatch.setattr(nccl_ep_utils, "nccl_ep_device_api_supported", lambda _mapping: False)
+    mapping = _make_model_config().mapping
+
+    with pytest.raises(RuntimeError, match="Device API"):
+        NcclEP(mapping, num_slots=128, hidden_size=4096)

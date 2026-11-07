@@ -69,6 +69,17 @@ class NcclEP(Communication):
         if not is_nccl_ep_installed():
             raise RuntimeError("nccl-ep is not installed.")
 
+        from tensorrt_llm._torch.moe.fused_moe.nccl_ep_utils import nccl_ep_device_api_supported
+
+        # Without NCCL Device API support (no GIN / GPUDirect RDMA, e.g. DGX Spark),
+        # Group.create fails at the first dispatch. Raise now so that auto-selection
+        # falls back to the next strategy.
+        if not nccl_ep_device_api_supported(mapping):
+            raise RuntimeError(
+                "NCCL EP requires NCCL Device API support, but it is not supported on this "
+                "platform."
+            )
+
         self.num_slots = num_slots
         self.num_experts = num_slots
         self.hidden_size = hidden_size
