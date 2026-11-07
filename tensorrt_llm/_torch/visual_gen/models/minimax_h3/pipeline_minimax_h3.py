@@ -260,10 +260,10 @@ class MiniMaxH3Pipeline(BasePipeline):
 
         if (
             pipeline_config.attention.backend == "TRTLLM"
-            and torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
+            and torch.cuda.get_device_capability() not in ((9, 0), (10, 0), (10, 3))
         ):
             raise NotImplementedError(
-                "MiniMax-H3 currently restricts TRTLLM attention to SM100 or SM103. "
+                "MiniMax-H3 currently restricts TRTLLM attention to SM90, SM100 or SM103. "
                 "Other architectures need model-specific numerical validation; use VANILLA."
             )
         if pipeline_config.cache is not None:
