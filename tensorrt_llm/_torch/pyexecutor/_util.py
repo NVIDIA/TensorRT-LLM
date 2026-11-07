@@ -2071,6 +2071,27 @@ class KvCacheCreator:
         return not self._is_disagg or disagg_shares_draft_kv(
             self._speculative_config)
 
+    def _check_dflash_cold_page_sharing(
+            self, cold_page_codec_provider: Optional[object]) -> None:
+        """Refuse a separate DFlash draft KV cache manager under cold-page compression.
+
+        Its pages would be encoded by a codec that knows only the target. A
+        TRTLLM drafter's layers in the target's manager stay lossless, and a
+        VANILLA or FA4 drafter has no draft manager.
+        """
+        spec_config = self._speculative_config
+        if (cold_page_codec_provider is None or spec_config is None
+                or not spec_config.spec_dec_mode.is_dflash()
+                or not self._should_create_separate_draft_kv_cache()):
+            return
+        reason = self._dflash_unify_blocker() or (
+            "the disaggregated worker does not share the draft KV "
+            "(TRTLLM_DISAGG_SHARED_DRAFT_KV)")
+        raise ValueError(
+            "Cold-page KV cache compression with a TRTLLM DFlash drafter needs "
+            "its KV layers in the target's KV cache manager, but they cannot "
+            f"share it: {reason}.")
+
     def _check_shared_draft_kv_request(self) -> None:
         """Fail at startup when disaggregated draft KV sharing is missing or cannot be honored."""
         if (not self._is_disagg or self._speculative_config is None
@@ -2130,8 +2151,14 @@ class KvCacheCreator:
         if is_gemma4_hybrid(
                 self._model_engine.model.model_config.pretrained_config):
             return "the target uses Gemma 4 hybrid attention"
-        if self._llm_args.kv_cache_compression_config is not None:
-            return "KV cache compression is enabled"
+        compression_config = self._llm_args.kv_cache_compression_config
+        # Cold-page quantization encodes only the target's layers of a shared
+        # manager and keeps the drafter's lossless; other algorithms change
+        # what the target's KV holds.
+        if (compression_config is not None and compression_config.algorithm
+                != "quantization_for_cold_page"):
+            return (f"KV cache compression {compression_config.algorithm!r} "
+                    "is enabled")
         # Specialized managers add cache roles and lifecycle protocols that an
         # external drafter cannot yet describe. Keep their existing fallback.
         if self._kv_cache_manager_cls is not KVCacheManagerV2:
@@ -3239,6 +3266,7 @@ class KvCacheCreator:
         cold_page_codec_provider = (
             compression_manager if compression_manager is not None
             and compression_manager.provides_cold_page_codec else None)
+        self._check_dflash_cold_page_sharing(cold_page_codec_provider)
 
         kv_cache_manager = self._create_kv_cache_manager(
             self._model_engine,
@@ -4107,15 +4135,13 @@ def validate_kv_cache_compression_compatibility(
             f"{guidance}")
     mode = spec_config.spec_dec_mode
     if config.algorithm == "quantization_for_cold_page":
-        # A DFlash drafter without a separate draft KVCM keeps its context K/V
-        # in worker-owned buffers, so the codec only ever sees target pages.
-        dflash_without_draft_kvcm = (
-            mode.is_dflash()
-            and not should_use_separate_draft_kv_cache(spec_config))
+        # A VANILLA or FA4 DFlash drafter keeps its context K/V in worker-owned
+        # buffers, so the codec only ever sees target pages; a TRTLLM drafter's
+        # layers must share the target's manager, where the codec keeps them
+        # lossless (KvCacheCreator._check_dflash_cold_page_sharing).
         supported = (mode.is_mtp_eagle_one_model()
-                     or mode.is_eagle3_one_model() or dflash_without_draft_kvcm)
-        guidance = ("one-model MTP-EAGLE or EAGLE3, or DFlash without a "
-                    "separate draft KV cache")
+                     or mode.is_eagle3_one_model() or mode.is_dflash())
+        guidance = "one-model MTP-EAGLE or EAGLE3, or DFlash"
     else:
         supported = mode.is_mtp_one_model() or mode.is_eagle3_one_model()
         guidance = "one-model MTP or EAGLE3"

@@ -100,6 +100,7 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_ops.rmsnorm_fp4_quant import rmsnorm_fp4_quant_available
 from ..modules.linear import Linear, TensorParallelMode
+from ..modules.logit_soft_cap import soft_capped_logits
 from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from ..moe.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
@@ -1638,8 +1639,7 @@ class MuseSparkOpenLogitsProcessor(LogitsProcessor):
         return_context_logits: bool = False,
     ) -> torch.Tensor:
         logits = super().forward(hidden_states, lm_head, attn_metadata, return_context_logits)
-        logits = logits.float() * self.logit_multiplier
-        return self.soft_cap * torch.tanh(logits / self.soft_cap)
+        return soft_capped_logits(logits, self.logit_multiplier, self.soft_cap)
 
 
 def _attention_allreduce_strategy() -> AllReduceStrategy:

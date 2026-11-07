@@ -81,7 +81,12 @@ from tensorrt_llm.logger import logger
 from ... import spec_worker as _drafter_worker
 from ...ops.embedding.replicated_gather import replicated_embedding_gather
 from ...ops.spec.dflash_accept import FORCE_FRACTIONAL
-from ...ops.spec.dflash_verify_fold import MAX_REQUESTS, VerifyFold, dflash_verify_fold
+from ...ops.spec.dflash_verify_fold import (
+    ACCEPTED_GIVEN,
+    MAX_REQUESTS,
+    VerifyFold,
+    dflash_verify_fold,
+)
 from ...ops.spec.draft_path_walk_tail import draft_path_walk_tail
 from ..draft_head import head as _draft_head
 from ..replicated_embedding import embedding as _replicated_embedding
@@ -95,6 +100,7 @@ OVERRIDDEN = (
     "_forward_impl",
     "sample_and_accept_draft_tokens",
     "_sample_and_accept_draft_tokens_base",
+    "_sample_and_accept_draft_tokens_rejection",
     "_prepare_attn_metadata_for_dflash",
     "_prepare_kv_for_draft_forward",
     "prepare_1st_drafter_inputs",
@@ -171,6 +177,8 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
     """
 
     _fold_verify: bool = False
+    #: ``rejection_fold`` (with ``verify_fold``): a rejection-sampled step's bookkeeping too.
+    _fold_rejection: bool = False
     _fold_path_walk_tail: bool = False
     #: Its ``_apply_dflash2_selector`` applies the draft head's deferred drafter
     #: logit transform (``draft_head.head._defers_transform``).
@@ -304,7 +312,6 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             return super()._sample_and_accept_draft_tokens_base(
                 logits, draft_tokens, num_contexts, batch_size, spec_metadata
             )
-        attn_metadata = step.attn_metadata
         runtime_draft_len = draft_tokens.shape[1]
         # fused_accept's statements up to its dflash_accept call.
         target_tokens = self._sample_tokens_for_batch(
@@ -315,6 +322,82 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
         if mode == FORCE_FRACTIONAL:
             self._ensure_force_accept_rng_state(logits.device)
             pool, counter = self._force_accept_rng_pool, self._force_accept_rng_counter
+        fold = self._launch_fold(
+            step,
+            target_tokens.reshape(-1),
+            draft_tokens,
+            num_contexts,
+            batch_size,
+            mode,
+            base_total,
+            max_total,
+            frac,
+            pool,
+            counter,
+        )
+        return fold.accepted, fold.num_accepted
+
+    def _sample_and_accept_draft_tokens_rejection(
+        self, logits, draft_tokens, draft_probs, num_contexts, batch_size, spec_metadata
+    ):
+        """The built-in rejection sampler, then its step's bookkeeping in one launch (``rejection_fold``).
+
+        The fold takes the sampler's accepted tokens and counts as given
+        (``ACCEPTED_GIVEN``): the forced override has already run inside the
+        built-in method, so the fold neither recomputes nor bumps anything there.
+        """
+        accepted, num_accepted = super()._sample_and_accept_draft_tokens_rejection(
+            logits, draft_tokens, draft_probs, num_contexts, batch_size, spec_metadata
+        )
+        if not self._fold_rejection:
+            return accepted, num_accepted
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        step = self._fold_current()
+        if not (
+            self._verify_fold_applies(
+                step, logits, draft_tokens, num_contexts, batch_size, spec_metadata
+            )
+            and accepted.dtype == torch.int32
+            and num_accepted.dtype == torch.int32
+            and tuple(accepted.shape) == (batch_size, draft_tokens.shape[1] + 1)
+            and accepted.is_contiguous()
+            and num_accepted.is_contiguous()
+        ):
+            return accepted, num_accepted
+        fold = self._launch_fold(
+            step,
+            accepted.reshape(-1),
+            draft_tokens,
+            num_contexts,
+            batch_size,
+            ACCEPTED_GIVEN,
+            0,
+            0,
+            0.0,
+            None,
+            None,
+            given_counts=num_accepted,
+        )
+        return fold.accepted, fold.num_accepted
+
+    def _launch_fold(
+        self,
+        step,
+        target_tokens,
+        draft_tokens,
+        num_contexts,
+        batch_size,
+        mode,
+        base_total,
+        max_total,
+        frac,
+        pool,
+        counter,
+        given_counts=None,
+    ) -> VerifyFold:
+        """``dflash_verify_fold`` on this step, and the rewind it now owes."""
+        attn_metadata = step.attn_metadata
         seq_lens = attn_metadata._seq_lens_cuda
         bumps_kv_lens = hasattr(attn_metadata, "kv_lens_cuda")
         fold = dflash_verify_fold(
@@ -333,6 +416,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             int(self._fold_mask_token_id(step.draft_model)),
             attn_metadata.kv_lens_cuda if bumps_kv_lens else None,
             seq_lens,
+            given_counts=given_counts,
         )
         step.fold, step.seq_lens_source = fold, seq_lens
         if bumps_kv_lens:
@@ -344,7 +428,7 @@ class SpecLoopFoldDFlashWorker(DFlashWorker):
             self._kv_rewind_nc = num_contexts
             self._kv_rewind_bs = batch_size
             self._kv_rewind_pending = True
-        return fold.accepted, fold.num_accepted
+        return fold
 
     def _prepare_attn_metadata_for_dflash(self, attn_metadata, spec_metadata):
         method = "_prepare_attn_metadata_for_dflash"
@@ -724,12 +808,14 @@ def install(
     declined: Optional[Callable[..., None]] = None,
     verify_pdl: bool = False,
     late_join: bool = False,
+    rejection: bool = False,
 ) -> bool:
     """Re-class the DFlash worker for the verify fold (``verify_fold``) and the path-walk tail
     (``path_walk_tail``) asked for; return whether anything changed.
 
-    ``preamble``, ``declined``, ``verify_pdl`` and ``late_join`` are ignored. Idempotent; the
-    shell calls it from every drafter load hook,
+    ``rejection`` (``rejection_fold``, with ``verify_fold``) folds a rejection-sampled
+    step's bookkeeping too. ``preamble``, ``declined``, ``verify_pdl`` and ``late_join`` are
+    ignored. Idempotent; the shell calls it from every drafter load hook,
     after ``draft_head.install`` and ``drafter_worker.install``.
 
     Raises:
@@ -747,13 +833,16 @@ def install(
     reason = unsupported_reason(spec_worker, verify_fold, path_walk_tail)
     if reason is not None:
         raise ValueError(f"[musespark_open] {','.join(selected)} cannot run here: {reason}")
+    rejection = bool(rejection and verify_fold)
     if isinstance(spec_worker, SpecLoopFoldDFlashWorker):
         changed = (
             spec_worker._fold_verify,
             spec_worker._fold_path_walk_tail,
-        ) != (verify_fold, path_walk_tail)
+            spec_worker._fold_rejection,
+        ) != (verify_fold, path_walk_tail, rejection)
         spec_worker._fold_verify = verify_fold
         spec_worker._fold_path_walk_tail = path_walk_tail
+        spec_worker._fold_rejection = rejection
         return changed
     cls = type(spec_worker)
     composed = _COMPOSED_WORKERS.get(cls)
@@ -770,10 +859,12 @@ def install(
     spec_worker.__class__ = composed
     spec_worker._fold_verify = verify_fold
     spec_worker._fold_path_walk_tail = path_walk_tail
+    spec_worker._fold_rejection = rejection
     sites = [
         name
         for on, name in (
             (verify_fold, "the acceptance kernel"),
+            (rejection, "the rejection-sampled steps' fold"),
             (path_walk_tail, "the draft-head walk"),
         )
         if on

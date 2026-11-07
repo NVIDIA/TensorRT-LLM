@@ -320,8 +320,26 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("fused_accept",),
     ),
     FastPath(
+        "paged_context_commit",
+        "the context-K/V fork's commit over a paged drafter context in one launch",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
+        "rejection_fold",
+        "a rejection-sampled step's bookkeeping folded into one launch after the rejection sampler",
+        "draft",
+        ("verify_fold",),
+    ),
+    FastPath(
         "path_walk_tail",
         "step bookkeeping folded into the draft-head walk",
+        "draft",
+        ("draft_head",),
+    ),
+    FastPath(
+        "draft_head_sampled",
+        "sampled drafts (rejection sampling) on the draft head's lattice, walked in one launch",
         "draft",
         ("draft_head",),
     ),
@@ -1027,7 +1045,7 @@ PRECONDITIONS: Tuple[Precondition, ...] = (
     Precondition(
         "ninja and nvcc for the head sampler's build (torch.utils.cpp_extension)",
         _head_sampler_toolchain,
-        ("split_sampler",),
+        ("split_sampler", "draft_head_sampled"),
     ),
 )
 

@@ -318,6 +318,11 @@ class _PrepareStager:
         first ``ceil(capacity / tokens_per_block) + 1`` columns (the batch maximum)
         carry everything read; the built-in copy moves all ``max_blocks_per_seq``.
 
+        The device table has one table per pool, or, for a manager with attention-op
+        pool groups (life cycles that mix page sizes, as a target and a drafter in one
+        manager), one per group: its life cycle's host rows at the group's scale and
+        K/V offset, with ``BAD_PAGE_INDEX`` kept, as the manager's own copy writes them.
+
         Returns:
             True if the copy is recorded; False if it is declined (the caller
             copies), which it is after an earlier decline.
@@ -329,8 +334,6 @@ class _PrepareStager:
             host is None
             or getattr(manager, "sparse_metadata_batch", None) is not None
             or getattr(manager, "_use_per_layer_page_tables", True)
-            # Shared attention-op tables are not the life cycles' SHARED-path tables.
-            or getattr(manager, "_attention_op_pool_groups", None) is not None
             or not dst.is_cuda
             or dst.dtype != torch.int32
             or host.dtype != torch.int32
@@ -338,7 +341,6 @@ class _PrepareStager:
             or not host.is_contiguous()
             or dst.dim() != 4
             or host.dim() != 4
-            or dst.shape[0] != host.shape[0]
             or dst.shape[2] != 2
             or dst.shape[3] != host.shape[3]
             or num_seqs > dst.shape[1]
@@ -362,33 +364,53 @@ class _PrepareStager:
         rows = copy_idx.tolist()
         if len(rows) != num_seqs:
             return self._decline_blocks("block offsets: copy index length")
-        scales = [int(s) for s in manager._index_scale_ints]
-        kv_offsets = [int(o) for o in manager.kv_offset.tolist()]
+        # Per device table: (host pool, scale, K/V offset, word for a BAD_PAGE_INDEX page).
+        groups = getattr(manager, "_attention_op_pool_groups", None)
+        if groups is None:
+            scales = [int(s) for s in manager._index_scale_ints]
+            kv_offsets = [int(o) for o in manager.kv_offset.tolist()]
+            tables = [(pool, scales[pool], kv_offsets[pool], 0) for pool in range(host.shape[0])]
+        else:
+            from tensorrt_llm.runtime.kv_cache_manager_v2 import BAD_PAGE_INDEX
+
+            tables = [
+                (int(g.pool_id), int(g.scale), int(g.kv_offset), BAD_PAGE_INDEX) for g in groups
+            ]
+        if dst.shape[0] != len(tables):
+            return self._decline_blocks("block offsets: layout or manager mode")
         host_rows, dst_rows = host.shape[1], dst.shape[1]
-        # (pool, seq, host row, column runs): one full-width run per row.
+        # (table, seq, host row, column runs): one full-width run per row.
         plan = [
-            (pool, seq, row, [(0, cols)])
-            for pool in range(host.shape[0])
+            (table, seq, row, [(0, cols)])
+            for table in range(len(tables))
             for seq, row in enumerate(rows)
         ]
-        if not self.staging.room(sum(len(runs) for *_, runs in plan)):
+        # A drafter in the manager reads its rows past the readable columns for their extent,
+        # so attention-op tables hold the bad-page word there, as the manager's own copy writes.
+        tail = num_blocks - cols if groups is not None else 0
+        if not self.staging.room(sum(len(runs) + 2 * (tail > 0) for *_, runs in plan)):
             return self._decline_blocks("staging block full")
         st = self.staging
         copied = 0
-        for pool, seq, row, runs in plan:
+        for table, seq, row, runs in plan:
+            pool, scale, kv_offset, bad_page = tables[table]
             src = _addr(host, (pool * host_rows + row) * 2 * num_blocks)
-            k = _addr(dst, (pool * dst_rows + seq) * 2 * num_blocks)
-            v = _addr(dst, ((pool * dst_rows + seq) * 2 + 1) * num_blocks)
+            k = _addr(dst, (table * dst_rows + seq) * 2 * num_blocks)
+            v = _addr(dst, ((table * dst_rows + seq) * 2 + 1) * num_blocks)
             for lo, hi in runs:
                 st.blocks(
                     self._dst(k + lo * 4, (hi - lo) * 4),
                     self._dst(v + lo * 4, (hi - lo) * 4),
                     src + lo * 4,
                     hi - lo,
-                    scales[pool],
-                    kv_offsets[pool],
+                    scale,
+                    kv_offset,
+                    bad_page,
                 )
                 copied += hi - lo
+            if tail:
+                st.fill(self._dst(k + cols * 4, tail * 4), 1, tail, bad_page)
+                st.fill(self._dst(v + cols * 4, tail * 4), 1, tail, bad_page)
         self.block_cols = cols
         self.block_seqs = num_seqs
         return True
@@ -493,7 +515,7 @@ class _PrepareStager:
         if not self.staging.room(len(rows)):
             return None
         for row in rows:
-            self.staging._add(*(int(v) for v in row[:7]))
+            self.staging._add(*(int(v) for v in row))
         return (input_ids.data_ptr(), position_ids.data_ptr(), n)
 
 
