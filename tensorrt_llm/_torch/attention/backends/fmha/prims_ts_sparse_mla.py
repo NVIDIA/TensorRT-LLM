@@ -25,7 +25,9 @@ the TRTLLM-Gen sparse MLA kernel the fallback library runs.
 The adapter consumes the dual-pool global indices that
 ``DeepseekV4TrtllmAttention.sparse_attn_predict`` already produces: SWA slots
 are storage rows of the SWA pool and compressed slots are storage rows of the
-layer's compress pool, so no page-table conversion happens here. The kernel
+layer's compress pool, so no page-table conversion happens here. With KV-cache
+offload, a ratio-4 layer's compressed slots are rows of its sparse cache arena
+instead, and the arena is the extra source. The kernel
 takes the two index lists and their live lengths directly; ``-1`` holes before a
 live length are masked in the kernel only on the configurations that can produce
 them (KV-cache offload, heuristic top-k), otherwise the plan promises valid
@@ -253,6 +255,11 @@ class PrimsTSSparseMlaFmha(Fmha):
             metadata.kv_cache_manager, "swa_pool_ptr"
         ):
             return "a DeepSeek-V4 KV cache manager is required."
+        if self._reads_sparse_arena(metadata) and (
+            attn.layer_idx not in metadata.sparse_offload_state.layers
+            or not hasattr(metadata.kv_cache_manager, "get_sparse_compress_buffers")
+        ):
+            return "the offloaded layer has no sparse cache arena."
         if metadata.beam_width != 1:
             return "beam search is not supported."
         if getattr(metadata, "token_positions_cuda", None) is None:
@@ -341,6 +348,17 @@ class PrimsTSSparseMlaFmha(Fmha):
         from tensorrt_llm.bindings import DataType
 
         return metadata.kv_cache_manager.dtype == DataType.FP8
+
+    def _reads_sparse_arena(self, metadata: "TrtllmAttentionMetadata") -> bool:
+        """Whether this layer's compressed rows sit in the sparse cache arena.
+
+        KV-cache offload covers the ratio-4 layers only; the others keep their
+        compress pool. Only DeepSeek-V4 metadata defines ``sparse_offload_state``.
+        """
+        return (
+            int(self.attn.compress_ratio) == 4
+            and getattr(metadata, "sparse_offload_state", None) is not None
+        )
 
     def _extra_capacity(self, metadata: "DeepseekV4TrtllmAttentionMetadata") -> int:
         ratio = int(self.attn.compress_ratio)
@@ -836,7 +854,12 @@ class PrimsTSSparseMlaFmha(Fmha):
         extra_pool = None
         run_kwargs = {}
         if extra:
-            extra_pool = self._pool_view(manager, DeepseekV4AttentionType.COMPRESS, ratio)
+            if self._reads_sparse_arena(metadata):
+                # sparse_attn_predict emits arena rows relative to the data arena's
+                # base; the manager's cached view of it is rooted there.
+                extra_pool = manager.get_sparse_compress_buffers(attn.layer_idx)[0]
+            else:
+                extra_pool = self._pool_view(manager, DeepseekV4AttentionType.COMPRESS, ratio)
             run_kwargs["extra_indices"] = indices[:, window:]
             run_kwargs["extra_lengths"] = metadata.sparse_mla_extra_lens[ratio][start:end]
 

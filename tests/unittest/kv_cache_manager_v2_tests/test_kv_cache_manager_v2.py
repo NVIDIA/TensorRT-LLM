@@ -693,6 +693,106 @@ class TestSparseBufferConfig(unittest.TestCase):
         finally:
             manager.shutdown()
 
+    def test_each_arena_pool_has_a_zeroed_tile_tail(self):
+        import ctypes
+
+        import cuda.bindings.runtime as cudart
+
+        def aligned(size: int) -> int:
+            return (size + 255) // 256 * 256
+
+        init_cuda_once()
+        # Exercise 32, 64, 128 and 256 stored rows per page, multiple layers and
+        # multiple leases. The guard is always 128 rows for each whole pool.
+        for tokens_per_block, unit_tokens, num_layers, max_leases in (
+            (128, 4, 1, 1),
+            (128, 2, 2, 3),
+            (128, 1, 2, 3),
+            (256, 1, 2, 3),
+        ):
+            with self.subTest(
+                tokens_per_block=tokens_per_block,
+                unit_tokens=unit_tokens,
+                num_layers=num_layers,
+                max_leases=max_leases,
+            ):
+                units_per_page = tokens_per_block // unit_tokens
+                units_per_buffer = 3 * units_per_page
+                row_bytes = {"key": 576, "key_scale": 36}
+                manager = KVCacheManager(
+                    KVCacheManagerConfig(
+                        tokens_per_block=tokens_per_block,
+                        cache_tiers=[GpuCacheTierConfig(64 << 20)],
+                        constraints=[
+                            BatchDesc(
+                                kv_caches=[KVCacheDesc(capacity=1024, history_length=0)]
+                                * max_leases
+                            )
+                        ],
+                        layers=[
+                            AttentionLayerConfig(
+                                layer,
+                                [
+                                    BufferConfig(role, units_per_page * size, is_sparse=True)
+                                    for role, size in row_bytes.items()
+                                ]
+                                + [BufferConfig("index", 256)],
+                                sparse_cache=SparseCacheConfig(
+                                    num_selected_blocks=2,
+                                    max_cached_units=units_per_buffer,
+                                    unit_tokens=unit_tokens,
+                                ),
+                            )
+                            for layer in range(num_layers)
+                        ],
+                    )
+                )
+                try:
+                    with TemporaryCudaStream([]) as stream:
+                        batch = Batch(
+                            manager,
+                            cast(CudaStream, stream.handle),
+                            max_batch_size=max_leases,
+                            max_blocks_per_seq=8,
+                            index_tables=manager.sparse_index_table_specs(),
+                        )
+                        usable_rows = max_leases * num_layers * units_per_buffer
+                        regions = sorted(
+                            (
+                                int(batch.get_sparse_cache_base_address(LayerId(0), role)),
+                                usable_rows * size,
+                                128 * size,
+                            )
+                            for role, size in row_bytes.items()
+                        )
+                        # Each region pads its payload and tail to 256 bytes, which the
+                        # one-lease key_scale region needs. No guard is allocated for the
+                        # dense indexer's empty arena region.
+                        first_base, first_payload, first_tail = regions[0]
+                        self.assertEqual(
+                            regions[1][0] - first_base, aligned(first_payload + first_tail)
+                        )
+                        metadata_bytes = aligned(num_layers * units_per_buffer * 4)
+                        self.assertEqual(
+                            batch.sparse_arena_bytes,
+                            sum(aligned(payload + tail) for _, payload, tail in regions)
+                            + 3 * 256
+                            + max_leases * metadata_bytes,
+                        )
+                        self.assertEqual(manager.get_sparse_cache_max_units(0), units_per_buffer)
+                        for base, payload, tail in regions:
+                            sink = (ctypes.c_ubyte * tail)()
+                            (err,) = cudart.cudaMemcpy(
+                                ctypes.addressof(sink),
+                                base + payload,
+                                tail,
+                                cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                            )
+                            self.assertEqual(int(err), 0)
+                            self.assertEqual(bytes(sink), bytes(tail))
+                finally:
+                    manager.shutdown()
+
     def test_sparse_sizing_defaults_and_roundtrip(self):
         plain = BufferConfig("key", 4096)
         self.assertFalse(plain.is_sparse)
@@ -1049,26 +1149,32 @@ class TestSparseCacheReservation(unittest.TestCase):
         return sum(stats.free for stats in manager.get_storage_statistics())
 
     def test_batch_rejects_resolve_shared_memory_overflow_before_fetch(self) -> None:
-        for max_cached_units, selection_width in ((1 << 20, 2), (1 << 16, (1 << 16) - 1)):
-            with self.subTest(max_cached_units=max_cached_units, selection_width=selection_width):
-                # Token-sized units keep the arena small while either residency metadata
-                # or the selection's probe table exceeds a device's per-block limit.
-                manager = self._manager(
-                    max_cached_units,
-                    num_selected_blocks=selection_width,
-                    unit_tokens=1,
+        # Token-sized units keep the arena small. The widest cache the probe index can name,
+        # 16256 units at 128 per page, needs about 80 KiB for its residency metadata, so the
+        # selection's probe table and miss lists are what exceed a device's per-block limit.
+        manager = self._manager(16256, num_selected_blocks=16255, unit_tokens=1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
+                Batch(
+                    manager,
+                    NULL_STREAM,
+                    max_batch_size=1,
+                    max_blocks_per_seq=4,
+                    index_tables=manager.sparse_index_table_specs(),
                 )
-                try:
-                    with self.assertRaisesRegex(RuntimeError, "above this device's limit"):
-                        Batch(
-                            manager,
-                            NULL_STREAM,
-                            max_batch_size=1,
-                            max_blocks_per_seq=4,
-                            index_tables=manager.sparse_index_table_specs(),
-                        )
-                finally:
-                    manager.shutdown()
+        finally:
+            manager.shutdown()
+
+    def test_a_cache_wider_than_the_probe_index_fails_with_the_config(self) -> None:
+        # The probe index names at most 16382 entries, which round down to 16256 token-sized
+        # units at 128 per page. A wider cache fails when the config is built, before a
+        # Batch sizes any resolve.
+        for max_cached_units in (16257, 1 << 20):
+            with self.subTest(max_cached_units=max_cached_units):
+                with self.assertRaisesRegex(
+                    RuntimeError, "exceeds the supported capacity of 16256 units"
+                ):
+                    self._manager(max_cached_units, unit_tokens=1)
 
     def test_batch_accepts_resolve_shared_memory_that_fits(self) -> None:
         # Three token-sized units round up to a full 128-unit cell.
@@ -1647,7 +1753,7 @@ class TestSparseCacheReservation(unittest.TestCase):
 
 
 class TestSparseResolve(unittest.TestCase):
-    """The sparse resolve kernel: probe index, victim choice and recency rebuild."""
+    """The sparse resolve kernel: probe index, victim choice and the ages it leaves."""
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -1662,7 +1768,7 @@ class TestSparseResolve(unittest.TestCase):
         selected: list[int],
         *,
         num_layers: int = 1,
-        lru: list[int] | None = None,
+        ages: list[int] | None = None,
         history_units: int = 1 << 20,
         capacity_units: int | None = None,
         max_in_flight_units: int = 0,
@@ -1671,13 +1777,11 @@ class TestSparseResolve(unittest.TestCase):
     ):
         entries = len(resident) // (num_layers * num_rows)
         width = len(selected) // (num_layers * num_rows)
-        if lru is None:
-            lru = list(range(entries)) * num_layers * num_rows
         history = [history_units] * num_rows
         capacity = [history_units if capacity_units is None else capacity_units] * num_rows
         return _introspection.sparse_resolve(
             resident,
-            lru,
+            ages or [],
             num_layers,
             entries,
             selected,
@@ -1710,29 +1814,33 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[1:], [-1, -1])
 
     def test_hits_outrank_units_fetched_this_step(self):
+        """Both entries are used this step, and the history flag is what separates them."""
         # Entry 0 holds unit 10 and is selected; unit 99 is new.
         resident = [10] + self._free(7)
         result = self._resolve(resident, [10, 99])
         fetched = result.out_slot[1]
-        self.assertEqual(result.lru_order[0], 0, "the hit should be most recently used")
-        self.assertEqual(result.lru_order[1], fetched, "the fetch ranks below the hit")
+        self.assertEqual(result.entry_age[0], 0)
+        self.assertEqual(result.entry_hit[0], 1, "the entry already held its unit")
+        self.assertEqual(result.entry_age[fetched], 0)
+        self.assertEqual(result.entry_hit[fetched], 0, "the unit was fetched into the entry")
 
-    def test_victims_come_from_the_lru_tail(self):
-        # A full cache, with entry 2 placed last in recency so it is the victim.
+    def test_victims_are_the_stalest_entries(self):
+        # A full cache, with entry 2 the oldest so it is the victim.
         resident = [10, 11, 12, 13]
-        lru = [0, 1, 3, 2]
-        result = self._resolve(resident, [99], lru=lru)
+        result = self._resolve(resident, [99], ages=[1, 1, 9, 1])
         self.assertEqual(result.miss_count, [1])
         self.assertEqual(result.out_slot, [2])
         self.assertEqual(result.resident_ordinal[2], 99)
-        # The units that were not selected keep their data.
+        # The units that were not selected keep their data, and age by nothing: the step
+        # clock only advances between resolves.
         self.assertEqual([result.resident_ordinal[i] for i in (0, 1, 3)], [10, 11, 13])
+        self.assertEqual([result.entry_age[i] for i in (0, 1, 3)], [1, 1, 1])
 
     def test_in_flight_entries_are_never_evicted(self):
         # Unit 12 is at or above the watermark, so it holds the only copy of its data.
         resident = [10, 11, 12, 13]
-        lru = [0, 1, 3, 2]  # entry 2 (unit 12) is least recently used
-        result = self._resolve(resident, [99], lru=lru, history_units=12)
+        ages = [1, 1, 9, 1]  # entry 2 (unit 12) is the oldest
+        result = self._resolve(resident, [99], ages=ages, history_units=12)
         self.assertEqual(result.resident_ordinal[2], 12, "an in-flight unit must survive")
         self.assertEqual(result.resident_ordinal[result.out_slot[0]], 99)
 
@@ -1840,35 +1948,20 @@ class TestSparseResolve(unittest.TestCase):
         self.assertEqual(result.out_slot[0], 0)
         self.assertEqual(result.resident_ordinal[2 + result.out_slot[2]], 42)
 
-    def test_large_caches_preserve_victims_and_recency_order(self):
-        """Hits, fetched victims, and untouched entries retain their relative order."""
-        import cuda.bindings.runtime as cudart
-
-        # The 8192-entry case needs 147552 bytes of dynamic shared memory per resolve block,
-        # on top of what the kernel declares statically.
-        err, device = cudart.cudaGetDevice()
-        self.assertEqual(int(err), int(cudart.cudaError_t.cudaSuccess))
-        err, shared_optin = cudart.cudaDeviceGetAttribute(
-            cudart.cudaDeviceAttr.cudaDevAttrMaxSharedMemoryPerBlockOptin, device
-        )
-        self.assertEqual(int(err), int(cudart.cudaError_t.cudaSuccess))
-        if shared_optin < 160 << 10:
-            self.skipTest(
-                f"needs 160 KiB of shared memory per block; this device allows {shared_optin}"
-            )
+    def test_large_caches_evict_the_free_entries_then_the_stalest(self):
+        """Free entries go first, then the oldest, and every other entry is left alone."""
         for entries in (31, 32, 33, 255, 256, 257, 2048, 4096, 4224, 8192):
             with self.subTest(entries=entries):
                 rng = random.Random(entries)
                 history = 100000
                 in_flight = 4
+                count = min(entries // 4, 512)
+                num_free = min(entries // 8, count // 2)
                 resident = list(range(entries - in_flight)) + list(
                     range(history, history + in_flight)
                 )
-                resident[: entries // 8] = self._free(entries // 8)
+                resident[:num_free] = self._free(num_free)
                 rng.shuffle(resident)
-                lru = list(range(entries))
-                rng.shuffle(lru)
-                count = min(entries // 4, 512)
                 hits = rng.sample(
                     [ordinal for ordinal in resident if 0 <= ordinal < history], count
                 )
@@ -1880,18 +1973,22 @@ class TestSparseResolve(unittest.TestCase):
                     for slot, ordinal in enumerate(resident)
                     if ordinal in hits or history <= ordinal < history + in_flight
                 }
-                eligible = [slot for slot in lru if slot not in hit_slots]
-                victims = set(eligible[-count:])
-                expected_lru = (
-                    [slot for slot in lru if slot in hit_slots]
-                    + [slot for slot in lru if slot in victims]
-                    + [slot for slot in lru if slot not in hit_slots | victims]
-                )
+                free_slots = {slot for slot, ordinal in enumerate(resident) if ordinal < 0}
+                # Two ages, far enough apart that the cache has to take the older group
+                # whole before it reaches anything else.
+                eligible = [
+                    slot
+                    for slot in range(entries)
+                    if slot not in hit_slots and slot not in free_slots
+                ]
+                stale = set(rng.sample(eligible, count - num_free))
+                ages = [9 if slot in stale else 1 for slot in range(entries)]
+                victims = free_slots | stale
                 try:
                     result = self._resolve(
                         resident,
                         selected,
-                        lru=lru,
+                        ages=ages,
                         history_units=history,
                         capacity_units=history + in_flight,
                         max_in_flight_units=in_flight,
@@ -1901,7 +1998,6 @@ class TestSparseResolve(unittest.TestCase):
                         raise unittest.SkipTest(str(error)) from error
                     raise
                 self.assertEqual(result.miss_count, [count])
-                self.assertEqual(result.lru_order, expected_lru)
                 fetched_slots = set()
                 for ordinal, slot in zip(selected, result.out_slot):
                     if ordinal < 0:
@@ -1914,40 +2010,42 @@ class TestSparseResolve(unittest.TestCase):
                 for slot, ordinal in enumerate(resident):
                     if slot not in victims:
                         self.assertEqual(result.resident_ordinal[slot], ordinal)
+                # Every entry the step used is now the youngest there is, and the flag
+                # separates the ones that were already holding their unit.
+                for slot in range(entries):
+                    if slot in victims:
+                        self.assertEqual((result.entry_age[slot], result.entry_hit[slot]), (0, 0))
+                    elif slot in hit_slots - free_slots:
+                        self.assertEqual((result.entry_age[slot], result.entry_hit[slot]), (0, 1))
+                    else:
+                        self.assertEqual(result.entry_age[slot], ages[slot])
                 self.assertEqual(
                     result.in_flight_slot,
                     [resident.index(history + i) for i in range(in_flight)],
                 )
 
-    def test_colliding_selections_preserve_slots_and_recency(self) -> None:
-        """Sparse ordinals and padding preserve the same eviction and stable-order contract."""
+    def test_colliding_selections_preserve_slots_and_eviction(self) -> None:
+        """Sparse ordinals and padding preserve the same eviction contract."""
         for entries in (63, 257, 2080):
             with self.subTest(entries=entries):
-                history = 1 << 28
-                resident = [i * 2048 for i in range(entries - 2)] + [history, history + 1]
-                lru = list(range(entries))
-                random.Random(entries).shuffle(lru)
+                history = 200000
+                resident = [i * 64 for i in range(entries - 2)] + [history, history + 1]
                 count = min(entries // 4, 32)
                 hits = resident[:count]
-                misses = [(entries + i) * 2048 for i in range(count)]
+                misses = [(entries + i) * 64 for i in range(count)]
                 selected = [-1, *misses, -1, *reversed(hits), -1]
                 hit_slots = set(range(count)) | {entries - 2, entries - 1}
-                eligible = [slot for slot in lru if slot not in hit_slots]
-                victims = set(eligible[-count:])
-                expected_lru = (
-                    [slot for slot in lru if slot in hit_slots]
-                    + [slot for slot in lru if slot in victims]
-                    + [slot for slot in lru if slot not in hit_slots | victims]
-                )
+                eligible = [slot for slot in range(entries) if slot not in hit_slots]
+                victims = set(random.Random(entries).sample(eligible, count))
+                ages = [9 if slot in victims else 1 for slot in range(entries)]
                 result = self._resolve(
                     resident,
                     selected,
-                    lru=lru,
+                    ages=ages,
                     history_units=history,
                     capacity_units=history + 2,
                     max_in_flight_units=4,
                 )
-                self.assertEqual(result.lru_order, expected_lru)
                 self.assertEqual(result.miss_count, [count])
                 self.assertEqual(result.miss_total, [count])
                 self.assertEqual(result.in_flight_slot, [entries - 2, entries - 1, -1, -1])
@@ -2045,7 +2143,7 @@ class TestSparseUnitCopy(unittest.TestCase):
 
     def test_layers_land_in_their_own_sub_slot(self):
         # A cold page concatenates two layers' buffers; the cache cell is derived.
-        unit, layers = 16, 2
+        unit, layers, cells = 16, 2, 2
         host = self._pattern(unit * layers)
         result = _introspection.sparse_unit_copy(
             host_pool=host,
@@ -2055,10 +2153,10 @@ class TestSparseUnitCopy(unittest.TestCase):
             # offset array: slot 0 of a pool coalescing two buffers converts to index 0 or
             # 1, and layer 0 is given the second.
             page_table=[1, 0],
-            device_arena=[0] * (unit * layers),
+            device_arena=[0] * (unit * layers * cells),
             base_cell=0,
             num_blocks=1,
-            cells_per_buffer=1,
+            cells_per_buffer=cells,
             buffer_bytes=unit,
             num_chunks=1,
             chunk_bytes=unit,
@@ -2066,15 +2164,18 @@ class TestSparseUnitCopy(unittest.TestCase):
             unit_stride=unit,
             expansion=1,
             miss_ordinal=[0, 0],
-            miss_slot=[0, 0],
+            # Each layer reads its own work list, so the layers name different entries.
+            miss_slot=[0, 1],
             miss_count=[1, 1],
             selection_width=1,
             buffer_layer=list(range(layers)),
         )
         # The cold page comes from the entry and the hot cell is arithmetic on the sub-slot,
-        # so layer 0 reads the second cold buffer into cell 0, and layer 1 the reverse.
+        # so layer 0 reads the second cold buffer into its first cell, and layer 1 the first
+        # cold buffer into its second.
         self.assertEqual(result[:unit], host[unit:])
-        self.assertEqual(result[unit:], host[:unit])
+        self.assertEqual(result[unit : 3 * unit], [0] * (2 * unit))
+        self.assertEqual(result[3 * unit :], host[:unit])
 
     def test_a_layer_without_misses_copies_nothing(self):
         unit = 16
@@ -3634,16 +3735,25 @@ class TestBatchPageTable(unittest.TestCase):
         them: the members' own mutations, and the watermarks and views publish() stages
         itself. Waiting inside publish() would cover only the second, and would do it while
         hiding that a member mutated before the call had already raced.
+
+        The refusal comes before publish() stages anything, the eviction clock included: the
+        copy in flight may still be reading the staged clock, and a refused step must not
+        count, so the next accepted publish advances the clock by exactly one.
         """
         with self._fixture() as (torch, manager, batch, handle):
             with self._member(manager, batch, 0, handle):
+                step_age, staged = _introspection.batch_sparse_clock(batch)
                 # _member's resize() published and nobody has waited on it.
                 with self.assertRaises(Exception) as caught:
                     batch.publish()
                 self.assertIn("still reading the staged rows", str(caught.exception))
+                self.assertEqual(_introspection.batch_sparse_clock(batch), (step_age, staged))
 
                 batch.wait_published()
                 batch.publish()
+                self.assertEqual(
+                    _introspection.batch_sparse_clock(batch), (step_age + 1, staged + 1)
+                )
 
     def test_a_member_refuses_a_second_page_index_buffer(self):
         """Its indices live in the Batch's row, so a second buffer is refused.
@@ -4496,11 +4606,11 @@ class TestSparseWriteIndices(unittest.TestCase):
         that treated its entry as an ordinary miss would copy stale bytes over what the model
         wrote. Removing that guard fails this.
 
-        It does not cover the separate `pinned` term in the victim test. Every in-flight
+        It does not cover the separate held-entry term in the victim test. Every in-flight
         ordinal is probed in the resolve's required prefix, so its entry is always classified
-        hit or fetched and never `kClassUntouched` -- which the victim test already excludes.
-        Dropping `pinned` leaves every test here passing, so it appears to be redundant with
-        that classification rather than load-bearing.
+        as matched and never as evictable -- which the victim test already excludes. Dropping
+        the held term leaves every test here passing, so it appears to be redundant with that
+        classification rather than load-bearing.
         """
         ctypes, cudart, torch = self._deps()
         manager = self._manager()

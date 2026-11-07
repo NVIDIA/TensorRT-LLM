@@ -770,7 +770,7 @@ def test_cancel_after_publication_cannot_overtake_request_data(
     protocol_order: list[str] = []
     initial_cancel_outcome: str | None = None
     thread_results: queue.Queue[Exception | None] = queue.Queue()
-    result_started = threading.Event()
+    result_recorded = threading.Event()
 
     receiver = object.__new__(Receiver)
     receiver._sessions_lock = threading.Lock()
@@ -834,13 +834,13 @@ def test_cancel_after_publication_cannot_overtake_request_data(
         session.cancel()
 
     def finish_writer() -> None:
-        result_started.set()
         session.process_kv_agent_result(
             peer_rank=0,
             receiver_slice_id=0,
             is_last_slice=True,
             status=AgentResult.FAILED,
         )
+        result_recorded.set()
 
     receive_thread = _start_checked_thread(receive, thread_results)
     cancel_thread = None
@@ -850,9 +850,8 @@ def test_cancel_after_publication_cannot_overtake_request_data(
         cancel_thread = _start_checked_thread(cancel, thread_results)
         initial_cancel_outcome = race_outcomes.get(timeout=10)
         result_thread = _start_checked_thread(finish_writer, thread_results)
-        assert result_started.wait(timeout=10)
-        assert result_thread.is_alive(), (
-            "terminal writer evidence should wait until REQUEST_DATA publication finishes"
+        assert result_recorded.wait(timeout=5), (
+            "terminal writer evidence must not wait for REQUEST_DATA publication"
         )
         assert not session.resources_drained(), (
             "terminal writer evidence authorized reuse before REQUEST_DATA publication finished"
@@ -1294,8 +1293,15 @@ def test_kv_payload_snapshot_is_shared_and_survives_same_peer_redispatch(
         device_id=0,
     )
     extractor = Mock()
+    # The write descriptor groups its fragments by the memory type of each side's pool.
     extractor.page_table = SimpleNamespace(
-        tokens_per_block=1, layer_groups=[SimpleNamespace(kind=CacheKind.PAGED)]
+        tokens_per_block=1,
+        layer_groups=[
+            SimpleNamespace(
+                kind=CacheKind.PAGED, pool_group_idx=0, pool_views=[SimpleNamespace(pool_idx=0)]
+            )
+        ],
+        pool_groups=[SimpleNamespace(pools=[SimpleNamespace(memory_type="VRAM")])],
     )
     regions = SimpleNamespace(
         src=SimpleNamespace(

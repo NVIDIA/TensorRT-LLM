@@ -775,6 +775,28 @@ class LongBenchV1(AccuracyTask):
                             apply_chat_template=True)
 
 
+class GovReport(AccuracyTask):
+    """ROUGE-L references for complete reports in the batched serving test.
+
+    The serving test selects reports using the model's chat tokenizer and
+    scores responses with LongBench's ``longbench_gov_report`` task.
+    """
+
+    DATASET = "gov_report"
+    DATASET_DIR = LongBenchV1.DATASET_DIR
+    METRIC_NAME = "ROUGE-L"
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50.0
+
+    NUM_SAMPLES = 32
+    MIN_INPUT_LEN = 6144
+    MAX_INPUT_LEN = 8192
+    MAX_OUTPUT_LEN = 512
+    MAX_BATCH_SIZE = 16
+    RANDOM_SEED = 0
+
+
 class LlmapiAccuracyTestHarness:
     # Model
     MODEL_NAME = None
