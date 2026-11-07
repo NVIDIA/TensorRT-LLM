@@ -53,6 +53,23 @@ def _make_server(key=_AUTH_KEY) -> RankInfoServer:
     return server
 
 
+@pytest.mark.parametrize("key", [None, b"rank-info-test-secret"])
+def test_transfer_worker_config_repr_omits_auth_key(key):
+    config = TransferWorkerConfig(
+        kv_cache_manager=Mock(),
+        device_id=0,
+        instance_name="test-instance",
+        rank_info_auth_key=key,
+    )
+
+    assert config.rank_info_auth_key == key
+    config_repr = repr(config)
+    assert "rank_info_auth_key" not in config_repr
+    if key is not None:
+        assert key.decode("ascii") not in config_repr
+    assert "test-instance" in config_repr
+
+
 def test_rank_info_server_challenges_unauthenticated_request():
     server = _make_server()
 

@@ -4883,7 +4883,7 @@ class TransferWorkerConfig:
     # trailing _BYTES, lowercased); dict > env > default. Ignored when
     # agent_buffer_size_mb == 0.
     agent_bounce_params: Optional[Dict[str, str]] = None
-    rank_info_auth_key: Optional[bytes] = None
+    rank_info_auth_key: Optional[bytes] = field(default=None, repr=False)
 
 
 class TransferWorker:
