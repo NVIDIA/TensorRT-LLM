@@ -72,6 +72,7 @@ from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     AttnLifeCycle,
     BatchDesc,
     BufferConfig,
+    CacheLevel,
     DataRole,
     KVCacheDesc,
     LayerId,
@@ -385,6 +386,8 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         # One (layer id, role) per layer group in the order _with_draft_pool_ratio
         # placed the pool ratio, checked against the native grouping once built.
         self._pool_ratio_groups: List[tuple] = []
+        # Name of each layer group, indexed by its life cycle id.
+        self._layer_group_names: List[str] = []
 
         if self.local_num_mamba_layers > 0:
             tp_size = _mamba_effective_tp_size(mapping)
@@ -523,6 +526,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                     "kv_cache_config.pool_ratio was placed for a layer-group order the native "
                     f"manager does not use (layer {layer_id} {role} is not in group {group})"
                 )
+        self._log_pool_group_slots()
 
         self._setup_state_pool()
 
@@ -1096,8 +1100,6 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         ``_check_pool_ratio_floors``.
         """
         ratio = config.initial_pool_ratio
-        if ratio is None:
-            return config
         keys: List[tuple] = []
         block_bytes: List[int] = []
         representatives: List[tuple] = []
@@ -1132,6 +1134,9 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             self._pool_ratio_group_name(layer_id, role, key, group == draft_group)
             for group, ((layer_id, role), key) in enumerate(zip(representatives, keys))
         ]
+        self._layer_group_names = names
+        if ratio is None:
+            return config
         groups = ", ".join(
             f"{group}: {name} (layer {layer_id} {role})"
             for group, (name, (layer_id, role)) in enumerate(zip(names, representatives))
@@ -1190,6 +1195,33 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             groups,
         )
         return config
+
+    def _log_pool_group_slots(self) -> None:
+        """Log the slots each pool group got on every cache level, named by its layer groups."""
+        for level, tier_name in enumerate(self._stats_cache_level_tier_names()):
+            cache_level = CacheLevel(level)
+            members: Dict[int, List[str]] = {}
+            for life_cycle, pool_group in enumerate(
+                self.impl.get_life_cycle_pool_group_indices(cache_level)
+            ):
+                name = (
+                    self._layer_group_names[life_cycle]
+                    if life_cycle < len(self._layer_group_names)
+                    else f"layer_group_{life_cycle}"
+                )
+                members.setdefault(int(pool_group), []).append(name)
+            entries = []
+            for pool_group, stats in enumerate(self._get_storage_statistics(cache_level)):
+                slot_bytes = sum(self._stats_slot_sizes(stats))
+                entries.append(
+                    f"{pool_group}: {'+'.join(members.get(pool_group, ['?']))} "
+                    f"num_slots={stats.total} slot_bytes={slot_bytes} "
+                    f"bytes={stats.total * slot_bytes}"
+                )
+            logger.info(
+                f"KV cache slots by pool group, cache level {level} ({tier_name}): "
+                + ", ".join(entries)
+            )
 
     # A full-history group pinned at its floor caps every full-history group
     # at that many blocks; another one holding this many times more is

@@ -418,6 +418,41 @@ def test_pool_ratio_group_at_floor_without_a_richer_group_warns(monkeypatch):
     assert "floor of 10" in warning
 
 
+def test_layer_group_names_are_recorded_without_a_pool_ratio():
+    manager, config = _k3_pool_ratio_manager_and_config(None)
+
+    assert manager._with_draft_pool_ratio(config) is config
+    assert manager._layer_group_names == ["ssm", "fp4_mla", "fp8_mla", "draft", "mla_hp_tail"]
+    assert manager._pool_ratio_groups == []
+
+
+def test_pool_group_slots_are_logged_per_cache_level(monkeypatch):
+    infos = _capture_log(monkeypatch, "info")
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager._layer_group_names = ["ssm", "fp4_mla", "fp8_mla"]
+    level_stats = [
+        [
+            SimpleNamespace(total=100, slot_sizes=[1000, 24]),
+            SimpleNamespace(total=7, slot_sizes=[64]),
+        ],
+        [SimpleNamespace(total=3, slot_sizes=[2048])],
+    ]
+    level_pool_groups = [[1, 0, 0], [0, 0, 0, 0]]
+    manager.impl = SimpleNamespace(
+        cache_tier_list=["GPU_MEM", "HOST_MEM"],
+        get_life_cycle_pool_group_indices=lambda level: level_pool_groups[level],
+    )
+    monkeypatch.setattr(manager, "_get_storage_statistics", lambda level: level_stats[level])
+
+    manager._log_pool_group_slots()
+
+    gpu, host = infos
+    assert gpu.startswith("KV cache slots by pool group, cache level 0 (")
+    assert "0: fp4_mla+fp8_mla num_slots=100 slot_bytes=1024 bytes=102400" in gpu
+    assert "1: ssm num_slots=7 slot_bytes=64 bytes=448" in gpu
+    assert "0: ssm+fp4_mla+fp8_mla+layer_group_3 num_slots=3 slot_bytes=2048" in host
+
+
 def test_base_manager_hooks_read_appended_draft_specs():
     manager = object.__new__(KVCacheManagerV2)
     manager.layer_specs = None
