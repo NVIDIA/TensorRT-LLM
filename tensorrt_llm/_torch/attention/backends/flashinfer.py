@@ -2822,6 +2822,8 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
                 custom_mask=attention_mask_data,
                 sm_scale=1 / (math.sqrt(self.head_dim) * self.q_scaling),
                 window_left=window_left,
+                # qo_indptr is the cumsum of seq_lens_cuda; seq_lens is its host copy.
+                max_len_extend=int(metadata.seq_lens[:num_contexts].max()),
             )
 
             if num_generations > 0:
