@@ -974,7 +974,7 @@ def launchTestListCheck(pipeline, globalVars)
             trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
 
             def llmPath = sh(script: "realpath ${LLM_ROOT}", returnStdout: true).trim()
-            sh "NVIDIA_TRITON_SERVER_VERSION=26.09 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
+            sh "NVIDIA_TRITON_SERVER_VERSION=26.10 LLM_ROOT=${llmPath} LLM_BACKEND_ROOT=${llmPath}/triton_backend " +
                "python3 ${llmPath}/scripts/check_test_list.py --l0 --qa --waive --validate --parity --check-duplicate-waives"
         }
     })

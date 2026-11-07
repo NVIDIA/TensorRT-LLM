@@ -1,5 +1,19 @@
 #!/bin/bash
 
+# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 set -ex
 
 # Align with the pre-installed cuDNN / cuBLAS / NCCL versions from the NGC PyTorch release notes:
@@ -12,13 +26,14 @@ CUDA_VER="13.4" # the NGC PyTorch image's CUDA_VERSION, major.minor
 # included, then ends up on a cuDNN anyone can install, and the tests validate that combination
 # rather than one only NGC can reproduce. The version guard below will not match on NGC PyTorch,
 # so its cuDNN is deliberately purged and reinstalled at this version.
-CUDNN_VER="9.26.0.51-1"
-NCCL_VER="2.31.2-1+cuda13.4"
+CUDNN_VER="9.27.0.42-1"
+NCCL_VER="2.32.3-1+cuda13.4"
+# The 26.10 image ships 13.8.1.7; use the closest publicly available package.
 CUBLAS_VER="13.8.0.4-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
-NVRTC_VER="13.4.59-1"
-CUDA_RUNTIME="13.4.49-1"
+NVRTC_VER="13.4.92-1"
+CUDA_RUNTIME="13.4.92-1"
 # Pin the cuda-compat that ships with CUDA_VER; the NGC PyTorch image reports a
 # CUDA_DRIVER_VERSION of its own that is typically never published as a package. The package
 # revision suffix is distro specific, so it is spelled out at each use site.

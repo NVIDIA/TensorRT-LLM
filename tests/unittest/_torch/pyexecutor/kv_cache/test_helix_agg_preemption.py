@@ -21,6 +21,7 @@ preemption and request state, not attention.
 """
 
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Optional
 from unittest.mock import Mock, patch
@@ -275,10 +276,27 @@ def _step(
     return decided
 
 
+@pytest.fixture
+def helix_ranks(
+    scenario_name: str,
+) -> Iterator[list[tuple[KVCacheManagerV2, KVCacheV2Scheduler]]]:
+    """Shut down cache managers before their scheduler reference cycles are collected."""
+    ranks = []
+    try:
+        for cp_rank in range(CP_SIZE):
+            ranks.append(_make_rank(cp_rank, SCENARIOS[scenario_name]))
+        yield ranks
+    finally:
+        for manager, _ in reversed(ranks):
+            manager.shutdown()
+
+
 @pytest.mark.parametrize("scenario_name", SCENARIOS)
-def test_agg_helix_preempts_identically_and_re_prefills_correctly(scenario_name: str) -> None:
+def test_agg_helix_preempts_identically_and_re_prefills_correctly(
+    scenario_name: str, helix_ranks: list[tuple[KVCacheManagerV2, KVCacheV2Scheduler]]
+) -> None:
     scenario = SCENARIOS[scenario_name]
-    ranks = [_make_rank(cp_rank, scenario) for cp_rank in range(CP_SIZE)]
+    ranks = helix_ranks
     context_preemptions = [0] * CP_SIZE
     for cp_rank, (manager, scheduler) in enumerate(ranks):
         # host_cache_size=0 leaves no tier below GPU, so recompute-pause is the

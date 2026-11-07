@@ -164,6 +164,7 @@ perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-flux2_blackwe
 test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity] SKIP (bug pending, tracked in PR 17414)
 test_e2e.py::test_trtllm_serve_example SKIP (https://nvbugs/6891165)
 test_kimi_k3_specdec.py::test_kimi_k3_sa_specdec_logits_parity SKIP (https://nvbugs/7016339)
+unittest/_torch/attention/sparse/csa2/test_module.py::test_fused_native_index_q_and_graph SKIP (https://nvbugs/7039506)
 unittest/_torch/modeling_v2 --ignore=unittest/_torch/modeling_v2/comm SKIP (https://nvbugs/7011673)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_allgather_op_matrix.py::test_allgather_op_matrix SKIP (https://nvbugs/6843474)
 unittest/_torch/modeling_v2/comm/test_modeling_v2_reducescatter_op_matrix.py::test_reducescatter_op_matrix SKIP (https://nvbugs/6843474)

@@ -27,17 +27,15 @@ pandas
 h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09 uses 2.14.0a0.
-# The floor is the NGC alpha, which PEP 440 orders below the public release of the same
-# series; the ceiling is that public release, which is what the resolver picks off the public
-# index. Ordered comparisons drop the local version, so the container's +nv build stays
-# admissible against the floor.
-torch>=2.14.0a0,<=2.14.0
+# Public installations use PyTorch 2.14.1. The upper bound also admits the
+# preinstalled NGC 26.10 PyTorch 2.15 alpha, including its local version suffix,
+# while excluding public PyTorch 2.15 releases that require Triton 3.9.
+torch>=2.14.1,<=2.15.0a0
 torchvision
 # The floor is the exact pin of the public torch above; the ceiling is the NCCL that
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-10.html#rel-26-10
 # ships, so the resolver lands on the container's own NCCL version there instead of an older one.
-nvidia-nccl-cu13>=2.30.7,<=2.31.2
+nvidia-nccl-cu13>=2.30.7,<=2.32.3
 # NCCL-EP uses nccl4py's nccl.ep package. The nccl-extensions wheel is built
 # from pinned source by CMake so it links against the container's NCCL.
 nccl4py>=0.4,<=0.5
@@ -83,11 +81,8 @@ meson
 ninja
 blake3
 soundfile
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-26-09.html#rel-26-09
-# ships 3.8.0 and the torch pin above requires the same series, so floor and ceiling coincide.
-# The pin carries no local version, which keeps the container's own +nv build admissible -- it
-# must not be reinstalled underneath the rest of the stack that was built against it. This is
-# also the version the vendored triton_kernels below track.
+# Public PyTorch 2.14.1 and NGC PyTorch 26.10 both use Triton 3.8.
+# Keep the compiler and vendored kernels on the same version.
 triton==3.8.0 # NOTE: if you update this, you must also run scripts/vendor_triton_kernels.py to vendor the new version of triton_kernels
 tiktoken
 blobfile
