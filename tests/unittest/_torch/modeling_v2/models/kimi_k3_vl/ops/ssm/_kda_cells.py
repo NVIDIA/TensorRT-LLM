@@ -6,7 +6,8 @@ float64 plain decode; a float64 verify that keeps each request's committed histo
 
 Not a test file (no ``test_`` prefix). Entry tests import it by name, as ``comm/`` imports ``_rank_job``: the
 k3_kda_decode_attn and kda_decode tests here, and the k3_kda_attn, k3_kda_verify and shared-buffer tests of the
-kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 target.
+kimi_k3_mxfp4__sm_100__tp16_moetp4ep4 target. The k3_kda_decode_attn and k3_kda_verify kernel tests use its float64
+references.
 
 Shapes: 6 heads, K = V = 128, conv width 4 (the TP16 rank slice); conv states bf16 in the ``[q | k | v]`` layout,
 SSM states fp32. The manager coalesces each slot's per-layer states, so every per-layer view is a strided slot view,

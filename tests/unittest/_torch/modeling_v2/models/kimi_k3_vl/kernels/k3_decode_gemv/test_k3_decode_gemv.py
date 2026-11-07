@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""trtllm::k3_decode_gemv / k3_decode_gemv_tail (CuTe DSL decode GEMV, M <= 8) at the Kimi K3 TP16 per-rank shapes,
-at every M in 1..8: error against an fp64 product and against the stock path (cuBLAS F.linear; RMSNorm -> slice ->
-concat -> linear for the tail), for the tail also against torch with the kernel's arithmetic (fp32 accumulators, the
-RMS on the latent one, one bf16 rounding), run-to-run identical bits and each M's rows bit-identical to the same rows
-of the 8-row call. 0 and 9 rows are refused."""
+"""trtllm::k3_decode_gemv_tail (the row-parallel MoE tail on the CuTe DSL decode GEMV, M <= 8) at the Kimi K3 TP16
+per-rank shapes, at every M in 1..8: error against an fp64 product, against the stock path (RMSNorm -> slice -> concat
+-> linear) and against torch with the kernel's arithmetic (fp32 accumulators, the RMS on the latent one, one bf16
+rounding), run-to-run identical bits and each M's rows bit-identical to the same rows of the 8-row call. supports_tail()
+refuses 0, 9 and 16 rows."""
 
 import functools
 
@@ -36,8 +36,6 @@ pytestmark = pytest.mark.skipif(not _is_sm100(), reason="needs an SM100-family G
 
 M_ALL = list(range(1, 9))
 TOL = 8e-3  # max |y - ref| / max |ref|
-# (N, K) per rank at TP16: the KDA o_proj (one CTA per weight tile) and the KDA input projection (split-K).
-SHAPES = {"kda_o_proj": (7168, 768), "kda_qkvg": (3208, 7168)}
 HIDDEN, LATENT, WIDTH, PAD, ACT = 7168, 3584, 224, 256, 384
 EPS = 1e-6
 
@@ -78,28 +76,6 @@ def _weight(n: int, k: int, seed: int) -> torch.Tensor:
 def _rows(k: int, seed: int, scale: float = 1.0) -> torch.Tensor:
     gen = torch.Generator(device="cuda").manual_seed(seed)
     return (torch.randn(8, k, generator=gen, device="cuda") * scale).bfloat16()
-
-
-@pytest.mark.parametrize("m", M_ALL)
-@pytest.mark.parametrize("name", list(SHAPES))
-def test_k3_decode_gemv(name, m):
-    ops = _ops()
-    n, k = SHAPES[name]
-    w = _weight(n, k, 1)
-    x8 = _rows(k, 2)
-    x = x8[:m].contiguous()
-    y = ops.k3_decode_gemv(x, w, True)
-    again = ops.k3_decode_gemv(x, w, True)
-    y8 = ops.k3_decode_gemv(x8, w, True)
-    ref = x.double() @ w.double().t()
-    deterministic = torch.equal(_bits(y), _bits(again))
-    m_invariant = torch.equal(_bits(y), _bits(y8[:m]))
-    _report(
-        "k3_decode_gemv", name, m, y, ref, F.linear(x, w), det=deterministic, rows_as_m8=m_invariant
-    )
-    assert y.shape == (m, n)
-    assert _rel(y, ref) <= TOL and _rel(y, F.linear(x, w)) <= TOL
-    assert deterministic and m_invariant
 
 
 def _tail_weight() -> torch.Tensor:
@@ -160,16 +136,11 @@ def test_k3_decode_gemv_tail(rank, m):
 
 @pytest.mark.parametrize("m", [0, 9, 16])
 def test_token_limit(m):
-    ops = _ops()
+    _ops()
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
         op,
     )
 
-    w = _weight(*SHAPES["kda_o_proj"], 1)
-    x = torch.zeros(m, w.shape[1], dtype=torch.bfloat16, device="cuda")
-    assert not op.supports(x, w)
-    with pytest.raises(ValueError):
-        ops.k3_decode_gemv(x, w, True)
     lat = torch.zeros(m, LATENT, dtype=torch.bfloat16, device="cuda")
     act = torch.zeros(m, ACT, dtype=torch.bfloat16, device="cuda")
     assert not op.supports_tail(lat, act, _tail_weight(), WIDTH)

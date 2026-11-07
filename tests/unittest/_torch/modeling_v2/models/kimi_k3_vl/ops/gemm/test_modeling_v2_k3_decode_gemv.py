@@ -8,6 +8,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_decode_gemv import (
+    op as decode_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_decode_gemv import (
     k3_decode_gemv,
 )
@@ -103,10 +106,12 @@ def test_graph_replay() -> None:
 
 
 def test_refused_calls() -> None:
-    """M 0 and 9, and weights neither kernel takes, raise ValueError before launching anything."""
+    """M 0, 9 and 16, and weights neither kernel takes, raise ValueError before launching anything; supports() refuses
+    those row counts."""
     weight, _ = _inputs(*SHORT_K)
-    for m in (0, 9):
+    for m in (0, 9, 16):
         x = torch.zeros(m, SHORT_K[1], dtype=torch.bfloat16, device="cuda")
+        assert not decode_op.supports(x, weight), f"M={m}: supports() admits the call"
         with pytest.raises(ValueError, match="unsupported call"):
             k3_decode_gemv(x, weight)
     # [128, 1152]: 9 k-tiles, more than short K holds and not a multiple of 4 for split K.

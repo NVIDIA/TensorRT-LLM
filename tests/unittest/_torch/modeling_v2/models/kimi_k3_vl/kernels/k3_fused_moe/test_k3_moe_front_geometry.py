@@ -21,6 +21,8 @@ front_op = pytest.importorskip(
     "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe.front_op"
 )
 
+pytestmark = pytest.mark.cpu_only
+
 K = 7168  # the MoE input's width
 SHARED_COLS = 384
 RING = 4

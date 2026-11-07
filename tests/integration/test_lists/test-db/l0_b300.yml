@@ -164,9 +164,7 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp4 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_103__tp8 --import-mode=importlib --ignore-glob=unittest/_torch/modeling_v2/models/minimax_m3/**/comm/* TIMEOUT (30)
   # K3 single-GPU kernel and wrapper checks.
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/test_k3_cluster_waits.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctm_gemv/test_k3_ctm_gemv_wide.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_ctx_kv/test_k3_ctx_kv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_decode_gemv/test_k3_decode_gemv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_drafter/test_k3_drafter_attn.py
@@ -179,13 +177,8 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_kda_verify/test_k3_kda_verify.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_attn.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_mla/test_k3_mla_q.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_moe_front_geometry.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_m1.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kimi_k3_mxfp4__sm_100__tp16_moetp16ep1/test_k3_moe_m2.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_fused_moe/test_k3_moe_wide.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_route_quant/test_k3_route_quant.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/kernels/k3_spec_accept/test_k3_spec_accept.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_tcgen05_fences.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_attn_res_fwd.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/norm/test_modeling_v2_attn_res_rmsnorm_fwd.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/ops/ssm/test_modeling_v2_causal_conv1d_fwd.py

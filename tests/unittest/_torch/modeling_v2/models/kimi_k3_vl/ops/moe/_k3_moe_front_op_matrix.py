@@ -491,7 +491,7 @@ def check_front_and_k3_moe_single_calls() -> None:
 
 
 def check_head_flags_epoch_wraps() -> None:
-    """The ready-word handoff across both int32 wraps of the epoch (check_head_flags of the kernel test, extended).
+    """The ready-word handoff across both int32 wraps of the epoch.
 
     From a new workspace's state (ready words zeroed, epoch 0): calls at M 1, 1; the epoch preset to -2 (as 2^32 - 2
     calls later): calls at M 1, 8, 3, 8, so that the M 8 call at epoch -1 waits for 0, the value a word past an earlier

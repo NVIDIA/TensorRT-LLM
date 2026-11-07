@@ -8,6 +8,10 @@ routing weights, MXFP8 codes, UE8M0 scales) must be its bits. Checks, in file or
   run-to-run identical, and each M's rows the bits of the same rows of the 64-token call;
 - edge cases at M 1, 3 and 8 (40 tied selection keys, equal logits, huge logits, zero / large / denormal latent
   rows): the stock op's bits;
+- the unfused chain (trtllm::noaux_tc_op, then trtllm::mxfp8_quantize) gives the same four outputs bit for bit, on
+  random inputs at M 1-8, 16, 32 and 64 and on seven edge cases at M 1, 3 and 8; the three edge cases without a cell
+  (16 or 5 winners in one selection lane, a bias that is an nn.Parameter) also match the stock op, run-to-run and with
+  the early trigger. These call the torch ops directly, outside inference mode;
 - a captured sequence of calls at three M replayed with rewritten inputs, eager calls of other M between replays:
   every call the bits of the same call made alone;
 - M 0 and 65, a non-contiguous or mistyped input and a mis-sized bias raise ValueError, and the next call is correct;
@@ -207,6 +211,111 @@ def test_edge_case(cell):
     _check_reference(
         got, k3_route_quant.reference(logits, bias, latent, scale, early_trigger=early)
     )
+
+
+M_UNFUSED = (*range(1, 9), 16, 32, 64)
+UNFUSED_EDGE_CASES = (
+    "40_tied_keys",
+    "all_equal_logits",
+    "huge_logits",
+    "16_winners_one_lane",
+    "5_winners_one_lane",
+    "zero_large_denormal_rows",
+    "bias_parameter",
+)
+
+
+def _unfused(logits, bias, latent):
+    """The stock chain the fused op replaces: noaux_tc routing, then the MXFP8 quantization of the latent."""
+    weights, ids = torch.ops.trtllm.noaux_tc_op(logits, bias, 1, 1, K, RSF)
+    quantized, scales = torch.ops.trtllm.mxfp8_quantize(latent, False, alignment=256)
+    return (
+        ids.int(),
+        weights.to(torch.bfloat16),
+        quantized.view(torch.float8_e4m3fn),
+        scales.view(logits.shape[0], -1),
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _unfused_random():
+    """64 tokens of router logits (std 2.5), a bias (std 0.1) and the latent (std 0.7)."""
+    gen = torch.Generator(device=DEV).manual_seed(20260928)
+    logits = torch.randn(64, E, generator=gen, device=DEV) * 2.5
+    bias = torch.randn(E, generator=gen, device=DEV) * 0.1
+    latent = (torch.randn(64, H, generator=gen, device=DEV) * 0.7).bfloat16()
+    return logits, bias, latent
+
+
+def _unfused_edge_cases():
+    """8 tokens of each edge case, drawn one after another from one generator."""
+    gen = torch.Generator(device=DEV).manual_seed(20260929)
+    m = 8
+    bias = torch.randn(E, generator=gen, device=DEV) * 0.1
+    latent = (torch.randn(m, H, generator=gen, device=DEV) * 0.7).bfloat16()
+    logits = torch.randn(m, E, generator=gen, device=DEV) * 2.5
+    logits[:, 100:140] = 3.0
+    bias_tied = bias.clone()
+    bias_tied[100:140] = 0.25  # 40 equal keys compete for the top 16: ties go to the lower id
+    yield "40_tied_keys", logits, bias_tied, latent
+    yield (
+        "all_equal_logits",
+        torch.full((m, E), 0.3, device=DEV),
+        torch.zeros(E, device=DEV),
+        latent,
+    )
+    yield "huge_logits", torch.randn(m, E, generator=gen, device=DEV) * 40.0, bias, latent
+    logits = torch.randn(m, E, generator=gen, device=DEV)
+    logits[:, 3::32] += 20.0  # every winner in one selection lane (the exact fallback)
+    yield "16_winners_one_lane", logits, bias, latent
+    logits = torch.randn(m, E, generator=gen, device=DEV)
+    logits[:, [5, 37, 69, 101, 133]] += 20.0
+    yield "5_winners_one_lane", logits, bias, latent
+    odd = latent.clone()
+    odd[0] = 0
+    odd[1, :64] = 0
+    odd[2] = odd[2] * 3e4
+    odd[3, ::7] = torch.tensor(1e-39).bfloat16()
+    odd[4, 5] = torch.tensor(-3e38).bfloat16()
+    yield "zero_large_denormal_rows", torch.randn(m, E, generator=gen, device=DEV), bias, odd
+    yield (
+        "bias_parameter",
+        torch.randn(m, E, generator=gen, device=DEV),
+        torch.nn.Parameter(bias.clone()),
+        latent,
+    )
+
+
+@pytest.mark.parametrize("m", M_UNFUSED)
+def test_unfused_chain_random(m):
+    """Random logits and latent: the four outputs are the unfused chain's bits."""
+    with torch.inference_mode(False):
+        logits64, bias, latent64 = _unfused_random()
+        logits, latent = logits64[:m].contiguous(), latent64[:m].contiguous()
+        got = torch.ops.trtllm.k3_route_quant(logits, bias, latent, RSF)
+        same = [_same(a, b) for a, b in zip(got, _unfused(logits, bias, latent))]
+        print(f"OPCHECK op=k3_route_quant case=random M={m} unfused_bits(ids,w,q,sf)={same}")
+        assert all(same), f"M {m}: {same}"
+
+
+@pytest.mark.parametrize("case", UNFUSED_EDGE_CASES)
+def test_unfused_chain_edge_case(case):
+    """Each edge case at M 1, 3 and 8: the bits of the stock op and of the unfused chain, run-to-run and with the early
+    trigger."""
+    with torch.inference_mode(False):
+        _, logits8, bias, latent8 = next(c for c in _unfused_edge_cases() if c[0] == case)
+        for m in (1, 3, 8):
+            logits, latent = logits8[:m].contiguous(), latent8[:m].contiguous()
+            got = torch.ops.trtllm.k3_route_quant(logits, bias, latent, RSF)
+            stock = [_same(a, b) for a, b in zip(got, _stock(logits, bias, latent, RSF))]
+            unfused = [_same(a, b) for a, b in zip(got, _unfused(logits, bias, latent))]
+            rerun = _same_outputs(torch.ops.trtllm.k3_route_quant(logits, bias, latent, RSF), got)
+            early = _same_outputs(
+                torch.ops.trtllm.k3_route_quant(logits, bias, latent, RSF, True), got
+            )
+            print(f"OPCHECK op=k3_route_quant case={case} M={m} stock_bits(ids,w,q,sf)={stock} "
+                  f"unfused_bits(ids,w,q,sf)={unfused} det={rerun} early_same={early}")  # fmt: skip
+            assert all(stock) and all(unfused) and rerun and early, f"{case} M {m}"
 
 
 def test_graph_capture_and_replay():

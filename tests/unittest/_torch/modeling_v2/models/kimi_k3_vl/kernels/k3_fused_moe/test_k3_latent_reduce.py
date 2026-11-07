@@ -13,12 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """trtllm::k3_latent_reduce (the Kimi K3 latent all-reduce as the consumer of the push-only k3_moe), one process per
-GPU over the TP group of this run (4 on one GB200 tray, 16 on four), at every M in 1..8 and every CTA split:
+GPU over the TP group of this run (4 on one GB200 tray, 16 on four), on an exchange shared by fabric handle, at every
+M in 1..8 and the explicit CTA splits 14 and 28 (the catalog entry's matrix runs the default split of 4 at W=4):
   each rank's partial is pushed as the push-only k3_moe stores it (bf16 pairs through the multicast mapping into slot
   [rank] of the call's half, -0.0 as +0.0); the reduce must equal MNNVLAllReduce's one-shot of the partials bit for
   bit, on every rank, run to run, with one rank's perturbed partial changing the result; after every call the whole
-  buffer is empty again, the call count is +1 and the arrival word 0; a CUDA graph of four push + reduce pairs,
-  replayed three times with new partials, matches the eager calls.
+  buffer is empty again, the call count is +1 and the arrival word 0.
+The exchange's refusal of an unsupported TP size runs in one process on one GPU.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
   srun -N1 -n4 --mpi=pmix python3 test_k3_latent_reduce.py
@@ -59,7 +60,7 @@ def _trtllm():
 WORLD = 4
 LATENT = 3584
 M_CASES = list(range(1, 9))
-CTAS = (4, 14, 28)
+CTAS = (14, 28)
 EMPTY_WORD = -(2**31)
 
 
@@ -69,10 +70,7 @@ def _supported() -> bool:
     return torch.cuda.get_device_capability()[0] == 10
 
 
-pytestmark = [
-    pytest.mark.threadleak(enabled=False),
-    pytest.mark.skipif(not _supported(), reason=f"needs {WORLD} SM100 GPUs with MNNVL and mpi4py"),
-]
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -179,50 +177,7 @@ def check_reduce(ctx):
     return results
 
 
-def check_graph(ctx):
-    """Four push + reduce pairs (M 8, 3, 8, 1) captured in one CUDA graph, replayed three times with new partials; an
-    even number of pairs, so every replay starts on the half the capture pushed into."""
-    results = []
-    ms = (8, 3, 8, 1)
-    inputs = [_partial(m, 500 + i, ctx.rank) for i, m in enumerate(ms)]
-    outs = [None] * len(ms)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        # eager first: every configuration compiled outside capture
-        for i, m in enumerate(ms):
-            outs[i] = _call(ctx, inputs[i], 0)
-        torch.cuda.synchronize()
-        base = ctx.count
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            for i, m in enumerate(ms):
-                # the halves alternate, so the captured pairs follow the eager calls' parity
-                _push(ctx, inputs[i], (base + i) & 1)
-                outs[i] = _trtllm().k3_latent_reduce(ctx.ex.uc, ctx.ex.flags, m, 0)
-    torch.cuda.synchronize()
-    ctx.comm.Barrier()
-    for rep in range(3):
-        fresh = [_partial(m, 900 + 10 * rep + i, ctx.rank) for i, m in enumerate(ms)]
-        for i in range(len(ms)):
-            inputs[i].copy_(fresh[i])
-        refs = [_allreduce(ctx, x) for x in fresh]
-        torch.cuda.synchronize()
-        ctx.comm.Barrier()
-        graph.replay()
-        ctx.count += len(ms)
-        torch.cuda.synchronize()
-        exact = all(_same(o, r) for o, r in zip(outs, refs))
-        row = dict(
-            op="k3_latent_reduce", case=f"graph_replay{rep}", M=8, exact=exact, state=_state_ok(ctx)
-        )
-        row["ok"] = all(ctx.comm.allgather(exact and row["state"]))
-        results.append(row)
-    del graph
-    return results
-
-
-CHECKS = {"reduce": check_reduce, "graph": check_graph}
+CHECKS = {"reduce": check_reduce}
 
 
 def _run_checks(names):
@@ -241,6 +196,7 @@ def _report(rows):
         print(f"OPCHECK op={row['op']} case={row['case']} M={row['M']} {fields}", flush=True)
 
 
+@pytest.mark.skipif(not _supported(), reason=f"needs {WORLD} SM100 GPUs with MNNVL and mpi4py")
 @pytest.mark.parametrize("mpi_pool_executor", [WORLD], indirect=True)
 def test_k3_latent_reduce(mpi_pool_executor):
     per_rank = list(mpi_pool_executor.map(_run_checks, [list(CHECKS)] * WORLD))
@@ -248,6 +204,7 @@ def test_k3_latent_reduce(mpi_pool_executor):
     assert all(row["ok"] for rows in per_rank for row in rows)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
 def test_latent_exchange_refuses_unsupported_tp_size():
     """The exchange serves TP groups of 4, 8 or 16 ranks: another size raises ValueError before any collective step
     (the size is the same on every rank of a group), eagerly and under CUDA-graph capture alike. One process, a group

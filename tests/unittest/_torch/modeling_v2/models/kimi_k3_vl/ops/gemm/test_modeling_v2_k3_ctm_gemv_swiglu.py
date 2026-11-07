@@ -7,6 +7,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
+    op as ctm_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_swiglu import (
     k3_ctm_gemv_swiglu,
 )
@@ -68,6 +71,9 @@ def test_call_site_cells(cell) -> None:
         for m in spec["ms"]:
             label = f"{cell.why} M={m}"
             gu = gu8[:m].contiguous()
+            assert ctm_op.supports_swiglu(gu, w, split), (
+                f"{label}: supports_swiglu() refuses the call"
+            )
             y = k3_ctm_gemv_swiglu(gu, w, True, split, push)
             assert y.shape == (m, n) and y.dtype == torch.bfloat16, label
             rel = _rel(y, ref8[:m])

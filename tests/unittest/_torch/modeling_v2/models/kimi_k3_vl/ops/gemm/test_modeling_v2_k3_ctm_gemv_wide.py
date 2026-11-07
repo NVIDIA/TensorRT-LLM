@@ -7,6 +7,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
+    op as ctm_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
@@ -86,6 +89,9 @@ def test_projection_cells(cell) -> None:
         for m in spec["ms"]:
             label = f"{cell.why} M={m}"
             x = x64[:m].contiguous()
+            assert ctm_op.supports_wide(x, w, sig, fp32), (
+                f"{label}: supports_wide() refuses the call"
+            )
             y = k3_ctm_gemv_wide(x, w, sig, fp32)
             assert y.shape == (m, n) and y.dtype == dtype, label
             assert _rel(y, ref64[:m]) <= tol, label
@@ -108,9 +114,6 @@ def test_projection_cells(cell) -> None:
 
 def test_rows_match_long_at_the_same_split() -> None:
     """A token's row is k3_ctm_gemv_long's for it (calls of up to 8 tokens) where the splits agree."""
-    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
-        op as ctm_op,
-    )
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv.k3_ctm_gemv_kernel import (
         wide_tile,
     )
@@ -162,7 +165,8 @@ def test_cuda_graph_replay_matches_eager() -> None:
 
 
 def test_unsupported_calls_raise_value_error() -> None:
-    """The op's own check refuses these before compiling or launching anything."""
+    """The op's own check refuses these before compiling or launching anything; supports_wide() refuses 0 and 65
+    rows."""
     n, k = 3208, 7168
     w = _weight(n, k)
     x8 = _rows(k)[:8]
@@ -177,6 +181,8 @@ def test_unsupported_calls_raise_value_error() -> None:
         "K % 64 != 0": (x8[:, :7136].contiguous(), w[:, :7136].contiguous(), -1, False),
         "fp16 x": (x8.half(), w, -1, False),
     }
+    for name in ("0 rows", "65 rows"):
+        assert not ctm_op.supports_wide(*cases[name]), f"{name}: supports_wide() admits the call"
     for name, (x, weight, sig, fp32) in cases.items():
         try:
             k3_ctm_gemv_wide(x, weight, sig, fp32)

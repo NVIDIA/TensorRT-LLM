@@ -1,14 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""GPU test for the k3_moe_m1 catalog entry (one GPU): single calls against the fp32 reference, and the call
-sequences over its caller-owned K3MoeM1State that its contract certifies. The checks are in ``_k3_moe_engines.py``
-beside this file."""
+"""GPU test for the k3_moe_m1 catalog entry (one GPU): single calls against the fp32 reference and trtllm::k3_moe,
+the call sequences over its caller-owned K3MoeM1State that its contract certifies, and the refusal of the two-token
+build at an intermediate of 768. The checks are in ``_k3_moe_engines.py`` beside this file."""
 
 import importlib
 import zlib
 
 import _k3_moe_engines as engines
 import pytest
+import torch
 
 __extra_import_path__ = ["../../.."]
 from _validating import validating
@@ -40,6 +41,19 @@ def test_single_calls(cell):
     seed = zlib.crc32(cell.why.encode())
     engine = engines.Engine("k3_moe_m1", cell.spec["m"])
     engines.check_single_calls(engine, k3_moe_m1, range(seed, seed + cell.spec["samples"]))
+
+
+def test_two_tokens_refuse_wide_intermediate():
+    """The two-token build is for the TP16 slice: at the TP4 x EP4 slice (768, 224 local experts) the FC2 tiles of
+    both tokens do not fit, and the state refuses it when it loads the kernel module, before it allocates its
+    workspace."""
+    op = importlib.import_module(
+        "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl."
+        "kimi_k3_mxfp4__sm_100__tp16_moetp16ep1.kernels.k3_moe_engines.op"
+    )
+    device = torch.device("cuda", torch.cuda.current_device())
+    with pytest.raises(AssertionError, match="does not fit"):
+        op.K3MoeM1State(device, 768, 768, 224, num_tokens=2)
 
 
 @pytest.mark.parametrize("engine", ENGINES, ids=IDS)

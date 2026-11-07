@@ -18,7 +18,8 @@ per-rank TP16 shape (6 heads, K = V = 128, conv width 4), against ``trtllm::kda_
 The reference is the model's plain-decode path fed the very projection rows the fused kernel computes: the stream
 alone (``trtllm::k3_kda_qkvg``, the same stream clusters) on the same x, its Lamport buffers decoded into the
 ``[q | k | v | og | f_a | b]`` rows, f_b as a bf16 ``F.linear``, then ``trtllm::kda_decode`` (native, indexed state
-pool, packed conv pool updated in place). A float64 torch decode on the same rows bounds both.
+pool, packed conv pool updated in place). A float64 torch decode on the same rows (``_kda_cells.F64Decode``) bounds
+both.
 
 Checks over rounds of distinct slots from the same initial pools: every request's output against kda_decode and
 float64 (fp32 tolerance), the state rows against both, the conv pool against kda_decode bit for bit (raw inputs),
@@ -29,14 +30,18 @@ written outside the buffers); launches interleaved with ``trtllm::k3_kda_attn`` 
 model runs them.
 
   pytest test_k3_kda_decode_attn.py
-  python3 test_k3_kda_decode_attn.py report
+  PYTHONPATH=<repo>/tests python3 test_k3_kda_decode_attn.py report
 """
 
 import sys
 
 import pytest
+import test_common.magic_import  # noqa: F401  (__extra_import_path__ when run directly)
 import torch
 import torch.nn.functional as F
+
+__extra_import_path__ = ["../../ops/ssm"]
+import _kda_cells as kc
 
 H = 6
 K = V = 128
@@ -205,56 +210,13 @@ class NativePath:
         return out.view(n, H, V)
 
 
-class F64Path:
-    """The plain KDA decode in float64 torch on the same rows (f_b in float64, rounded to bf16 as the GEMM's
-    output): conv4 + SiLU, q / k L2 norm (q scaled), beta sigmoid, the lower-bound gate,
-    S <- S d + beta (v - (S d) k) k^T, o = S q, the gated RMSNorm."""
-
-    def __init__(self, wt, pools):
-        self.wt = wt
-        self.conv = pools["conv"].double().clone()
-        self.state = pools["state"].double().clone()
-
-    def __call__(self, rows, slots):
-        wt = self.wt
-        r = rows.double()
-        n = rows.shape[0]
-        conv_w = torch.stack([wt["w_q"], wt["w_k"], wt["w_v"]]).double()  # [3, HK, W]
-        g = (r[:, 4 * HK : 4 * HK + K] @ wt["w_fb"].double().t()).bfloat16().double()
-        outs = torch.empty(n, H, V, dtype=torch.float64, device="cuda")
-        for i, s in enumerate(slots.tolist()):
-            new = r[i, : 3 * HK].view(3, HK)
-            win = self.conv[s].view(3, HK, W - 1)
-            u = torch.cat([win, new.unsqueeze(-1)], dim=-1)  # [3, HK, W], oldest first
-            act = (u * conv_w).sum(-1)
-            act = act * torch.sigmoid(act)
-            self.conv[s] = u[:, :, 1:].reshape(3 * HK, W - 1)
-            q, k, v = (act[j].view(H, K) for j in range(3))
-            q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6) * SCALE
-            k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-            beta = torch.sigmoid(r[i, 4 * HK + K : 4 * HK + K + H])
-            xg = torch.exp(wt["a_log"].double()).unsqueeze(-1) * (
-                g[i].view(H, K) + wt["dt_bias"].double().view(H, K)
-            )
-            decay = torch.exp(LOWER_BOUND * torch.sigmoid(xg))
-            st = self.state[s] * decay.unsqueeze(1)  # [H, V, K] * decay per key
-            res = (v - (st * k.unsqueeze(1)).sum(-1)) * beta.unsqueeze(-1)  # [H, V]
-            st = st + res.unsqueeze(-1) * k.unsqueeze(1)
-            self.state[s] = st
-            o = (st * q.unsqueeze(1)).sum(-1)  # [H, V]
-            rms = torch.rsqrt((o * o).mean(-1, keepdim=True) + EPS)
-            gate = torch.sigmoid(r[i, 3 * HK : 4 * HK].view(H, V))
-            outs[i] = o * rms * wt["onorm_w"].double() * gate
-        return outs
-
-
 def run_schedule(num_requests, layout="dense", seed=0, rounds=ROUNDS):
     _ops()
     wt = make_weights(100 + seed)
     pools = make_pools(200 + seed, layout)
     fused = FusedPath(wt, clone_pools(pools))
     native = NativePath(wt, clone_pools(pools))
-    ref = F64Path(wt, pools)
+    ref = kc.F64Decode(wt, {"conv": pools["conv"], "ssm": pools["state"]})
     rows_of = Rows(wt)
     gen = torch.Generator(device="cuda").manual_seed(400 + seed)
     metrics, outs = [], []
@@ -266,7 +228,7 @@ def run_schedule(num_requests, layout="dense", seed=0, rounds=ROUNDS):
         out_f = fused(x, slots)
         rows = rows_of(x)
         out_n = native(rows, slots)
-        out_r = ref(rows, slots)
+        out_r = ref.step_rows(rows, slots)
         torch.cuda.synchronize()
         idx = slots.long()
         others = torch.ones(POOL, dtype=torch.bool, device="cuda")

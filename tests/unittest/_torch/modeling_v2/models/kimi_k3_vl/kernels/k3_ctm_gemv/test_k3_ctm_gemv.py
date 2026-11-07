@@ -12,11 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The CTM decode GEMVs (trtllm::k3_ctm_gemv, _gated, _swiglu, _long, _tail) and trtllm::k3_situ_mul at the Kimi K3
-TP16 per-rank shapes and the call sites' split / ring / push flags, at every M in 1..8: error against an fp64 product
-of the unfused activation (torch's bf16 roundings) and against the stock path (cuBLAS F.linear; the Triton SiTU),
-run-to-run identical bits, each M's rows bit-identical to the same rows of the 8-row call; split 1 the bits of
-k3_decode_gemv, the long GEMV's sigmoid columns torch.sigmoid of its own plain output. 0 and 9 rows are refused."""
+"""trtllm::k3_ctm_gemv_gated, trtllm::k3_ctm_gemv_tail and trtllm::k3_situ_mul at the Kimi K3 TP16 per-rank shapes,
+at every M in 1..8: error against an fp64 product of the unfused activation (torch's bf16 roundings) and against the
+stock path (cuBLAS F.linear; the Triton SiTU), run-to-run identical bits, each M's rows bit-identical to the same rows
+of the 8-row call. The CTM GEMVs that a k3_decode_gemv op also computes return its bits: trtllm::k3_ctm_gemv and the
+gated GEMV at split 1, and the tail. The supports() checks refuse 0, 9 and 16 rows."""
 
 import functools
 
@@ -37,12 +37,11 @@ pytestmark = pytest.mark.skipif(not _is_sm100(), reason="needs an SM100-family G
 M_ALL = list(range(1, 9))
 TOL = 8e-3  # max |y - ref| / max |ref|
 
-# k3_ctm_gemv: (N, K, split, push). The MLA o_proj shape at splits 1 and 2, the drafter o_proj (tuned and synthetic).
-PLAIN = {
-    "o_proj_s1": (7168, 768, 1, False),
-    "o_proj_s2": (7168, 768, 2, False),
-    "drafter_o_proj": (7168, 384, 1, True),
-    "drafter_o_proj_dummy": (7168, 256, 1, True),
+# k3_ctm_gemv at split 1: (N, K, push). The MLA o_proj, the drafter o_proj (tuned and synthetic).
+SPLIT1 = {
+    "o_proj_s1": (7168, 768, False),
+    "drafter_o_proj": (7168, 384, True),
+    "drafter_o_proj_dummy": (7168, 256, True),
 }
 # k3_ctm_gemv_long: (N, K, sig_col0, split, ring, push), as each call site passes them.
 LONG = {
@@ -68,8 +67,6 @@ LONG = {
         True,
     ),  # KDA q/k/v/g/f_a/b: 25 whole tiles and an 8-row last one
 }
-# k3_ctm_gemv_swiglu: (N, K, split, push), the drafter down projection (tuned and synthetic).
-SWIGLU = {"drafter_down": (7168, 896, 2, True), "drafter_down_dummy": (7168, 768, 2, True)}
 AG_COLS, G_COL0, K_O = (
     2880,
     2112,
@@ -142,33 +139,15 @@ def _checks(call, args8, m):
 
 
 @pytest.mark.parametrize("m", M_ALL)
-@pytest.mark.parametrize("name", list(PLAIN))
-def test_k3_ctm_gemv(name, m):
+@pytest.mark.parametrize("name", list(SPLIT1))
+def test_k3_ctm_gemv_split1_is_k3_decode_gemv(name, m):
+    """At split 1 the CTM GEMV returns the bits of k3_decode_gemv on the same rows."""
     ops = _ops()
-    n, k, split, push = PLAIN[name]
+    n, k, push = SPLIT1[name]
     w = _weight(n, k, 1, 0.03)
-    assert _ctm().supports(_rows(k, 2)[:m], w, split)
-    (x,), y, det, minv = _checks(
-        lambda x_: ops.k3_ctm_gemv(x_, w, True, split, push), [_rows(k, 2)], m
-    )
-    ref = x.double() @ w.double().t()
-    decode = ops.k3_decode_gemv(x, w, True)
-    same_decode = torch.equal(_bits(y), _bits(decode))
-    _report(
-        "k3_ctm_gemv",
-        name,
-        m,
-        y,
-        ref,
-        F.linear(x, w),
-        det=det,
-        rows_as_m8=minv,
-        eq_k3_decode_gemv=same_decode,
-    )
-    assert _rel(y, ref) <= TOL and _rel(y, F.linear(x, w)) <= TOL
-    assert det and minv
-    if split == 1:
-        assert same_decode
+    x = _rows(k, 2)[:m].contiguous()
+    y = ops.k3_ctm_gemv(x, w, True, 1, push)
+    assert torch.equal(_bits(y), _bits(ops.k3_decode_gemv(x, w, True)))
 
 
 @pytest.mark.parametrize("m", M_ALL)
@@ -202,58 +181,6 @@ def test_k3_ctm_gemv_gated(split, gate_sigmoid, m):
     assert det and minv
     if split == 1:
         assert same_decode
-
-
-def _silu_and_mul(gu: torch.Tensor) -> torch.Tensor:
-    """silu_and_mul's fp32 arithmetic and one bf16 rounding."""
-    k = gu.shape[1] // 2
-    return (F.silu(gu[:, :k].float()) * gu[:, k:].float()).bfloat16()
-
-
-@pytest.mark.parametrize("m", M_ALL)
-@pytest.mark.parametrize("name", list(SWIGLU))
-def test_k3_ctm_gemv_swiglu(name, m):
-    ops = _ops()
-    n, k, split, push = SWIGLU[name]
-    w = _weight(n, k, 7)
-    gu8 = _rows(2 * k, 8, 2.0)
-    assert _ctm().supports_swiglu(gu8, w, split)
-    (gu,), y, det, minv = _checks(
-        lambda g_: ops.k3_ctm_gemv_swiglu(g_, w, True, split, push), [gu8], m
-    )
-    act = _silu_and_mul(gu)
-    ref = act.double() @ w.double().t()
-    _report("k3_ctm_gemv_swiglu", name, m, y, ref, F.linear(act, w), det=det, rows_as_m8=minv)
-    assert _rel(y, ref) <= TOL and _rel(y, F.linear(act, w)) <= TOL
-    assert det and minv
-
-
-@pytest.mark.parametrize("m", M_ALL)
-@pytest.mark.parametrize("name", list(LONG))
-def test_k3_ctm_gemv_long(name, m):
-    ops = _ops()
-    n, k, sig, split, ring, push = LONG[name]
-    w = _weight(n, k, 9)
-    x8 = _rows(k, 10)
-    assert _ctm().supports_long(x8, w, split, ring)
-
-    def call(x_, sig_col0):
-        return ops.k3_ctm_gemv_long(x_, w, sig_col0, split, ring, True, push)
-
-    (x,), y, det, minv = _checks(lambda x_: call(x_, sig), [x8], m)
-    plain = call(x, -1) if sig >= 0 else y
-    ref = x.double() @ w.double().t()
-    cols = slice(0, sig if sig >= 0 else n)
-    # Columns >= sig_col0 hold bf16(sigmoid(bf16(x @ W^T))): torch.sigmoid of the op's own plain output.
-    sigmoid_ok = sig < 0 or (
-        torch.equal(_bits(y[:, :sig]), _bits(plain[:, :sig]))
-        and torch.equal(_bits(y[:, sig:]), _bits(plain[:, sig:].sigmoid()))
-    )
-    _report("k3_ctm_gemv_long", name, m, plain, ref, F.linear(x, w), det=det, rows_as_m8=minv,
-            sigmoid_cols=sigmoid_ok)  # fmt: skip
-    assert _rel(plain, ref) <= TOL and _rel(plain, F.linear(x, w)) <= TOL
-    assert _rel(y[:, cols], ref[:, cols]) <= TOL
-    assert det and minv and sigmoid_ok
 
 
 @pytest.mark.parametrize("m", M_ALL)

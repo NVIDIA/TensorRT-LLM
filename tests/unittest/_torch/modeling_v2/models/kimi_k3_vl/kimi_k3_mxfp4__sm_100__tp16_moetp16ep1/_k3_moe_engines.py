@@ -5,6 +5,11 @@ routed tokens, the fp32 reference, and the checks both stateful entries run over
 calls, call sequences across layers and steps, capture and replay, two states interleaved, the epochs across the
 int32 wrap, the explicit constructor).
 
+Single calls are also compared with trtllm::k3_moe (K3MoeLayer) on the same buffers and routing, which it reads at
+the padded size. The zero rows add exact zeros, so the two compute the same math; both entries keep k3_moe's FC2
+operand and combine order, so the bits match except where their two FC1 partial sums round an intermediate value
+differently. Bit identity is reported; the gate is one bf16 ulp of the row's max.
+
 Imported by the two test files beside it (this tree is not a package).
 """
 
@@ -88,8 +93,10 @@ def layer_weights(index: int):
     return tuple(t.roll(index, dims=0).contiguous() for t in proc) if index else proc
 
 
-def routed(m: int, seed: int):
-    """m tokens' MXFP8 latents and routing, as trtllm::k3_route_quant produces them (the engines' caller)."""
+def routed(m: int, seed: int, case: str = "random"):
+    """m tokens' MXFP8 latents and routing, as trtllm::k3_route_quant produces them (the engines' caller). For two
+    tokens, ``case`` "shared" gives both the same logits (the same 16 experts) and "disjoint" sets the second
+    token's logits to -30 on the first token's raw-logit top 16, so their experts mostly differ."""
     import tensorrt_llm  # noqa: F401
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_route_quant import (
         op as _rq,  # noqa: F401
@@ -97,6 +104,12 @@ def routed(m: int, seed: int):
 
     gen = torch.Generator(device="cuda").manual_seed(seed)
     logits = (torch.randn(m, NUM_EXPERTS, generator=gen, device="cuda") * 3.0).float()
+    if case == "shared":
+        logits[1] = logits[0]
+    elif case == "disjoint":
+        logits[1, torch.topk(logits[0], TOP_K).indices] = -30.0
+    else:
+        assert case == "random", case
     x = torch.randn(m, H, generator=gen, device="cuda").bfloat16()
     bias = (torch.randn(NUM_EXPERTS, generator=gen, device="cuda") * 0.05).float()
     ids, weights, x_fp8, x_sf = torch.ops.trtllm.k3_route_quant(logits, bias, x, RSF, True)
@@ -171,22 +184,47 @@ def _alone(engine):
     return _reference_calls(engine.name, engine.m)
 
 
-def check_single_calls(engine, entry, seeds):
+@functools.lru_cache(maxsize=None)
+def _k3_moe_state():
+    from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
+        op,
+    )
+
+    return op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_PAD, NUM_EXPERTS)
+
+
+def k3_moe(weights, tokens) -> torch.Tensor:
+    """trtllm::k3_moe (K3MoeLayer) on the same buffers and routing."""
+    return _k3_moe_state().layer(*weights)(*tokens, 0)
+
+
+def check_single_calls(engine, entry, seeds, case: str = "random"):
     """Single calls over the grid against the fp32 reference (8 ulp of the row max per element, 4 ulp relative
-    RMS), and run to run bit for bit."""
+    RMS) and against trtllm::k3_moe (1 ulp of the row max), and run to run bit for bit."""
     state = engine.create()
-    layer = state.layer(*layer_weights(0))
+    weights = layer_weights(0)
+    layer = state.layer(*weights)
+    n_bit = 0
     for seed in seeds:
-        tokens = routed(engine.m, seed)
+        tokens = routed(engine.m, seed, case)
         y = engine.call(layer, tokens)
         again = engine.call(layer, tokens)
+        y_k3 = k3_moe(weights, tokens)
         elt, rms = row_ulp(y, entry.reference(experts()[1], *tokens, 0))
-        print(
-            f"OPCHECK op={engine.name} M={engine.m} seed={seed} vs_ref_elt_ulp={elt:.2f} vs_ref_rms_ulp={rms:.2f}"
-        )
+        elt_k3, _ = row_ulp(y, y_k3)
+        bit = same(y, y_k3)
+        n_bit += bit
+        distinct = len(set(tokens[2].view(-1).tolist()))
+        print(f"OPCHECK op={engine.name} M={engine.m} case={case} seed={seed} experts={distinct} "
+              f"vs_ref_elt_ulp={elt:.2f} vs_ref_rms_ulp={rms:.2f} vs_k3_moe_elt_ulp={elt_k3:.2f} "
+              f"bit_identical_to_k3_moe={bit}")  # fmt: skip
         assert bool(torch.isfinite(y.float()).all())
         assert elt <= 8.0 and rms <= 4.0, (elt, rms)
+        assert elt_k3 <= 1.0, elt_k3
         assert same(y, again), "run-to-run bits differ"
+    print(
+        f"OPCHECK op={engine.name} M={engine.m} case={case} bit_identical_to_k3_moe={n_bit}/{len(seeds)}"
+    )
 
 
 def check_call_sequences(engine):

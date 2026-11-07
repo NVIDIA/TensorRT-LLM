@@ -22,8 +22,8 @@ Two references, run over the same schedule of rounds from the same initial pools
   ``trtllm::kda_mtp_decode`` replaying each request's accepted drafts from its replay caches
   (``cu_seqlens[n] = n T - pending[n]``, ``num_accepted_tokens = pending``), then the gated RMSNorm
   (``rms_norm_gated_token_major``, sigmoid gate). The report says which ``kda_mtp_decode`` was loaded.
-* a float64 torch delta rule (the "fp32 reference"; float64 so that no TF32 enters) that keeps each request's
-  committed token history: conv4 + SiLU, q / k L2 norm, beta sigmoid, the lower-bound gate,
+* a float64 torch delta rule (the "fp32 reference", ``_kda_cells.F64Verify``; float64 so that no TF32 enters) that
+  keeps each request's committed token history: conv4 + SiLU, q / k L2 norm, beta sigmoid, the lower-bound gate,
   S <- S d + beta (v - (S d) k) k^T, o = S q, the gated RMSNorm.
 
 Checks per round: the outputs of every request against both references (fp32 tolerance), the committed pool state
@@ -34,7 +34,7 @@ Also: requests isolated, each schedule twice bit-identical, CUDA-graph replays w
 and the pending counts given as slices of longer index tensors at any element offset.
 
   pytest test_k3_kda_verify.py
-  python3 test_k3_kda_verify.py report | time
+  PYTHONPATH=<repo>/tests python3 test_k3_kda_verify.py report | time
 """
 
 import inspect
@@ -42,8 +42,12 @@ import statistics
 import sys
 
 import pytest
+import test_common.magic_import  # noqa: F401  (__extra_import_path__ when run directly)
 import torch
 import torch.nn.functional as F
+
+__extra_import_path__ = ["../../ops/ssm"]
+import _kda_cells as kc
 
 H = 6
 K = V = 128
@@ -195,73 +199,6 @@ class K3Path:
         )  # fmt: skip
 
 
-def conv_silu(win, raw, c, w):
-    """Channel group ``c`` (q, k, v) of the causal conv over the window (oldest first) and the new raw input, SiLU."""
-    x = win[0][c] * w[:, 0] + win[1][c] * w[:, 1] + win[2][c] * w[:, 2] + raw[c] * w[:, 3]
-    return x * torch.sigmoid(x)
-
-
-class Fp32Path:
-    """The delta rule over each request's committed history (raw conv inputs and the state after the last committed
-    token), in float64: no TF32 even where cuBLAS is told to use it."""
-
-    def __init__(self, wt, pools, slots, num_spec):
-        self.wt, self.num_spec = wt, num_spec
-        self.slots = slots.tolist()
-        # Committed raw inputs, oldest first: the conv caches' window columns 0..2 (q, k, v).
-        self.seq = [[torch.stack([pools[c][s, :, i].double() for c in ("cs_q", "cs_k", "cs_v")]) for i in range(3)]
-                    for s in self.slots]  # fmt: skip
-        self.state = [pools["state"][s].double().clone() for s in self.slots]
-        self.last = None
-
-    def __call__(self, proj):
-        """Outputs [T, H, V] and the per-token states of every request."""
-        t_total, x_q, x_k, x_v, og, f_a, beta_raw = split_proj(proj)
-        steps = self.num_spec + 1
-        # f_b's output is bf16 in the model.
-        g_all = F.linear(f_a.double(), self.wt["w_fb"].double()).bfloat16().double()
-        wq, wk, wv = (self.wt[n].double() for n in ("w_q", "w_k", "w_v"))
-        exp_a = self.wt["a_log"].double().exp()
-        dt_bias = self.wt["dt_bias"].double().view(H, K)
-        onorm_w = self.wt["onorm_w"].double()
-        out = torch.empty(t_total, H, V, dtype=torch.float64, device="cuda")
-        self.last = []
-        for n in range(len(self.slots)):
-            seq = list(self.seq[n])
-            s_cur = self.state[n]
-            states, raws = [], []
-            for t in range(steps):
-                row = n * steps + t
-                raw = torch.stack([x_q[row].double(), x_k[row].double(), x_v[row].double()])
-                win = seq[-3:]
-                q = conv_silu(win, raw, 0, wq).view(H, K)
-                k = conv_silu(win, raw, 1, wk).view(H, K)
-                v = conv_silu(win, raw, 2, wv).view(H, V)
-                q = q * torch.rsqrt((q * q).sum(-1, keepdim=True) + 1e-6) * SCALE
-                k = k * torch.rsqrt((k * k).sum(-1, keepdim=True) + 1e-6)
-                beta = torch.sigmoid(beta_raw[row].double())
-                gk = LOWER_BOUND * torch.sigmoid(exp_a[:, None] * (g_all[row].view(H, K) + dt_bias))
-                decay = gk.exp()
-                sd = s_cur * decay[:, None, :]
-                vn = v - torch.einsum("hvk,hk->hv", sd, k)
-                s_cur = sd + beta[:, None, None] * vn[:, :, None] * k[:, None, :]
-                o = torch.einsum("hvk,hk->hv", s_cur, q)
-                rms = torch.rsqrt((o * o).mean(-1, keepdim=True) + EPS)
-                out[row] = o * rms * onorm_w * torch.sigmoid(og[row].double().view(H, V))
-                states.append(s_cur)
-                raws.append(raw)
-                seq.append(raw)
-            self.last.append((states, raws))
-        return out
-
-    def commit(self, pending):
-        """The sampler accepted ``pending[n]`` drafts of the last round: the golden token and those drafts commit."""
-        for n, p in enumerate(pending):
-            states, raws = self.last[n]
-            self.seq[n] = (self.seq[n] + raws[: p + 1])[-3:]
-            self.state[n] = states[p]
-
-
 def make_slots(num_requests: int, seed: int) -> torch.Tensor:
     perm = torch.randperm(POOL, generator=torch.Generator().manual_seed(seed))
     return perm[:num_requests].to(torch.int32).cuda()
@@ -287,7 +224,7 @@ def run_schedule(
     slots = make_slots(num_requests, 300 + seed)
     main = MainPath(wt, clone_pools(pools), slots, num_spec)
     k3 = K3Path(wt, clone_pools(pools), slots, num_spec)
-    ref = Fp32Path(wt, pools, slots, num_spec)
+    ref = kc.F64Verify(wt, dict(pools, ssm=pools["state"]), slots, num_spec)
     pending_req = torch.zeros(num_requests, dtype=torch.int32, device="cuda")
     gen = torch.Generator(device="cuda").manual_seed(400 + seed)
     rows, outs = [], []

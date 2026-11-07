@@ -7,6 +7,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_ctm_gemv import (
+    op as ctm_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_ctm_gemv_long import (
     k3_ctm_gemv_long,
 )
@@ -82,6 +85,9 @@ def test_call_site_cells(cell) -> None:
         for m in spec["ms"]:
             label = f"{cell.why} M={m}"
             x = x8[:m].contiguous()
+            assert ctm_op.supports_long(x, w, split, ring), (
+                f"{label}: supports_long() refuses the call"
+            )
             y = k3_ctm_gemv_long(x, w, sig, split, ring, True, push)
             assert y.shape == (m, n) and y.dtype == torch.bfloat16, label
             assert _rel(y, ref8[:m]) <= TOL, label

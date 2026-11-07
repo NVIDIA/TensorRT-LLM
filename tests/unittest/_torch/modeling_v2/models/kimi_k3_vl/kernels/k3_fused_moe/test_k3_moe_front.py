@@ -13,9 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """trtllm::k3_moe_front (the Kimi K3 MoE front: sharded head GEMV, head all-gather, top-16 routing, MXFP8 latent,
-shared gate_up + SiTU), alone and followed by trtllm::k3_moe through a K3MoeLayer (the plain build waits for the
-front's grid; the head_flags build acquires the ready words the front publishes with ag_ready), one process per GPU
-over the TP group of this run, at every M in 1..8, over one K3MoeHeadWorkspace. The head is sharded over the group
+shared gate_up + SiTU), alone on random input and followed by trtllm::k3_moe through a head_flags K3MoeLayer (k3_moe
+acquires the ready words the front publishes with ag_ready), one process per GPU over the TP group of this run, over
+one K3MoeHeadWorkspace shared by fabric handle (the catalog entry's matrix runs POSIX handles, exact payloads, the
+fused head_flags handoff, capture and the refusals). The head is sharded over the group
 (TP W: 3584 / W latent + 896 / W router rows and 2 x 6144 / W shared rows per rank; W = 4 on one GB200 tray, the
 model's TP16 shapes with 16 processes); the routed experts are one rank of experts TP4 x EP4 (224 local experts,
 intermediate 768), as in the TP16 deployment.
@@ -26,22 +27,16 @@ intermediate 768), as in the TP16 deployment.
           scales (> 99.9 % equal; for the same reason a code may differ only at a reference rounding tie: the
           adjacent E4M3 value under the same block scale, the reference latent within two bf16 ulps of the two
           values' midpoint), the shared activation within 2e-2; the same routing and latent bits on every rank; the
-          head buffers empty and the buffer index flipped after each call;
-  fused : y against the TRTLLM-Gen W4A8_MXFP4_MXFP8 runner on the front's own routing and MXFP8 latent (op-catalog
-          gates), the shared activation the front's bits, k3_moe's scratch re-armed;
-  head_flags : fused with the ready-word handoff (k3_moe built with head_flags) across the head epoch's int32 wrap:
-          no word a call polls already holds the value it waits for, the plain call's bits, every ready word left
-          at the next call's epoch (check_head_flags);
-  publish_order : the handoff with k3_moe's epoch advance racing the front's epoch read: rank 1 routed nothing, k3_moe
-          on half the SMs, each quantization CTA held before its flags read until the epoch moves; every ready word
-          left at the next call's epoch (check_publish_order);
-front and fused each with run-to-run identical bits and each M's rows bit-identical to the same rows of the 8-token
-call (the fused y within one bf16 ulp: k3_moe's slice FC2 groups a token's expert terms by the step's group count).
-The buffer and scratch checks run between barriers (peers write this rank's buffers in their next call); a failing
-rank's rows are printed after rank 0's.
+          head buffers empty and the buffer index flipped after each call, at every M in 1..8, with run-to-run
+          identical bits and each M's rows bit-identical to the same rows of the 8-token call;
+  publish_order : the ready-word handoff with k3_moe's epoch advance racing the front's epoch read: rank 1 routed
+          nothing, k3_moe on half the SMs, each quantization CTA held before its flags read until the epoch moves;
+          every ready word left at the next call's epoch (check_publish_order).
+The buffer checks run between barriers (peers write this rank's buffers in their next call); a failing rank's rows
+are printed after rank 0's.
 
 Run under pytest (a pool of 4 MPI workers) or directly, one process per GPU:
-  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front.py [front fused head_flags publish_order]
+  srun -N1 -n4 --mpi=pmix python3 test_k3_moe_front.py [front publish_order]
 """
 
 import importlib.util
@@ -88,7 +83,6 @@ GATE_CAP, LINEAR_CAP = 4.0, 25.0
 RSF = 2.827
 I_TP, E_LOCAL, MOE_TP = 768, 224, 4  # one rank of the routed experts' TP4 x EP4
 EMPTY = -(2**31)
-ULP = 2.0**-8
 M_ALL = list(range(1, 9))
 
 
@@ -181,22 +175,20 @@ def _context(with_experts):
     ctx = SimpleNamespace(
         comm=comm, rank=rank, world=world, wl=wl, we=we, inter=inter, bias=bias, x8=x8, head=head, gate_up=gate_up,
         front=front_op.front_weight(head, gate_up), ws=ws, ag=(ws.uc, ws.mc, ws.flags, ws.rank),
-        offset=(rank % 4) * E_LOCAL, experts=_experts(20260928 + rank) if with_experts else None, layer=None,
+        offset=(rank % 4) * E_LOCAL, experts=_experts(20260928 + rank) if with_experts else None,
     )  # fmt: skip
-    if with_experts:
-        ctx.layer = _layer(ctx)
     return ctx
 
 
-def _layer(ctx, head_flags=False, num_ctas=None):
-    """This rank's experts as a layer of a new K3MoeState: the plain build, or the head_flags build; ``num_ctas`` caps
-    k3_moe's persistent grid (default one CTA per SM)."""
+def _layer(ctx, num_ctas):
+    """This rank's experts as a layer of a new K3MoeState, the head_flags build; ``num_ctas`` caps k3_moe's persistent
+    grid."""
     from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_fused_moe import (
         op as moe_op,
     )
 
     p = ctx.experts
-    state = moe_op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL, head_flags=head_flags,
+    state = moe_op.K3MoeState(torch.device("cuda", torch.cuda.current_device()), I_TP, E_LOCAL, head_flags=True,
                               num_ctas=num_ctas)  # fmt: skip
     return state.layer(p["w31"], p["w31s"], p["w2"], p["w2s"])
 
@@ -307,143 +299,18 @@ def check_front(ctx):
     return results
 
 
-def _fused(ctx, x, layer=None, bias=None):
-    """trtllm::k3_moe_front, then trtllm::k3_moe on ``layer`` (default: the plain build's ``ctx.layer``); returns
-    (y, shared). A head_flags layer's front publishes the ready words (``ag_ready``) and its k3_moe acquires them."""
-    layer = layer or ctx.layer
-    head = layer.state.head_flags
+def _fused(ctx, x, layer, bias):
+    """trtllm::k3_moe_front, then trtllm::k3_moe on the head_flags ``layer``; returns (y, shared). The front publishes
+    the ready words (``ag_ready``) and k3_moe acquires them."""
     ids, w, q, s, shared = _trtllm().k3_moe_front(
-        x, ctx.front, ctx.bias if bias is None else bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag, ctx.world,
-        ag_ready=ctx.ws.ready if head else None,
+        x, ctx.front, bias, RSF, ctx.inter, GATE_CAP, LINEAR_CAP, *ctx.ag, ctx.world, ag_ready=ctx.ws.ready,
     )  # fmt: skip
-    if not head:
-        return layer(q, s, ids, w, ctx.offset), shared
     y = layer(q, s, ids, w, ctx.offset, head_ready=ctx.ws.ready, head_flags=ctx.ws.flags)
     return y, shared
 
 
-def _runner(ctx, ids, w, q, s):
-    """The TRTLLM-Gen W4A8_MXFP4_MXFP8 MoE, pre-routed (the model's base path for these experts)."""
-    from tensorrt_llm._torch.moe.fused_moe.routing import RoutingMethodType
-    from tensorrt_llm._torch.utils import ActType_TrtllmGen
-
-    p = ctx.experts
-    alpha = torch.full((E_LOCAL,), GATE_CAP, dtype=torch.float32, device="cuda")
-    beta = torch.full((E_LOCAL,), LINEAR_CAP, dtype=torch.float32, device="cuda")
-    return _trtllm().mxe4m3_mxe2m1_block_scale_moe_runner(
-        None, None, q, s.view(-1), p["w31"], p["w31s"], None, alpha, beta, None, p["w2"], p["w2s"], None, EXPERTS,
-        TOP_K, 1, 1, I_TP, LATENT, I_TP, ctx.offset, E_LOCAL, 1.0, int(RoutingMethodType.DeepSeekV3),
-        int(ActType_TrtllmGen.SiTu), topk_weights=w, topk_ids=ids)  # fmt: skip
-
-
-def _compare(y, ref):
-    o, r = y.float(), ref.float()
-    row = r.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
-    elt = ((o - r).abs() / row).max().item() / ULP
-    rms = ((o - r).pow(2).mean().sqrt() / r.pow(2).mean().sqrt().clamp_min(1e-12)).item() / ULP
-    return elt, rms, bool(torch.isfinite(o).all()) and elt <= 8.0 and rms <= 4.0
-
-
-def _scratch_rearmed(ctx):
-    """The plain build's intermediate slab armed again and its layer's counters zero."""
-    st = ctx.layer.state
-    mod = st.mod
-    cs = st.cs.view(mod.G_CAP, 8, mod.K2_TILES, mod.SFB_GROUP_BYTES)
-    armed = bool((st.c == -128).all()) and bool((cs[..., :4] == -1).all())
-    return armed and bool((ctx.layer.counters == 0).all())
-
-
-def _max_ulp(a: torch.Tensor, b: torch.Tensor) -> int:
-    def ordered(x):
-        i = x.contiguous().view(torch.int16).int()
-        return torch.where(i < 0, -(i & 0x7FFF), i)
-
-    return int((ordered(a) - ordered(b)).abs().max().item()) if a.numel() else 0
-
-
-def check_fused(ctx):
-    """y's rows against the 8-token call within one bf16 ulp: k3_moe's slice FC2 groups a token's expert terms by the
-    step's group count (bit-identity reported); the shared activation (per token) bit for bit."""
-    results = []
-    y8, sh8 = _fused(ctx, ctx.x8)
-    for m in M_ALL:
-        x = ctx.x8[:m].contiguous()
-        y, shared = _fused(ctx, x)
-        torch.cuda.synchronize()
-        rearmed = _quiet_check(ctx, lambda: _scratch_rearmed(ctx) and _buffers_empty(ctx))
-        ids, w, q, s, f_shared = _front(ctx, x)
-        y_stock = _runner(ctx, ids, w, q, s)
-        local = int(((ids >= ctx.offset) & (ids < ctx.offset + E_LOCAL)).sum())
-        again = [_fused(ctx, x) for _ in range(2)]
-        if local:
-            elt, rms, close = _compare(y, y_stock)
-        else:
-            elt, rms, close = 0.0, 0.0, bool((y.float() == 0).all())
-        row = dict(
-            op="k3_fused_moe_front", case=f"tp{ctx.world}", M=m, local_pairs=local, vs_stock_elt_ulp=elt,
-            vs_stock_rms_ulp=rms, shared_eq_front=_same(shared, f_shared),
-            det=all(_same(a, y) and _same(b, shared) for a, b in again),
-            rows_as_m8=_same(y, y8[:m]) and _same(shared, sh8[:m]), max_ulp_vs_m8=_max_ulp(y, y8[:m]),
-            shared_rows_as_m8=_same(shared, sh8[:m]), scratch_rearmed=rearmed,
-        )  # fmt: skip
-        good = (close and row["shared_eq_front"] and row["det"] and row["max_ulp_vs_m8"] <= 1
-                and row["shared_rows_as_m8"] and rearmed)  # fmt: skip
-        row["rank"], row["good"] = ctx.rank, bool(good)
-        row["ok"] = _all_ranks(ctx, good)
-        results.append(row)
-    return results
-
-
 def _i32(v: int) -> int:
     return (v + 2**31) % 2**32 - 2**31
-
-
-def check_head_flags(ctx):
-    """The front, then k3_moe with the ready-word handoff (``ag_ready``: k3_moe built with head_flags acquires the
-    front's ready words, ready[t] / ready[8 + t] = the head epoch flags[2] + 1 for token t, instead of its grid)
-    across the epoch's int32 wrap. From a new workspace's state (epoch 0, ready words 0), two calls at M 1, then the
-    epoch preset to -2, then calls at M 1, 8, 3, 8: the M 8 call at epoch -1 waits for 0, the value of the words that
-    no call has published. Per call: no word the call polls already holds its epoch + 1 (such a word would let k3_moe
-    read the routing before the front writes it; the call is then not run); y and the shared activation the bits of
-    the plain call; afterwards the epoch and every ready word hold the next call's epoch, the head buffers empty."""
-    flags, ready = ctx.ws.flags, ctx.ws.ready
-    flag_layer = _layer(ctx, head_flags=True)
-    plain = {m: _fused(ctx, ctx.x8[:m].contiguous()) for m in (1, 3, 8)}
-    torch.cuda.synchronize()
-
-    def set_epoch(epoch):
-        flags[2] = epoch
-
-    _quiet_check(ctx, lambda: (ready.zero_(), set_epoch(0)))
-    results = []
-    for m in (1, 1, None, 1, 8, 3, 8):
-        if m is None:  # two calls before the epoch reaches 0
-            _quiet_check(ctx, lambda: set_epoch(-2))
-            continue
-        x = ctx.x8[:m].contiguous()
-        epoch, words = _quiet_check(ctx, lambda: (int(flags[2].item()), ready[:16].tolist()))
-        want = _i32(epoch + 1)
-        pre_matched = [i for i in [*range(m), *range(8, 8 + m)] if words[i] == want]
-        row = dict(op="k3_fused_moe_front_ready", case=f"tp{ctx.world}", M=m, epoch=epoch,
-                   pre_matched=pre_matched)  # fmt: skip
-        if not _all_ranks(ctx, not pre_matched):
-            row["rank"], row["good"], row["ok"] = ctx.rank, False, False
-            results.append(row)
-            break
-        y, shared = _fused(ctx, x, flag_layer)
-        torch.cuda.synchronize()
-        after, words = _quiet_check(ctx, lambda: (int(flags[2].item()), ready[:16].tolist()))
-        row.update(
-            epoch_advanced=after == want, ready_rearmed=all(w == want for w in words),
-            y_as_plain=_same(y, plain[m][0]), shared_as_plain=_same(shared, plain[m][1]),
-            buffers_empty=_quiet_check(ctx, lambda: _buffers_empty(ctx)),
-        )  # fmt: skip
-        good = all(row[k] for k in ("epoch_advanced", "ready_rearmed", "y_as_plain", "shared_as_plain",
-                                    "buffers_empty"))  # fmt: skip
-        row["rank"], row["good"] = ctx.rank, bool(good)
-        row["ok"] = _all_ranks(ctx, good)
-        results.append(row)
-    return results
 
 
 # The role CTAs' read of the head workspace's flags (buffer index, epoch) in k3_moe_front.py, and what
@@ -511,7 +378,7 @@ def check_publish_order(ctx, num_ctas=None):
         ctas = num_ctas or ctas // 2
     saved_kernel, saved_compiled = front_op._kernel, dict(front_op._compiled)
     tmp_dir = tempfile.mkdtemp(prefix="k3_moe_front_")
-    held_layer = _layer(ctx, head_flags=True, num_ctas=ctas)
+    held_layer = _layer(ctx, ctas)
 
     def fused(x):
         return _fused(ctx, x, held_layer, bias)
@@ -570,15 +437,13 @@ def check_publish_order(ctx, num_ctas=None):
 
 CHECKS = {
     "front": check_front,
-    "fused": check_fused,
-    "head_flags": check_head_flags,
     "publish_order": check_publish_order,
 }
 
 
 def _run_checks(names):
     try:
-        ctx = _context(with_experts=bool({"fused", "head_flags", "publish_order"} & set(names)))
+        ctx = _context(with_experts="publish_order" in names)
         with torch.inference_mode():
             return [row for name in names for row in CHECKS[name](ctx)]
     except Exception:

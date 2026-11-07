@@ -8,6 +8,9 @@ import zlib
 import pytest
 import torch
 
+from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_head_gemv import (
+    op as head_op,
+)
 from tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.ops.gemm.k3_head_gemv import (
     K3HeadGemvWorkspace,
     k3_head_gemv,
@@ -65,8 +68,8 @@ def _at_rest(ws: K3HeadGemvWorkspace) -> bool:
 
 @pytest.mark.parametrize("cell", k3_head_gemv.CELLS, ids=[c.why[:40] for c in k3_head_gemv.CELLS])
 def test_certified_cells(cell) -> None:
-    """Every M on one workspace: shape, dtype, error, rerun and 8-row-call bits, the words at zero after each call;
-    keep_tiles 40 and 80 bit-identical to 0."""
+    """Every M on one workspace: supports() admits it; shape, dtype, error, rerun and 8-row-call bits, the words at zero
+    after each call; keep_tiles 40 and 80 bit-identical to 0."""
     n, k = (cell.spec[key] for key in ("n", "k"))
     weight, weight2, x8 = _inputs(zlib.crc32(cell.why.encode()) % 2**31, n, k)
     weight = (weight, weight2)[cell.spec["weight_index"]]
@@ -83,6 +86,7 @@ def test_certified_cells(cell) -> None:
         y8 = k3_head_gemv(x8, weight, ws)
         for m in cell.spec["ms"]:
             x = x8[:m]
+            assert head_op.supports(x, weight), f"M={m}: supports() refuses the call"
             y = k3_head_gemv(x, weight, ws)
             again = k3_head_gemv(x, weight, ws)
             assert y.shape == (m, n) and y.dtype == torch.bfloat16 and y.device == x.device
