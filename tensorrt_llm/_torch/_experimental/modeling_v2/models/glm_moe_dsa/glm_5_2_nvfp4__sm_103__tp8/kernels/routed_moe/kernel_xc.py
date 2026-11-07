@@ -1181,7 +1181,13 @@ class RoutedMoeExpertClusterKernel(RoutedMoeKernel):
                 tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                 kb = Int32(0)
                 while kb < FC1_KB:
-                    cute.arch.mbarrier_wait(b_mbar + kb, 0)
+                    # the peers' bulk copies of B / SFB complete this barrier with a
+                    # cluster-scope release: acquire at cluster scope (the plain wait
+                    # is CTA scope and does not order the async-proxy reads below)
+                    kbar = Int32((b_mbar + kb).toint())
+                    done = ptx.mbar_try_wait_cluster(kbar, Int32(0))
+                    while done == 0:
+                        done = ptx.mbar_try_wait_cluster(kbar, Int32(0))
                     ring.consumer_wait(ring_state)
                     cute.copy(
                         copy_s2t_sfa,
@@ -1319,7 +1325,11 @@ class RoutedMoeExpertClusterKernel(RoutedMoeKernel):
             # debug only: wait for every k-block (local and peers'), then CTA 0
             # dumps B / SFB
             for k2 in cutlass.range_constexpr(FC1_KB):
-                cute.arch.mbarrier_wait(b_mbar + k2, 0)
+                # peers' bulk copies complete these barriers: acquire at cluster scope
+                kbar2 = Int32((b_mbar + k2).toint())
+                done = ptx.mbar_try_wait_cluster(kbar2, Int32(0))
+                while done == 0:
+                    done = ptx.mbar_try_wait_cluster(kbar2, Int32(0))
             qt = warp_idx * 32 + lane
             if warp_idx > TMA_WARP:
                 qt = qt - 64
