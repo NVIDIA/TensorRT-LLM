@@ -21,6 +21,7 @@ import queue
 import struct
 import threading
 import time
+import traceback
 import weakref
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -115,6 +116,81 @@ _FALLBACK_TX_WAIT_SLICE_S = 1.0
 # an overall deadline. KvCacheTransceiverV2 requires a configured transfer
 # timeout before it creates either sender or receiver sessions.
 _FALLBACK_TX_OVERALL_TIMEOUT_S = 60.0
+# Longest a remote-metadata load waits for in-flight transfers without physical
+# ownership to leave _AgentOperationGate before it loads anyway.
+_METADATA_DRAIN_TIMEOUT_S = 10.0
+
+
+class _AgentOperationGate:
+    """Reader/writer gate between NIXL transfers and remote-metadata loads.
+
+    A remote-metadata load (``load_remote_agent``) holds NIXL's metadata lock
+    while UCX creates endpoints, which can take seconds. Releasing a transfer
+    request (the ``TransferStatus`` destructor) needs that lock and runs with
+    the GIL held, so a release that overlaps a load freezes every Python
+    thread of the process. Transfers enter as readers for the full
+    submit + wait + release interval; a load enters as the single writer once
+    no transfer is active, and waits here with the GIL released.
+
+    A transfer wait has no timeout, so the drain is bounded instead: after
+    ``drain_timeout_s`` the load enters with the remaining transfers still
+    inside. Those keep running and may overlap the load as they would without
+    the gate; transfers that arrive later still wait for the load to finish.
+    """
+
+    def __init__(self, drain_timeout_s: float = _METADATA_DRAIN_TIMEOUT_S):
+        self._condition = threading.Condition()
+        self._drain_timeout_s = drain_timeout_s
+        self._active_transfers = 0
+        self._metadata_active = False
+        self._metadata_waiters = 0
+
+    @contextmanager
+    def transfer(self):
+        with self._condition:
+            # A waiting metadata load goes first so a continuous transfer
+            # stream cannot starve first-use peer registration.
+            while self._metadata_active or self._metadata_waiters > 0:
+                self._condition.wait()
+            self._active_transfers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._active_transfers -= 1
+                if self._active_transfers == 0:
+                    self._condition.notify_all()
+
+    @contextmanager
+    def metadata(self) -> Iterator[int]:
+        """Enter as the single writer.
+
+        Yields:
+            The number of transfers still inside the gate: 0 unless the drain
+            timed out.
+        """
+        with self._condition:
+            self._metadata_waiters += 1
+            try:
+                deadline = time.monotonic() + self._drain_timeout_s
+                while self._metadata_active or self._active_transfers > 0:
+                    if self._metadata_active:
+                        self._condition.wait()
+                        continue
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._condition.wait(remaining)
+                self._metadata_active = True
+                undrained = self._active_transfers
+            finally:
+                self._metadata_waiters -= 1
+        try:
+            yield undrained
+        finally:
+            with self._condition:
+                self._metadata_active = False
+                self._condition.notify_all()
 
 
 # Every REQUEST_DATA from a generation server on v1.3.0rc25 or a later release that still has
@@ -614,6 +690,7 @@ class Sender(SenderBase):
         # Guards concurrent add() from the listener thread.
         self._loaded_remote_agents: set[str] = set()
         self._loaded_remote_agents_lock = threading.Lock()
+        self._agent_operation_gate = _AgentOperationGate()
         self._ownership_poisoned: Optional[Exception] = None
         self._ownership_poison_lock = (
             threading.Lock() if retirement_watchdog is None else retirement_watchdog.lock
@@ -928,12 +1005,26 @@ class Sender(SenderBase):
                 "NIXL sender rejected transfer before backend submission"
             ) from error
         if not owned:
-            status = self._agent.submit_transfer_requests(request)
-            if on_submitted is not None:
-                with disagg_diagnostics.suppress_diagnostic_errors():
-                    on_submitted()
-            completed = status.wait()
-            detail = None if completed else getattr(status, "last_status_str", lambda: None)()
+            with self._agent_operation_gate.transfer():
+                status = self._agent.submit_transfer_requests(request)
+                try:
+                    if on_submitted is not None:
+                        with disagg_diagnostics.suppress_diagnostic_errors():
+                            on_submitted()
+                    completed = status.wait()
+                    detail = (
+                        None if completed else getattr(status, "last_status_str", lambda: None)()
+                    )
+                except Exception as error:
+                    # The traceback keeps the status alive through the frames
+                    # of the call that raised; clear them so that the release
+                    # below is the last reference.
+                    traceback.clear_frames(error.__traceback__)
+                    raise
+                finally:
+                    # The status destructor releases the NIXL request; it must
+                    # run inside the gate, before a metadata load can start.
+                    del status
             return completed, detail
         with self._ownership_poison_lock:
             if self._ownership_poisoned is not None:
@@ -1809,17 +1900,33 @@ class Sender(SenderBase):
         ri: RankInfo = RankInfo.from_bytes(message[1])
         agent_name = ri.instance_name + str(ri.instance_rank)
         logger.debug(f"Loading remote transfer agent descriptor for peer '{agent_name}'")
-        # NIXL serializes descriptor load against submit internally. This lock
-        # only closes the local load-vs-shutdown window; active transfers do
-        # not need to drain before a new peer is registered.
+        # The lock closes the local load-vs-shutdown window. When transfers
+        # without physical ownership can run, the gate drains them first (see
+        # _AgentOperationGate): NIXL also serializes the load against requests,
+        # but a request released while the load runs would block with the GIL
+        # held. Physical-ownership transfers keep their status in the task and
+        # never enter the gate, so with ownership enforced for every transfer
+        # the load does not wait there.
         with self._loaded_remote_agents_lock:
             if self._shutdown_requested:
                 return
             self._registrar.register(ri.instance_name, ri.instance_rank, ri)
-            self._agent.load_remote_agent(
-                agent_name,
-                ri.transfer_engine_info,
+            metadata_gate = (
+                nullcontext()
+                if self._enforce_physical_ownership
+                else self._agent_operation_gate.metadata()
             )
+            with metadata_gate as undrained:
+                if undrained:
+                    logger.warning(
+                        f"Sender: loading remote agent '{agent_name}' while {undrained} NIXL "
+                        f"transfer(s) are still in flight after {_METADATA_DRAIN_TIMEOUT_S:.0f} s; "
+                        "a request released during the load can stall this process until it ends"
+                    )
+                self._agent.load_remote_agent(
+                    agent_name,
+                    ri.transfer_engine_info,
+                )
             self._loaded_remote_agents.add(agent_name)
         logger.debug(
             f"Completed handling REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"

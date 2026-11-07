@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -410,6 +411,182 @@ def test_failed_sender_write_retains_roots_until_fatal_deadline() -> None:
     assert operation.status is status
     assert not task.resources_drained
     assert not owner.close()
+
+
+def test_agent_gate_metadata_drains_transfers_and_goes_first() -> None:
+    """A metadata load waits for active transfers and is not starved by new ones."""
+    gate = transfer_mod._AgentOperationGate()
+    order: list[str] = []
+    release_first = threading.Event()
+    first_in = threading.Event()
+
+    def first_transfer() -> None:
+        with gate.transfer():
+            first_in.set()
+            release_first.wait(5)
+            order.append("transfer1-done")
+
+    def load() -> None:
+        with gate.metadata():
+            order.append("load")
+
+    def second_transfer() -> None:
+        with gate.transfer():
+            order.append("transfer2")
+
+    t1 = threading.Thread(target=first_transfer)
+    t1.start()
+    assert first_in.wait(5)
+    t_load = threading.Thread(target=load)
+    t_load.start()
+    deadline = time.monotonic() + 5
+    while gate._metadata_waiters == 0 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert gate._metadata_waiters == 1
+    t2 = threading.Thread(target=second_transfer)
+    t2.start()
+    time.sleep(0.05)
+    assert order == []  # the load waits for transfer1; transfer2 waits behind the load
+    release_first.set()
+    for t in (t1, t_load, t2):
+        t.join(5)
+        assert not t.is_alive()
+    assert order == ["transfer1-done", "load", "transfer2"]
+    assert gate._active_transfers == 0 and not gate._metadata_active
+
+
+def test_agent_gate_metadata_loads_after_drain_timeout() -> None:
+    """A transfer that never leaves delays a metadata load only by the drain timeout."""
+    drain_timeout_s = 0.05
+    gate = transfer_mod._AgentOperationGate(drain_timeout_s=drain_timeout_s)
+    stuck_in, release_stuck = threading.Event(), threading.Event()
+    load_in, release_load = threading.Event(), threading.Event()
+    later_done = threading.Event()
+    undrained: list[int] = []
+
+    def stuck_transfer() -> None:
+        with gate.transfer():
+            stuck_in.set()
+            release_stuck.wait(5)
+
+    def load() -> None:
+        with gate.metadata() as count:
+            undrained.append(count)
+            load_in.set()
+            release_load.wait(5)
+
+    def later_transfer() -> None:
+        with gate.transfer():
+            later_done.set()
+
+    t_stuck = threading.Thread(target=stuck_transfer)
+    t_stuck.start()
+    assert stuck_in.wait(5)
+    started = time.monotonic()
+    t_load = threading.Thread(target=load)
+    t_load.start()
+    assert load_in.wait(5)
+    assert time.monotonic() - started >= drain_timeout_s
+    assert undrained == [1]  # the load entered with the stuck transfer still inside
+    t_later = threading.Thread(target=later_transfer)
+    t_later.start()
+    assert not later_done.wait(0.05)  # a new transfer still waits for the load
+    release_load.set()
+    assert later_done.wait(5)
+    release_stuck.set()
+    for t in (t_stuck, t_load, t_later):
+        t.join(5)
+        assert not t.is_alive()
+    assert gate._active_transfers == 0 and not gate._metadata_active
+
+
+def test_submit_transfer_releases_status_inside_agent_gate() -> None:
+    """The status destructor (NIXL request release) runs before the transfer leaves the gate.
+
+    Covers a completed, a failed and a raising wait; the traceback of the raising one must not
+    keep the status alive past the gate.
+    """
+    gate = transfer_mod._AgentOperationGate()
+    seen: list[tuple[int, bool]] = []
+
+    class _Status:
+        def __init__(self, completed: bool | None) -> None:
+            self._completed = completed
+
+        def wait(self) -> bool:
+            if self._completed is None:
+                raise RuntimeError("wait failed")
+            return self._completed
+
+        def last_status_str(self) -> str:
+            return "ERROR"
+
+        def __del__(self) -> None:
+            seen.append((gate._active_transfers, gate._metadata_active))
+
+    sender = object.__new__(transfer_mod.Sender)
+    sender._shutdown = True  # No worker threads or transport were created by this fixture.
+    sender._enforce_physical_ownership = False
+    sender._agent_operation_gate = gate
+    outcomes: list[bool | None] = [True, False, None]
+    # Build each status on demand: a list of prebuilt ones would keep them alive past the call.
+    sender._agent = Mock(
+        submit_transfer_requests=Mock(side_effect=lambda _req: _Status(outcomes.pop(0))),
+        check_remote_descs=Mock(return_value=True),
+    )
+    task = transfer_mod.SendTaskBase(DisaggregatedParams(disagg_request_id=21))
+
+    def request() -> Mock:
+        return Mock(op=transfer_mod.TransferOp.WRITE, remote_name="peer")
+
+    assert sender._submit_transfer(task, 3, request()) == (True, None)
+    assert sender._submit_transfer(task, 3, request()) == (False, "ERROR")
+    with pytest.raises(RuntimeError, match="wait failed"):
+        sender._submit_transfer(task, 3, request())
+    assert seen == [(1, False)] * 3
+    assert gate._active_transfers == 0
+
+
+def test_unowned_sender_registration_waits_for_active_transfer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without physical ownership, a remote-metadata load waits for the transfer in flight."""
+    sender = object.__new__(transfer_mod.Sender)
+    sender._shutdown = True  # No worker threads or transport were created by this fixture.
+    sender._shutdown_requested = False
+    sender._enforce_physical_ownership = False
+    sender._loaded_remote_agents_lock, sender._loaded_remote_agents = threading.Lock(), set()
+    sender._agent_operation_gate = transfer_mod._AgentOperationGate()
+    sender._device_id, sender._registrar, sender._agent = 0, Mock(), Mock()
+    peer = SimpleNamespace(instance_name="gen", instance_rank=2, transfer_engine_info=b"descriptor")
+    monkeypatch.setattr(transfer_mod.torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(transfer_mod.cudart, "cudaSetDevice", Mock(return_value=0))
+    monkeypatch.setattr(transfer_mod, "CUASSERT", Mock())
+    monkeypatch.setattr(transfer_mod.RankInfo, "from_bytes", Mock(return_value=peer))
+    errors: list[Exception] = []
+
+    def register() -> None:
+        try:
+            sender._register_peer_rank(b"", [b"", b"rank"])
+        except Exception as error:  # Re-raised on the test thread below.
+            errors.append(error)
+
+    gate = sender._agent_operation_gate
+    with gate.transfer():
+        registration = threading.Thread(target=register)
+        registration.start()
+        deadline = time.monotonic() + 5
+        while gate._metadata_waiters == 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert gate._metadata_waiters == 1
+        sender._agent.load_remote_agent.assert_not_called()
+    registration.join(5)
+    assert not registration.is_alive()
+    if errors:
+        raise errors[0]
+    sender._agent.load_remote_agent.assert_called_once_with("gen2", b"descriptor")
+    assert sender._loaded_remote_agents == {"gen2"}
+    assert gate._active_transfers == 0 and not gate._metadata_active
 
 
 @pytest.mark.parametrize("kill_raises", [False, True])
