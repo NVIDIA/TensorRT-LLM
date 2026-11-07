@@ -418,6 +418,31 @@ index 8b2e8a43e5553ed33b67603273e0cc1fbd3585ae..fd3f735ede1f723f66d76f45a6490921
  from ...tensor_map import create_tensor_map_tiled_from_view
  from .gather import _address, gather4, select_gather_map
  from ...fmha_decode.fmha_decode_resources.tmem_transformed_kv import (
+diff --git a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
+index 0f953c00ed9a42f2eba63de8923bd3a21951245e..fd825a70072c597511d37230198964e2788a2af7 100644
+--- a/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
++++ b/kernels/mla_decode/throughput_latency_1cta/parallel_reduction.py
+@@ -353,17 +353,17 @@ def _run_parallel_gmem_reduction_g1_shared_stats(
+                     cutlass.const_expr(lane_slot_i == 0)
+                     or Int32(lane_slot_i * GMEM_REDUCTION_WARP_LANES) < split_limit
+                 ):
+-                    stats_split_idx = lane_idx + Int32(
++                    weight_split_idx = lane_idx + Int32(
+                         lane_slot_i * GMEM_REDUCTION_WARP_LANES
+                     )
+-                    if stats_split_idx < split_limit:
++                    if weight_split_idx < split_limit:
+                         stats_weight = normalized_lse_weight(
+                             lane_lse[lane_slot_i], global_lse
+                         )
+                         if cutlass.const_expr(finalize_attention):
+                             stats_weight *= stats_sink_scale
+                         smem_scale[
+-                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + stats_split_idx
++                            stats_row * Int32(cfg.num_ctas_per_seq_kv) + weight_split_idx
+                         ] = stats_weight
+ 
+     prims.barrier_cta_sync(
 diff --git a/mla_decode.py b/mla_decode.py
 index 94547ed86f7365df3638215daa0762ff1344741f..d0916ceffe0839ff9dd5c26fcf380a7bf4e50862 100644
 --- a/mla_decode.py
