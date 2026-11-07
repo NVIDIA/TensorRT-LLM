@@ -1326,21 +1326,17 @@ class MiniMaxVLVisionTransformer(nn.Module):
         self.register_buffer("inv_freq_h", inv_freq_h, persistent=False)
         self.register_buffer("inv_freq_w", inv_freq_w, persistent=False)
 
-    def _compute_cu_seqlens(
-        self, grid_thw: Sequence[Sequence[int]], device: torch.device
-    ) -> torch.Tensor:
+    def _compute_cu_seqlens(self, grid_thw: Sequence[Sequence[int]]) -> torch.Tensor:
         """Cumulative per-image token boundary tensor for SDPA segmentation.
 
         For each image we add ``grid_t * grid_h * grid_w`` tokens to the
-        running total. Returns a 1D int32 tensor of length
-        ``num_images + 1`` on the requested device.
+        running total. Returns a 1D int32 CPU tensor of length
+        ``num_images + 1``; the attention layers read it on the host.
         """
         seqlens = [0]
         for grid_t, grid_h, grid_w in grid_thw:
             seqlens.append(grid_t * grid_h * grid_w)
-        return torch.cumsum(torch.tensor(seqlens, dtype=torch.int32, device=device), dim=0).to(
-            torch.int32
-        )
+        return torch.cumsum(torch.tensor(seqlens, dtype=torch.int32), dim=0).to(torch.int32)
 
     def _get_3d_rope_freqs(
         self,
@@ -1433,7 +1429,9 @@ class MiniMaxVLVisionTransformer(nn.Module):
         hidden_states = self.pre_layrnorm(hidden_states)
 
         device = hidden_states.device
-        cu_seqlens = self._compute_cu_seqlens(grid_thw, device=device)
+        # Read the grid on the host once; a GPU grid would otherwise sync on every element read.
+        grid_thw = _flatten_grids(grid_thw)
+        cu_seqlens = self._compute_cu_seqlens(grid_thw)
         freqs = self._get_rope_freqs(grid_thw).to(device=device)
         cos, sin = _prepare_rotary_cos_sin(freqs)
 
