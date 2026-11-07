@@ -524,7 +524,7 @@ def runIsolatedTests(pipeline, preprocessedLists, testCmdLine, llmSrc, stageName
         isolateTestCmdLine += ["--test-list=${singleTestFile}"]
         isolateTestCmdLine += ["--test-prefix=${stageName}"]
         isolateTestCmdLine += ["--csv=${WORKSPACE}/${stageName}/report_isolated_${i}.csv"]
-        isolateTestCmdLine += ["--periodic-junit-xmlpath ${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
+        isolateTestCmdLine += ["--periodic-junit-xmlpath=${WORKSPACE}/${stageName}/results_isolated_${i}.xml"]
 
         try {
             sh """
@@ -1920,7 +1920,8 @@ def getPytestBaseCommandLine(
         // Coverage capture: only CBTS (post-merge) stages instrument, via cbts_plugin / sitecustomize.
         cbtsMode ? "-p cbts_plugin" : "",
         "--periodic-junit",
-        "--periodic-junit-xmlpath ${outputPath}/results.xml",
+        // Keep an existing report path out of pytest's initial collection-path discovery.
+        "--periodic-junit-xmlpath=${outputPath}/results.xml",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
         // Reruns redirect --periodic-junit-xmlpath elsewhere but inherit this
@@ -5207,7 +5208,7 @@ def rerunFailedTests(pipeline, stageName, llmSrc, testCmdLine, resultFileName="r
         newTestCmdLine += [
             "--test-list=${currentRerunTestList}",
             "--csv=${rerunDir}/rerun_report_${times}.csv",
-            "--periodic-junit-xmlpath ${xmlFile}",
+            "--periodic-junit-xmlpath=${xmlFile}",
             "--reruns ${times - 1}"
         ]
         def rerunProgressTar = "results-${stageName}${postTag}-progress.tar.gz"
