@@ -15,8 +15,8 @@ from ..custom_ops.nvfp4_sfc_finalize import FP8_MAX
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor, gelu_tanh, relu2
-from .linear import (Linear, TensorParallelMode, UnquantizedLinearMethod,
-                     WeightMode, WeightsLoadingConfig,
+from .linear import (FP8QDQLinearMethod, Linear, TensorParallelMode,
+                     UnquantizedLinearMethod, WeightMode, WeightsLoadingConfig,
                      is_dynamic_nvfp4_input_eligible,
                      is_static_nvfp4_input_eligible)
 
@@ -178,6 +178,7 @@ class MLP(nn.Module):
         )
 
         self._use_fused_relu2_quant = False
+        self._use_fp8_gelu_fusion = False
         self._use_fused_gelu = False
         self._use_fused_gelu_fp4out = False
         self._use_fused_gelu_deferred_fp4out = False
@@ -208,13 +209,39 @@ class MLP(nn.Module):
     # the (still fused) bf16-out path.
     _FP4OUT_MIN_M = 128
 
+    def enable_fp8_gelu_fusion(self) -> bool:
+        """Run up_proj with bias + GELU(tanh) + FP8 output in its GEMM epilogue, feeding
+        down_proj's static FP8 input directly. Call after weights are loaded; returns whether
+        the fusion applies (static FP8 up/down projections on the cuBLAS path)."""
+        up, down = self.up_proj, self.down_proj
+        self._use_fp8_gelu_fusion = (
+            self.activation is gelu_tanh
+            and isinstance(up.quant_method, FP8QDQLinearMethod)
+            and isinstance(down.quant_method, FP8QDQLinearMethod)
+            and up.quant_method.supports_cublas_epilogues(up)
+            and down.quant_method.get_static_input_scale(down) is not None
+            and not up.gather_output)
+        return self._use_fp8_gelu_fusion
+
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
         lora_params: Optional[dict] = None,
+        defer_down_bias: bool = False,
     ) -> torch.Tensor:
+        """With defer_down_bias, returns down_proj's output without its bias (the caller adds it)."""
         if lora_params is not None:
+            if defer_down_bias:
+                raise ValueError("defer_down_bias is not supported with LoRA.")
             return self.forward_lora(x, lora_params=lora_params)
+
+        if self._use_fp8_gelu_fusion and isinstance(x, torch.Tensor):
+            up, down = self.up_proj, self.down_proj
+            h8 = up.quant_method.apply_gelu_fp8_out(up, x, down.inv_input_scale)
+            return down.forward_without_bias(h8) if defer_down_bias else down(
+                h8)
+        if defer_down_bias:
+            raise ValueError("defer_down_bias needs enable_fp8_gelu_fusion().")
 
         # Fuse up_proj GEMM + bias + GELU(tanh) (+ NVFP4-quant) into the GEMM
         # epilogue (mirrors GatedMLP). Static eligibility can go stale: quant_method

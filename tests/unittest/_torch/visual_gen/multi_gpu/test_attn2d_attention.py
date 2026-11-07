@@ -35,6 +35,7 @@ import torch.nn.functional as F
 
 from tensorrt_llm._torch.attention.backends.interface import PredefinedAttentionMask
 from tensorrt_llm._torch.visual_gen.attention.backends import Attention2DAttention
+from tensorrt_llm._torch.visual_gen.attention.backends.cudnn import CuDNNAttention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import FlashAttn4Attention
 from tensorrt_llm._torch.visual_gen.attention.backends.flash_attn4 import (
     _flash_attn_fwd as _fa4_fwd,
@@ -760,6 +761,56 @@ def _logic_attn2d_fa4_vs_standard(rank, world_size):
     )
 
 
+def _logic_attn2d_cudnn_vs_standard(rank, world_size):
+    """Attention2DAttention with the cuDNN inner backend matches standard SDPA (2x2 mesh).
+
+    Q is scaled so each query attends to few keys: the two partial results a rank combines
+    then differ, and the output is only right if the partial LSEs are merged per query and
+    head.
+    """
+    row_size, col_size = 2, 2
+    batch, num_heads, head_dim = 2, 8, 128
+    seq_per_rank = 64
+    seq_full = seq_per_rank * world_size
+
+    device = torch.device(f"cuda:{rank}")
+    row_pg, col_pg = _make_process_groups(rank, world_size, row_size, col_size)
+
+    inner = CuDNNAttention(num_heads=num_heads, head_dim=head_dim, dtype=torch.bfloat16)
+    try:
+        attn = Attention2DAttention(inner, row_pg, col_pg)
+    except ImportError:
+        pytest.skip("flash_attn_combine JIT kernels not available")
+
+    torch.manual_seed(42)
+    q_full = 4 * torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    q_full = q_full.to(torch.bfloat16)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+    rows = slice(rank * seq_per_rank, (rank + 1) * seq_per_rank)
+    output = attn(
+        q_full[:, rows].contiguous(),
+        k_full[:, rows].contiguous(),
+        v_full[:, rows].contiguous(),
+        batch_size=batch,
+    )
+
+    ref = F.scaled_dot_product_attention(
+        q_full.transpose(1, 2).float(),
+        k_full.transpose(1, 2).float(),
+        v_full.transpose(1, 2).float(),
+        scale=1.0 / math.sqrt(head_dim),
+    ).transpose(1, 2)
+    torch.testing.assert_close(
+        output.float(),
+        ref[:, rows],
+        rtol=2e-2,
+        atol=2e-2,
+        msg=f"Rank {rank}: cuDNN Attention2D output differs from standard attention",
+    )
+
+
 def _logic_attn2d_fa4_asymmetric_1x4(rank, world_size):
     """Attention2DAttention with FlashAttn4 inner backend matches standard SDPA (1x4 mesh).
 
@@ -904,6 +955,16 @@ class TestFlashAttn4Forward:
         out = inner.forward(q=q, k=k, v=v)
         assert out.shape == q.shape, f"Expected {q.shape}, got {out.shape}"
         assert torch.isfinite(out).all(), "Output contains non-finite values"
+
+
+class TestAttn2DAttentionCuDNN:
+    """Attention2DAttention using cuDNN as the inner backend."""
+
+    def test_attn2d_cudnn_vs_standard(self):
+        """cuDNN inner backend: output matches standard full-sequence SDPA (2x2 mesh)."""
+        run_test_in_distributed(
+            world_size=4, test_fn=_logic_attn2d_cudnn_vs_standard, use_cuda=True
+        )
 
 
 class TestAttn2DAttentionFlashAttn4:
