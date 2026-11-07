@@ -1538,6 +1538,35 @@ async def _create_input_tokens_harmony(
     return _render_for_completion(messages)
 
 
+RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS_ENV = "TRTLLM_RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS"
+
+
+def responses_default_max_output_tokens() -> Optional[int]:
+    """The ``max_output_tokens`` applied to a Responses request that sets none.
+
+    Read from ``TRTLLM_RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS``. Unset or empty
+    leaves such a request uncapped, so it generates until the model stops or
+    the context is full. A value that is not a positive integer is reported
+    once and ignored. A request's own ``max_output_tokens`` always wins
+    (``ResponsesRequest.to_sampling_params``).
+    """
+    raw = os.environ.get(RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning_once(
+            f"{RESPONSES_DEFAULT_MAX_OUTPUT_TOKENS_ENV}={raw!r} is not a "
+            "positive integer; requests without max_output_tokens stay "
+            "uncapped.",
+            key="responses_default_max_output_tokens_env")
+        return None
+    return value
+
+
 async def request_preprocess(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
@@ -1555,7 +1584,9 @@ async def request_preprocess(
     sampling_params = request.to_sampling_params(
         default_sampling_params={
             "stop_token_ids":
-            get_harmony_adapter().get_stop_tokens() if use_harmony else []
+            get_harmony_adapter().get_stop_tokens() if use_harmony else [],
+            "max_tokens":
+            responses_default_max_output_tokens(),
         },
         reasoning_parser=reasoning_parser,
     )

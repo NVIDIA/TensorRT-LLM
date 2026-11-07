@@ -1763,11 +1763,12 @@ class ResponsesRequest(OpenAIBaseModel):
         default_sampling_params: Optional[dict] = None,
         reasoning_parser: Optional[str] = None,
     ) -> SamplingParams:
-        max_tokens = None
-        if self.max_output_tokens is not None:
-            max_tokens = self.max_output_tokens
-
         default_sampling_params = default_sampling_params or {}
+        # A request that sets no max_output_tokens takes the server's default
+        # cap, when there is one; the response then reports that cap.
+        max_tokens = self.max_output_tokens
+        if max_tokens is None:
+            max_tokens = default_sampling_params.get("max_tokens")
         if (temperature := self.temperature) is None:
             temperature = default_sampling_params.get(
                 "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
