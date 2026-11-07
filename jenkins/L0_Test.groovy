@@ -685,7 +685,7 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, durationsPath="") 
         "--group ${splitId}",
     ]
     if (durationsPath) {
-        testListCmd += ["--durations-path ${durationsPath}"]
+        testListCmd += ["--durations-path=${durationsPath}"]
     }
     testListCmd += getInfraDryRunPytestTargets(cleanedTestDBList)
 
@@ -2476,7 +2476,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 if (useClusterDurations) {
                     def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
                     def clusterDurationsPathNode = "${llmSrcNode}/tests/integration/defs/.test_durations_${clusterKey}"
-                    clusterDurationsArgsNode = ["--durations-path ${clusterDurationsPathNode}"]
+                    clusterDurationsArgsNode = ["--durations-path=${clusterDurationsPathNode}"]
                 }
                 def extraArgs = [
                     "--test-list=$testListPathNode",
@@ -5865,7 +5865,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
             def clusterKey = partition.clusterName.replaceAll('[^a-zA-Z0-9]', '_')
             clusterNameForDurations = clusterKey
             clusterDurationsPath = "${llmSrc}/tests/integration/defs/.test_durations_${clusterKey}"
-            clusterDurationsArgs = ["--durations-path ${clusterDurationsPath}"]
+            clusterDurationsArgs = ["--durations-path=${clusterDurationsPath}"]
         }
 
         def testDBList = renderTestDB(pipeline, testList, llmSrc, stageName, null, clusterNameForDurations)
