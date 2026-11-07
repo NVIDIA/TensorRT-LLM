@@ -18,13 +18,15 @@ import os
 from contextlib import ExitStack
 from typing import Dict, List, Optional, Sequence, Union
 
+import psutil
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._utils import (confidential_compute_enabled, get_sm_version,
-                                 is_sm_100f, prefer_pinned,
-                                 str_dtype_to_binding, torch_dtype_to_str)
+                                 is_device_integrated, is_sm_100f,
+                                 prefer_pinned, str_dtype_to_binding,
+                                 torch_dtype_to_str)
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 # isort: off
@@ -93,6 +95,24 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
+
+
+def _mem_get_info_for_kv_sizing() -> tuple[int, int]:
+    """`torch.cuda.mem_get_info()` that treats reclaimable page cache as free.
+
+    On integrated (unified-memory) GPUs such as DGX Spark, the CPU page cache,
+    e.g. the one filled by reading the checkpoint, is not reported as free by
+    `cudaMemGetInfo`, although the kernel reclaims it on demand and CUDA
+    allocations can use it. Counting it as used shrinks the KV cache budget.
+    Use the kernel's available-memory estimate (MemAvailable) there instead.
+    """
+    free, total = torch.cuda.mem_get_info()
+    if is_device_integrated():
+        available = psutil.virtual_memory().available
+        free = max(free, min(available, total))
+    return free, total
+
+
 _DEFAULT_INDEX_MAPPER_RESERVED_SLOTS = 1
 _CONFIDENCE_INDEX_MAPPER_RESERVED_SLOTS = 2
 
@@ -1914,7 +1934,7 @@ class KvCacheCreator:
 
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
-        end, total_gpu_memory = torch.cuda.mem_get_info()
+        end, total_gpu_memory = _mem_get_info_for_kv_sizing()
         total_used_bytes = total_gpu_memory - end
         model_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         logger.info(
@@ -1963,7 +1983,7 @@ class KvCacheCreator:
 
                 # Clear the caching allocator before measuring the current memory usage
                 torch.cuda.empty_cache()
-                end, total_gpu_memory = torch.cuda.mem_get_info()
+                end, total_gpu_memory = _mem_get_info_for_kv_sizing()
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
             finally:
