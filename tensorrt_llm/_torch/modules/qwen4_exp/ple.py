@@ -66,6 +66,10 @@ def _uses_ple_host_offload() -> bool:
 
 def _uses_scaled_fp8_ngram_table(config: object) -> bool:
     """Return whether the HF config declares the custom scaled-FP8 PLE table."""
+    # ModelOpt NVFP4 checkpoints exclude the PLE from quantization_config and
+    # declare its FP8 table with ple_embedding_dtype instead.
+    if getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn":
+        return True
     quantization_config = getattr(config, "quantization_config", None)
     if not isinstance(quantization_config, dict):
         return False
