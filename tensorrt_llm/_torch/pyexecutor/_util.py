@@ -68,7 +68,7 @@ from .connectors.kv_cache_connector import KvCacheConnectorManager
 from .dwdp import DwdpManager
 from .engine.lora import make_lora_model_config
 from .engine.multimodal import is_multimodal, use_mrope
-from .guided_decoder import GuidedDecoder
+from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache.kv_cache_manager_v2 import (KVCacheLayerOwner, KVCacheLayerSpec,
                                            KVCacheManagerV2, Role,
                                            _resolve_v2_max_attention_window_vec)
@@ -4926,6 +4926,7 @@ def create_py_executor_instance(
     sampler,
     drafter,
     guided_decoder: Optional[GuidedDecoder] = None,
+    capturable_guided_decoder: Optional[CapturableGuidedDecoder] = None,
     lora_config: Optional[LoraConfig] = None,
     garbage_collection_gen0_threshold: Optional[int] = None,
     kv_connector_manager: Optional[KvCacheConnectorManager] = None,
@@ -4988,6 +4989,7 @@ def create_py_executor_instance(
         kv_cache_transceiver=execution_resources.kv_cache_transceiver,
         transfer_budget_is_explicit=transfer_budget_is_explicit,
         guided_decoder=guided_decoder,
+        capturable_guided_decoder=capturable_guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=execution_resources.kv_connector_manager,

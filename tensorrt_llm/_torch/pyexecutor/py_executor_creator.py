@@ -1106,6 +1106,7 @@ def _create_py_executor(
                                      ctx_chunk_config)
 
     guided_decoder: Optional[GuidedDecoder] = None
+    capturable_guided_decoder: Optional[CapturableGuidedDecoder] = None
     if guided_decoding_config is not None:
         with allocation_scope(ExecutorMemoryType.GUIDED_DECODER):
             if mapping.is_last_pp_rank():
@@ -1127,8 +1128,10 @@ def _create_py_executor(
                 elif spec_config.spec_dec_mode.support_capturable_guided_decoder(
                 ):
                     # CapturableGuidedDecoder is applicable to one-model speculative decoding.
+                    capturable_guided_decoder = CapturableGuidedDecoder(
+                        **kwargs)
                     success = model_engine.set_guided_decoder(
-                        CapturableGuidedDecoder(**kwargs))
+                        capturable_guided_decoder)
                     if not success:
                         raise ValueError(
                             f"Failed to set guided decoder for speculative decoding mode: {spec_config.spec_dec_mode.name}."
@@ -1387,6 +1390,7 @@ def _create_py_executor(
             sampler=sampler,
             drafter=drafter,
             guided_decoder=guided_decoder,
+            capturable_guided_decoder=capturable_guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
             kv_connector_manager=kv_connector_manager
