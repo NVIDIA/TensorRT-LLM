@@ -64,7 +64,7 @@ GEN_TEXT = "HELLO_FROM_GEN"
 
 # The uvicorn worker threads / CLI-output pump thread are background threads that
 # outlive a strict thread snapshot; exempt this module (same as the other e2e).
-pytestmark = pytest.mark.threadleak(enabled=False)
+pytestmark = [pytest.mark.threadleak(enabled=False), pytest.mark.cpu_only]
 
 
 @pytest.fixture(autouse=True)

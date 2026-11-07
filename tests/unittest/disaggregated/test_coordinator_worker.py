@@ -74,6 +74,8 @@ from tensorrt_llm.serve.router import (
 )
 from tensorrt_llm.serve.router_utils import BlockHashMixin as SharedBlockHashMixin
 
+pytestmark = pytest.mark.cpu_only
+
 
 @pytest.fixture(autouse=True)
 def _reset_prometheus_registry():

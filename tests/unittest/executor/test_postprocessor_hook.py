@@ -14,6 +14,8 @@ from tensorrt_llm.executor.postprocessor_hook import (
 )
 from tensorrt_llm.executor.result import CompletionOutput
 
+pytestmark = pytest.mark.cpu_only
+
 
 class _FakeResult:
     """Minimal stand-in for a GenerationResult at the detok chokepoint."""

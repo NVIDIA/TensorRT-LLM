@@ -18,6 +18,8 @@ import json
 import click
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 
 def _write_config(tmp_path, architectures, with_pooling=True):
     (tmp_path / "config.json").write_text(

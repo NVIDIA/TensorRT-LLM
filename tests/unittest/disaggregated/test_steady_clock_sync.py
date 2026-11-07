@@ -40,6 +40,8 @@ from tensorrt_llm.serve.openai_disagg_server import (
     OpenAIDisaggServer,
 )
 
+pytestmark = pytest.mark.cpu_only
+
 # The stub sleeps this long between its own receive/transmit stamps, mirroring
 # the real `get_steady_clock_offset` handler. It cancels out of the NTP math.
 _SERVER_PROCESSING_S = 0.01

@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _MODULE_PATH = _REPO_ROOT / "tests/integration/defs/test_unittests.py"
 
