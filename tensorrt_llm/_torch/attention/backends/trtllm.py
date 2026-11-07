@@ -1220,6 +1220,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             host_request_types=self.host_request_types[:self.num_seqs],
         )
 
+        # Per-step host planning of the opt-in wide-beam generation library.
+        # It must run here, ahead of every forward of the step, so that under
+        # CUDA graphs it precedes both capture and replay.
+        if self.beam_width > 1:
+            from .fmha.beam_shared_prefix import plan_step
+            plan_step(self)
+
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
 
