@@ -100,6 +100,7 @@ def test_combined_fmha_uses_flattened_v2_page_bound() -> None:
         return 23
 
     kv_cache_manager = object.__new__(KVCacheManagerV2)
+    kv_cache_manager._use_per_layer_page_tables = False
     kv_cache_manager.impl = SimpleNamespace(get_page_index_upper_bound=get_page_index_upper_bound)
 
     assert (

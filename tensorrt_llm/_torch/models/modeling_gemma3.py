@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import math
-from typing import Any, Dict, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 import torch
 import triton
@@ -25,6 +25,7 @@ from transformers import Gemma3TextConfig
 from tensorrt_llm._torch.attention.qk_norm_attention import QKNormRoPEAttention
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -44,6 +45,9 @@ from ..modules.rms_norm import RMSNorm
 from ..utils import inference_mode_unless_compiling
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
 
 @triton.jit
@@ -376,6 +380,20 @@ class Gemma3TextModel(DecoderModel):
 @register_auto_model("Gemma3ForCausalLM")
 class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
                                                 Gemma3TextConfig]):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        """Default to prefill scratch reuse on SM90+ when block reuse is disabled."""
+        enable_scratch = (getattr(llm_args, "attn_backend", "TRTLLM").upper()
+                          == "TRTLLM" and get_sm_version() >= 90)
+        kv_cache_config = llm_args.kv_cache_config
+        if enable_scratch and kv_cache_config.enable_block_reuse:
+            enable_scratch = False
+        return {
+            "kv_cache_config": {
+                "enable_swa_scratch_reuse": enable_scratch,
+            },
+        }
 
     @classmethod
     def get_preferred_transceiver_runtime(
