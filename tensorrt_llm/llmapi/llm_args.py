@@ -5251,8 +5251,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "The data type for the KV cache. 'auto' (default) leaves the checkpoint's "
         "own KV-cache quantization metadata untouched (quant_config.kv_cache_quant_algo "
-        "is inherited as-is); 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
+        "is inherited as-is); 'int8', 'fp8', 'fp8_ds_mla', or 'nvfp4' override it explicitly. "
         "'fp8_ds_mla' selects the packed FP8 cache used by sparse MLA on SM90/SM120/SM121. "
+        "'int8' requires the legacy TRTLLM decode path and is rejected on devices "
+        "using TRTLLM-Gen decode kernels. "
         "'mixed_nvfp4_<dtype>' (prototype) stores the full KV history in NVFP4 and "
         "keeps the first and last N tokens of every sequence in <dtype> "
         "('fp8', 'float16' or 'bfloat16'), N from mixed_precision_first_n and "
@@ -5261,8 +5263,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "LLM-construction time, including when set via trtllm-serve "
         "--extra_llm_api_options.",
         telemetry=TelemetryField.categorical("auto", "float16", "bfloat16",
-                                             "float32", "fp8", "fp8_ds_mla",
-                                             "nvfp4",
+                                             "float32", "int8", "fp8",
+                                             "fp8_ds_mla", "nvfp4",
                                              *_MIXED_PRECISION_KV_DTYPES))
 
     mixed_precision_first_n: NonNegativeInt = Field(
@@ -8578,6 +8580,8 @@ class TorchLlmArgs(BaseLlmArgs):
         assert self.quant_config is not None
         if self.kv_cache_config.dtype == "auto":
             return self
+        elif self.kv_cache_config.dtype == 'int8':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.INT8
         elif self.kv_cache_config.dtype in ('fp8', 'fp8_ds_mla',
                                             'mixed_nvfp4_fp8'):
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8

@@ -148,6 +148,23 @@ def test_validate_and_set_kv_cache_quant_explicit_dtype_overrides(
     assert model_config.quant_config.kv_cache_quant_algo == expected_quant
 
 
+@pytest.mark.parametrize("checkpoint_quant", [None, QuantAlgo.FP8, QuantAlgo.INT8])
+def test_int8_kv_explicit_override_keeps_layers_in_sync(
+    checkpoint_quant: QuantAlgo | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit INT8 override must update both global and per-layer quantization."""
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    config = _make_model_config_with_kv_quant(checkpoint_quant)
+    config.quant_config_dict = {
+        "model.layers.0.self_attn": QuantConfig(kv_cache_quant_algo=checkpoint_quant),
+        "model.layers.1.self_attn": QuantConfig(kv_cache_quant_algo=checkpoint_quant),
+    }
+    validate_and_set_kv_cache_quant(config, "int8")
+    for quant in [config.quant_config, *config.quant_config_dict.values()]:
+        assert quant.layer_quant_mode.has_int8_kv_cache()
+        assert not quant.layer_quant_mode.has_fp8_kv_cache()
+
+
 @pytest.mark.parametrize("is_encoder_decoder", [False, True])
 def test_validate_and_set_kv_cache_quant_rejects_invalid_dtype(is_encoder_decoder):
     model_config = _make_model_config_with_kv_quant(QuantAlgo.FP8)

@@ -69,6 +69,7 @@ from .config_utils import (is_hybrid_linear, is_minimax_m3, is_mla,
                            validate_kimi_kda_state_dtype)
 
 _KV_CACHE_MAP = {
+    "int8": QuantAlgo.INT8.value,
     "fp8": QuantAlgo.FP8.value,
     "fp8_ds_mla": QuantAlgo.FP8.value,
     "nvfp4": QuantAlgo.NVFP4.value,
@@ -80,7 +81,7 @@ _KV_CACHE_MAP = {
     "mixed_nvfp4_float16": None,
     "mixed_nvfp4_bfloat16": None,
 }
-_VALID_KV_CACHE_DTYPES = ("fp8", "fp8_ds_mla", "nvfp4", "auto",
+_VALID_KV_CACHE_DTYPES = ("int8", "fp8", "fp8_ds_mla", "nvfp4", "auto",
                           "mixed_nvfp4_fp8", "mixed_nvfp4_float16",
                           "mixed_nvfp4_bfloat16")
 _SHADOW_WEIGHT_LOAD_PLAN_ENV = "TRTLLM_SHADOW_WEIGHT_LOAD_PLAN"
@@ -457,6 +458,8 @@ def initialize_dummy_weights(
         ".inv_input_scale",
         ".kv_scales",
         ".inv_kv_scales",
+        ".kv_cache_scaling_factor",
+        ".inv_kv_cache_scaling_factor",
         ".alpha",
         ".scalar_alpha",
     )
