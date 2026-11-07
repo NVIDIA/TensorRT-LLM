@@ -7482,10 +7482,10 @@ class KVCacheManagerV2(BaseResourceManager):
         and all of them raise when any rank cannot honor the settings.
 
         Raises:
-            ValueError: KV pool rebalancing, speculative decoding, block reuse or
-                pipeline parallelism is enabled, or the host history size, with an
-                explicit host cache tier, exceeds this rank's share of available host
-                memory or the pinned-memory limit.
+            ValueError: KV pool rebalancing, speculative decoding or pipeline
+                parallelism is enabled, or the host history size, with an explicit
+                host cache tier, exceeds this rank's share of available host memory or
+                the pinned-memory limit.
             RuntimeError: Another rank cannot honor the settings.
         """
         error: Optional[ValueError] = None
@@ -7502,12 +7502,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 "Sparse KV cache offload does not support speculative decoding: a sparse cache "
                 "takes one input token per decode step. Remove speculative_config or disable "
                 "sparse_attention_config.enable_kv_cache_offload."
-            )
-        elif kv_cache_config.enable_block_reuse:
-            error = ValueError(
-                "Sparse KV cache offload does not support block reuse: offloaded history lives "
-                "in host-backed pools that reuse cannot share. Set "
-                "kv_cache_config.enable_block_reuse=False."
             )
         elif mapping.pp_size > 1:
             error = ValueError(

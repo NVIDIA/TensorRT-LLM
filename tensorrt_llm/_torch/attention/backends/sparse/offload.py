@@ -615,15 +615,31 @@ class SparseOffloadCacheMixin:
 
     def _validate_sparse_history_policy(self) -> None:
         """Check fixed history policies during attention metadata initialization."""
-        if (
-            self.enable_block_reuse
-            or self.kv_compression_manages_history
-            or self._has_cp_helix
-            or self.is_draft
-        ):
+        if self.kv_compression_manages_history or self._has_cp_helix or self.is_draft:
             raise NotImplementedError(
-                "Sparse offload requires block reuse, KV compression, CP Helix, and draft caches disabled"
+                "Sparse offload requires KV compression, CP Helix, and draft caches disabled"
             )
+
+    def try_commit_blocks(self, request: llm_request.LlmRequest) -> None:
+        # Committing can rebase a cache onto pages the reuse tree already holds, which a
+        # published Batch row would still name, so a request commits before it is seated.
+        if (
+            self._enable_kv_cache_offload
+            and self.enable_block_reuse
+            and request.py_request_id in self._sparse_batch_members
+        ):
+            raise RuntimeError(
+                f"Request {request.py_request_id} commits KV blocks while seated in the "
+                "sparse Batch"
+            )
+        super().try_commit_blocks(request)
+
+    def _can_commit_generation_blocks(self, request: llm_request.LlmRequest) -> bool:
+        # Offloaded decode history advances in update_forward_resources, which commits
+        # nothing, so a cache stops committing once its received prompt is committed.
+        if self._enable_kv_cache_offload:
+            return False
+        return super()._can_commit_generation_blocks(request)
 
     def _order_sparse_history_update(self, requests: Iterable[llm_request.LlmRequest]) -> None:
         """Order writeback after all model producers and attention readers.

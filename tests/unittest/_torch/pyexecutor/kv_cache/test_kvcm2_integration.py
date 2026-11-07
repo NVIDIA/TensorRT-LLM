@@ -5779,12 +5779,12 @@ def test_sparse_kv_offload_rejects_speculative_decoding() -> None:
 
 
 @pytest.mark.cpu_only
-def test_sparse_kv_offload_rejects_block_reuse() -> None:
-    # Reuse is on by default, so the check runs before any pool or arena is sized.
-    with pytest.raises(ValueError, match="does not support block reuse"):
-        KVCacheManagerV2._check_sparse_kv_offload_config(
-            SparseKvCacheOffloadConfig(), KvCacheConfig(), Mapping(), spec_config=None
-        )
+def test_sparse_kv_offload_accepts_block_reuse() -> None:
+    # Reuse is on by default. On a decode worker it lets the KV transfer skip a
+    # prompt prefix the reuse tree already holds.
+    KVCacheManagerV2._check_sparse_kv_offload_config(
+        SparseKvCacheOffloadConfig(), KvCacheConfig(), Mapping(), spec_config=None
+    )
 
 
 @pytest.mark.cpu_only

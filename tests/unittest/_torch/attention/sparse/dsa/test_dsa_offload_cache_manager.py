@@ -19,6 +19,7 @@ from tensorrt_llm._torch.attention.backends.sparse.offload import (
 )
 from tensorrt_llm._torch.attention.backends.sparse.offload_kernels import merge_sparse_arena_indices
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttention
+from tensorrt_llm._torch.disaggregation.resource.cache_reuse import create_cache_reuse_adapter
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -27,7 +28,7 @@ from tensorrt_llm.bindings import DataType, SamplingConfig
 from tensorrt_llm.bindings.internal.batch_manager import CacheType as CacheTypeCpp
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig, KvCacheConfig
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.runtime.kv_cache_manager_v2 import _introspection
+from tensorrt_llm.runtime.kv_cache_manager_v2 import PageIndexMode, _introspection
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm_100f(),
@@ -306,6 +307,26 @@ def _arena_rows(descriptor, index: int, row_bytes: int) -> torch.Tensor:
     )
 
 
+def _latent_history_pages(manager, layer: int, request_id: int) -> list[torch.Tensor]:
+    """A request's FP8 latent history pages at ``layer``, as int32 words per token row.
+
+    The pages are host memory mapped into the device address space, where a
+    disaggregated transfer writes them and the fetch reads them.
+    """
+    local_layer = manager.layer_offsets[layer]
+    base = manager.impl.get_mem_pool_base_address(local_layer, Role.KEY, PageIndexMode.SHARED)
+    page_stride = manager.impl.get_page_stride(local_layer, Role.KEY)
+    (indices,) = manager.get_batch_cache_indices([request_id], layer_idx=layer)
+    return [
+        convert_to_torch_tensor(
+            TensorWrapper(
+                base + int(index) * page_stride, torch.int32, (TOKENS_PER_BLOCK, HEAD_DIM // 4)
+            )
+        )
+        for index in indices
+    ]
+
+
 @pytest.mark.parametrize(
     ("num_layers", "num_requests", "dtype"),
     [
@@ -563,6 +584,140 @@ def test_suspended_request_keeps_its_history_through_demotion():
         decode(decode_steps, oldest=True)
         assert len(written) == 2 * decode_steps
         manager.free_resources(first)
+    finally:
+        manager.shutdown()
+
+
+def test_received_prompt_is_reused_from_host_pages():
+    """A request repeating a received prompt takes its full blocks from the reuse tree.
+
+    With block reuse on a disaggregated decode worker, the KV transfer skips the
+    prefix the radix tree already holds. The first request's prompt is committed
+    once its transfer lands and stays in the tree, on droppable host pages, after
+    the request leaves. The second request then holds those same pages, so its
+    transfer covers only the last partial block, and its decode step must fetch the
+    first request's rows from the shared blocks and its own from the rest.
+    """
+    manager = _manager(
+        kv_cache_config=KvCacheConfig(enable_block_reuse=True, max_tokens=16384, host_cache_size=0)
+    )
+    try:
+        manager._validate_sparse_history_policy()
+        prompt_len = 3 * TOKENS_PER_BLOCK + 5
+        shared_len = 3 * TOKENS_PER_BLOCK
+        descriptors = manager.get_sparse_offload_descriptors()
+        arenas = {
+            layer: _arena_rows(descriptor, descriptor.data_buffer_index, HEAD_DIM)
+            for layer, descriptor in descriptors.items()
+        }
+        state = allocate_sparse_offload_state(
+            lambda name, shape, dtype: torch.empty(shape, dtype=dtype, device="cuda"),
+            descriptors,
+            max_batch_size=MAX_BATCH_SIZE,
+            topk=TOPK,
+        )
+
+        def receive(request: LlmRequest, start: int) -> None:
+            """Write the prompt rows a transfer delivers from ``start`` on, then commit."""
+            rid = request.py_request_id
+            for layer in range(NUM_LAYERS):
+                pages = _latent_history_pages(manager, layer, rid)
+                for position in range(start, prompt_len):
+                    page, offset = divmod(position, TOKENS_PER_BLOCK)
+                    pages[page][offset, :3] = torch.tensor(
+                        [position, layer, rid], dtype=torch.int32, device="cuda"
+                    )
+            torch.cuda.synchronize()
+            # What the executor does once a verified transfer completes.
+            request.context_current_position = request.prompt_len
+            manager.try_commit_blocks(request)
+            # Offloaded decode history is never committed, so committing ends here.
+            assert not _introspection.is_commit_allowed(manager.kv_cache_map[rid])
+
+        def decode(request: LlmRequest, owner) -> None:
+            """Run one step, checking which request wrote each fetched prompt row."""
+            rid = request.py_request_id
+            assert manager.try_allocate_generation(request)
+            scheduled = SimpleNamespace(context_requests=[], generation_requests=[request])
+            manager.prepare_resources(scheduled)
+            manager.prepare_sparse_offload(state, [rid], beam_width=1)
+            history = manager.kv_cache_map[rid].history_length
+            assert history == prompt_len
+            batch_row = state.batch_rows[0].item()
+            # Every fourth shared unit, the whole tail, and the token written this step.
+            units = [*range(0, shared_len, 4), *range(shared_len, prompt_len), history]
+            topk = torch.full((1, TOPK), -1, dtype=torch.int32, device="cuda")
+            topk[0, : len(units)] = torch.tensor(units, dtype=torch.int32)
+            request_indices = torch.zeros(1, dtype=torch.int32, device="cuda")
+            kv_lengths = torch.tensor([history + 1], dtype=torch.int32, device="cuda")
+            out = torch.empty((1, TOPK), dtype=torch.int32, device="cuda")
+            for layer in range(NUM_LAYERS):
+                writes = manager.prepare_sparse_write_indices(state, layer)
+                data = state.out_slots[layer][descriptors[layer].data_buffer_index]
+                write_row = writes[batch_row, data].item()
+                assert write_row >= 0
+                arenas[layer][write_row, :3] = torch.tensor(
+                    [history, layer, rid], dtype=torch.int32, device="cuda"
+                )
+                fetched = manager.fetch_sparse_indices(
+                    state, layer, topk, request_indices, kv_lengths
+                )
+                merge_sparse_arena_indices(
+                    topk,
+                    request_indices,
+                    state.batch_rows,
+                    state.active_request_count,
+                    kv_lengths,
+                    state.history_lengths,
+                    fetched[:, data, :],
+                    writes[:, data],
+                    out,
+                    unit_tokens=1,
+                )
+                got = arenas[layer][out[0, : len(units)].long(), :3].tolist()
+                assert got == [[unit, layer, owner(unit)] for unit in units], (rid, layer)
+            manager.update_forward_resources(scheduled, wait_for_input_copy=lambda: None)
+            torch.cuda.synchronize()
+            # The write-back put this step's row in the page a transfer writes.
+            page, offset = divmod(history, TOKENS_PER_BLOCK)
+            for layer in range(NUM_LAYERS):
+                pages = _latent_history_pages(manager, layer, rid)
+                assert pages[page][offset, :3].tolist() == [history, layer, rid]
+
+        first = _request(1, prompt_len)
+        assert manager.prepare_disagg_gen_init(first)
+        assert manager.kv_cache_map[1].num_committed_tokens == 0
+        receive(first, start=0)
+        decode(first, owner=lambda unit: 1)
+        first_pages = {
+            layer: manager.get_batch_cache_indices([1], layer_idx=layer)[0]
+            for layer in range(NUM_LAYERS)
+        }
+        manager.free_resources(first)
+        assert _introspection.all_tree_pages_droppable(manager.impl)
+
+        second = _request(2, prompt_len)
+        assert manager.prepare_disagg_gen_init(second)
+        cache = manager.kv_cache_map[2]
+        # The match may reach into the partial block; the transfer skips whole blocks.
+        assert second.context_current_position == cache.num_committed_tokens >= shared_len
+        num_groups = len(cache.reuse_status)
+        assert (
+            create_cache_reuse_adapter(manager).get_cached_token_count_per_layer_group(
+                second, [None] * num_groups
+            )
+            == [shared_len] * num_groups
+        )
+        for layer in range(NUM_LAYERS):
+            shared_pages = manager.get_batch_cache_indices([2], layer_idx=layer)[0][:3]
+            assert shared_pages == first_pages[layer][:3]
+        receive(second, start=shared_len)
+        decode(second, owner=lambda unit: 1 if unit < shared_len else 2)
+        # A seated request's published row names its pages, which a commit could rebase.
+        with pytest.raises(RuntimeError, match="while seated"):
+            manager.try_commit_blocks(second)
+        manager.free_resources(second)
+        assert _introspection.all_tree_pages_droppable(manager.impl)
     finally:
         manager.shutdown()
 

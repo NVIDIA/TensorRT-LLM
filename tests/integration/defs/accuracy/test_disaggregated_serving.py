@@ -696,9 +696,15 @@ def _test_sparse_offload_long_context(
     quant_algo: str,
     index_topk: int,
     unit_tokens: int,
+    block_reuse: bool = False,
     server_waiting_timeout: int = 1200,
 ) -> None:
-    """Compare batched GovReport quality against the resident YAML reference."""
+    """Compare batched GovReport quality against the resident YAML reference.
+
+    With ``block_reuse``, both servers keep block reuse on and every prompt runs
+    twice. The second round must find the prompts in the generation worker's
+    reuse tree, so its KV transfers skip those prefixes, and must score as well.
+    """
     min_input_len = GovReport.MIN_INPUT_LEN
     max_input_len = GovReport.MAX_INPUT_LEN
     max_batch_size = GovReport.MAX_BATCH_SIZE
@@ -759,7 +765,7 @@ def _test_sparse_offload_long_context(
                       enable_autotuner=False)
         config["kv_cache_config"] = {
             **config["kv_cache_config"],
-            "enable_block_reuse": False,
+            "enable_block_reuse": block_reuse,
             "use_kv_cache_manager_v2": True,
             "tokens_per_block": tokens_per_block,
         }
@@ -804,49 +810,64 @@ def _test_sparse_offload_long_context(
                 timeout=300,
                 max_retries=0) as client:
         _get_disagg_generation_stats(llm.serve_url)
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            futures = [
-                pool.submit(client.completions.create,
-                            model=model_path,
-                            prompt=prompt,
-                            max_tokens=output_len,
-                            temperature=0,
-                            seed=random_seed,
-                            extra_body={"detokenize": False})
-                for prompt in prompts
-            ]
-            responses = [future.result() for future in futures]
-        stats = _get_disagg_generation_stats(llm.serve_url)
-        batched_steps = sum(
-            stat.get("inflightBatchingStats", {}).get("numGenRequests", 0) > 1
-            for stat in stats)
-        assert batched_steps >= tokens_per_block, (
-            f"Only {batched_steps} decode iterations had multiple requests; "
-            "the long-context test must exercise sustained batched decode")
+        for repeat in range(2 if block_reuse else 1):
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [
+                    pool.submit(client.completions.create,
+                                model=model_path,
+                                prompt=prompt,
+                                max_tokens=output_len,
+                                temperature=0,
+                                seed=random_seed,
+                                extra_body={"detokenize": False})
+                    for prompt in prompts
+                ]
+                responses = [future.result() for future in futures]
+            stats = _get_disagg_generation_stats(llm.serve_url)
+            if repeat:
+                # Attention DP spreads the prompts over the ranks; require at
+                # least one prompt's full blocks to come from the reuse tree.
+                cached_tokens = sum(
+                    sum(stat.get("iterCachedTokensByLevel", ()))
+                    for stat in stats)
+                min_cached_tokens = ((min(map(len, prompts)) - 1) //
+                                     tokens_per_block * tokens_per_block)
+                assert cached_tokens >= min_cached_tokens, (
+                    f"The repeated round found {cached_tokens} prompt tokens "
+                    "in the generation worker's reuse tree; expected at least "
+                    f"{min_cached_tokens}")
+            batched_steps = sum(
+                stat.get("inflightBatchingStats", {}).get("numGenRequests", 0) >
+                1 for stat in stats)
+            assert batched_steps >= tokens_per_block, (
+                f"Only {batched_steps} decode iterations had multiple requests; "
+                "the long-context test must exercise sustained batched decode")
 
-        scores = []
-        long_decodes = 0
-        for sample, prompt, response in zip(samples, prompts, responses):
-            assert response.usage.prompt_tokens == len(prompt)
-            choice = response.choices[0]
-            assert choice.finish_reason in ("length", "stop")
-            token_ids = choice.model_dump()["token_ids"]
-            assert 0 < len(token_ids) <= output_len
-            assert response.usage.completion_tokens == len(token_ids)
-            long_decodes += ((len(token_ids) - 1) // unit_tokens
-                             > cache_units - index_topk)
-            prediction = tokenizer.decode(token_ids, skip_special_tokens=True)
-            scores.append(
-                task.process_results(sample, [prediction])["rouge_score"])
-        assert long_decodes >= max_batch_size, (
-            f"Only {long_decodes} summaries decoded beyond the cache's "
-            "free slots; need at least one full batch")
-        score = 100 * sum(scores) / len(scores)
-        print(f"GovReport offload=True: n={num_samples}, "
-              f"ROUGE-L={score:.3f}, batched_steps={batched_steps}, "
-              f"long_decodes={long_decodes}")
-        print(reference.report(score))
-        reference.assert_passing(score)
+            scores = []
+            long_decodes = 0
+            for sample, prompt, response in zip(samples, prompts, responses):
+                assert response.usage.prompt_tokens == len(prompt)
+                choice = response.choices[0]
+                assert choice.finish_reason in ("length", "stop")
+                token_ids = choice.model_dump()["token_ids"]
+                assert 0 < len(token_ids) <= output_len
+                assert response.usage.completion_tokens == len(token_ids)
+                long_decodes += ((len(token_ids) - 1) // unit_tokens
+                                 > cache_units - index_topk)
+                prediction = tokenizer.decode(token_ids,
+                                              skip_special_tokens=True)
+                scores.append(
+                    task.process_results(sample, [prediction])["rouge_score"])
+            assert long_decodes >= max_batch_size, (
+                f"Only {long_decodes} summaries decoded beyond the cache's "
+                "free slots; need at least one full batch")
+            score = 100 * sum(scores) / len(scores)
+            print(f"GovReport offload=True, round={repeat + 1}: "
+                  f"n={num_samples}, ROUGE-L={score:.3f}, "
+                  f"batched_steps={batched_steps}, "
+                  f"long_decodes={long_decodes}")
+            print(reference.report(score))
+            reference.assert_passing(score)
 
 
 def run_parallel_test(model_name: str,
@@ -2546,8 +2567,7 @@ class TestGLM52NVFP4(LlmapiAccuracyTestHarness):
 
         Each decode step fetches the indexer-selected tokens into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
-        history resident. Offload takes no speculative decoding and no block
-        reuse.
+        history resident. Offload takes no speculative decoding.
         """
         # Both servers use the same KV dtype for transfer and decode.
         kv_cache_config = {
@@ -2730,8 +2750,17 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
 
         Each decode step fetches the indexer-selected units into a GPU cache.
         Only a decode-only worker can offload, so the context server keeps its
-        history resident. Offload takes no block reuse.
+        history resident.
         """
+        self._run_kv_cache_offload(block_reuse=False)
+
+    @pytest.mark.timeout(3600)
+    @pytest.mark.skip_less_device(4)
+    def test_kv_cache_offload_block_reuse(self) -> None:
+        """A repeated GovReport round reuses its prompts on the offloading worker."""
+        self._run_kv_cache_offload(block_reuse=True)
+
+    def _run_kv_cache_offload(self, *, block_reuse: bool) -> None:
         cache_transceiver_config = {
             "backend": "NIXL",
             "transceiver_runtime": "PYTHON",
@@ -2756,10 +2785,7 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
             "moe_config": {
                 "backend": "TRTLLM",
             },
-            "kv_cache_config": {
-                **kv_cache_config,
-                "enable_block_reuse": False,
-            },
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": cache_transceiver_config,
             "sparse_attention_config": {
                 "algorithm": "deepseek_v4",
@@ -2783,7 +2809,8 @@ class TestDeepSeekV4Flash(LlmapiAccuracyTestHarness):
                                           model_name=self.MODEL_NAME,
                                           quant_algo="MIXED_PRECISION",
                                           index_topk=512,
-                                          unit_tokens=4)
+                                          unit_tokens=4,
+                                          block_reuse=block_reuse)
 
 
 @pytest.mark.timeout(14400)
