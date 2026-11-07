@@ -294,6 +294,14 @@ size_t CudaVirtualMemoryManager::releaseWithTag(std::string const& tag)
         std::rethrow_exception(ePtr);
     }
 
+    size_t hostBackupBytes = 0;
+    auto const remaining = mEntries.equal_range(tag);
+    for (auto it = remaining.first; it != remaining.second; ++it)
+    {
+        hostBackupBytes += it->second->second.mMemory.hostBackupBytes();
+    }
+    TLLM_LOG_INFO("Tagged memory release: tag=%s, released_blobs=%zu, retained_host_backup_bytes=%zu", tag.c_str(),
+        count, hostBackupBytes);
     return count;
 }
 

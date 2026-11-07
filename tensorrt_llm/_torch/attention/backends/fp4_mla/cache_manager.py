@@ -14,6 +14,7 @@ from tensorrt_llm._torch.disaggregation.resource.page import MapperKind, RoleLay
 from tensorrt_llm._torch.kimi_k3_cache_policy import get_kimi_k3_fp8_kv_layer_ids
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
 from tensorrt_llm._torch.pyexecutor.resource_manager import CacheTypeCpp, DataType, KVCacheManager
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor, prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -277,6 +278,7 @@ class Fp4MlaV2CacheLayoutPolicy:
             "rebuild_disagg_imported_cache",
             "_get_runtime_cache_size_layer_components",
             "_get_generation_request_capacity",
+            "_zero_pools_on_wakeup",
         )
         for method_name in method_names:
             method = getattr(Fp4MlaV2CacheLayoutPolicy, method_name)
@@ -294,6 +296,11 @@ class Fp4MlaV2CacheLayoutPolicy:
             with torch.cuda.stream(manager._stream):
                 v_scale_pool.zero_()
             manager._stream.synchronize()
+
+    def _zero_pools_on_wakeup(self, mode: RestoreMode) -> bool:
+        """Remapped pools must restore the zeroed V-scale tiles set by ``finalize_manager``."""
+        del mode
+        return True
 
     @property
     def fp4_mla_hp_pool_size(self) -> int:

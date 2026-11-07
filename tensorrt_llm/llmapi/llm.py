@@ -1928,6 +1928,8 @@ class _TorchLLM(BaseLLM):
             target_ranks: int | list[int] | None = None) -> list[Any]:
         """Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
+        Ray sleep must use :meth:`release` for group-wide coordination.
+
         Args:
             method (str): The name of the worker method to execute.
             args (tuple[Any, ...]): Positional arguments to pass to the worker method. Defaults to ().
@@ -1997,7 +1999,7 @@ class _TorchLLM(BaseLLM):
 
         Returns:
             tensorrt_llm.llmapi.llm_args.RuntimeMemoryStatus: The reconciled
-            state reported by the runtime workers.
+            worker state, or the Ray driver's group gate during a transition.
         """
         self._check_runtime_memory_enabled()
         replies = self._collective_rpc("get_memory_status")
@@ -2031,7 +2033,14 @@ class _TorchLLM(BaseLLM):
         self._check_runtime_memory_enabled()
         normalized = self._normalize_runtime_memory_tags(
             tags, default_tags=_RUNTIME_MEMORY_TYPES)
-        self._collective_rpc("sleep", ([tag.value for tag in normalized], ))
+        sleep_tags = [tag.value for tag in normalized]
+        if self._orchestrator_type == "ray":
+            if self._encode_only:
+                raise RuntimeError(
+                    "release() is not available when encode_only=True.")
+            self._executor.sleep(sleep_tags)
+        else:
+            self._collective_rpc("sleep", (sleep_tags, ))
 
     @set_api_status("prototype")
     def resume(

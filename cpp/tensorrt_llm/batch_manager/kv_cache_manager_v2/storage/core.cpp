@@ -547,6 +547,14 @@ void PoolGroupBase::_waitSlotUsable(SlotId slot) const
     }
 }
 
+void PoolGroupBase::waitUsable() const
+{
+    if (numSlots() != 0)
+    {
+        _waitSlotUsable(SlotId{numSlots() - 1});
+    }
+}
+
 std::vector<Slot> PoolGroupBase::allocateMultiple(SlotCount numSlots)
 {
     if (numSlots == SlotCount{0})

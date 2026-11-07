@@ -93,6 +93,12 @@ public:
         {
             return nullptr;
         }
+
+        //! Host backup bytes currently retained by this configurator.
+        [[nodiscard]] virtual size_t hostBackupBytes() const noexcept
+        {
+            return 0;
+        }
     };
 
     using ConfiguratorPtr = std::unique_ptr<Configurator>;
@@ -153,6 +159,17 @@ public:
     void release()
     {
         _release(false);
+    }
+
+    //! Host backup bytes retained across all configurators, not GPU mapping bytes.
+    [[nodiscard]] size_t hostBackupBytes() const noexcept
+    {
+        size_t bytes = 0;
+        for (auto const& configurator : mConfigurators)
+        {
+            bytes += configurator->hostBackupBytes();
+        }
+        return bytes;
     }
 
     CUDAVirtualMemoryChunk(CUDAVirtualMemoryChunk const&) = delete;
@@ -350,6 +367,11 @@ struct OffloadConfigurator : CUDAVirtualMemoryChunk::Configurator
     void setup(CUmemGenericAllocationHandle handle) override;
     void teardown(CUmemGenericAllocationHandle handle, bool destructing) override;
     IBuffer::UniquePtr detachHostBackup() override;
+
+    size_t hostBackupBytes() const noexcept override
+    {
+        return mBackedStorage ? mSize : 0;
+    }
 
     CUdeviceptr mAddress;
     size_t mSize;

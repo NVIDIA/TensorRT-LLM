@@ -77,7 +77,7 @@ scheduler_config:
 ### Selecting the KV Cache Manager
 
 ```{warning}
-KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. Sleep mode (`sleep_config`), RocketKV, and skip-softmax still require V1 until V2 support is available; keep V1 for these features during migration.
+KV cache manager V1 (`use_kv_cache_manager_v2: false`, or `auto` when it resolves to V1) is deprecated as of TensorRT-LLM 1.4 (2026-11) and will be removed after the 3-month migration period. Use KV cache manager V2, the default, for supported features. RocketKV and skip-softmax still require V1. V2 supports sleep with the restrictions listed in [Sleep and wakeup with V2](#sleep-and-wakeup-with-v2).
 ```
 
 TensorRT LLM ships two KV cache manager implementations. `use_kv_cache_manager_v2`
@@ -357,6 +357,85 @@ Pages, or reduce the amount of KV retained by an algorithm. Compression is
 configured separately from `KvCacheConfig`; see
 [KV Cache Compression](kv-cache-compression.md) for the available methods and
 their activation points.
+
+### Sleep and Wakeup with V2
+
+`SleepConfig` retains the selected V2 manager; it does not automatically fall back
+to V1. Unsupported KV sleep configurations fail explicitly. See
+[V2 compatibility](sleep-wakeup.md#v2-compatibility) and the
+[Ray failure contract](sleep-wakeup.md#python-api) before enabling KV release.
+
+When releasing V2 KV cache with `CPU` or `PINNED` preservation, GPU pages are
+evicted into a host cache tier below all GPU cache levels. To back up the full GPU
+cache, give that tier a quota at least as large as the combined GPU cache quota
+for each KV manager on each rank, including draft managers, by setting
+`kv_cache_config.host_cache_size`; speculative decoding splits this budget between
+the target and draft managers. Automatic host sizing uses the minimum across ranks
+and may choose a smaller quota because of available host memory or pinned-memory
+limits. A smaller host tier logs a warning before release: reusable pages may then
+be dropped, and the release fails if live pages of retained internal requests do
+not fit in the configured tiers. Weights-only release and KV `NONE`/`MEMSET`
+release do not use this native host-tier backup capacity; ordinary host-tier sizing and
+sparse-attention requirements still apply.
+
+The `kv_cache` entry in `sleep_config.restore_modes` controls the native KV pool
+policy. Torch buffers have a separate backup policy, described below the table.
+
+| Mode | Sleep | Wakeup |
+| --- | --- | --- |
+| `CPU`, `PINNED` | Suspend internal requests and evict GPU pages through the configured host and optional disk tiers. Reusable pages may be dropped under capacity pressure. | Restore GPU pool capacity and resume internal requests. Reusable pages return to GPU on demand. |
+| `NONE` | Discard KV contents and reusable prefixes, release GPU and HOST pool backing, and retain native cache objects and their logical state. Torch buffers still use host backup, as described below. | Restore pool capacities and initialize fresh backing before retained internal caches resume. User KV is not restored. |
+| `MEMSET` | Discard KV contents and reusable prefixes as for `NONE`. | Zero the restored GPU pools and materialized host pages, then resume the retained caches. |
+
+Torch GPU buffers allocated during V2 manager construction are separate from the
+native KV pools. These buffers include metadata and scratch storage, such as Mamba
+in-forward staging rows when enabled. With `NONE` or `MEMSET`, these buffers use
+`CPU` preservation instead: sleep copies their contents to host memory, and wakeup
+restores them at the same GPU virtual addresses. With `CPU` or `PINNED`, they retain
+the selected runtime restore mode. These host backups are additional to the
+`kv_cache_config.host_cache_size` quota and add copy cost on each sleep/wake cycle.
+Thus, discarding native KV contents does not eliminate all host backup or copy costs.
+
+V2 uses its existing pinned host tier for both `CPU` and `PINNED`; these modes
+provide the same KV-cache policy and do not promise to retain every reusable
+prefix. Other memory tags retain their runtime restore-mode behavior. Live pages
+held by suspended internal requests cannot be dropped; an inability to place
+those pages in the configured tiers fails the sleep operation.
+
+Fresh GPU backing is zeroed in every V2 mode before preserved pages are restored.
+This prevents masked attention tails and internal replay counters from reading
+uninitialized data. Other memory tags keep their selected restore-mode behavior.
+
+Sleep drains user requests before changing memory. Internal padding requests
+retain their native cache identities, logical state, and metadata buffers. Wakeup
+resumes them through normal page and scratch allocation and refreshes their KV
+and SSM indices before execution. Slot IDs may change; CUDA graphs consume the
+updated indices through stable metadata buffers. GPU pool virtual addresses
+remain reserved throughout sleep. Both hot and cold GPU pools release their
+physical backing and recover their capacities on wakeup. Encoded cold pages retain
+their representation when moved from GPU to host. Discard modes also release HOST
+pool backing without migrating its contents to disk; independent disk staging
+buffers are retained. HOST virtual addresses remain reserved, and HOST backing
+is restored before cache pages.
+
+Native `Batch` objects retain their rows, sparse arena leases, and graph-visible
+addresses. Preserving sleep also saves the bounded sparse GPU arena to temporary
+host memory, including units not yet written back to host pages. This memory is
+additional to the configured cold host-tier quota and is freed after wakeup.
+Discard sleep resets arena residency instead. Wakeup restores pool and arena
+backing, resumes members, and republishes their indices before execution.
+Batch mutation and sparse fetch are not permitted while memory is released.
+
+V2 KV sleep is rejected with a cache transceiver or a KV-moving
+connector because sleep/wake does not rebuild their memory registrations. This
+connector restriction also applies to host-staged transfers until connector
+sleep/wake compatibility is qualified. Capacity-only connectors move no KV and
+do not prevent sleep. These restrictions do not affect weights-only release.
+An attached KV cache lender also prevents KV sleep because its retained leases,
+staging copies, and backend access have no sleep/wake lifecycle.
+MiniMax-M3 configurations with optional index-V buffers also reject KV sleep.
+These buffers are indexed by KV slot outside the native pools and are not
+remapped when restored pages change slots. Weights-only release is unaffected.
 
 ### Partial Reuse
 

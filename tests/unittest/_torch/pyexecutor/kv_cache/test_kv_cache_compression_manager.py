@@ -382,6 +382,7 @@ class TestKvCacheCreatorLifecycle:
             uses_iteration_lifecycle=True,
         )
         creator = object.__new__(util_mod.KvCacheCreator)
+        creator._is_kv_cache_manager_v2 = True
         creator._skip_est = False
         creator._max_seq_len = 1024
         creator._kv_cache_config = SimpleNamespace(host_cache_size=None, disk_cache_size=None)
