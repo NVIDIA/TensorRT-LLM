@@ -4817,12 +4817,34 @@
           "description": "Size of the disk cache in bytes. Only used by KV cache manager v2 in the PyTorch backend.",
           "title": "Disk Cache Size"
         },
+        "disk_io_threads": {
+          "default": 0,
+          "description": "Worker threads for asynchronous disk KV cache I/O, shared by the whole process. 0 runs each disk transfer as a blocking read/write loop in a CUDA host callback, which serializes all disk transfers. Only used by KV cache manager v2 with a disk cache.",
+          "minimum": 0,
+          "status": "prototype",
+          "title": "Disk Io Threads",
+          "type": "integer"
+        },
+        "disk_keep_copy_after_restore": {
+          "default": false,
+          "description": "Keep a reusable block's disk copy after restoring it from disk, so evicting it to disk again writes nothing. Only used by KV cache manager v2 with a disk cache.",
+          "status": "prototype",
+          "title": "Disk Keep Copy After Restore",
+          "type": "boolean"
+        },
         "disk_prefetch_num_reqs": {
           "default": 0,
           "description": "Number of queued context requests to prefetch disk-tier KV cache blocks to host for. Set to 0 to disable prefetch. Only effective with KV cache manager v2 and block reuse enabled.",
           "minimum": 0,
           "title": "Disk Prefetch Num Reqs",
           "type": "integer"
+        },
+        "disk_write_through": {
+          "default": false,
+          "description": "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its later host-to-disk eviction writes nothing. Requires `disk_keep_copy_after_restore`. Only used by KV cache manager v2 with a disk cache.",
+          "status": "prototype",
+          "title": "Disk Write Through",
+          "type": "boolean"
         },
         "dtype": {
           "default": "auto",

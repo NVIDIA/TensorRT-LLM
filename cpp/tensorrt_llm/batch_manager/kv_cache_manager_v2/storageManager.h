@@ -344,8 +344,8 @@ public:
 
     // ---- Keep-disk-copy ----------------------------------------------------
     //
-    // With TLLM_KVCM2_DISK_KEEP_COPY=1, a committed page restored from a disk level keeps its disk slot as a
-    // "retained copy" instead of releasing it: committed pages are immutable, so the disk data stays valid. When
+    // With DiskCacheTierConfig::keepCopyAfterRestore, a committed page restored from a disk level keeps its disk slot
+    // as a "retained copy" instead of releasing it: committed pages are immutable, so the disk data stays valid. When
     // the page later falls back to that level, it takes the retained slot back and the write is skipped.
     // Retained copies are duplicates, so a level reclaims them (oldest first) before it evicts any real page.
 
@@ -568,7 +568,7 @@ private:
         uint64_t reclaimed{0};
         uint64_t dropped{0};
         int64_t lastPrintNs{0};
-        int statsSec{30};
+        int statsSec{0}; // TLLM_KVCM2_DISK_KEEP_COPY_STATS_SEC; 0 = off
     };
 
     void addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
@@ -586,7 +586,7 @@ private:
     TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
     KeepCopyStats mKeepCopyStats;
 
-    // ---- Disk write-through (TLLM_KVCM2_DISK_WRITE_THROUGH=1, needs keep-copy). When committed pages are evicted
+    // ---- Disk write-through (DiskCacheTierConfig::writeThrough, needs keep-copy). When committed pages are evicted
     // from GPU to host, also copy them to free disk slots in the background and keep those as retained copies, so a
     // later host -> disk eviction reuses the copy instead of writing on the restore's critical path. Appended last.
     void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);

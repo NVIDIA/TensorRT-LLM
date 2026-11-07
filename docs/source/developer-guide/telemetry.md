@@ -146,7 +146,10 @@ unset or when the safety sanitizer rejects the runtime value.
 | `kv_cache_config.copy_on_partial_reuse` | `bool` | `value` |  |
 | `kv_cache_config.cross_kv_cache_fraction` | `float\|none` | `value` |  |
 | `kv_cache_config.disk_cache_size` | `int\|none` | `value` |  |
+| `kv_cache_config.disk_io_threads` | `int` | `value` |  |
+| `kv_cache_config.disk_keep_copy_after_restore` | `bool` | `value` |  |
 | `kv_cache_config.disk_prefetch_num_reqs` | `int` | `value` |  |
+| `kv_cache_config.disk_write_through` | `bool` | `value` |  |
 | `kv_cache_config.dtype` | `allowlist` | `categorical` | `auto`, `float16`, `bfloat16`, `float32`, `fp8`, `fp8_ds_mla`, `nvfp4`, `mixed_nvfp4_fp8`, `mixed_nvfp4_float16`, `mixed_nvfp4_bfloat16` |
 | `kv_cache_config.enable_block_reuse` | `bool` | `value` |  |
 | `kv_cache_config.enable_kv_pool_rebalance` | `bool` | `value` |  |

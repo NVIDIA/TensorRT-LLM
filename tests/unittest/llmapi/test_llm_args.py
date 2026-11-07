@@ -2013,6 +2013,30 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disk_offload_options(tmp_path):
+    default = KvCacheConfig()
+    assert default.disk_io_threads == 0
+    assert default.disk_keep_copy_after_restore is False
+    assert default.disk_write_through is False
+
+    config = KvCacheConfig(disk_cache_size=2048,
+                           disk_cache_path=str(tmp_path),
+                           disk_io_threads=16,
+                           disk_keep_copy_after_restore=True,
+                           disk_write_through=True)
+    assert config.disk_io_threads == 16
+    assert config.disk_keep_copy_after_restore is True
+    assert config.disk_write_through is True
+
+    with pytest.raises(ValidationError) as exc_info:
+        KvCacheConfig(disk_write_through=True)
+    assert "disk_keep_copy_after_restore" in str(exc_info.value)
+
+    with pytest.raises(ValidationError):
+        KvCacheConfig(disk_io_threads=-1)
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):

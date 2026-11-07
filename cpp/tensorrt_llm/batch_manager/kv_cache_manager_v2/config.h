@@ -99,6 +99,18 @@ struct DiskCacheTierConfig
     size_t quota = 0; // bytes
     std::string path; // directory for temp files
 
+    // Worker threads for asynchronous disk I/O, shared by every disk tier in the process. 0 keeps the
+    // synchronous path, where each transfer is a blocking pread/pwrite loop in a CUDA host callback.
+    int numIoThreads = 0;
+
+    // Keep a committed page's disk copy after restoring it from disk, so its next eviction to disk reuses
+    // the copy instead of writing the page again.
+    bool keepCopyAfterRestore = false;
+
+    // When a committed page is evicted from GPU to host, also copy it to a free disk slot in the background,
+    // so its later host -> disk eviction writes nothing. Requires keepCopyAfterRestore.
+    bool writeThrough = false;
+
     [[nodiscard]] CacheTier tier() const noexcept
     {
         return CacheTier::DISK;

@@ -144,7 +144,7 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Asynchronous disk I/O for host <-> disk migrations (opt-in: TLLM_KVCM2_DISK_IO_THREADS > 0).
+// Asynchronous disk I/O for host <-> disk migrations (opt-in: DiskCacheTierConfig::numIoThreads > 0).
 //
 // The synchronous path above runs a blocking pread/pwrite loop inside a cuLaunchHostFunc callback. CUDA runs
 // all host functions of a process on one driver thread, even across independent streams, so every disk
@@ -158,10 +158,9 @@ CUDA_CB void hostFnHostToHostCopy(void* userData) noexcept
 // streams proceed concurrently, each transfer is split into chunks served by several threads, and reads
 // (restores, on the critical path) are served before writes (evictions).
 //
-// Environment:
-//   TLLM_KVCM2_DISK_IO_THREADS       worker threads per process; 0 (default) keeps the synchronous path
+// Enabled by DiskCacheTierConfig::numIoThreads > 0 (configureAsyncDiskIo). Tuning knobs, read from the environment:
 //   TLLM_KVCM2_DISK_IO_CHUNK         max bytes per work item (default 4 MiB)
-//   TLLM_KVCM2_DISK_IO_DIRECT_WRITE  1: write 4 KiB-aligned pieces with O_DIRECT (default 0)
+//   TLLM_KVCM2_DISK_IO_DIRECT_WRITE  1: write 4 KiB-aligned pieces with O_DIRECT (default 1)
 //   TLLM_KVCM2_DISK_IO_DIRECT_READ   1: read 4 KiB-aligned pieces with O_DIRECT (default 0)
 //   TLLM_KVCM2_DISK_IO_STATS_SEC     print read/write queue and service times every N seconds (default 0 = off)
 // ---------------------------------------------------------------------------------------------------------------
@@ -180,9 +179,11 @@ size_t diskIoEnv(char const* name, size_t fallback) noexcept
     return end == value ? fallback : static_cast<size_t>(parsed);
 }
 
+// Worker threads for asynchronous disk I/O; 0 keeps the synchronous path. Set by configureAsyncDiskIo().
+std::atomic<size_t> gAsyncDiskIoThreads{0};
+
 struct DiskIoConfig
 {
-    size_t threads;
     size_t chunkBytes;
     size_t statsSec;
     bool directWrite;
@@ -191,9 +192,9 @@ struct DiskIoConfig
 
 DiskIoConfig const& diskIoConfig() noexcept
 {
-    static DiskIoConfig const config{diskIoEnv("TLLM_KVCM2_DISK_IO_THREADS", 0),
+    static DiskIoConfig const config{
         std::max<size_t>(diskIoEnv("TLLM_KVCM2_DISK_IO_CHUNK", size_t{4} << 20), size_t{64} << 10),
-        diskIoEnv("TLLM_KVCM2_DISK_IO_STATS_SEC", 0), diskIoEnv("TLLM_KVCM2_DISK_IO_DIRECT_WRITE", 0) != 0,
+        diskIoEnv("TLLM_KVCM2_DISK_IO_STATS_SEC", 0), diskIoEnv("TLLM_KVCM2_DISK_IO_DIRECT_WRITE", 1) != 0,
         diskIoEnv("TLLM_KVCM2_DISK_IO_DIRECT_READ", 0) != 0};
     return config;
 }
@@ -209,17 +210,29 @@ int64_t currentNs() noexcept
 // number AND inode: a pool file can be closed and its fd number reused for a different file, and a stale
 // direct descriptor would then write to the old (deleted) file. The kernel flushes and invalidates cached
 // pages of a range written with O_DIRECT, so buffered reads of the same file stay coherent.
+struct DirectFdEntry
+{
+    int direct = 0; // direct fd + 1; 0 = not opened, -1 = open failed
+    dev_t dev = 0;
+    ino_t ino = 0;
+};
+
+std::mutex& directFdMutex()
+{
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<DirectFdEntry>& directFdTable() // indexed by the buffered fd
+{
+    static std::vector<DirectFdEntry> table;
+    return table;
+}
+
 int directFd(int fd) noexcept
 {
-    struct Entry
-    {
-        int direct = 0; // direct fd + 1; 0 = not opened, -1 = open failed
-        dev_t dev = 0;
-        ino_t ino = 0;
-    };
-
-    static std::mutex mutex;
-    static std::vector<Entry> table; // indexed by the buffered fd
+    auto& mutex = directFdMutex();
+    auto& table = directFdTable();
     struct stat st = {};
     if (fd < 0 || ::fstat(fd, &st) != 0)
     {
@@ -230,7 +243,7 @@ int directFd(int fd) noexcept
     {
         table.resize(static_cast<size_t>(fd) + 1);
     }
-    Entry& entry = table[fd];
+    DirectFdEntry& entry = table[fd];
     if (entry.direct != 0 && (entry.dev != st.st_dev || entry.ino != st.st_ino))
     {
         if (entry.direct > 0)
@@ -476,6 +489,13 @@ public:
         }
     }
 
+    // Blocks until every piece submitted so far has finished.
+    void waitIdle()
+    {
+        std::unique_lock<std::mutex> lock(mMutex);
+        mIdleCv.wait(lock, [this] { return mInFlight == 0; });
+    }
+
     // Called from a stream callback: must not call CUDA APIs or block on I/O.
     void submit(std::shared_ptr<DiskTransfer> const& transfer)
     {
@@ -494,6 +514,7 @@ public:
         }
         {
             std::lock_guard<std::mutex> lock(mMutex);
+            mInFlight += numPieces;
             auto& queue = transfer->isRead ? mReads : mWrites;
             for (size_t task = 0; task < transfer->numTasks(); ++task)
             {
@@ -539,11 +560,20 @@ private:
             {
                 transfer.finish();
             }
+            {
+                std::lock_guard<std::mutex> lock(mMutex);
+                if (--mInFlight == 0)
+                {
+                    mIdleCv.notify_all();
+                }
+            }
         }
     }
 
     std::mutex mMutex;
     std::condition_variable mCv;
+    std::condition_variable mIdleCv;
+    size_t mInFlight = 0; // pieces queued or running
     std::deque<Piece> mReads;
     std::deque<Piece> mWrites;
 };
@@ -551,7 +581,7 @@ private:
 DiskIoPool& diskIoPool()
 {
     // Intentionally leaked: detached workers may still be waiting on it during static destruction.
-    static auto* const pool = new DiskIoPool(diskIoConfig().threads);
+    static auto* const pool = new DiskIoPool(gAsyncDiskIoThreads.load());
     return *pool;
 }
 
@@ -610,22 +640,55 @@ CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream str
 
 bool asyncDiskIo() noexcept
 {
-    static bool const enabled = []
-    {
-        auto const& config = diskIoConfig();
-        if (config.threads > 0)
-        {
-            TLLM_LOG_INFO(
-                "[kvCacheManagerV2Utils] async disk I/O: threads=%zu chunk_bytes=%zu direct_write=%d direct_read=%d",
-                config.threads, config.chunkBytes, static_cast<int>(config.directWrite),
-                static_cast<int>(config.directRead));
-        }
-        return config.threads > 0;
-    }();
-    return enabled;
+    return gAsyncDiskIoThreads.load(std::memory_order_relaxed) > 0;
 }
 
 } // namespace
+
+void releaseDiskFile(int fd) noexcept
+{
+    if (fd < 0)
+    {
+        return;
+    }
+    if (asyncDiskIo())
+    {
+        // Workers may still hold pieces for this file; let them finish before its descriptors go away.
+        diskIoPool().waitIdle();
+    }
+    std::lock_guard<std::mutex> lock(directFdMutex());
+    auto& table = directFdTable();
+    if (static_cast<size_t>(fd) < table.size())
+    {
+        DirectFdEntry& entry = table[fd];
+        if (entry.direct > 0)
+        {
+            ::close(entry.direct - 1);
+        }
+        entry = DirectFdEntry{};
+    }
+}
+
+void configureAsyncDiskIo(size_t numThreads) noexcept
+{
+    if (numThreads == 0)
+    {
+        return;
+    }
+    size_t current = 0;
+    if (gAsyncDiskIoThreads.compare_exchange_strong(current, numThreads))
+    {
+        auto const& config = diskIoConfig();
+        TLLM_LOG_INFO(
+            "[kvCacheManagerV2Utils] async disk I/O: threads=%zu chunk_bytes=%zu direct_write=%d direct_read=%d",
+            numThreads, config.chunkBytes, static_cast<int>(config.directWrite), static_cast<int>(config.directRead));
+    }
+    else if (current != numThreads)
+    {
+        TLLM_LOG_WARNING("[kvCacheManagerV2Utils] async disk I/O already uses %zu threads; ignoring a request for %zu",
+            current, numThreads);
+    }
+}
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
 {
