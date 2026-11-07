@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Test-only: load the companion Slurm agent fix for GCP validation.
+// Test-only: load the companion Slurm agent fix for joint validation.
 @Library(['bloom-jenkins-shared-lib@dev-yanchaol-slurm-agent-profiler', 'trtllm-jenkins-shared-lib@main']) _
 
 import java.lang.InterruptedException
