@@ -9289,6 +9289,11 @@ class PyExecutor:
         still let the C++ batch allocation fail after a peer rank has
         succeeded. ``draft_reserve`` overrides the draft tokens reserved for
         the dummy; by default they follow the dummy role.
+
+        The estimate covers one sequence. A generation dummy with
+        ``max_beam_width > 1`` can need a block per beam; if those do not
+        fit, ``add_dummy_requests`` returns None and the callers schedule an
+        empty batch instead.
         """
         token_num = (token_nums[0] if token_nums is not None else 1 +
                      self.max_total_draft_tokens)
@@ -9461,6 +9466,8 @@ class PyExecutor:
                     token_nums=token_nums,
                     is_gen=self._adp_dummy_is_gen,
                     max_num_draft_tokens=self.max_total_draft_tokens,
+                    max_beam_width=(self.max_beam_width
+                                    if self._adp_dummy_is_gen else 1),
                 )
             except OutOfPagesError:
                 dummy_requests = None
@@ -9496,6 +9503,8 @@ class PyExecutor:
                 token_nums=token_nums,
                 is_gen=self._adp_dummy_is_gen,
                 max_num_draft_tokens=self.max_total_draft_tokens,
+                max_beam_width=(self.max_beam_width
+                                if self._adp_dummy_is_gen else 1),
             )
         except OutOfPagesError:
             dummy_requests = None
@@ -9597,6 +9606,7 @@ class PyExecutor:
                 is_gen=not context_dummy,
                 max_num_draft_tokens=(0 if context_dummy else
                                       self.max_total_draft_tokens),
+                max_beam_width=1 if context_dummy else self.max_beam_width,
             )
         except (OutOfPagesError, NoFreeSlotsError):
             dummy_requests = None
