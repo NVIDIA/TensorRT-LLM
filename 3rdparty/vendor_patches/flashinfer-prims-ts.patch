@@ -1,5 +1,5 @@
 diff --git a/_compile_cache.py b/_compile_cache.py
-index b374a65..cdfa762 100644
+index b374a65311402982d818d80e9145ab40ed9727a1..cdfa76294f2d854117db62ad36724254006f8cb8 100644
 --- a/_compile_cache.py
 +++ b/_compile_cache.py
 @@ -1,3 +1,4 @@
@@ -194,7 +194,7 @@ index b374a65..cdfa762 100644
          f"prims_ts_{family}",
          f"{kind}_sm{major}{minor}_{key}",
 diff --git a/block_sparse.py b/block_sparse.py
-index fa05561..38de492 100644
+index fa055618705216cddf6b7f3e9ed4c1d680c2af9a..38de4926a045f17c5b6f206f4a20ecbe2532a1c7 100644
 --- a/block_sparse.py
 +++ b/block_sparse.py
 @@ -1,3 +1,4 @@
@@ -256,7 +256,7 @@ index fa05561..38de492 100644
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/context.py b/context.py
-index 898859e..564760b 100644
+index 898859e0dabfa12b9a5e6d5f35a8999ac31a2d4b..564760b837053a62f8201632ec207e1f10c57d12 100644
 --- a/context.py
 +++ b/context.py
 @@ -56,7 +56,7 @@ from .vc_attention import (
@@ -278,7 +278,7 @@ index 898859e..564760b 100644
          require_cute_dsl_arch(device_index)
      return device_index
 diff --git a/decode.py b/decode.py
-index 4fb096f..f918146 100644
+index 4fb096f39849a3801349758360e71b092ee200e9..f91814650c48dcf5b116273742880ac722fed527 100644
 --- a/decode.py
 +++ b/decode.py
 @@ -1,3 +1,4 @@
@@ -327,7 +327,7 @@ index 4fb096f..f918146 100644
      q: torch.Tensor,
      paged_kv_cache: PagedKVCache,
 diff --git a/kernels/fmha_context/fmha_resources.py b/kernels/fmha_context/fmha_resources.py
-index fbd1f12..2efae0a 100644
+index fbd1f1285278c5e9dd2ca1dd753d48e23e3c5561..2efae0a160c68ba9748e5e5d5ae04a257e4c44bc 100644
 --- a/kernels/fmha_context/fmha_resources.py
 +++ b/kernels/fmha_context/fmha_resources.py
 @@ -1,3 +1,4 @@
@@ -401,7 +401,7 @@ index fbd1f12..2efae0a 100644
 +    _resolve_kv_tile_idx_context,
 +)
 diff --git a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
-index b22f0f4..a4a8720 100644
+index b22f0f413b7312bab9a5f8e296255fe9aeabe901..a4a87200ca5d3ace5cf899caa9672a1a32c5289e 100644
 --- a/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 +++ b/kernels/fmha_decode/fmha_decode_resources/tmem_transformed_kv.py
 @@ -1,3 +1,4 @@
@@ -419,7 +419,7 @@ index b22f0f4..a4a8720 100644
  from .helpers_common import (
      _TASK_CACHE_TMEM_BASE_OFFSET,
 diff --git a/mla_decode.py b/mla_decode.py
-index b62bd10..7a305b1 100644
+index b62bd1081fbae0e18e0950008bae87c8986677b4..7a305b1ec6f2e860b3627e6d71c562e231c98a52 100644
 --- a/mla_decode.py
 +++ b/mla_decode.py
 @@ -1,3 +1,4 @@
@@ -742,7 +742,7 @@ index b62bd10..7a305b1 100644
  def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
      """Return workspace bytes using the same arguments as wrapper.plan().
 diff --git a/q_token_kv_block_sparse_metadata.py b/q_token_kv_block_sparse_metadata.py
-index e2bbef1..17025db 100644
+index e2bbef13c0f552030875e6b433e0fcdb20686cf6..80c19d0bd0fb7c5e6165b630462bac2e479aae1e 100644
 --- a/q_token_kv_block_sparse_metadata.py
 +++ b/q_token_kv_block_sparse_metadata.py
 @@ -1,3 +1,4 @@
@@ -771,47 +771,25 @@ index e2bbef1..17025db 100644
  
      return gen_prims_ts_q_token_kv_block_sparse_metadata_module().build_and_load()
  
-@@ -273,7 +274,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
-                 self.sparse_block_size,
+@@ -274,6 +275,12 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                  self.max_seq_len_kv,
                  self.release_attention_pdl,
--                self.locator_head_multiplier,
+                 self.locator_head_multiplier,
++                # flashinfer-python 0.7.3 ships #6774's metadata module, which
++                # takes count_current_block_in_topk and fixed_query_len after
++                # locator_head_multiplier; these defaults keep the pre-#6774
++                # behavior of this vendored tree.
++                True,
++                0,
              )
          else:
              self.metadata_run(
-@@ -289,7 +289,6 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
-                 self.sparse_block_size,
+@@ -290,6 +297,8 @@ class _PrimsTSQTokenKvBlockSparseMetadataPlan:
                  self.max_seq_len_kv,
                  self.release_attention_pdl,
--                self.locator_head_multiplier,
+                 self.locator_head_multiplier,
++                True,
++                0,
              )
  
  
-@@ -1042,13 +1041,9 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
-         split_kv,
-         share_pattern_across_kv_heads,
-     )
--    # Eligible FP8 G2..G8/page-4 profiles consume one bit-plane per query.
--    # Other profiles and the standalone metadata API retain page-byte masks.
--    query_major_memberships = (
--        sparse_block_size == 4
--        and spec.config.use_fp8_qkv
--        and spec.config.supports_query_major_memberships
--    )
-+    # flashinfer-python 0.7.2 ships the pre-#5351 metadata module without the
-+    # run_*_query_major entry points, so every profile keeps page-byte masks.
-+    query_major_memberships = False
-     if query_major_memberships:
-         page_capacity = (page_capacity + 31) // 32 * 32
-     membership_words = (
-@@ -1806,7 +1801,9 @@ def _prepare_q_token_kv_block_sparse_attention(
-             else ()
-         ),
-         direct_q1_max_model_len=max_seq_len_kv if group_size == 1 else None,
--        allow_head_aware_locators=group_size > 1,
-+        # flashinfer-python 0.7.2 ships the pre-#5351 metadata module: no
-+        # locator_head_multiplier argument and head-stride-1 locators only.
-+        allow_head_aware_locators=False,
-     )
-     # Preparation only binds shapes and storage; attention does not read these
-     # outputs until metadata runs. Use its resolved format for the producer.

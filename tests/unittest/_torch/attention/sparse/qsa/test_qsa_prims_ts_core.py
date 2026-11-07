@@ -478,3 +478,82 @@ def test_decode_rows_get_exact_plans() -> None:
     )
     torch.cuda.synchronize()
     torch.testing.assert_close(out, expected, atol=2e-2, rtol=2e-2)
+
+
+_ARITY_ERROR = (
+    "Mismatched number of arguments when calling: `run_fixed(...)`. Expected {} but got 0 arguments"
+)
+
+
+def _metadata_module_raising(message: str, error_type: type[Exception]):
+    def run_fixed(*args):
+        raise error_type(message)
+
+    return lambda: SimpleNamespace(run_fixed=run_fixed)
+
+
+def test_metadata_module_probe_reports_mismatch(monkeypatch) -> None:
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+
+    cases = (
+        (_ARITY_ERROR.format(prims_ts_core._METADATA_RUN_FIXED_ARGS), TypeError, None),
+        (_ARITY_ERROR.format(13), TypeError, "does not match the vendored tree"),
+        ("JIT compilation is disabled via FLASHINFER_DISABLE_JIT", RuntimeError, "unavailable"),
+    )
+    try:
+        for message, error_type, expected in cases:
+            monkeypatch.setattr(
+                fi_metadata,
+                "_get_prims_ts_q_token_kv_block_sparse_metadata_module",
+                _metadata_module_raising(message, error_type),
+            )
+            prims_ts_core._metadata_module_reason.cache_clear()
+            reason = prims_ts_core._metadata_module_reason()
+            if expected is None:
+                assert reason is None
+            else:
+                assert expected in reason and message in reason
+    finally:
+        prims_ts_core._metadata_module_reason.cache_clear()
+
+
+def test_metadata_module_mismatch_falls_back_to_triton(monkeypatch) -> None:
+    _requires_prims_ts()
+    import tensorrt_llm._torch.attention.backends.prims_ts.q_token_kv_block_sparse_metadata as fi_metadata
+    from tensorrt_llm._torch.attention.backends.sparse.qsa import prims_ts_core
+
+    warnings = []
+    monkeypatch.setattr(
+        prims_ts_core,
+        "logger",
+        SimpleNamespace(warning_once=lambda *msg, key: warnings.append(key)),
+    )
+    monkeypatch.setattr(
+        fi_metadata,
+        "_get_prims_ts_q_token_kv_block_sparse_metadata_module",
+        _metadata_module_raising(_ARITY_ERROR.format(13), TypeError),
+    )
+    device = torch.device("cuda")
+    q = torch.empty(4, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    k_cache = torch.empty(1, NUM_KV_HEADS, PAGE_SIZE, HEAD_DIM, dtype=torch.bfloat16, device=device)
+
+    def resolve(backend):
+        return prims_ts_core.resolve_sparse_core_backend(
+            _params(sparse_core_backend=backend),
+            q=q,
+            k_cache=k_cache,
+            page_size=PAGE_SIZE,
+            is_decode=True,
+            num_rows=4,
+        )
+
+    prims_ts_core._metadata_module_reason.cache_clear()
+    try:
+        assert resolve("auto") == "triton"
+        assert resolve("auto") == "triton"
+        assert warnings == ["qsa_prims_ts_unavailable", "qsa_prims_ts_unavailable"]
+        with pytest.raises(RuntimeError, match="does not match the vendored tree"):
+            resolve("prims_ts")
+    finally:
+        prims_ts_core._metadata_module_reason.cache_clear()
