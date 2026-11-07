@@ -99,6 +99,29 @@ def _drop_ctx_handoff(response: UCompletionResponse) -> None:
         response.finish_reason = None
 
 
+def _name_responses_reply(request: UCompletionRequest, disagg_request_id: int) -> None:
+    """Name the reply to a Responses request ``resp_<disagg_request_id>_<16 hex>``.
+
+    A worker answers a Responses request under the request's ``request_id``, by
+    default a random ``resp_`` id. Each worker numbers its own engine requests,
+    so an engine request id can name different requests on different workers;
+    the disaggregated request id is unique across the deployment, and both
+    workers and this server record it with the request. The random part keeps
+    the name unique should a disaggregated request id repeat.
+
+    The name is given once, before any worker sees the request, so it stays the
+    same if a retried context request gets a new disaggregated request id. A
+    ``request_id`` the client set is kept, and other requests are left alone.
+
+    The workers get the name only because assigning a field adds it to
+    pydantic's ``model_fields_set``: ``_encode_request_body`` forwards set
+    fields only (``exclude_unset=True``), and an unset ``request_id`` would
+    leave each worker to draw its own from the field's default factory.
+    """
+    if isinstance(request, ResponsesRequest) and "request_id" not in request.model_fields_set:
+        request.request_id = f"resp_{disagg_request_id}_{os.urandom(8).hex()}"
+
+
 class _SseErrorObserver:
     """Observe worker error events without changing the forwarded SSE bytes."""
 
@@ -300,6 +323,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        _name_responses_reply(request, disagg_request_id)
         # reserve a gen_server if conditional disagg is needed
         gen_server, need_ctx = await self._check_conditional_disagg(request, disagg_request_id)
         # Context retries may replace disagg_request_id for the KV-transfer
@@ -604,6 +628,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         disagg_request_id = await self._coordinator.get_disagg_request_id()
         if hooks:
             hooks.on_disagg_request_id(disagg_request_id)
+        _name_responses_reply(request, disagg_request_id)
         if need_ctx:
             # arrival->here = pre-ctx wait in the orchestrator/fleet.
             if hooks:

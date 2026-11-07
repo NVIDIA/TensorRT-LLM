@@ -440,6 +440,23 @@ def test_the_failed_snapshot_says_failed_and_carries_no_content():
     assert response["id"] == processor.request.request_id
 
 
+def test_the_created_event_is_named_after_the_request_id():
+    """A worker opens its stream under the request_id it was sent, e.g. a disaggregated one."""
+    request_id = "resp_101_0123456789abcdef"
+    request = ResponsesRequest(model="test-model", input="hi", stream=True, request_id=request_id)
+    processor = ResponsesStreamingProcessor(
+        request=request,
+        sampling_params=request.to_sampling_params(),
+        model_name="test-model",
+        use_harmony=False,
+    )
+
+    created = processor.get_initial_responses()[0]
+
+    assert _event_type(created) == "response.created"
+    assert _event_data(created)["response"]["id"] == request_id
+
+
 @pytest.mark.asyncio
 async def test_a_relay_numbers_its_error_event_across_split_delimiters():
     frames = [
@@ -963,6 +980,7 @@ def _server_streaming(monkeypatch, steps):
     server._extract_metrics = AsyncMock()
 
     class Generation:
+        request_id = 1
         prompt_token_ids = [1, 2, 3]
         finished = False
 
