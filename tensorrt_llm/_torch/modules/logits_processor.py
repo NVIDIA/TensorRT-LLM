@@ -10,6 +10,7 @@ from tensorrt_llm._utils import nvtx_range
 
 from ..attention.backends import AttentionMetadata
 from .linear import Linear
+from .logits_cast import widen_logits_to_fp32
 
 
 def scale_and_soft_cap_logits(logits: torch.Tensor, multiplier: float,
@@ -53,5 +54,6 @@ class LogitsProcessor(nn.Module):
                 hidden_states = hidden_states[-1]
 
         logits = lm_head(hidden_states)
-        logits = logits.float()
-        return logits
+        # Bit-identical to .float(); the vectorized kernel runs at HBM
+        # bandwidth when the logits fit it (see logits_cast.py).
+        return widen_logits_to_fp32(logits)
