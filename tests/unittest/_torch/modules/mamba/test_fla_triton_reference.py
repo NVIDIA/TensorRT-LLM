@@ -28,7 +28,8 @@ NUM_K_HEADS, NUM_V_HEADS, HEAD_K_DIM, HEAD_V_DIM = 2, 4, 96, 48
 NUM_SLOTS = 8
 #: One pool slot per sequence, out of order; slots 2, 4 and 5 stay untouched.
 SLOTS = (6, 0, 3, 7, 1)
-#: The fp64 reference test's band: the WY operands are rounded to bf16.
+#: The band of the qwen4_exp test_modeling_v2_chunk_gated_delta_rule.py:
+#: the WY operands are rounded to bf16.
 RTOL, ATOL_OUTPUT, ATOL_STATE = 1.6e-2, 2e-3, 2e-2
 
 
@@ -75,12 +76,15 @@ def check_chunk_gated_delta_rule(device: str, dtype: torch.dtype) -> None:
     assert torch.equal(pool[untouched], pool_before[untouched])
 
 
-def check_l2norm_fwd(device: str) -> None:
-    """A row tail (17 rows, 16-row blocks) and a column tail (96 of 128)."""
+def check_l2norm_fwd(device: str, dtype: torch.dtype, dim: int) -> None:
+    """17 rows and a column tail: dim 96 (of 128) runs l2norm_fwd_kernel in
+    16-row blocks, dim 600 (of 1024) runs the row-per-program l2norm_fwd_kernel1."""
     eps = 1e-6
-    x = torch.randn(17, 96, generator=torch.Generator().manual_seed(17)).to(device)
+    x = torch.randn(17, dim, generator=torch.Generator().manual_seed(17)).to(device, dtype)
     y = l2norm_fwd(x, eps=eps)
-    torch.testing.assert_close(y, x / torch.sqrt(x.pow(2).sum(-1, keepdim=True) + eps))
+    xf = x.float()
+    ref = xf / torch.sqrt(xf.pow(2).sum(-1, keepdim=True) + eps)
+    torch.testing.assert_close(y, ref.to(dtype))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -89,6 +93,8 @@ def test_chunk_gated_delta_rule_matches_fp64_reference(dtype: torch.dtype) -> No
     check_chunk_gated_delta_rule("cuda", dtype)
 
 
+@pytest.mark.parametrize("dim", [96, 600])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @torch.inference_mode()
-def test_l2norm_fwd_matches_formula() -> None:
-    check_l2norm_fwd("cuda")
+def test_l2norm_fwd_matches_formula(dtype: torch.dtype, dim: int) -> None:
+    check_l2norm_fwd("cuda", dtype, dim)
