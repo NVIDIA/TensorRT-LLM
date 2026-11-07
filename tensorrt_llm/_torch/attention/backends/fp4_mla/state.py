@@ -15,6 +15,7 @@ from .metadata import configure_fp4_mla_device_page_table, populate_fp4_mla_appe
 if TYPE_CHECKING:
     from ....memory_buffer_utils import Buffers
     from ..trtllm import TrtllmAttentionMetadata
+    from .cache_update import _Fp4MlaContextScatterPlan
     from .fp4_mla_context import _Fp8MlaContextScratch
 
 
@@ -43,6 +44,15 @@ class Fp4MlaState:
     # Packed decode plans its KV split once per step (the plan depends only on
     # the step's lengths); this key marks the plan as current.
     packed_plan_key: tuple | None = None
+    # Per-step serial of the generation lengths: the 4x split plan (one launch per step, not per layer)
+    # re-plans when it changes. Monotonic across steps, never reset.
+    generation_lengths_serial: int = 0
+    plan_4x_key: tuple | None = None
+    # Ceiling (tokens) of the KV regime this CUDA graph metadata serves, an upper bound of its steps' longest live KV,
+    # set through set_decode_kv_regime by a graph runner that keys its decode graphs by KV regime
+    # (fp4_mla_dispatch.kv_regimes_for_batch). None (eager metadata, graphs without regimes): decide on the
+    # page-table capacity.
+    kv_regime_max_kv: int | None = None
     generation_cache_scattered: bool = False
     device_page_table: bool = False
     device_page_table_valid: bool = False
@@ -57,6 +67,8 @@ class Fp4MlaState:
     q_batch_capacity: int | None = None
     prequantized_q_rows_per_seq: int | None = None
     fp8_context_state: tuple[_Fp8MlaContextScratch, TrtllmAttentionMetadata] | None = None
+    # Context cache-update inputs shared by every layer of the current step.
+    context_scatter_plan: _Fp4MlaContextScatterPlan | None = None
     _paged_kv_indptr: torch.Tensor | None = None
     paged_kv_indptr_decode: torch.Tensor | None = None
     _paged_kv_indices: torch.Tensor | None = None
@@ -67,6 +79,14 @@ class Fp4MlaState:
     full_pages_cache: tuple[tuple, bool] | None = None
     workspaces: dict[str, torch.Tensor] = field(default_factory=dict)
     v_packed_cache_tags: dict[str, tuple] = field(default_factory=dict)
+    # Global layer whose lifecycle provides this state's page table; None
+    # selects the first FP4 layer.
+    page_table_layer_idx: int | None = None
+    # Compact FP4 layer that index 0 of ``v_scale_pool`` belongs to.
+    v_layer_base: int = 0
+    # Global layers served by this state; None means every FP4 layer that no
+    # other state claims.
+    layer_ids: frozenset[int] | None = None
 
     @property
     def paged_kv_indices(self) -> torch.Tensor:
@@ -81,7 +101,19 @@ class Fp4MlaState:
         return self._paged_kv_indptr[: self.num_sequences + 1]
 
     @classmethod
-    def create(cls, metadata: TrtllmAttentionMetadata, buffers: Buffers | None) -> Fp4MlaState:
+    def create(
+        cls,
+        metadata: TrtllmAttentionMetadata,
+        buffers: Buffers | None,
+        *,
+        draft_lifecycle: bool = False,
+    ) -> Fp4MlaState:
+        """Create the state of the target layers, or of the draft-layer lifecycle.
+
+        On a disaggregated context worker only one-model draft layers keep the
+        decode views, and they live in a lifecycle of their own with a page
+        table of their own; ``draft_lifecycle`` selects the state for them.
+        """
         manager = metadata.kv_cache_manager
         hp_ring_size = manager.fp4_mla_hp_pool_size
         if hp_ring_size < HP_BLOCK_SIZE:
@@ -106,18 +138,43 @@ class Fp4MlaState:
                 f"{getattr(hp_pool, 'shape', None)}."
             )
 
+        prefix = "fp4_mla_draft_" if draft_lifecycle else "fp4_mla_"
+
         def allocate(
             name: str, shape: tuple[int, ...], dtype: torch.dtype = torch.int32
         ) -> torch.Tensor:
             return metadata.get_empty(
                 buffers,
                 shape,
-                cache_name=f"fp4_mla_{name}",
+                cache_name=f"{prefix}{name}",
                 dtype=dtype,
                 capture_graph=metadata.is_cuda_graph,
             )
 
-        state = cls(hp_pool=hp_pool, v_scale_pool=manager.get_mla_v_scale_pool())
+        v_layer_base = int(getattr(manager, "fp4_mla_v_layer_base", 0))
+        if draft_lifecycle:
+            layer_ids = manager.fp4_mla_draft_lifecycle_layer_ids()
+            if not layer_ids:
+                raise RuntimeError("FP4 MLA has no draft-layer lifecycle to create a state for.")
+            state = cls(
+                hp_pool=hp_pool,
+                v_scale_pool=manager.get_mla_v_scale_pool(),
+                page_table_layer_idx=layer_ids[0],
+                v_layer_base=v_layer_base,
+                layer_ids=frozenset(layer_ids),
+            )
+        else:
+            # Single-copy target layers keep no V scales, so their state
+            # exposes none even when draft layers keep some.
+            state = cls(
+                hp_pool=hp_pool,
+                v_scale_pool=(
+                    None
+                    if getattr(manager, "fp4_mla_context_only_cache", False)
+                    else manager.get_mla_v_scale_pool()
+                ),
+                v_layer_base=v_layer_base,
+            )
         tokens = (metadata.max_num_tokens,)
         sequences = (metadata.max_num_sequences,)
         indptr = (metadata.max_num_sequences + 1,)
@@ -142,10 +199,13 @@ class Fp4MlaState:
         self.generation_lengths_num_contexts = -1
         self.generation_lengths_capture_recorded = False
         self.packed_plan_key = None
+        self.plan_4x_key = None
 
     def prepare(self, metadata: TrtllmAttentionMetadata, kv_lens: torch.Tensor) -> None:
-        # All local layers reuse this FP8 view only within the current batch.
+        # All local layers reuse this FP8 view and this cache-update plan only
+        # within the current batch.
         self.fp8_context_state = None
+        self.context_scatter_plan = None
         self.invalidate_generation_lengths()
         if metadata.kv_cache_manager is None or metadata.request_ids is None:
             raise RuntimeError(
@@ -163,6 +223,7 @@ class Fp4MlaState:
 
     def on_update_kv_lens(self, metadata: TrtllmAttentionMetadata) -> None:
         self.device_page_table_valid = False
+        self.context_scatter_plan = None
         if metadata.num_tokens > 0:
             self.invalidate_generation_lengths()
             if metadata.num_contexts > 0:
@@ -179,6 +240,7 @@ class Fp4MlaState:
         # Rebind aliases to the restored stable tensors, never to the temporary
         # spec-dec clone whose storage may be released after graph capture.
         num_seqs = metadata.num_seqs
+        self.context_scatter_plan = None
         metadata.kv_lens_cuda_runtime = metadata.kv_lens_cuda[:num_seqs]
         metadata.prompt_lens_cuda_runtime = metadata.seq_lens_kv_cuda[:num_seqs]
         if not torch.cuda.is_current_stream_capturing():

@@ -310,6 +310,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                  default=None,
                                                  repr=False,
                                                  compare=False)
+    # FP4 state of the draft layers when they live in a lifecycle of their own
+    # (single-copy target layers); their attention runs with it swapped in.
+    fp4_mla_draft_state: Optional[Fp4MlaState] = field(init=False,
+                                                       default=None,
+                                                       repr=False,
+                                                       compare=False)
 
     # Pre-computed FlashMLA tile-scheduler metadata and num_splits.
     # Computed once per forward pass in TrtllmAttention.forward() and reused across layers.
@@ -648,6 +654,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 getattr(self.kv_cache_manager, "get_fp4_mla_page_table_spec",
                         None)):
             self.fp4_mla_state = Fp4MlaState.create(self, buffers)
+            draft_layer_ids = getattr(self.kv_cache_manager,
+                                      "fp4_mla_draft_lifecycle_layer_ids", None)
+            if callable(draft_layer_ids) and draft_layer_ids():
+                self.fp4_mla_draft_state = Fp4MlaState.create(
+                    self, buffers, draft_lifecycle=True)
 
         # Allocate static buffers for helix parallelism support.
         if self.enable_helix:
@@ -717,8 +728,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
-        state = getattr(self, "fp4_mla_state", None)
-        if state is not None:
+        for state in self._fp4_mla_states():
             state.on_update_kv_lens(self)
         view = self.mixed_precision_staging
         if view is not None and view.manager is self.kv_cache_manager:
@@ -733,9 +743,42 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         if self.enable_flash_mla:
             self._flash_mla_metadata_valid = False
         self._invalidate_mla_scheduler_buffers()
-        state = getattr(self, "fp4_mla_state", None)
-        if state is not None:
+        for state in self._fp4_mla_states():
             state.update_for_spec_dec(self)
+
+    def _fp4_mla_states(self) -> List[Fp4MlaState]:
+        return [
+            state for state in (getattr(self, "fp4_mla_state", None),
+                                getattr(self, "fp4_mla_draft_state", None))
+            if state is not None
+        ]
+
+    @contextlib.contextmanager
+    def use_fp4_mla_state(self, state: Fp4MlaState) -> Iterator[None]:
+        """Present ``state`` as ``fp4_mla_state`` to the FP4 MLA code within."""
+        saved = self.fp4_mla_state
+        self.fp4_mla_state = state
+        try:
+            yield
+        finally:
+            self.fp4_mla_state = saved
+
+    def set_decode_kv_regime(self, kv_regime: Optional[int]) -> None:
+        # The FP4 MLA decode dispatcher chooses 2x | 4x | two-stream on it.
+        for state in self._fp4_mla_states():
+            state.kv_regime_max_kv = kv_regime
+
+    @property
+    def decode_kv_regime(self) -> Optional[int]:
+        state = self.fp4_mla_state
+        return None if state is None else state.kv_regime_max_kv
+
+    def fp4_mla_state_for_layer(self, layer_idx: int) -> Optional[Fp4MlaState]:
+        """The draft-lifecycle FP4 state if it serves ``layer_idx``, else None."""
+        state = self.fp4_mla_draft_state
+        if state is not None and layer_idx in state.layer_ids:
+            return state
+        return None
 
     def _invalidate_mla_scheduler_buffers(self) -> None:
         # Spec-dec rewrites q_lens and kv_lens between sub-steps, so the cumulative
@@ -747,8 +790,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     def restore_from_spec_dec(self) -> None:
         super().restore_from_spec_dec()
         self.context_plan = None
-        if self.fp4_mla_state is not None:
-            self.fp4_mla_state.restore_from_spec_dec(self)
+        for state in self._fp4_mla_states():
+            state.restore_from_spec_dec(self)
 
     def update_helix_param(
         self,
@@ -1222,6 +1265,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.fp4_mla_state is not None:
             self.fp4_mla_state.prepare(self, kv_lens)
+        if self.fp4_mla_draft_state is not None:
+            # The page-table setup reads and writes ``self.fp4_mla_state``.
+            with self.use_fp4_mla_state(self.fp4_mla_draft_state):
+                self.fp4_mla_draft_state.prepare(self, kv_lens)
 
         if self._has_mixed_precision_staging():
             # Native BF16 paged-context FMHA reads 32-token pages.
@@ -1466,6 +1513,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.block_ids_per_seq[:self.num_generations, :num_blocks].copy_(
             block_ids_per_seq[self.num_contexts:], non_blocking=True)
 
+    def _mla_cached_kv_partition_tokens(self) -> Optional[int]:
+        """Cached tokens attended per MLA context partition, or None if unpartitioned.
+
+        Chunked prefill splits the cached prefix by its buffer size. FP4 MLA
+        also attends a prefix claimed by block reuse in partitions read back
+        from FP4 storage; each partition must fit the FP8 context scratch,
+        which holds ``max_num_tokens`` tokens per chunked-prefill buffer.
+        """
+        features = self.runtime_features
+        if features.chunked_prefill:
+            return features.chunk_size * features.chunked_prefill_buffer_batch_size
+        if self.fp4_mla_state is not None:
+            return int(self.max_num_tokens)
+        return None
+
     def pre_process_for_chunked_prefill(
         self,
         chunked_seq_len: torch.Tensor,
@@ -1475,15 +1537,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         merge_op_tensor: torch.Tensor,
         max_chunk_len_per_loop: list[int],
         chunked_loop_num: int,
+        total_chunk_size: Optional[int] = None,
     ) -> None:
         """
         Pre-process the MLA layer for chunked prefill.
         This method is called before the forward pass to prepare the MLA layer for chunked prefill.
+        Each loop attends at most ``total_chunk_size`` cached tokens summed over the
+        context requests; it defaults to the chunked-prefill buffer size.
         """
         num_contexts = self.num_contexts
-        chunk_size = self.runtime_features.chunk_size
-        chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-        total_chunk_size = chunk_size * chunk_batch_size
+        if total_chunk_size is None:
+            chunk_size = self.runtime_features.chunk_size
+            chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
+            total_chunk_size = chunk_size * chunk_batch_size
         remain_buffer_len = total_chunk_size
         current_batch_idx = 0
         max_chunk_len_per_loop.clear()
@@ -1591,10 +1657,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             )
             # determine the number of loop
             # currently we assume that the chunk size is the same as the max_num_tokens
-            if self.runtime_features.chunked_prefill:
-                chunk_size = self.runtime_features.chunk_size
-                chunk_batch_size = self.runtime_features.chunked_prefill_buffer_batch_size
-                total_chunk_size = chunk_size * chunk_batch_size
+            total_chunk_size = self._mla_cached_kv_partition_tokens()
+            if total_chunk_size is not None:
                 self.chunked_loop_num = math.ceil(self.num_ctx_cached_tokens /
                                                   total_chunk_size)
                 self.chunked_seq_len = torch.zeros(
@@ -1646,7 +1710,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cu_chunked_seq_len=self.host_cu_chunked_seq_len,
                     merge_op_tensor=self.host_merge_op_tensor,
                     max_chunk_len_per_loop=self.max_chunk_len_per_loop,
-                    chunked_loop_num=self.chunked_loop_num)
+                    chunked_loop_num=self.chunked_loop_num,
+                    total_chunk_size=total_chunk_size)
                 self.chunked_seq_len.copy_(self.host_chunked_seq_len,
                                            non_blocking=True)
                 self.cu_chunked_seq_len.copy_(self.host_cu_chunked_seq_len,

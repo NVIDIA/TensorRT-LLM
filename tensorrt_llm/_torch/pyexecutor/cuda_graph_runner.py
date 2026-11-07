@@ -151,6 +151,16 @@ class KeyType(NamedTuple):
     # Total submitted verifier tokens for a ragged generation graph. ``None``
     # retains the existing uniform graph family.
     ragged_verify_bucket: Optional[int] = None
+    # Ceiling (tokens) of the KV regime the graph was captured for, when the
+    # runner keys its decode graphs by the step's longest live KV so the FP4
+    # MLA decode dispatcher decides on it. ``None`` keeps one KV family.
+    kv_regime: Optional[int] = None
+
+
+def _largest_kv_regime(regimes) -> Optional[int]:
+    """The largest KV regime among the ranks' (None entries ignored); None when no rank keys by regime."""
+    known = [regime for regime in regimes if regime is not None]
+    return max(known) if known else None
 
 
 def _save_spec_decode_capture_state(
@@ -252,6 +262,13 @@ class CUDAGraphRunner:
     WARMUP_STEPS = 1
     # CUDAGraphRunnerConfig.short_long_seq_len_threshold, when the config set one.
     _configured_seq_len_threshold: Optional[int] = None
+    # Resolves a graph shape (batch size, draft length) to the ceilings of the
+    # KV regimes its decode graphs are keyed by (ascending, the page-table
+    # capacity last); set by the decoder's graph component once the KV cache
+    # exists, None keeps every graph in one KV family. The regime is pinned
+    # while a capture pass runs, like the sampling tier.
+    kv_regime_resolver: Optional[Callable[[int, int], Tuple[int, ...]]] = None
+    _capture_kv_regime: Optional[int] = None
 
     def __init__(self, config: CUDAGraphRunnerConfig):
         self.config = config
@@ -271,6 +288,8 @@ class CUDAGraphRunner:
         self.enable_in_graph_sampling = config.enable_in_graph_sampling
         # Set by DecoderCudaGraphs while capturing an in-graph sampling tier pass.
         self._capture_sample_type: Optional[SampleType] = None
+        self.kv_regime_resolver = None
+        self._capture_kv_regime = None
         # Resolves a runtime batch to its tier; registered through the decoder runner so the
         # graph runner does not need to know about the sampler.
         self._sample_type_resolver: Optional[Callable[
@@ -399,21 +418,79 @@ class CUDAGraphRunner:
                 or (self.enable_encoder_decoder_mixed_cuda_graph
                     and self._is_mixed_encoder_decoder_batch(batch)))
 
-    def _gather_adp_graph_batch_info(self, batch: ScheduledRequests,
+    def _gather_adp_graph_batch_info(self,
+                                     batch: ScheduledRequests,
                                      can_run_cuda_graph: bool,
-                                     sample_type: SampleType):
-        """Return ``[(can_run_cuda_graph, batch_size, sample_type)]`` per TP rank.
+                                     sample_type: SampleType,
+                                     kv_regime: Optional[int] = None):
+        """Return ``[(can_run_cuda_graph, batch_size, sample_type, kv_regime)]``
+        per TP rank.
 
         One fixed-size exchange, entered by every rank unconditionally. The
         sampling tier rides along because it is part of the graph key: ranks
         that resolved different tiers would otherwise replay different graphs.
+        So does the KV regime once the decode graphs are keyed by it (-1 from
+        a caller that does not agree it); otherwise the vector keeps its three
+        fields and every rank's regime reads None.
         """
-        gathered = self.config.dist.tp_allgather_int64(
-            [bool(can_run_cuda_graph), batch.batch_size, sample_type.value])
+        vector = [bool(can_run_cuda_graph), batch.batch_size, sample_type.value]
+        keyed_by_kv_regime = self.kv_regime_resolver is not None
+        if keyed_by_kv_regime:
+            vector.append(-1 if kv_regime is None else int(kv_regime))
+        gathered = self.config.dist.tp_allgather_int64(vector)
         flags = gathered[:, 0].astype(bool).tolist()
         sizes = gathered[:, 1].tolist()
         tiers = gathered[:, 2].tolist()
-        return list(zip(flags, sizes, tiers))
+        if keyed_by_kv_regime:
+            regimes = [
+                None if regime < 0 else int(regime)
+                for regime in gathered[:, 3].tolist()
+            ]
+        else:
+            regimes = [None] * len(flags)
+        return list(zip(flags, sizes, tiers, regimes))
+
+    def _max_total_seq_len(
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> int:
+        """Longest total sequence length a generation row of ``batch`` reads.
+
+        The sequence length of the execution view: the tokens of this step
+        included, ``max_draft_len`` more for speculative rows, one more for a
+        row the overlap scheduler already assigned to a batch, and the context
+        cursor for a promoted final-context row. Keys the sparse short/long
+        graph families and the KV regime of the FP4 MLA decode dispatcher.
+        """
+        new_tokens_device, next_draft_tokens_device = None, None
+        if new_tensors_device is not None:
+            new_tokens_device = new_tensors_device.new_tokens
+            if isinstance(new_tensors_device, SampleStateTensorsSpec):
+                next_draft_tokens_device = new_tensors_device.next_draft_tokens
+        overlap_scheduler_enabled = new_tokens_device is not None
+        max_total_seq_len = 0
+        for request in batch.generation_requests:
+            is_spec_request = get_draft_token_length(
+                request) > 0 or next_draft_tokens_device is not None
+            num_draft_tokens = self.spec_config.max_draft_len if is_spec_request else 0
+            if request.py_request_id in promoted_context_request_ids:
+                # A promoted context row may retain overlap bookkeeping
+                # such as py_batch_idx from an earlier context chunk. That
+                # state describes the previous batch, not the sequence
+                # length of the final prompt token executed by this graph.
+                # Use the authoritative context cursor so graph keying
+                # matches the decode-shaped input prepared for this row.
+                total_seq_len = request.context_current_position + 1
+            # With overlap scheduler disabled or dummy request or not assigned to a batch,
+            elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
+                total_seq_len = request.max_beam_num_tokens + num_draft_tokens
+            # Other cases
+            else:
+                total_seq_len = request.max_beam_num_tokens + num_draft_tokens + 1
+            max_total_seq_len = max(max_total_seq_len, total_seq_len)
+        return max_total_seq_len
 
     @property
     def short_long_seq_len_threshold(self) -> Optional[int]:
@@ -448,36 +525,11 @@ class CUDAGraphRunner:
             # and long sequences. We need to first collect the sequence length of the requests and then determine
             # the sequence length mode. For long sequences, use the default maximum sequence length. For short
             # sequences, use the sequence length threshold as the maximum sequence length.
-            total_seq_lens = []
-            new_tokens_device, next_draft_tokens_device = None, None
-            if new_tensors_device is not None:
-                new_tokens_device = new_tensors_device.new_tokens
-                if isinstance(new_tensors_device, SampleStateTensorsSpec):
-                    next_draft_tokens_device = new_tensors_device.next_draft_tokens
-            overlap_scheduler_enabled = new_tokens_device is not None
-            for request in batch.generation_requests:
-                is_spec_request = get_draft_token_length(
-                    request) > 0 or next_draft_tokens_device is not None
-                num_draft_tokens = self.spec_config.max_draft_len if is_spec_request else 0
-                if request.py_request_id in promoted_context_request_ids:
-                    # A promoted context row may retain overlap bookkeeping
-                    # such as py_batch_idx from an earlier context chunk. That
-                    # state describes the previous batch, not the sequence
-                    # length of the final prompt token executed by this graph.
-                    # Use the authoritative context cursor so graph keying
-                    # matches the decode-shaped input prepared for this row.
-                    total_seq_len = request.context_current_position + 1
-                # With overlap scheduler disabled or dummy request or not assigned to a batch,
-                elif not overlap_scheduler_enabled or request.is_dummy or request.py_batch_idx is None:
-                    total_seq_len = request.max_beam_num_tokens + num_draft_tokens
-                # Other cases
-                else:
-                    total_seq_len = request.max_beam_num_tokens + num_draft_tokens + 1
-                total_seq_lens.append(total_seq_len)
             # Determine the sequence length mode.
             from ..speculative import get_num_extra_kv_tokens
             num_extra_kv_tokens = get_num_extra_kv_tokens(self.spec_config)
-            max_seq_len = max(total_seq_lens)
+            max_seq_len = self._max_total_seq_len(batch, new_tensors_device,
+                                                  promoted_context_request_ids)
             if max_seq_len <= self.short_long_seq_len_threshold - num_extra_kv_tokens:
                 short_seq_len_mode = True
             else:
@@ -498,6 +550,7 @@ class CUDAGraphRunner:
         peft_cache_data_type: Optional[torch.dtype] = None,
         use_lora_graph: bool = False,
         forced_sample_type: Optional[SampleType] = None,
+        forced_kv_regime: Optional[int] = None,
     ) -> Optional[KeyType]:
         batch_size = batch.batch_size
 
@@ -524,6 +577,12 @@ class CUDAGraphRunner:
         sample_type = (forced_sample_type if forced_sample_type is not None
                        else self._resolve_sample_type(
                            batch, promoted_context_request_ids))
+
+        # KV regime of the step when the decode graphs are keyed by it (FP4 MLA
+        # decode dispatcher); under attention DP the caller has agreed it.
+        kv_regime = (forced_kv_regime if forced_kv_regime is not None else
+                     self._kv_regime_for_batch(batch, new_tensors_device,
+                                               promoted_context_request_ids))
 
         # With dynamic spec decode, the draft length may be zero even when enable_spec_decode is True,
         # so we need to get the draft length from the batch instead of using enable_spec_decode.
@@ -556,12 +615,28 @@ class CUDAGraphRunner:
                        peft_cache_data_type=peft_cache_data_type,
                        use_lora_graph=use_lora_graph,
                        temperature_only=temperature_only,
-                       ragged_verify_bucket=self._ragged_verify_bucket(batch))
+                       ragged_verify_bucket=self._ragged_verify_bucket(batch),
+                       kv_regime=kv_regime)
 
     def set_capture_sample_type(self,
                                 sample_type: Optional[SampleType]) -> None:
         """Pin the tier captured by the current pass; None restores runtime resolution."""
         self._capture_sample_type = sample_type
+
+    def set_kv_regime_resolver(
+            self, resolver: Optional[Callable[[int, int], Tuple[int,
+                                                                ...]]]) -> None:
+        """Key the decode graphs by KV regime; None restores one KV family.
+
+        ``resolver(batch_size, draft_len)`` lists the ceilings in tokens of
+        the regimes that graph shape is keyed by, ascending, the page-table
+        capacity last (``fp4_mla_dispatch.kv_regimes_for_batch``).
+        """
+        self.kv_regime_resolver = resolver
+
+    def set_capture_kv_regime(self, kv_regime: Optional[int]) -> None:
+        """Pin the KV regime captured by the current pass; None restores runtime resolution."""
+        self._capture_kv_regime = kv_regime
 
     def register_sample_type_resolver(
         self,
@@ -633,31 +708,110 @@ class CUDAGraphRunner:
         return min(compatible_keys,
                    key=lambda captured_key: captured_key.num_encoder_tokens)
 
+    def _kv_regime_for_batch(
+        self,
+        batch: ScheduledRequests,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        promoted_context_request_ids: frozenset[int] = frozenset()
+    ) -> Optional[int]:
+        """Ceiling of the KV regime ``batch`` replays; None without regimes.
+
+        Pinned during a capture pass, so the graph records the dispatcher's
+        decision for that regime; otherwise, among the regimes of the batch's
+        graph shape, the one covering the step's longest live KV, an upper
+        bound the captured decision was taken on.
+        """
+        resolver = self.kv_regime_resolver
+        if resolver is None:
+            return None
+        if self._capture_kv_regime is not None:
+            return self._capture_kv_regime
+        draft_len = max((len(request.py_draft_tokens)
+                         for request in batch.generation_requests),
+                        default=0)
+        ceilings = resolver(batch.batch_size, draft_len)
+        if len(ceilings) == 1:
+            # Most shapes have one regime; the step's KV cannot change it.
+            return int(ceilings[0])
+        # One-engine speculation reads max_draft_len - 1 KV tokens beyond the
+        # row's sequence length (the sparse short/long split counts them too).
+        # Imported here: only an FP4 MLA decode registers a resolver.
+        from ..attention.backends.fp4_mla import fp4_mla_dispatch
+        from ..speculative import get_num_extra_kv_tokens
+        max_kv_len = self._max_total_seq_len(
+            batch, new_tensors_device,
+            promoted_context_request_ids) + get_num_extra_kv_tokens(
+                self.spec_config)
+        return fp4_mla_dispatch.kv_regime_for_step(max_kv_len, ceilings)
+
+    def _get_compatible_kv_regime_key(self, key: KeyType) -> KeyType:
+        """Round the KV regime up to a captured graph key.
+
+        A graph of a larger regime is valid for the step: the kernels are
+        planned for the page-table capacity and only the dispatcher's decision
+        is baked in. A regime whose capture was skipped replays the next one
+        up, or the largest captured when none covers it.
+        """
+        if (key.kv_regime is None or self._capture_allowed
+                or key in self.graph_metadata):
+            return key
+        key_without_regime = key._replace(kv_regime=None)
+        compatible_keys = [
+            captured_key for captured_key in self.graph_metadata
+            if isinstance(captured_key, KeyType)
+            and captured_key.kv_regime is not None and captured_key._replace(
+                kv_regime=None) == key_without_regime
+        ]
+        if not compatible_keys:
+            return key
+        covering_keys = [
+            captured_key for captured_key in compatible_keys
+            if captured_key.kv_regime >= key.kv_regime
+        ]
+        if covering_keys:
+            return min(covering_keys,
+                       key=lambda captured_key: captured_key.kv_regime)
+        return max(compatible_keys,
+                   key=lambda captured_key: captured_key.kv_regime)
+
     def _ragged_verify_bucket(self, batch: ScheduledRequests) -> Optional[int]:
         """Optional token bucket supplied by a specialized graph runner."""
         return None
 
     def _agree_graph_shape(
-        self, batch: ScheduledRequests, can_run_cuda_graph: bool,
-        promoted_context_request_ids: frozenset[int]
-    ) -> Tuple[bool, Optional[SampleType]]:
-        """Agree on graph eligibility, rows and sampling tier across ADP ranks."""
+        self,
+        batch: ScheduledRequests,
+        can_run_cuda_graph: bool,
+        promoted_context_request_ids: frozenset[int],
+        new_tensors_device: Optional[SampleStateTensors] = None,
+    ) -> Tuple[bool, Optional[SampleType], Optional[int]]:
+        """Agree on graph eligibility, rows, sampling tier and KV regime
+        across ADP ranks.
+
+        The agreed KV regime is the largest one, so every rank replays the
+        same graph family and its own rows are covered; None when the graphs
+        are not keyed by regime.
+        """
         if not (self.enabled and self.config.enable_attention_dp
                 and self.config.mapping.tp_size > 1):
-            return True, None
+            return True, None, None
         local_sample_type = self._resolve_sample_type(
             batch, promoted_context_request_ids)
+        local_kv_regime = self._kv_regime_for_batch(
+            batch, new_tensors_device, promoted_context_request_ids)
         graph_batch_info = self._gather_adp_graph_batch_info(
-            batch, can_run_cuda_graph, local_sample_type)
+            batch, can_run_cuda_graph, local_sample_type, local_kv_regime)
         all_can_graph = all(rank_info[0] for rank_info in graph_batch_info)
         all_batch_sizes_equal = all(rank_info[1] == graph_batch_info[0][1]
                                     for rank_info in graph_batch_info)
         if not all_can_graph or not all_batch_sizes_equal:
-            return False, None
+            return False, None, None
         forced_sample_type = (local_sample_type if all(
             rank_info[2] == graph_batch_info[0][2]
             for rank_info in graph_batch_info) else SampleType.FULL)
-        return True, forced_sample_type
+        forced_kv_regime = _largest_kv_regime(rank_info[3]
+                                              for rank_info in graph_batch_info)
+        return True, forced_sample_type, forced_kv_regime
 
     @staticmethod
     def _get_mrope_position_delta(request: Any) -> Optional[Any]:
@@ -722,8 +876,10 @@ class CUDAGraphRunner:
         is_mixed_encoder_decoder = self._is_mixed_encoder_decoder_batch(batch)
         can_run_cuda_graph = self._can_run_cuda_graph_batch(batch)
         batch_size = batch.batch_size
-        shapes_agree, forced_sample_type = self._agree_graph_shape(
-            batch, can_run_cuda_graph, promoted_context_request_ids)
+        shapes_agree, forced_sample_type, forced_kv_regime = (
+            self._agree_graph_shape(batch, can_run_cuda_graph,
+                                    promoted_context_request_ids,
+                                    new_tensors_device))
         if not shapes_agree:
             return None, None, None
 
@@ -743,11 +899,13 @@ class CUDAGraphRunner:
                                  spec_resource_manager, spec_metadata,
                                  promoted_context_request_ids,
                                  peft_cache_data_type, use_lora_graph,
-                                 forced_sample_type)
+                                 forced_sample_type, forced_kv_regime)
         if key is None:
             return None, None, None
         if is_mixed_encoder_decoder:
             key = self._get_compatible_mixed_encoder_decoder_key(key)
+        if key.kv_regime is not None:
+            key = self._get_compatible_kv_regime_key(key)
 
         if key in self.graph_metadata:
             return self.graph_metadata[key][
@@ -767,6 +925,11 @@ class CUDAGraphRunner:
         graph_attn_metadata = attn_metadata.create_cuda_graph_metadata(
             num_sequences_in_batch, False, key.draft_len,
             self.cuda_graph_meta_buffers)
+        if key.kv_regime is not None:
+            # The decode captured in this graph chooses its kernels on the
+            # regime ceiling, an upper bound of the live KV, instead of the
+            # page-table capacity.
+            graph_attn_metadata.set_decode_kv_regime(key.kv_regime)
         if is_mixed_encoder_decoder:
             generation_query_len = key.draft_len + 1
             graph_attn_metadata.seq_lens = torch.tensor(
@@ -952,6 +1115,7 @@ class CUDAGraphRunner:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
         self._check_strict_buffer_stability(stored_meta)
+        self._check_kv_regime_metadata(key, stored_meta)
 
         static_tensors = self.shared_static_tensors
 
@@ -1160,6 +1324,18 @@ class CUDAGraphRunner:
         if "spec_metadata_ptrs" in stored_meta:
             self._assert_graph_tensor_ptrs_stable(
                 stored_meta["spec_metadata"], stored_meta["spec_metadata_ptrs"])
+
+    @staticmethod
+    def _check_kv_regime_metadata(key: KeyType, stored_meta: Dict[str,
+                                                                  Any]) -> None:
+        """Assert the stored attention metadata carries the key's KV regime, if strict checking is enabled."""
+        if not _STRICT_BUFFER_CHECK or key.kv_regime is None:
+            return
+        # None: the backend's decode does not depend on the KV length.
+        stored_kv_regime = stored_meta["attn_metadata"].decode_kv_regime
+        assert stored_kv_regime in (None, key.kv_regime), (
+            f"CUDA graph {key} replays attention metadata of KV "
+            f"regime {stored_kv_regime}")
 
     def will_pad_to(self, padded_bs: int, num_requests: int) -> bool:
         """Whether a batch of ``num_requests`` can actually reach ``padded_bs``.
@@ -1658,9 +1834,18 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
                    default=0)
 
     def _agree_graph_shape(
-        self, batch: ScheduledRequests, can_run_cuda_graph: bool,
-        promoted_context_request_ids: frozenset[int]
-    ) -> Tuple[bool, Optional[SampleType]]:
+        self,
+        batch: ScheduledRequests,
+        can_run_cuda_graph: bool,
+        promoted_context_request_ids: frozenset[int],
+        new_tensors_device: Optional[SampleStateTensors] = None,
+    ) -> Tuple[bool, Optional[SampleType], Optional[int]]:
+        """Agree shape, tier and KV regime like the base runner, reusing the
+        policy's shape agreement when it holds.
+
+        A reused agreement leaves the KV regime rank-local: the regime only
+        picks the attention kernels of the rank's own rows.
+        """
         agreement = self.adp_shape_agreement
         # The policy agreement covers shape, not the in-graph sampling tier.
         reuse_agreement = bool(
@@ -1682,27 +1867,39 @@ class DSparkCUDAGraphRunner(CUDAGraphRunner):
             batch,
             promoted_context_request_ids) if adp_graph_agreement else None
         if not adp_graph_agreement or reuse_agreement:
-            return True, None
+            return True, None, None
 
         # Replay freezes all_rank_num_tokens. Compare every rank-local shape
         # component before launch; -1 denotes a non-applicable field.
         local_bucket = self._ragged_verify_bucket(
             batch) if can_run_cuda_graph else None
-        peer_shapes = self.config.dist.tp_allgather_int64([
+        local_shape = [
             can_run_cuda_graph,
             batch.batch_size,
             -1 if local_bucket is None else int(local_bucket),
             self._local_draft_len(batch) if can_run_cuda_graph else -1,
             local_sample_type.value,
-        ]).tolist()
+        ]
+        # The KV regime rides along once the decode graphs are keyed by it.
+        keyed_by_kv_regime = self.kv_regime_resolver is not None
+        if keyed_by_kv_regime:
+            local_kv_regime = self._kv_regime_for_batch(
+                batch, new_tensors_device, promoted_context_request_ids)
+            local_shape.append(-1 if local_kv_regime is
+                               None else int(local_kv_regime))
+        peer_shapes = self.config.dist.tp_allgather_int64(local_shape).tolist()
         if (not all(peer[0] for peer in peer_shapes)
                 or not all(peer[1:4] == peer_shapes[0][1:4]
                            for peer in peer_shapes)):
-            return False, None
+            return False, None, None
         forced_sample_type = (local_sample_type if all(
             peer[4] == peer_shapes[0][4]
             for peer in peer_shapes) else SampleType.FULL)
-        return True, forced_sample_type
+        forced_kv_regime = None
+        if keyed_by_kv_regime:
+            forced_kv_regime = _largest_kv_regime(
+                None if peer[5] < 0 else int(peer[5]) for peer in peer_shapes)
+        return True, forced_sample_type, forced_kv_regime
 
     def _get_num_tokens_for_key(self, key: KeyType) -> int:
         if key.ragged_verify_bucket is not None:
