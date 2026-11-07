@@ -134,7 +134,8 @@ class DynamicTreeSlotStorage:
 
     def mark_invalid(self, slot_id):
         """Clear validity and restore valid no-tree metadata."""
-        self.has_tree[slot_id] = False
+        # fill_ avoids the blocking copy of a Python scalar into one element.
+        self.has_tree[slot_id].fill_(False)
         self.packed_mask[slot_id] = self._no_tree_packed_mask
         self.position_offsets[slot_id] = self._no_tree_position_offsets
         self.retrieve_index[slot_id] = 0
