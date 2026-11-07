@@ -93,6 +93,8 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 to_disaggregated_params)
 from tensorrt_llm.serve.render import RenderResources, render_conversation
 from tensorrt_llm.serve.responses_web_search import is_web_search_tool
+from tensorrt_llm.serve.serving_extensions import (ServingExtension,
+                                                   get_serving_extension)
 from tensorrt_llm.serve.tool_parser.base_tool_parser import (
     BaseToolParser, warn_if_tool_call_unparsed)
 from tensorrt_llm.serve.tool_parser.core_types import ToolCallItem
@@ -1156,15 +1158,26 @@ def _fold_tool_calls_into_open_assistant_turn(
 async def _create_input_messages(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
+    extension: Optional[ServingExtension] = None,
 ) -> list[ChatCompletionMessageParam]:
-    return chat_messages_from_responses_input(request, prev_msgs)
+    return chat_messages_from_responses_input(request, prev_msgs, extension)
 
 
 def chat_messages_from_responses_input(
     request: ResponsesRequest,
     prev_msgs: list[ChatCompletionMessageParam],
+    extension: Optional[ServingExtension] = None,
 ) -> list[ChatCompletionMessageParam]:
-    """Convert a Responses request's instructions, history and input to chat messages."""
+    """Convert a Responses request's instructions, history and input to chat messages.
+
+    ``extension`` is the serving extension of the model the messages are
+    rendered for: it decides how each stored message of the history is
+    replayed (``replay_stored_turn``) and adapts the finished conversation to
+    its renderer (``prepare_responses_history``). Without one the generic
+    defaults apply.
+    """
+    if extension is None:
+        extension = get_serving_extension(None)
     messages: list[ChatCompletionMessageParam] = []
     if request.instructions:
         messages.append({
@@ -1172,20 +1185,14 @@ def chat_messages_from_responses_input(
             "content": request.instructions,
         })
 
-    # Prepend the conversation history.
-    # Skip the reasoning output, but keep the tool calls a reasoning message
-    # carries: the tool results that follow answer them.
+    # Prepend the conversation history, each stored message as the model's
+    # extension replays it. By default the reasoning output is skipped and
+    # the tool calls a reasoning message carries are kept: the tool results
+    # that follow answer them.
     for msg in prev_msgs:
-        if "reasoning" not in msg:
-            messages.append(msg)
-            continue
-        tool_calls = msg.get("tool_calls")
-        if tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": tool_calls,
-            })
+        replayed = extension.replay_stored_turn(msg)
+        if replayed is not None:
+            messages.append(replayed)
 
     # Append the new input.
     # Responses API supports simple text inputs without chat format.
@@ -1204,7 +1211,7 @@ def chat_messages_from_responses_input(
                 continue
             messages.append(message)
 
-    return messages
+    return extension.prepare_responses_history(messages)
 
 
 def _stored_tool_arguments(call) -> str:
@@ -1445,23 +1452,24 @@ async def _create_input_tokens(
     Returns:
         PromptInputs: The token ids, or a prompt dict with the multimodal data.
     """
-    messages = await _create_input_messages(
-        request=request,
-        prev_msgs=prev_msgs,
-    )
-
-    if enable_store and request.store:
-        await conversation_store.store_messages(request.request_id, messages,
-                                                request.previous_response_id)
-
     # Same pipeline as the chat route: the server template and the model
-    # extension's tool serialization apply here too.
+    # extension's history rules and tool serialization apply here too.
     render_resources = RenderResources.from_parts(
         tokenizer=tokenizer,
         model_type=resolve_top_level_model_type(model_config),
         hf_config=model_config,
         processor=processor,
         default_chat_template=chat_template)
+    messages = await _create_input_messages(
+        request=request,
+        prev_msgs=prev_msgs,
+        extension=render_resources.extension,
+    )
+
+    if enable_store and request.store:
+        await conversation_store.store_messages(request.request_id, messages,
+                                                request.previous_response_id)
+
     tools_dict = [
         render_resources.extension.serialize_tool(tool)
         for tool in _get_chat_completion_function_tools(request.tools)
@@ -1538,6 +1546,17 @@ async def _create_input_tokens_harmony(
     return _render_for_completion(messages)
 
 
+def _serving_extension_for(model_config: Optional[PretrainedConfig],
+                           use_harmony: bool) -> ServingExtension:
+    """The serving extension of the model a Responses request is served by.
+
+    Resolved as the render resources resolve it: the Harmony path has no
+    model config of its own and is gpt-oss's.
+    """
+    return get_serving_extension("gpt_oss" if use_harmony else
+                                 resolve_top_level_model_type(model_config))
+
+
 async def request_preprocess(
     request: ResponsesRequest,
     prev_response: Optional[ResponsesResponse],
@@ -1551,6 +1570,11 @@ async def request_preprocess(
     multimodal_server_config: Optional[MultimodalServerConfig] = None,
     chat_template: Optional[str] = None,
 ) -> tuple[PromptInputs, SamplingParams]:
+    # The model's extension sees the request before anything reads it: the
+    # sampling parameters built next and the prompt rendered below both read
+    # the fields it may derive or pin.
+    _serving_extension_for(model_config,
+                           use_harmony).apply_responses_extensions(request)
 
     sampling_params = request.to_sampling_params(
         default_sampling_params={

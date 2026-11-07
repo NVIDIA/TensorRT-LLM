@@ -24,6 +24,13 @@ to ``openai_protocol.py`` / ``openai_server.py``. Lookups are keyed two ways:
 - by reasoning-parser name for structured-output placement
   (:func:`structured_output_format_for`).
 
+The Responses API (``/v1/responses``) consults the same extension through its
+own hooks: :meth:`ServingExtension.apply_responses_extensions` preprocesses the
+request, :meth:`ServingExtension.replay_stored_turn` decides how a stored turn
+of the conversation is replayed, and
+:meth:`ServingExtension.prepare_responses_history` adapts the converted chat
+messages before the chat template renders them.
+
 Built-in extensions live in :mod:`tensorrt_llm.serve.extensions`; importing
 that package registers them. The hook lookup functions import it on first use so
 the registry is populated wherever it is consulted (``openai_protocol`` reaches
@@ -37,7 +44,11 @@ import importlib
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Literal, Optional
 
 if TYPE_CHECKING:
-    from tensorrt_llm.serve.openai_protocol import ChatCompletionRequest
+    from tensorrt_llm.serve.openai_protocol import (
+        ChatCompletionMessageParam,
+        ChatCompletionRequest,
+        ResponsesRequest,
+    )
 
 
 RequiredToolChoiceMode = Literal["template", "grammar"]
@@ -122,6 +133,51 @@ class ServingExtension:
         from request-level fields). Called only for requests whose resolved
         ``model_type`` this extension is registered for.
         """
+
+    def apply_responses_extensions(self, request: "ResponsesRequest") -> None:
+        """Preprocess a ``ResponsesRequest`` before its sampling parameters and prompt are built.
+
+        The Responses counterpart of :meth:`apply_chat_extensions`: mutates
+        ``request`` in place, typically deriving chat-template kwargs or
+        sampling fields from request-level fields. Called for every Responses
+        request of a model this extension is registered for, relayed
+        (pre-tokenized) prompts included, before ``to_sampling_params`` reads
+        the request. Any exception raised here rejects the request with a 400
+        ``BadRequestError`` carrying its message, as the route answers every
+        preprocessing error.
+        """
+
+    def replay_stored_turn(
+        self, message: "ChatCompletionMessageParam"
+    ) -> Optional["ChatCompletionMessageParam"]:
+        """The chat message that replays one stored message of a Responses conversation.
+
+        A ``previous_response_id`` follow-up replays the chat messages an
+        earlier turn stored in front of its own input; this decides what each
+        one becomes, ``None`` leaving it out. The default replays a message as
+        stored unless it is an assistant message carrying ``reasoning``: the
+        reasoning is not replayed, only the tool calls the message carries,
+        which the tool results that follow answer.
+        """
+        if "reasoning" not in message:
+            return message
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            return None
+        return {"role": "assistant", "content": None, "tool_calls": tool_calls}
+
+    def prepare_responses_history(
+        self, messages: List["ChatCompletionMessageParam"]
+    ) -> List["ChatCompletionMessageParam"]:
+        """Adapt the chat messages converted from a Responses request to the model's renderer.
+
+        ``messages`` is the whole conversation the chat template is about to
+        render: the instructions, the replayed history and the request's
+        input, in order. The returned list is what is rendered and stored;
+        the default returns ``messages`` unchanged. An override that changes
+        the conversation returns a new list rather than mutating this one.
+        """
+        return messages
 
     def required_tool_choice_mode(self) -> Optional[RequiredToolChoiceMode]:
         """Return the required-tool policy; boolean permission selects template enforcement."""
