@@ -2059,6 +2059,28 @@ def test_KvCacheConfig_disk_offload_options(tmp_path):
     with pytest.raises(ValidationError):
         KvCacheConfig(disk_io_threads=-1)
 
+    # The C++ disk tier config the fields are passed to applies the same rules.
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
+
+    tier = DiskCacheTierConfig(2048, str(tmp_path))
+    assert tier.num_io_threads == 0
+    assert tier.keep_copy_after_restore is False
+    assert tier.write_through is False
+    tier.validate()
+
+    tier = DiskCacheTierConfig(2048,
+                               str(tmp_path),
+                               num_io_threads=16,
+                               keep_copy_after_restore=True,
+                               write_through=True)
+    tier.validate()
+    assert tier.num_io_threads == 16
+
+    with pytest.raises(ValueError):
+        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    with pytest.raises(ValueError):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
+
 
 @pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
