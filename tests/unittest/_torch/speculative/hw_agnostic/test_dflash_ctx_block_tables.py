@@ -139,7 +139,6 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
 
     decode.assert_called_once()
     encoded, divisor, table, counts = decode.call_args.args
-    # The layer offset is removed once, by the decode.
     assert encoded.dtype == dtype
     assert torch.equal(encoded, original[1, :2, 0])
     assert decode.call_args.kwargs == {"block_offset": block_offset}
@@ -156,7 +155,6 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
 def test_fused_generation_prepare_covers_the_unified_cache(unified: bool) -> None:
     worker = _worker(unified=unified)
     worker._paged_latent_prepare = True
-    # K = 7 drafts: _draft_tokens_per_req is K + 1 = 8.
     worker.spec_config = SimpleNamespace(max_draft_len=7)
     metadata = SimpleNamespace(runtime_draft_len=7, captured_hidden_states=object())
 

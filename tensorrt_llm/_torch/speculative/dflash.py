@@ -1416,7 +1416,6 @@ class DFlashWorker(SpecWorkerBase):
         # is taken before the clamp erases the placeholders; it is informative
         # only on the python V2 backend, the cpp one already mapped
         # BAD_PAGE_INDEX to 0.
-        # The kernel removes the layer offset in int64 and leaves the metadata's table unchanged.
         decode_draft_block_table(
             src[self._ctx_pool_idx, :num_seqs, 0],
             self._ctx_block_divisor,
