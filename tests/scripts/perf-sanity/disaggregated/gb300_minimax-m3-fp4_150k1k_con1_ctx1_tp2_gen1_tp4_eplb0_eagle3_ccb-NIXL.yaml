@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# MiniMax-M3 NVFP4 + EAGLE3-GQA decode at a fixed long context, for the
-# gen_only_no_context lane: one TP4 gen worker on one GB300 node decodes 1 request
+# MiniMax-M3 NVFP4 + EAGLE3-GQA decode at a fixed long context. In the
+# gen_only_no_context lane, one TP4 gen worker on one GB300 node decodes 1 request
 # of exactly 153600 input / 1024 output random tokens. This is the low-latency end
 # (B=1) of the TP4 gen-only sweep of the MiniMax-M3 ctx-only / gen-only
 # optimization study; gb300_minimax-m3-fp4_150k1k_con64_... is its B=64 end, on the
@@ -15,13 +15,11 @@
 # 16384 tokens) is written into the yaml, the retired max_tokens_in_buffer is
 # dropped, three env vars main does not read are left out and TLLM_LOG_LEVEL=INFO is
 # added, as in every perf-sanity config. The ctx section (the study's TP2 prefill
-# worker) is not started by gen_only_no_context.
+# worker) is not started by gen_only_no_context; the ctx_only lane runs it alone and
+# the e2e lane runs it in front of the gen worker.
 #
-# modeling_v2 is `auto` on the gen worker. Main has no MiniMax-M3 route, so the
-# built-in model runs (same device step time as with modeling_v2 unset); once a
-# MiniMax-M3 TP4 target is on main, this lane runs it. #20306's TP4 target took
-# 6.15 ms per decode step here against 10.54 ms for the built-in model (same
-# wheel, GB300).
+# modeling_v2 is pinned `off` on the gen worker: every MiniMax-M3 150k1k lane
+# measures the built-in model.
 #
 # On the ctx worker, block reuse and its 180 GiB host tier (the study's AgentX prefix
 # reuse) are off: the fixed random prompts share no prefix, and with reuse on the
@@ -75,7 +73,7 @@ profiling:
   nsys_on: false
 worker_config:
   gen:
-    modeling_v2: auto
+    modeling_v2: 'off'
     print_iter_log: true
     max_batch_size: 64
     max_num_tokens: 512
