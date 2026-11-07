@@ -155,3 +155,43 @@ def test_llm_get_stats_async_tp2():
 @pytest.mark.gpu2
 def test_llm_get_stats_async_pp2():
     llm_get_stats_async_test_harness(pp_size=2, pytorch_backend=True)
+
+
+@pytest.mark.gpu2
+def test_llm_beam_search_pp2():
+    """Beam search under pipeline parallelism returns every finalized beam.
+
+    Only the last pipeline-parallel rank samples; the first rank, which returns
+    the results, finalizes the beams from the state that rank hands over.
+    """
+    beam_width = 4
+    max_tokens = 24
+    prompts = ["A B C", "The future of the AI is"]
+    sampling_params = SamplingParams(max_tokens=max_tokens,
+                                     n=beam_width,
+                                     best_of=beam_width,
+                                     use_beam_search=True,
+                                     logprobs=True)
+    with LLM(model=llama_model_path,
+             kv_cache_config=global_kv_cache_config,
+             pipeline_parallel_size=2,
+             max_beam_width=beam_width) as llm:
+        outputs = llm.generate(prompts, sampling_params=sampling_params)
+
+    for prompt, output in zip(prompts, outputs):
+        beams = output.outputs
+        assert len(beams) == beam_width, prompt
+        # Finalized beams are distinct paths, best first.
+        assert len({tuple(beam.token_ids) for beam in beams}) == beam_width
+        cumulative = [beam.cumulative_logprob for beam in beams]
+        assert None not in cumulative, prompt
+        assert cumulative == sorted(cumulative, reverse=True), prompt
+        for beam in beams:
+            assert 0 < len(beam.token_ids) <= max_tokens, prompt
+            assert len(beam.logprobs) == len(beam.token_ids), prompt
+            token_logprobs = [
+                next(iter(position.values())).logprob
+                for position in beam.logprobs
+            ]
+            assert sum(token_logprobs) == pytest.approx(
+                beam.cumulative_logprob), prompt
