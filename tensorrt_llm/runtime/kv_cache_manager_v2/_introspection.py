@@ -246,6 +246,11 @@ def storage_utilization(manager: Any, cache_level: int = 0) -> list[float]:
     return list(_cpp().storage_utilization(manager, cache_level))
 
 
+def disk_copy_counters(manager: Any) -> dict[str, int]:
+    """Return the retained disk copy and write-through counters of the storage manager."""
+    return dict(_cpp().disk_copy_counters(manager))
+
+
 def sparse_cache_resident_ordinals(kv_cache: Any, lc_id: int) -> list[int]:
     """Resident unit ordinal per sparse cache entry, laid out [buffer][entry].
 

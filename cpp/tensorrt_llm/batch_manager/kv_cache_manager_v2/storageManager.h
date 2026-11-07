@@ -361,6 +361,18 @@ public:
     [[nodiscard]] SlotCount numRetainedCopies(
         CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
 
+    struct DiskCopyCounters
+    {
+        uint64_t retained; // retained copies held now
+        uint64_t created;
+        uint64_t reused;   // evictions that took a retained slot back instead of writing
+        uint64_t reclaimed;
+        uint64_t dropped;
+        uint64_t writeThroughPages;
+    };
+
+    [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
