@@ -16,17 +16,21 @@
 
 import asyncio
 import queue as _queue
+import threading
 import time as _time
 from concurrent.futures import Future as _Future
 from unittest.mock import Mock
 from unittest.mock import Mock as _Mock
 
 import pytest
+import zmq
 
 from tensorrt_llm.executor import EngineDeadError
 from tensorrt_llm.executor import proxy as proxy_module
 from tensorrt_llm.executor import worker as worker_module
+from tensorrt_llm.executor.ipc import IpcQueue
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
+from tensorrt_llm.executor.request import CancellingRequest
 from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.executor.worker_process_monitor import WorkerProcessIdentity
 
@@ -52,6 +56,7 @@ class _FakeResult:
 def _bare_proxy():
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
     proxy._engine_dead = False
+    proxy.doing_shutdown = False
     proxy._results = {}
     # Set so the __del__ -> shutdown() path is a clean no-op at GC time.
     proxy.workers_started = False
@@ -86,6 +91,81 @@ def test_mark_engine_dead_is_idempotent():
     # A second call must not enqueue another error.
     proxy._mark_engine_dead(RuntimeError("second"))
     assert r.queue.empty()
+
+
+@pytest.mark.parametrize("state", ["healthy", "graceful", "dead", "fatal"])
+def test_cancellation_preserves_live_worker_shutdown(state: str) -> None:
+    """Only a terminal executor suppresses cancellation of worker requests."""
+    proxy = _bare_proxy()
+    proxy._fatal_error = RuntimeError("worker failed") if state == "fatal" else None
+    proxy._engine_dead = state == "dead"
+    proxy.doing_shutdown = state == "graceful"
+    proxy._error_queue = _queue.Queue()
+    proxy._results = {42: _FakeResult()}
+    proxy.request_queue = IpcQueue(is_server=True)
+    proxy._request_sender = proxy_module._RequestSender(
+        proxy.request_queue, proxy._error_queue, batching=False
+    )
+    peer = IpcQueue(proxy.request_queue.address, is_server=False)
+    try:
+        peer.setup_lazily()
+        # Complete the real connection before checking delivery or suppression.
+        assert peer.socket.poll(timeout=1000, flags=zmq.POLLOUT)
+        proxy.abort_request(42)
+        if state in ("healthy", "graceful"):
+            assert peer.poll(timeout=1)
+            cancel = __import__("pickle").loads(peer.get()[0])
+            assert isinstance(cancel, CancellingRequest)
+            assert cancel.id == 42
+        else:
+            assert not peer.poll(timeout=1)
+    finally:
+        proxy._close_request_sender()
+        peer.close()
+
+
+@pytest.mark.parametrize("batching", [False, True])
+@pytest.mark.timeout(10, method="thread")
+def test_cancellation_without_peer_fails_executor(batching: bool) -> None:
+    """An undetected lost peer must not strand cancellation or pending results."""
+    proxy = _bare_proxy()
+    proxy._fatal_error = None
+    proxy.doing_shutdown = False
+    proxy._error_queue = _queue.Queue()
+    proxy.workers_started = True
+    proxy._worker_process_monitor = Mock()
+    proxy._worker_process_monitor.find_dead_worker.return_value = None
+    proxy._shutdown_event = threading.Event()
+    proxy.mpi_session = object()
+    proxy.mpi_futures = []
+    proxy.request_queue = IpcQueue(is_server=True)
+    proxy._request_sender = proxy_module._RequestSender(
+        proxy.request_queue, proxy._error_queue, batching=batching, connect_timeout=0.2
+    )
+    result = _FakeResult()
+    result.abort = Mock()
+    proxy._results = {42: result}
+    monitor = None
+    try:
+        proxy.abort_request(42)
+        error = proxy._error_queue.get(timeout=3)
+        proxy._error_queue.put(error)
+        monitor = threading.Thread(target=proxy._error_monitor_loop, daemon=True)
+        monitor.start()
+        monitor.join(timeout=3)
+        assert not monitor.is_alive()
+        assert proxy.doing_shutdown
+        proxy._worker_process_monitor.close.assert_called_once()
+        assert not proxy.check_health()
+        assert proxy._engine_dead
+        assert isinstance(result.queue.get_nowait(), EngineDeadError)
+    finally:
+        proxy.workers_started = False
+        proxy._shutdown_event.set()
+        if monitor is not None:
+            monitor.join(timeout=3)
+        proxy._close_request_sender()
+        proxy.request_queue.close()
 
 
 def test_handle_worker_death_broadcasts_event_driven():
@@ -150,6 +230,9 @@ class _DeadAfterRegistrationMonitor:
     def find_dead_worker(self):
         return self.identities[0] if self.identities else None
 
+    def close(self):
+        pass
+
 
 def test_worker_death_before_ready_is_reported_from_registered_identity():
     """A pre-READY worker death must not depend on its MPI future finishing."""
@@ -168,7 +251,7 @@ def test_worker_death_before_ready_is_reported_from_registered_identity():
     proxy.pre_shutdown = _Mock()
     proxy._handle_background_error = _Mock()
 
-    with pytest.raises(RuntimeError, match=r"rank 3 \(pid 12345\) exited unexpectedly"):
+    with pytest.raises(RuntimeError, match=r"rank 3 \(pid 12345\) lost process liveness"):
         proxy._wait_for_executor_workers_ready()
 
     assert not proxy.mpi_futures[0].done()
@@ -406,7 +489,8 @@ class _FakeRequest:
         self.id = request_id
 
 
-def test_submit_rechecks_engine_death_after_registration(monkeypatch):
+@pytest.mark.parametrize("failure", ["death", "shutdown"])
+def test_submit_rechecks_engine_death_after_registration(monkeypatch, failure):
     """Close the submit-vs-death race.
 
     If the engine dies between the top-of-submit guard and registering the
@@ -416,6 +500,7 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch):
     proxy = _bare_proxy()
     proxy._fatal_error = None
     proxy._engine_dead = False
+    proxy.doing_shutdown = False
     proxy._results = {}
     proxy._start_dispatch_threads = lambda: None
     proxy._get_next_client_id = lambda: 42
@@ -427,12 +512,17 @@ def test_submit_rechecks_engine_death_after_registration(monkeypatch):
     def fake_generation_result(*args, **kwargs):
         # Simulate the error-monitor thread marking the engine dead mid-submit,
         # after the top guard passed but as the result is being created.
-        proxy._engine_dead = True
+        if failure == "death":
+            proxy._engine_dead = True
+        else:
+            proxy.doing_shutdown = True
         return fake_result
 
     monkeypatch.setattr("tensorrt_llm.executor.proxy.GenerationResult", fake_generation_result)
 
-    with pytest.raises(EngineDeadError):
+    from tensorrt_llm.executor.utils import EngineUnavailableError
+
+    with pytest.raises(EngineDeadError if failure == "death" else EngineUnavailableError):
         proxy.submit(_FakeRequest())
 
     # The raced result must not be left dangling in _results.
@@ -788,12 +878,14 @@ def _proxy_awaiting_worker_init(
     proxy = _bare_proxy()
     proxy._error_queue = _queue.Queue()
     proxy._fatal_error = None
+    proxy._command_failure_lock = threading.Lock()
+    proxy._workers_ready = False
+    proxy._command_failure = None
     proxy._owns_mpi_session = owns_session
     proxy.worker_cls = object
-    # The loop sets workers_started, so the __del__ -> shutdown() path at GC
-    # time is live: keep it out of pre_shutdown(), whose attributes (the
-    # worker-process monitor teardown, the request queue) this fixture does
-    # not seed.
+    # This partial fixture owns no worker or socket resources. Its finalizer
+    # must not wait on fake futures or tear down uninitialized fields.
+    proxy.shutdown = _Mock()
     proxy.doing_shutdown = True
 
     worker_future = _Future()
@@ -818,6 +910,98 @@ def _proxy_awaiting_worker_init(
         status_queue.get.return_value = ready_status
     proxy.worker_init_status_queue = status_queue
     return proxy
+
+
+@pytest.mark.timeout(10, method="thread")
+@pytest.mark.parametrize("loss_at", ["waiting-for-ready", "readiness-transition"])
+def test_early_command_disconnect_aborts_before_marking_dead(tmp_path, loss_at):
+    """An eager command monitor must preserve ordered initialization teardown."""
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=True, ready_status=(GenerationExecutorProxy.READY_SIGNAL, None)
+    )
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+    proxy._num_frontends = 2
+    proxy._multi_frontend_ipc_dir = str(tmp_path)
+    proxy._multi_frontend_hmac = b"k" * 32
+    proxy._enable_resource_governor = False
+    proxy.mpi_session.check_worker_error.return_value = None
+    status_queue = proxy.worker_init_status_queue
+    address = (
+        proxy_module.multi_frontend_request_addr(str(tmp_path)),
+        proxy._multi_frontend_hmac,
+    )
+    peer = IpcQueue(address, is_server=True, socket_type=zmq.PULL)
+    peer_monitor = peer.socket.get_monitor_socket(events=zmq.EVENT_HANDSHAKE_SUCCEEDED)
+    try:
+        # Exercise the real startup callback selected by queue construction,
+        # before any generation command or worker READY message exists.
+        proxy._setup_queues()
+        proxy.worker_init_status_queue.close()
+        proxy.worker_init_status_queue = status_queue
+        assert peer_monitor.poll(2000), "command transport did not establish a connection"
+        peer.socket.disable_monitor()
+        peer_monitor.close(linger=0)
+        proxy._handle_background_error = _Mock(wraps=proxy._handle_background_error)
+
+        def disconnect():
+            peer.close()
+            proxy._request_sender._thread.join(timeout=2)
+            assert not proxy._request_sender._thread.is_alive()
+            return True
+
+        if loss_at == "waiting-for-ready":
+            status_queue.poll.return_value = False
+            disconnect()
+        else:
+            # READY has arrived, but initialization has not yet committed to
+            # runtime failure handling. A loss here must not fall between them.
+            proxy._worker_process_monitor.wait_remote_ready.side_effect = disconnect
+
+        with pytest.raises(RuntimeError, match="initialization") as error:
+            proxy._start_executor_workers({})
+
+        cause = error.value.__cause__
+        assert isinstance(cause, ConnectionError)
+        assert proxy._fatal_error is cause
+        assert pending.queue.get_nowait().root_cause is cause
+        proxy.mpi_session.shutdown_abort.assert_called_once_with(reason=cause)
+        called = [call[0] for call in proxy.mpi_session.mock_calls]
+        assert called.index("shutdown_abort") < called.index("release_exit_joins")
+        proxy._handle_background_error.assert_not_called()
+        assert proxy._error_queue.empty()
+    finally:
+        peer_monitor.close(linger=0)
+        peer.close()
+        if proxy._request_sender is not None:
+            proxy._request_sender.close(timeout=2)
+        if hasattr(proxy, "result_queue"):
+            proxy.result_queue.close()
+        if proxy.worker_init_status_queue is not status_queue:
+            proxy.worker_init_status_queue.close()
+
+
+def test_remote_supervision_failure_after_ready_preserves_startup_error():
+    proxy = _proxy_awaiting_worker_init(
+        owns_session=True, ready_status=(GenerationExecutorProxy.READY_SIGNAL, None)
+    )
+    proxy._worker_process_monitor.wait_remote_ready.return_value = False
+    proxy._worker_process_monitor.find_dead_worker.return_value = WorkerProcessIdentity(
+        1, 4321, None, "follower", None
+    )
+    pending = _FakeResult()
+    proxy._results = {1: pending}
+
+    with pytest.raises(RuntimeError, match="supervision is unavailable") as error:
+        proxy._start_executor_workers({})
+
+    cause = error.value.__cause__
+    assert isinstance(cause, RuntimeError)
+    assert "rank 1 (pid 4321)" in str(cause)
+    assert proxy._fatal_error is cause
+    assert pending.queue.get_nowait().root_cause is cause
+    called = [call[0] for call in proxy.mpi_session.mock_calls]
+    assert called.index("shutdown_abort") < called.index("release_exit_joins")
 
 
 def test_worker_death_during_init_aborts_the_wedged_world():
@@ -995,3 +1179,14 @@ def test_non_ready_status_during_init_does_not_abort_borrowed_session():
     assert proxy._engine_dead is True
     proxy.mpi_session.shutdown_abort.assert_not_called()
     proxy.mpi_session.release_exit_joins.assert_called_once_with()
+
+
+def test_cancellation_tolerates_concurrent_terminal_failure():
+    proxy = _bare_proxy()
+    proxy._results = {42: _FakeResult()}
+    proxy._fatal_error = None
+    proxy.doing_shutdown = True
+    proxy._request_sender = _Mock()
+    proxy._request_sender.send.side_effect = EngineDeadError(RuntimeError("worker exited"))
+    proxy.abort_request(42)
+    proxy._request_sender.send.assert_called_once()

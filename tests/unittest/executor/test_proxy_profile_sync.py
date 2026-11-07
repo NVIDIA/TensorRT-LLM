@@ -20,15 +20,27 @@ These tests pin that contract for the IPC-proxy path.
 """
 
 import concurrent.futures
+import pickle
 import queue
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import zmq
 
-from tensorrt_llm.executor.proxy import GenerationExecutorProxy
-from tensorrt_llm.executor.request import StartProfileRequest, StopProfileRequest
+from tensorrt_llm.executor.ipc import IpcQueue
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy, _RequestSender
+from tensorrt_llm.executor.request import (
+    CancellingRequest,
+    GenerationRequest,
+    StartProfileRequest,
+    StopProfileRequest,
+)
+from tensorrt_llm.executor.utils import EngineDeadError, RequestError
+from tensorrt_llm.executor.worker import _dispatch_requests
+from tensorrt_llm.sampling_params import SamplingParams
 
 # These tests deliberately keep a real single-thread
 # ``_profile_control_executor`` alive for the whole test body -- pinning
@@ -37,7 +49,100 @@ from tensorrt_llm.executor.request import StartProfileRequest, StopProfileReques
 # function-scoped fixture finalizer necessarily runs too late to satisfy
 # it. The ``bare_proxy`` teardown below still drains the executor, so the
 # owner threads are reclaimed and do not accumulate across the module.
-pytestmark = pytest.mark.threadleak(enabled=False)
+pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
+
+
+@pytest.mark.threadleak(enabled=True)
+@pytest.mark.timeout(15, method="thread")
+@pytest.mark.parametrize("outcome", ["success", "rejected", "fatal"])
+def test_profile_flush_keeps_shared_command_ingress_live(tmp_path, outcome):
+    address = (f"ipc://{tmp_path}/commands", b"k" * 32)
+    entered = threading.Event()
+    release = threading.Event()
+    cancelled = threading.Event()
+    ready = threading.Event()
+    errors = queue.Queue()
+    received = []
+
+    class Worker:
+        def stop_profile(self):
+            entered.set()
+            assert release.wait(5)
+            if outcome == "rejected":
+                raise RequestError("profile rejected")
+            if outcome == "fatal":
+                raise RuntimeError("profile failed")
+
+        def submit(self, request):
+            received.append(request.id)
+
+        def abort_request(self, request_id):
+            assert request_id == 7
+            cancelled.set()
+
+    def dispatch():
+        ingress = IpcQueue(address, is_server=True, socket_type=zmq.PULL, receive_hwm=16)
+        try:
+            ingress.setup_lazily()
+            ready.set()
+            _dispatch_requests(Worker(), ingress)
+        except BaseException as error:
+            errors.put(error)
+        finally:
+            ingress.close()
+
+    thread = threading.Thread(target=dispatch)
+    thread.start()
+    ack = IpcQueue(is_server=True)
+    senders = [
+        _RequestSender(
+            IpcQueue(address, is_server=False, socket_type=zmq.PUSH),
+            errors,
+            batching=False,
+            connect_timeout=0.5,
+        )
+        for _ in range(2)
+    ]
+    try:
+        assert ready.wait(3)
+        ack.setup_lazily()
+        senders[0].send(pickle.dumps(StopProfileRequest(ack_addr=ack.address)), control=True)
+        assert entered.wait(3)
+        # Exceed the production transport's finite buffers while export is
+        # held. The other frontend must keep making progress, not time out.
+        for request_id in range(64):
+            request = GenerationRequest([1] * (512 * 1024), SamplingParams())
+            request.set_id(request_id)
+            senders[1].send(pickle.dumps(request))
+        senders[1].send(pickle.dumps(CancellingRequest(7)), control=True)
+        assert cancelled.wait(2)
+        assert received == list(range(64))
+        assert errors.empty()
+        assert not ack.poll(0.01), "profile acknowledged before trace export completed"
+        release.set()
+        if outcome == "fatal":
+            error = errors.get(timeout=3)
+            assert isinstance(error, RuntimeError)
+            assert str(error) == "profile failed"
+        else:
+            assert ack.get(timeout=3) == (
+                "stop",
+                "profile rejected" if outcome == "rejected" else None,
+            )
+    finally:
+        release.set()
+        senders[1].close(timeout=3)
+        senders[0].close(timeout=3, send_sentinel=outcome != "fatal")
+        thread.join(timeout=3)
+        ack.close()
+    assert not thread.is_alive()
+    if outcome == "fatal":
+        # Closing the failed worker's ingress can independently notify both
+        # frontend owners before their orderly cleanup begins.
+        while not errors.empty():
+            assert isinstance(errors.get_nowait(), ConnectionError)
+    else:
+        assert errors.empty()
 
 
 @pytest.fixture
@@ -49,19 +154,55 @@ def bare_proxy():
     subprocess).
 
     Also wires a real single-thread ``_profile_control_executor`` —
-    this matches the production setup, which pins all profile-related
-    ZMQ socket operations to one owning thread (see
-    ``GenerationExecutorProxy.__init__``).
+    this matches the production setup, where the shared command sender
+    owns writes and the profile-control executor owns profile replies.
     """
     proxy = GenerationExecutorProxy.__new__(GenerationExecutorProxy)
     # Set by ``GenerationExecutor.__init__`` in production; the profile
     # handlers reject control once ``pre_shutdown()`` flips it.
     proxy.doing_shutdown = False
+    proxy.workers_started = False
+    proxy._engine_dead = False
+    proxy._fatal_error = None
     proxy.request_queue = MagicMock()
     # The fix introduces a ``profile_ack_queue`` attribute. Pre-fix this
     # attribute does not exist; we stub it as MagicMock so old code paths
     # accessing it via getattr() see a sentinel.
     proxy.profile_ack_queue = MagicMock()
+    proxy.profile_ack_queue.address = ("unused-profile-ack", b"k" * 32)
+    delivered = queue.Queue()
+
+    class Commands:
+        socket = SimpleNamespace(
+            setsockopt=lambda *args: None,
+            get_monitor_socket=lambda **kwargs: SimpleNamespace(
+                poll=lambda timeout: False, close=lambda **kwargs: None
+            ),
+            disable_monitor=lambda: None,
+        )
+
+        def setup_lazily(self):
+            pass
+
+        def put(self, message, **kwargs):
+            if message is not None:
+                for payload in message:
+                    proxy.request_queue.put(pickle.loads(payload))
+                    delivered.put(None)
+
+        def close(self):
+            pass
+
+    proxy._request_sender = _RequestSender(Commands(), queue.Queue(), batching=False)
+    original_wait = proxy._wait_profile_ack
+
+    def wait_for_delivered_ack(kind, timeout):
+        # A real worker cannot acknowledge a command before receiving it.
+        # Preserve that causality with asynchronous command submission too.
+        delivered.get(timeout=timeout)
+        return original_wait(kind, timeout)
+
+    proxy._wait_profile_ack = wait_for_delivered_ack
     proxy._profile_control_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="proxy_profile_control"
     )
@@ -73,6 +214,7 @@ def bare_proxy():
     if executor is not None:
         executor.shutdown(wait=True)
         proxy._profile_control_executor = None
+    proxy._request_sender.close(timeout=5)
 
 
 def test_stop_profile_blocks_until_worker_acks(bare_proxy):
@@ -112,7 +254,7 @@ def test_stop_profile_blocks_until_worker_acks(bare_proxy):
     def blocking_get(timeout=None):
         # Wait for the worker thread to finish, then return the ack.
         if not ack_event.wait(timeout=timeout):
-            raise TimeoutError("ack not received within timeout")
+            raise queue.Empty()
         return ("stop", None)
 
     proxy.profile_ack_queue.get.side_effect = blocking_get
@@ -154,7 +296,7 @@ def test_start_profile_blocks_until_worker_acks(bare_proxy, tmp_path):
 
     def blocking_get(timeout=None):
         if not ack_event.wait(timeout=timeout):
-            raise TimeoutError("ack not received within timeout")
+            raise queue.Empty()
         return ("start", None)  # ("status", optional_error_message)
 
     proxy.profile_ack_queue.get.side_effect = blocking_get
@@ -245,7 +387,7 @@ def test_profile_control_during_pre_shutdown_raises_runtime_error(bare_proxy, ki
     proxy.profile_ack_queue.get.assert_not_called()
 
 
-def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
+def test_stop_profile_timeout_warns_does_not_hang(bare_proxy, monkeypatch):
     """Timeout produces a warning rather than wedging the event loop.
 
     If the worker is stuck (no ack within the timeout), the proxy
@@ -257,8 +399,10 @@ def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
     real ``except Empty`` branch in ``_wait_profile_ack``.
     """
     proxy = bare_proxy
+    monkeypatch.setattr(proxy, "_STOP_PROFILE_ACK_TIMEOUT_S", 0.05)
 
     def never_ack(timeout=None):
+        time.sleep(timeout)
         raise queue.Empty()
 
     proxy.profile_ack_queue.get.side_effect = never_ack
@@ -269,6 +413,51 @@ def test_stop_profile_timeout_warns_does_not_hang(bare_proxy):
     elapsed = time.monotonic() - t0
     # The TimeoutError path returns promptly.
     assert elapsed < 1.0
+
+
+@pytest.mark.threadleak(enabled=True)
+def test_profile_ack_wait_fails_promptly_after_worker_death():
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy.doing_shutdown = False
+    proxy._engine_dead = False
+    proxy._fatal_error = None
+    proxy._results = {}
+    proxy._request_sender = None
+    entered = threading.Event()
+    outcomes = queue.Queue()
+
+    def wait_for_ack():
+        ack = IpcQueue(is_server=True)
+        original_get = ack.get
+
+        def observed_get(*args, **kwargs):
+            entered.set()
+            return original_get(*args, **kwargs)
+
+        ack.get = observed_get
+        proxy.profile_ack_queue = ack
+        try:
+            proxy._wait_profile_ack("stop", 1.5)
+            outcomes.put(None)
+        except BaseException as error:
+            outcomes.put(error)
+        finally:
+            ack.close()
+
+    owner = threading.Thread(target=wait_for_ack)
+    owner.start()
+    try:
+        assert entered.wait(3)
+        proxy._set_fatal_error(RuntimeError("worker died during profile"))
+        owner.join(0.5)
+        assert not owner.is_alive(), "fatal profiling wait kept HTTP shutdown blocked"
+        error = outcomes.get_nowait()
+        assert isinstance(error, EngineDeadError)
+        assert "worker died during profile" in str(error)
+    finally:
+        owner.join(3)
+    assert not owner.is_alive()
 
 
 def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
@@ -333,22 +522,11 @@ def test_profile_control_pinned_to_single_owner_thread(bare_proxy, tmp_path):
     # 2 puts (start request, stop request) + 2 gets (each ack) = 4 ops.
     assert len(seen_threads) == 4, seen_threads
 
-    owner_threads = {th for _, th in seen_threads}
-    assert len(owner_threads) == 1, (
-        f"Profile-control queue ops touched multiple threads: "
-        f"{[(op, th.name) for op, th in seen_threads]}"
-    )
-
-    owner = next(iter(owner_threads))
-    # The owner is the executor's worker, not either caller thread.
-    assert owner not in caller_threads, (
-        f"Owner thread {owner.name!r} matched a caller thread; the "
-        "executor pinning is not effective."
-    )
-    assert owner.name.startswith("proxy_profile_control"), (
-        f"Owner thread name {owner.name!r} does not match the expected "
-        "'proxy_profile_control' prefix."
-    )
+    owners = {op: {th for kind, th in seen_threads if kind == op} for op in ("put", "get")}
+    assert all(len(threads) == 1 for threads in owners.values())
+    assert next(iter(owners["put"])).name == "proxy_request_sender"
+    assert next(iter(owners["get"])).name.startswith("proxy_profile_control")
+    assert not set(caller_threads).intersection(owners["put"] | owners["get"])
 
 
 # --------------------------------------------------------------------------- #
@@ -371,14 +549,14 @@ class _ThreadSafetyRecorder:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._active = 0
+        self._active = {"put": 0, "get": 0}
         self.peak_concurrency = 0
         self.events = []  # list of ("op", thread)
 
     def record(self, op):
         with self._lock:
-            self._active += 1
-            self.peak_concurrency = max(self.peak_concurrency, self._active)
+            self._active[op] += 1
+            self.peak_concurrency = max(self.peak_concurrency, self._active[op])
             self.events.append((op, threading.current_thread()))
         try:
             # Hold the "inside-the-socket" window briefly so any
@@ -386,7 +564,7 @@ class _ThreadSafetyRecorder:
             time.sleep(0.001)
         finally:
             with self._lock:
-                self._active -= 1
+                self._active[op] -= 1
 
 
 def test_profile_ops_serialized_under_concurrent_callers(bare_proxy, tmp_path):
@@ -449,16 +627,10 @@ def test_profile_ops_serialized_under_concurrent_callers(bare_proxy, tmp_path):
         f"this would corrupt the socket. (See PR review §2.)"
     )
 
-    owner_threads = {th for _, th in recorder.events}
-    assert len(owner_threads) == 1, (
-        f"Profile-control ZMQ ops touched {len(owner_threads)} threads "
-        f"({[t.name for t in owner_threads]}) — must be exactly one."
-    )
-
-    (owner,) = owner_threads
-    assert owner.name.startswith("proxy_profile_control"), (
-        f"Owner thread {owner.name!r} is not the dedicated executor."
-    )
+    owners = {op: {th for kind, th in recorder.events if kind == op} for op in ("put", "get")}
+    assert all(len(threads) == 1 for threads in owners.values())
+    assert next(iter(owners["put"])).name == "proxy_request_sender"
+    assert next(iter(owners["get"])).name.startswith("proxy_profile_control")
 
 
 def test_profile_control_thread_name_is_stable_across_calls(bare_proxy, tmp_path):
@@ -499,7 +671,7 @@ def test_profile_control_thread_name_is_stable_across_calls(bare_proxy, tmp_path
     assert len(seen_owners) == 4 * n_calls
 
     owner_set = set(seen_owners)
-    assert len(owner_set) == 1, (
+    assert len(owner_set) == 2, (
         f"Owner thread changed across calls: "
         f"{sorted(t.name for t in owner_set)}. "
         f"max_workers may have been bumped > 1."
@@ -564,6 +736,4 @@ def test_caller_thread_never_touches_zmq_queue(bare_proxy, tmp_path):
 
     # And every owner is the dedicated executor worker.
     for th in queue_owner_set:
-        assert th.name.startswith("proxy_profile_control"), (
-            f"Unexpected owner thread {th.name!r}; expected 'proxy_profile_control*'."
-        )
+        assert th.name == "proxy_request_sender" or th.name.startswith("proxy_profile_control")

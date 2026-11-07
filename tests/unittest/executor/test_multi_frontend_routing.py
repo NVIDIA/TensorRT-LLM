@@ -20,12 +20,17 @@ attached-frontend proxy lifecycle over real ipc:// sockets.
 """
 
 import os
+import pickle
+import queue
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 
 import pytest
+import zmq
 
+from tensorrt_llm.executor.ipc import FusedIpcQueue, IpcQueue
 from tensorrt_llm.executor.utils import (
     FRONTEND_COUNTER_MASK,
     MAX_NUM_FRONTENDS,
@@ -34,6 +39,8 @@ from tensorrt_llm.executor.utils import (
     get_frontend_id,
     namespace_client_id,
 )
+from tensorrt_llm.executor.worker import _response_queue_lifetime
+from tensorrt_llm.llmapi.utils import ManagedThread
 
 pytestmark = pytest.mark.cpu_only
 
@@ -75,6 +82,90 @@ class TestClientIdNamespacing:
 
 def _response(client_id):
     return SimpleNamespace(client_id=client_id)
+
+
+@pytest.mark.parametrize("lanes", [1, 2])
+@pytest.mark.parametrize("mode", ["stopped", "finished", "never_started"])
+def test_response_owner_sends_last_batch_before_one_terminal_message(monkeypatch, lanes, mode):
+    monkeypatch.setenv("TLLM_LLMAPI_ZMQ_DEBUG", "1")
+    receivers = [IpcQueue(is_server=True, socket_type=zmq.PULL) for _ in range(lanes)]
+    senders = [
+        FusedIpcQueue(receiver.address, is_server=False, fuse_message=False, socket_type=zmq.PUSH)
+        for receiver in receivers
+    ]
+    entered, release = threading.Event(), threading.Event()
+    errors = queue.Queue()
+
+    def respond():
+        entered.set()
+        assert release.wait(3)
+        for sender in senders:
+            sender.put(["last-response"])
+        return False
+
+    thread = ManagedThread(respond, errors)
+    worker = SimpleNamespace(await_response_thread=thread)
+
+    def notify():
+        for sender in senders:
+            sender.put(None)
+
+    timer = None
+    try:
+        with _response_queue_lifetime(worker, notify):
+            if mode != "never_started":
+                thread.start()
+                assert entered.wait(3)
+                if mode == "finished":
+                    release.set()
+                    thread.join(3)
+                    assert not thread.is_alive()
+                else:
+                    # Exit while a response is still in flight: the terminal
+                    # notification must wait for that response's owner.
+                    timer = threading.Timer(0.05, release.set)
+                    timer.start()
+        assert errors.empty()
+        for receiver in receivers:
+            if mode != "never_started":
+                assert receiver.poll(3)
+                assert receiver.get() == ["last-response"]
+            assert receiver.poll(3)
+            assert receiver.get() == [None]
+            assert not receiver.poll(0.05)
+    finally:
+        release.set()
+        thread.stop()
+        if thread.ident is not None:
+            thread.join(3)
+        if timer is not None:
+            timer.join(3)
+        for sender in senders:
+            sender.queue.close()
+        for receiver in receivers:
+            receiver.close()
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize("dispatch_failed", [False, True])
+def test_response_notification_failure_preserves_dispatch_failure(dispatch_failed):
+    errors = queue.Queue()
+    thread = ManagedThread(lambda: False, errors)
+    worker = SimpleNamespace(await_response_thread=thread)
+
+    def notify():
+        raise RuntimeError("notification failed")
+
+    expected = ValueError if dispatch_failed else RuntimeError
+    with pytest.raises(
+        expected, match="dispatch failed" if dispatch_failed else "notification failed"
+    ):
+        with _response_queue_lifetime(worker, notify):
+            thread.start()
+            thread.join(3)
+            assert not thread.is_alive()
+            if dispatch_failed:
+                raise ValueError("dispatch failed")
 
 
 class TestClassicResponseBucketing:
@@ -231,7 +322,7 @@ class TestClassicFrontendProxyEndToEnd:
             result = proxy.submit(GenerationRequest([1, 2, 3], SamplingParams()))
             assert get_frontend_id(result.request_id) == 1
             assert worker_ingress.poll(5)
-            received = worker_ingress.get()
+            received = pickle.loads(worker_ingress.get()[0])
             assert isinstance(received, GenerationRequest)
             assert received.id == result.request_id
 
@@ -239,7 +330,7 @@ class TestClassicFrontendProxyEndToEnd:
             # must NOT emit the None engine-shutdown sentinel.
             proxy.shutdown()
             assert worker_ingress.poll(5)
-            cancel = worker_ingress.get()
+            cancel = pickle.loads(worker_ingress.get()[0])
             assert isinstance(cancel, CancellingRequest)
             assert cancel.id == result.request_id
             assert not worker_ingress.poll(1), (
@@ -253,7 +344,7 @@ class TestClassicFrontendProxyEndToEnd:
         from tensorrt_llm.sampling_params import SamplingParams
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            proxy, _, _, _ = self._make_proxy_and_fake_worker(tmpdir)
+            proxy, worker_ingress, _, _ = self._make_proxy_and_fake_worker(tmpdir)
 
             # Regression: this state lives in GenerationExecutorProxy.__init__,
             # which an attached frontend deliberately skips, so it must be
@@ -266,6 +357,11 @@ class TestClassicFrontendProxyEndToEnd:
             assert not proxy.check_health()
             with pytest.raises(EngineDeadError):
                 proxy.submit(GenerationRequest([1], SamplingParams()))
+            proxy.shutdown()
+            assert not worker_ingress.poll(1), (
+                "an attached frontend failure must never stop shared workers"
+            )
+            worker_ingress.close()
 
     def test_dispatch_routes_own_lane_responses(self):
         import zmq

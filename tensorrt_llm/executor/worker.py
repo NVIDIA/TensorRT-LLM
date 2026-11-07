@@ -20,9 +20,10 @@ import sys
 import threading
 import time
 import traceback
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import zmq
 
@@ -41,6 +42,7 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
+from .remote_worker_process_monitor import supervise_worker_process
 from .request import (CancellingRequest, GenerationRequest, StartProfileRequest,
                       StopProfileRequest)
 from .rpc_worker_mixin import RpcWorkerMixin
@@ -359,14 +361,20 @@ class GenerationExecutorWorker(RpcWorkerMixin, BaseWorker):
                 self.engine.wait_shutdown()
 
 
-def _incoming_requests(request_queue: IpcQueue):
+def _incoming_requests(request_queue: IpcQueue,
+                       poll_control: Optional[Callable[[], bool]] = None):
     """Yield the proxy's requests until its shutdown sentinel arrives.
 
     With TRTLLM_PROXY_BATCH_REQUESTS=1 the proxy sends a burst of requests as
     one list of pickled requests. ``request_queue.get()`` has already
     authenticated that message, and with it every payload inside.
     """
-    while (msg := request_queue.get()) is not None:
+    while True:
+        if poll_control is not None and poll_control():
+            if not request_queue.poll(timeout=0.05):
+                continue
+        if (msg := request_queue.get()) is None:
+            return
         if isinstance(msg, list):
             for payload in msg:
                 yield pickle.loads(payload)  # nosec B301
@@ -374,7 +382,142 @@ def _incoming_requests(request_queue: IpcQueue):
             yield msg
 
 
+def _dispatch_requests(worker: GenerationExecutorWorker,
+                       request_queue: IpcQueue) -> None:
+    """Keep command ingress live while serialized profiling control waits."""
+    profile_ack_queue = None
+    profile_ack_addr = None
+    pending = None
+    pending_request = None
+
+    def send_profile_ack(kind: str, err: Optional[str],
+                         req: StartProfileRequest | StopProfileRequest) -> None:
+        nonlocal profile_ack_queue, profile_ack_addr
+        addr = req.ack_addr
+        if addr is None:
+            return
+        if profile_ack_queue is None or addr != profile_ack_addr:
+            if profile_ack_queue is not None:
+                profile_ack_queue.close()
+            profile_ack_queue = IpcQueue(addr,
+                                         is_server=False,
+                                         name="worker_profile_ack_queue")
+            profile_ack_addr = addr
+        try:
+            profile_ack_queue.put((kind, err), timeout=1.0)
+        except zmq.Again:
+            logger.warning("Profile control acknowledgement timed out")
+
+    def run_profile(
+        req: StartProfileRequest | StopProfileRequest
+    ) -> tuple[str, Optional[str]]:
+        kind = "start" if isinstance(req, StartProfileRequest) else "stop"
+        try:
+            if kind == "start":
+                worker.start_profile(output_dir=req.output_dir,
+                                     num_steps=req.num_steps,
+                                     start_step=req.start_step,
+                                     activities=req.activities)
+            else:
+                # Trace export remains on the executor thread; this caller
+                # waits for its completion without blocking command ingress.
+                worker.stop_profile()
+        except RequestError as error:
+            return kind, str(error)
+        return kind, None
+
+    def poll_profile() -> bool:
+        nonlocal pending, pending_request
+        if pending is not None and pending.done():
+            completed, req = pending, pending_request
+            pending = pending_request = None
+            kind, error = completed.result()
+            send_profile_ack(kind, error, req)
+        return pending is not None
+
+    completed_normally = False
+    try:
+        # Threads start lazily. At most one profile operation is admitted;
+        # subsequent controls get a rejection rather than accumulating work.
+        with ThreadPoolExecutor(max_workers=1,
+                                thread_name_prefix="worker_profile_control"
+                                ) as profile_executor:
+            for req in _incoming_requests(request_queue, poll_profile):
+                if isinstance(req, CancellingRequest):
+                    worker.abort_request(req.id)
+                elif isinstance(req, (StartProfileRequest, StopProfileRequest)):
+                    if pending is not None:
+                        kind = "start" if isinstance(
+                            req, StartProfileRequest) else "stop"
+                        send_profile_ack(
+                            kind, "Profiling control is already in progress",
+                            req)
+                    else:
+                        pending_request = req
+                        pending = profile_executor.submit(run_profile, req)
+                elif isinstance(req, GenerationRequest):
+                    try:
+                        worker.submit(req)
+                    except RequestError as e:
+                        logger.error(f"submit request failed: {e}")
+                        logger.error(traceback.format_exc())
+                        worker._await_response_helper.temp_error_responses.put(
+                            ErrorResponse(req.id, e, req.id))
+                else:
+                    raise ValueError(f"Unknown request type: {type(req)}")
+
+            completed_normally = True
+    finally:
+        try:
+            # The executor has joined before engine teardown. A shutdown
+            # sentinel does not acknowledge an unfinished trace export.
+            if completed_normally:
+                poll_profile()
+        finally:
+            if profile_ack_queue is not None:
+                profile_ack_queue.close()
+
+
+@contextmanager
+def _response_queue_lifetime(worker: GenerationExecutorWorker,
+                             notify: Callable[[], None]) -> Iterator[None]:
+    """End classic IPC response queues on their producer's thread."""
+    thread = worker.await_response_thread
+    previous_context = thread.context
+    errors: list[Exception] = []
+
+    def notify_safely() -> None:
+        try:
+            notify()
+        except Exception as error:
+            errors.append(error)
+
+    @contextmanager
+    def response_owner() -> Iterator[None]:
+        try:
+            with previous_context:
+                yield
+        finally:
+            notify_safely()
+
+    thread.context = response_owner()
+    try:
+        yield
+    finally:
+        if thread.ident is None:
+            notify_safely()
+        else:
+            thread.stop()
+            thread.join()
+        thread.context = previous_context
+        if errors:
+            if sys.exc_info()[0] is None:
+                raise errors[0]
+            logger.error(f"Failed to end IPC response queues: {errors[0]!r}")
+
+
 @print_traceback_on_error
+@supervise_worker_process
 def worker_main(
     worker_queues: WorkerCommIpcAddrs,
     log_level: str,
@@ -480,23 +623,6 @@ def worker_main(
             is_server=False,
             name="worker_resource_governor_queue"
         ) if worker_queues.resource_governor_queue_addr else None
-        # Synchronous ack channel back to the proxy for control requests
-        # (start_profile / stop_profile). Connected on first use rather
-        # than at startup: the proxy only binds its end when profiling is
-        # actually requested, and it passes the address on the request,
-        # so a deployment that never profiles never creates this socket.
-        profile_ack_queue = None
-
-        def send_profile_ack(kind: str, err, req) -> None:
-            nonlocal profile_ack_queue
-            addr = getattr(req, "ack_addr", None)
-            if addr is None:
-                return
-            if profile_ack_queue is None:
-                profile_ack_queue = IpcQueue(addr,
-                                             is_server=False,
-                                             name="worker_profile_ack_queue")
-            profile_ack_queue.put((kind, err))
 
         if postproc_worker_config.enabled:
             # IPC queues for sending inputs to the postprocess parallel
@@ -625,7 +751,9 @@ def worker_main(
             import torch._dynamo.config
             torch._dynamo.config.run_gc_after_compile = False
 
-    with worker:
+    response_queues = (_response_queue_lifetime(
+        worker, notify_proxy_threads_to_quit) if is_leader else nullcontext())
+    with worker, response_queues:
         try:
             worker.block_subordinates()
 
@@ -650,60 +778,13 @@ def worker_main(
                     worker.engine.set_resource_governor_queue(
                         resource_governor_queue)
 
-                for req in _incoming_requests(request_queue):
-                    if isinstance(req, CancellingRequest):
-                        worker.abort_request(req.id)
-                    elif isinstance(req, StartProfileRequest):
-                        # ``PyExecutor.start_profile`` raises
-                        # ``RequestError`` on the double-start path.
-                        # Capture it and propagate back to the proxy via
-                        # ``profile_ack_queue`` so the HTTP /start_profile
-                        # handler can return 409 in the IPC-proxy
-                        # deployment too.
-                        ack_err: Optional[str] = None
-                        try:
-                            worker.start_profile(output_dir=req.output_dir,
-                                                 num_steps=req.num_steps,
-                                                 start_step=req.start_step,
-                                                 activities=req.activities)
-                        except RequestError as e:
-                            logger.warning(f"start_profile rejected: {e}")
-                            ack_err = str(e)
-                        send_profile_ack("start", ack_err, req)
-                    elif isinstance(req, StopProfileRequest):
-                        # ``worker.stop_profile`` blocks until
-                        # ``PyExecutor.stop_profile`` has actually fired
-                        # the in-loop stop and exported the chrome trace
-                        # (or its 30s timeout elapsed). Acking only after
-                        # that return is what gives the proxy its
-                        # synchronous "trace is on disk" guarantee.
-                        ack_err = None
-                        try:
-                            worker.stop_profile()
-                        except RequestError as e:
-                            logger.warning(f"stop_profile rejected: {e}")
-                            ack_err = str(e)
-                        send_profile_ack("stop", ack_err, req)
-                    elif isinstance(req, GenerationRequest):
-                        try:
-                            worker.submit(req)
-                        except RequestError as e:
-                            logger.error(f"submit request failed: {e}")
-                            logger.error(traceback.format_exc())
-                            worker._await_response_helper.temp_error_responses.put(
-                                ErrorResponse(req.id, e, req.id))
-                    else:
-                        raise ValueError(f"Unknown request type: {type(req)}")
-
-                notify_proxy_threads_to_quit()
+                _dispatch_requests(worker, request_queue)
 
         except GenerationExecutorWorker.WorkerExit as e:
             # This will capture by the with-statement and exit normally.
             raise e
 
         except Exception as e:  # other critical errors
-            if is_leader:
-                notify_proxy_threads_to_quit()
             logger.error(traceback.format_exc())
             # This will be captured by mpi4py and handled by future.done_callback
             raise e

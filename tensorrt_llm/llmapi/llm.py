@@ -49,7 +49,8 @@ from ..executor.postproc_worker import PostprocParams
 from ..executor.postprocessor_hook import (PostProcessorHook,
                                            load_post_processor_hook)
 from ..executor.request import DEFAULT_REQUEST_PRIORITY
-from ..executor.utils import (RequestError, create_mpi_comm_session,
+from ..executor.utils import (EngineUnavailableError, RequestError,
+                              create_mpi_comm_session,
                               get_spawn_proxy_process_env)
 from ..inputs import (PromptInputs, TokensPrompt, create_input_processor,
                       create_input_processor_with_hash,
@@ -863,7 +864,7 @@ class BaseLLM:
 
         # Check if the worker is shutting down
         if self._executor is None or self._executor.is_shutdown():
-            raise RuntimeError("LLM is shutting down")
+            raise EngineUnavailableError("LLM is shutting down")
 
         sampling_params = self._prepare_sampling_params(sampling_params)
 

@@ -16,6 +16,7 @@
 
 import asyncio
 import os
+import queue
 import signal
 import subprocess
 import sys
@@ -33,6 +34,7 @@ from fastapi.testclient import TestClient
 from starlette.routing import Match
 
 from tensorrt_llm._utils import AdjustedSteadyClock
+from tensorrt_llm.executor.proxy import GenerationExecutorProxy
 from tensorrt_llm.llmapi.disagg_utils import ServerRole
 from tensorrt_llm.serve import _frontend_processes, openai_server
 from tensorrt_llm.serve._frontend_processes import _watch_attached_frontends
@@ -50,9 +52,10 @@ pytestmark = pytest.mark.cpu_only
 class _FakeLauncher:
     """aiohttp app on a Unix socket standing in for the launcher's uvicorn."""
 
-    def __init__(self, path: str, health_status: int = 200) -> None:
+    def __init__(self, path: str, health_status: int = 200, health_handler=None) -> None:
         self.path = path
         self.health_status = health_status
+        self.health_handler = health_handler
         self.health_hits = 0
         self.seen = []
         self._loop = asyncio.new_event_loop()
@@ -74,6 +77,11 @@ class _FakeLauncher:
 
         async def health(_: web.Request) -> web.Response:
             self.health_hits += 1
+            if self.health_handler is not None:
+                response = await self.health_handler()
+                return web.Response(
+                    status=response.status_code, body=response.body, headers=response.headers
+                )
             return web.Response(status=self.health_status)
 
         app = web.Application()
@@ -164,7 +172,10 @@ async def _wait_for(predicate, timeout: float = 10.0) -> None:
         await asyncio.sleep(0.01)
 
 
-def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_path) -> None:
+@pytest.mark.parametrize("initial_status", [200, 503])
+def test_watchdog_counts_health_failures_only_after_the_launcher_answered(
+    tmp_path, initial_status
+) -> None:
     path = str(tmp_path / "launcher.sock")
     deaths = []
 
@@ -184,12 +195,11 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_pa
             # The launcher starts listening after its attached frontends: ~25
             # failed probes against a socket nobody serves yet are not fatal.
             await asyncio.sleep(0.5)
-            launcher = await asyncio.to_thread(_FakeLauncher, path, 503)
-            await _wait_for(lambda: launcher.health_hits >= 3)
             assert not deaths and not task.done()
-            launcher.health_status = 200
-            await _wait_for(lambda: launcher.health_hits >= 4)
-            launcher.health_status = 503
+            launcher = await asyncio.to_thread(_FakeLauncher, path, initial_status)
+            if initial_status == 200:
+                await _wait_for(lambda: launcher.health_hits >= 3)
+                launcher.health_status = 503
             await asyncio.wait_for(task, timeout=10)
         finally:
             task.cancel()
@@ -200,6 +210,60 @@ def test_watchdog_counts_health_failures_only_after_the_launcher_answered(tmp_pa
 
     asyncio.run(run())
     assert len(deaths) == 1 and "failed 2 consecutive" in str(deaths[0])
+
+
+@pytest.mark.parametrize("failure", ["engine", "batcher"])
+def test_watchdog_uses_launcher_health_without_transport_grace(tmp_path, monkeypatch, failure):
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy.doing_shutdown = False
+    proxy._fatal_error = None
+    proxy._engine_dead = False
+    proxy._results = {}
+    proxy._error_queue = queue.Queue()
+    proxy._check_mpi_workers = lambda: False
+    proxy._request_sender = SimpleNamespace(
+        available=True, fail=lambda _: None, close=lambda **_: None
+    )
+    server = object.__new__(OpenAIServer)
+    server.embedding_batcher = None
+    server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
+    monkeypatch.setattr(openai_server, "_record_generator_termination", lambda _: None)
+    monkeypatch.setattr(signal, "raise_signal", lambda _: None)
+    deaths = []
+
+    async def run():
+        launcher = await asyncio.to_thread(
+            _FakeLauncher, str(tmp_path / "launcher.sock"), 200, server.health
+        )
+        forwarder = LauncherForwarder(launcher.path)
+        watchdog = AttachedFrontendWatchdog(
+            forwarder,
+            os.getppid(),
+            deaths.append,
+            ppid_interval_s=0.01,
+            health_interval_s=0.04,
+            health_failures=3,
+        )
+        task = asyncio.create_task(watchdog.run())
+        try:
+            await _wait_for(lambda: launcher.health_hits >= 4)
+            assert (await server.health()).status_code == 200
+            assert not deaths
+            if failure == "engine":
+                proxy._handle_worker_death(RuntimeError("command connection lost"))
+            else:
+                server.embedding_batcher = SimpleNamespace(is_alive=lambda: False)
+            assert (await server.health()).status_code == 503
+            await asyncio.wait_for(task, timeout=10)
+            assert len(deaths) == 1
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await forwarder.close()
+            await asyncio.to_thread(launcher.close)
+
+    asyncio.run(run())
 
 
 def test_watchdog_notices_a_gone_launcher_process(tmp_path) -> None:
@@ -242,11 +306,16 @@ def test_launcher_logs_an_attached_frontend_that_dies(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("doing_shutdown", [False, True])
-def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown: bool) -> None:
+@pytest.mark.parametrize("server_exiting", [False, True])
+def test_on_launcher_lost_fails_fast_then_shuts_down(
+    monkeypatch, doing_shutdown, server_exiting
+) -> None:
     fatal_errors = []
     executor = SimpleNamespace(doing_shutdown=doing_shutdown, _set_fatal_error=fatal_errors.append)
     server = object.__new__(OpenAIServer)
     server.generator = SimpleNamespace(_executor=executor)
+    server._uvicorn_server = SimpleNamespace(should_exit=server_exiting)
+    server._http_shutdown_requested = False
     signals, terminations = [], []
     monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
     monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
@@ -255,9 +324,35 @@ def test_on_launcher_lost_fails_fast_then_shuts_down(monkeypatch, doing_shutdown
     server._on_launcher_lost(error)
 
     assert fatal_errors == [error]
-    # A shutdown already under way gets no second SIGINT (which would force-quit it).
-    assert signals == ([] if doing_shutdown else [signal.SIGINT])
-    assert terminations == ([] if doing_shutdown else [server.generator])
+    # Only HTTP shutdown prevents another signal; executor cleanup is separate.
+    assert signals == ([] if server_exiting else [signal.SIGINT])
+    assert terminations == ([] if server_exiting else [server.generator])
+
+
+@pytest.mark.parametrize("server_exiting", [False, True])
+def test_fatal_health_requests_http_shutdown_after_executor_cleanup(
+    monkeypatch, server_exiting
+) -> None:
+    proxy = object.__new__(GenerationExecutorProxy)
+    proxy.workers_started = False
+    proxy.doing_shutdown = True
+    proxy._fatal_error = RuntimeError("worker died")
+    server = object.__new__(OpenAIServer)
+    server.generator = SimpleNamespace(_executor=proxy, _check_health=proxy.check_health)
+    server.embedding_batcher = None
+    server._uvicorn_server = SimpleNamespace(should_exit=server_exiting)
+    server._http_shutdown_requested = False
+    signals, terminations = [], []
+    monkeypatch.setattr(openai_server.signal, "raise_signal", signals.append)
+    monkeypatch.setattr(openai_server, "_record_generator_termination", terminations.append)
+
+    async def probe() -> None:
+        assert (await server.health()).status_code == 503
+        assert (await server.health()).status_code == 503
+
+    asyncio.run(probe())
+    assert signals == ([] if server_exiting else [signal.SIGINT])
+    assert terminations == ([] if server_exiting else [server.generator])
 
 
 def test_shared_clock_offset_publish_and_poll(tmp_path) -> None:

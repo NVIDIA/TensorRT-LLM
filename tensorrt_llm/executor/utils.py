@@ -135,6 +135,10 @@ class RequestError(RuntimeError):
     ''' The error raised when the request is failed. '''
 
 
+class EngineUnavailableError(RequestError):
+    """Retryable admission rejection while command delivery is unavailable."""
+
+
 # Machine-readable error code the OpenAI-compatible server attaches to
 # over-length-prompt rejections (mirrors OpenAI's "context_length_exceeded").
 CONTEXT_LENGTH_EXCEEDED_CODE = "context_length_exceeded"
