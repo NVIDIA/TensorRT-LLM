@@ -6,6 +6,8 @@ from __future__ import annotations
 import types
 from unittest.mock import Mock
 
+import pytest
+
 from tensorrt_llm._torch.disaggregation.orchestration.coordinator import NoopDisaggCoordinator
 from tensorrt_llm._torch.pyexecutor.py_executor import _UNBOUNDED_PAUSE_MAX_INPUT_LEN, PyExecutor
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
@@ -116,3 +118,36 @@ def test_terminal_request_does_not_recompute_after_pp_consensus() -> None:
     assert request.py_request_id not in executor._pending_recompute_pause_ids
     assert request.py_request_id not in executor.inflight_req_ids
     assert request.py_request_id not in executor.result_wait_queues
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("pause_pending", [False, True])
+def test_idle_pp_iteration_flushes_and_advances_termination_once(pause_pending: bool) -> None:
+    """With no executed batch, buffered responses are flushed and the PP
+    termination handler advances exactly once, whether or not a recompute pause
+    is pending; an iteration that executed a batch leaves both to it."""
+    handler = Mock()
+    executor = _make_executor(handler)
+    executor._flush_pending_transfer_responses = Mock()
+    if pause_pending:
+        executor._pending_recompute_pause_ids.add(7)
+
+    executor._progress_idle_pp_iteration(1)
+
+    executor._flush_pending_transfer_responses.assert_not_called()
+    handler.terminate_pending_requests.assert_not_called()
+
+    executor._progress_idle_pp_iteration(0)
+
+    executor._flush_pending_transfer_responses.assert_called_once_with()
+    handler.terminate_pending_requests.assert_called_once_with()
+
+
+@pytest.mark.cpu_only
+def test_idle_pp_iteration_without_termination_handler_only_flushes() -> None:
+    executor = _make_executor(None)
+    executor._flush_pending_transfer_responses = Mock()
+
+    executor._progress_idle_pp_iteration(0)
+
+    executor._flush_pending_transfer_responses.assert_called_once_with()

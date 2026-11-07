@@ -1100,8 +1100,10 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
             print(f"Got data_transceiver_state: {len(state)} bytes", flush=True)
 
             # generation_only on worker 1 using state from worker 0.
-            # max_tokens=1 ensures only one decode step runs, so the test
-            # relies on the KV cache transfer delivering all prompt tokens.
+            # max_tokens=2 makes exactly one decode step run on the transferred
+            # KV, so the test relies on the transfer delivering all prompt
+            # tokens; with max_tokens=1 the first token alone ends the request
+            # and no decode step reads the KV.
             print("Sending generation_only to worker 1", flush=True)
             DISAGG_REQ_ID = 42
             disagg_params = DisaggregatedParams(
@@ -1110,7 +1112,7 @@ def test_arbitrary_kv_cache_transfer(model, generation_overlap):
                 first_gen_tokens=[0],
                 disagg_request_id=DISAGG_REQ_ID,
             )
-            requests = [(prompt, SamplingParams(max_tokens=1, ignore_eos=True),
+            requests = [(prompt, SamplingParams(max_tokens=2, ignore_eos=True),
                          disagg_params)]
             responses = send_requests_to_worker(requests, 1, intercomm)
             assert len(responses) == 1
