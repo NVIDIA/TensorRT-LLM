@@ -308,14 +308,16 @@ class OpenAIHttpClient(OpenAIClient):
         if not conversation_id:
             return server
         num_frontends, stride = self._frontend_affinity
-        host, _, port = server.rpartition(":")
+        host, _, port = server.rstrip("/").rpartition(":")
         frontend = zlib.crc32(conversation_id.encode()) % num_frontends
         affinity_server = f"{host}:{int(port) + stride * (frontend + 1)}"
-        refused_at = self._refused_affinity_ports.get(affinity_server)
+        # _post_with_retry records a refused port by the netloc of its URL.
+        refused_key = urlsplit(_server_base_url(affinity_server)).netloc
+        refused_at = self._refused_affinity_ports.get(refused_key)
         if refused_at is not None:
             if get_steady_clock_now_in_seconds() - refused_at < _REFUSED_AFFINITY_PORT_BYPASS_SECS:
                 return server
-            del self._refused_affinity_ports[affinity_server]
+            del self._refused_affinity_ports[refused_key]
         return affinity_server
 
     def _get_request_headers(self, request: UCompletionRequest) -> dict[str, str]:

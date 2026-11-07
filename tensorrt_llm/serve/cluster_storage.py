@@ -3,6 +3,7 @@ import asyncio
 import importlib.metadata as importlib_metadata
 import importlib.util
 import ipaddress
+import json
 import sys
 import time
 from dataclasses import dataclass
@@ -12,11 +13,13 @@ from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 import aiohttp
+import grpc
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.serve.record_signing import sign_record, signature_matches
 
 
 def is_loopback_host(host: Optional[str]) -> bool:
@@ -528,10 +531,12 @@ class Etcd3WatchEventQueue(WatchEventQueue):
 
     def __init__(self,
                  key_prefix: str,
-                 cancel_event: Callable[[], None] = None):
+                 cancel_event: Callable[[], None] = None,
+                 verify: Optional[Callable[[str, str], Optional[str]]] = None):
         self.key_prefix = key_prefix
         self.events = asyncio.Queue()
         self._cancel_event = cancel_event
+        self._verify = verify
 
     def cancel_event(self):
         if self._cancel_event:
@@ -548,11 +553,15 @@ class Etcd3WatchEventQueue(WatchEventQueue):
             for event in watch_resp.events:
                 # Event type is not in public interface of etcd3
                 event_type = WatchEventType.SET if "Put" in event.__class__.__name__ else WatchEventType.DELETE
+                key = event.key.decode("utf-8")
+                value = event.value.decode("utf-8")
+                if self._verify is not None and event_type == WatchEventType.SET:
+                    value = self._verify(key, value)
+                    if value is None:
+                        continue
                 self.events.put_nowait(
                     WatchEvent(
-                        storage_item=StorageItem(
-                            key=event.key.decode("utf-8"),
-                            value=event.value.decode("utf-8")),
+                        storage_item=StorageItem(key=key, value=value),
                         event_type=event_type,
                     ))
             if self.events._loop:
@@ -560,6 +569,11 @@ class Etcd3WatchEventQueue(WatchEventQueue):
         except Exception as e:
             logger.error(f"Error adding event: {e}")
             self.cancel_event()
+
+
+def _is_unauthenticated(error: grpc.RpcError) -> bool:
+    code = getattr(error, "code", None)
+    return callable(code) and code() == grpc.StatusCode.UNAUTHENTICATED
 
 
 def handle_etcd_error(return_on_error: bool | None):
@@ -577,6 +591,13 @@ def handle_etcd_error(return_on_error: bool | None):
                 logger.error(f"Etcd client value error in {f.__name__}")
                 storage.reconnect()
                 return return_on_error
+            except grpc.RpcError as e:
+                if not _is_unauthenticated(e):
+                    raise
+                logger.error(
+                    f"Etcd3 rejected the authentication token in {f.__name__}")
+                storage.reconnect()
+                return return_on_error
 
         return wrap
 
@@ -586,24 +607,48 @@ def handle_etcd_error(return_on_error: bool | None):
 class Etcd3ClusterStorage(ClusterStorage):
 
     @staticmethod
-    def _connect(cluster_uri: str) -> etcd3.MultiEndpointEtcd3Client:
+    def _connect(
+            cluster_uri: str,
+            user: Optional[str] = None,
+            password: Optional[str] = None,
+            ca_cert: Optional[str] = None,
+            cert_key: Optional[str] = None,
+            cert_cert: Optional[str] = None) -> etcd3.MultiEndpointEtcd3Client:
         logger.info(f"Connecting to {cluster_uri}")
+        credentials = None if ca_cert is None else etcd3.Etcd3Client.get_secure_creds(
+            ca_cert, cert_key, cert_cert)
         endpoints = []
         for url in cluster_uri.split(","):
             parsed_url = urlparse(url)
             endpoints.append(
                 etcd3.Endpoint(parsed_url.hostname,
                                parsed_url.port,
-                               secure=False))
-        return etcd3.MultiEndpointEtcd3Client(endpoints, timeout=10)
+                               secure=credentials is not None,
+                               creds=credentials))
+        return etcd3.MultiEndpointEtcd3Client(endpoints,
+                                              timeout=10,
+                                              user=user,
+                                              password=password)
 
     def __init__(self,
                  cluster_uri: str,
                  cluster_name: str,
                  one_single_lease: bool = False,
+                 user: Optional[str] = None,
+                 password: Optional[str] = None,
+                 ca_cert: Optional[str] = None,
+                 cert_key: Optional[str] = None,
+                 cert_cert: Optional[str] = None,
+                 record_auth_key: Optional[str] = None,
                  **kwargs):
         self._cluster_uri = cluster_uri
-        self._client = self._connect(self._cluster_uri)
+        self._client_options = dict(user=user,
+                                    password=password,
+                                    ca_cert=ca_cert,
+                                    cert_key=cert_key,
+                                    cert_cert=cert_cert)
+        self._record_auth_key = record_auth_key
+        self._client = self._connect(self._cluster_uri, **self._client_options)
         self._leases = {}
         self._instance_lease = None
         self._watch_handles = {}
@@ -627,7 +672,36 @@ class Etcd3ClusterStorage(ClusterStorage):
         return self._client
 
     def reconnect(self):
-        self._client = self._connect(self._cluster_uri)
+        self._client = self._connect(self._cluster_uri, **self._client_options)
+
+    def _sign(self, key: str, value: str) -> str:
+        """The record to store: with record_auth_key, the value and its signature as JSON."""
+        if self._record_auth_key is None:
+            return value
+        return json.dumps({
+            "value":
+            value,
+            "signature":
+            sign_record(self._record_auth_key, key, value)
+        })
+
+    def _verify(self, key: str, stored: Optional[str]) -> Optional[str]:
+        """The value of a stored record, or None if it has no valid signature."""
+        if self._record_auth_key is None or stored is None:
+            return stored
+        try:
+            record = json.loads(stored)
+        except (ValueError, RecursionError):
+            record = None
+        if (not isinstance(record, dict)
+                or not isinstance(record.get("value"), str)
+                or not signature_matches(self._record_auth_key,
+                                         key, record["value"],
+                                         record.get("signature"))):
+            logger.warning(
+                f"Ignoring cluster record {key} without a valid signature")
+            return None
+        return record["value"]
 
     async def start(self):
         # nothing to do
@@ -644,6 +718,7 @@ class Etcd3ClusterStorage(ClusterStorage):
                   overwrite_if_exists: bool = False,
                   ttl: int = -1) -> bool:
         lease = self._get_lease(key, ttl)
+        value = self._sign(key, value)
         if not overwrite_if_exists:
             return self.client.put_if_not_exists(key, value, lease=lease)
         else:
@@ -653,7 +728,7 @@ class Etcd3ClusterStorage(ClusterStorage):
     @handle_etcd_error(return_on_error=None)
     async def get(self, key: str) -> str:
         data, meta = self.client.get(key)
-        return data.decode('utf-8') if data else None
+        return self._verify(key, data.decode('utf-8')) if data else None
 
     @handle_etcd_error(return_on_error=False)
     async def delete(self, key: str) -> bool:
@@ -674,17 +749,20 @@ class Etcd3ClusterStorage(ClusterStorage):
     async def get_prefix(self,
                          key_prefix: str,
                          keys_only: bool = False) -> Dict[str, str]:
-        resp = self.client.get_prefix(key_prefix)
-        return {
-            metadata.key.decode("utf-8"): "" if keys_only else v.decode("utf-8")
-            for v, metadata in resp
-        }
+        records = {}
+        for v, metadata in self.client.get_prefix(key_prefix):
+            key = metadata.key.decode("utf-8")
+            value = self._verify(key, v.decode("utf-8"))
+            if value is not None:
+                records[key] = "" if keys_only else value
+        return records
 
     @handle_etcd_error(return_on_error=None)
     async def watch(self, key_prefix: str) -> WatchEventQueue:
         if key_prefix in self._watch_handles:
             return self._watch_handles[key_prefix]
-        watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix)
+        watch_handle = Etcd3WatchEventQueue(key_prefix=key_prefix,
+                                            verify=self._verify)
         watch_id = self.client.add_watch_prefix_callback(
             key_prefix, watch_handle.add_events_from_resp)
         watch_handle.set_cancel_event(

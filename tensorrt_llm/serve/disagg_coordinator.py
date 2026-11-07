@@ -169,7 +169,9 @@ class DisaggCoordinatorService(DisaggCoordinator):
         # in-process HTTP server, its routes are mounted on the coordinator app.
         self._cluster_storage: Optional[ClusterStorage] = (
             create_cluster_storage(
-                config.disagg_cluster_config.cluster_uri, config.disagg_cluster_config.cluster_name
+                config.disagg_cluster_config.cluster_uri,
+                config.disagg_cluster_config.cluster_name,
+                **config.disagg_cluster_config.etcd_client_options(),
             )
             if config.disagg_cluster_config
             else None

@@ -2097,6 +2097,42 @@
             {
               "additionalProperties": false,
               "properties": {
+                "ca_cert": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Ca Cert"
+                },
+                "cert_cert": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Cert Cert"
+                },
+                "cert_key": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Cert Key"
+                },
                 "cluster_name": {
                   "default": "",
                   "title": "Cluster Name",
@@ -2126,6 +2162,42 @@
                     }
                   ],
                   "default": null
+                },
+                "password": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Password"
+                },
+                "record_auth_key": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "Record Auth Key"
+                },
+                "user": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "title": "User"
                 }
               },
               "required": [
@@ -8911,6 +8983,42 @@
         {
           "additionalProperties": false,
           "properties": {
+            "ca_cert": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Ca Cert"
+            },
+            "cert_cert": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cert Cert"
+            },
+            "cert_key": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Cert Key"
+            },
             "cluster_name": {
               "default": "",
               "title": "Cluster Name",
@@ -8940,6 +9048,42 @@
                 }
               ],
               "default": null
+            },
+            "password": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Password"
+            },
+            "record_auth_key": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Record Auth Key"
+            },
+            "user": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "User"
             }
           },
           "required": [

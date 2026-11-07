@@ -50,13 +50,36 @@ def validate_config_non_negative_int(value: Any, field_name: str) -> int:
     return value
 
 
-def validate_internal_request_auth_key(value: object) -> str | None:
-    """Validate the serving auth key without including its value in errors."""
+def _validate_auth_key(value: object, field_name: str) -> str | None:
+    """Validate an auth key without including its value in errors."""
     try:
         return _AUTH_KEY_ADAPTER.validate_python(value)
     except ValidationError:
+        raise ValueError(f"{field_name} must be a non-empty string") from None
+
+
+def validate_internal_request_auth_key(value: object) -> str | None:
+    """Validate the serving auth key without including its value in errors."""
+    return _validate_auth_key(value, "internal_request_auth_key")
+
+
+def validate_etcd_client_options(subject: str, user: Optional[str],
+                                 password: Optional[str],
+                                 ca_cert: Optional[str],
+                                 cert_key: Optional[str],
+                                 cert_cert: Optional[str]) -> None:
+    """Check the combinations of etcd credentials and TLS files."""
+    if (user is None) != (password is None):
+        raise ValueError(f"{subject} user and password must be set together")
+    if user is not None and ca_cert is None:
         raise ValueError(
-            "internal_request_auth_key must be a non-empty string") from None
+            f"{subject} user and password require ca_cert: the etcd client "
+            "sends its authentication token only over a TLS connection")
+    if (cert_key is None) != (cert_cert is None):
+        raise ValueError(
+            f"{subject} cert_key and cert_cert must be set together")
+    if cert_key is not None and ca_cert is None:
+        raise ValueError(f"{subject} cert_key and cert_cert require ca_cert")
 
 
 def _extract_internal_request_auth_key(
@@ -130,6 +153,10 @@ class MinimalInstances:
     generation_servers: int = 1  # the minimal number of generation servers
 
 
+_ETCD_OPTION_NAMES = ("user", "password", "ca_cert", "cert_key", "cert_cert",
+                      "record_auth_key")
+
+
 @dataclass
 class DisaggClusterConfig:
     cluster_uri: str  # the uri of the cluster storage
@@ -137,6 +164,37 @@ class DisaggClusterConfig:
     minimal_instances: Optional[MinimalInstances] = None
     heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
     inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
+    # Optional etcd client credentials and TLS files, for an `etcd://` cluster_uri.
+    user: Optional[str] = None
+    password: Optional[str] = field(default=None, repr=False)
+    ca_cert: Optional[str] = None
+    cert_key: Optional[str] = None
+    cert_cert: Optional[str] = None
+    # Shared secret used to sign and verify the records in the cluster storage.
+    # When set, records without a valid signature are ignored by readers.
+    record_auth_key: Optional[str] = field(default=None, repr=False)
+
+    def __post_init__(self):
+        self.validate_etcd_options()
+
+    def etcd_client_options(self) -> Dict[str, str]:
+        """The etcd options that are set, as keyword arguments for the storage."""
+        return {
+            name: getattr(self, name)
+            for name in _ETCD_OPTION_NAMES if getattr(self, name) is not None
+        }
+
+    def validate_etcd_options(self) -> None:
+        self.record_auth_key = _validate_auth_key(
+            self.record_auth_key, "disagg_cluster record_auth_key")
+        validate_etcd_client_options("disagg_cluster", self.user, self.password,
+                                     self.ca_cert, self.cert_key,
+                                     self.cert_cert)
+        options = self.etcd_client_options()
+        if options and not self.cluster_uri.startswith("etcd://"):
+            raise ValueError(
+                "disagg_cluster user, password, ca_cert, cert_key, cert_cert "
+                "and record_auth_key require an etcd:// cluster_uri")
 
 
 @dataclass
@@ -240,20 +298,9 @@ class MetadataServerConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_credentials(self) -> "MetadataServerConfig":
-        if (self.user is None) != (self.password is None):
-            raise ValueError(
-                "metadata server user and password must be set together")
-        if self.user is not None and self.ca_cert is None:
-            raise ValueError(
-                "metadata server user and password require ca_cert: the etcd "
-                "client sends its authentication token only over a TLS "
-                "connection")
-        if (self.cert_key is None) != (self.cert_cert is None):
-            raise ValueError(
-                "metadata server cert_key and cert_cert must be set together")
-        if self.cert_key is not None and self.ca_cert is None:
-            raise ValueError(
-                "metadata server cert_key and cert_cert require ca_cert")
+        validate_etcd_client_options("metadata server", self.user,
+                                     self.password, self.ca_cert, self.cert_key,
+                                     self.cert_cert)
         return self
 
 
@@ -597,6 +644,7 @@ def extract_disagg_cluster_config(
         DisaggClusterConfig(cluster_uri or cluster_config_dict["cluster_uri"]),
         cluster_config_dict,
     )
+    cluster_config.validate_etcd_options()
     return cluster_config
 
 
