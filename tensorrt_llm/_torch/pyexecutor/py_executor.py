@@ -2454,16 +2454,20 @@ class PyExecutor:
             self._mpi_progress_thread = None
             self._mpi_progress_thread_exit_hook = None
 
-    def release_resources(self) -> None:
+    def release_resources(self, *, startup_profiling: bool = False) -> None:
         """Stop a profiling phase and detach resources before cache replacement.
 
         Call collectively after consuming profiling responses. Graph destruction
-        precedes workspace release, and transfer registrations precede cache
+        precedes workspace release, and registrations normally precede cache
         release. Model engines, weights and the execution stream remain valid.
+
+        ``startup_profiling`` is only for the unpublished initial sizing phase,
+        whose dummy requests do not transfer KV cache.
         """
         if self._closed or self._resources_released:
             raise RuntimeError("Executor resources are already released")
-        if not self._release_execution_resources():
+        if not self._release_execution_resources(
+                startup_profiling=startup_profiling):
             raise RuntimeError(
                 "Cannot release resources after an executor hang")
         self.resource_manager = None
@@ -2529,8 +2533,8 @@ class PyExecutor:
 
     def _release_execution_resources(self,
                                      *,
-                                     release_model_owned_graphs: bool = False
-                                     ) -> bool:
+                                     release_model_owned_graphs: bool = False,
+                                     startup_profiling: bool = False) -> bool:
         """Stop execution and release GPU resources; retain model ownership."""
         if getattr(self, "_shutdown_runtime_complete", False):
             return self._release_execution_pools()
@@ -2622,12 +2626,16 @@ class PyExecutor:
         # resource managers start freeing GPU-backed workspaces.
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        if self.kv_cache_transceiver is not None:
+        if not startup_profiling and self.kv_cache_transceiver is not None:
             self.kv_cache_transceiver.shutdown()
         if self.resource_manager is not None:
             for manager in self.resource_manager.resource_managers.values():
                 if manager:
                     manager.shutdown()
+        if startup_profiling and self.kv_cache_transceiver is not None:
+            # This unpublished phase has no KV transfers. Keep NIXL alive until
+            # the temporary pools are released so their VMM memory is reclaimed.
+            self.kv_cache_transceiver.shutdown()
         # Retry a later failure without repeating request publication, graph
         # release, or resource-manager shutdown.
         self._shutdown_runtime_complete = True

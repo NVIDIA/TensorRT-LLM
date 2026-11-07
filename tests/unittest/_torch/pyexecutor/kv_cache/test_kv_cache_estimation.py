@@ -2326,7 +2326,7 @@ def test_profiling_failure_releases_resources_and_restores_response_state():
     ):
         creator.configure_kv_cache_capacity(executor)
 
-    executor.release_resources.assert_called_once_with()
+    executor.release_resources.assert_called_once_with(startup_profiling=True)
     executor.shutdown.assert_not_called()
     executor.warmup_scope.assert_called_once_with()
     warmup_scope.__enter__.assert_called_once()

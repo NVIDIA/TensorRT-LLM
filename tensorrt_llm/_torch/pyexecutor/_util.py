@@ -1985,7 +1985,7 @@ class KvCacheCreator:
                     kv_stats_draft.allocated_bytes
                     if kv_stats_draft is not None else 0)
                 warmup.close()
-                py_executor.release_resources()
+                py_executor.release_resources(startup_profiling=True)
                 py_executor.enable_iter_perf_stats = origin_iter_stats
                 py_executor.set_gather_responses(False)
 
