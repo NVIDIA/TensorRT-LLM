@@ -568,3 +568,7 @@ A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` f
 * `UCX_NET_DEVICES`: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.
 
 * `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy` on GB200 for better performance. The default value is `auto`.
+
+## Experimental completed-prefix retention
+
+See [native retained-prefix reuse](retained-prefix-reuse.md) for the opt-in Python/NIXL contract and current validation limits.

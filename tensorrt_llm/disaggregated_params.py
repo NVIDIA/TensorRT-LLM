@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from tensorrt_llm.bindings import executor as tllme
+from tensorrt_llm.retained_prefix import RetainedPrefixParams, parse_retained_prefix
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -57,6 +58,8 @@ class DisaggregatedParams:
     """
 
     request_type: Optional[str] = None
+    retain_prefix: bool = False
+    retained_prefix: Optional[RetainedPrefixParams] = None
     # P-D Disaggregated Params
     first_gen_tokens: Optional[List[int]] = None
     first_gen_log_probs: Optional[List] = None
@@ -115,6 +118,10 @@ class DisaggregatedParams:
             )
 
     def __post_init__(self):
+        if type(self.retain_prefix) is not bool:
+            raise ValueError("retain_prefix must be a bool")
+        if self.retained_prefix is not None:
+            self.retained_prefix = parse_retained_prefix(self.retained_prefix)
         if (self.multimodal_positions is None) != (self.multimodal_lengths is None):
             raise ValueError(
                 "multimodal_positions and multimodal_lengths must be provided together"

@@ -4970,6 +4970,96 @@
       "title": "NGramDecodingConfig",
       "type": "object"
     },
+    "NativeRetainedPrefixConfig": {
+      "additionalProperties": false,
+      "description": "Opt-in native completed-decoder prefix ownership.\n\nPeer endpoints are administrator configuration. Public retained references\ncontain opaque aliases and capabilities, never transport addresses.",
+      "properties": {
+        "control_bind": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Local control endpoint for authenticated retained-prefix claims.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Control Bind"
+        },
+        "lease_seconds": {
+          "default": 120.0,
+          "description": "Maximum admission lifetime in seconds for an exported retained prefix.",
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "title": "Lease Seconds",
+          "type": "number"
+        },
+        "max_claims_per_export": {
+          "default": 4,
+          "description": "Maximum number of concurrently admitted claims for each retained-prefix export.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Claims Per Export",
+          "type": "integer"
+        },
+        "max_exports": {
+          "default": 8,
+          "description": "Maximum number of concurrently owned retained-prefix exports.",
+          "maximum": 64,
+          "minimum": 1,
+          "title": "Max Exports",
+          "type": "integer"
+        },
+        "model_identity": {
+          "description": "SHA256 of the sealed checkpoint/tokenizer manifest.",
+          "pattern": "^[0-9a-f]{64}$",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Model Identity",
+          "type": "string"
+        },
+        "model_manifest": {
+          "description": "Full immutable checkpoint/effective-model manifest verified at startup.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Model Manifest",
+          "type": "string"
+        },
+        "peer_id": {
+          "description": "Administrator-assigned opaque identity of this retained-prefix peer.",
+          "pattern": "^[A-Za-z0-9_.-]{1,128}$",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Peer Id",
+          "type": "string"
+        },
+        "trusted_peers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Administrator-configured mapping from trusted peer aliases to control endpoints.",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Trusted Peers",
+          "type": "object"
+        }
+      },
+      "required": [
+        "peer_id",
+        "model_identity",
+        "model_manifest"
+      ],
+      "title": "NativeRetainedPrefixConfig",
+      "type": "object"
+    },
     "Nvfp4GemmConfig": {
       "additionalProperties": false,
       "description": "Configuration for NVFP4 GEMM backend selection.",
@@ -7776,6 +7866,22 @@
       "$ref": "#/$defs/ModelExpressConfig",
       "description": "ModelExpress (MX) P2P checkpoint loading config.",
       "status": "prototype"
+    },
+    "native_retained_prefix": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NativeRetainedPrefixConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Opt-in completed-decoder native prefix export/import; requires qualified physical ownership.",
+      "status": "prototype",
+      "telemetry": {
+        "exclude": true
+      }
     },
     "num_postprocess_workers": {
       "default": 0,

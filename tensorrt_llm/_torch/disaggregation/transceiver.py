@@ -257,7 +257,8 @@ def _select_lifecycle_ownership(
     manager: KVCacheManagerV2,
     config: CacheTransceiverConfig,
     dist: Distributed,
-) -> tuple[bool, bool, Optional["MPI.Comm"]]:
+    native_retained_prefix_config=None,
+) -> tuple:
     """Agree on protection before any rank publishes transfer metadata.
 
     The global setting requires a supported profile when explicitly enabled.
@@ -281,6 +282,8 @@ def _select_lifecycle_ownership(
     fp4 = context_first = False
     communicator = None
     failure = None
+    retained_profile = None
+    retained_version = None
     try:
         setting = os.getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
         legacy_fp4 = os.getenv(_FP4_MLA_OWNERSHIP_BRIDGE_ENV, "0") == "1"
@@ -288,34 +291,51 @@ def _select_lifecycle_ownership(
             raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
         if setting == "0" and legacy_fp4:
             raise ValueError("KV lifecycle enforcement is disabled but the FP4 bridge is enabled")
+        if native_retained_prefix_config is not None:
+            if setting == "0":
+                raise ValueError(
+                    "retained ownership cannot run with lifecycle enforcement explicitly disabled"
+                )
+            from .native.retained_coverage import VERSION
+            from .native.retained_profile import qualify_retained_local
+
+            retained_version = VERSION
+            retained_profile = qualify_retained_local(
+                mapping, manager, config, native_retained_prefix_config
+            )
         if setting != "0":
             fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config)
         if setting == "1" and not fp4:
-            if manager.dtype == DataType.NVFP4:
+            if manager.dtype == DataType.NVFP4 and retained_profile is None:
                 fp4 = _validate_fp4_mla_bridge_profile(mapping, manager, config, enabled=True)
-            else:
+            elif manager.dtype != DataType.NVFP4:
                 context_first = supports_context_first_bf16(mapping, manager, config)
-                if not context_first:
+                if not context_first and retained_profile is None:
                     raise ValueError(
                         "KV lifecycle enforcement requires a supported no-retry FP4 MLA or "
                         "direct BF16 context-first profile; the local configuration is unsupported"
                     )
-        if fp4 or context_first:
+        if fp4 or context_first or retained_profile is not None:
             communicator = _retirement_executor_comm(mapping, warn=False)
     except Exception as error:
         # Exchange all rank-local failures before raising so peers reach agreement.
         failure = f"{type(error).__name__}: {error}"
 
-    selections = dist.allgather((fp4, context_first, failure))
-    failures = [f"rank {rank}: {item[2]}" for rank, item in enumerate(selections) if item[2]]
+    modes = (
+        (fp4, context_first, retained_version)
+        if native_retained_prefix_config is not None
+        else (fp4, context_first)
+    )
+    selections = dist.allgather((*modes, failure))
+    failures = [f"rank {rank}: {item[-1]}" for rank, item in enumerate(selections) if item[-1]]
     if failures:
         raise ValueError("KV lifecycle initialization rejected: " + "; ".join(failures))
-    if len(selections) != mapping.world_size or any(
-        item[:2] != (fp4, context_first) for item in selections
-    ):
+    if len(selections) != mapping.world_size or any(item[:-1] != modes for item in selections):
         raise ValueError("KV lifecycle ownership must agree on every executor rank")
-    if fp4 or context_first:
+    if fp4 or context_first or retained_profile is not None:
         _warn_retirement_termination_scope(mapping)
+    if native_retained_prefix_config is not None:
+        return fp4, context_first, communicator, retained_profile
     return fp4, context_first, communicator
 
 
@@ -370,6 +390,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
         dist: Distributed,
         kv_cache_manager: KVCacheManagerV2,
         cache_transceiver_config: CacheTransceiverConfig,
+        native_retained_prefix_config=None,
     ):
         if not isinstance(kv_cache_manager, KVCacheManagerV2):
             raise ValueError(
@@ -400,14 +421,31 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             else None
         )
         self._check_compatible()
-        (
-            enforce_physical_ownership,
-            self._context_first_ownership,
-            self._retirement_mpi_comm,
-        ) = _select_lifecycle_ownership(mapping, kv_cache_manager, cache_transceiver_config, dist)
+        if native_retained_prefix_config is None:
+            selection = _select_lifecycle_ownership(
+                mapping, kv_cache_manager, cache_transceiver_config, dist
+            )
+        else:
+            selection = _select_lifecycle_ownership(
+                mapping,
+                kv_cache_manager,
+                cache_transceiver_config,
+                dist,
+                native_retained_prefix_config=native_retained_prefix_config,
+            )
+        enforce_physical_ownership, self._context_first_ownership, self._retirement_mpi_comm = (
+            selection[:3]
+        )
+        self._retained_local_profile = (
+            selection[3] if native_retained_prefix_config is not None else None
+        )
         self._fp4_mla_bridge_enabled = enforce_physical_ownership
         self._context_first_ownership_logged = False
-        ownership_capable = enforce_physical_ownership or self._context_first_ownership
+        ownership_capable = (
+            enforce_physical_ownership
+            or self._context_first_ownership
+            or self._retained_local_profile is not None
+        )
         self._reuse_adapter: CacheReuseAdapter = create_cache_reuse_adapter(kv_cache_manager)
 
         self._device_id = torch.cuda.current_device()
@@ -438,6 +476,7 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                 rx_timeout_s=transfer_timeout_s,
                 enforce_physical_ownership=enforce_physical_ownership,
                 context_first_ownership=self._context_first_ownership,
+                retained_profile=self._retained_local_profile,
                 quiescence_fatal_callback=(
                     self._fail_unproven_transfer if ownership_capable else None
                 ),
