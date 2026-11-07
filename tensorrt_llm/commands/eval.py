@@ -24,7 +24,7 @@ from ..evaluate import (AALCR, AIME2025, AIME2026, GSM8K, HLE, MMLU, MMMU,
                         ArenaHard, CnnDailymail, CoVoST2, GPQADiamond,
                         GPQAExtended, GPQAMain, GPQANemoSkills, GSM8KInferenceX,
                         IFBench, ImageGenerationEval, JsonModeEval, LongBenchV1,
-                        LongBenchV2, MMMUPro, SciCode)
+                        LongBenchV2, MMMUPro, SciCode, VideoGenerationEval)
 from ..llmapi import KvCacheConfig
 from ..llmapi.llm_args import TorchLlmArgs
 from ..llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -168,7 +168,8 @@ def main(ctx, model: str, tokenizer: Optional[str],
                 f"{backend} is not a known backend, check help for available options.",
                 param_hint="backend")
 
-    if ctx.invoked_subcommand == _IMAGE_GENERATION_EVAL_COMMAND:
+    if ctx.invoked_subcommand in (_IMAGE_GENERATION_EVAL_COMMAND,
+                                  "video_generation_eval"):
         ctx.obj = {
             "model": model,
             "extra_llm_api_options": extra_llm_api_options,
@@ -278,6 +279,7 @@ main.add_command(GPQANemoSkills.command)
 main.add_command(IFBench.command)
 main.add_command(SciCode.command)
 main.add_command(ImageGenerationEval.command)
+main.add_command(VideoGenerationEval.command)
 main.add_command(HLE.command)
 main.add_command(AALCR.command)
 main.add_command(ArenaHard.command)

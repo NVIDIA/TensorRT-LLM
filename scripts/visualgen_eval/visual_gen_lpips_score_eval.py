@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import importlib.util
 import json
 import os
 import pathlib
@@ -63,12 +64,27 @@ import tempfile
 import time
 from typing import Any
 
-import cv2
-import lpips
 import numpy as np
 import torch
 import yaml
 from PIL import Image
+
+# Load the shared scorer without importing tensorrt_llm.__init__: scoring
+# existing media must also work in environments without the native runtime.
+_scoring_path = (
+    pathlib.Path(__file__).resolve().parents[2] / "tensorrt_llm/evaluate/visual_gen/lpips.py"
+)
+_scoring_spec = importlib.util.spec_from_file_location("_visual_gen_lpips_scoring", _scoring_path)
+_scoring = importlib.util.module_from_spec(_scoring_spec)
+_scoring_spec.loader.exec_module(_scoring)
+
+_make_lpips_model = _scoring.make_lpips_model
+_score_images = _scoring.score_images
+_score_video_files = _scoring.score_video_files
+_to_lpips_tensor = _scoring._to_lpips_tensor
+_decode_video_to_lpips_batch = _scoring._decode_video_to_lpips_batch
+_validate_paired_video_shapes = _scoring._validate_paired_video_shapes
+
 
 MODEL_ALIASES: dict[str, tuple[str, str]] = {
     "flux1": ("FLUX.1-dev", "black-forest-labs/FLUX.1-dev"),
@@ -407,34 +423,6 @@ def _load_image(path: pathlib.Path) -> Image.Image:
         return image.convert("RGB").copy()
 
 
-def _to_lpips_tensor(image: Any, device: str) -> torch.Tensor:
-    """Convert an RGB image-like object to LPIPS input: NCHW float in [-1, 1]."""
-    if isinstance(image, Image.Image):
-        tensor = torch.from_numpy(np.array(image.convert("RGB")))
-    elif isinstance(image, np.ndarray):
-        tensor = torch.from_numpy(image)
-    elif isinstance(image, torch.Tensor):
-        tensor = image.detach().cpu()
-    else:
-        raise TypeError(f"Unsupported image type for LPIPS: {type(image)}")
-
-    if tensor.dim() == 4:
-        tensor = tensor[0]
-    if tensor.dim() != 3:
-        raise ValueError(f"Expected 3D image tensor, got shape {tuple(tensor.shape)}")
-
-    if tensor.shape[0] == 3 and tensor.shape[-1] != 3:
-        tensor = tensor.permute(1, 2, 0)
-    if tensor.shape[-1] != 3:
-        raise ValueError(f"Expected RGB image with 3 channels, got shape {tuple(tensor.shape)}")
-
-    tensor = tensor.to(device=device, dtype=torch.float32)
-    if tensor.max() > 2.0:
-        tensor = tensor / 255.0
-    tensor = tensor.permute(2, 0, 1).unsqueeze(0)
-    return tensor * 2.0 - 1.0
-
-
 def _extract_image(output: Any) -> Any:
     image = getattr(output, "image", None)
     if image is None:
@@ -466,79 +454,6 @@ def _extract_video(output: Any) -> Any:
     if isinstance(video, torch.Tensor):
         return video.detach().cpu()
     return video
-
-
-def _score_images(
-    lpips_model: Any,
-    generated_image: Any,
-    reference_image: Image.Image,
-    device: str,
-) -> float:
-    generated_tensor = _to_lpips_tensor(generated_image, device)
-    reference_tensor = _to_lpips_tensor(reference_image, device)
-    if generated_tensor.shape != reference_tensor.shape:
-        raise ValueError(
-            "Generated image and reference image must have the same LPIPS tensor shape: "
-            f"{tuple(generated_tensor.shape)} vs {tuple(reference_tensor.shape)}."
-        )
-    with torch.no_grad():
-        return float(lpips_model(generated_tensor, reference_tensor).reshape(-1).mean().item())
-
-
-def _decode_video_to_lpips_batch(
-    video_path: pathlib.Path,
-    device: str,
-) -> torch.Tensor:
-    if not video_path.exists():
-        raise FileNotFoundError(f"Video not found for LPIPS comparison: {video_path}")
-
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Failed to open video for LPIPS comparison: {video_path}")
-
-    frames = []
-    try:
-        while True:
-            ok, frame_bgr = cap.read()
-            if not ok:
-                break
-            frames.append(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
-    finally:
-        cap.release()
-
-    if not frames:
-        raise ValueError(f"Decoded video contains no frames: {video_path}")
-
-    frames_array = np.stack(frames, axis=0)
-    batch = torch.from_numpy(frames_array.copy()).permute(0, 3, 1, 2).float() / 255.0
-    return batch.to(device=device, dtype=torch.float32) * 2.0 - 1.0
-
-
-def _validate_paired_video_shapes(generated: torch.Tensor, reference: torch.Tensor) -> None:
-    if generated.shape[1:] != reference.shape[1:]:
-        raise ValueError(
-            "Generated and reference video frames must have the same LPIPS tensor shape: "
-            f"{tuple(generated.shape[1:])} vs {tuple(reference.shape[1:])}."
-        )
-
-
-def _score_video_files(
-    lpips_model: Any,
-    generated_video_path: pathlib.Path,
-    reference_video_path: pathlib.Path,
-    device: str,
-) -> float:
-    generated = _decode_video_to_lpips_batch(generated_video_path, device)
-    reference = _decode_video_to_lpips_batch(reference_video_path, device)
-    _validate_paired_video_shapes(generated, reference)
-
-    paired_frame_count = min(generated.shape[0], reference.shape[0])
-    generated = generated[:paired_frame_count]
-    reference = reference[:paired_frame_count]
-
-    with torch.no_grad():
-        scores = lpips_model(generated, reference).flatten()
-    return float(scores.mean().item())
 
 
 def _resolve_output_path(
@@ -605,12 +520,6 @@ def _save_video(
         audio_sample_rate=int(audio_sample_rate),
     )
     return pathlib.Path(saved_path)
-
-
-def _make_lpips_model(net: str, device: str) -> Any:
-    if device.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError(f"LPIPS device is {device}, but CUDA is not available.")
-    return lpips.LPIPS(net=net, verbose=False).to(device).eval()
 
 
 def _evaluate(args: argparse.Namespace) -> dict[str, Any]:
