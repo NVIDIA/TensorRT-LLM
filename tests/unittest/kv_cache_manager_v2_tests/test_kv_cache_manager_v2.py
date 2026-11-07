@@ -22,6 +22,7 @@ import math
 import os
 import random
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -597,6 +598,7 @@ def create_config(
     sink_tokens: int,
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
+    disk_tier_options: dict | None = None,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -615,7 +617,7 @@ def create_config(
     cache_tiers = [
         GpuCacheTierConfig(quota=gpu_quota),
         HostCacheTierConfig(quota=host_quota),
-        DiskCacheTierConfig(quota=disk_quota, path=disk_path),
+        DiskCacheTierConfig(quota=disk_quota, path=disk_path, **(disk_tier_options or {})),
     ]
     cache_tiers = [t for t in cache_tiers if t.quota > 0]
     return KVCacheManagerConfig(
@@ -5858,6 +5860,8 @@ class TestKVCacheManagerV2(unittest.TestCase):
     cfg: KVCacheManagerConfig
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
+    # Extra DiskCacheTierConfig options for tests that configure a disk tier.
+    disk_tier_options: dict = {}
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -5905,6 +5909,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
             sink_tokens,
             kv_buf_size,
             block_quant_buf_size,
+            disk_tier_options=self.disk_tier_options,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -11498,6 +11503,45 @@ class TestPoison(TestKVCacheManagerV2):
 
         self.assertIn("deliberate test poisoning", take_poison())
         self.assertIsNone(poison_reason())
+
+
+class TestDiskCacheTierOptions(unittest.TestCase):
+    def test_defaults_and_validation(self):
+        path = tempfile.gettempdir()
+        default = DiskCacheTierConfig(64 << 20, path)
+        self.assertEqual(default.num_io_threads, 0)
+        self.assertFalse(default.keep_copy_after_restore)
+        self.assertFalse(default.write_through)
+        default.validate()
+
+        config = DiskCacheTierConfig(
+            64 << 20, path, num_io_threads=4, keep_copy_after_restore=True, write_through=True
+        )
+        config.validate()
+        self.assertEqual(config.num_io_threads, 4)
+
+        with self.assertRaises(ValueError):
+            DiskCacheTierConfig(64 << 20, path, write_through=True).validate()
+        with self.assertRaises(ValueError):
+            DiskCacheTierConfig(64 << 20, path, num_io_threads=-1).validate()
+
+
+# The disk-tier tests again with every SSD offload option on: retained disk copies, write-through, and the
+# asynchronous I/O pool. The pool is process-wide and stays on once enabled, so later tests in the same process
+# also run with it.
+_ALL_DISK_OPTIONS = {"num_io_threads": 4, "keep_copy_after_restore": True, "write_through": True}
+
+
+class TestNoBatchingDiskOptions(TestNoBatching):
+    disk_tier_options = _ALL_DISK_OPTIONS
+
+
+class TestResizeQuotaDiskOptions(TestResizeQuota):
+    disk_tier_options = _ALL_DISK_OPTIONS
+
+
+class TestDisaggDiskOptions(TestDisagg):
+    disk_tier_options = _ALL_DISK_OPTIONS
 
 
 class TestTeardownWithoutCudaContext(TestKVCacheManagerV2):

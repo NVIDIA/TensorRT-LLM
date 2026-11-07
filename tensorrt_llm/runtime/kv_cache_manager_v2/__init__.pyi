@@ -275,6 +275,9 @@ class HostCacheTierConfig:
 class DiskCacheTierConfig:
     quota: int
     path: str
+    num_io_threads: int = 0
+    keep_copy_after_restore: bool = False
+    write_through: bool = False
     @property
     def tier(self) -> CacheTier: ...
     def validate(self) -> None: ...

@@ -23,6 +23,7 @@
 #include "kv_cache_manager_v2/exceptions.h"
 #include "kv_cache_manager_v2/page.h"
 #include "kv_cache_manager_v2/stagingBuffer.h"
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 #include "kv_cache_manager_v2/utils/hostMem.h"
 #include "kv_cache_manager_v2/utils/math.h"
@@ -33,15 +34,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <limits>
 #include <numeric>
 #include <set>
 #include <string>
 #include <tuple>
-#include <unistd.h>
 #include <utility>
+#include <variant>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
 {
@@ -566,24 +566,22 @@ StorageManager::StorageManager(LifeCycleRegistry const& lifeCycles, StorageConfi
     {
         mNumRetainedCopies[level].resize(numPoolGroups(level), 0);
     }
-    if (char const* env = std::getenv("TLLM_KVCM2_DISK_KEEP_COPY"); env != nullptr && std::atoi(env) != 0)
+    for (auto const& tierConfig : config.cacheTiers)
     {
-        bool hasDisk = false;
-        for (CacheLevel level{1}; level < mLevels.size(); ++level)
+        if (auto const* disk = std::get_if<DiskCacheTierConfig>(&tierConfig))
         {
-            hasDisk = hasDisk || cacheTier(level) == CacheTier::DISK;
+            mKeepDiskCopy = mKeepDiskCopy || disk->keepCopyAfterRestore;
+            mDiskWriteThrough = mDiskWriteThrough || (disk->keepCopyAfterRestore && disk->writeThrough);
+            configureAsyncDiskIo(static_cast<size_t>(std::max(disk->numIoThreads, 0)));
         }
-        mKeepDiskCopy = hasDisk;
+    }
+    if (mKeepDiskCopy)
+    {
         if (char const* sec = std::getenv("TLLM_KVCM2_DISK_KEEP_COPY_STATS_SEC"); sec != nullptr)
         {
             mKeepCopyStats.statsSec = std::atoi(sec);
         }
-        if (char const* wt = std::getenv("TLLM_KVCM2_DISK_WRITE_THROUGH"); wt != nullptr && std::atoi(wt) != 0)
-        {
-            mDiskWriteThrough = mKeepDiskCopy;
-        }
-        std::fprintf(stderr, "[kvcm2-keepcopy] pid=%d enabled=%d (disk level present=%d) write_through=%d\n",
-            static_cast<int>(::getpid()), static_cast<int>(mKeepDiskCopy), static_cast<int>(hasDisk),
+        TLLM_LOG_INFO("[kvCacheManagerV2] disk tier: keep_copy_after_restore=1 write_through=%d",
             static_cast<int>(mDiskWriteThrough));
     }
 }
@@ -893,7 +891,7 @@ void StorageManager::releaseSlot(LifeCycleId lc, CacheLevel level, Slot slot)
 }
 
 // ---------------------------------------------------------------------------
-// Keep-disk-copy (TLLM_KVCM2_DISK_KEEP_COPY=1)
+// Keep-disk-copy (DiskCacheTierConfig::keepCopyAfterRestore)
 // ---------------------------------------------------------------------------
 
 bool StorageManager::keepDiskCopyEnabled() const noexcept
@@ -954,7 +952,22 @@ bool StorageManager::pinRetainedCopy(Page const& page, CacheLevel level, bool pi
 
 void StorageManager::eraseRetainedCopy(RetainedCopyList::iterator iter)
 {
-    // The slot's ready event covers the restore read that created the copy, so the next user of the slot waits for it.
+    // A write-through may still be reading the page's host slot. Its completion lives only on this retained disk
+    // slot, so move the dependency onto the page before the entry goes: whoever later releases or reuses the host
+    // slot (migration, destruction, pool shrink) then waits for the write.
+    if (mDiskWriteThrough)
+    {
+        Page const& page = *iter->page;
+        if (page.cacheLevel != kHotLevel && cacheTier(page.cacheLevel) == CacheTier::HOST_MEM)
+        {
+            if (auto pending = pendingDiskWrite(page); !pending.isClosed())
+            {
+                std::vector<CachedCudaEvent> events{page.readyEvent, std::move(pending)};
+                const_cast<Page&>(page).readyEvent = mergeEvents(events);
+            }
+        }
+    }
+    // The slot's ready event covers the I/O that last used it, so the next user of the slot waits for it.
     mLevels.at(iter->level).storage->release(iter->pgIdx, std::move(iter->slot));
     --mNumRetainedCopies.at(iter->level).at(iter->pgIdx);
     mRetainedByPage.erase(iter->page);
@@ -999,16 +1012,8 @@ void StorageManager::onPageDestroyed(Page const& page) noexcept
     KVCM2_POISON_ON_EXCEPT(
         [this, &page]()
         {
-            if (mDiskWriteThrough && page.cacheLevel != kHotLevel && cacheTier(page.cacheLevel) == CacheTier::HOST_MEM)
-            {
-                // The page's host slot is released right after this; it must also wait for a write-through still
-                // reading it.
-                if (auto pending = pendingDiskWrite(page); !pending.isClosed())
-                {
-                    std::vector<CachedCudaEvent> events{page.readyEvent, std::move(pending)};
-                    const_cast<Page&>(page).readyEvent = mergeEvents(events);
-                }
-            }
+            // The page's host slot is released right after this. eraseRetainedCopy moves a write-through still
+            // reading it onto the page's ready event, so the release waits for it.
             auto it = mRetainedByPage.find(&page);
             if (it != mRetainedByPage.end())
             {
@@ -1037,10 +1042,10 @@ void StorageManager::maybePrintKeepCopyStats()
         return;
     }
     mKeepCopyStats.lastPrintNs = now;
-    std::fprintf(stderr,
-        "[kvcm2-keepcopy] pid=%d retained=%zu created=%llu reused=%llu reused_GiB=%.3f reclaimed=%llu dropped=%llu "
-        "wt_pages=%llu wt_GiB=%.3f wt_skipped=%llu\n",
-        static_cast<int>(::getpid()), mRetainedCopies.size(), static_cast<unsigned long long>(mKeepCopyStats.created),
+    TLLM_LOG_INFO(
+        "[kvCacheManagerV2] disk keep-copy stats: retained=%zu created=%llu reused=%llu reused_GiB=%.3f "
+        "reclaimed=%llu dropped=%llu wt_pages=%llu wt_GiB=%.3f wt_skipped=%llu",
+        mRetainedCopies.size(), static_cast<unsigned long long>(mKeepCopyStats.created),
         static_cast<unsigned long long>(mKeepCopyStats.reused), mKeepCopyStats.reusedBytes / double(1ull << 30),
         static_cast<unsigned long long>(mKeepCopyStats.reclaimed),
         static_cast<unsigned long long>(mKeepCopyStats.dropped), static_cast<unsigned long long>(mWriteThroughPages),

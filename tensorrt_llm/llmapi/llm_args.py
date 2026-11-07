@@ -5328,6 +5328,26 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Directory used for disk KV cache files. Must be set when `disk_cache_size` is positive."
     )
+    disk_io_threads: NonNegativeInt = Field(
+        default=0,
+        status="prototype",
+        description=
+        "Worker threads for asynchronous disk KV cache I/O, shared by the whole process. 0 runs each disk "
+        "transfer as a blocking read/write loop in a CUDA host callback, which serializes all disk transfers. "
+        "Only used by KV cache manager v2 with a disk cache.")
+    disk_keep_copy_after_restore: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Keep a reusable block's disk copy after restoring it from disk, so evicting it to disk again writes "
+        "nothing. Only used by KV cache manager v2 with a disk cache.")
+    disk_write_through: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "When a reusable block is evicted from GPU to host, also copy it to disk in the background, so its "
+        "later host-to-disk eviction writes nothing. Requires `disk_keep_copy_after_restore`. Only used by KV "
+        "cache manager v2 with a disk cache.")
     cross_kv_cache_fraction: Optional[float] = Field(
         default=None,
         description=
@@ -5779,6 +5799,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     f"kv_cache_config.disk_cache_path {self.disk_cache_path} does not exist or is not a directory"
                 )
+        if self.disk_write_through and not self.disk_keep_copy_after_restore:
+            raise ValueError(
+                "kv_cache_config.disk_write_through requires disk_keep_copy_after_restore"
+            )
         return self
 
     @model_validator(mode='after')

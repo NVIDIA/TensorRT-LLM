@@ -151,6 +151,14 @@ void DiskCacheTierConfig::validate() const
     {
         throw std::invalid_argument("DiskCacheTierConfig: path '" + path + "' is not a directory");
     }
+    if (numIoThreads < 0)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: numIoThreads must be >= 0");
+    }
+    if (writeThrough && !keepCopyAfterRestore)
+    {
+        throw std::invalid_argument("DiskCacheTierConfig: writeThrough requires keepCopyAfterRestore");
+    }
 }
 
 namespace
