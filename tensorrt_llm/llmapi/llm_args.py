@@ -2824,6 +2824,60 @@ class MooncakeStoreConfig(StrictBaseModel):
         return value
 
 
+class NativeRetainedPrefixConfig(StrictBaseModel):
+    """Opt-in native completed-decoder prefix ownership.
+
+    Peer endpoints are administrator configuration. Public retained references
+    contain opaque aliases and capabilities, never transport addresses.
+    """
+    peer_id: str = Field(
+        pattern=r"^[A-Za-z0-9_.-]{1,128}$",
+        telemetry=False,
+        description=
+        "Administrator-assigned opaque identity of this retained-prefix peer.")
+    model_identity: str = Field(
+        pattern=r"^[0-9a-f]{64}$",
+        telemetry=False,
+        description="SHA256 of the sealed checkpoint/tokenizer manifest.")
+    model_manifest: str = Field(
+        telemetry=False,
+        description=
+        "Full immutable checkpoint/effective-model manifest verified at startup."
+    )
+    control_bind: Optional[str] = Field(
+        default=None,
+        telemetry=False,
+        description=
+        "Local control endpoint for authenticated retained-prefix claims.")
+    trusted_peers: Dict[str, str] = Field(
+        default_factory=dict,
+        telemetry=False,
+        description=
+        "Administrator-configured mapping from trusted peer aliases to control endpoints."
+    )
+    lease_seconds: float = Field(
+        default=120.0,
+        gt=0,
+        le=3600,
+        allow_inf_nan=False,
+        description=
+        "Maximum admission lifetime in seconds for an exported retained prefix."
+    )
+    max_exports: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description=
+        "Maximum number of concurrently owned retained-prefix exports.")
+    max_claims_per_export: int = Field(
+        default=4,
+        ge=1,
+        le=64,
+        description=
+        "Maximum number of concurrently admitted claims for each retained-prefix export."
+    )
+
+
 class KvCacheConnectorConfig(StrictBaseModel):
     """Configuration for the KV Cache Connector.
 
@@ -7497,6 +7551,13 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="The config for KV cache connector.",
         status="prototype",
+    )
+    native_retained_prefix: Optional[NativeRetainedPrefixConfig] = Field(
+        default=None,
+        status="prototype",
+        telemetry=False,
+        description=
+        "Opt-in completed-decoder native prefix export/import; requires qualified physical ownership."
     )
 
     mm_encoder_only: bool = Field(

@@ -5852,6 +5852,9 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         self.impl.refresh_retention()
+        retained = getattr(self, "native_retained_prefix", None)
+        if retained is not None:
+            retained.import_batch(scheduled_batch)
         for request in scheduled_batch.context_requests:
             ready = self._disagg_receive_ready.get(request.py_request_id)
             if ready is not None:

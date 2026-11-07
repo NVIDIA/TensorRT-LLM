@@ -1591,6 +1591,13 @@ class PyExecutor:
 
         self._maybe_init_kv_connector_manager()
 
+        self.native_retained_prefix = None
+        if getattr(self.llm_args, "native_retained_prefix", None) is not None:
+            from .native_retained_prefix import NativeRetainedPrefix
+            self.native_retained_prefix = NativeRetainedPrefix(
+                self, self.llm_args.native_retained_prefix)
+            self.kv_cache_manager.native_retained_prefix = self.native_retained_prefix
+
         self._validate_moe_a2a_checkpoint_support()
 
     def rebind_resources(self, resources: PyExecutorResources) -> None:
@@ -2607,6 +2614,9 @@ class PyExecutor:
             # synchronization and allocator teardown can touch DMA-owned memory
             # or hang on a failed device, so retain the whole execution state.
             return False
+        retained = getattr(self, "native_retained_prefix", None)
+        if retained is not None:
+            retained.shutdown()
         # Release CUDA graphs before resource managers free their GPU memory.
         # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
         # that is referenced by raw pointers inside captured CUDA graphs.  If
@@ -2889,6 +2899,9 @@ class PyExecutor:
             len(self.waiting_queue) == 0 and not self._has_pending_connector_transfers()
 
     def _has_pending_connector_transfers(self) -> bool:
+        retained = getattr(self, "native_retained_prefix", None)
+        if retained is not None and retained.pending:
+            return True
         connector = getattr(self, "kv_connector_manager", None)
         if connector is None:
             return False
@@ -7163,6 +7176,11 @@ class PyExecutor:
                      are parked until the ``with`` block exits.
         """
 
+        if getattr(self, "native_retained_prefix", None) is not None:
+            raise NotImplementedError(
+                "Mutable control actions require a worker restart while native retained prefixes are enabled"
+            )
+
         if self.dist.rank == 0:
             self.executor_request_queue.enqueue_control_request(
                 drain=drain, control_id=control_id)
@@ -7554,6 +7572,9 @@ class PyExecutor:
         self.kv_cache_manager.update_resources(scheduled_requests,
                                                attn_metadata,
                                                kv_cache_dtype_byte_size)
+        retained = getattr(self, "native_retained_prefix", None)
+        if retained is not None:
+            retained.prepare_exports(scheduled_requests)
 
     def _process_previous_batch(self):
         scheduled_requests = self.previous_batch.scheduled_requests
@@ -7933,6 +7954,18 @@ class PyExecutor:
 
         # Check if request has enough budget
         self._validate_request_budget(request)
+        retained_params = request.py_disaggregated_params
+        if retained_params is not None:
+            requested = retained_params.retain_prefix or retained_params.retained_prefix is not None
+            if requested and getattr(self, "native_retained_prefix",
+                                     None) is None:
+                raise ValueError(
+                    "retained prefixes require explicit native_retained_prefix configuration"
+                )
+            if retained_params.retained_prefix is not None and request.is_generation_only_request:
+                raise ValueError(
+                    "a retained prefix imports into context, not a generation-only handoff"
+                )
 
         # Model-specific multimodal admission checks: rejecting here fails
         # only this request; the same condition raised inside forward is
@@ -7947,6 +7980,9 @@ class PyExecutor:
     def _fetch_and_enqueue_requests(self, waiting_queue: WaitingQueue,
                                     total_num_live_requests: int) -> None:
         """Fetch requests from request_queue and enqueue to waiting_queue."""
+        retained = getattr(self, "native_retained_prefix", None)
+        if retained is not None:
+            retained.poll()
         connector = self.kv_connector_manager
         control_pending = len(self.control_requests) != 0
         # ADP polls owner-local completions before routing. All owners must
@@ -10666,6 +10702,9 @@ class PyExecutor:
                 raise self._fatal_error
 
     def _terminate_request(self, request: LlmRequest) -> None:
+        retained = getattr(self, "native_retained_prefix", None)
+        if retained is not None and retained.protects(request):
+            return
         connector = getattr(self, "kv_connector_manager", None)
         if connector is not None:
             connector.release_unstarted_prefix_loads(request)

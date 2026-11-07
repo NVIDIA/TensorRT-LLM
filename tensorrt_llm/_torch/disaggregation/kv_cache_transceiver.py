@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from abc import ABC, abstractmethod
 from os import getenv
@@ -119,7 +131,8 @@ def create_kv_cache_transceiver(
     kv_cache_manager: KVCacheManager | KVCacheManagerV2,
     attention_type: AttentionTypeCpp,
     cache_transceiver_config: CacheTransceiverConfig,
-    mamba_cache_manager: Optional[BaseMambaCacheManager] = None
+    mamba_cache_manager: Optional[BaseMambaCacheManager] = None,
+    native_retained_prefix_config=None,
 ) -> Optional["KvCacheTransceiver"]:
     resolve_cache_transceiver_config(cache_transceiver_config)
     lifecycle_policy = getenv(_KV_LIFECYCLE_ENFORCEMENT_ENV)
@@ -128,6 +141,9 @@ def create_kv_cache_transceiver(
                        cache_transceiver_config.transceiver_runtime != "PYTHON")
     # Python ranks report policy errors through their startup collective.
     if bypasses_python:
+        if native_retained_prefix_config is not None:
+            raise ValueError(
+                "native retained prefixes require the Python/NIXL transceiver")
         if lifecycle_policy not in (None, "0", "1"):
             raise ValueError(f"{_KV_LIFECYCLE_ENFORCEMENT_ENV} must be 0 or 1")
         if lifecycle_policy == "1":
@@ -221,8 +237,15 @@ def create_kv_cache_transceiver(
             KvCacheTransceiverV2
         logger.info("Using KvCacheTransceiverV2")
         # MambaHybridCacheManagerV2 contains both the KV and Mamba pools.
-        return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
-                                    cache_transceiver_config)
+        if native_retained_prefix_config is None:
+            return KvCacheTransceiverV2(mapping, dist, kv_cache_manager,
+                                        cache_transceiver_config)
+        return KvCacheTransceiverV2(
+            mapping,
+            dist,
+            kv_cache_manager,
+            cache_transceiver_config,
+            native_retained_prefix_config=native_retained_prefix_config)
 
     # Explicit legacy runtime: transceiver_runtime is None or "CPP".
     return BindKvCacheTransceiver(mapping, dist, kv_cache_manager,

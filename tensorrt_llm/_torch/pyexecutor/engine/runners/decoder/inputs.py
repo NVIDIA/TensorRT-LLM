@@ -1,5 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Decoder input preparation state."""
 
 import math
@@ -1296,6 +1308,21 @@ class DecoderInputPreparer:
             past_seen_token_num = begin_compute
             num_cached_tokens_per_seq.append(past_seen_token_num - request.py_num_compressed_tokens)
             request.cached_tokens = request.context_current_position
+            if (
+                request.py_retained_import_receipt is not None
+                and request.context_current_position == request.py_retained_imported_tokens
+            ):
+                from tensorrt_llm._torch.pyexecutor.native_retained_prefix import (
+                    record_retained_model_input,
+                )
+
+                record_retained_model_input(
+                    request,
+                    rank=self.mapping.rank,
+                    tokens=prompt_tokens,
+                    positions=position_ids[context_start_idx : len(position_ids)],
+                    cached_tokens=num_cached_tokens_per_seq[-1],
+                )
             extra_inputs.add_context_request(request)
 
             self._pack_context_multimodal(
