@@ -63,6 +63,7 @@ def make_dense_budget_manager() -> KVCacheManagerV2:
     manager.mixed_precision_low_dtype = None
     manager.max_attention_window_vec = [None]
     manager._ledger_tokens_per_block = 32
+    manager.max_blocks_per_seq = 8
     manager.num_extra_kv_tokens = 0
     manager._kv_reserve_draft_tokens = 0
     manager.impl = Mock()
@@ -178,6 +179,86 @@ def test_dense_v2_resize_preserves_state_beyond_page_table_and_can_retry(first_c
     assert cache.suspend.call_count == int(first_chunk)
     assert manager.resize_context(request, 32)
     cache.resize.assert_called_once_with(64)
+
+
+@pytest.mark.parametrize("mode", ["disaggregated", "mixed_precision", "windowed", "cp"])
+@pytest.mark.parametrize("temporarily_full", [False, True])
+def test_page_index_admission_rejects_excluded_long_request_and_schedules_short(
+    mode: str, temporarily_full: bool
+) -> None:
+    manager = make_dense_budget_manager()
+    if mode == "disaggregated":
+        manager.is_disagg = True
+    elif mode == "mixed_precision":
+        manager.mixed_precision_low_dtype = DataType.NVFP4
+    elif mode == "windowed":
+        manager.max_attention_window_vec = [64]
+    else:
+        manager.mapping.cp_size = 2
+    assert not manager.kv_block_budget_applies()
+    long, short = make_ctx_request(1, 8192), make_ctx_request(2, 32)
+    for request in (long, short):
+        request.orig_prompt_len = request.prompt_len
+        request.max_new_tokens = 1
+        request.py_beam_width = 1
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+        _validate_encoder_output_len=Mock(),
+        _mm_encoder_item_scheduling_enabled=False,
+        _fetch_new_requests=Mock(return_value=[long, short]),
+        _handle_errors=Mock(),
+        waiting_queue=[],
+        active_requests=[],
+        is_shutdown=False,
+    )
+    executor._validate_request = lambda req: PyExecutor._validate_request_budget(executor, req)
+    accepted = PyExecutor._fetch_and_activate_new_requests(executor)
+    assert accepted == executor.active_requests == [short]
+    error = executor._handle_errors.call_args
+    assert "fixed page-index capacity of 8" in error.args[0]
+    assert error.kwargs == {"requests": [long], "charge_budget": False}
+    allocation_manager = make_kv_cache_manager(tokens_per_block=32)
+    allocation_manager.resize_context.side_effect = [False, True] if temporarily_full else [True]
+    scheduler = make_scheduler(allocation_manager, max_num_tokens=8192)
+    output = scheduler.schedule_request(accepted, set())
+    if temporarily_full:
+        assert output.context_requests == []
+        output = scheduler.schedule_request(accepted, set())
+    assert output.context_requests == [short]
+    assert scheduler._stalled_schedules == 0
+    assert not executor.is_shutdown
+    manager._get_storage_statistics.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "new_tokens,extra,reserve,required", [(223, 0, 0, 8), (224, 1, 0, 9), (223, 0, 1, 9)]
+)
+def test_page_index_budget_covers_generation_and_reserves_without_beam_multiplication(
+    new_tokens: int, extra: int, reserve: int, required: int
+) -> None:
+    manager = make_dense_budget_manager()
+    manager.num_extra_kv_tokens, manager._kv_reserve_draft_tokens = extra, reserve
+    manager.max_attention_window_vec = [64]
+    request = SimpleNamespace(orig_prompt_len=33, max_new_tokens=new_tokens, py_beam_width=4)
+    assert manager.get_request_kv_page_index_budget(request) == (required, 8)
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+        _validate_encoder_output_len=Mock(),
+    )
+    if required > 8:
+        with pytest.raises(ValueError, match="fixed page-index capacity"):
+            PyExecutor._validate_request_budget(executor, request)
+    else:
+        PyExecutor._validate_request_budget(executor, request)
+
+
+def test_page_index_budget_leaves_rebased_context_managers_to_their_own_check() -> None:
+    class RebasedManager(KVCacheManagerV2):
+        def resize_context(self, request, num_tokens):
+            return True
+
+    manager = object.__new__(RebasedManager)
+    assert manager.get_request_kv_page_index_budget(Mock()) is None
 
 
 def test_dense_v2_admission_requires_subclasses_to_opt_in() -> None:
