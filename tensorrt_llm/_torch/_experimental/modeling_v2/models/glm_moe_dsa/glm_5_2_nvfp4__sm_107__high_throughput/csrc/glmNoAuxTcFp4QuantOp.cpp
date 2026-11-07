@@ -88,13 +88,12 @@ void glm_rubin_noaux_tc_fp4_quantize_out(th::Tensor const& scores, th::Tensor co
     at::assert_no_overlap(topkIndices, sfOut);
     at::assert_no_overlap(fp4Out, sfOut);
     auto stream = at::cuda::getCurrentCUDAStream(scores.get_device());
-    tk::invokeGlmRubinNoAuxTcFp4Quant(reinterpret_cast<float*>(scores.mutable_data_ptr()),
-        reinterpret_cast<float*>(bias.mutable_data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(hiddenStates.data_ptr()),
-        reinterpret_cast<float const*>(globalScale.data_ptr()), reinterpret_cast<float*>(topkValues.mutable_data_ptr()),
-        reinterpret_cast<int32_t*>(topkIndices.mutable_data_ptr()),
-        reinterpret_cast<uint32_t*>(fp4Out.mutable_data_ptr()), reinterpret_cast<uint8_t*>(sfOut.mutable_data_ptr()),
-        numTokens, numExperts, topk, hiddenSize, routed_scaling_factor, stream);
+    tk::invokeGlmRubinNoAuxTcFp4Quant(static_cast<float*>(scores.mutable_data_ptr()),
+        static_cast<float*>(bias.mutable_data_ptr()), static_cast<__nv_bfloat16 const*>(hiddenStates.data_ptr()),
+        static_cast<float const*>(globalScale.data_ptr()), static_cast<float*>(topkValues.mutable_data_ptr()),
+        static_cast<int32_t*>(topkIndices.mutable_data_ptr()), static_cast<uint32_t*>(fp4Out.mutable_data_ptr()),
+        static_cast<uint8_t*>(sfOut.mutable_data_ptr()), numTokens, numExperts, topk, hiddenSize, routed_scaling_factor,
+        stream);
 }
 
 } // namespace torch_ext

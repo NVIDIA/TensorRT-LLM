@@ -101,7 +101,7 @@ static __device__ __forceinline__ float noAuxTcRoutingWeight(float s, float S, d
     return noAuxTcRoutingWeightFp64(s, S, c);
 }
 
-static constexpr int MaxSupportedTopExperts = 32;
+static constexpr int kMaxSupportedTopExperts = 32;
 
 __device__ __forceinline__ void routeToken(float const* scores, float const* bias, float* topkValues,
     int32_t* topkIndices, int64_t topk, double routedScalingFactor)
@@ -126,8 +126,8 @@ __device__ __forceinline__ void routeToken(float const* scores, float const* bia
             localExperts[i] = i * 32 + lane;
             localScores[i] = biasedScores[localExperts[i]];
         }
-        float topScores[MaxSupportedTopExperts];
-        int32_t topExperts[MaxSupportedTopExperts];
+        float topScores[kMaxSupportedTopExperts];
+        int32_t topExperts[kMaxSupportedTopExperts];
         reduce_topk::reduceTopK(warp, topScores, topExperts, localScores, localExperts, -INFINITY, topk);
         int const selected = lane < topk ? topExperts[lane] : 255;
         float const selectedScore = lane < topk ? sigmoidScores[selected] : 0.F;
@@ -140,11 +140,11 @@ __device__ __forceinline__ void routeToken(float const* scores, float const* bia
     }
 }
 
-static constexpr int NoAuxTcFp4QuantNumExperts = 256;
-static constexpr int NoAuxTcFp4QuantThreads = NoAuxTcFp4QuantNumExperts;
-static constexpr int NvFp4SfVecSize = 16;
+static constexpr int kNoAuxTcFp4QuantNumExperts = 256;
+static constexpr int kNoAuxTcFp4QuantThreads = kNoAuxTcFp4QuantNumExperts;
+static constexpr int kNvFp4SfVecSize = 16;
 
-__global__ __launch_bounds__(NoAuxTcFp4QuantThreads) void glmRubinNoAuxTcFp4QuantKernel(float* scores,
+__global__ __launch_bounds__(kNoAuxTcFp4QuantThreads) void glmRubinNoAuxTcFp4QuantKernel(float* scores,
     float* routingBias, __nv_bfloat16 const* hiddenStates, float const* globalScale, float* topkValues,
     int32_t* topkIndices, uint32_t* fp4Out, uint32_t* sfOut, int64_t numTokens, int64_t topk, int hiddenSize,
     double routedScalingFactor)
@@ -159,7 +159,7 @@ __global__ __launch_bounds__(NoAuxTcFp4QuantThreads) void glmRubinNoAuxTcFp4Quan
     else
     {
         using QuantPackedVec = PackedVec<__nv_bfloat16>;
-        static constexpr int CvtNumThreadsPerSf = NvFp4SfVecSize / CVT_ELTS_PER_THREAD;
+        static constexpr int CvtNumThreadsPerSf = kNvFp4SfVecSize / CVT_ELTS_PER_THREAD;
         int const rowIdx = static_cast<int>(blockIdx.x - numTokens);
         int const numColThreads = hiddenSize / CVT_ELTS_PER_THREAD;
         float const sfScaleVal = globalScale[0];
@@ -168,10 +168,10 @@ __global__ __launch_bounds__(NoAuxTcFp4QuantThreads) void glmRubinNoAuxTcFp4Quan
         for (int colIdx = threadIdx.x; colIdx < numColThreads; colIdx += blockDim.x)
         {
             auto sfOutPtr = cvt_quant_get_sf_out_offset<uint32_t, CvtNumThreadsPerSf>(optionalBatchIdx, rowIdx, colIdx,
-                optionalNumRows, hiddenSize / NvFp4SfVecSize, sfOut, QuantizationSFLayout::LINEAR);
+                optionalNumRows, hiddenSize / kNvFp4SfVecSize, sfOut, QuantizationSFLayout::LINEAR);
             int64_t const offset = static_cast<int64_t>(rowIdx) * numColThreads + colIdx;
             QuantPackedVec inVec = reinterpret_cast<QuantPackedVec const*>(hiddenStates)[offset];
-            fp4Out[offset] = cvt_warp_fp16_to_fp4<__nv_bfloat16, NvFp4SfVecSize, false>(inVec, sfScaleVal, sfOutPtr);
+            fp4Out[offset] = cvt_warp_fp16_to_fp4<__nv_bfloat16, kNvFp4SfVecSize, false>(inVec, sfScaleVal, sfOutPtr);
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -187,14 +187,14 @@ void invokeGlmRubinNoAuxTcFp4Quant(float* scores, float* bias, __nv_bfloat16 con
     int64_t const numTokens, int64_t const numExperts, int64_t const topk, int64_t const hiddenSize,
     double const routedScalingFactor, cudaStream_t const stream)
 {
-    TLLM_CHECK_WITH_INFO(numExperts == NoAuxTcFp4QuantNumExperts && topk >= 1 && topk <= MaxSupportedTopExperts,
+    TLLM_CHECK_WITH_INFO(numExperts == kNoAuxTcFp4QuantNumExperts && topk >= 1 && topk <= kMaxSupportedTopExperts,
         "invokeGlmRubinNoAuxTcFp4Quant: 256 experts and top-1..32 expected (got %ld experts, top-%ld)", numExperts,
         topk);
     TLLM_CHECK_WITH_INFO(hiddenSize > 0 && hiddenSize % (2 * CVT_ELTS_PER_THREAD) == 0,
         "invokeGlmRubinNoAuxTcFp4Quant: the hidden size must be a multiple of 16 (got %ld)", hiddenSize);
     cudaLaunchConfig_t config;
     config.gridDim = static_cast<unsigned int>(2 * numTokens);
-    config.blockDim = NoAuxTcFp4QuantThreads;
+    config.blockDim = kNoAuxTcFp4QuantThreads;
     config.dynamicSmemBytes = 0;
     config.stream = stream;
     cudaLaunchAttribute attrs[1];

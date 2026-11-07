@@ -83,7 +83,7 @@ at::Tensor rubinMtpHeadGather(
     params.output = out.data_ptr();
     params.bufferPtrLocal = comm_buffer.data_ptr();
     params.multicastPtr = mcastMem->getMulticastPtr();
-    params.bufferFlags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
+    params.bufferFlags = static_cast<uint32_t*>(buffer_flags.data_ptr());
     params.stream = at::cuda::getCurrentCUDAStream(input.get_device());
     TRTLLM_MV2_NS::kernels::glm_rubin_mtp::oneshotAllGatherOp(params);
     return out;

@@ -139,7 +139,7 @@ void glmRubinNvfp4WorklistPipelined(th::Tensor const& hostPoolPointers, th::Tens
     auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
     tk::invokeGlmRubinNvfp4WorklistPipelined(pools.data, pools.scales, memberIndices.data_ptr<int32_t>(),
         static_cast<int32_t>(numMembers), queryReqIndices.data_ptr<int32_t>(),
-        reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()), compactIndices.data_ptr<int32_t>(),
+        static_cast<__nv_fp8_e4m3*>(output.data_ptr()), compactIndices.data_ptr<int32_t>(),
         ownerTable.data_ptr<int64_t>(), memberOwners.data_ptr<int32_t>(), memberOwners.size(1),
         ownerCount.data_ptr<int32_t>(), ownerState.data_ptr<int32_t>(), globalDequantScale.data_ptr<float>(),
         static_cast<int32_t>(output.size(0)), static_cast<int32_t>(output.size(1)), static_cast<int32_t>(numRequests),
@@ -163,7 +163,7 @@ void glmRubinNvfp4WorklistMember(th::Tensor const& hostPoolPointers, th::Tensor 
     c10::cuda::CUDAGuard const deviceGuard(device);
     auto stream = at::cuda::getCurrentCUDAStream(device.index()).stream();
     tk::invokeGlmRubinNvfp4WorklistMember(pools.data, pools.scales, memberOwners.data_ptr<int32_t>(),
-        ownerCount.data_ptr<int32_t>(), reinterpret_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+        ownerCount.data_ptr<int32_t>(), static_cast<__nv_fp8_e4m3*>(output.data_ptr()),
         compactIndices.data_ptr<int32_t>(), globalDequantScale.data_ptr<float>(), static_cast<int32_t>(output.size(0)),
         static_cast<int32_t>(output.size(1)), stream);
 }

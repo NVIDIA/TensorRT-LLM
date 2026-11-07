@@ -71,7 +71,7 @@ int64_t setDraftStepExchangeAdp(sd::DraftSampleGlueAdpParams& params, at::Tensor
         ": draft_tokens must be [rows, draft_len] with 1 to segment_rows rows and draft_step inside");
 
     sd::DraftSampleGlueParams& step = params.step;
-    step.logits = reinterpret_cast<__nv_bfloat16 const*>(logits.data_ptr());
+    step.logits = static_cast<__nv_bfloat16 const*>(logits.data_ptr());
     step.logitsStride = logits.stride(0);
     step.numRows = static_cast<int>(rows);
     step.vocabShard = static_cast<int>(logits.size(1));
@@ -79,7 +79,7 @@ int64_t setDraftStepExchangeAdp(sd::DraftSampleGlueAdpParams& params, at::Tensor
     step.tpSize = static_cast<int>(group_size);
     step.exchangeLocal = exchange_buffer.data_ptr();
     step.exchangeMcast = mcastMem->getMulticastPtr();
-    step.exchangeFlags = reinterpret_cast<uint32_t*>(exchange_flags.data_ptr());
+    step.exchangeFlags = static_cast<uint32_t*>(exchange_flags.data_ptr());
     step.draftTokens = draft_tokens.data_ptr<int32_t>();
     step.numDraftTokens = static_cast<int>(draft_tokens.size(1));
     step.draftStep = static_cast<int>(draft_step);
@@ -115,7 +115,7 @@ void setDraftStepGlue(sd::DraftSampleGlueParams& params, char const* op, int64_t
         CHECK_INPUT(embed_table.value(), at::ScalarType::BFloat16);
         TORCH_CHECK(embed_table->dim() == 2 && embed_table->size(1) == kHidden && isAligned16(*embed_table), op,
             ": embed_table must be [vocab, 6144]");
-        params.embedTable = reinterpret_cast<__nv_bfloat16 const*>(embed_table->data_ptr());
+        params.embedTable = static_cast<__nv_bfloat16 const*>(embed_table->data_ptr());
         params.vocabSize = embed_table->size(0);
     }
     if (col_hi > kHidden)
@@ -125,15 +125,15 @@ void setDraftStepGlue(sd::DraftSampleGlueParams& params, char const* op, int64_t
                 && hidden->size(1) == kHidden && hidden->stride(1) == 1 && hidden->stride(0) % 8 == 0
                 && isAligned16(*hidden),
             op, ": hidden must be a 16-byte aligned BF16 [rows, 6144] view");
-        params.hidden = reinterpret_cast<__nv_bfloat16 const*>(hidden->data_ptr());
+        params.hidden = static_cast<__nv_bfloat16 const*>(hidden->data_ptr());
         params.hiddenStride = hidden->stride(0);
     }
-    params.enormWeight = reinterpret_cast<__nv_bfloat16 const*>(enorm_weight->data_ptr());
-    params.hnormWeight = reinterpret_cast<__nv_bfloat16 const*>(hnorm_weight->data_ptr());
+    params.enormWeight = static_cast<__nv_bfloat16 const*>(enorm_weight->data_ptr());
+    params.hnormWeight = static_cast<__nv_bfloat16 const*>(hnorm_weight->data_ptr());
     params.eps = static_cast<float>(eps);
     params.colLo = static_cast<int>(col_lo);
     params.colHi = static_cast<int>(col_hi);
-    params.glueOut = reinterpret_cast<__nv_bfloat16*>(glue_out->data_ptr());
+    params.glueOut = static_cast<__nv_bfloat16*>(glue_out->data_ptr());
     params.glueOutStride = glue_out->stride(0);
 }
 
