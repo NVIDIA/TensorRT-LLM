@@ -3,6 +3,7 @@
 
 """Real frontend processes must fail and shut down as one serving instance."""
 
+import asyncio
 import fcntl
 import os
 import resource
@@ -11,6 +12,8 @@ import socket
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import grpc
@@ -18,9 +21,10 @@ import pytest
 
 pytest.importorskip("grpc_health", reason="gRPC health runtime not installed")
 
-from tensorrt_llm.grpc.openengine import server as openengine_server
-from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle
-from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc
+from tensorrt_llm.grpc.openengine import server as openengine_server  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import lifecycle_pb2 as lifecycle  # noqa: E402
+from tensorrt_llm.grpc.openengine.bindings import openengine_pb2_grpc as rpc  # noqa: E402
+from tensorrt_llm.grpc.openengine.coordinator import _Connection  # noqa: E402
 
 pytestmark = [pytest.mark.cpu_only, pytest.mark.threadleak(enabled=False)]
 
@@ -39,6 +43,36 @@ def test_second_frontend_group_rejects_occupied_port_before_model_load(monkeypat
                 "127.0.0.1", port, {"model": "test", "backend": "pytorch", "num_serve_frontends": 2}
             )
     model_loaded.assert_not_called()
+
+
+def test_launcher_rejects_oversized_coordinator_abort_socket(monkeypatch):
+    """Validate the longest private socket before trying to start the coordinator."""
+    directory = "/" + "x" * 90
+    assert len(os.fsencode(f"{directory}/coordinator")) < 108
+    assert len(os.fsencode(f"{directory}/coordinator-abort")) >= 108
+    temp = SimpleNamespace(name=directory, cleanup=Mock())
+    monkeypatch.setattr(openengine_server.tempfile, "TemporaryDirectory", lambda **_: temp)
+    monkeypatch.setattr(openengine_server, "PyTorchLLM", Mock())
+    monkeypatch.setattr(
+        openengine_server,
+        "_init_multi_frontend_mode",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            num_frontends=2, is_launcher=True, is_attached_frontend=False
+        ),
+    )
+    monkeypatch.setattr(
+        openengine_server,
+        "CoordinatorReactor",
+        Mock(side_effect=AssertionError("coordinator started before path validation")),
+    )
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    with pytest.raises(ValueError, match="OpenEngine private Unix socket path exceeds 107 bytes"):
+        openengine_server.launch_server(
+            "127.0.0.1", port, {"model": "test", "backend": "pytorch", "num_serve_frontends": 2}
+        )
+    temp.cleanup.assert_called_once()
 
 
 @pytest.mark.parametrize("exits", [True, False])
@@ -137,9 +171,10 @@ def test_ready_child_death_fails_startup(monkeypatch, last_child_ready):
                 os.close(fd)
 
 
-# Replace only the GPU engine boundary. The real launcher, readiness pipes,
-# signals, gRPC servers, coordinator, and subprocess cleanup remain in use.
+# Replace the GPU engine and gate failure callbacks where needed. The real
+# launcher, readiness pipes, gRPC servers, coordinator, and cleanup remain in use.
 _LAUNCHER = """
+import asyncio
 import os
 from pathlib import Path
 import signal
@@ -187,6 +222,103 @@ class Engine:
         (root / f"shutdown-{frontend}").touch()
 
 server.PyTorchLLM = Engine
+if sys.argv[3] in ("startup-coordinator-withdraw", "startup-coordinator-withdraw-delayed"):
+    original_start = server.OpenEngineServer.start
+    async def paused_server_start(self):
+        await original_start(self)
+        if frontend == 0:
+            (root / "server-start-paused").touch()
+            deadline = time.monotonic() + 30
+            while not (root / "resume-server-start").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("test did not release server startup")
+                await asyncio.sleep(0.01)
+    server.OpenEngineServer.start = paused_server_start
+    original_frontend = server.FrontendClient
+    class TrackingFrontend(original_frontend):
+        def __init__(self, directory, frontend_id, fail):
+            super().__init__(directory, frontend_id, fail)
+            if frontend == 0:
+                (root / "coordinator-directory").write_text(directory)
+    server.FrontendClient = TrackingFrontend
+    original_error = server.logger.error
+    def track_failure(reason, *args, **kwargs):
+        if frontend == 0 and reason == "OpenEngine frontend 1 is stopping":
+            (root / "withdraw-fenced").touch()
+        return original_error(reason, *args, **kwargs)
+    server.logger.error = track_failure
+    if sys.argv[3] == "startup-coordinator-withdraw-delayed":
+        original_reactor = server.CoordinatorReactor
+        class DelayedFailureReactor(original_reactor):
+            def __init__(self, directory, count, instance_id, healthy, fail):
+                def delay_owner_failure(reason):
+                    (root / "owner-failure-delayed").touch()
+                    asyncio.get_running_loop().call_later(60, fail, reason)
+                super().__init__(directory, count, instance_id, healthy, delay_owner_failure)
+            async def set_ready(self):
+                if (root / "owner-failure-delayed").exists():
+                    (root / "set-ready-before-failure").touch()
+                return await super().set_ready()
+        server.CoordinatorReactor = DelayedFailureReactor
+if sys.argv[3] == "blocked-failure-log":
+    from tensorrt_llm.grpc.openengine import coordinator
+    original_dispatch = coordinator.Coordinator._dispatch
+    def pause_reservation(self, message, context):
+        if message.get("request_id") != "before-terminal-failure":
+            return original_dispatch(self, message, context)
+        original_healthy = self._healthy
+        def paused_health():
+            healthy = original_healthy()
+            (root / "reservation-health-paused").touch()
+            deadline = time.monotonic() + 10
+            while not (root / "release-reservation-health").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("test did not release reservation health")
+                time.sleep(0.01)
+            (root / "health-before-publication").write_text(str(original_healthy()))
+            return healthy
+        self._healthy = paused_health
+        try:
+            return original_dispatch(self, message, context)
+        finally:
+            self._healthy = original_healthy
+    coordinator.Coordinator._dispatch = pause_reservation
+    original_reactor = server.CoordinatorReactor
+    class FailureReactor(original_reactor):
+        def report_owner_failure(self, reason):
+            (root / "publication-entered").touch()
+            return super().report_owner_failure(reason)
+    server.CoordinatorReactor = FailureReactor
+    original_error = server.logger.error
+    def blocked_error(reason, *args, **kwargs):
+        if frontend == 0 and reason == "injected first terminal failure":
+            (root / "failure-logging").touch()
+            deadline = time.monotonic() + 10
+            while not (root / "release-failure-log").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("test did not release failure logging")
+                time.sleep(0.01)
+        return original_error(reason, *args, **kwargs)
+    server.logger.error = blocked_error
+    original_frontend = server.FrontendClient
+    class FailureFrontend(original_frontend):
+        def __init__(self, directory, frontend_id, fail):
+            super().__init__(directory, frontend_id, fail)
+            if frontend == 0:
+                (root / "coordinator-directory").write_text(directory)
+                signal.signal(signal.SIGUSR1,
+                              lambda signum, frame: fail("injected first terminal failure"))
+                def repeat_failure(signum, frame):
+                    fail("injected second terminal failure")
+                    (root / "reentrant-returned").touch()
+                signal.signal(signal.SIGUSR2, repeat_failure)
+    server.FrontendClient = FailureFrontend
+if sys.argv[3] == "admission-cancel":
+    original_stop = server.CoordinatorReactor.stop_admission
+    async def cancel_admission_shutdown(self):
+        await original_stop(self)
+        raise asyncio.CancelledError()
+    server.CoordinatorReactor.stop_admission = cancel_admission_shutdown
 server.launch_server("127.0.0.1", int(sys.argv[2]),
                      {"model": "test", "backend": "pytorch", "num_serve_frontends": 2})
 """
@@ -209,9 +341,13 @@ def _wait_until(predicate, timeout=90):
         "child-hang",
         "launcher-death",
         "shutdown",
+        "admission-cancel",
+        "blocked-failure-log",
         "startup-signal",
         "child-startup-signal",
         "child-startup-engine-failure",
+        "startup-coordinator-withdraw",
+        "startup-coordinator-withdraw-delayed",
     ],
 )
 def test_frontend_group_cleanup(tmp_path, failure):
@@ -252,6 +388,38 @@ def test_frontend_group_cleanup(tmp_path, failure):
         elif failure == "child-startup":
             assert process.wait(timeout=90) != 0
             assert (tmp_path / "shutdown-0").exists()
+        elif failure in ("startup-coordinator-withdraw", "startup-coordinator-withdraw-delayed"):
+            _wait_until(lambda: (tmp_path / "server-start-paused").exists())
+            child_pid = int((tmp_path / "pid-1").read_text())
+            # Keep the child alive until the launcher's post-start check passes.
+            os.kill(child_pid, signal.SIGSTOP)
+
+            async def withdraw():
+                directory = (tmp_path / "coordinator-directory").read_text()
+                connection = _Connection(f"unix:{directory}/coordinator")
+                try:
+                    await connection.request({"operation": "withdraw", "frontend": 1})
+                finally:
+                    await connection.close()
+
+            asyncio.run(withdraw())
+            failure_marker = (
+                "owner-failure-delayed"
+                if failure == "startup-coordinator-withdraw-delayed"
+                else "withdraw-fenced"
+            )
+            _wait_until(lambda: (tmp_path / failure_marker).exists(), timeout=3)
+            (tmp_path / "resume-server-start").touch()
+            assert process.wait(timeout=30) != 0
+            if failure == "startup-coordinator-withdraw-delayed":
+                assert (tmp_path / "set-ready-before-failure").exists()
+                assert (
+                    "CoordinationError: OpenEngine coordinator is fenced: "
+                    "OpenEngine frontend 1 is stopping"
+                ) in log_path.read_text()
+            else:
+                assert "RuntimeError: OpenEngine frontend 1 is stopping" in log_path.read_text()
+            assert (tmp_path / "shutdown-0").exists()
         else:
             with grpc.insecure_channel(f"127.0.0.1:{port}") as channel:
                 control = rpc.ControlStub(channel)
@@ -279,9 +447,56 @@ def test_frontend_group_cleanup(tmp_path, failure):
                 process.kill()
                 process.wait(timeout=10)
                 _wait_until(lambda: (tmp_path / "shutdown-1").exists(), timeout=20)
+            elif failure == "blocked-failure-log":
+
+                async def reserve(request_id):
+                    directory = (tmp_path / "coordinator-directory").read_text()
+                    connection = _Connection(f"unix:{directory}/coordinator")
+                    try:
+                        return await connection.request(
+                            {
+                                "operation": "reserve",
+                                "request_id": request_id,
+                                "token": "generation",
+                                "frontend": 1,
+                            }
+                        )
+                    finally:
+                        await connection.close()
+
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    earlier = executor.submit(asyncio.run, reserve("before-terminal-failure"))
+                    try:
+                        _wait_until(
+                            lambda: (tmp_path / "reservation-health-paused").exists(), timeout=3
+                        )
+                        os.kill(process.pid, signal.SIGUSR1)
+                        _wait_until(
+                            lambda: (tmp_path / "publication-entered").exists()
+                            or (tmp_path / "failure-logging").exists(),
+                            timeout=3,
+                        )
+                        (tmp_path / "release-reservation-health").touch()
+                        assert earlier.result(timeout=3) == {"reserved": True}
+                        assert (tmp_path / "health-before-publication").read_text() == "True"
+                        _wait_until(lambda: (tmp_path / "failure-logging").exists(), timeout=3)
+                        assert asyncio.run(reserve("after-terminal-failure")) == {
+                            "ready": False,
+                            "reserved": False,
+                        }
+                        os.kill(process.pid, signal.SIGUSR2)
+                        _wait_until(lambda: (tmp_path / "reentrant-returned").exists(), timeout=3)
+                    finally:
+                        (tmp_path / "release-reservation-health").touch()
+                        (tmp_path / "release-failure-log").touch()
+                assert process.wait(timeout=30) != 0
+                assert "RuntimeError: injected first terminal failure" in log_path.read_text()
+                assert (tmp_path / "shutdown-0").exists()
+                assert (tmp_path / "shutdown-1").exists()
             else:
                 process.terminate()
-                assert process.wait(timeout=30) == 0
+                return_code = process.wait(timeout=30)
+                assert (return_code == 0) == (failure == "shutdown")
                 assert (tmp_path / "shutdown-0").exists()
                 assert (tmp_path / "shutdown-1").exists()
 
