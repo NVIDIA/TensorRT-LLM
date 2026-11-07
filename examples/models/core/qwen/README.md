@@ -82,12 +82,12 @@ pushd Model-Optimizer
 pip install -e .
 
 # Quantize the Qwen3-235B-A22B model by nvfp4
-# By default, the checkpoint would be stored in `Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/`.
-./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4 --export_fmt hf
+# By default, the checkpoint would be stored in `Model-Optimizer/examples/hf_ptq/saved_models_Qwen3-235B-A22B_nvfp4/`.
+./examples/hf_ptq/scripts/huggingface_example.sh --model Qwen3-235B-A22B/ --quant nvfp4
 
-# Quantize the Qwen3-32B model by fp8_pc_pt
-# By default, the checkpoint would be stored in `Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-32B_fp8_pc_pt_hf/`.
-./examples/llm_ptq/scripts/huggingface_example.sh --model Qwen3-32B/ --quant fp8_pc_pt --export_fmt hf
+# Quantize the Qwen3-32B model by fp8_per_channel_per_token
+# By default, the checkpoint would be stored in `Model-Optimizer/examples/hf_ptq/saved_models_Qwen3-32B_fp8_per_channel_per_token/`.
+./examples/hf_ptq/scripts/huggingface_example.sh --model Qwen3-32B/ --quant fp8_per_channel_per_token
 popd
 ```
 
@@ -98,7 +98,7 @@ To run the benchmark, we suggest using the `trtllm-bench` tool. Please refer to 
 ```bash
 #!/bin/bash
 
-folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+folder_model=Model-Optimizer/examples/hf_ptq/saved_models_Qwen3-235B-A22B_nvfp4/
 path_config=config.yml
 num_gpus=8
 ep_size=8
@@ -138,7 +138,7 @@ trtllm-bench --model ${folder_model} --model_path ${folder_model} throughput \
 We suggest benchmarking with a real dataset. It will prevent from having improperly distributed tokens in the MoE. Here, we use the `aa_prompt_isl_1k_osl_2k_qwen3_10000samples.txt` dataset. It has 10000 samples with an average input length of 1024 and an average output length of 2048. If you don't have a dataset (this or another) and you want to run the benchmark, you can use the following command to generate a random dataset:
 
 ```bash
-folder_model=Model-Optimizer/examples/llm_ptq/saved_models_Qwen3-235B-A22B_nvfp4_hf/
+folder_model=Model-Optimizer/examples/hf_ptq/saved_models_Qwen3-235B-A22B_nvfp4/
 min_input_len=1024
 min_output_len=2048
 concurrency=128
