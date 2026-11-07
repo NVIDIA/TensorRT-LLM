@@ -20,6 +20,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import async_tensor_h2d, maybe_pin_memory
+
 from ...trtllm import TrtllmAttentionMetadata
 from .common import build_paged_kv_slot_mapping
 
@@ -554,7 +556,7 @@ def build_runtime_metadata_from_kv_manager(
 
     # Expand block ids -> per-token slot ids.
     # slot_id = block_id * tokens_per_block + offset_within_block
-    block_ids_dev = block_ids.to(device).to(torch.int64)
+    block_ids_dev = maybe_pin_memory(block_ids).to(device, non_blocking=True).to(torch.int64)
     within_block = torch.arange(tokens_per_block, device=device, dtype=torch.int64)
     # Outer product per batch entry: [batch, max_blocks, tokens_per_block]
     slot_grid = block_ids_dev.unsqueeze(-1) * tokens_per_block + within_block
@@ -596,10 +598,12 @@ def build_runtime_metadata_from_kv_manager(
         for ext in extend_seq_lens_cpu:
             cu_q.append(cu_q[-1] + int(ext))
         total_q = cu_q[-1]
-        cu_seqlens_q_src = torch.tensor(cu_q, dtype=torch.int32, device=device)
+        cu_seqlens_q_src = async_tensor_h2d(cu_q, torch.int32, device)
+        # output_size keeps repeat_interleave from reading the repeat total back from the GPU.
         q_batch_row_src = torch.repeat_interleave(
             torch.arange(batch, device=device, dtype=torch.int32),
-            torch.tensor(extend_seq_lens_cpu, dtype=torch.int64, device=device),
+            async_tensor_h2d(extend_seq_lens_cpu, torch.int64, device),
+            output_size=total_q,
         )
         q_positions_src, out_cache_loc_src = derive_q_positions_and_cache_slots(
             req_to_token, prefix_lens_dev, cu_seqlens_q_src, q_batch_row_src
@@ -821,7 +825,7 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
             int(num_cached_per_seq[b]) + int(seq_lens_cpu[b].item()) for b in range(batch_size)
         ]
         kv_lens_cpu = torch.tensor(kv_lens_cpu_list, dtype=torch.int32)
-        kv_lens_dev = kv_lens_cpu.to(device=cache_device, non_blocking=True)
+        kv_lens_dev = async_tensor_h2d(kv_lens_cpu, torch.int32, cache_device)
 
         static_buffers = self._maybe_get_m3_static_buffers(cache_device, kv_cache_manager)
 
@@ -833,11 +837,7 @@ class MiniMaxM3AttentionMetadata(TrtllmAttentionMetadata):
             extend_seq_lens_cpu = [
                 kv_lens_cpu_list[b] - prefix_lens_list[b] for b in range(batch_size)
             ]
-            prefix_lens = torch.tensor(
-                prefix_lens_list,
-                dtype=torch.int32,
-                device=cache_device,
-            )
+            prefix_lens = async_tensor_h2d(prefix_lens_list, torch.int32, cache_device)
             m3_meta, out_cache_loc = build_runtime_metadata_from_kv_manager(
                 kv_cache_manager=kv_cache_manager,
                 request_ids=request_ids,

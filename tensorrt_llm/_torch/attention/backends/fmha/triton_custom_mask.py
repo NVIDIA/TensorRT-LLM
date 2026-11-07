@@ -335,4 +335,6 @@ class TritonCustomMaskFmha(PhasedFmha):
                 fwd.kv_scale_quant_orig if QuantMode(attn.quant_mode).has_fp8_kv_cache() else None
             ),
             out_scale=fwd.out_scale if params.output.dtype == torch.float8_e4m3fn else None,
+            # Host max of context_lengths, which cu_q_seqlens is built from.
+            max_len_extend=params.input_seq_length,
         )

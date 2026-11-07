@@ -333,6 +333,29 @@ class TestTritonPrefillNoPrefix:
         ref = _sdpa_reference(q, k, v, mask=masks, sm_scale=sm_scale)
         torch.testing.assert_close(output, ref, atol=1e-2, rtol=1e-2)
 
+        # A host max_len_extend skips the GPU readback and gives the same output.
+        output_host_max = torch.zeros_like(q)
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            triton_prefill_with_custom_mask(
+                q=q,
+                k=k,
+                v=v,
+                output=output_host_max,
+                qo_indptr=qo_indptr,
+                kv_cache=None,
+                prefix_lens=prefix_lens,
+                page_table_indptr=page_table_indptr,
+                page_table_indices=page_table_indices,
+                page_size=1,
+                custom_mask=mask_flat,
+                sm_scale=sm_scale,
+                max_len_extend=max(seq_lens),
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        assert torch.equal(output_host_max, output)
+
     def test_batch_bidirectional_mixed(self, device):
         """Batch with some seqs having image tokens, some text-only."""
         torch.manual_seed(42)
