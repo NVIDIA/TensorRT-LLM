@@ -6204,7 +6204,7 @@ __device__ __noinline__ void issueBlockedEarly(Ctx const& ctx, int blocker, int 
     }
 }
 
-#include "glmMegakernelStages.cuh"
+#include "glm_moe_dsa/glm_5_2_nvfp4__sm_107__low_latency/csrc/glmMegakernelStages.cuh"
 
 // ----------------------------------------------------------------------------------------------------------------
 // Kernel

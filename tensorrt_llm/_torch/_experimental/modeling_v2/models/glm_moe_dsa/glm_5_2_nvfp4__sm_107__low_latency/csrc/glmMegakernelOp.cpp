@@ -131,12 +131,17 @@ TRTLLM_MV2_NAMESPACE_END
 
 TRTLLM_MV2_LIBRARY_FRAGMENT(m)
 {
-    m.def("glm_megakernel_info() -> int[]", &TRTLLM_MV2_NS::torch_ext::glmMegakernelInfo);
+    m.def("glm_megakernel_info() -> int[]");
     m.def("glm_megakernel_indexer_tmap(Tensor pool, int rows) -> Tensor");
     m.def("glm_megakernel_weight_table(Tensor(a!) params, int offset) -> ()");
     m.def(
         "glm_megakernel(Tensor params, Tensor x, Tensor residual, Tensor(a!) topk, Tensor block_table, "
         "Tensor kv_lens, Tensor(b!)[] state, Tensor(c!)[] kv_cache, bool pdl) -> (Tensor, Tensor)");
+}
+
+TRTLLM_MV2_LIBRARY_IMPL(CompositeExplicitAutograd, m)
+{
+    m.impl("glm_megakernel_info", &TRTLLM_MV2_NS::torch_ext::glmMegakernelInfo);
 }
 
 TRTLLM_MV2_LIBRARY_IMPL(CUDA, m)
