@@ -1,0 +1,122 @@
+# Text Watermarking
+
+TensorRT-LLM can embed a statistical watermark in generated text while it samples tokens, so that an
+operator holding the secret key can later test whether a piece of text came from the service. Some
+regions require AI-generated content to be marked this way.
+
+The watermark uses a keyed Gumbel-max draw in place of the random draw of the final token selection.
+Temperature, top-k, top-p and min-p are applied first, so the output distribution is unchanged on
+average over keys. Detection needs only the token ids, the tokenizer and the key.
+
+This feature is a prototype: the API and the detection recipe may change.
+
+## Enable it
+
+```python
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.watermark import WatermarkConfig
+
+llm = LLM(model="Qwen/Qwen3-1.7B", watermark_config=WatermarkConfig(key=123456789))
+out = llm.generate(["Write a short note about GPUs."], SamplingParams(temperature=0.8, max_tokens=200))
+```
+
+`WatermarkConfig` fields:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `algorithm` | `"gumbel"` | `"gumbel"` or `"gumbel_dual_key"`. Dual-key additionally supports speculative decoding with rejection sampling (see below). |
+| `key` | required | Secret integer in `[0, 2**64)`. Detection needs the same value. Excluded from `repr`. |
+| `context_width` | 4 | Number of preceding tokens that seed each decision, 1 to 64. Larger values are less robust to edits; above 16 a warning is logged. |
+| `deduplicate_contexts` | `"single_turn"` | A repeated context would repeat its token and count as independent evidence, so it falls back to ordinary sampling. `"none"` disables this; `"single_turn"` searches the tokens the request generates; `"all"` also searches the prompt (for example earlier turns of a conversation) and leaves the first `context_width` generated tokens unwatermarked. |
+| `deduplicate_contexts_max_history` | 8192 | How many generated positions back the repeat search reaches. `None` means the whole generation. GPU memory is 8 bytes per position per sequence slot (about 134 MB for 2048 slots at the default), capped at 512 MiB. |
+| `allow_target_only_watermarking` | `False` | Only for speculative decoding with rejection sampling: leave accepted draft tokens unmarked (see below). |
+| `allow_request_opt_out` | `True` | Whether a request may set `SamplingParams.watermarking=False`. Set to `False` to enforce the watermark on every request that can carry one. |
+| `prf` | `"philox"` | Pseudo-random function. Fast but not cryptographic: it does not protect against key recovery or forgery. |
+
+With `trtllm-serve`, put `watermark_config: {key: ...}` in the `--config` YAML. Per request,
+`SamplingParams.watermarking` (and the `watermarking` field of the OpenAI-compatible completion and chat
+requests) set to `False` opts out; see the next section.
+
+## Which requests are watermarked
+
+| Request | Watermarked? |
+|---------|--------------|
+| The engine has no `watermark_config` | No. |
+| `SamplingParams.watermarking=False` | No, unless the engine sets `allow_request_opt_out=False`. |
+| `watermarking=None` (the default) or `True` | Follows the engine: watermarked if it has a `watermark_config`. `True` does not force a watermark on an engine without one; only `False` changes the outcome. |
+| Greedy (`temperature=0`) or beam search | No. The request is generated normally and a warning is logged once. |
+| A sampled request | Yes, token by token. A token whose context repeats (`deduplicate_contexts`), the first `context_width` tokens with `"all"`, and the accepted drafts with `allow_target_only_watermarking` use ordinary sampling. |
+
+## Speculative decoding
+
+Watermarking works with the one-model speculative modes (Eagle3, MTP, DraftTarget and the others that
+share their verification).
+
+- **Exact-match verification (the default).** A draft token is accepted only when it equals the token
+  the target itself sampled at that position, so the output is exactly what plain decoding with the
+  same key produces, and the watermark strength does not depend on the acceptance rate.
+- **Rejection sampling (`use_rejection_sampling=True`).** Accepted draft tokens were not sampled from
+  the target, so they need care. Two modes are supported:
+  - `algorithm="gumbel_dual_key"` draws the draft tokens under the key and the token that follows the
+    accepted prefix under a second key derived from it. The two draws and the accept decisions are
+    independent, so the output distribution stays exact. The detector tests every token against both
+    keys. Requires an autoregressive drafter (Eagle3, MTP, DraftTarget).
+  - `allow_target_only_watermarking=True` leaves accepted draft tokens unmarked and watermarks only the
+    token that follows them. The signal weakens as the acceptance rate rises.
+
+  Without one of these, a watermarked request fails at admission. `gumbel_dual_key` is also rejected at
+  admission with parallel-draft speculation.
+
+## Detect it
+
+```python
+from tensorrt_llm.watermark import GumbelWatermarkDetector, WatermarkConfig
+
+detector = GumbelWatermarkDetector(WatermarkConfig(key=123456789))
+result = detector.detect(output_token_ids, prompt_token_ids=prompt_token_ids)
+print(result.p_value, result.is_watermarked)
+```
+
+`result.num_tokens` is the number of tokens given and `result.num_scored` the number of positions that could carry the
+mark (repeated contexts and, with `"all"`, the first tokens are not scored). A watermarked response with few scored
+positions, or whose tokens the model was nearly certain about, cannot reach a small p-value; the engine does not count
+keyed tokens per request, because that would need a device-to-host read on every step.
+
+Tokenize text with the tokenizer used for generation. The configuration must match generation: key,
+`context_width`, PRF and deduplication settings (a smaller `deduplicate_contexts_max_history` than the engine's lowers detection power). Without `prompt_token_ids` the first `context_width`
+positions are not scored. A fixed key reuses random values across documents, so the nominal p-value
+assumes independent inputs; measure the false-positive rate on representative unwatermarked text
+before relying on a decision. Detection outputs can help an attacker imitate or strip the watermark.
+
+## Compatibility
+
+See the Text Watermarking row of the [feature combination matrix](feature-combination-matrix.md). Notes on
+specific combinations:
+
+- Disaggregated serving: configure the context and generation workers with the same `watermark_config`.
+- Logits post-processor: it edits the logits before the watermark draw, so tokens it bans are never sampled
+  and the mark steers among the rest. It cannot be combined with speculative decoding, which the executor
+  already rejects.
+- KV cache reuse: the first request matches an engine without reuse. A later request that hits the cache can
+  differ in its sampled text through bf16 numerics, as it does without the watermark, and is still detected.
+- Guided decoding: untested. The grammar mask is applied before the watermark draw, so the mark can only
+  steer among the tokens the grammar allows.
+
+## Limitations
+
+- Sampling becomes deterministic given the context, and repeated contexts are not watermarked.
+- Parallel sampling (`n > 1`) is supported, but watermarked candidates can be identical while their
+  contexts remain identical. The same holds for repeated requests with the same prompt. A request
+  `seed` does not change a watermarked draw: it only affects the tokens that ordinary sampling picks
+  for repeated contexts, which is the only source of divergence between candidates.
+- Low-entropy output (code, short answers) and heavily edited text carry little signal.
+- A fixed key applies the same random values wherever a context recurs across requests. For answers
+  of one token from a small set (multiple choice, labels) many requests share their context, so the key
+  can move accuracy up or down by several points; the average over keys is unbiased.
+  `deduplicate_contexts="all"` leaves the first `context_width` generated tokens unwatermarked and
+  avoids this, at the price of no mark on very short outputs.
+- Not supported, and rejected by the engine:
+  - NGram and user-provided drafts: at startup.
+  - DSpark speculation (its verification windows are ragged): when the LLM arguments are validated.
+  - Tree (dynamic tree) speculation, relaxed acceptance for thinking, and rejection sampling without a
+    dual-key or target-only setting: at request admission.

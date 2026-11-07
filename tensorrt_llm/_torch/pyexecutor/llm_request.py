@@ -720,6 +720,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode: LogprobMode = LogprobMode.RAW,
             logprobs_simple_format: bool = False,
             return_routed_experts: bool = False,
+            watermarking: Optional[bool] = None,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -832,6 +833,10 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_logprobs_simple_format = logprobs_simple_format
+        # SamplingParams.watermarking: None/True requests a watermark, False opts out.
+        self.py_watermarking = watermarking
+        # Cached by TorchSampler: the request filters nothing but its temperature.
+        self.py_watermark_neutral: Optional[bool] = None
         # Router Replay: attach routed_experts to this request's output.
         self.py_return_routed_experts = return_routed_experts
         self.py_return_context_logits = return_context_logits
@@ -1251,6 +1256,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             logprobs_mode=self.py_logprobs_mode,
             logprobs_simple_format=self.py_logprobs_simple_format,
             return_routed_experts=self.py_return_routed_experts,
+            watermarking=self.py_watermarking,
             embedding_bias=deepcopy(self.py_embedding_bias),
             position_ids=deepcopy(self.py_position_ids),
             guided_decoding_params=deepcopy(self.py_guided_decoding_params),
@@ -1738,6 +1744,7 @@ def executor_request_to_llm_request(
         logprobs_mode=inputs.logprobs_mode,
         logprobs_simple_format=inputs.logprobs_simple_format,
         return_routed_experts=inputs.return_routed_experts,
+        watermarking=inputs.watermarking,
     )
 
     # Bad-words list for the TorchSampler path, kept in its native
