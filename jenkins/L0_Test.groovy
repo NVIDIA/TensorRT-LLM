@@ -2632,6 +2632,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     "--no-container-mount-home",
                     // Other CI variables inherit the exported job environment.
                     // BASH_ENV must override the CI image's /etc/bash.bashrc default.
+                    // Keep overrides in one option; Slurm forwards only its last occurrence.
                     "--container-env=BASH_ENV"
                 ]
 

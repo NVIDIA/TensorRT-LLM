@@ -2547,8 +2547,9 @@ def launchJob(pipeline, jobName, reuseBuild, enableFailFast, globalVars, additio
     // runBranchesWithInfraDefer in L0_Test.groovy and Build.groovy). That is incomplete coverage,
     // not a failure: throwing here is exactly what trips the per-arch failFast and
     // cancels the healthy sibling architecture, so do NOT throw. Mark the build
-    // UNSTABLE (visible + re-runnable) and let the sibling finish. FAILURE and
-    // ABORTED still throw below, so real failures fail-fast exactly as before.
+    // UNSTABLE (visible + re-runnable) and let the sibling finish. With default
+    // propagation, FAILURE and ABORTED still throw below; callers opting out
+    // inspect and handle those returned statuses themselves.
     if (buildStatus == "UNSTABLE") {
         catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
             error "Downstream job ${jobName} is infra-incomplete (UNSTABLE); sibling not cancelled"
