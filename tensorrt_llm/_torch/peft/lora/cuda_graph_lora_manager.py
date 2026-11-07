@@ -21,7 +21,7 @@ from ...._utils import nvtx_range
 from ....logger import logger
 from ...attention.backends.interface import AttentionMetadata
 from ...pyexecutor.resource_manager import PeftCacheManager
-from ...pyexecutor.scheduler import ScheduledRequests
+from ...pyexecutor.scheduler import RequestList, ScheduledRequests
 from .adapter_slot_manager import AdapterSlotManager
 from .cuda_graph_lora_params import CudaGraphLoraParams
 from .layer import LoraLayer
@@ -181,6 +181,24 @@ class CudaGraphLoraManager:
                     module_num=len(module.lora_module_types),
                     output_sizes=module.output_hidden_sizes,
                 )
+
+    def fits_batch(self, requests: RequestList) -> bool:
+        """Whether the adapter slots can hold every distinct adapter of a batch.
+
+        The scheduler admits as many distinct adapters as the PEFT device cache
+        holds, which can be more than ``max_lora_size``. A batch with more
+        distinct adapters than slots cannot run as a LoRA CUDA graph.
+
+        Args:
+            requests: The generation requests of one batch.
+
+        Returns:
+            True when the requests use at most ``max_lora_size`` distinct LoRA task ids.
+        """
+        distinct_tasks = {
+            request.lora_task_id for request in requests if request.lora_task_id is not None
+        }
+        return len(distinct_tasks) <= self.max_lora_size
 
     @nvtx_range("prepare_cuda_graph_lora_params")
     def prepare_cuda_graph_lora_params(

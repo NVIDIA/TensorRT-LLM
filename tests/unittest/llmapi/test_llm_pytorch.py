@@ -15,7 +15,8 @@ from tensorrt_llm import LLM
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 from tensorrt_llm.executor import GenerationExecutorWorker, RequestError
 from tensorrt_llm.executor.rpc_proxy import GenerationExecutorRpcProxy
-from tensorrt_llm.llmapi import CacheTransceiverConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (CacheTransceiverConfig, CudaGraphConfig,
+                                 KvCacheConfig)
 from tensorrt_llm.llmapi.llm_args import (NGramDecodingConfig, SchedulerConfig,
                                           WaitingQueuePolicy)
 from tensorrt_llm.metrics import MetricNames
@@ -24,7 +25,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 # isort: off
 from .lora_test_utils import (create_mock_nemo_lora_checkpoint,
                               compare_cuda_graph_lora_params_filler,
-                              CUDAGraphLoRATestParams,
+                              CUDAGraphLoRATestParams, QWEN3_MODEL_DIR,
+                              qwen3_lora_adapter,
                               test_lora_with_and_without_cuda_graph)
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, global_kvcache_config_no_reuse,
@@ -531,6 +533,44 @@ def test_gemma3_1b_instruct_multi_lora(cuda_graph_config) -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+@pytest.mark.part2
+def test_lora_cuda_graph_batch_with_more_adapters_than_slots() -> None:
+    """A decode batch with more distinct adapters than LoRA CUDA graph slots completes.
+
+    ``max_loras`` is unset, so the LoRA CUDA graph keeps its default eight
+    adapter slots while the PEFT cache admits more adapters than that.
+    """
+    num_requests = 9
+    with qwen3_lora_adapter() as adapter_path:
+        llm = LLM(str(QWEN3_MODEL_DIR),
+                  lora_config=LoraConfig(
+                      lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                      max_lora_rank=8),
+                  cuda_graph_config=CudaGraphConfig(
+                      batch_sizes=[1, 2, 4, 8, 16], enable_padding=True))
+        with llm:
+            prompts = ["The capital of France is"] * num_requests
+            sampling_params = SamplingParams(max_tokens=8)
+            one_task = [LoRARequest("shared", 0, str(adapter_path))
+                        ] * num_requests
+            distinct_tasks = [
+                LoRARequest(f"task-{i}", i + 1, str(adapter_path))
+                for i in range(num_requests)
+            ]
+            expected = llm.generate(prompts,
+                                    sampling_params,
+                                    lora_request=one_task)
+            outputs = llm.generate(prompts,
+                                   sampling_params,
+                                   lora_request=distinct_tasks)
+
+    # The eager and CUDA-graph LoRA paths may round differently, so the texts
+    # are compared for similarity rather than equality.
+    for output, reference in zip(outputs, expected, strict=True):
+        assert output.outputs[0].text
+        assert similar(output.outputs[0].text, reference.outputs[0].text)
 
 
 @skip_gpu_memory_less_than_40gb
