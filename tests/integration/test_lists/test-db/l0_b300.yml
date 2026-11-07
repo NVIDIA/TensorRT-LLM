@@ -198,7 +198,6 @@ l0_b300:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_construction.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_gemv.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drafter.py
-  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_drift.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_moe_routing.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_noaux_tc_mxfp8_quant.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_route_b_moe.py

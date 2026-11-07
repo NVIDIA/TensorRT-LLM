@@ -23,6 +23,8 @@ import pytest
 
 import tensorrt_llm._torch._experimental.modeling_v2 as _modeling_v2
 
+pytestmark = pytest.mark.cpu_only
+
 # The package, not this file: the targets live under tensorrt_llm/ while this test lives under tests/.
 _FAMILY = Path(_modeling_v2.__file__).resolve().parent / "models" / "kimi_k3_vl"
 _ROUTE_A = _FAMILY / "kimi_k3_mxfp4__sm_100__tp16_moetp4ep4"

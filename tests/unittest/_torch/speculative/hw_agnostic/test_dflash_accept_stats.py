@@ -13,6 +13,8 @@ import os
 
 import pytest
 
+pytestmark = pytest.mark.cpu_only
+
 try:
     from tensorrt_llm._torch.speculative import accept_stats
 except ImportError:  # pragma: no cover - torch-less host fallback
