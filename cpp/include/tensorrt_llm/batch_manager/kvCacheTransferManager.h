@@ -77,6 +77,13 @@ public:
     //! must be called after the last call to KVCacheManager::addSequenceBatch in every step.
     void syncTransfers();
 
+    //! \brief Make a target buffer-manager stream wait for already-scheduled onboard copies and block the host until
+    //! those copies are ready for host-initiated transfer reads.
+    //! \details This is used by cache-transfer formatting, whose private stream may differ from the KV manager's
+    //! stream. Unlike syncTransfers(), this is not an iteration-boundary API and does not clear pending-transfer
+    //! bookkeeping.
+    void syncOnboardToBufferManager(tr::BufferManager const& bufferManager);
+
     //! \brief Get transfer stats accumulated since last call, and reset the counters.
     [[nodiscard]] KvCacheTransferStats getAndResetTransferStats();
 
