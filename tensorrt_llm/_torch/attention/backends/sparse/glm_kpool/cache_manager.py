@@ -40,7 +40,9 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import Role
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import MambaHybridCacheManagerV2
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import _host_slots_to_device
 from tensorrt_llm._torch.pyexecutor.resource_manager import get_pp_layers
+from tensorrt_llm._utils import async_tensor_h2d
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -201,9 +203,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if slots:
             with replay.on_cache_stream(self._stream):
                 replay.seed_transferred_slots(
-                    torch.tensor(
-                        slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device
-                    )
+                    _host_slots_to_device(slots, replay.prev_num_accepted_tokens.device)
                 )
 
     @override
@@ -256,9 +256,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         self._kda_replay.relocate_slots(old_slots, new_slots)
         fresh_slots = [new for old, new in zip(old_slots, new_slots) if old < 0]
         if fresh_slots:
-            slots = torch.tensor(
-                fresh_slots, dtype=torch.long, device=self.cuda_state_indices.device
-            )
+            slots = _host_slots_to_device(fresh_slots, self.cuda_state_indices.device)
             self._kda_replay.reset_slots(slots, fresh_slots)
 
     @override
@@ -311,20 +309,20 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         if not active_requests:
             return
         device = replay.prev_num_accepted_tokens.device
-        state_indices = torch.tensor(
+        state_indices = async_tensor_h2d(
             [state_index_map[request.py_request_id] for request in active_requests],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
-        accepted_drafts = torch.tensor(
+        accepted_drafts = async_tensor_h2d(
             [request.py_num_accepted_draft_tokens for request in active_requests],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
-        is_dummy_request = torch.tensor(
+        is_dummy_request = async_tensor_h2d(
             [dummy_map.get(request.py_request_id, False) for request in active_requests],
-            dtype=torch.bool,
-            device=device,
+            torch.bool,
+            device,
         )
         replay.record_acceptance(state_indices, accepted_drafts, is_dummy_request)
 
@@ -343,7 +341,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         )
         if slots:
             replay.seed_transferred_slots(
-                torch.tensor(slots, dtype=torch.long, device=replay.prev_num_accepted_tokens.device)
+                _host_slots_to_device(slots, replay.prev_num_accepted_tokens.device)
             )
 
     def seed_kda_replay_caches_for_disagg_gen(self, request_ids: list[int]) -> None:

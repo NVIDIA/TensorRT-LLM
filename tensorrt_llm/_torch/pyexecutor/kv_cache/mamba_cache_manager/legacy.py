@@ -52,7 +52,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import (
     get_pp_layers,
 )
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import nvtx_range, prefer_pinned, torch_dtype_to_binding
+from tensorrt_llm._utils import async_tensor_h2d, nvtx_range, prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
@@ -1559,10 +1559,10 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
         )
         device = self._impl.mamba_cache.temporal.device
         num_contexts = len(scheduled_batch.context_requests)
-        num_accepted = torch.tensor(
+        num_accepted = async_tensor_h2d(
             [0] * num_contexts + [r.py_num_accepted_draft_tokens + 1 for r in gen_requests],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
         # Batch-ordered slots (contexts then gens), matching the ordering
         # the forward used for the intermediate scratch buffers. Requests
@@ -1572,13 +1572,13 @@ class MixedMambaHybridCacheManager(KVCacheManager, MambaCacheManager, MambaHybri
         # the reserved padding slot (a harmless scratch write).
         slot_index = self.mamba_cache_index
         padding_slot = self._impl._padding_slot
-        state_indices = torch.tensor(
+        state_indices = async_tensor_h2d(
             [
                 slot_index.get(r.py_request_id, padding_slot)
                 for r in scheduled_batch.context_requests + gen_requests
             ],
-            dtype=torch.int32,
-            device=device,
+            torch.int32,
+            device,
         )
         self.update_mamba_states(attn_metadata, num_accepted, state_indices)
 
