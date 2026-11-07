@@ -241,12 +241,12 @@ def _tiny_cached_model(hidden=32):
 def test_frozen_constant_cache_fills_from_either_loader_walk(stage):
     """Both loader walks must reach both cache owners.
 
-    `ModelLoader` has two post-load walks and they look up *different* names
-    (`pyexecutor/model_loader.py`):
+    The model loader has two post-load walks and they look up *different*
+    names (`models/checkpoints/model_hooks.py`):
 
-    * `_walk_full_post_load` looks up `post_load_weights`. This is the
+    * `walk_full_post_load` looks up `post_load_weights`. This is the
       branch the ordinary load takes.
-    * `_walk_cache_state` looks up `cache_derived_state`. This is the branch
+    * `walk_cache_state` looks up `cache_derived_state`. This is the branch
       the GPU-memory-service read-only reader and the staged-receiver path take;
       an RO rank never calls the MuseSparkOpen weight mapper at all, it zero-copy
       imports weights another rank committed and then runs exactly this stage.
