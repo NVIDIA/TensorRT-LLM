@@ -235,8 +235,7 @@ REQUIRED_ENGINE_FIELDS = {
 }
 
 #: Stock code the generic path runs outside the catalog, declared so it is not consumed silently: every
-#: tensorrt_llm import of this module that computes (test_modeling_v2_claims.py checks the list both ways). An entry
-#: leaves the list when a catalog entry replaces it.
+#: tensorrt_llm import of this module that computes. An entry leaves the list when a catalog entry replaces it.
 UNCERTIFIED_GENERIC_CALLS = (
     # The checkpoint load and the engine hooks this target inherits, and the causal LM around the text model.
     "tensorrt_llm._torch.models.modeling_kimi_linear.KimiLinearForCausalLM",

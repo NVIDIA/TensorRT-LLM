@@ -8,10 +8,10 @@ outcomes are ``NoTarget`` (this installation does not carry the target, so
 installed library is broken, which is never a fallback).
 
 The last is the load smoke test of the installed wheel: every family library in
-``tensorrt_llm/libs`` opens in a fresh process, names the targets it carries, and
-defines no op the target's fake_ops.py does not fake. A library aborts its
-process from a static initializer if two libraries claim one torch namespace, so
-each one is opened in a child process.
+``tensorrt_llm/libs`` opens in a fresh process and defines no op its family's or
+target's fake_ops.py does not fake. A library aborts its process from a static
+initializer if two libraries claim one torch namespace, so each one is opened in
+a child process.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ import subprocess
 import sys
 import textwrap
 import types
-from pathlib import Path
 
 import pytest
 
@@ -60,12 +59,22 @@ def libs(monkeypatch, tmp_path):
 
 def test_names():
     assert namespace_of(_TARGET) == _TARGET_NS
-    assert namespace_of(f"{_TARGET}.ops.moe.entry") == _TARGET_NS
+    assert namespace_of(f"{_TARGET}.fake_ops") == _TARGET_NS
     assert namespace_of(f"{_FAMILY}.fake_ops") == "mv2_gpt_oss"
+    assert namespace_of(f"{_FAMILY}.any_name.fake_ops") == "mv2_gpt_oss_any_name"
     with pytest.raises(ValueError):
         namespace_of("tensorrt_llm._torch.models")
+    with pytest.raises(ValueError, match="fake_ops module"):
+        namespace_of(f"{_TARGET}.ops.moe.entry")
     with pytest.raises(ValueError, match="models.<family>.<target>"):
         load_target_ops(f"{_TARGET}.weights")
+
+
+def test_a_target_loads_whatever_its_name(libs, monkeypatch):
+    ops = types.SimpleNamespace(mv2_gpt_oss=object(), mv2_gpt_oss_any_name=object())
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(ops=ops))
+    libs.install(lambda: frozenset({"any_name"}))
+    assert load_target_ops(f"{_FAMILY}.any_name") is ops.mv2_gpt_oss_any_name
 
 
 def test_what_is_not_built_and_what_is_broken(libs):
@@ -109,9 +118,21 @@ _LOAD_ONE_FAMILY = textwrap.dedent(
     import tensorrt_llm  # noqa: F401 -- loads libth_common.so
     from tensorrt_llm._torch._experimental.modeling_v2 import _native
 
-    built = sorted(_native._load_family_library(sys.argv[1]))
-    schemas = sorted(s.name for s in torch._C._jit_get_all_schemas() if s.name.startswith("mv2_"))
-    print(json.dumps({"built": built, "ops": schemas}))
+    family = sys.argv[1]
+    built = sorted(_native._load_family_library(family))
+    # Loading each target imports its fake_ops.py, so the fakes below are the registered ones.
+    for target in built:
+        _native.load_target_ops(f"{_native._MODELS_PACKAGE}.{family}.{target}")
+    namespaces = {_native._namespace(family)} | {_native._namespace(family, t) for t in built}
+    ops = [
+        s.name + (f".{s.overload_name}" if s.overload_name else "")
+        for s in torch._C._jit_get_all_schemas()
+        if s.name.split("::")[0] in namespaces
+        # built_targets() is the library's own metadata query, not a tensor op.
+        and s.name != f"{_native._namespace(family)}::built_targets"
+    ]
+    unfaked = sorted(op for op in ops if not torch._C._dispatch_has_kernel_for_dispatch_key(op, "Meta"))
+    print(json.dumps({"built": built, "unfaked": unfaked}))
     """
 )
 
@@ -120,7 +141,6 @@ def test_every_installed_family_library_loads():
     libraries = sorted(_native._LIBS_DIR.glob("libth_modeling_v2_*.so"))
     if not libraries:
         pytest.skip("this installation has no modeling_v2 family library")
-    models = Path(_native.__file__).resolve().parent / "models"
     for library in libraries:
         family = library.name[len("libth_modeling_v2_") : -len(".so")]
         result = subprocess.run(
@@ -132,14 +152,7 @@ def test_every_installed_family_library_loads():
             f"{library.name} failed to load:\n{result.stdout}\n{result.stderr}"
         )
         report = json.loads(result.stdout.strip().splitlines()[-1])
+        # The build installs a family library only when it compiles one of the family's targets.
         assert report["built"], f"{library.name} carries no target"
-        for target in report["built"]:
-            assert (models / family / target / "__init__.py").is_file(), (
-                f"{library.name} carries {target}, which has no Python target package"
-            )
-            prefix = f"{_native._namespace(family, target)}::"
-            target_ops = [op[len(prefix) :] for op in report["ops"] if op.startswith(prefix)]
-            fake_ops = models / family / target / "fake_ops.py"
-            text = fake_ops.read_text() if fake_ops.is_file() else ""
-            unfaked = [op for op in target_ops if f'::{op}"' not in text]
-            assert not unfaked, f"{family}/{target} defines {unfaked} with no fake in fake_ops.py"
+        unfaked = report["unfaked"]
+        assert not unfaked, f"{library.name} defines {unfaked} with no fake in a fake_ops.py"

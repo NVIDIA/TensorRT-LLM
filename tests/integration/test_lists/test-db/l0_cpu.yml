@@ -14,8 +14,8 @@ l0_cpu:
   tests:
   - unittest/_torch/modeling_v2/models/minimax_m3/test_shared_kernel_contracts.py
   - unittest/_torch/modeling_v2/models/minimax_m3/test_collective_launcher_cleanup.py
-  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_eagle3_worker_api.py
-  - unittest/_torch/modeling_v2/models/minimax_m3/spec/test_modeling_v2_spec_tail_contracts.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/test_modeling_v2_eagle3_worker_api.py
+  - unittest/_torch/modeling_v2/models/minimax_m3/ops/spec/test_modeling_v2_spec_tail_contracts.py
   # MiniMax-M3 Rubin target unit tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/test_modeling_v2_m3_drafter_fullctx_cells.py
   # MiniMax-M3 target unit tests.
@@ -78,12 +78,12 @@ l0_cpu:
   - unittest/_torch/peft
   - unittest/_torch/memory
   - unittest/_torch/modeling
-  # modeling_v2 routing and routing-table claims: config shapes and a monkeypatched
+  # modeling_v2 routing and routing-table checks: config shapes and a monkeypatched
   # compute capability, no device. The default targets' shard tests: small CPU
   # tensors and the CPU block_scale_interleave. The rest of unittest/_torch/modeling_v2
   # needs a GPU.
-  - unittest/_torch/modeling_v2/test_modeling_v2_claims.py
-  - unittest/_torch/modeling_v2/test_modeling_v2_native_claims.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py
+  - unittest/_torch/modeling_v2/test_modeling_v2_contracts.py
   - unittest/_torch/modeling_v2/test_modeling_v2_native_loader.py
   - unittest/_torch/modeling_v2/test_modeling_v2_rank_agreement.py
   - unittest/_torch/modeling_v2/test_modeling_v2_env_scope.py
@@ -92,7 +92,7 @@ l0_cpu:
   - unittest/_torch/modeling_v2/test_modeling_v2_routing.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_equality.py
   - unittest/_torch/modeling_v2/comm/test_modeling_v2_rank_job.py
-  # l0_b300 selects unittest/_torch/modeling_v2 with -m "not cpu_only", so this entry is what runs it.
+  # The GPU stages run with -m "not cpu_only", so this entry is what runs it.
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_kimi_k3_decode_step.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_modeling_v2_k3_mnnvl_workspace.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_k3_decode_worker.py
@@ -101,8 +101,9 @@ l0_cpu:
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_draft_block_rows.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_drafter_comm.py
   - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_spec_worker_gate.py
-  - unittest/_torch/modeling_v2/models/deepseek_v3/test_modeling_v2_deepseek_default_shards.py
-  - unittest/_torch/modeling_v2/models/gpt_oss/test_modeling_v2_gpt_oss_default_shards.py
+  - unittest/_torch/modeling_v2/models/kimi_k3_vl/test_kimi_k3_uncertified_generic_calls.py
+  - unittest/_torch/modeling_v2/models/deepseek_v3/r1_0528_nvfp4__sm_10x__default/test_modeling_v2_deepseek_default_shards.py
+  - unittest/_torch/modeling_v2/models/gpt_oss/gpt_oss_120b__sm_10x__default/test_modeling_v2_gpt_oss_default_shards.py
   # MiniMax-M3 sm_107 tp2 target: its device-free (cpu_only) tests.
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_block_table_contract.py
   - unittest/_torch/modeling_v2/models/minimax_m3/minimax_m3_nvfp4__sm_107__tp2/attention/test_modeling_v2_m3_n_valid_contract.py

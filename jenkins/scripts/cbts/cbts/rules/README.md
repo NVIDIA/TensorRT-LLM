@@ -17,7 +17,7 @@ for the overall CBTS architecture.
 | `test_list.py` | `TestListRule` | `testlistonly` | `tests/integration/test_lists/test-db/*.yml` |
 | `visual_gen.py` | `VisualGenRule` | `visualgenonly` | `examples/visual_gen/**`, `scripts/visualgen_eval/**`, `tensorrt_llm/_torch/visual_gen/**`, `tensorrt_llm/media/**`, `tensorrt_llm/visual_gen/**` (each excl. docs), and the exact VisualGen serve schema |
 | `spec_dec.py` | `SpecDecRule` | `specdeconly` | `tensorrt_llm/_torch/speculative/**`, `tensorrt_llm/models/{eagle,medusa,redrafter}/**`, `examples/{eagle,medusa,redrafter,draft_target_model,ngram}/**`, `examples/llm-api/llm_speculative_decoding.py` (each excl. docs) |
-| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per model node for changes under `models/` |
+| `modeling_v2.py` | `ModelingV2Rule` | `modelingv2only` | `tensorrt_llm/_torch/_experimental/modeling_v2/**`, `cpp/tensorrt_llm/modeling_v2/**`, `cpp/cmake/modules/modeling_v2.cmake` (excl. docs); per target or family for changes under `models/` and `catalog/<category>/`, from paths and imports |
 | `agent_flow.py` | `AgentFlowRule` | `agentflowonly` | `agent-flow/**` (excl. docs and out-of-scope metadata) → the single `CPU-AgentFlow-UnitTest` stage; not test-db-driven |
 | `openengine.py` | `OpenEngineRule` | `openengineonly` | `tensorrt_llm/grpc/openengine/**` (excl. docs) → the `l0_cpu` block containing `unittest/grpc/openengine/` |
 | `docs.py` | `DocsRule` | `docsonly` | Outside noop paths: `docs/**` and verified Python docstring edits → `CPU-Build_Docs` plus documentation-related CPU tests; other `**/*.md` / `**/*.rst` → `CPU-Build_Docs` only |
@@ -339,7 +339,7 @@ Outcomes:
 
 ## ModelingV2Rule
 
-Path-only rule. Claims non-documentation source changes under
+Path and import rule. Claims non-documentation source changes under
 `tensorrt_llm/_torch/_experimental/modeling_v2/`, the self-contained second modeling
 path (one flat forward per checkpoint/arch/parallel triple, assembled
 from a catalog of op wrappers), including each family's native code
@@ -348,14 +348,57 @@ per model family, loaded only when routing picks one of the family's targets),
 plus what every family library shares: `cpp/tensorrt_llm/modeling_v2/` and the
 native build module `cpp/cmake/modules/modeling_v2.cmake`.
 
-Scope — per model node, else all of modeling_v2: source changes under
-`models/` (native `csrc/` included) select the nearest model node's unit tests
-and the accuracy gates of its targets. Family-shared code selects the whole
-family. A covering directory entry is retained when no more specific entry
-exists, unless it ignores that node. Whole-tree unit checks are always retained.
-Shared Python or native infrastructure selects every modeling_v2 entry, as does
-an unreadable routing tree. If no modeling_v2 entry matches, the rule falls back
-to baseline.
+Scope — per target, per family, else all of modeling_v2. Targets are
+defined by code, and the test tree mirrors the code tree. A directory
+`models/<family>/<target>/` is a target when a function in the family's
+`routing.py` decorated with `@routes(...)` returns a class that `routing.py`
+imports with `from .<target>... import <Class>`. Its tests are
+`unittest/_torch/modeling_v2/models/<family>/<target>` and
+`accuracy/modeling_v2/<family>/<target>`. Everything else under
+`models/<family>/` is family code. When `routing.py` is missing, does not
+parse, or returns anything else, every path of the family is family code and
+the whole family's tests stand in for those of its targets. The CPU check
+`tests/unittest/_torch/modeling_v2/test_modeling_v2_ci_selection.py` requires
+every target to have an accuracy directory and every accuracy directory to
+name a target.
+
+| Changed file | Selects |
+|---|---|
+| Any file in a target, native code included | Only that target's tests |
+| Python family code | Its mirror unit directory under `models/<family>/`, else the family-level unit tests (test files directly in the family's unit directory and its non-target subdirectories); plus the tests of every target that imports it, and every unit test file that imports it |
+| Python family code no target imports (such as `routing.py`) | The whole family: `unittest/_torch/modeling_v2/models/<family>` and `accuracy/modeling_v2/<family>`; plus every unit test file that imports it |
+| Non-Python family file | The whole family |
+| Python file under `catalog/<category>/` | `unittest/_torch/modeling_v2/<category>` plus the tests of every target that imports it and every unit test file that imports it; every modeling_v2 entry if that directory does not exist |
+| Any other file: `catalog/_op.py`, files directly under the subtree, `models/` or `catalog/`, the shared native build | Every modeling_v2 entry |
+
+The rule reads imports from the checkout, which in CI is the PR head: it
+parses every Python file of the subtree and of `tests/unittest/_torch/modeling_v2/`
+once per run. Imports and routing are read by `modeling_v2_source.py`, a
+standard-library-only module that the CPU check above loads by path, so the
+rule and the check read imports the same way. Relative imports, package `__init__` files, imports inside
+functions and constant `importlib.import_module` calls count, also when the
+file binds `import_module` to another name. A module depends on its own
+packages as well, since importing it runs their `__init__` files. A computed
+`import_module` argument counts as importing every module under the file's
+directory. Names under the subtree count whether or not their file exists, so
+a deleted or moved module still selects the targets and tests that import it.
+
+"Every unit test file that imports it" means any `test_*.py` under
+`unittest/_torch/modeling_v2/`, mirror directory or not, that imports the
+changed module or a module that reaches it, directly or through a test helper.
+Tests import helpers (`_validating`, `_cells`, `_k3_*`, ...) by bare name after
+putting different directories on `sys.path`, so a bare name matches every file
+of that name in the unit test tree. This over-selects rather than misses.
+
+Import paths stop at the files directly under the subtree, `models/` or
+`catalog/`, since those reach every family. A file that does not parse widens
+import-based selection to the whole family or to every entry. Selections of
+several files union.
+
+A covering directory entry is retained when no more specific entry exists,
+unless it ignores that path. Whole-tree unit checks directly under
+`unittest/_torch/modeling_v2/` are always retained. If no modeling_v2 entry
+matches, the rule falls back to baseline.
 
 `.md` exclusion carries more weight here than elsewhere: every catalog
 entry ships a contract document, so roughly a fifth of the subtree is
@@ -370,15 +413,17 @@ in `backend: pytorch` blocks beside everything else. A block belongs to
 modeling_v2 iff one of its `tests:` entries matches
 `_MV2_ENTRY_PATTERNS`:
 
-- `unittest/_torch/modeling_v2/` — the unit tests: one directory entry
-  (`--ignore` of `comm/`) that collects the catalog matrix and every
-  family's tests under `models/<family>`, plus `comm/` on
-  `l0_gb300_multi_gpus` for the 4-rank collectives.
-- `test_modeling_v2_` — the accuracy gates, and any future unit file.
+- `unittest/_torch/modeling_v2/` — the unit tests. `l0_b300` has one entry
+  per GPU-run top-level file, catalog category and target (Kimi K3's flat
+  family directory has one entry per file), so the selected prefixes map
+  onto entries. `comm/` runs on `l0_gb300_multi_gpus` for the 4-rank
+  collectives, and the `cpu_only` files run on `l0_cpu`.
+- `accuracy/modeling_v2/` — the accuracy tests, one directory per target.
+- `test_modeling_v2_` — any future unit file named by the subtree's convention.
 
-Both markers are exact by construction rather than by luck: every test
-file in the subtree is named `test_modeling_v2_*` precisely so it cannot
-collide with the upstream test of the same op. So unlike `SpecDecRule`'s
+The markers are exact by construction rather than by luck: the unit
+tests and the accuracy tests each live in their own `modeling_v2/`
+directory. So unlike `SpecDecRule`'s
 `mtp_nextn`, no substring here can claim an unrelated entry and no
 carve-out is needed.
 
