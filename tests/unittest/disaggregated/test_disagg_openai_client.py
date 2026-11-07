@@ -533,8 +533,9 @@ class TestOpenAIHttpClient:
         assert first_token_after == [len(sent) - 1]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("single_read", [False, True])
     async def test_streaming_perf_metrics_preserve_sse_event_boundaries(
-        self, openai_client, streaming_completion_request, mock_session, mock_router
+        self, openai_client, streaming_completion_request, mock_session, mock_router, single_read
     ):
         openai_client._request_perf_metrics = True
         mock_http_response = AsyncMock()
@@ -549,6 +550,10 @@ class TestOpenAIHttpClient:
         marker_split = len("event: trtllm")
 
         async def mock_iter_any():
+            if single_read:
+                # The last token, [DONE] and the trailer can arrive in one read.
+                yield response_data + done_data + metrics_data
+                return
             yield response_data
             yield done_data + metrics_data[:marker_split]
             yield metrics_data[marker_split:]
@@ -559,13 +564,17 @@ class TestOpenAIHttpClient:
         mock_http_response.__aexit__ = AsyncMock()
         mock_session.post.return_value = mock_http_response
         hooks = MagicMock(spec=ResponseHooks)
+        events = []
+        hooks.on_resp_done.side_effect = lambda *args: events.append("on_resp_done")
 
         response_generator = await openai_client.send_request(
             streaming_completion_request, hooks=hooks
         )
-        chunks = [chunk async for chunk in response_generator]
+        async for chunk in response_generator:
+            events.append(chunk)
 
-        assert chunks == [response_data, done_data]
+        # on_resp_done records the request, so it must run before [DONE] is forwarded.
+        assert events == [response_data, "on_resp_done", done_data]
         hooks.on_first_token.assert_called_once_with("localhost:8000", streaming_completion_request)
         hooks.on_perf_metrics.assert_called_once()
         hooks.on_resp_done.assert_called_once_with(
@@ -576,8 +585,9 @@ class TestOpenAIHttpClient:
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("payload", ["not-json", "[1]"])
     async def test_malformed_streaming_metrics_do_not_fail_request(
-        self, openai_client, streaming_completion_request, mock_session, mock_router
+        self, openai_client, streaming_completion_request, mock_session, mock_router, payload
     ):
         openai_client._request_perf_metrics = True
         mock_http_response = AsyncMock()
@@ -585,7 +595,7 @@ class TestOpenAIHttpClient:
         mock_http_response.headers = {"Content-Type": "text/event-stream"}
 
         response_data = b'data: "Hello"\n\ndata: [DONE]\n\n'
-        metrics_data = f"event: {SSE_METRICS_EVENT}\ndata: not-json\n\n".encode()
+        metrics_data = f"event: {SSE_METRICS_EVENT}\ndata: {payload}\n\n".encode()
 
         async def mock_iter_any():
             yield b""
@@ -1650,6 +1660,30 @@ class TestRequestCleanup:
         )
         client._metrics_collector.error_requests.inc.assert_called_once_with()
         client._metrics_collector.completed_requests.inc.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("trailer_bytes", [0, 10])
+    async def test_upstream_break_in_metrics_trailer_still_forwards_done(
+        self, client, streaming_completion_request, mock_session, mock_router, trailer_bytes
+    ):
+        # [DONE] is held back until the trailer is read. If the upstream breaks while
+        # the trailer is arriving, the request is complete and the client still needs [DONE].
+        client._request_perf_metrics = True
+        token = b'data: "first"\n\n'
+        done = b"data: [DONE]\n\n"
+        trailer = f"event: {SSE_METRICS_EVENT}\ndata: {{}}\n\n".encode()
+
+        async def chunks():
+            yield token + done + trailer[:trailer_bytes]
+            raise aiohttp.ClientPayloadError("connection closed in trailer")
+
+        mock_session.post.return_value = self._response(chunks)
+        response = await client.send_request(streaming_completion_request, req_id=42)
+
+        assert b"".join([chunk async for chunk in response]) == token + done
+        mock_router.finish_request.assert_awaited_once_with(
+            streaming_completion_request, mock_session, success=True, req_id=42
+        )
 
 
 class TestRemoteTailHandoffRetry:
