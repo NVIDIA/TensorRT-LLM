@@ -1064,6 +1064,36 @@ def nanosleep(ns, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def mbarrier_wait_acquire_cluster(mbar_ptr, phase, *, loc=None, ip=None):
+    """Wait for a phase of this CTA's mbarrier with ``.acquire.cluster`` semantics.
+
+    The scheduler response is written into this CTA's SMEM by the leader CTA's
+    ``st.async``, whose complete-tx releases at cluster scope. The pipeline's
+    default wait acquires at CTA scope and does not synchronize with a thread of
+    another CTA, so the response would be read unordered against that store.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            cutlass.Int32(phase).ir_value(loc=loc, ip=ip),
+        ],
+        "{"
+        " .reg .pred phase_complete;"
+        " WAIT_LOOP:"
+        " mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
+        " phase_complete, [$0], $1, 10000000;"
+        " @!phase_complete bra WAIT_LOOP;"
+        "}",
+        "r,r",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def sigmoid_f32(
     a: Union[float, cutlass.Float32], fastmath: bool = False
 ) -> Union[float, cutlass.Float32]:
@@ -3505,8 +3535,13 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     )
                                 )
                                 fc1_scheduler_producer_state.advance()
-                            fc1_scheduler_pipeline.consumer_wait(
-                                fc1_scheduler_consumer_state
+                            # The leader's st.async releases at cluster scope:
+                            # acquire at cluster scope before reading the response.
+                            mbarrier_wait_acquire_cluster(
+                                fc1_scheduler_pipeline.sync_object_full.get_barrier(
+                                    fc1_scheduler_consumer_state.index
+                                ),
+                                fc1_scheduler_consumer_state.phase,
                             )
                             work_tile = fc1_tile_sched.get_published_work()
                             fc1_scheduler_pipeline.consumer_release(
@@ -3604,8 +3639,13 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                     )
                                 )
                                 fc2_scheduler_producer_state.advance()
-                            fc2_scheduler_pipeline.consumer_wait(
-                                fc2_scheduler_consumer_state
+                            # The leader's st.async releases at cluster scope:
+                            # acquire at cluster scope before reading the response.
+                            mbarrier_wait_acquire_cluster(
+                                fc2_scheduler_pipeline.sync_object_full.get_barrier(
+                                    fc2_scheduler_consumer_state.index
+                                ),
+                                fc2_scheduler_consumer_state.phase,
                             )
                             fc2_work_tile = fc2_tile_sched.get_published_work()
                             fc2_scheduler_pipeline.consumer_release(
