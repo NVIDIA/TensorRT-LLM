@@ -13,6 +13,8 @@ import threading
 import pytest
 import zmq
 
+from tensorrt_llm._errors import ConfigInputError, RuntimeInitError
+from tensorrt_llm._startup_errors import classify_startup_error
 from tensorrt_llm._torch.disaggregation.native import utils as network_utils
 from tensorrt_llm.executor import remote_worker_process_monitor as remote
 from tensorrt_llm.executor.proxy import GenerationExecutorProxy
@@ -116,9 +118,18 @@ def test_unresolvable_watch_host_reports_configuration_error(monkeypatch, overri
         raise failure
 
     monkeypatch.setattr(remote.socket, "getaddrinfo", resolve)
-    with pytest.raises(RuntimeError, match="TRTLLM_WORKER_WATCH_HOST") as error:
+    with pytest.raises(RuntimeInitError, match="TRTLLM_WORKER_WATCH_HOST") as error:
         remote.RemoteWorkerProcessMonitor(1)
     assert error.value.__cause__ is failure
+    assert error.value.hint == remote.WORKER_WATCH_HINT
+
+
+@pytest.mark.parametrize("port", ["not-a-port", "0", "65536"])
+def test_invalid_watch_port_is_a_configuration_error(monkeypatch, port):
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_PORT", port)
+    with pytest.raises(ConfigInputError, match="TRTLLM_WORKER_WATCH_PORT"):
+        remote.RemoteWorkerProcessMonitor(1)
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
@@ -177,12 +188,17 @@ def test_unreachable_watch_helper_reports_rank_endpoint_and_configuration_hint(m
         endpoint = remote.ProcessWatchEndpoint(
             f"tcp://127.0.0.1:{reservation.getsockname()[1]}", b"test-key"
         )
-        with pytest.raises(RuntimeError) as error:
+        with pytest.raises(RuntimeInitError) as error:
             remote.WorkerProcessWatch(endpoint, 7)
     message = str(error.value)
     assert "MPI rank 7" in message
     assert endpoint.address in message
+    # Launchers that forward only text keep the hint in the message.
     assert "TRTLLM_WORKER_WATCH_HOST" in message and "firewall" in message
+    info = classify_startup_error(error.value)
+    assert info.category == "runtime_init"
+    assert info.hint == remote.WORKER_WATCH_HINT
+    assert "firewall" not in info.summary
 
 
 def test_shutdown_before_worker_submission_closes_remote_monitor(monkeypatch):
@@ -219,6 +235,7 @@ def test_queued_heartbeats_prevent_false_death_after_receiver_pause(monkeypatch)
     monitor._failure = None
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {r["rank"]: (r, 0.0) for r in reports}
+    monitor._returned = {}
     frames = deque(dict(r, sequence=1) for r in reports)
 
     def poll(_timeout):
@@ -252,6 +269,7 @@ def test_continuous_traffic_cannot_hide_an_expired_rank(monkeypatch, invalid_sig
     monitor._failure = None
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {0: (reports[0], 100.0), 1: (reports[1], 0.0)}
+    monitor._returned = {}
     received = 0
 
     def poll(_timeout):
@@ -298,6 +316,7 @@ def _paused_receiver(monkeypatch, buffered_until_first_wait):
     monitor._failure = None
     reports = [dict(rank=r, pid=r + 1, host="worker", sequence=0, kind="alive") for r in (0, 1)]
     monitor._seen = {r["rank"]: (r, clock[0]) for r in reports}
+    monitor._returned = {}
     frames = deque()
     paused = []
     empty_polls = []
@@ -350,3 +369,44 @@ def test_silent_rank_still_expires_after_a_receiver_pause(monkeypatch):
     assert monitor._wake.is_set()
     assert monitor.failure["rank"] == 1
     assert monitor.failure["reason"] == "heartbeat timed out"
+
+
+def test_worker_call_outcome_precedes_a_returned_report(monkeypatch):
+    # Regression: a worker call that raised in a live process sent its final
+    # helper report before MPI delivered the exception, so a generic liveness
+    # loss replaced the worker's classified startup or runtime error.
+    monkeypatch.setenv("TRTLLM_WORKER_WATCH_HOST", "127.0.0.1")
+    monkeypatch.setattr(remote, "_RETURN_GRACE", 1.5)
+    wake = threading.Event()
+    monitor = WorkerProcessMonitor()
+    endpoint = monitor.start_remote(1, wake)
+    worker = subprocess.Popen(
+        [sys.executable, "-c", _WORKER], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True
+    )
+    try:
+        worker.stdin.write(
+            json.dumps(
+                {"module": remote.__file__, "address": endpoint.address, "key": endpoint.key.hex()}
+            )
+            + "\n"
+        )
+        worker.stdin.flush()
+        worker.stdout.readline()
+        assert monitor.wait_remote_ready()
+        # The worker call ends while its process stays alive.
+        worker.stdin.write("stop\n")
+        worker.stdin.flush()
+        assert worker.wait(timeout=3) == 0
+        assert not wake.wait(0.4), "A returned call failed before MPI could report it"
+        assert monitor.find_dead_worker() is None
+        assert wake.wait(3), "A returned call without an MPI result stayed invisible"
+        dead = monitor.find_dead_worker()
+        assert dead is not None and dead.rank == 0 and dead.pid == worker.pid
+        assert monitor._remote.failure["reason"] == "worker returned without an MPI result"
+    finally:
+        monitor.close()
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait(timeout=3)
+        worker.stdin.close()
+        worker.stdout.close()

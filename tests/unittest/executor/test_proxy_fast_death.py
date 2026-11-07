@@ -25,6 +25,7 @@ from unittest.mock import Mock as _Mock
 import pytest
 import zmq
 
+from tensorrt_llm._errors import RuntimeInitError
 from tensorrt_llm._startup_errors import (
     StartupErrorInfo,
     classify_startup_error,
@@ -1052,12 +1053,14 @@ def test_remote_supervision_failure_after_ready_preserves_startup_error():
     pending = _FakeResult()
     proxy._results = {1: pending}
 
-    with pytest.raises(RuntimeError, match="supervision is unavailable") as error:
+    with pytest.raises(RuntimeInitError, match="supervision is unavailable") as error:
         proxy._start_executor_workers({})
 
     cause = error.value.__cause__
-    assert isinstance(cause, RuntimeError)
+    assert isinstance(cause, RuntimeInitError) and cause.reason == "worker_died"
     assert "rank 1 (pid 4321)" in str(cause)
+    # The rank loss, not the generic supervision failure, names the next step.
+    assert classify_startup_error(error.value).reason == "worker_died"
     assert proxy._fatal_error is cause
     assert pending.queue.get_nowait().root_cause is cause
     called = [call[0] for call in proxy.mpi_session.mock_calls]
