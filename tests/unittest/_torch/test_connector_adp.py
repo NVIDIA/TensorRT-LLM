@@ -61,6 +61,8 @@ def _request(request_id: int, *, dummy: bool = False) -> MagicMock:
     req.context_current_position = 0
     req.context_remaining_length = 8
     req.context_chunk_size = 8
+    req.py_orig_prompt_len = 8
+    req.total_input_len_cp = 8
     req.get_tokens.return_value = list(range(8))
     req.py_draft_tokens = []
     req.kv_cache_retention_config = None
@@ -103,7 +105,11 @@ def _configure_recovery_controls(executor: "PyExecutor") -> None:
     executor.enable_early_first_token_response = False
     executor.gather_all_responses = False
     executor.kv_connector_manager = None
+    executor._fetch_hint_enabled = False
+    executor._packed_sync_enabled = False
+    executor._stage_timing = False
     executor.kv_cache_transceiver = None
+    executor.model_engine = SimpleNamespace(cuda_graph_runner=None)
     executor.dwdp_manager = None
     executor._is_kv_manager_v2 = False
     executor._kv_load_tracker = KvLoadTracker(None, rank=0, enabled=False)
@@ -1299,8 +1305,8 @@ def test_idle_fleet_polls_saves_without_new_traffic(outcome: str) -> None:
         else:
             # Only the existing routing allgather runs when no transfers exist.
             for executor in executors:
-                executor.dist.tp_allgather_int64.assert_not_called()
-                assert executor.dist.tp_allgather.call_count == 3
+                executor.dist.tp_allgather.assert_not_called()
+                assert executor.dist.tp_allgather_int64.call_count == 3
 
 
 def test_ready_owner_polls_save_during_peer_recovery() -> None:
