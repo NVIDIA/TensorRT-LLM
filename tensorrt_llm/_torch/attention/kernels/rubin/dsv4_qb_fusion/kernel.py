@@ -1530,6 +1530,10 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             if cutlass.const_expr(self.use_tma_store):
                 if warp_idx == 0:
                     cute.arch.cp_async_bulk_wait_group(0)
+            # Every epilogue warp has fenced its last TMEM load (fence_view_async_tmem_load and
+            # tcgen05.fence::before_thread_sync above) before warp 0 frees the accumulator. The
+            # TMA store mode already orders the warps per tile; the STG mode has no other barrier.
+            self.epilog_sync_barrier.arrive_and_wait()
             tmem.relinquish_alloc_permit()
             tmem.free(acc_tmem_ptr)
             iket.range_pop()
