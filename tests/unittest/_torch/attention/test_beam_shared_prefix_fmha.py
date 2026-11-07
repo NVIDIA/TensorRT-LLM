@@ -29,6 +29,8 @@ from utils.llm_data import llm_models_root
 
 from tensorrt_llm._torch.attention.backends.fmha.beam_shared_prefix import (
     LIB_NAME,
+    _StepIndices,
+    fused_tail_and_merge,
     merge_prefix_and_tail,
     metadata_eligible,
     plan_step,
@@ -151,6 +153,90 @@ def _beam_meta(manager, *, beam_width=4, request_ids=(7, 9), kv_lens=(11, 7),
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("tail_len", [0, 1, 3])
+@pytest.mark.parametrize("group", [1, 2, 4, 8])
+def test_fused_tail_and_merge_matches_unfused_reference(group, tail_len, head_dim, dtype):
+    """The fused kernel reproduces the unfused tail attention and merge, and the KV write."""
+    torch.manual_seed(0)
+    device = "cuda"
+    num_kv_heads, tokens_per_block, rows = 2, 16, 24
+    num_heads = num_kv_heads * group
+    num_pages = 3 * rows
+    sm_scale = head_dim**-0.5
+    pool = torch.randn(num_pages, 2, num_kv_heads, tokens_per_block, head_dim, device=device).to(
+        dtype
+    )
+    # q, k and v are strided slices of one packed QKV tensor, as in the model.
+    qkv = torch.randn(rows, (num_heads + 2 * num_kv_heads) * head_dim, device=device).to(dtype)
+    q = qkv[:, : num_heads * head_dim].view(rows, num_heads, head_dim)
+    k = qkv[:, num_heads * head_dim :][:, : num_kv_heads * head_dim].view(
+        rows, num_kv_heads, head_dim
+    )
+    v = qkv[:, (num_heads + num_kv_heads) * head_dim :].view(rows, num_kv_heads, head_dim)
+    prefix_out = torch.randn(rows, num_heads, head_dim, device=device).to(dtype)
+    prefix_lse = torch.randn(rows, num_heads, device=device) * 2
+    prefix_empty = torch.zeros(rows, dtype=torch.bool, device=device)
+    prefix_empty[::7] = True
+
+    # Current tokens go to their own pages; past positions live in a disjoint range.
+    write_page = torch.arange(rows, device=device, dtype=torch.int64)
+    write_slot = torch.randint(0, tokens_per_block, (rows,), device=device, dtype=torch.int64)
+    tail_page = tail_slot = tail_valid = None
+    if tail_len:
+        tail_page = torch.randint(rows, 3 * rows, (rows, tail_len), device=device)
+        tail_slot = torch.randint(0, tokens_per_block, (rows, tail_len), device=device)
+        tail_valid = torch.rand(rows, tail_len, device=device) > 0.3
+    indices = _StepIndices(
+        step=0,
+        write_page=write_page,
+        write_slot=write_slot,
+        tail_page=tail_page,
+        tail_slot=tail_slot,
+        tail_valid=tail_valid,
+        prefix_empty=prefix_empty,
+        captured=False,
+    )
+
+    if tail_len:
+        k_all = torch.cat([pool[tail_page, 0, :, tail_slot, :], k.unsqueeze(1)], dim=1)
+        v_all = torch.cat([pool[tail_page, 1, :, tail_slot, :], v.unsqueeze(1)], dim=1)
+        valid = torch.cat([tail_valid, torch.ones(rows, 1, dtype=torch.bool, device=device)], 1)
+    else:
+        k_all, v_all, valid = k.unsqueeze(1), v.unsqueeze(1), None
+    expected = merge_prefix_and_tail(
+        q,
+        k_all,
+        v_all,
+        valid,
+        prefix_out,
+        prefix_lse,
+        num_kv_heads=num_kv_heads,
+        sm_scale=sm_scale,
+        prefix_empty=prefix_empty,
+    )
+
+    output = torch.empty(rows, num_heads, head_dim, device=device, dtype=dtype)
+    fused_tail_and_merge(
+        q,
+        k,
+        v,
+        pool,
+        indices,
+        prefix_out,
+        prefix_lse,
+        output,
+        tail_len=tail_len,
+        num_kv_heads=num_kv_heads,
+        sm_scale=sm_scale,
+    )
+    torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(pool[write_page, 0, :, write_slot, :], k, atol=0, rtol=0)
+    torch.testing.assert_close(pool[write_page, 1, :, write_slot, :], v, atol=0, rtol=0)
+
+
 def test_only_kv_manager_v2_with_one_table_per_pool_is_eligible():
     """The library reads the V2 block table: a V1 manager (no index mapper) and a V2 manager with
     per-layer page tables (indexed by local layer, not by pool) are declined."""
@@ -192,18 +278,39 @@ def _qwen3_small_path():
     return path if path.exists() else None
 
 
-def _run_beam_search(model_path, prompts, beam_width, max_tokens, env):
+def _run_beam_search(
+    model_path, prompts, beam_width, max_tokens, env, max_num_tokens=None, iterations=None
+):
+    """Beam search over ``prompts``; ``iterations`` collects per-step batch kinds.
+
+    ``max_num_tokens`` below the whole prompt set makes later requests prefill
+    while earlier ones decode. ``iterations`` (needs the single-process worker)
+    gets the number of generation steps that carried context requests (``mixed``)
+    and that the library planned (``planned``).
+    """
     from tensorrt_llm import LLM, SamplingParams
+    from tensorrt_llm._torch.attention.backends.fmha import beam_shared_prefix as lib
     from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
     previous = {key: os.environ.get(key) for key in env}
     os.environ.update(env)
+    plan_step = lib.plan_step
+    if iterations is not None:
+        iterations.update(mixed=0, planned=0)
+
+        def counting_plan_step(metadata):
+            plan_step(metadata)
+            iterations["mixed"] += int(metadata.num_contexts > 0 and metadata.num_generations > 0)
+            state = metadata.fmha_plan_caches.get(LIB_NAME)
+            iterations["planned"] += int(state is not None and state.plan is not None)
+
+        lib.plan_step = counting_plan_step
     try:
         llm = LLM(
             model=str(model_path),
             max_beam_width=beam_width,
             max_batch_size=len(prompts),
-            max_num_tokens=max(len(p) for p in prompts) * len(prompts),
+            max_num_tokens=max_num_tokens or max(len(p) for p in prompts) * len(prompts),
             max_seq_len=max(len(p) for p in prompts) + max_tokens + 1,
             kv_cache_config=KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.3),
             cuda_graph_config=CudaGraphConfig(batch_sizes=[len(prompts)]),
@@ -225,11 +332,31 @@ def _run_beam_search(model_path, prompts, beam_width, max_tokens, env):
             for out in outputs
         ]
     finally:
+        lib.plan_step = plan_step
         for key, value in previous.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def _assert_beams_match(reference, candidate, beam_width):
+    for ref_beams, cand_beams in zip(reference, candidate):
+        assert len(cand_beams) == beam_width
+        ref_tokens = [tokens for tokens, _ in ref_beams]
+        cand_tokens = [tokens for tokens, _ in cand_beams]
+        # Kernel numerics differ slightly, so allow the ranking of a few
+        # near-tied beams to move; the sets must agree almost entirely.
+        overlap = len(set(ref_tokens) & set(cand_tokens)) / beam_width
+        assert overlap >= 0.9, (overlap, ref_tokens, cand_tokens)
+        assert cand_tokens[0] == ref_tokens[0]
+        # Compare each beam present in both runs by its tokens: a near-tied pair
+        # that swaps rank must not pair up unrelated beams.
+        cand_logprobs = dict(cand_beams)
+        for tokens, ref_lp in ref_beams:
+            cand_lp = cand_logprobs.get(tokens)
+            if ref_lp is not None and cand_lp is not None:
+                assert abs(ref_lp - cand_lp) < 0.1 + 0.02 * abs(ref_lp)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -267,15 +394,48 @@ def test_beam_shared_prefix_matches_fallback_e2e():
         },
     )
 
-    for ref_beams, cand_beams in zip(reference, candidate):
-        assert len(cand_beams) == beam_width
-        ref_tokens = [tokens for tokens, _ in ref_beams]
-        cand_tokens = [tokens for tokens, _ in cand_beams]
-        # Kernel numerics differ slightly, so allow the ranking of a few
-        # near-tied beams to move; the sets must agree almost entirely.
-        overlap = len(set(ref_tokens) & set(cand_tokens)) / beam_width
-        assert overlap >= 0.9, (overlap, ref_tokens, cand_tokens)
-        assert cand_tokens[0] == ref_tokens[0]
-        for (tokens, ref_lp), (_, cand_lp) in zip(ref_beams, cand_beams):
-            if ref_lp is not None and cand_lp is not None:
-                assert abs(ref_lp - cand_lp) < 0.1 + 0.02 * abs(ref_lp)
+    _assert_beams_match(reference, candidate, beam_width)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(_qwen3_small_path() is None, reason="Qwen3-0.6B checkpoint not available")
+@pytest.mark.threadleak(enabled=False)
+def test_beam_shared_prefix_matches_fallback_in_mixed_batches_e2e():
+    """Generation rows that share a step with context requests use the library.
+
+    The token budget fits only two of the four prompts per step, so the other two
+    prefill while the first pair decodes. The context phase runs on the regular
+    library and the generation rows on this one.
+    """
+    model_path = _qwen3_small_path()
+    vocab = 150000
+    prompts = [
+        [1024 + ((17 * i + 13 * p) % (vocab - 1024)) for p in range(n)]
+        for i, n in enumerate((300, 173, 260, 220))
+    ]
+    beam_width, max_tokens = 16, 3
+    max_num_tokens = 300 + 173 + 2 * beam_width
+
+    base_env = {"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}
+    reference = _run_beam_search(
+        model_path, prompts, beam_width, max_tokens, base_env, max_num_tokens=max_num_tokens
+    )
+    iterations = {}
+    candidate = _run_beam_search(
+        model_path,
+        prompts,
+        beam_width,
+        max_tokens,
+        base_env
+        | {
+            "TLLM_FMHA_LIBS": f"+{LIB_NAME}",
+            "TLLM_BEAM_SHARED_PREFIX_CHECK": "1",
+            "TLLM_BEAM_SHARED_PREFIX_MAX_TAIL": str(max_tokens - 1),
+        },
+        max_num_tokens=max_num_tokens,
+        iterations=iterations,
+    )
+
+    assert iterations["mixed"] > 0, iterations
+    assert iterations["planned"] >= iterations["mixed"], iterations
+    _assert_beams_match(reference, candidate, beam_width)
