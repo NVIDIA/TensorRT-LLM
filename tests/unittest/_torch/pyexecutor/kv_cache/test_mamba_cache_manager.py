@@ -2642,7 +2642,7 @@ def _configure_fp4_mla_hybrid(mgr, pretrained_config) -> KVCacheManagerConfig:
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
         layers=_base_attention_layer_configs(4),
-        initial_pool_ratio=[1.0],
+        initial_pool_ratio=None,
     )
     return MambaHybridCacheManagerV2._build_cache_config(mgr, base_config)
 
