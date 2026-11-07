@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@revert-a9ad06d4', 'trtllm-jenkins-shared-lib@main']) _
 
 LLM_ROOT = "llm"
 
