@@ -202,19 +202,18 @@ def allreduce_workspace_ipc_failed(mapping: Mapping) -> bool:
     return _allreduce_workspaces[mapping][2]
 
 
-def _require_ipc_workspace(mapping: Mapping, op_name: str) -> torch.LongTensor:
-    """Workspace for fused ops that reinterpret it as `void**` and have no NCCL path.
+def _ipc_required_error(op_name: str) -> RuntimeError:
+    """Error for fused ops that reinterpret the workspace as `void**`, with no NCCL path.
 
     AllReduce degrades to NCCL when CUDA IPC turns out to be unusable, but these
-    kernels cannot: they would dereference the null peer pointers. Fail here with an
-    actionable message rather than in the kernel with an illegal memory access.
+    kernels cannot: they would dereference the null peer pointers. Raised from forward
+    and not from __init__, because models build these modules whether or not the fused
+    path ever runs, and fail with an actionable message rather than with an illegal
+    memory access in the kernel.
     """
-    workspace = get_allreduce_workspace(mapping)
-    if allreduce_workspace_ipc_failed(mapping):
-        raise RuntimeError(
-            f"{op_name} requires CUDA IPC, which is unavailable on this system, "
-            "and it has no NCCL fallback.")
-    return workspace
+    return RuntimeError(
+        f"{op_name} requires CUDA IPC, which is unavailable on this system, "
+        "and it has no NCCL fallback.")
 
 
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
@@ -1741,7 +1740,8 @@ class MoEAllReduce(nn.Module):
         """
         super().__init__()
         self.mapping = mapping
-        self.workspace = _require_ipc_workspace(self.mapping, "MoEAllReduce")
+        self.workspace = get_allreduce_workspace(self.mapping)
+        self.ipc_failed = allreduce_workspace_ipc_failed(self.mapping)
         # Pls keep this value in sync with the kOneShotMaxToken in moeAllReduceFusionKernels.h
         self.max_token = 128
 
@@ -1751,6 +1751,9 @@ class MoEAllReduce(nn.Module):
         *,
         all_reduce_params: MoEAllReduceParams,
     ) -> torch.Tensor:
+
+        if self.ipc_failed:
+            raise _ipc_required_error("MoEAllReduce")
 
         assert all_reduce_params.is_valid(), "MoEAllReduceParams is not valid"
 
@@ -2004,11 +2007,13 @@ class MiniMaxAllReduceRMS(nn.Module):
     def __init__(self, mapping: Mapping):
         super().__init__()
         self.mapping = mapping
-        self.workspace = _require_ipc_workspace(self.mapping,
-                                                "MiniMaxAllReduceRMS")
+        self.workspace = get_allreduce_workspace(self.mapping)
+        self.ipc_failed = allreduce_workspace_ipc_failed(self.mapping)
 
     def forward(self, input: torch.Tensor, rms_weights: torch.Tensor,
                 eps: float):
+        if self.ipc_failed:
+            raise _ipc_required_error("MiniMaxAllReduceRMS")
         return torch.ops.trtllm.minimax_allreduce_rms(input, rms_weights,
                                                       self.workspace,
                                                       self.mapping.tp_rank,
@@ -2019,6 +2024,8 @@ class MiniMaxAllReduceRMS(nn.Module):
                    rms_weights_q: torch.Tensor, rms_weights_k: torch.Tensor,
                    eps: float):
         """Fused Q+K RMS norm with allreduce. Returns (q_out, k_out)."""
+        if self.ipc_failed:
+            raise _ipc_required_error("MiniMaxAllReduceRMS")
         out_list = torch.ops.trtllm.minimax_allreduce_rms_qk(
             q,
             k,

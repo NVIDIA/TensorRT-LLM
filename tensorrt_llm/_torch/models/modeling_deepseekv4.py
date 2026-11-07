@@ -63,6 +63,7 @@ from ..distributed import (
     MoEAllReduce,
     MoEAllReduceParams,
     allgather,
+    allreduce_workspace_ipc_failed,
 )
 from ..mmap_utils import pageout_file_backed_regions
 from ..model_config import ModelConfig
@@ -2126,6 +2127,10 @@ class DeepseekV4DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
             )
             self.moe_allreduce = MoEAllReduce(self.mapping)
+            # MoEAllReduce has no NCCL path: skip the fused kernel without CUDA IPC.
+            self.is_p2p_supported = self.is_p2p_supported and not allreduce_workspace_ipc_failed(
+                self.mapping
+            )
 
         # The attention output projection (o_b_proj) completes the TP reduction
         # itself, so the tensor mHC hands to the MoE block is already replicated

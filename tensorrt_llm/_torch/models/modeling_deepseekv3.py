@@ -57,7 +57,8 @@ from ..attention.backends import AttentionMetadata
 from ..attention.backends.interface import PositionalEmbeddingParams, RopeParams
 from ..attention.mla import MLA
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather,
+                           allreduce_workspace_ipc_failed)
 from ..locality_domain.policy import LocalityDomainPolicy
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
@@ -1380,6 +1381,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        strategy=model_config.allreduce_strategy,
                                        dtype=config.torch_dtype)
             self.moe_allreduce = MoEAllReduce(self.mapping)
+            # MoEAllReduce has no NCCL path: skip the fused kernel without CUDA IPC.
+            self.is_p2p_supported = (
+                self.is_p2p_supported
+                and not allreduce_workspace_ipc_failed(self.mapping))
 
         has_tp = mapping.has_tp()
         if (config.n_routed_experts is not None

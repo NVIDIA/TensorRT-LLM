@@ -26,8 +26,7 @@ failure though, and must not change the strategy, or MNNVL never gets selected.
 
 The CUDA runtime and the collectives are stubbed, so no multi-GPU and no MPI needed.
 This directory runs in the CPU-only l0_cpu stage since #16498, so everything here has
-to pass with zero GPUs.  `test_lamport_skipped` is the exception and skips there: the
-workspace helper it drives allocates device tensors.
+to pass with zero GPUs.
 
     pytest tests/unittest/_torch/distributed/test_ipc_memory_fallback.py -v
 """
@@ -43,6 +42,8 @@ from tensorrt_llm import _ipc_utils
 from tensorrt_llm._ipc_utils import IpcMemory
 from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
+
+pytestmark = pytest.mark.cpu_only
 
 
 def _has_allreduce_op() -> bool:
@@ -374,7 +375,7 @@ class FakeMNNVLAllReduce:
     def is_mnnvl(mapping, dtype, explicitly_requested=False):
         return True
 
-    def __init__(self, mapping, dtype):
+    def __init__(self, mapping, dtype, **kwargs):
         self.mapping = mapping
 
 
@@ -418,24 +419,51 @@ def test_downgrade_to_nccl(mapping):
     assert allreduce.mnnvl_allreduce is None
 
 
-@requires_allreduce_op
-def test_moe_allreduce_raises(mapping):
-    # MoEAllReduce has no NCCL path: it must fail with an actionable message rather
+def test_moe_allreduce_raises_in_forward(mapping):
+    # Models build MoEAllReduce whenever TP > 1 and only call it on the fused path, so
+    # construction must succeed. Calling it must fail with an actionable message rather
     # than dereference the null peer pointers inside the kernel.
     from tensorrt_llm._torch.distributed import ops
 
     with _patched_workspace(ipc_failed=True):
-        with pytest.raises(RuntimeError, match="requires CUDA IPC"):
-            ops.MoEAllReduce(mapping)
+        moe_allreduce = ops.MoEAllReduce(mapping)
+
+    with pytest.raises(RuntimeError, match="requires CUDA IPC"):
+        moe_allreduce(torch.zeros(1), all_reduce_params=None)
 
 
-@requires_allreduce_op
-def test_minimax_allreduce_rms_raises(mapping):
+def test_minimax_allreduce_rms_raises_in_forward(mapping):
     from tensorrt_llm._torch.distributed import ops
 
     with _patched_workspace(ipc_failed=True):
-        with pytest.raises(RuntimeError, match="requires CUDA IPC"):
-            ops.MiniMaxAllReduceRMS(mapping)
+        minimax_rms = ops.MiniMaxAllReduceRMS(mapping)
+
+    tensor = torch.zeros(1)
+    with pytest.raises(RuntimeError, match="requires CUDA IPC"):
+        minimax_rms(tensor, tensor, 1e-6)
+    with pytest.raises(RuntimeError, match="requires CUDA IPC"):
+        minimax_rms.forward_qk(tensor, tensor, tensor, tensor, 1e-6)
+
+
+@requires_allreduce_op
+@pytest.mark.parametrize("ipc_failed", [False, True])
+def test_minimax_m2_norm_uses_nccl_without_ipc(mapping, ipc_failed):
+    # MiniMaxRMSNorm already has a NCCL path for inter-node TP, which it must also take
+    # when P2P was reported but the IPC handles could not be exchanged.
+    from tensorrt_llm._torch.models import modeling_minimaxm2
+
+    with (
+        _patched_workspace(ipc_failed),
+        patch.object(modeling_minimaxm2, "can_access_peer", lambda _mapping: True),
+        patch.object(
+            modeling_minimaxm2, "allreduce_workspace_ipc_failed", lambda _mapping: ipc_failed
+        ),
+    ):
+        norm = modeling_minimaxm2.MiniMaxRMSNorm(
+            hidden_size=8, eps=1e-6, mapping=mapping, dtype=torch.bfloat16
+        )
+
+    assert norm.is_p2p_supported == (not ipc_failed)
 
 
 @requires_allreduce_op
@@ -460,7 +488,6 @@ def test_group_args_fall_back_to_nccl(mapping, ipc_failed):
         assert args["workspace"] is workspace
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_lamport_skipped(mapping):
     # lamport_initialize writes through lamport_buffers.local_ptr, which is null
     # once IPC has been disabled.
@@ -472,12 +499,18 @@ def test_lamport_skipped(mapping):
         cudart, FakeDist(TP_SIZE, peer_open_error=FakeCudaError.cudaErrorInvalidDevice)
     )
     calls = []
+    real_tensor = torch.tensor
+
+    def host_tensor(data, *, dtype, device):
+        # The workspace helper places its flag and pointer tensors on the GPU.
+        return real_tensor(data, dtype=dtype)
 
     with (
         cudart_patch,
         dist_patch,
         patch.object(allreduce_helper, "can_access_peer", lambda _mapping: True),
         patch.object(allreduce_helper, "lamport_initialize", lambda *args: calls.append(args)),
+        patch.object(allreduce_helper.torch, "tensor", host_tensor),
     ):
         buffers, _ = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(mapping, 1 << 20)
 
