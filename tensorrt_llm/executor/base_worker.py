@@ -553,9 +553,11 @@ class BaseWorker(GenerationExecutor):
                 PythonRequestInputs(
                     original_end_id=request.sampling_params.end_id,
                     num_logprobs=request.sampling_params.logprobs,
-                    context_logits_explicit=request.sampling_params.return_context_logits,
+                    context_logits_explicit=request.sampling_params.
+                    return_context_logits,
                     prompt_logprobs=request.sampling_params.prompt_logprobs,
-                    prompt_logprobs_simple_format=request.sampling_params.prompt_logprobs_simple_format,
+                    prompt_logprobs_simple_format=request.sampling_params.
+                    prompt_logprobs_simple_format,
                     lora_path=py_lora_path,
                     lora_ckpt_source=py_lora_ckpt_source,
                     logprobs_mode=request.sampling_params.logprobs_mode,

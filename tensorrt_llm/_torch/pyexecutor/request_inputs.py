@@ -56,7 +56,9 @@ class PythonRequestInputs:
             num_logprobs=getattr(request, "py_num_logprobs", 0),
             context_logits_explicit=getattr(request, "py_context_logits_explicit", True),
             prompt_logprobs=getattr(request, "py_prompt_logprobs", None),
-            prompt_logprobs_simple_format=getattr(request, "py_prompt_logprobs_simple_format", False),
+            prompt_logprobs_simple_format=getattr(
+                request, "py_prompt_logprobs_simple_format", False
+            ),
             disaggregated_params=getattr(request, "py_disaggregated_params", None),
             lora_path=getattr(request, "py_lora_path", None),
             lora_ckpt_source=getattr(request, "py_lora_ckpt_source", None),
