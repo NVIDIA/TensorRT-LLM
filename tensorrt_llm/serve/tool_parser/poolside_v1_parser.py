@@ -59,8 +59,25 @@ def _convert_number(value: str) -> Any:
     return int(value)
 
 
+def _is_strict_json(value: Any) -> bool:
+    """Whether ``json.dumps`` spells `value` as strict JSON (no NaN or Infinity).
+
+    The value is checked one level deep, the depth it has inside the arguments
+    object.
+    """
+    try:
+        json.dumps([value], allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    return True
+
+
 def _parse_argument_value(value: str, arg_type: str | None) -> Any:
-    """Parse a raw argument value according to its schema type."""
+    """Parse a raw argument value according to its schema type.
+
+    A decoded value that is not strict JSON (``NaN``, an overflowing ``1e999``)
+    keeps the raw text.
+    """
     value = value.strip()
 
     if arg_type == "string":
@@ -68,20 +85,20 @@ def _parse_argument_value(value: str, arg_type: str | None) -> Any:
 
     try:
         parsed = json.loads(value)
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         parsed = None
     else:
         if arg_type == "integer" and not isinstance(parsed, bool):
             try:
-                return int(parsed)
-            except (TypeError, ValueError):
-                return parsed
-        if arg_type == "number" and not isinstance(parsed, bool):
+                parsed = int(parsed)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        elif arg_type == "number" and not isinstance(parsed, bool):
             try:
-                return float(parsed)
-            except (TypeError, ValueError):
-                return parsed
-        return parsed
+                parsed = float(parsed)
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return parsed if _is_strict_json(parsed) else value
 
     if arg_type == "integer":
         try:
@@ -91,9 +108,10 @@ def _parse_argument_value(value: str, arg_type: str | None) -> Any:
 
     if arg_type == "number":
         try:
-            return _convert_number(value)
+            number = _convert_number(value)
         except (TypeError, ValueError):
             return value
+        return number if _is_strict_json(number) else value
 
     if arg_type == "boolean":
         if value.lower() == "true":
