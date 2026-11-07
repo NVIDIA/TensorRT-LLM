@@ -82,9 +82,10 @@ seeds replay from the transferred recurrent state after the transfer completes.
 
 Replay state follows its request through suspend and resume; the physical slot can move. The
 provider uploads each request's replay slot; the KDA manager exposes it through
-`get_replay_state_indices` and `cuda_replay_state_indices`. The metadata keeps these slots in
-`Mamba2Metadata.replay_state_indices`,
-and the mixer and kernels address the replay buffers by them. A replay slot a request acquires for
+`get_replay_state_indices` and `cuda_replay_state_indices`. The KDA metadata keeps these slots in
+`KimiK3MambaMetadata.replay_state_indices`, and the mixer, the kernels and the acceptance update
+address the replay buffers by them. The shared `Mamba2Metadata` and `MambaAcceptanceBatch` carry no
+replay slots. A replay slot a request acquires for
 the first time is reset (`reset_replay_slots`). The provider tracks replay-slot changes independently
 of the recurrent-state upload, so a moved replay page refreshes its index even when the recurrent
 slot stays fixed. Release clears the request's initialization marker; suspend retains it.

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -210,11 +209,7 @@ class KDAReplayRegion:
         if indices is None:
             indices = self.cuda_indices(state_indices)
         start = batch.num_contexts
-        self.state.update(
-            replace(
-                batch, replay_indices=indices[start : start + batch.num_generations].to(torch.int32)
-            )
-        )
+        self.state.update(batch, indices[start : start + batch.num_generations].to(torch.int32))
 
     def release(self, request_id: int) -> None:
         self._request_indices.pop(request_id, None)

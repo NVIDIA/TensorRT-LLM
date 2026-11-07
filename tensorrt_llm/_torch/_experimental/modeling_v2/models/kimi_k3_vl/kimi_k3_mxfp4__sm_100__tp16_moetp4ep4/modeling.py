@@ -2300,9 +2300,7 @@ class K3DecodeKDA(KimiKDALinearAttention):
         # their own.
         replay_slots = getattr(mamba_metadata, "generation_replay_state_indices", None)
         if replay_slots is None:
-            replay_slots = getattr(
-                mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
-            )[: x.shape[0]]
+            replay_slots = mamba_metadata.replay_state_indices[: x.shape[0]]
         layer_cache = attn_metadata.kv_cache_manager.mamba_layer_cache(self.layer_idx)
         w_q, w_k, w_v = self._get_mtp_conv_weights()
         core = k3_kda_decode_attn(

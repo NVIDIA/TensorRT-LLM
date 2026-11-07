@@ -549,9 +549,7 @@ class KimiKDALinearAttention(nn.Module):
         state_indices = mamba_metadata.state_indices[:batch_size]
         # Replay caches have slots of their own when the cache manager keeps
         # them in a separate pool; otherwise these are the state slots.
-        replay_state_indices = getattr(
-            mamba_metadata, "replay_state_indices", mamba_metadata.state_indices
-        )[:batch_size]
+        replay_state_indices = mamba_metadata.replay_state_indices[:batch_size]
         cu_seqlens = mamba_metadata.query_start_loc_long[: num_prefills + 1]
         num_decodes = batch_size - num_prefills
 

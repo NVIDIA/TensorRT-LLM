@@ -108,9 +108,6 @@ class MambaAcceptanceBatch:
     source_state_indices: torch.Tensor
     destination_state_indices: torch.Tensor
     is_dummy_request: torch.Tensor | None
-    # Replay-history slots of the generation rows; None means the
-    # destination state slots.
-    replay_indices: torch.Tensor | None = None
 
 
 class MambaState(Protocol):

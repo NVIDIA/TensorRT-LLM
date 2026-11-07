@@ -681,36 +681,3 @@ class TestMamba2Metadata:
 
         torch.testing.assert_close(indices_triton, indices_ref)
         torch.testing.assert_close(offsets_triton, offsets_ref)
-
-
-@skip_no_cuda
-def test_prepare_fills_static_replay_slots_for_private_replay():
-    """A manager with PRIVATE replay buffers gets its replay slots copied into one static buffer, so CUDA graphs keep
-    reading the same address; otherwise the replay slots alias the state slots."""
-
-    class PrivateReplayCacheManager(_StateIndexCacheManager):
-        replay_layer_group_id = 1
-
-        def __init__(self, state_indices, replay_indices):
-            super().__init__(state_indices)
-            self.replay_indices = replay_indices
-
-        def get_replay_state_indices(self, request_ids):
-            return self.replay_indices[: len(request_ids)]
-
-    manager = PrivateReplayCacheManager([4, 1], [6, 0])
-    metadata = Mamba2Metadata(max_batch_size=2, chunk_size=8)
-    metadata.prepare(_decode_attn_metadata(manager))
-    address = metadata.replay_state_indices.data_ptr()
-    assert address != metadata.state_indices.data_ptr()
-    torch.cuda.synchronize()
-    assert metadata.replay_state_indices.tolist() == [6, 0]
-    manager.replay_indices = [3, 5]
-    metadata.prepare(_decode_attn_metadata(manager))
-    torch.cuda.synchronize()
-    assert metadata.replay_state_indices.data_ptr() == address
-    assert metadata.replay_state_indices.tolist() == [3, 5]
-
-    coupled = Mamba2Metadata(max_batch_size=2, chunk_size=8)
-    coupled.prepare(_decode_attn_metadata(_StateIndexCacheManager([4, 1])))
-    assert coupled.replay_state_indices is coupled.state_indices

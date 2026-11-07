@@ -831,13 +831,16 @@ class KDAReplayState:
                 self.rand_seed.index_select(0, source_slots),
             )
 
-    def update(self, batch: MambaAcceptanceBatch) -> None:
+    def update(self, batch: MambaAcceptanceBatch, replay_slots: torch.Tensor | None = None) -> None:
+        """Record the batch's accepted drafts.
+
+        Args:
+            batch: The generation rows' acceptance.
+            replay_slots: ``[num_generations]`` replay slots of the generation rows;
+                ``batch.destination_state_indices`` when ``None``.
+        """
         self.record_acceptance(
-            (
-                batch.destination_state_indices
-                if batch.replay_indices is None
-                else batch.replay_indices
-            ),
+            batch.destination_state_indices if replay_slots is None else replay_slots,
             batch.num_accepted_tokens - 1,
             batch.is_dummy_request,
         )

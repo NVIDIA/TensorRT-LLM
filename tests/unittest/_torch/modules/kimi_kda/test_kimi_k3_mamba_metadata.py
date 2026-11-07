@@ -293,6 +293,57 @@ def test_k3_prepare_materializes_stable_aligned_generation_indices() -> None:
     assert metadata.generation_state_indices is None
 
 
+def test_prepare_fills_static_replay_slots_for_private_replay() -> None:
+    """A manager with replay slots of its own gets them copied into one static buffer, so CUDA
+    graphs keep reading the same address; otherwise the replay slots alias the state slots."""
+
+    class StateIndexCacheManager:
+        def __init__(self, state_indices: list[int]) -> None:
+            self.state_indices = state_indices
+
+        def get_state_indices(self, request_ids: list[int], is_padding: list[bool]) -> list[int]:
+            return self.state_indices[: len(request_ids)]
+
+    class PrivateReplayCacheManager(StateIndexCacheManager):
+        replay_layer_group_id = 1
+
+        def __init__(self, state_indices: list[int], replay_indices: list[int]) -> None:
+            super().__init__(state_indices)
+            self.replay_indices = replay_indices
+
+        def get_replay_state_indices(self, request_ids: list[int]) -> list[int]:
+            return self.replay_indices[: len(request_ids)]
+
+    def decode_step(manager: StateIndexCacheManager) -> SimpleNamespace:
+        seq_lens = torch.tensor([1, 1], dtype=torch.int)
+        return SimpleNamespace(
+            seq_lens=seq_lens,
+            seq_lens_cuda=seq_lens.cuda(),
+            num_contexts=0,
+            num_ctx_tokens=0,
+            kv_cache_manager=manager,
+            request_ids=[10, 11],
+            kv_cache_params=None,
+        )
+
+    manager = PrivateReplayCacheManager([4, 1], [6, 0])
+    metadata = KimiK3MambaMetadata(max_batch_size=2, chunk_size=8, max_num_tokens=8)
+    metadata.prepare(decode_step(manager))
+    address = metadata.replay_state_indices.data_ptr()
+    assert address != metadata.state_indices.data_ptr()
+    torch.cuda.synchronize()
+    assert metadata.replay_state_indices.tolist() == [6, 0]
+    manager.replay_indices = [3, 5]
+    metadata.prepare(decode_step(manager))
+    torch.cuda.synchronize()
+    assert metadata.replay_state_indices.data_ptr() == address
+    assert metadata.replay_state_indices.tolist() == [3, 5]
+
+    coupled = KimiK3MambaMetadata(max_batch_size=2, chunk_size=8, max_num_tokens=8)
+    coupled.prepare(decode_step(StateIndexCacheManager([4, 1])))
+    assert coupled.replay_state_indices is coupled.state_indices
+
+
 def test_k3_prepare_materializes_stable_aligned_generation_replay_indices() -> None:
     """With replay slots of their own, the generation requests' replay slots get a stable,
     16-byte-aligned copy like their state slots; without them the replay slots are the state
