@@ -1773,9 +1773,13 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         .def("validate", &kv::HostCacheTierConfig::validate) DEF_COPY(kv::HostCacheTierConfig);
 
     nb::class_<kv::DiskCacheTierConfig>(m, "DiskCacheTierConfig")
-        .def(nb::init<size_t, std::string>(), nb::arg("quota"), nb::arg("path"))
+        .def(nb::init<size_t, std::string, int, bool, bool>(), nb::arg("quota"), nb::arg("path"),
+            nb::arg("num_io_threads") = 0, nb::arg("keep_copy_after_restore") = false, nb::arg("write_through") = false)
         .def_rw("quota", &kv::DiskCacheTierConfig::quota)
         .def_rw("path", &kv::DiskCacheTierConfig::path)
+        .def_rw("num_io_threads", &kv::DiskCacheTierConfig::numIoThreads)
+        .def_rw("keep_copy_after_restore", &kv::DiskCacheTierConfig::keepCopyAfterRestore)
+        .def_rw("write_through", &kv::DiskCacheTierConfig::writeThrough)
         .def_prop_ro("tier", &kv::DiskCacheTierConfig::tier)
         .def("validate", &kv::DiskCacheTierConfig::validate) DEF_COPY(kv::DiskCacheTierConfig);
 
@@ -2785,6 +2789,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
             return std::move(utilization.raw());
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
+    mIntrospection.def(
+        "disk_copy_counters",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const c = manager.storage().diskCopyCounters();
+            nb::dict counters;
+            counters["retained"] = c.retained;
+            counters["created"] = c.created;
+            counters["reused"] = c.reused;
+            counters["reclaimed"] = c.reclaimed;
+            counters["dropped"] = c.dropped;
+            counters["write_through_pages"] = c.writeThroughPages;
+            return counters;
+        },
+        nb::arg("manager"));
     mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,

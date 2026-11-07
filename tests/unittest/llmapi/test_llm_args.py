@@ -2035,6 +2035,51 @@ def test_KvCacheConfig_disk_cache_validation(tmp_path):
 
 
 @pytest.mark.cpu_only
+def test_KvCacheConfig_disk_offload_options(tmp_path):
+    default = KvCacheConfig()
+    assert default.disk_io_threads == 0
+    assert default.disk_keep_copy_after_restore is False
+    assert default.disk_write_through is False
+
+    config = KvCacheConfig(disk_cache_size=2048,
+                           disk_cache_path=str(tmp_path),
+                           disk_io_threads=16,
+                           disk_keep_copy_after_restore=True,
+                           disk_write_through=True)
+    assert config.disk_io_threads == 16
+    assert config.disk_keep_copy_after_restore is True
+    assert config.disk_write_through is True
+
+    with pytest.raises(ValidationError) as exc_info:
+        KvCacheConfig(disk_write_through=True)
+    assert "disk_keep_copy_after_restore" in str(exc_info.value)
+
+    with pytest.raises(ValidationError):
+        KvCacheConfig(disk_io_threads=-1)
+
+    from tensorrt_llm.runtime.kv_cache_manager_v2 import DiskCacheTierConfig
+
+    tier = DiskCacheTierConfig(2048, str(tmp_path))
+    assert tier.num_io_threads == 0
+    assert tier.keep_copy_after_restore is False
+    assert tier.write_through is False
+    tier.validate()
+
+    tier = DiskCacheTierConfig(2048,
+                               str(tmp_path),
+                               num_io_threads=16,
+                               keep_copy_after_restore=True,
+                               write_through=True)
+    tier.validate()
+    assert tier.num_io_threads == 16
+
+    with pytest.raises(ValueError):
+        DiskCacheTierConfig(2048, str(tmp_path), write_through=True).validate()
+    with pytest.raises(ValueError):
+        DiskCacheTierConfig(2048, str(tmp_path), num_io_threads=-1).validate()
+
+
+@pytest.mark.cpu_only
 class TestMultimodalEncoderCudaGraphConfig:
 
     def test_automatic_buckets_need_only_max_batch_size(self):

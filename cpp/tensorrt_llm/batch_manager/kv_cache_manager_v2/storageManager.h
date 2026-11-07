@@ -28,8 +28,10 @@
 #include "kv_cache_manager_v2/storage/core.h"
 #include "tensorrt_llm/common/assert.h"
 
+#include <cstdint>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -340,6 +342,30 @@ public:
         return mSlotUtilFracMax.at(lcId);
     }
 
+    // Keep-disk-copy: a committed page restored from disk keeps its (immutable) disk slot as a retained copy and
+    // takes it back on its next eviction there, skipping the write. Retained copies are reclaimed oldest first,
+    // before any real page is evicted.
+
+    [[nodiscard]] bool keepDiskCopyEnabled() const noexcept;
+
+    // Called from Page::~Page: releases the page's retained copy, if any.
+    void onPageDestroyed(Page const& page) noexcept;
+
+    [[nodiscard]] SlotCount numRetainedCopies(
+        CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
+
+    struct DiskCopyCounters
+    {
+        uint64_t retained; // retained copies held now
+        uint64_t created;
+        uint64_t reused;   // evictions that took a retained slot back instead of writing
+        uint64_t reclaimed;
+        uint64_t dropped;
+        uint64_t writeThroughPages;
+    };
+
+    [[nodiscard]] DiskCopyCounters diskCopyCounters() const noexcept;
+
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
     // (mirrors Python's _compute_slots_for_batch).
@@ -528,6 +554,47 @@ private:
     static constexpr size_t kIndexStagingBytes = 256u << 10u;
     // Allocated only when a codec requests device indices; protected through codec completion.
     std::unique_ptr<StagingBufferManager> mIndexStagingManager;
+
+    struct RetainedCopy
+    {
+        Page const* page;
+        CacheLevel level;
+        PoolGroupIndex pgIdx;
+        Slot slot;
+        // Set while a fallen page is about to take this slot back, so reclaiming skips it.
+        bool pinned;
+    };
+
+    using RetainedCopyList = std::list<RetainedCopy>;
+
+    struct KeepCopyStats
+    {
+        uint64_t created{0};
+        uint64_t reused{0};
+        uint64_t reclaimed{0};
+        uint64_t dropped{0};
+    };
+
+    void addRetainedCopy(Page const& page, CacheLevel level, PoolGroupIndex pgIdx, Slot slot);
+    [[nodiscard]] std::optional<Slot> takeRetainedCopy(Page const& page, CacheLevel level);
+    bool pinRetainedCopy(Page const& page, CacheLevel level, bool pin) noexcept;
+    void releaseRetainedCopies(CacheLevel level, PoolGroupIndex pgIdx, SlotCount count);
+    void releaseAllRetainedCopies(std::optional<CacheLevel> level);
+    void eraseRetainedCopy(RetainedCopyList::iterator iter);
+
+    bool mKeepDiskCopy{false};
+    // Oldest first.
+    RetainedCopyList mRetainedCopies;
+    std::unordered_map<Page const*, RetainedCopyList::iterator> mRetainedByPage;
+    TypedVec<CacheLevel, TypedVec<PoolGroupIndex, SlotCount>> mNumRetainedCopies;
+    KeepCopyStats mKeepCopyStats;
+
+    // Write-through: pages evicted GPU -> host are also copied to free disk slots as retained copies.
+    void writeThroughToDisk(CacheLevel hostLevel, std::vector<SharedPtr<Page>> const& pages);
+    // Completion event of a write-through still reading this host page, or a null event.
+    [[nodiscard]] CachedCudaEvent pendingDiskWrite(Page const& page) const;
+    bool mDiskWriteThrough{false};
+    uint64_t mWriteThroughPages{0};
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -17,6 +17,7 @@
 
 #include "kv_cache_manager_v2/storage/core.h"
 
+#include "kv_cache_manager_v2/utils/copyUtils.h"
 #include "kv_cache_manager_v2/utils/funcGuard.h"
 
 #include "tensorrt_llm/common/assert.h"
@@ -468,6 +469,7 @@ void DiskSlotPool::destroy()
 {
     if (mFd != kBadFileDescriptor)
     {
+        releaseDiskFile(mFd);
         ::close(mFd);
         mFd = kBadFileDescriptor;
     }

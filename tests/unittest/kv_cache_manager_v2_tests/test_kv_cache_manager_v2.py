@@ -596,6 +596,7 @@ def create_config(
     sink_tokens: int,
     kv_buf_size: int = 8192,
     block_quant_buf_size: int | None = None,
+    disk_tier_options: dict | None = None,
 ) -> KVCacheManagerConfig:
     layer_buffers = [
         BufferConfig(role=Role.KEY, size=kv_buf_size),
@@ -614,7 +615,7 @@ def create_config(
     cache_tiers = [
         GpuCacheTierConfig(quota=gpu_quota),
         HostCacheTierConfig(quota=host_quota),
-        DiskCacheTierConfig(quota=disk_quota, path=disk_path),
+        DiskCacheTierConfig(quota=disk_quota, path=disk_path, **(disk_tier_options or {})),
     ]
     cache_tiers = [t for t in cache_tiers if t.quota > 0]
     return KVCacheManagerConfig(
@@ -5747,6 +5748,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
     cfg: KVCacheManagerConfig
     manager: KVCacheManager
     _token_id_gen: Iterator[int]
+    disk_tier_options: dict = {}
 
     def setUp(self) -> None:
         init_cuda_once()
@@ -5794,6 +5796,7 @@ class TestKVCacheManagerV2(unittest.TestCase):
             sink_tokens,
             kv_buf_size,
             block_quant_buf_size,
+            disk_tier_options=self.disk_tier_options,
         )
         self.engine = FakeEngine(self.cfg)
         self.manager = KVCacheManager(self.cfg)
@@ -11387,6 +11390,61 @@ class TestPoison(TestKVCacheManagerV2):
 
         self.assertIn("deliberate test poisoning", take_poison())
         self.assertIsNone(poison_reason())
+
+
+# Disk-tier tests rerun with every SSD offload option on.
+_ALL_DISK_OPTIONS = {"num_io_threads": 4, "keep_copy_after_restore": True, "write_through": True}
+
+
+class TestNoBatchingDiskOptions(TestNoBatching):
+    disk_tier_options = _ALL_DISK_OPTIONS
+
+    def _run_and_close(self, req: "TestNoBatching.Request") -> None:
+        with TemporaryCudaStream([]) as s:
+            assert req.kv_cache.resume(cast(CudaStream, s.handle))
+            self.run_request(req, 32, True)
+            req.kv_cache.close()
+        s.take_finish_event()
+
+    def test_retained_disk_copies_are_reused_and_reclaimed(self) -> None:
+        # GPU and host each hold about one request, so later requests push committed pages GPU -> host -> disk.
+        self.prepare(32 << 20, 32 << 20, 1 << 30, 36, 128, 1, kv_buf_size=32768)
+        seq_len = 32 * 22
+        req_ids = itertools.count()
+        first = self.new_request(next(req_ids), None, 256, seq_len - 256)
+        self._run_and_close(first)
+        for _ in range(7):
+            self._run_and_close(self.new_request(next(req_ids), None, 256, seq_len - 256))
+
+        filled = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(filled["write_through_pages"], 0)
+        # Host -> disk evictions of written-through pages took their disk slot back instead of writing.
+        self.assertGreater(filled["reused"], 0)
+
+        # Restore the first request's prefix from disk; refcheck verifies the restored KV.
+        prompt = first.kv_cache.committed_tokens[: seq_len // 2]
+        reuse = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self.assertGreater(reuse.kv_cache.num_committed_tokens, 0)
+        self._run_and_close(reuse)
+        restored = _introspection.disk_copy_counters(self.manager)
+        self.assertGreater(restored["retained"], 0)
+
+        # Resizing the disk tier drops every retained copy; the pages themselves stay valid.
+        self.assertTrue(self.manager.resize(CacheLevel(2), 512 << 20))
+        shrunk = _introspection.disk_copy_counters(self.manager)
+        self.assertEqual(shrunk["retained"], 0)
+        self.assertGreater(shrunk["reclaimed"], restored["reclaimed"])
+        again = self.Request(next(req_ids), self.manager.create_kv_cache(None, prompt), prompt, 32)
+        self._run_and_close(again)
+        self.manager.clear_reusable_blocks()
+
+
+class TestResizeQuotaDiskOptions(TestResizeQuota):
+    disk_tier_options = _ALL_DISK_OPTIONS
+
+
+class TestDisaggDiskOptions(TestDisagg):
+    disk_tier_options = _ALL_DISK_OPTIONS
 
 
 if __name__ == "__main__":

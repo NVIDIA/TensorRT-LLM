@@ -33,6 +33,12 @@ struct Task
     SrcAddr src;
 };
 
+//! Process-wide: run host <-> disk copies on a pool of \p numThreads threads. The first nonzero call sizes it.
+void configureAsyncDiskIo(size_t numThreads) noexcept;
+
+//! Call before closing a disk pool file: waits for in-flight I/O and closes its cached O_DIRECT descriptor.
+void releaseDiskFile(int fd) noexcept;
+
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyDiskToHost(std::vector<Task<MemAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
 CUresult copyHostToDisk(std::vector<Task<DiskAddress, MemAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept;
