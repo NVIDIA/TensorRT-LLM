@@ -78,6 +78,12 @@ ack for the next allocation never replaces it. A ready successor also starts han
 the alert window, so long jobs can use a fresh allocation. The old watcher admits nothing more
 and exits when its existing jobs are done.
 
+Every pass judges the successor again. One that stopped heart-beating for
+:data:`WATCHER_STALE_S` (its allocation was cancelled or failed) is dropped, and another live
+later-ending watcher takes its place; with none, a watcher not yet within ``handover_lead`` of
+its end leaves hand-over and admits jobs again, and one within it holds only the jobs that would
+not finish in time. A watcher never exits for a successor that is no longer live.
+
 ADMISSION
 =========
 
@@ -813,7 +819,7 @@ class Scheduler:
         self.heartbeat()
 
     def serve(self) -> int:
-        """Run until a successor is up and every job this watcher started is gone."""
+        """Run until a live successor is up and every job this watcher started is gone."""
         while True:
             try:
                 self.tick()
@@ -828,7 +834,7 @@ class Scheduler:
                     file=sys.stderr,
                     flush=True,
                 )
-            if self.handover.get("successor") and not self.jobs:
+            if self.handed_over(self.clock()):
                 self._append_status(
                     f"watcher: handed over to {self.handover['successor']}, exiting at {utc_iso()}"
                 )
@@ -1203,25 +1209,51 @@ class Scheduler:
     # -------------------------------------------------------------- hand-over
 
     def _plan_handover(self, now: float) -> None:
-        """Drain when the allocation is ending or a later-ending successor is ready."""
+        """Drain when the allocation is ending or a later-ending successor is live.
+
+        Judged again every pass: a recorded successor that stopped heart-beating is dropped,
+        and without a live one a watcher not yet within ``handover_lead`` of its end leaves
+        hand-over.
+        """
         ends_at = self.config.ends_at
         if ends_at is None:
             return
         peers = [
-            peer
+            str(peer.get("watcher"))
             for peer in self.paths.live_watchers(WATCHER_STALE_S, now)
             if peer.get("watcher") != self.watcher_id and _ends_after(peer, ends_at)
         ]
+        recorded = self.handover.get("successor")
+        if recorded and recorded not in peers:
+            del self.handover["successor"]
+            self._append_status(
+                f"watcher: successor {recorded} is gone (no heartbeat for "
+                f"{WATCHER_STALE_S:.0f}s) at {utc_iso(now)}"
+            )
         if ends_at - now > self.config.handover_lead_s and not peers:
+            if self.handover:
+                self.handover = {}
+                self._append_status(
+                    f"watcher: allocation ends {utc_iso(ends_at)} and no successor is live; "
+                    f"out of hand-over, admitting jobs again at {utc_iso(now)}"
+                )
             return
         if not self.handover:
             self.handover["since"] = utc_iso(now)
             self._append_status(f"watcher: allocation ends {utc_iso(ends_at)}; in hand-over")
-        if peers:
-            successor = peers[0].get("watcher")
-            if self.handover.get("successor") != successor:
-                self._append_status(f"watcher: successor {successor} is up")
-            self.handover["successor"] = successor
+        if peers and not self.handover.get("successor"):
+            self.handover["successor"] = peers[0]
+            self._append_status(f"watcher: successor {peers[0]} is up")
+
+    def handed_over(self, now: float) -> bool:
+        """Whether this watcher may exit: none of its jobs is left and its successor is live."""
+        successor = self.handover.get("successor")
+        if not successor or self.jobs:
+            return False
+        return any(
+            peer.get("watcher") == successor
+            for peer in self.paths.live_watchers(WATCHER_STALE_S, now)
+        )
 
     def _handover_hold(self, spec: JobSpec, now: float) -> "Hold | None":
         ends_at = self.config.ends_at
