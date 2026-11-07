@@ -20138,6 +20138,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                         situ_linear_beta=_canonicalize_situ_beta(
                             situ_linear_beta),
                         reserved_sms=0,
+                        die_major=die_major,
                     )
                     tuner.choose_one(
                         tuner_key,
