@@ -30,8 +30,8 @@
 
 #include <cstdint>
 #include <deque>
-#include <list>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -362,7 +362,8 @@ public:
     void onPageDestroyed(Page const& page) noexcept;
 
     // Number of retained copies at a level (all pool groups when pgIdx is omitted).
-    [[nodiscard]] SlotCount numRetainedCopies(CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
+    [[nodiscard]] SlotCount numRetainedCopies(
+        CacheLevel level, std::optional<PoolGroupIndex> pgIdx = std::nullopt) const;
 
     friend class KvCacheManager;
     // White-box test introspection reaches computePoolGroupSlotsForBatch() via friendship
