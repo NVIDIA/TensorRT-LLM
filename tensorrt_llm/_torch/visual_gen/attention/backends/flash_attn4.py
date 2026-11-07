@@ -33,14 +33,10 @@ os.environ.setdefault("FA_DISABLE_2CTA", "1")
 
 
 def _install_cutlass_dsl_compatibility() -> None:
-    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
-    import cutlass.cute as cute
+    """Restore the CuTe and QuACK names the pinned FA4 calls (``cute_dsl_utils.install_cutlass_dsl_compatibility``)."""
+    from ....cute_dsl_utils import install_cutlass_dsl_compatibility
 
-    for name in ("ThrCopy", "ThrMma"):
-        if not hasattr(cute.core, name) and hasattr(cute, name):
-            setattr(cute.core, name, getattr(cute, name))
-    if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
-        cute.make_fragment = cute.make_rmem_tensor
+    install_cutlass_dsl_compatibility()
 
 
 def _install_flash_attn_tile_scheduler_compatibility() -> None:

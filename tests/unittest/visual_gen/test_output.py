@@ -345,7 +345,7 @@ def test_save_video_preserves_frames_and_raw_audio(
     )
     encoder = encoding._FfmpegCliEncoder()
     process = MagicMock(returncode=0)
-    process.communicate.return_value = (b"", b"")
+    process.stderr.read.return_value = b""
     with ExitStack() as stack:
         stack.enter_context(patch.object(encoding, "_get_video_encoder", return_value=encoder))
         write_wav = stack.enter_context(
@@ -388,10 +388,10 @@ def test_save_video_preserves_frames_and_raw_audio(
             )
             assert len(decoded.stdout) == num_frames * height * width * 3
     else:
-        assert process.communicate.call_count == (batch_size or 1)
-        for i, call in enumerate(process.communicate.call_args_list):
+        assert process.stdin.write.call_count == (batch_size or 1)
+        for i, call in enumerate(process.stdin.write.call_args_list):
             video_i = raw_video if batch_size is None else raw_video[i]
-            assert bytes(call.kwargs["input"]) == video_i.numpy().tobytes()
+            assert bytes(call.args[0]) == video_i.numpy().tobytes()
     assert output.audio is audio
     assert output.video is video
     torch.testing.assert_close(output.audio, raw_audio, rtol=0, atol=0)

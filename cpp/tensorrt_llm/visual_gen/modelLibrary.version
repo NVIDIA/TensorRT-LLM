@@ -1,0 +1,4 @@
+/* See cpp/cmake/modules/visual_gen.cmake. */
+{
+  local: *;
+};

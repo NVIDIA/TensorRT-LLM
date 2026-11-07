@@ -15,6 +15,7 @@
 
 """Synthetic pipeline-level tests for MiniMax-H3."""
 
+import copy
 import itertools
 import json
 from contextlib import contextmanager
@@ -28,6 +29,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers import MiniMaxH3Scheduler
 from PIL import Image
+from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
 
 from tensorrt_llm._torch.attention.attention import _inherit_process_group_attrs
 from tensorrt_llm._torch.device_mesh import DeviceMeshTopologyImpl
@@ -38,8 +40,16 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm._torch.visual_gen.mapping import VisualGenMapping
 from tensorrt_llm._torch.visual_gen.models.minimax_h3 import pipeline_minimax_h3 as h3_pipeline
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.packing import (
+    MINIMAX_H3_AUDIO_CHANNELS,
+    MINIMAX_H3_KEYFRAME_NOISE_AUG,
+    MINIMAX_H3_TEXT_ENCODER_LAYER,
     MINIMAX_H3_TEXT_TAG,
+    audio_latent_num_frames,
+    build_packed_sequence,
+    build_row_timesteps,
+    patchify_video_latents,
     resolve_canvas_size,
+    video_latent_num_frames,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import MiniMaxH3Pipeline
 from tensorrt_llm._torch.visual_gen.offloading import PipelineOffloader
@@ -243,6 +253,7 @@ class _SyntheticMiniMaxH3Pipeline(MiniMaxH3Pipeline):
         self.audio_scheduler = MiniMaxH3Scheduler(shift=3.0)
         self._is_warmup = True
         self._parallel_vae_enabled = False
+        self._text_encoder_truncated = False
 
     def _encode_prompt(
         self,
@@ -476,6 +487,18 @@ def test_pipeline_unwraps_component_scoped_transformer_weights() -> None:
 
     assert captured["weights"] is expected_weights
     assert not pipeline.transformer.training
+
+
+@pytest.mark.parametrize("runtime_lora", [None, SimpleNamespace()])
+def test_post_load_weights_skips_qk_epilogue_with_runtime_lora(runtime_lora) -> None:
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    pipeline.pipeline_config = SimpleNamespace(visual_gen_mapping=None, runtime_lora=runtime_lora)
+    installs = []
+    pipeline.transformer.install_qk_epilogue = lambda: installs.append(True)
+
+    pipeline.post_load_weights()
+
+    assert installs == ([] if runtime_lora is not None else [True])
 
 
 def test_pipeline_keeps_torch_compile_enabled(
@@ -1988,3 +2011,136 @@ def test_pipeline_accepts_tp(
     config.visual_gen_mapping.ulysses_size = ulysses_size
     MiniMaxH3Pipeline(config)
     assert initialized == [config]
+
+
+def test_truncated_text_encoder_returns_the_selected_hidden_layer() -> None:
+    """The truncated encoder's ``last_hidden_state`` is the full encoder's selected hidden layer."""
+    torch.manual_seed(0)
+    config = Qwen3VLConfig(
+        text_config={
+            "vocab_size": 64,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": MINIMAX_H3_TEXT_ENCODER_LAYER + 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "max_position_embeddings": 64,
+            "rope_parameters": {
+                "rope_type": "default",
+                "mrope_section": [4, 2, 2],
+                "mrope_interleaved": True,
+            },
+        },
+        vision_config={
+            "depth": 1,
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_heads": 2,
+            "out_hidden_size": 32,
+            "num_position_embeddings": 16,
+            "deepstack_visual_indexes": [0],
+        },
+    )
+    full = Qwen3VLForConditionalGeneration(config).eval()
+    truncated = copy.deepcopy(full)
+    h3_pipeline._truncate_text_encoder(truncated)
+    input_ids = torch.tensor([[3, 17, 5, 42, 8, 60, 1]])
+    inputs = dict(
+        input_ids=input_ids,
+        attention_mask=torch.ones_like(input_ids),
+        mm_token_type_ids=torch.zeros_like(input_ids),
+        use_cache=False,
+    )
+
+    with torch.inference_mode():
+        expected = full.model(**inputs, output_hidden_states=True).hidden_states[
+            MINIMAX_H3_TEXT_ENCODER_LAYER
+        ]
+        actual = truncated.model(**inputs).last_hidden_state
+
+    torch.testing.assert_close(actual, expected)
+
+
+def test_latent_noise_follows_the_request_seed_draw_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The initial latents are the request generator's video draw, then its audio draw."""
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    original_denoise = pipeline.denoise
+    initial = {}
+
+    def record(**kwargs):
+        initial["video"] = kwargs["latents"][0].clone()
+        initial["audio"] = kwargs["extra_streams"]["audio"][0][0].clone()
+        return original_denoise(**kwargs)
+
+    monkeypatch.setattr(pipeline, "denoise", record)
+    pipeline.forward(
+        prompt="test",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=2,
+    )
+
+    generator = torch.Generator().manual_seed(42)
+    video = torch.randn((1, 2, video_latent_num_frames(124), 16, 16), generator=generator)
+    audio = torch.randn(
+        (audio_latent_num_frames(124) * MINIMAX_H3_AUDIO_CHANNELS, 3), generator=generator
+    )
+    assert torch.equal(initial["video"], patchify_video_latents(video, (1, 2, 2)))
+    assert torch.equal(initial["audio"], audio)
+
+
+def test_row_timestep_plan_matches_a_per_step_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The plan equals ``build_row_timesteps`` per step; equal row indices share one copy."""
+    pipeline = _SyntheticMiniMaxH3Pipeline()
+    # A 32x32 keyframe becomes 64 condition rows, so the plan carries condition timesteps.
+    monkeypatch.setattr(pipeline, "_encode_keyframes", lambda *args: torch.zeros(64, 8))
+    layouts = []
+    plan = []
+    fake_call = _FakeMiniMaxH3Transformer.__call__
+
+    def record_layout(*args):
+        layouts.append(build_packed_sequence(*args))
+        return layouts[-1]
+
+    def record_step(self, **kwargs):
+        plan.append((kwargs["conditioning_timesteps"], kwargs["timestep_indices"]))
+        return fake_call(self, **kwargs)
+
+    monkeypatch.setattr(h3_pipeline, "build_packed_sequence", record_layout)
+    monkeypatch.setattr(_FakeMiniMaxH3Transformer, "__call__", record_step)
+    pipeline.forward(
+        prompt="test",
+        seed=42,
+        height=32,
+        width=32,
+        num_frames=124,
+        frame_rate=24.0,
+        num_inference_steps=4,
+        keyframes=[Image.new("RGB", (32, 32))],
+        keyframe_anchors=("first",),
+    )
+
+    (layout,) = layouts
+    expected = [
+        build_row_timesteps(
+            layout,
+            float(video_timestep),
+            float(audio_timestep),
+            max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),
+            1.0,
+        )
+        for video_timestep, audio_timestep in zip(
+            pipeline.scheduler.timesteps, pipeline.audio_scheduler.timesteps
+        )
+    ]
+    assert len(plan) == len(expected)
+    for step, expected_step in zip(plan, expected):
+        for actual, reference in zip(step, expected_step):
+            assert actual.dtype == reference.dtype
+            assert torch.equal(actual, reference)
+    distinct_indices = {tuple(indices.tolist()) for _, indices in expected}
+    assert len({id(indices) for _, indices in plan}) == len(distinct_indices)

@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the lossless MiniMax-H3 video-VAE decode: batched tiles, memory-sized batches, fp16 Linear copies,
-compiled decoder blocks."""
+"""Tests for the MiniMax-H3 decode: the lossless video-VAE decode (batched tiles, memory-sized batches, fp16 Linear
+copies, compiled decoder blocks, decode glue) and the fused anti-aliased activation of the BigVGAN audio decoder."""
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -13,17 +14,31 @@ AutoencoderKLMiniMaxH3 = pytest.importorskip(
     "diffusers.models.autoencoders.autoencoder_kl_minimax_h3"
 ).AutoencoderKLMiniMaxH3
 
+from diffusers.models.autoencoders.autoencoder_kl_minimax_h3_audio import (  # noqa: E402
+    MiniMaxH3AudioActivation1d,
+    MiniMaxH3AudioSnakeBeta,
+)
+
 import tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae as parallel_vae  # noqa: E402
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.anti_alias_activation_cuda import (  # noqa: E402
+    install_fused_activations,
+)
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.parallel_vae import (  # noqa: E402
     TiledAutoencoderKLMiniMaxH3,
 )
 from tensorrt_llm._torch.visual_gen.models.minimax_h3.pipeline_minimax_h3 import (  # noqa: E402
     MiniMaxH3Pipeline,
+    _prepare_decode,
     _prepare_vae_decoder,
 )
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline  # noqa: E402
+from tensorrt_llm._utils import get_sm_version  # noqa: E402
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+requires_sm100 = pytest.mark.skipif(
+    not (torch.cuda.is_available() and get_sm_version() in (100, 103)),
+    reason="needs an SM100/SM103 GPU (the fused anti-aliased activation is installed there only)",
+)
 
 
 def _tiny_vae() -> TiledAutoencoderKLMiniMaxH3:
@@ -98,7 +113,7 @@ def test_single_rank_decode_batches_tiles_and_matches_the_tile_loop(
 @requires_cuda
 def test_calibration_sizes_the_batches_from_the_free_memory(monkeypatch):
     vae = _tiny_vae()
-    _prepare_vae_decoder(vae)
+    _prepare_vae_decoder(vae, fused_kernels=True)
     per_latent = vae._decode_bytes_per_latent
     assert per_latent is not None and per_latent > 0
     z = _latent(vae, frames=2, tiles=2)  # 3 x 3 tiles
@@ -124,7 +139,7 @@ def test_calibration_sizes_the_batches_from_the_free_memory(monkeypatch):
 @requires_cuda
 def test_upper_bound_caps_the_batches_whatever_the_free_memory(monkeypatch):
     vae = _tiny_vae()
-    _prepare_vae_decoder(vae)
+    _prepare_vae_decoder(vae, fused_kernels=True)
     monkeypatch.setattr(parallel_vae, "available_device_bytes", lambda device: 2**60)
     vae.max_tiles_per_decoder_call = 4
     z = _latent(vae, frames=2, tiles=2)  # 3 x 3 tiles
@@ -138,12 +153,31 @@ def test_upper_bound_caps_the_batches_whatever_the_free_memory(monkeypatch):
 
 
 @requires_cuda
+def test_prepare_decode_folds_a_host_decoder_as_on_the_gpu():
+    """CPU offloading keeps the audio decoder on the host at load; its folded weights match a GPU-resident decoder's."""
+
+    def decoder() -> torch.nn.Module:
+        torch.manual_seed(0)
+        return torch.nn.Sequential(
+            *(torch.nn.utils.weight_norm(torch.nn.Conv1d(512, 512, 7)) for _ in range(2))
+        )
+
+    on_gpu = SimpleNamespace(decoder=decoder().cuda(), decode=lambda z: z)
+    on_host = SimpleNamespace(decoder=decoder(), decode=lambda z: z)
+    _prepare_decode(None, on_gpu)
+    _prepare_decode(None, on_host)
+    for gpu_param, host_param in zip(on_gpu.decoder.parameters(), on_host.decoder.parameters()):
+        assert host_param.device.type == "cpu"
+        assert torch.equal(gpu_param.cpu(), host_param)
+
+
+@requires_cuda
 def test_prepared_decoder_fp16_linear_copies_are_bitwise_identical_under_autocast():
     vae = _tiny_vae()
     z = _latent(vae, frames=2, tiles=2)
     with torch.inference_mode(), torch.autocast("cuda", torch.float16):
         expected = _reference_decode_clip(vae, z)
-    _prepare_vae_decoder(vae)
+    _prepare_vae_decoder(vae, fused_kernels=False)
     assert all(
         m.weight.dtype == torch.float16
         for m in vae.decoder.modules()
@@ -181,7 +215,7 @@ def test_unequal_tiles_fall_back_to_one_call_per_tile(monkeypatch):
 def test_distributed_decode_batches_each_ranks_tiles_and_gathers_once(monkeypatch, rank):
     """A group of two: each rank decodes its every-second tile in one batch; one gather per clip."""
     vae = _tiny_vae()
-    _prepare_vae_decoder(vae)
+    _prepare_vae_decoder(vae, fused_kernels=False)
     monkeypatch.setattr(parallel_vae, "available_device_bytes", lambda device: 2**60)
     monkeypatch.setattr(parallel_vae.dist, "get_world_size", lambda g: 2)
     monkeypatch.setattr(parallel_vae.dist, "get_rank", lambda g: rank)
@@ -218,7 +252,7 @@ def test_distributed_decode_batches_each_ranks_tiles_and_gathers_once(monkeypatc
 def test_distributed_decode_splits_batches_by_the_group_minimum(monkeypatch, rank):
     """The agreed count bounds every rank's batch so the gathered tensors have equal shapes."""
     vae = _tiny_vae()
-    _prepare_vae_decoder(vae)
+    _prepare_vae_decoder(vae, fused_kernels=False)
     monkeypatch.setattr(parallel_vae, "available_device_bytes", lambda device: 2**60)
     monkeypatch.setattr(parallel_vae.dist, "get_world_size", lambda g: 2)
     monkeypatch.setattr(parallel_vae.dist, "get_rank", lambda g: rank)
@@ -305,6 +339,7 @@ def test_torch_compile_compiles_every_decoder_block_with_the_configured_fullgrap
     monkeypatch.setattr(BasePipeline, "torch_compile", lambda self: base_calls.append(self))
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline._fused_decode = False
     pipeline.pipeline_config = SimpleNamespace(
         torch_compile=SimpleNamespace(enable_fullgraph=fullgraph)
     )
@@ -329,6 +364,60 @@ def test_torch_compile_leaves_a_skipped_vae_alone(monkeypatch):
     monkeypatch.setattr(BasePipeline, "torch_compile", lambda self: None)
     pipeline = MiniMaxH3Pipeline.__new__(MiniMaxH3Pipeline)
     torch.nn.Module.__init__(pipeline)
+    pipeline._fused_decode = False
     pipeline.pipeline_config = SimpleNamespace(torch_compile=SimpleNamespace(enable_fullgraph=True))
     pipeline.vae = None
     pipeline.torch_compile()
+
+
+@requires_cuda
+@pytest.mark.parametrize("frames", [10, 12])  # two clips each; 10 latent frames are padded to 12
+def test_decode_glue_run_eagerly_is_bitwise_identical_to_the_diffusers_decode(monkeypatch, frames):
+    """``compile_decode_glue`` with an eager ``torch.compile``: the decoder split into prologue, blocks and
+    epilogue, and the clip join, against Diffusers' ``_decode`` over ``decoder(post_quant_conv(tile))``."""
+    vae = _tiny_vae()
+    z = _latent(vae, frames=frames, tiles=2)
+    ran = set()
+
+    def eager_compile(fn, **kwargs):
+        def run(*args):
+            ran.add(fn.__name__)
+            return fn(*args)
+
+        return run
+
+    monkeypatch.setattr(torch, "compile", eager_compile)
+    with torch.inference_mode(), torch.autocast("cuda", torch.float16):
+        expected = AutoencoderKLMiniMaxH3._decode(vae, z)
+        vae.compile_decode_glue()
+        actual = vae._decode(z)
+    assert ran == {"_decoder_prologue", "_decoder_epilogue", "_stitch_tiles", "_join_clips"}
+    assert torch.equal(actual, expected)
+
+
+@requires_sm100
+@pytest.mark.parametrize(
+    ("batch", "channels", "length", "compiled"),
+    [(2, 3, 5, False), (2, 3, 5, True), (1, 4, 2049, False)],
+)
+def test_fused_anti_aliased_activation_matches_diffusers(batch, channels, length, compiled):
+    """Shapes: both sequence ends inside one kernel block over several rows, and three kernel blocks with a
+    one-sample odd tail. ``compiled`` traces the op through its fake."""
+    torch.manual_seed(0)
+    module = MiniMaxH3AudioActivation1d(MiniMaxH3AudioSnakeBeta(channels))
+    with torch.no_grad():
+        for param in module.act.parameters():
+            param.normal_(std=0.5)
+        # The stored Kaiser-sinc filters are symmetric and equal, which would hide tap order and roles.
+        for taps in (module.upsample.filter, module.downsample.lowpass.filter):
+            taps.uniform_(0, 1 / 6)
+    x = torch.randn(batch, channels, length)
+    with torch.inference_mode():
+        expected = copy.deepcopy(module).double()(x.double())
+    module.cuda()
+    assert install_fused_activations(module) == 1
+    forward = torch.compile(module, fullgraph=True) if compiled else module
+    with torch.inference_mode():
+        actual = forward(x.cuda())
+    # fp32 12-tap sums and sinf/expf in the kernel, against fp64 math on the same fp32 input, filters and parameters.
+    torch.testing.assert_close(actual.cpu().double(), expected, atol=1e-4, rtol=0)

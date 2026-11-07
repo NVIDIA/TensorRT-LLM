@@ -403,6 +403,8 @@ if(BUILD_PYT)
   add_subdirectory(thop)
   # modeling_v2 family libraries: torch-op libraries loaded on demand.
   add_subdirectory(modeling_v2)
+  # VisualGen model libraries: torch-op libraries loaded on demand.
+  add_subdirectory(visual_gen)
 endif()
 
 add_subdirectory(nanobind)

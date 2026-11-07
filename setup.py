@@ -180,6 +180,7 @@ else:
         'libs/libtensorrt_llm.so',
         'libs/libth_common.so',
         'libs/libth_modeling_v2_*.so',
+        'libs/libth_visual_gen_*.so',
         'libs/libtensorrt_llm_ucx_wrapper.so',
         'libs/libdecoder_attention_0.so',
         'libs/libtensorrt_llm_nixl_wrapper.so',
@@ -275,8 +276,10 @@ def warn_on_build_skew(precompiled_location: str) -> None:
         "setup.py",
         "scripts/build_wheel.py",
         "requirements.txt",
-        # modeling_v2 families keep their native code with their Python code.
-        ":(glob)tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/**"
+        # modeling_v2 families and VisualGen models keep their native code with
+        # their Python code.
+        ":(glob)tensorrt_llm/_torch/_experimental/modeling_v2/models/**/csrc/**",
+        ":(glob)tensorrt_llm/_torch/visual_gen/models/**/csrc/**",
     ]
 
     def head_of(checkout: str) -> str | None:

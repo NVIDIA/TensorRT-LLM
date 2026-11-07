@@ -6,6 +6,7 @@ Exercises real PNG round-trips, ``video_to_bytes``, and the path-based
 ``resolve_video_format`` contract.
 """
 
+import shutil
 from io import BytesIO
 from pathlib import Path
 from unittest import mock
@@ -130,6 +131,36 @@ def test_save_video_avi_writes_riff_container(tmp_path):
         head = f.read(12)
     assert head[:4] == b"RIFF"
     assert head[8:12] == b"AVI "
+
+
+_requires_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+
+
+@_requires_ffmpeg
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("default_device", ["cpu", "cuda"])
+def test_video_to_bytes_mp4_strided_cuda_matches_cpu(default_device):
+    """A strided CUDA video encodes to its CPU frames' MP4 bytes, whatever the default device."""
+    frames = torch.randint(
+        0, 256, (4, 32, 48, 3), dtype=torch.uint8, generator=torch.Generator().manual_seed(0)
+    )
+    video = frames.permute(0, 3, 1, 2).contiguous().cuda().permute(0, 2, 3, 1)
+    assert not video.is_contiguous()
+    expected = video_to_bytes(frames, frame_rate=8.0)
+    with torch.device(default_device):
+        assert video_to_bytes(video, frame_rate=8.0) == expected
+
+
+@_requires_ffmpeg
+def test_save_video_mp4_ffmpeg_failure_raises_with_stderr(tmp_path):
+    """An ffmpeg that exits before reading the frames raises with its stderr in the message.
+
+    ffmpeg rejects the negative input frame rate before reading stdin, and the 6 MiB of frames
+    exceed the pipe buffer (1 MiB on 64 KiB-page kernels), so writing them hits a closed pipe.
+    """
+    video = _dummy_video(num_frames=8, height=512, width=512)
+    with pytest.raises(RuntimeError, match=r"(?s)ffmpeg encoding failed: .*-1\.0"):
+        save_video(video, tmp_path / "out.mp4", frame_rate=-1.0)
 
 
 # ---------------------------------------------------------------------------

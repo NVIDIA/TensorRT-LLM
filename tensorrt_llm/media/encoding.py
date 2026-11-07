@@ -8,6 +8,7 @@ import shutil
 import struct
 import subprocess  # nosec B404
 import tempfile
+import threading
 import wave
 from abc import ABC, abstractmethod
 from io import BytesIO
@@ -17,6 +18,7 @@ from typing import Any, List, Optional, Tuple, Union
 import torch
 from PIL import Image
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 
 # Video encoder availability flags (cached after first check).
@@ -157,7 +159,16 @@ class _FfmpegCliEncoder(_VideoEncoder):
     ) -> str:
         self._validate_video_tensor(video)
 
-        video_np = video.cpu().numpy()
+        if video.is_cuda:
+            # C-contiguous host memory, pinned where that helps: the copy runs at full bandwidth
+            # and makes a strided video contiguous on the GPU.
+            host = torch.empty(
+                video.shape, dtype=video.dtype, device="cpu", pin_memory=prefer_pinned()
+            )
+            host.copy_(video)
+            video_np = host.numpy()
+        else:
+            video_np = video.cpu().numpy()
         num_frames, height, width, channels = video_np.shape
         if channels != 3:
             raise ValueError(f"Expected 3-channel RGB video, got {channels} channels")
@@ -209,11 +220,11 @@ class _FfmpegCliEncoder(_VideoEncoder):
                 process = subprocess.Popen(
                     cmd,
                     stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
                 raw_frames = memoryview(video_np.reshape(-1))
-                _, stderr = process.communicate(input=raw_frames)
+                stderr = self._feed_ffmpeg(process, raw_frames)
                 if process.returncode != 0:
                     raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode()}")
             except FileNotFoundError:
@@ -221,6 +232,28 @@ class _FfmpegCliEncoder(_VideoEncoder):
 
         logger.info(f"Saved video{' with audio' if audio is not None else ''} to {output_path}")
         return output_path
+
+    @staticmethod
+    def _feed_ffmpeg(process: subprocess.Popen, data: memoryview) -> bytes:
+        """Write ``data`` to ffmpeg's stdin in one call, wait for ffmpeg and return its stderr.
+
+        A thread drains stderr meanwhile, so a full stderr pipe never blocks ffmpeg.
+        """
+        stderr: List[bytes] = []
+        reader = threading.Thread(target=lambda: stderr.append(process.stderr.read()), daemon=True)
+        reader.start()
+        try:
+            process.stdin.write(data)
+        except BrokenPipeError:
+            pass  # ffmpeg exited early; its return code and stderr carry the cause.
+        try:
+            process.stdin.close()
+        except BrokenPipeError:
+            pass
+        reader.join()
+        process.wait()
+        process.stderr.close()
+        return b"".join(stderr)
 
     def _write_wav(self, path: str, audio: Any, sample_rate: int) -> None:
         import numpy as np

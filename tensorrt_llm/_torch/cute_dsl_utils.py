@@ -103,7 +103,7 @@ def gmem_ptr(tensor, dtype, assumed_align: int):
 
 
 def install_cutlass_dsl_compatibility() -> None:
-    """Restore CuTe aliases required by pinned third-party FA4 and QuACK."""
+    """Restore CuTe and QuACK names required by pinned third-party FA4, QuACK and the packaged MSA kernels."""
     if not IS_CUTLASS_DSL_AVAILABLE:
         return
 
@@ -114,6 +114,14 @@ def install_cutlass_dsl_compatibility() -> None:
             setattr(cute.core, name, getattr(cute, name))
     if not hasattr(cute, "make_fragment") and hasattr(cute, "make_rmem_tensor"):
         cute.make_fragment = cute.make_rmem_tensor
+    # FA4 4.0.0b19 and the MSA kernels call quack.activation.sub_packed_f32x2, which QuACK 0.6 replaced with cute.arch's.
+    try:
+        import quack.activation
+    except (ImportError, AttributeError):
+        return
+    if not hasattr(quack.activation, "sub_packed_f32x2") and hasattr(
+            cute.arch, "sub_packed_f32x2"):
+        quack.activation.sub_packed_f32x2 = cute.arch.sub_packed_f32x2
 
 
 # SMs that a kernel resident for the whole step holds (the DWDP fabric gather;

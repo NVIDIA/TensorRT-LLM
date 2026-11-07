@@ -17,8 +17,11 @@
 
 """TRT-LLM VisualGen pipeline for MiniMax-H3 FL2VA and Ref2VA checkpoints."""
 
+import functools
+import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager, nullcontext
 from io import BytesIO
 from typing import TYPE_CHECKING, Any, Optional
@@ -46,6 +49,8 @@ from tensorrt_llm.inputs.utils import load_image
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import MpiTopology
 
+from .kernels.anti_alias_activation_cuda import install_fused_activations
+from .kernels.vae_swiglu_quack import fuse_vae_swiglu
 from .packing import (
     MINIMAX_H3_AUDIO_CHANNELS,
     MINIMAX_H3_CANVAS_MULTIPLE,
@@ -74,26 +79,99 @@ from .packing import (
 from .parallel_vae import TiledAutoencoderKLMiniMaxH3
 from .ref2va import load_references, prepare_references, validate_reference_order
 from .text_encoder_tp import MiniMaxH3TensorParallelTextEncoder
-from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel
+from .transformer_minimax_h3 import MiniMaxH3Transformer3DModel, single_gpu_sm100
 
 if TYPE_CHECKING:
     from ...sleep import PipelineSleepManager, SleepRestoreMode
 
 
-def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3) -> None:
-    """Lossless decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
+def _prepare_vae_decoder(vae: TiledAutoencoderKLMiniMaxH3, *, fused_kernels: bool) -> None:
+    """Decode-path preparation for the fp16-autocast decode in ``MiniMaxH3Pipeline._decode_video``.
 
     * Every ``nn.Linear`` of the ViT decoder is converted to fp16 in place: autocast casts weight and bias to fp16
       on every call, so converting once gives the same bits under autocast (norm weights and the ``scale1``/``scale2``
       gains stay fp32, as autocast leaves them). The decoder must therefore keep running under the fp16 autocast of
       ``_decode_video``; a decode outside it would run fp16 instead of the reference fp32 math.
+    * With ``fused_kernels`` each self-attention takes q and k from one GEMM whose epilogue applies the Q/K RMSNorm
+      and RoPE (``vae_qk_epilogue.install_vae_qk_epilogue``; q and k keep their head dims pair-permuted), and each
+      FFN ``SwiGLU`` runs its activation in the projection's GEMM epilogue (``vae_swiglu_quack.fuse_vae_swiglu``),
+      rounding the ``[M, I]`` product to fp16 once.
     * One tile is decoded eagerly to measure the decoder's memory footprint, so the VAE can size its batched tile
       decode from the memory free at decode time (``TiledAutoencoderKLMiniMaxH3.calibrate_tile_decode_memory``).
     """
     for module in vae.decoder.modules():
         if isinstance(module, torch.nn.Linear):
             module.to(torch.float16)
+    if fused_kernels:
+        # Imported here: it pulls in QuACK's CuTe epilogue frontend.
+        from .kernels.vae_qk_epilogue import install_vae_qk_epilogue
+
+        install_vae_qk_epilogue(vae.decoder)
+        fuse_vae_swiglu(vae.decoder)
     vae.calibrate_tile_decode_memory()
+
+
+def _video_to_uint8(
+    video: torch.Tensor, pixel_mean: torch.Tensor, pixel_std: torch.Tensor
+) -> torch.Tensor:
+    """Decoded ``[B, C, T, H, W]`` video in the VAE's normalized pixel space to ``[B, T, H, W, C]`` uint8."""
+    video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
+    return (video.permute(0, 2, 3, 4, 1) * 255).round().to(torch.uint8)
+
+
+def _compile_decode(
+    vae: Optional[TiledAutoencoderKLMiniMaxH3],
+    audio_vae: Optional[AutoencoderKLMiniMaxH3Audio],
+):
+    """Compile the VAE decoder glue and pixel conversion and the BigVGAN audio decoder (``torch_compile``).
+
+    Returns the compiled pixel conversion, or None.
+    """
+    pixels = None
+    if isinstance(vae, TiledAutoencoderKLMiniMaxH3):
+        vae.compile_decode_glue()
+        pixels = torch.compile(_video_to_uint8, mode="default", dynamic=False)
+    if audio_vae is not None:
+        audio_vae.decoder = torch.compile(audio_vae.decoder, mode="default", dynamic=None)
+    return pixels
+
+
+def _prepare_decode(
+    vae: Optional[TiledAutoencoderKLMiniMaxH3],
+    audio_vae: Optional[AutoencoderKLMiniMaxH3Audio],
+) -> None:
+    """Fold the BigVGAN decoder's ``weight_norm`` into its convolution weights once, run its anti-aliased
+    activations with the fused kernel, and run the audio decode with cuDNN's algorithm search (``cudnn.benchmark``).
+
+    ``remove_weight_norm`` computes the weight with the same ``_weight_norm`` the forward pre-hook runs on every call,
+    so the decoder sees the same weights. The fold runs on the GPU even when CPU offloading keeps the decoder on the
+    host, since a host fold rounds differently. The algorithm search is per process, so the waveform is not bitwise
+    reproducible across processes.
+    """
+    if audio_vae is None:
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    for module in audio_vae.decoder.modules():
+        if hasattr(module, "weight_g"):
+            home = module.weight_v.device
+            module.to(device)
+            torch.nn.utils.remove_weight_norm(module)
+            module.to(home)
+    install_fused_activations(audio_vae.decoder)
+    decode = audio_vae.decode
+
+    @functools.wraps(decode)
+    def decode_with_algorithm_search(*args, **kwargs):
+        cudnn = torch.backends.cudnn
+        with cudnn.flags(
+            enabled=cudnn.enabled,
+            benchmark=True,
+            deterministic=cudnn.deterministic,
+            allow_tf32=cudnn.allow_tf32,
+        ):
+            return decode(*args, **kwargs)
+
+    audio_vae.decode = decode_with_algorithm_search
 
 
 def _component_skipped(
@@ -116,6 +194,50 @@ def _load_keyframe_image(content: Any) -> Image.Image:
     if isinstance(content, (bytes, bytearray, memoryview)):
         return Image.open(BytesIO(bytes(content))).convert("RGB")
     return load_image(content, format="pil")
+
+
+def _start_thread(name: str, fn: Callable[..., Any], *args: Any) -> Callable[[], Any]:
+    """Run ``fn(*args)`` on a new thread; the returned call joins it and returns the result or raises."""
+    future: Future = Future()
+
+    def run() -> None:
+        try:
+            future.set_result(fn(*args))
+        except Exception as error:  # re-raised by join()
+            future.set_exception(error)
+
+    thread = threading.Thread(target=run, name=name)
+    thread.start()
+
+    def join() -> Any:
+        thread.join()
+        return future.result()
+
+    return join
+
+
+def _truncate_text_encoder(text_encoder: Qwen3VLForConditionalGeneration) -> None:
+    """Keep only the Qwen3-VL decoder layers whose output MiniMax-H3 reads.
+
+    With the later layers dropped and the final norm an identity, ``last_hidden_state`` is the full
+    encoder's ``hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]``.
+    """
+    language_model = text_encoder.model.language_model
+    language_model.layers = language_model.layers[:MINIMAX_H3_TEXT_ENCODER_LAYER]
+    language_model.norm = torch.nn.Identity()
+
+
+def _upload_distinct(tensors: list[torch.Tensor], device: torch.device) -> list[torch.Tensor]:
+    """Copy host tensors to ``device`` once per distinct value; equal tensors share one copy."""
+    uploaded: list[tuple[torch.Tensor, torch.Tensor]] = []
+    copies = []
+    for tensor in tensors:
+        copy = next((dev for host, dev in uploaded if torch.equal(host, tensor)), None)
+        if copy is None:
+            copy = tensor.to(device)
+            uploaded.append((tensor, copy))
+        copies.append(copy)
+    return copies
 
 
 def _check_denoise_step(velocity: torch.Tensor, name: str, step: int) -> None:
@@ -196,6 +318,8 @@ class MiniMaxH3Pipeline(BasePipeline):
     VIDEO_SCHEDULER_SHIFT = 12.0
     AUDIO_SCHEDULER_SHIFT = 3.0
     derive_output_size_from_reference = True
+    # Replaced by a compiled version in torch_compile.
+    _video_to_uint8 = staticmethod(_video_to_uint8)
 
     @staticmethod
     def _request_generator(seed: int) -> torch.Generator:
@@ -281,7 +405,11 @@ class MiniMaxH3Pipeline(BasePipeline):
         self.audio_vae = None
         self.audio_scheduler = None
         self.processor = None
+        self._text_encoder_truncated = False
         self._sleep_manager: Optional["PipelineSleepManager"] = None
+        # Set in post_load_weights: SM100/SM103 with one GPU per request runs the decode-path kernels, the audio
+        # decode preparation and the compiled decode glue.
+        self._fused_decode = False
         super().__init__(pipeline_config)
 
     def default_offload_stages(self) -> tuple[tuple[str, ...], ...]:
@@ -528,11 +656,16 @@ class MiniMaxH3Pipeline(BasePipeline):
                         checkpoint_dir, device
                     )
                 else:
-                    self.text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
+                    text_encoder = Qwen3VLForConditionalGeneration.from_pretrained(
                         checkpoint_dir,
                         subfolder=PipelineComponent.TEXT_ENCODER,
                         torch_dtype=torch.bfloat16,
-                    ).to("cpu" if "text_encoder" in offloaded else device)
+                    )
+                    _truncate_text_encoder(text_encoder)
+                    self._text_encoder_truncated = True
+                    self.text_encoder = text_encoder.to(
+                        "cpu" if "text_encoder" in offloaded else device
+                    )
                     self.text_encoder.eval()
             else:
                 self.text_encoder = None
@@ -569,12 +702,18 @@ class MiniMaxH3Pipeline(BasePipeline):
 
     def post_load_weights(self) -> None:
         super().post_load_weights()
+        # Runtime LoRA fuses its deltas into the checkpoint's Q/K row order after this hook.
+        if self.transformer is not None and self.pipeline_config.runtime_lora is None:
+            self.transformer.install_qk_epilogue()
         if self.scheduler is not None:
             self.scheduler.set_shift(self.VIDEO_SCHEDULER_SHIFT)
         if self.audio_scheduler is not None:
             self.audio_scheduler.set_shift(self.AUDIO_SCHEDULER_SHIFT)
+        self._fused_decode = self.device.type == "cuda" and single_gpu_sm100(self.pipeline_config)
         if self.vae is not None and self.device.type == "cuda":
-            _prepare_vae_decoder(self.vae)
+            _prepare_vae_decoder(self.vae, fused_kernels=self._fused_decode)
+        if self._fused_decode:
+            _prepare_decode(self.vae, getattr(self, "audio_vae", None))
 
     def torch_compile(self) -> None:
         super().torch_compile()
@@ -591,6 +730,10 @@ class MiniMaxH3Pipeline(BasePipeline):
                 )
                 for block in blocks
             )
+        if self._fused_decode:
+            pixels = _compile_decode(self.vae, getattr(self, "audio_vae", None))
+            if pixels is not None:
+                self._video_to_uint8 = pixels
 
     def _load_request_keyframes(
         self,
@@ -949,12 +1092,15 @@ class MiniMaxH3Pipeline(BasePipeline):
                 attention_mask=torch.ones_like(input_ids),
                 mm_token_type_ids=mm_token_type_ids,
                 use_cache=False,
-                output_hidden_states=True,
+                output_hidden_states=not self._text_encoder_truncated,
                 **vision_kwargs,
             )
-        return outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER].to(
-            device=self.device, dtype=self.dtype
+        hidden_states = (
+            outputs.last_hidden_state
+            if self._text_encoder_truncated
+            else outputs.hidden_states[MINIMAX_H3_TEXT_ENCODER_LAYER]
         )
+        return hidden_states.to(device=self.device, dtype=self.dtype)
 
     def _encode_keyframes(
         self,
@@ -1004,16 +1150,16 @@ class MiniMaxH3Pipeline(BasePipeline):
         )
         return self.scheduler.scale_noise(condition_rows, MINIMAX_H3_KEYFRAME_NOISE_AUG, noise)
 
-    def _prepare_latents(
+    def _draw_latent_noise(
         self,
-        *,
         num_latent_frames: int,
         latent_height: int,
         latent_width: int,
         num_audio_latents: int,
         generator: torch.Generator,
-        condition_latents: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Draw the video, then the audio latent noise on the CPU from the request generator."""
+        cpu = torch.device("cpu")
         latents = randn_tensor(
             (
                 1,
@@ -1023,25 +1169,43 @@ class MiniMaxH3Pipeline(BasePipeline):
                 latent_width,
             ),
             generator=generator,
-            device=self.device,
+            device=cpu,
             dtype=torch.float32,
         )
-        video_rows = patchify_video_latents(
-            latents,
-            self.transformer.config.patch_size,
-        )
-        if condition_latents is not None:
-            video_rows = torch.cat((condition_latents, video_rows))
-
         audio_rows = randn_tensor(
             (
                 num_audio_latents * MINIMAX_H3_AUDIO_CHANNELS,
                 self.audio_vae.config.latent_channels,
             ),
             generator=generator,
-            device=self.device,
+            device=cpu,
             dtype=torch.float32,
         )
+        return latents, audio_rows
+
+    def _prepare_latents(
+        self,
+        *,
+        num_latent_frames: int,
+        latent_height: int,
+        latent_width: int,
+        num_audio_latents: int,
+        generator: torch.Generator,
+        condition_latents: Optional[torch.Tensor],
+        noise: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``noise`` is a ``_draw_latent_noise`` result made ahead with the same generator."""
+        if noise is None:
+            noise = self._draw_latent_noise(
+                num_latent_frames, latent_height, latent_width, num_audio_latents, generator
+            )
+        latents, audio_rows = (value.to(self.device) for value in noise)
+        video_rows = patchify_video_latents(
+            latents,
+            self.transformer.config.patch_size,
+        )
+        if condition_latents is not None:
+            video_rows = torch.cat((condition_latents, video_rows))
         return video_rows, audio_rows
 
     def _decode_video(
@@ -1080,8 +1244,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             video = self.vae.decode(latents, return_dict=False)[0]
         pixel_mean = torch.tensor(MINIMAX_H3_PIXEL_MEAN, device=self.device).view(1, -1, 1, 1, 1)
         pixel_std = torch.tensor(MINIMAX_H3_PIXEL_STD, device=self.device).view(1, -1, 1, 1, 1)
-        video = (video.float() * pixel_std + pixel_mean).clamp(0, 1)
-        return (video.permute(0, 2, 3, 4, 1) * 255).round().to(torch.uint8)
+        return self._video_to_uint8(video, pixel_mean, pixel_std)
 
     def _decode_audio(
         self,
@@ -1173,6 +1336,19 @@ class MiniMaxH3Pipeline(BasePipeline):
         latent_height = height // self.vae.spatial_compression_ratio
         latent_width = width // self.vae.spatial_compression_ratio
         num_audio_latents = audio_latent_num_frames(num_frames)
+        latent_noise = None
+        if self.workflow != "ref2va" and not keyframes:
+            # Nothing else draws from the generator before _prepare_latents on this path, and
+            # torch's CPU randn releases the GIL, so the draw overlaps the text encoder.
+            latent_noise = _start_thread(
+                "minimax-h3-noise",
+                self._draw_latent_noise,
+                num_latent_frames,
+                latent_height,
+                latent_width,
+                num_audio_latents,
+                generator,
+            )
 
         audio_condition_latents = None
         if self.workflow == "ref2va":
@@ -1215,6 +1391,7 @@ class MiniMaxH3Pipeline(BasePipeline):
             num_audio_latents=num_audio_latents,
             generator=generator,
             condition_latents=condition_latents,
+            noise=None if latent_noise is None else latent_noise(),
         )
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
@@ -1228,22 +1405,29 @@ class MiniMaxH3Pipeline(BasePipeline):
                 f"{len(self.scheduler.timesteps)} vs "
                 f"{len(self.audio_scheduler.timesteps)} steps."
             )
-        row_timestep_plan = [
-            tuple(
-                tensor.to(self.device)
-                for tensor in build_row_timesteps(
-                    layout,
-                    float(video_timestep),
-                    float(audio_timestep),
-                    max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),
-                    1.0,
-                )
+        # Built from host copies of both schedules, so no step reads the device; the per-step
+        # tables go up in one copy and the row indices once per distinct pattern.
+        row_timesteps = [
+            build_row_timesteps(
+                layout,
+                float(video_timestep),
+                float(audio_timestep),
+                max(float(video_timestep), MINIMAX_H3_KEYFRAME_NOISE_AUG),
+                1.0,
             )
             for video_timestep, audio_timestep in zip(
-                self.scheduler.timesteps,
-                self.audio_scheduler.timesteps,
+                self.scheduler.timesteps.cpu(),
+                self.audio_scheduler.timesteps.cpu(),
             )
         ]
+        row_timestep_plan = list(
+            zip(
+                torch.cat([values for values, _ in row_timesteps])
+                .to(self.device)
+                .split([values.numel() for values, _ in row_timesteps]),
+                _upload_distinct([indices for _, indices in row_timesteps], self.device),
+            )
+        )
         with self.offloader.context_if_requested("transformer"):
             static_context = self.transformer.prepare_static_context(
                 prompt_embeds,

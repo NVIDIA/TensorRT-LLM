@@ -37,18 +37,33 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
-from tensorrt_llm._torch.visual_gen.models.minimax_h3.fused_rope import (
+from tensorrt_llm._torch.visual_gen.models.minimax_h3.kernels.fused_rope import (
     apply_minimax_h3_qk_norm_rope_bf16,
 )
 from tensorrt_llm._torch.visual_gen.models.modeling import BaseDiffusionModel
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm._torch.visual_gen.utils import SequenceSharder
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
-from .fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .kernels.fused_adaln import h3_adaln_supported, h3_gate_res_norm_mod, h3_norm_mod
+from .kernels.gated_mlp_quack import gate_up_swiglu_quack_h3
+from .kernels.native_ops import load_ops
 
 MINIMAX_H3_MODALITY_NUM = 3
+
+
+def _sm100_family() -> bool:
+    return torch.cuda.is_available() and get_sm_version() in (100, 103)
+
+
+def single_gpu_sm100(config) -> bool:
+    """SM100/SM103 with one GPU per request, where H3 runs its model-local kernels."""
+    if not _sm100_family():
+        return False
+    vgm = getattr(config, "visual_gen_mapping", None)
+    return (vgm.world_size if vgm is not None else config.mapping.world_size) == 1
 
 
 @dataclass
@@ -64,7 +79,7 @@ class MiniMaxH3StaticContext:
     """Lossless request-static transformer inputs reusable across denoise steps."""
 
     text_embeds: torch.Tensor
-    rotary_emb: tuple[torch.Tensor, torch.Tensor]
+    rotary_emb: tuple[torch.Tensor, ...]
 
     @property
     def sequence_length(self) -> int:
@@ -106,8 +121,11 @@ class MiniMaxH3RotaryPosEmbed(nn.Module):
             ** (torch.arange(0, 2 * rope_freq_dim, 2, dtype=torch.float32) / (2 * rope_freq_dim))
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # Set when some attention computes RoPE in its Q|K GEMM epilogue from the positions.
+        self.with_positions = False
 
-    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, position_ids: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Return ``(cos, sin)``, followed by the fp32 ``(pos_t, pos_h, pos_w)`` when ``with_positions``."""
         if position_ids.ndim != 2 or position_ids.shape[-1] != 3:
             raise ValueError(
                 "position_ids must have shape [sequence_length, 3], got "
@@ -116,6 +134,9 @@ class MiniMaxH3RotaryPosEmbed(nn.Module):
         freqs = position_ids.to(torch.float32).unsqueeze(-1) * self.inv_freq.view(1, 1, -1)
         freqs = torch.cat(freqs.unbind(dim=1), dim=-1)
         freqs = torch.cat((freqs, freqs), dim=-1)
+        if self.with_positions:
+            pos = position_ids.to(torch.float32)
+            return freqs.cos(), freqs.sin(), *(pos[:, axis].contiguous() for axis in range(3))
         return freqs.cos(), freqs.sin()
 
 
@@ -149,7 +170,7 @@ class MiniMaxH3Attention(Attention):
             bias=False,
             # H3 rotates a leading split-half region and passes the tail through, which
             # the shared fused kernel does not implement; the flag drives H3's own kernel
-            # (fused_rope.py) through the override of forward() below.
+            # (kernels/fused_rope.py) through the override of forward() below.
             fuse_qk_norm_rope=True,
             interleave=False,
             config=model_config,
@@ -159,6 +180,8 @@ class MiniMaxH3Attention(Attention):
             separate_qkv_is_self_attention=True,
         )
         self.use_async_ulysses = use_async_ulysses
+        # Set by MiniMaxH3Transformer3DModel.install_qk_epilogue.
+        self.h3_qk_epilogue = None
 
     def _use_fused_qk_norm_rope(
         self,
@@ -180,7 +203,7 @@ class MiniMaxH3Attention(Attention):
         for norm in (self.norm_q, self.norm_k):
             if norm.allreduce is not None or norm.use_gemma or norm.weight.dtype != torch.bfloat16:
                 return False
-        cos, sin = rotary_emb
+        cos, sin = rotary_emb[:2]
         if (
             not hidden_states.is_cuda
             or hidden_states.dtype != torch.bfloat16
@@ -210,12 +233,27 @@ class MiniMaxH3Attention(Attention):
                 hidden_states, rotary_emb, key_padding_mask=key_padding_mask, timestep=timestep
             )
         batch_size, sequence_length = hidden_states.shape[:2]
-        if rotary_emb is not None and self._use_fused_qk_norm_rope(hidden_states, rotary_emb):
+        qk_epilogue = self.h3_qk_epilogue
+        if (
+            qk_epilogue is not None
+            and rotary_emb is not None
+            and len(rotary_emb) == 5
+            and batch_size == 1
+        ):
+            query, key, value = qk_epilogue(
+                hidden_states.view(sequence_length, -1), self.qkv_proj.weight, rotary_emb[2:]
+            )
+            query, key, value = query[None], key[None], value[None]
+        elif (
+            rotary_emb is not None
+            and qk_epilogue is None
+            and self._use_fused_qk_norm_rope(hidden_states, rotary_emb)
+        ):
             # One launch normalizes and rotates Q and K from the packed projection
             # output; V stays a view of the same buffer.
             qkv = self.qkv_proj(hidden_states)
             value = qkv.split([self.local_q_dim, self.local_kv_dim, self.local_kv_dim], dim=-1)[2]
-            cos, sin = rotary_emb
+            cos, sin = rotary_emb[:2]
             query, key = apply_minimax_h3_qk_norm_rope_bf16(
                 qkv,
                 self.norm_q.weight,
@@ -235,9 +273,13 @@ class MiniMaxH3Attention(Attention):
                 batch_size, sequence_length, self.local_num_key_value_heads, self.head_dim
             )
             query, key = self.apply_qk_norm(query, key)
+            if qk_epilogue is not None:
+                # The Q/K weights are stored pair-permuted for the epilogue.
+                query = query.index_select(-1, qk_epilogue.unpermute)
+                key = key.index_select(-1, qk_epilogue.unpermute)
             if rotary_emb is not None:
-                query = apply_minimax_h3_rotary_emb(query, *rotary_emb)
-                key = apply_minimax_h3_rotary_emb(key, *rotary_emb)
+                query = apply_minimax_h3_rotary_emb(query, *rotary_emb[:2])
+                key = apply_minimax_h3_rotary_emb(key, *rotary_emb[:2])
             query = query.flatten(2)
             key = key.flatten(2)
         hidden_states = self._attn_impl(
@@ -266,7 +308,7 @@ class MiniMaxH3Attention(Attention):
         def project(linear: Linear, heads: int, norm: RMSNorm) -> torch.Tensor:
             states = norm(linear(hidden_states).view(batch_size, sequence_length, heads, head_dim))
             if rotary_emb is not None:
-                states = apply_minimax_h3_rotary_emb(states, *rotary_emb)
+                states = apply_minimax_h3_rotary_emb(states, *rotary_emb[:2])
             return states
 
         def compute_q() -> torch.Tensor:
@@ -289,6 +331,15 @@ class MiniMaxH3Attention(Attention):
         )
         batch_size, local_seq_len = out_4d.shape[:2]
         return self.to_out[0](out_4d.reshape(batch_size, local_seq_len, -1))
+
+
+class MiniMaxH3GatedMLP(GatedMLP):
+    """``GatedMLP`` whose fused BF16 gate/up GEMM + SwiGLU runs as ``gate_up_swiglu_quack_h3``."""
+
+    def _fused_gate_up_swiglu_bf16(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape
+        output = gate_up_swiglu_quack_h3(x.reshape(-1, input_shape[-1]), self.gate_up_proj.weight)
+        return output.reshape(*input_shape[:-1], output.shape[-1])
 
 
 def _norm_2d(norm: RMSNorm, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -430,7 +481,7 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         self.norm2 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
         )
-        self.ff = GatedMLP(
+        self.ff = (MiniMaxH3GatedMLP if single_gpu_sm100(model_config) else GatedMLP)(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=False,
@@ -566,7 +617,7 @@ class MiniMaxH3TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(
             hidden_size=hidden_size, eps=norm_eps, dtype=model_config.torch_dtype, has_weights=True
         )
-        self.ff = GatedMLP(
+        self.ff = (MiniMaxH3GatedMLP if single_gpu_sm100(model_config) else GatedMLP)(
             hidden_size=hidden_size,
             intermediate_size=ffn_dim,
             bias=False,
@@ -583,6 +634,13 @@ class MiniMaxH3TransformerBlock(nn.Module):
         )
         # Fused RMSNorm + gathered modulation (and the gated residual before norm2).
         self._fused_adaln = h3_adaln_supported(hidden_size, model_config.torch_dtype)
+        # norm1 runs in a CuTe DSL kernel and the norm2 side in a CUDA kernel built for hidden size 5376.
+        self._cute_norm1 = self._fused_adaln and single_gpu_sm100(model_config)
+        self._cuda_grnm = self._cute_norm1 and hidden_size == 5376
+        if self._cute_norm1:
+            from .kernels import norm_scale_shift_cute  # noqa: F401  (registers the op)
+        if self._cuda_grnm:
+            load_ops()
 
     def forward(
         self,
@@ -632,11 +690,72 @@ class MiniMaxH3TransformerBlock(nn.Module):
     ) -> torch.Tensor:
         hidden_size = hidden_states.shape[-1]
         mod = self.adaln_proj.table(temb)
-        norm_hidden_states = h3_norm_mod(
+        norm_hidden_states = self._norm1_modulate(hidden_states, mod, adaln_indices)
+        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
+        hidden_states, norm_hidden_states = self._gate_resid_norm2_modulate(
+            hidden_states, attn_output, mod, adaln_indices
+        )
+        ff_output = self.ff(
+            norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
+        ).reshape_as(norm_hidden_states)
+        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
+        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
+
+    def _norm1_modulate(
+        self,
+        hidden_states: torch.Tensor,
+        mod: torch.Tensor,
+        adaln_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """``norm1(hidden_states) * (1 + scale_msa[idx]) + shift_msa[idx]``, both rows read from ``mod``."""
+        hidden_size = hidden_states.shape[-1]
+        if (
+            self._cute_norm1
+            and hidden_size % 256 == 0
+            and self.norm1.weight.dtype == hidden_states.dtype
+            and adaln_indices.numel() * hidden_size == hidden_states.numel()
+        ):
+            return torch.ops.trtllm.minimax_h3_rmsnorm_indexed_scale_shift_cute(
+                hidden_states.reshape(-1, hidden_size),
+                self.norm1.weight,
+                mod[:, :hidden_size],
+                mod[:, hidden_size : 2 * hidden_size],
+                adaln_indices,
+                self.norm1.variance_epsilon,
+            ).view(hidden_states.shape)
+        return h3_norm_mod(
             hidden_states, self.norm1.weight, mod, adaln_indices, self.norm1.variance_epsilon, 1, 0
         )
-        attn_output = self.attn(norm_hidden_states, rotary_emb, key_padding_mask, timestep)
-        hidden_states, norm_hidden_states = h3_gate_res_norm_mod(
+
+    def _gate_resid_norm2_modulate(
+        self,
+        hidden_states: torch.Tensor,
+        attn_output: torch.Tensor,
+        mod: torch.Tensor,
+        adaln_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(h, norm2(h) * (1 + scale_mlp[idx]) + shift_mlp[idx])`` with ``h = hidden_states + gate_msa[idx] *
+        attn_output``, all three rows read from ``mod``."""
+        hidden_size = hidden_states.shape[-1]
+        if (
+            self._cuda_grnm
+            and attn_output.dtype == torch.bfloat16
+            and attn_output.shape == hidden_states.shape
+            and self.norm2.weight.dtype == torch.bfloat16
+            and adaln_indices.numel() * hidden_size == hidden_states.numel()
+        ):
+            y, h = torch.ops.vg_minimax_h3.gate_resid_rmsnorm_indexed_shift_scale(
+                hidden_states.reshape(-1, hidden_size),
+                attn_output.reshape(-1, hidden_size),
+                self.norm2.weight,
+                mod[:, 2 * hidden_size : 3 * hidden_size],
+                mod[:, 3 * hidden_size : 4 * hidden_size],
+                mod[:, 4 * hidden_size : 5 * hidden_size],
+                adaln_indices,
+                self.norm2.variance_epsilon,
+            )
+            return h.view(hidden_states.shape), y.view(hidden_states.shape)
+        return h3_gate_res_norm_mod(
             hidden_states,
             attn_output,
             self.norm2.weight,
@@ -647,11 +766,6 @@ class MiniMaxH3TransformerBlock(nn.Module):
             4,
             3,
         )
-        ff_output = self.ff(
-            norm_hidden_states.reshape(-1, norm_hidden_states.shape[-1])
-        ).reshape_as(norm_hidden_states)
-        gate_mlp = mod[:, 5 * hidden_size : 6 * hidden_size]
-        return hidden_states + gate_mlp.index_select(0, adaln_indices) * ff_output
 
 
 class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
@@ -890,6 +1004,35 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
             rotary_emb=self.rope(position_ids),
         )
 
+    @torch.no_grad()
+    def install_qk_epilogue(self) -> None:
+        """Run each block's Q/K RMSNorm and RoPE in the epilogue of its Q|K projection GEMM.
+
+        Needs SM100/SM103 with one GPU per request, BF16 fused QKV without bias and head_dim 128.
+        ``MiniMaxH3QKEpilogue`` stores the Q/K weights pair-permuted, so call it once, after the last
+        change to the loaded weights.
+        """
+        if not single_gpu_sm100(self.model_config):
+            return
+        from .kernels.qk_epilogue import QK_EPILOGUE_EPS, MiniMaxH3QKEpilogue
+
+        rotary_dim = 6 * self.rope.inv_freq.numel()
+        device = torch.device("cuda", torch.cuda.current_device())
+        for block in self.transformer_blocks:
+            attn = block.attn
+            if (
+                attn.qkv_mode != QKVMode.FUSE_QKV
+                or attn.qkv_proj.weight.dtype != torch.bfloat16
+                or attn.qkv_proj.bias is not None
+                or attn.head_dim != 128
+                or attn.local_num_attention_heads != attn.local_num_key_value_heads
+                or attn.norm_q.variance_epsilon != QK_EPILOGUE_EPS
+                or attn.norm_k.variance_epsilon != QK_EPILOGUE_EPS
+            ):
+                continue
+            attn.h3_qk_epilogue = MiniMaxH3QKEpilogue(attn, self.rope.inv_freq, rotary_dim, device)
+            self.rope.with_positions = True
+
     def _validate_layout(
         self,
         sequence_length: int,
@@ -981,6 +1124,9 @@ class MiniMaxH3Transformer3DModel(BaseDiffusionModel):
         adaln_indices = timestep_indices * MINIMAX_H3_MODALITY_NUM + token_tags.clamp(min=0)
         timestep_indices_for_norm = timestep_indices
         rotary_emb = static_context.rotary_emb
+        if self.sharder.is_active:
+            # The Q|K epilogue reads unsharded positions; sharded rows take the unfused RoPE.
+            rotary_emb = rotary_emb[:2]
         pad = _padding_to_multiple(sequence_length, self.sharder.size)
         token_tags_for_mask = token_tags
         if pad:

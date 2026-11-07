@@ -1380,7 +1380,7 @@ def test_bf16_configuration_opts_into_the_fused_swiglu_epilogue(
     reason="needs an SM100/SM103 GPU",
 )
 def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With eligible shapes every refiner and transformer block's FFN takes the fused op once."""
+    """With eligible shapes every refiner and transformer block's FFN takes H3's fused op once."""
     if not gated_mlp_module.gate_up_swiglu_quack_available():
         pytest.skip("QuACK gemm_act is unavailable")
     # The kernel is built on first use; when it does not build against the installed CUTLASS
@@ -1396,13 +1396,13 @@ def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPat
     ).to("cuda")
     _initialize_weights(model, scale=0.1)
     calls: list[int] = []
-    op = gated_mlp_module.gate_up_swiglu_quack_bf16
+    op = h3.gate_up_swiglu_quack_h3
 
     def tracked(*args: object, **kwargs: object) -> torch.Tensor:
         calls.append(1)
         return op(*args, **kwargs)
 
-    monkeypatch.setattr(gated_mlp_module, "gate_up_swiglu_quack_bf16", tracked)
+    monkeypatch.setattr(h3, "gate_up_swiglu_quack_h3", tracked)
     hidden_states = torch.randn(7, 32, dtype=torch.bfloat16, device="cuda")
     with torch.inference_mode():
         for ff in _ff_modules(model):
@@ -1410,6 +1410,15 @@ def test_bf16_blocks_run_the_fused_swiglu_epilogue(monkeypatch: pytest.MonkeyPat
             assert ff._can_fuse_gate_up_swiglu_bf16(hidden_states)
             ff(hidden_states)
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("world_size, selected", [(1, True), (2, False)])
+def test_model_local_kernels_need_one_gpu_per_request(
+    monkeypatch: pytest.MonkeyPatch, world_size: int, selected: bool
+) -> None:
+    monkeypatch.setattr(h3, "_sm100_family", lambda: True)
+    config = SimpleNamespace(visual_gen_mapping=SimpleNamespace(world_size=world_size))
+    assert h3.single_gpu_sm100(config) is selected
 
 
 @pytest.mark.parametrize("world_size", [2, 4, 8])
@@ -1428,6 +1437,7 @@ def test_ulysses_refiner_masks_padding_and_restores_sequence(
 
         class RankSharder:
             size = world_size
+            is_active = True
 
             def shard(self, tensor, dim):
                 assert dim == 1
@@ -1494,6 +1504,7 @@ def test_ulysses_forward_aligns_metadata_and_unpads_outputs(
 
         class RankSharder:
             size = world_size
+            is_active = True
 
             def shard(self, tensor, dim):
                 assert tensor.shape[dim] == padded_length
@@ -1579,7 +1590,9 @@ class _RecordingAsyncUlysses:
 
 def _make_ulysses_config(async_ulysses: bool) -> DiffusionModelConfig:
     config = _make_model_config()
-    config.visual_gen_mapping = SimpleNamespace(ulysses_size=2, cp_size=1, ring_size=1, cfg_size=1)
+    config.visual_gen_mapping = SimpleNamespace(
+        ulysses_size=2, cp_size=1, ring_size=1, cfg_size=1, world_size=2
+    )
     config.parallel = ParallelConfig(ulysses_size=2, async_ulysses=async_ulysses)
     return config
 
@@ -1658,6 +1671,7 @@ def test_load_weights_accepts_diffusers_layout_with_async_ulysses(
     config = _make_model_config(num_layers=1, num_refiner_layers=1)
     config.visual_gen_mapping = SimpleNamespace(
         ulysses_size=2,
+        world_size=2,
         cp_size=1,
         ring_size=1,
         cfg_size=1,

@@ -57,6 +57,141 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
     max_tiles_per_decoder_call: int = 16
     # Peak decoder bytes per latent element of a tile, from calibrate_tile_decode_memory.
     _decode_bytes_per_latent: float | None = None
+    # Compiled decode work around the compiled decoder blocks, from compile_decode_glue.
+    _compiled_prologue = None
+    _compiled_epilogue = None
+    _compiled_stitch = None
+    _compiled_join = None
+
+    def compile_decode_glue(self) -> None:
+        """Compile the tile decode work outside the decoder's transformer blocks.
+
+        The prologue (``post_quant_conv``, token projection, register tokens, RoPE tables) and the epilogue (output
+        norm, patch projection, unpatchify) run per decoder call with a tile count that varies with the free memory,
+        so they compile like the blocks; the tile stitching and the temporal join of the clips compile once per
+        geometry.
+        """
+        self._compiled_prologue = torch.compile(
+            self._decoder_prologue, mode="default", dynamic=None
+        )
+        self._compiled_epilogue = torch.compile(
+            self._decoder_epilogue, mode="default", dynamic=None
+        )
+        self._compiled_stitch = torch.compile(self._stitch_tiles, mode="default", dynamic=False)
+        self._compiled_join = torch.compile(self._join_clips, mode="default", dynamic=False)
+
+    def _decoder_prologue(
+        self, latents: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """``post_quant_conv`` and ``MiniMaxH3VideoViTDecoder3d.forward`` up to its transformer blocks."""
+        decoder = self.decoder
+        hidden_states = self.post_quant_conv(latents)
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        hidden_states = hidden_states.permute(0, 2, 3, 4, 1).reshape(
+            batch_size, num_frames * height * width, num_channels
+        )
+        hidden_states = decoder.proj_in(hidden_states)
+        register_tokens = decoder.register_tokens.expand(batch_size, -1, -1)
+        cls_token = torch.zeros_like(hidden_states[:, :1, :])
+        hidden_states = torch.cat([hidden_states, register_tokens, cls_token], dim=1)
+        grids = [
+            2.0 * (torch.arange(0.5, size, dtype=torch.float32, device=hidden_states.device) / size)
+            - 1.0
+            for size in (num_frames, height, width)
+        ]
+        position_ids = torch.stack(torch.meshgrid(*grids, indexing="ij"), dim=-1).flatten(0, 2)
+        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1, -1)
+        suffix_ids = position_ids.new_zeros((batch_size, decoder.num_register_tokens + 1, 3))
+        position_ids = torch.cat([position_ids, suffix_ids], dim=1)
+        return hidden_states, decoder.rope(position_ids)
+
+    def _decoder_epilogue(
+        self, hidden_states: torch.Tensor, num_frames: int, height: int, width: int
+    ) -> torch.Tensor:
+        """``MiniMaxH3VideoViTDecoder3d.forward`` after its transformer blocks."""
+        decoder = self.decoder
+        batch_size = hidden_states.shape[0]
+        hidden_states = decoder.proj_out(decoder.norm_out(hidden_states))
+        hidden_states = hidden_states[:, : num_frames * height * width, :]
+        patch_size, patch_size_t = decoder.patch_size, decoder.patch_size_t
+        hidden_states = hidden_states.view(
+            batch_size,
+            num_frames,
+            height,
+            width,
+            decoder.out_channels,
+            patch_size_t,
+            patch_size,
+            patch_size,
+        )
+        hidden_states = hidden_states.permute(0, 4, 1, 5, 2, 6, 3, 7).contiguous()
+        return hidden_states.reshape(
+            batch_size,
+            decoder.out_channels,
+            num_frames * patch_size_t,
+            height * patch_size,
+            width * patch_size,
+        )
+
+    def _decode(self, z: torch.Tensor) -> torch.Tensor:
+        """Diffusers' ``_decode``, with the clips' temporal cross-fade, concatenation and crop compiled."""
+        if self._compiled_join is None:
+            return super()._decode(z)
+        tokens_chunk_size = self.tokens_chunk_size
+        temporal_ratio = self.temporal_compression_ratio
+        num_tokens = z.shape[2] + self.config.token_drop
+        pad_tokens = (-num_tokens) % tokens_chunk_size
+        num_chunks = (num_tokens + pad_tokens) // tokens_chunk_size - int(
+            self.config.token_drop > 0
+        )
+        if pad_tokens > 0:
+            z = torch.cat([z, z[:, :, -1:].repeat(1, 1, pad_tokens, 1, 1)], dim=2)
+        clips = [
+            self._decode_clip(z[:, :, start : start + tokens_chunk_size + self.token_overlap])
+            for start in range(0, num_chunks * tokens_chunk_size, tokens_chunk_size)
+        ]
+        pad_frames = 0
+        if pad_tokens > 0:
+            intra_tail = self.config.clip_length % temporal_ratio
+            num_tokens_before_pad = z.shape[2] - pad_tokens
+            pad_frames = sum(
+                intra_tail
+                if intra_tail and (num_tokens_before_pad + k) % tokens_chunk_size == 0
+                else temporal_ratio
+                for k in range(pad_tokens)
+            )
+        return self._compiled_join(clips, pad_frames)
+
+    def _join_clips(self, clips: list[torch.Tensor], pad_frames: int) -> torch.Tensor:
+        """Cross-fade consecutive decoded clips over ``frame_overlap`` frames, concatenate them and drop the
+        ``pad_frames`` trailing frames of the repeated latents."""
+        chunk_num_frames = self.tokens_chunk_size * self.temporal_compression_ratio
+        decoded_chunks = []
+        overlap = None
+        for clip in clips:
+            for j in range(int(self.config.token_drop > 0) + 1):
+                frame_start = j * chunk_num_frames
+                chunk = clip[:, :, frame_start : frame_start + chunk_num_frames]
+                chunk = chunk[:, :, self.frame_pre_padding :]
+                if j == 0:
+                    if overlap is not None:
+                        chunk = self._blend(overlap, chunk, self.frame_overlap, dim=-3)
+                    decoded_chunks.append(chunk)
+                else:
+                    overlap = chunk
+        if overlap is not None:
+            decoded_chunks.append(overlap)
+        dec = torch.cat(decoded_chunks, dim=2)
+        return dec[:, :, :-pad_frames] if pad_frames else dec
+
+    def _decode_tile_batch(self, latents: torch.Tensor) -> torch.Tensor:
+        """Decode a batch of equal-size latent tiles."""
+        if self._compiled_prologue is None:
+            return self.decoder(self.post_quant_conv(latents))
+        hidden_states, rotary_emb = self._compiled_prologue(latents)
+        for block in self.decoder.transformer_blocks:
+            hidden_states = block(hidden_states, rotary_emb)
+        return self._compiled_epilogue(hidden_states, *latents.shape[2:])
 
     def configure_parallel(self, group: dist.ProcessGroup | None = None) -> None:
         """Enable tile parallelism using the loaded VAE's spatial geometry."""
@@ -166,7 +301,8 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
         else:
             decoded = self._decode_tiles_distributed(z, tiles, group)
         rows = [decoded[i : i + columns] for i in range(0, len(tiles), columns)]
-        return self._stitch_tiles(rows, y_overlaps, x_overlaps)
+        stitch = self._stitch_tiles if self._compiled_stitch is None else self._compiled_stitch
+        return stitch(rows, y_overlaps, x_overlaps)
 
     def _decode_tiles_batched(
         self, z: torch.Tensor, tiles: list[tuple[int, int, int, int]]
@@ -177,14 +313,14 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
         """
         latents = [z[..., y : y + h, x : x + w] for y, h, x, w in tiles]
         if len({tuple(t.shape) for t in latents}) != 1:
-            return [self.decoder(self.post_quant_conv(t)) for t in latents]
+            return [self._decode_tile_batch(t) for t in latents]
         batch = z.shape[0]
         decoded: list[torch.Tensor] = []
         start = 0
         while start < len(latents):
             count = self._tiles_per_decoder_call(latents[0], len(latents) - start)
             chunk = torch.cat(latents[start : start + count], dim=0)
-            decoded.extend(self.decoder(self.post_quant_conv(chunk)).split(batch, dim=0))
+            decoded.extend(self._decode_tile_batch(chunk).split(batch, dim=0))
             start += count
         return decoded
 
@@ -213,7 +349,7 @@ class TiledAutoencoderKLMiniMaxH3(AutoencoderKLMiniMaxH3):
         for start in range(0, waves, count):
             chunk = own[start : start + count]
             if chunk:
-                local = self.decoder(self.post_quant_conv(torch.cat(chunk, dim=0))).contiguous()
+                local = self._decode_tile_batch(torch.cat(chunk, dim=0)).contiguous()
             else:
                 # Every rank owns at least waves - 1 tiles, so only a last batch can be empty
                 # and the previous batch has set local's tile geometry.
