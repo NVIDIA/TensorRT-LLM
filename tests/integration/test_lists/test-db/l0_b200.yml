@@ -345,6 +345,11 @@ l0_b200:
   - unittest/_torch/modeling_v2/attention/test_modeling_v2_fused_qk_norm_rope.py
   # Vocab-parallel token selection kernels on a single shard.
   - unittest/_torch/speculative/test_vocab_parallel.py
+  # Fused rejection sampling kernels (TLLM_SPEC_FAST_RS): temperature-only and top-p.
+  - unittest/_torch/speculative/test_fast_rejection_sampling.py
+  - unittest/_torch/speculative/test_fast_topp_nucleus.py
+  - unittest/_torch/speculative/test_fast_topp_rejection_sampling.py
+  - unittest/_torch/speculative/test_fast_topp_rs_worker.py
   - unittest/_torch/moe/kernels/parallel
   - unittest/_torch/kernels/parallel TIMEOUT (90)
   - unittest/_torch/visual_gen/kernels/parallel

@@ -48,6 +48,10 @@ from ..pyexecutor.sampler import penalties as penalty_ops
 from ..pyexecutor.sampler.ops import custom as fused_sampling
 from ..pyexecutor.sampler.ops import flashinfer as flashinfer_sampling
 from ..pyexecutor.sampler.ops.vanilla import greedy_search_sampling_batch
+from .fast_rejection_sampling import (fast_rs_draft_block, fast_rs_enabled,
+                                      fast_rs_supported, fast_rs_verify)
+from .fast_topp_rejection_sampling import (fast_topp_rs_draft_block,
+                                           fast_topp_rs_verify)
 from .fused_accept import MAX_DRAFT_LEN, fused_strict_accept
 from .greedy_argmax import greedy_argmax
 from .spec_tail_kernels import strict_accept
@@ -1540,6 +1544,18 @@ class SpecMetadata:
         # same table to map logits rows back to their slot, so they enable it too.
         if (self.use_rejection_sampling
                 or self.enable_penalty) and self.batch_slot_ids is not None:
+            if fast_rs_enabled() and self.draft_probs is not None:
+                # The fused kernels index draft_probs by these ids without a
+                # device-side bound check (the reference's advanced indexing
+                # has one), so check the host list before it is copied.
+                num_rows = self.draft_probs.shape[0]
+                bad = [s for s in per_request_slot_ids if not 0 <= s < num_rows]
+                if bad:
+                    raise RuntimeError(
+                        f"rejection sampling: slot ids {bad[:8]} outside "
+                        f"draft_probs rows [0, {num_rows}) (num_seq_slots="
+                        f"{self.num_seq_slots}, max_num_requests="
+                        f"{self.max_num_requests})")
             self.batch_slot_ids[:len(per_request_slot_ids)].copy_(
                 torch.tensor(per_request_slot_ids,
                              dtype=torch.long,
@@ -2400,6 +2416,17 @@ class SpecWorkerBase(nn.Module, ABC):
             if self._rejection_buffers_valid(draft_tokens, draft_len,
                                              stored_vocab, num_contexts,
                                              batch_size, logits, spec_metadata):
+                # The fused verify assumes draft_len + 1 target rows per
+                # request, so ragged verification keeps the reference path.
+                if (not spec_metadata.is_ragged_verify
+                        and self._fast_rs_applies(spec_metadata, logits,
+                                                  stored_vocab)):
+                    # Fused kernels read the slot rows in place (no gather).
+                    accepted = self._sample_and_accept_draft_tokens_fast_rs(
+                        logits, draft_tokens, num_contexts, batch_size,
+                        spec_metadata)
+                    return self._commit_occurrence_counts(
+                        accepted, batch_size, spec_metadata)
                 # Gather the gen subset's slot rows, filled at the previous draft
                 # step indexed by py_seq_slot.
                 gen_slot_ids = spec_metadata.batch_slot_ids[
@@ -2784,6 +2811,118 @@ class SpecWorkerBase(nn.Module, ABC):
             return False
         return True
 
+    def _fast_rs_applies(self,
+                         spec_metadata: SpecMetadata,
+                         logits,
+                         stored_vocab: int,
+                         site: str = "verify") -> bool:
+        """Whether the fused rejection-sampling kernels cover this step.
+
+        ``TLLM_SPEC_FAST_RS=1`` opts in. The kernels implement temperature
+        sampling with an optional top-p nucleus, so the deploy-time
+        ``advanced_sampling_mode`` must disable top-k: ``no_topk_no_topp`` (pure
+        temperature, the original fused kernels) or ``no_topk`` (top-p honoured,
+        the nucleus kernels of `fast_topp_rejection_sampling`; the reference
+        path applies the same per-request filters in these modes). They also
+        need a shared draft/target vocabulary, full-vocab fp32 logits, no
+        synthetic acceptance override and no guided decoding (not validated
+        with the fused path). Host-side checks only, so the decision is CUDA-
+        graph safe. With the flag off nothing else is read, so the reference
+        dispatch is unchanged. The first decision of each call site (``site``)
+        is logged once per worker, so a run's log shows which path the opt-in
+        took.
+        """
+        if not fast_rs_enabled():
+            return False
+        mode = spec_metadata.advanced_sampling_mode
+        applies = (mode.skips_top_k and self._d2t is None
+                   and self.guided_decoder is None
+                   and self.force_num_accepted_tokens == 0.0
+                   and not isinstance(logits, VocabShardedLogits)
+                   and fast_rs_supported(logits, spec_metadata.draft_probs,
+                                         stored_vocab))
+        reported = getattr(self, "_fast_rs_reported_sites", None)
+        if reported is None:
+            reported = self._fast_rs_reported_sites = set()
+        if site not in reported:
+            reported.add(site)
+            if applies:
+                logger.info("TLLM_SPEC_FAST_RS=1: fused rejection sampling "
+                            f"active ({site}; "
+                            f"{'temperature' if mode.skips_top_p else 'top-p'}"
+                            " kernels).")
+            else:
+                logger.warning(
+                    "TLLM_SPEC_FAST_RS=1 but the fused rejection sampling does "
+                    f"not cover this step ({site}; it needs advanced_sampling_"
+                    "mode=no_topk or no_topk_no_topp, a shared draft/target "
+                    "vocabulary, full-vocab fp32 logits and no guided decoding; "
+                    f"mode={mode.name}); using the reference path.")
+        return applies
+
+    @staticmethod
+    def _fast_rs_dummy_row(spec_metadata: SpecMetadata) -> int:
+        # dummy_slot_row 0 is a live request's row, not a padding marker (see
+        # _zero_padding_rows), so it maps to "no padding slot".
+        row = getattr(spec_metadata, "dummy_slot_row", 0)
+        return row if row > 0 else -1
+
+    def _sample_and_accept_draft_tokens_fast_rs(self, logits: torch.Tensor,
+                                                draft_tokens: torch.Tensor,
+                                                num_contexts: int,
+                                                batch_size: int,
+                                                spec_metadata: SpecMetadata):
+        """Rejection-sampling acceptance through the fused kernels.
+
+        Same contract as `_sample_and_accept_draft_tokens_rejection` (context
+        rows take the target's sampled first token, generation rows run
+        rejection sampling); the generation rows read their proposals from the
+        slot-indexed ``draft_probs`` in place.
+        """
+        num_gens = batch_size - num_contexts
+        runtime_draft_len = draft_tokens.shape[1]
+        gen_end = num_contexts + num_gens * (runtime_draft_len + 1)
+        # The acceptance slot's stream, as the reference passes to
+        # rejection_sampling_one_model.
+        seed, offset = self._rng_state_per_request(
+            spec_metadata,
+            num_contexts,
+            batch_size,
+            slot=spec_metadata.rng_accept_slot)
+        rows_args = (
+            logits[num_contexts:gen_end],
+            spec_metadata.temperatures[num_contexts:gen_end],
+        )
+        req_args = (
+            draft_tokens.to(torch.int32).contiguous(),
+            spec_metadata.batch_slot_ids[num_contexts:batch_size],
+            self._fast_rs_dummy_row(spec_metadata),
+            spec_metadata.draft_probs,
+            seed,
+            offset,
+        )
+        if spec_metadata.advanced_sampling_mode.skips_top_p:
+            gen_accepted, gen_num_accepted = fast_rs_verify(
+                *rows_args, *req_args)
+        else:
+            # Top-p honoured (no_topk): verify against the targets' nuclei.
+            gen_accepted, gen_num_accepted = fast_topp_rs_verify(
+                rows_args[0], rows_args[1],
+                spec_metadata.top_ps[num_contexts:gen_end], *req_args)
+        if num_contexts == 0:
+            return gen_accepted, gen_num_accepted
+        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+        accepted_tokens[:num_contexts, 0] = self._sample_tokens_for_batch(
+            logits[:num_contexts], spec_metadata, num_contexts, num_contexts)
+        accepted_tokens[num_contexts:] = gen_accepted
+        num_accepted_tokens[num_contexts:] = gen_num_accepted
+        return accepted_tokens, num_accepted_tokens
+
     def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata) -> bool:
         # Skip rejection sampling when the whole batch is greedy: the accepted
         # result is identical to argmax and the base path is cheaper. Mixed
@@ -3162,6 +3301,40 @@ class SpecWorkerBase(nn.Module, ABC):
             return torch.empty((0, K),
                                dtype=torch.int32,
                                device=gen_logits.device)
+
+        flat_view = gen_logits.reshape(num_gens * K, vocab)
+        if (getattr(spec_metadata, "use_rejection_sampling", False)
+                and spec_metadata.draft_probs is not None
+                and spec_metadata.batch_slot_ids is not None
+                and self._fast_rs_applies(
+                    spec_metadata, flat_view, vocab, site="draft")):
+            # Fused: the proposals go straight to draft_probs[slot, 0:K]; draft
+            # position i of request b draws from subsequence b * K + i at
+            # offset + 1 (see the Philox layout in fast_rejection_sampling).
+            req_temps = spec_metadata.request_temperatures[
+                num_contexts:batch_size]
+            req_args = (
+                spec_metadata.batch_slot_ids[num_contexts:batch_size],
+                self._fast_rs_dummy_row(spec_metadata),
+                spec_metadata.draft_probs,
+                spec_metadata.request_seeds[num_contexts:batch_size],
+                spec_metadata.request_offsets[num_contexts:batch_size],
+            )
+            if spec_metadata.advanced_sampling_mode.skips_top_p:
+                tokens = fast_rs_draft_block(flat_view,
+                                             req_temps,
+                                             *req_args,
+                                             step_offset=1)
+            else:
+                # Top-p honoured (no_topk): sample from, and store, the nucleus.
+                tokens = fast_topp_rs_draft_block(
+                    flat_view,
+                    req_temps,
+                    spec_metadata.request_top_ps[num_contexts:batch_size],
+                    *req_args,
+                    step_offset=1)
+            spec_metadata.draft_probs_last_dim = vocab
+            return tokens.reshape(num_gens, K)
 
         # Take the gen slice and repeat each request's value K times to line up
         # with the flattened [num_gens*K, vocab] logits (K rows per request).
