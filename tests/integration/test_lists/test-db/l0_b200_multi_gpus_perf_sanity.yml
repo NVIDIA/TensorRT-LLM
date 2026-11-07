@@ -1,5 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# One top-level key per test list: a stage names its list (the key) in jenkins/L0_Test.groovy.
 version: 0.0.1
 l0_b200_multi_gpus_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tp4_8k1k] TIMEOUT (35)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_8k1k] TIMEOUT (35)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tep4_mtp3_8k1k] TIMEOUT (35)
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_mtp3_8k1k] TIMEOUT (30)
+l0_b200_multi_gpus_perf_sanity_glm5:
 - condition:
     ranges:
       system_gpu_count:
@@ -18,7 +42,3 @@ l0_b200_multi_gpus_perf_sanity:
   # glm-5-fp4
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_tep8_mtp3_8k1k] TIMEOUT (60)
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-glm5_fp4_blackwell-glm5_fp4_dep8_mtp1_8k1k] TIMEOUT (35)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tp4_8k1k] TIMEOUT (35)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_8k1k] TIMEOUT (35)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_tep4_mtp3_8k1k] TIMEOUT (35)
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_5_397b_fp4_blackwell-qwen3_5_397b_fp4_dep8_mtp3_8k1k] TIMEOUT (30)

@@ -49,6 +49,8 @@ class Stage:
 
 @dataclass
 class Block:
+    # The test-db context (top-level YAML key) holding the block, i.e. the test list a stage
+    # names. A YAML file may hold several contexts; for a single-context file this is its stem.
     yaml_stem: str
     block_index: int
     condition: dict
@@ -237,9 +239,14 @@ class YAMLIndex:
         return idx
 
     def _load_one(self, yml_path: Path) -> None:
-        yaml_stem = yml_path.stem
+        """Index every test-db context (top-level key) that `yml_path` defines."""
         data = yaml.safe_load(yml_path.read_text()) or {}
-        blocks_data = data.get(yaml_stem, []) or []
+        for context, blocks_data in data.items():
+            if context != "version" and isinstance(blocks_data, list):
+                self._load_context(context, blocks_data)
+
+    def _load_context(self, yaml_stem: str, blocks_data: list) -> None:
+        """Index the blocks of context `yaml_stem` and map each of their tests to its blocks."""
         for i, block_data in enumerate(blocks_data):
             if not isinstance(block_data, dict):
                 continue
@@ -726,10 +733,11 @@ def write_filtered_test_db(
 ) -> None:
     """Generate a tmp test-db dir narrowed by CBTS Layer 3.
 
-    Each output YAML contains ONLY the blocks listed in `block_filters` for
-    that stem, with each affected block's `tests:` array filtered to entries
-    in the per-block filter prefix subtree. Unaffected blocks and unaffected
-    YAML files are dropped entirely.
+    Each output YAML is `<context>.yml` for one affected test-db context and
+    contains ONLY the blocks listed in `block_filters` for that context, with
+    each affected block's `tests:` array filtered to entries in the per-block
+    filter prefix subtree. Unaffected blocks and unaffected contexts are
+    dropped entirely.
 
     Two narrowing checks per entry:
       1. Subtree match — entry's target lives under at least one filter prefix
@@ -760,47 +768,73 @@ def write_filtered_test_db(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     affected_stems = {stem for stem, _ in block_filters}
+    context_files = find_context_files(src_dir)
     for stem in sorted(affected_stems):
-        src = src_dir / f"{stem}.yml"
-        if not src.exists():
+        src = context_files.get(stem)
+        if src is None:
             continue
         data = yaml.safe_load(src.read_text()) or {}
-
-        for ctx_key, ctx_blocks in list(data.items()):
-            if not isinstance(ctx_blocks, list):
+        ctx_blocks = data.get(stem)
+        if not isinstance(ctx_blocks, list):
+            continue
+        new_blocks = []
+        for i, block_data in enumerate(ctx_blocks):
+            if not isinstance(block_data, dict):
                 continue
-            new_blocks = []
-            for i, block_data in enumerate(ctx_blocks):
-                if not isinstance(block_data, dict):
+            key = (stem, i)
+            if key not in block_filters:
+                # Drop unaffected blocks (see docstring rationale).
+                continue
+            original = block_data.get("tests") or []
+            prefix_to_waives = block_filters[key]
+            kept = []
+            for t in original:
+                target = _entry_target(t)
+                matched_waives: set[str] = set()
+                for prefix, waives in prefix_to_waives.items():
+                    if _target_in_filter_subtree(target, prefix):
+                        matched_waives |= waives
+                if not matched_waives:
                     continue
-                key = (stem, i)
-                if key not in block_filters:
-                    # Drop unaffected blocks (see docstring rationale).
-                    continue
-                original = block_data.get("tests") or []
-                prefix_to_waives = block_filters[key]
-                kept = []
-                for t in original:
-                    target = _entry_target(t)
-                    matched_waives: set[str] = set()
-                    for prefix, waives in prefix_to_waives.items():
-                        if _target_in_filter_subtree(target, prefix):
-                            matched_waives |= waives
-                    if not matched_waives:
-                        continue
-                    # -k keyword guard: drop entries whose `-k` filter
-                    # excludes every matching waive. Entries without `-k`
-                    # are always kept (`_entry_applies_to_waive` returns
-                    # True when no keyword is present).
-                    if any(_entry_applies_to_waive(t, w) for w in matched_waives):
-                        kept.append(t)
-                # Safety: empty filter result → fallback to original (prevents
-                # silent skip from typo'd waive ids or granularity mismatch).
-                if kept:
-                    block_data["tests"] = kept
-                new_blocks.append(block_data)
-            data[ctx_key] = new_blocks
+                # -k keyword guard: drop entries whose `-k` filter
+                # excludes every matching waive. Entries without `-k`
+                # are always kept (`_entry_applies_to_waive` returns
+                # True when no keyword is present).
+                if any(_entry_applies_to_waive(t, w) for w in matched_waives):
+                    kept.append(t)
+            # Safety: empty filter result → fallback to original (prevents
+            # silent skip from typo'd waive ids or granularity mismatch).
+            if kept:
+                block_data["tests"] = kept
+            new_blocks.append(block_data)
 
-        (output_dir / src.name).write_text(
-            yaml.safe_dump(data, sort_keys=False, default_flow_style=False)
-        )
+        write_context_file(output_dir, data, stem, new_blocks)
+
+
+def find_context_files(test_db_dir: Path) -> dict[str, Path]:
+    """Map each test-db context (top-level key) to the YAML file that defines it.
+
+    A file may define several contexts, so a context is not looked up by file name.
+    """
+    files: dict[str, Path] = {}
+    for yml_path in sorted(test_db_dir.glob("*.yml")):
+        data = yaml.safe_load(yml_path.read_text()) or {}
+        for context, blocks in data.items():
+            if context != "version" and isinstance(blocks, list):
+                files[context] = yml_path
+    return files
+
+
+def write_context_file(output_dir: Path, source_data: dict, context: str, blocks: list) -> None:
+    """Write `<context>.yml` holding only the `version` key and `context`.
+
+    A stage finds its narrowed test list by its context name: renderTestDB looks for
+    `<testList>.yml` in the override directory.
+    """
+    out: dict = {}
+    if "version" in source_data:
+        out["version"] = source_data["version"]
+    out[context] = blocks
+    (output_dir / f"{context}.yml").write_text(
+        yaml.safe_dump(out, sort_keys=False, default_flow_style=False)
+    )

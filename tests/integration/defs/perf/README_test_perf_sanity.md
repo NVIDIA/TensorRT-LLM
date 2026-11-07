@@ -445,13 +445,18 @@ JSON. To reproduce the uploaded numbers offline, run
 
 Test lists are defined in `tests/integration/test_lists/test-db/`.
 
-### YAML File Naming Convention
+### Test List Naming Convention
 
-| Test Type | File Pattern | Example |
-|-----------|--------------|---------|
-| Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
-| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8.yml` |
-| Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
+A test list is a top-level key of a test-db YAML file, and a Jenkins stage names its list (`trt-test-db --context`). One file can hold several lists: the perf-sanity lists of a GPU type share one file for single-node and one for multi-node stages, so CODEOWNERS (`*multi_gpu*`, `*multi_node*`) still routes their reviews.
+
+| Test Type | File | Test list | Example list |
+|-----------|------|-----------|--------------|
+| Single-node | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_{gpu_type}_multi_gpus_perf_sanity[_{suffix}]` | `l0_gb300_multi_gpus_perf_sanity_glm5` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count}` | `l0_gb200_multi_nodes_perf_sanity_node2_gpu8` |
+| Multi-node gen_only_no_context | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_gen1_node{node count}_gpu{gpu count}[_{suffix}]` | `l0_gb300_multi_nodes_perf_sanity_gen1_node2_gpu8_glm5` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_nodes_perf_sanity.yml` | `l0_{gpu_type}_multi_nodes_perf_sanity_ctx{ctx workers}_node{nodes per ctx worker}_gpu{gpus per ctx worker}_gen{gen workers}_node{nodes per gen worker}_gpu{gpus per gen worker}[_{suffix}]` | `l0_gb300_multi_nodes_perf_sanity_ctx12_node1_gpu4_gen1_node2_gpu8_e2e` |
+
+The optional `{suffix}` (`glm5`, `e2e`) separates cases that share a topology but run at a different post-merge frequency (see below).
 
 ### Jenkins Pipeline Configuration
 
@@ -477,6 +482,20 @@ Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` functio
 | Disaggregated e2e test | Any | 1 | Always one test per stage |
 
 **Important**: Pre-merge and post-merge tests must be in separate stages.
+
+### Post-merge Run Frequency
+
+The official post-merge pipeline runs every perf-sanity stage once every N builds:
+
+| Cases | N |
+|-------|---|
+| Qwen3-235B FP4 and GLM-5 FP4 (all modes) | 8 |
+| DeepSeek-V4-Pro FP4 disaggregated `e2e` | 4 |
+| Every other perf-sanity case | 2 |
+
+`POST_MERGE_STAGE_BUILD_INTERVALS` in `jenkins/L0_Test.groovy` sets `N` (or `[N, offset]`) per stage: split `k` runs on the post-merge builds whose `BUILD_NUMBER % N == (offset + k - 1) % N`, and the offsets spread the stages so that every build carries a similar load. Because the frequency is per stage, a test list holds cases of one frequency only; a case that runs at a different frequency than its list goes into its own list and stage (the `_glm5` / `-GLM5-` and `_e2e` / `-E2E-` ones). Add a new case to a list of its own frequency, and give a new list an entry if it is not every 2 builds.
+
+A PR's `/bot run --post-merge` runs no post-merge perf-sanity stage (a stage whose name contains both `PerfSanity` and `Post-Merge`); only the official post-merge pipeline runs them. The pre-merge perf-sanity stages run as in a plain `/bot run`. To run a post-merge perf-sanity stage on a PR, name it with `--stage-list` or `--extra-stage`.
 
 ### Pre-merge vs Post-merge Perf-Regression Gating
 
