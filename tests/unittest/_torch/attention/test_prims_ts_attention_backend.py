@@ -33,8 +33,14 @@ from backend_case import (
 from utils.util import getSMVersion
 
 pytestmark = pytest.mark.skipif(
+    getSMVersion() not in (100, 103, 107),
+    reason="PrimsTS attention kernels require SM100, SM103, or SM107",
+)
+
+
+_REQUIRES_BLACKWELL_MLA = pytest.mark.skipif(
     getSMVersion() not in (100, 103),
-    reason="PrimsTS attention kernels require SM100 or SM103",
+    reason="MLA PrimsTS integration requires SM100 or SM103",
 )
 
 
@@ -98,17 +104,30 @@ _DEEPSEEK_V3_LITE_MLA = {
             },
             id="mixed",
         ),
+        pytest.param(
+            {"seq_lens": [41, 17], "num_cached_tokens": [63, 32], "num_contexts": 2},
+            id="cached-context",
+        ),
+        pytest.param(
+            {"seq_lens": [1, 1], "num_cached_tokens": [8191, 4096], "num_contexts": 0},
+            id="long-generation",
+        ),
     ],
 )
+@pytest.mark.parametrize("dtype", ["bfloat16", "float16"], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["native-kv", "fp8-kv"])
 def test_prims_ts_qwen2_gqa(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
     phase_args: dict,
+    kv_dtype: str | None,
+    dtype: str,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     case = BackendCase(
-        **_QWEN2_7B,
+        **{**_QWEN2_7B, "dtype": dtype},
         **phase_args,
+        kv_dtype=kv_dtype,
         use_kv_cache_manager_v2=use_kv_cache_manager_v2,
     )
 
@@ -200,8 +219,10 @@ def test_prims_ts_context_receives_zeroed_v_tail(
     assert zeroed_tails == [(0, 1), (1, 5)]
 
 
+@pytest.mark.parametrize("kv_dtype", [None, "fp8"], ids=["fp16-kv", "fp8-kv"])
 def test_prims_ts_fp16_dense_context_with_alternate_shape(
     monkeypatch: pytest.MonkeyPatch,
+    kv_dtype: str | None,
 ) -> None:
     monkeypatch.setenv("TLLM_FMHA_LIBS", "prims_ts")
     case = BackendCase(
@@ -212,6 +233,7 @@ def test_prims_ts_fp16_dense_context_with_alternate_shape(
         num_cached_tokens=[0, 0],
         num_contexts=2,
         dtype="float16",
+        kv_dtype=kv_dtype,
         causal=False,
         kv_layout="HND",
         page_size=64,
@@ -363,6 +385,7 @@ def test_prims_ts_uses_compact_preprocessing_and_separate_decode_workspace(
 
 
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_deepseek_v3_lite_mla_generation(
     monkeypatch: pytest.MonkeyPatch,
     use_kv_cache_manager_v2: bool,
@@ -381,6 +404,7 @@ def test_prims_ts_deepseek_v3_lite_mla_generation(
 
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("use_kv_cache_manager_v2", [False, True], ids=["v1", "v2"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_fp8_mla_preprocessing(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, use_kv_cache_manager_v2: bool
 ) -> None:
@@ -447,6 +471,7 @@ def test_prims_ts_fp8_mla_preprocessing(
 @pytest.mark.parametrize("num_heads", [6, 12, 96])
 @pytest.mark.parametrize("batch_size", [2, 65])
 @pytest.mark.parametrize("max_seq_len", [64, 128], ids=["short-kv", "regular-kv"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_fp8_mla_scales_and_graph_replay(
     monkeypatch: pytest.MonkeyPatch, num_heads: int, batch_size: int, max_seq_len: int
 ) -> None:
@@ -720,7 +745,7 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
     wrapper.plan(
         device=device,
         batch_size=batch_size,
-        max_seq_len_q=3,
+        max_q_len=3,
         max_kv_len=max_seq_len,
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
@@ -738,12 +763,12 @@ def test_prims_ts_context_wrapper_cuda_graph_replay_with_updated_metadata(
 
     assert len(compile_records) == 3
     assert [
-        (args[0].max_seq_len_q, args[0].max_kv_len, policy["scheduler"])
+        (args[0].max_q_len, args[0].max_kv_len, args[0].runtime_lengths, policy["scheduler"])
         for args, policy, _compiled in compile_records
     ] == [
-        (96, 96, "clc_dynamic_persistent"),
-        (128, 128, "nonpersistent"),
-        (3, 64, "clc_dynamic_persistent"),
+        (None, None, True, "clc_dynamic_persistent"),
+        (None, None, True, "nonpersistent"),
+        (None, None, True, "clc_dynamic_persistent"),
     ]
     assert compile_records[0][0] != compile_records[2][0]
     assert len({id(recorded) for _args, _policy, recorded in compile_records}) == 3
@@ -863,11 +888,11 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
         head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -924,6 +949,7 @@ def test_prims_ts_decode_live_wrapper_cuda_graph_replay() -> None:
 
 
 @pytest.mark.parametrize("max_seq_len", [64, 1024], ids=["short-kv", "regular-kv"])
+@_REQUIRES_BLACKWELL_MLA
 def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
     from tensorrt_llm._torch.attention.backends.prims_ts import (
         BatchMLADecodePagedTSWrapper,
@@ -978,7 +1004,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         q_dtype=dtype,
         kv_dtype=dtype,
         out_dtype=dtype,
@@ -999,11 +1025,11 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         qk_rope_head_dim,
         page_size,
         max_seq_len,
-        max_seq_len_q=1,
+        max_q_len=1,
         packed_query=False,
-        q_data_type=dtype,
-        kv_data_type=dtype,
-        o_data_type=dtype,
+        q_dtype=dtype,
+        kv_dtype=dtype,
+        out_dtype=dtype,
         mask_type="causal",
         workspace_buffer=external_workspace,
     )
@@ -1019,7 +1045,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_cache,
         block_tables,
         seq_lens,
-        bmm1_scale=bmm1_scale,
+        softmax_scale=bmm1_scale,
         out=output,
     )
     graph = torch.cuda.CUDAGraph()
@@ -1029,7 +1055,7 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
             kv_cache,
             block_tables,
             seq_lens,
-            bmm1_scale=bmm1_scale,
+            softmax_scale=bmm1_scale,
             out=output,
             validate=False,
         )
@@ -1047,8 +1073,8 @@ def test_prims_ts_mla_live_wrapper_cuda_graph_replay(max_seq_len: int) -> None:
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         max_kv_len=max_seq_len,
-        max_seq_len_q=1,
-        bmm1_scale=bmm1_scale,
+        max_q_len=1,
+        softmax_scale=bmm1_scale,
         out_dtype=dtype,
         out=torch.empty_like(output),
         mask_type="causal",
@@ -1130,11 +1156,11 @@ def test_prims_ts_decode_graph_profiles_reset_shared_workspace_a_b_a() -> None:
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1289,11 +1315,11 @@ def test_prims_ts_decode_wrappers_share_workspace_across_serialized_layers() -> 
             head_dim,
             page_size,
             max_seq_len,
-            max_seq_len_q=1,
+            max_q_len=1,
             packed_query=False,
-            q_data_type=dtype,
-            kv_data_type=dtype,
-            o_data_type=dtype,
+            q_dtype=dtype,
+            kv_dtype=dtype,
+            out_dtype=dtype,
             mask_type="causal",
             workspace_buffer=shared_workspace,
         )
@@ -1504,8 +1530,8 @@ def test_prims_ts_cache_free_fp8_recipes(
         assert (run_kwargs["vc"].q_scale is not None) == (qk_dtype == "fp8")
         assert (plan_kwargs["vc_config"].repair_tiles > 0) == (vc_repair_budget > 0)
         assert plan_kwargs["vc_config"].demean == (vc_smooth and not vc_repair_budget)
-        assert run_kwargs["output_scale"] is None
-        assert run_kwargs["scale_softmax_log2"] is None
+        assert run_kwargs["output_scale"] == 1.0
+        assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     else:
         # The quantize op returns BF16-rounded dequant scales.
         torch.testing.assert_close(
@@ -1515,13 +1541,11 @@ def test_prims_ts_cache_free_fp8_recipes(
             expected = (
                 dequant_scale(inputs["q"])
                 * dequant_scale(inputs["new_k"])
-                * (math.log2(math.e) / math.sqrt(case.head_dim))
+                / math.sqrt(case.head_dim)
             )
-            torch.testing.assert_close(
-                run_kwargs["scale_softmax_log2"], expected, rtol=1e-2, atol=0.0
-            )
+            torch.testing.assert_close(run_kwargs["softmax_scale"], expected, rtol=1e-2, atol=0.0)
         else:
-            assert run_kwargs["scale_softmax_log2"] is None
+            assert run_kwargs["softmax_scale"] == 1.0 / math.sqrt(case.head_dim)
     # The second sample's output is ``outlier`` times larger. Normalize it before comparing.
     sample_gain = torch.tensor([1.0, outlier], device=out.device).view(-1, 1)
     torch.testing.assert_close(
@@ -1601,3 +1625,195 @@ def test_prims_ts_unsupported_context_falls_back(monkeypatch: pytest.MonkeyPatch
 
     assert calls["fallback"] > 0
     assert calls["prims_context"] == 0
+
+
+@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize(
+    ("mode", "page_size", "head_ratio"),
+    [
+        ("disabled", 16, 1),
+        ("gmem_reduction", 32, 7),
+        ("gmem_reduction_with_separate_kernel", 64, 8),
+        ("cluster_smem_reduction", 128, 16),
+    ],
+)
+def test_prims_ts_fp8_decode_bf16_device_scales(
+    monkeypatch: pytest.MonkeyPatch, head_dim: int, mode: str, page_size: int, head_ratio: int
+) -> None:
+    """Qualify BF16 stores/reducers and live device scales across graph replay."""
+    from dataclasses import replace
+
+    import cutlass
+
+    from tensorrt_llm._torch.attention.backends.prims_ts import decode
+    from tensorrt_llm._torch.attention.backends.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        make_decode_config,
+    )
+
+    torch.manual_seed(123)
+    batch_size, kv_heads = 2, 2
+    qo_heads = kv_heads * head_ratio
+    max_kv_len = 2048
+    pages_per_seq = max_kv_len // page_size
+    num_pages = batch_size * pages_per_seq
+    q = torch.randn(batch_size, qo_heads, head_dim, device="cuda").to(torch.float8_e4m3fn)
+    k = torch.randn(num_pages, kv_heads, page_size, head_dim, device="cuda").to(torch.float8_e4m3fn)
+    v = torch.randn_like(k, dtype=torch.float32).to(torch.float8_e4m3fn)
+    # Permuted pages and padded table rows catch assumptions about pool layout.
+    table = torch.full((batch_size, pages_per_seq + 3), -1, dtype=torch.int32, device="cuda")
+    table[:, :pages_per_seq] = torch.randperm(num_pages, device="cuda").reshape(batch_size, -1)
+    lengths_host = [max_kv_len - 13, max_kv_len // 2 + 7]
+    lengths = torch.tensor(lengths_host, dtype=torch.int32, device="cuda")
+    bmm1 = torch.tensor([0.25 / math.sqrt(head_dim)], device="cuda")
+    bmm2 = torch.tensor([1.75], device="cuda")
+    output = torch.empty_like(q, dtype=torch.bfloat16)
+    splits = 1 if mode == "disabled" else 4
+    cfg = make_decode_config(
+        headdim=head_dim,
+        args={"tile_size_q": 16, "groups_tokens_heads_q": True, "use_keeps_mma_ab": False},
+        seq_len_q=1,
+        seq_len_kv=max_kv_len,
+        batch_size=batch_size,
+        num_heads_q=qo_heads,
+        num_heads_kv=kv_heads,
+        qkv_dtype=cutlass.Float8E4M3FN,
+        o_dtype=cutlass.BFloat16,
+        qkv_layout="pagedKv",
+        num_tokens_per_page=page_size,
+        split_kv_mode=mode,
+        splits_kv=splits,
+        max_splits_kv=splits,
+        mask_type="causal",
+        auto_tuner=False,
+    )
+
+    def plan(output_dtype: torch.dtype, use_device_scales: bool):
+        spec = decode._decode_launch_spec_from_config(
+            replace(
+                cfg,
+                out_dtype=cutlass.BFloat16 if output_dtype == torch.bfloat16 else cutlass.Float16,
+            ),
+            batch_size=batch_size,
+            num_qo_heads=qo_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
+            seq_len_q=1,
+            max_active_clusters=torch.cuda.get_device_properties(0).multi_processor_count,
+        )
+        monkeypatch.setattr(decode, "_resolve_decode_launch_spec", lambda *args, **kwargs: spec)
+        wrapper = decode.BatchDecodePagedTSWrapper()
+        wrapper.plan(
+            q.device,
+            batch_size,
+            qo_heads,
+            kv_heads,
+            head_dim,
+            page_size,
+            max_kv_len,
+            q_dtype=q.dtype,
+            out_dtype=output_dtype,
+            mask_type="causal",
+            softmax_scale=bmm1 if use_device_scales else bmm1.item(),
+            output_scale=bmm2 if use_device_scales else bmm2.item(),
+        )
+        return wrapper
+
+    wrapper = plan(torch.bfloat16, True)
+    fp16_wrapper = plan(torch.float16, False)
+    bf16_host_wrapper = plan(torch.bfloat16, False)
+
+    def run() -> torch.Tensor:
+        if mode == "gmem_reduction":
+            wrapper._plan_state.workspace.split_kv_counter.zero_()
+        return wrapper.run(
+            q,
+            (k, v),
+            lengths,
+            table,
+            out=output,
+            softmax_scale=bmm1,
+            output_scale=bmm2,
+            validate=False,
+        )
+
+    def reference() -> torch.Tensor:
+        results = []
+        for batch_idx, length in enumerate(lengths_host):
+            ids = table[batch_idx, :pages_per_seq].long()
+            keys = k.float()[ids].permute(1, 0, 2, 3).reshape(kv_heads, -1, head_dim)[:, :length]
+            values = v.float()[ids].permute(1, 0, 2, 3).reshape(kv_heads, -1, head_dim)[:, :length]
+            keys = keys.repeat_interleave(head_ratio, dim=0)
+            values = values.repeat_interleave(head_ratio, dim=0)
+            scores = torch.einsum("hd,htd->ht", q[batch_idx].float(), keys) * bmm1
+            results.append(torch.einsum("ht,htd->hd", scores.softmax(-1), values) * bmm2)
+        return torch.stack(results)
+
+    def check_output() -> None:
+        # The FP8 kernel rounds the intermediate P operand to E4M3. Compare
+        # math with that quantization tolerance, and the existing FP16 output
+        # path tightly to isolate BF16 stores and device-scale handling.
+        torch.testing.assert_close(output.float(), reference(), atol=0.01, rtol=0.05)
+        if mode == "gmem_reduction":
+            fp16_wrapper._plan_state.workspace.split_kv_counter.zero_()
+        fp16_output = fp16_wrapper.run(
+            q,
+            (k, v),
+            lengths,
+            table,
+            softmax_scale=bmm1.item(),
+            output_scale=bmm2.item(),
+            validate=False,
+        )
+        torch.testing.assert_close(output.float(), fp16_output.float(), atol=0.0005, rtol=0.008)
+
+        if mode == "gmem_reduction":
+            bf16_host_wrapper._plan_state.workspace.split_kv_counter.zero_()
+        bf16_host_output = bf16_host_wrapper.run(
+            q,
+            (k, v),
+            lengths,
+            table,
+            softmax_scale=bmm1.item(),
+            output_scale=bmm2.item(),
+            validate=False,
+        )
+        torch.testing.assert_close(
+            output.float(), bf16_host_output.float(), atol=0.0005, rtol=0.008
+        )
+
+    if mode == "gmem_reduction":
+        wrapper._plan_state.workspace.split_kv_counter.zero_()
+    wrapper.run(
+        q,
+        (k, v),
+        lengths,
+        table,
+        out=output,
+        softmax_scale=bmm1,
+        output_scale=bmm2,
+        validate=True,
+    )
+    torch.cuda.synchronize()
+    check_output()
+
+    def no_host_read(*args, **kwargs):
+        raise AssertionError("decode must not read scales back to the host")
+
+    with monkeypatch.context() as guard:
+        guard.setattr(torch.Tensor, "item", no_host_read)
+        guard.setattr(torch.Tensor, "__float__", no_host_read)
+        sync_debug_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            run()
+        finally:
+            torch.cuda.set_sync_debug_mode(sync_debug_mode)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        # Both attention scores and final output must consume updated scales.
+        bmm1.mul_(2)
+        bmm2.mul_(0.5)
+        graph.replay()
+    torch.cuda.synchronize()
+    check_output()
