@@ -1,0 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+version: 0.0.1
+l0_gr100_perf_sanity:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      compute_capability: '10.7'
+      stage: post_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  # gemma-4-26b-a4b-nvfp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-gemma4_26b_a4b_nvfp4_rubin-gemma4_26b_a4b_nvfp4_tp1_1k1k] TIMEOUT (30)
+  # qwen3.8-flash-next-nvfp4
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-qwen3_8_flash_next_fp4_rubin-qwen3_8_flash_next_fp4_tp1_mtp3_8k1k] TIMEOUT (35)

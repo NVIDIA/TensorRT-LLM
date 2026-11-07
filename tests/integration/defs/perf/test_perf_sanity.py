@@ -22,6 +22,7 @@ import ipaddress
 import json
 import math
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -72,6 +73,13 @@ SUPPORTED_GPU_MAPPING = {
     "B300": "b300",
     "H200": "h200",
     "VR200": "vr200",
+}
+
+# Pre-production boards report the placeholder product name "NVIDIA Graphics
+# Device", so they are identified by (compute capability, host CPU) instead.
+PLACEHOLDER_GPU_NAME = "Graphics Device"
+PLACEHOLDER_GPU_MAPPING = {
+    ("10.7", "x86_64"): "gr100",
 }
 
 # benchmark_client value selecting the AgentX trace-replay client
@@ -4529,6 +4537,16 @@ class PerfSanityTestConfig:
                     stderr=subprocess.DEVNULL,
                     text=True,
                 )
+                if PLACEHOLDER_GPU_NAME in output:
+                    compute_cap = subprocess.check_output(
+                        "nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1",
+                        shell=True,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    ).strip()
+                    return PLACEHOLDER_GPU_MAPPING.get(
+                        (compute_cap, platform.machine()), "unsupported"
+                    )
                 model = output.split()[-1]
                 return SUPPORTED_GPU_MAPPING.get(model, "unsupported")
             except (subprocess.CalledProcessError, FileNotFoundError, IndexError):

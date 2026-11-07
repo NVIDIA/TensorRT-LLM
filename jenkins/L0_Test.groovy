@@ -7076,6 +7076,8 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         // PerfSanity post-merge tests
         "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 1, 8, 1, true],
         "GR100-PyTorch-Post-Merge-1": ["auto:gr100-x1", "l0_gr100", 1, 1],
+        // Single-GPU Rubin PerfSanity post-merge tests
+        "GR100-PyTorch-PerfSanity-Post-Merge-1": ["auto:gr100-x1", "l0_gr100_perf_sanity", 1, 1],
     ]
     x86SlurmTestConfigs = cbtsResizeSplits(x86SlurmTestConfigs)
     fullSet += x86SlurmTestConfigs.keySet()
