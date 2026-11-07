@@ -1624,6 +1624,10 @@ def test_KvCacheConfig_declaration(offload_field):
         BlockReuseConfig(policy="invalid")
     with pytest.raises(ValidationError):
         BlockReuseConfig(max_num_turns=0)
+    assert BlockReuseConfig(policy="per_conversation",
+                            drop_extended_turns=True).drop_extended_turns
+    with pytest.raises(ValidationError, match="drop_extended_turns"):
+        BlockReuseConfig(drop_extended_turns=True)
 
 
 @pytest.mark.cpu_only

@@ -5023,6 +5023,20 @@ class BlockReuseConfig(StrictBaseModel):
         "Only used when "
         "`policy` is 'per_conversation'.")
 
+    drop_extended_turns: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "With policy 'per_conversation', drop a retained turn as soon as a "
+        "later turn of the same conversation extends it (its committed tokens "
+        "are a prefix of the later turn's), instead of waiting for it to age "
+        "out of `max_num_turns`. Turns that are not extended keep their state "
+        "until the `max_num_turns` cap drops the oldest. This helps when one "
+        "conversation id carries several branches, such as subagents that "
+        "share their parent's id: a subagent's turns no longer push out the "
+        "parent's state. Set `max_num_turns` to at least the number of "
+        "branches to keep.")
+
     swa_endpoint_rewind_tokens: NonNegativeInt = Field(
         default=0,
         status="prototype",
@@ -5055,6 +5069,13 @@ class BlockReuseConfig(StrictBaseModel):
             raise ValueError(
                 "block_reuse_config.swa_endpoint_rewind_tokens requires "
                 "block_reuse_config.policy='all_reusable'.")
+        return self
+
+    @model_validator(mode="after")
+    def validate_drop_extended_turns_policy(self) -> 'BlockReuseConfig':
+        if self.drop_extended_turns and self.policy != "per_conversation":
+            raise ValueError("block_reuse_config.drop_extended_turns requires "
+                             "block_reuse_config.policy='per_conversation'.")
         return self
 
 
