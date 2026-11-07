@@ -6,8 +6,8 @@ import base64
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import (Any, Collection, Coroutine, Dict, List, Optional, Tuple,
-                    TypedDict, Union)
+from typing import (Any, Callable, Collection, Coroutine, Dict, List, Optional,
+                    Tuple, TypedDict, Union)
 from urllib.parse import urlparse
 
 import numpy as np
@@ -359,6 +359,7 @@ class MultimodalDataTracker:
         model_type: str,
         multimodal_server_config: Optional[MultimodalServerConfig] = None,
         request_media_io_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+        decoded_memory_reserver: Optional[Callable[[int, int], Any]] = None,
     ):
         self._model_type = model_type
         self._data = defaultdict[str, list](list)
@@ -378,11 +379,17 @@ class MultimodalDataTracker:
         # Per-request override merged with the server default at media-load
         # time; see `BaseMediaIO.merge_kwargs` in `inputs/media_io.py`.
         self._request_media_io_kwargs = request_media_io_kwargs
+        self._decoded_memory_reserver = decoded_memory_reserver
 
     @property
     def request_media_io_kwargs(self) -> Optional[Dict[str, Dict[str, Any]]]:
         """Per-request `media_io_kwargs` override, or `None` if not set."""
         return self._request_media_io_kwargs
+
+    @property
+    def decoded_memory_reserver(self) -> Optional[Callable[[int, int], Any]]:
+        """Budget shared by this request's video decodes, or `None`."""
+        return self._decoded_memory_reserver
 
     async def retrieve_all_async(
         self

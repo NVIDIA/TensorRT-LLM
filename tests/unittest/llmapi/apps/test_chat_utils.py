@@ -1,6 +1,8 @@
+import base64
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 
 from tensorrt_llm.inputs import MultimodalDataTracker
@@ -747,6 +749,85 @@ class TestMakeMediaIo:
         io = _make_media_io("video", server, request)
         assert io._num_frames == 32
         assert io._fps == 30  # default, not the server's overridden value
+
+    @pytest.mark.parametrize(
+        ("modality", "key"),
+        [
+            ("video", "max_decoded_frame_bytes"),
+            ("video", "decoded_memory_reserver"),
+            ("audio", "decoded_memory_reserver"),
+        ],
+    )
+    def test_request_cannot_set_server_only_kwargs(self, modality, key):
+        with pytest.raises(ValueError, match=key):
+            _make_media_io(modality, None, {modality: {key: 1 << 40}})
+
+
+@pytest.fixture(scope="module")
+def video_data_uri(tmp_path_factory):
+    """A 40-frame 64x64 mp4 as a base64 data URI."""
+    cv2 = pytest.importorskip("cv2")
+
+    width, height, num_frames = 64, 64, 40
+    path = tmp_path_factory.mktemp("bounded_video") / "clip.mp4"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), 30, (width, height))
+    assert writer.isOpened(), "OpenCV has no mp4v encoder for the test video"
+    for i in range(num_frames):
+        writer.write(np.full((height, width, 3), i, dtype=np.uint8))
+    writer.release()
+    return "data:video/mp4;base64," + base64.b64encode(path.read_bytes()).decode()
+
+
+class TestRequestVideoDecodeBudget:
+    """All videos of one request share the server's decoded-frame limit."""
+
+    # Counted peak bytes of ten 64x64 frames in the default "pt" format.
+    TEN_FRAMES_PEAK_BYTES = 10 * 64 * 64 * 3 * 9
+
+    def test_only_failed_decodes_are_refunded(self):
+        budget = _chat_utils._DecodedVideoBudget(100)
+        committed = budget.reserve(60, 30)
+        committed.commit(30)
+        committed.release()
+        budget.reserve(40, 40).release()
+        budget.reserve(40, 40)
+        with pytest.raises(ValueError, match="more than 100 bytes"):
+            budget.reserve(1, 1)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("server_video_kwargs", "num_frames", "num_videos", "error"),
+        [
+            ({}, 10, 1, None),
+            ({}, 40, 1, "exceeding the limit"),
+            ({"max_decoded_frame_bytes": 2 * TEN_FRAMES_PEAK_BYTES - 1}, 10, 2, "for this request"),
+            ({"max_decoded_frame_bytes": None}, 40, 2, None),
+        ],
+        ids=["within_default_limit", "over_default_limit", "videos_share_limit", "limit_disabled"],
+    )
+    async def test_request_decode_is_bounded(
+        self, video_data_uri, monkeypatch, server_video_kwargs, num_frames, num_videos, error
+    ):
+        monkeypatch.setattr(
+            _chat_utils, "_DEFAULT_MAX_DECODED_VIDEO_FRAME_BYTES", self.TEN_FRAMES_PEAK_BYTES
+        )
+
+        class _StubConfig:
+            model_type = _MM_MODEL_TYPE
+
+        content = [{"type": "video_url", "video_url": {"url": video_data_uri}}] * num_videos
+        _, mm_coroutine, _, _ = parse_chat_messages_coroutines(
+            [{"role": "user", "content": content}],
+            _StubConfig(),
+            MultimodalServerConfig(media_io_kwargs={"video": server_video_kwargs}),
+            request_media_io_kwargs={"video": {"num_frames": num_frames, "fps": 1000}},
+        )
+        if error is not None:
+            with pytest.raises(ValueError, match=error):
+                await mm_coroutine
+            return
+        mm_data, _ = await mm_coroutine
+        assert [len(video.frames) for video in mm_data["video"]] == [num_frames] * num_videos
 
 
 class TestMediaIoKwargsLoaderForwarding:

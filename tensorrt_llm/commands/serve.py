@@ -1442,7 +1442,10 @@ def launch_visual_gen_server(
                   "the corresponding loader. "
                   "Example: '{\"video\": {\"extract_audio\": true, "
                   "\"num_frames\": 16}}' to enable audio extraction from "
-                  "video files.",
+                  "video files. \"video\": {\"max_decoded_frame_bytes\": N} "
+                  "caps the decoded frame buffers of all videos in one "
+                  "request (default 8 GiB; null disables the cap); requests "
+                  "cannot override it.",
                   status="prototype")
 @stability_option("--video_pruning_rate",
                   type=float,
