@@ -15,9 +15,12 @@
 """Tests for culprit attribution and parallel-config lookup in the unittest integration wrapper."""
 
 import importlib.util
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -61,6 +64,97 @@ _TEST_UNITTESTS = _load_test_unittests_module()
 _junit_culprits = _TEST_UNITTESTS._junit_culprits
 _fail_unittests = _TEST_UNITTESTS._fail_unittests
 _parallel_config_key = _TEST_UNITTESTS._parallel_config_key
+
+
+@pytest.mark.cpu_only
+def test_long_selectors_preserve_separate_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pandas as pd
+
+    monkeypatch.setattr(
+        pd, "read_csv", lambda path: pd.DataFrame(columns=["gpu", "unittest_case_name"])
+    )
+    nvml = types.ModuleType("pynvml")
+    nvml.nvmlInit = lambda: None
+    nvml.nvmlDeviceGetHandleByIndex = lambda index: index
+    nvml.nvmlDeviceGetName = lambda handle: "CPU"
+    nvml.NVMLError = RuntimeError
+    monkeypatch.setitem(sys.modules, "pynvml", nvml)
+    monkeypatch.setenv("LLM_TEST_PARALLEL_OVERRIDE", "1")
+    monkeypatch.setattr(_TEST_UNITTESTS, "tests_path", lambda: str(tmp_path))
+
+    reports = []
+
+    def run_cmd(command: list[str], **kwargs: object) -> None:
+        path = Path(
+            next(
+                arg.split("=", 1)[1]
+                for arg in command
+                if arg.startswith("--periodic-junit-xmlpath=")
+            )
+        )
+        reports.append(path)
+        path.write_text(str(len(reports)), encoding="utf-8")
+
+    request = Mock()
+    request.config.getoption.return_value = None
+    prefix = (
+        "unittest/disaggregated/test_cache_transceiver_single_process.py::test_cache_transceiver"
+    )
+    for selector in (f'{prefix} -k "v2 and no_window"', f'{prefix} -k "v2 and uniform_window"'):
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path), types.SimpleNamespace(run_cmd=run_cmd), selector, str(tmp_path), request
+        )
+
+    for selector in ("x" * 80, "x" * 81, "x" * 81):
+        _TEST_UNITTESTS.test_unittests_v2(
+            str(tmp_path), types.SimpleNamespace(run_cmd=run_cmd), selector, str(tmp_path), request
+        )
+
+    assert reports[0] != reports[1]
+    assert reports[2].name == f"results-sub-unittests-{'x' * 80}.xml"
+    long_name = reports[3].name.removeprefix("results-sub-unittests-").removesuffix(".xml")
+    assert len(long_name) == 80
+    assert reports[2] != reports[3]
+    assert reports[3] == reports[4]
+    assert [path.read_text(encoding="utf-8") for path in reports[:2]] == ["1", "2"]
+    assert reports[2].read_text(encoding="utf-8") == "3"
+    assert reports[4].read_text(encoding="utf-8") == "5"
+
+
+@pytest.mark.cpu_only
+def test_long_selector_report_names_are_stable_across_processes(tmp_path: Path) -> None:
+    names_by_seed = []
+    for seed in ("1", "2"):
+        run_dir = tmp_path / seed
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "--noconftest",
+                "-p",
+                "no:cacheprovider",
+                "-c",
+                "/dev/null",
+                "-q",
+                "--basetemp",
+                str(run_dir),
+                f"{Path(__file__)}::test_long_selectors_preserve_separate_reports",
+            ],
+            env={**os.environ, "PYTHONHASHSEED": seed, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        names_by_seed.append(
+            sorted(path.name for path in run_dir.rglob("results-sub-unittests-*.xml"))
+        )
+
+    assert len(names_by_seed[0]) == 4
+    assert names_by_seed[0] == names_by_seed[1]
 
 
 def test_junit_culprits_reports_failures_and_errors(tmp_path: Path) -> None:
