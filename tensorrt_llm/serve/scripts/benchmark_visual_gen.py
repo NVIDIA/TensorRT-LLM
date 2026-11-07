@@ -126,7 +126,7 @@ STAT_FUNCS = {"mean": np.mean, "median": np.median, "std": np.std, "min": np.min
 STAT_COLUMNS = tuple(STAT_FUNCS)
 
 PATH_DISABLED_HINT = (
-    "The server refuses response_format='path' (TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1). "
+    "The server refuses response_format='path' (TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1). "
     "Pass --response-format file (video) or --response-format url (image). "
     "There is no automatic fallback: it would silently "
     "change whether the media transfer is counted in the latency."
@@ -1186,7 +1186,7 @@ async def benchmark(
                     "Initial test run failed - Please make sure benchmark arguments are "
                     f"correctly specified. Error: {test_record.error}"
                 )
-                if "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in (test_record.error or ""):
+                if "response_format='path' is disabled" in (test_record.error or ""):
                     message = f"{message}\n{PATH_DISABLED_HINT}"
                 raise ValueError(message)
             print("Initial test run completed. Starting main benchmark run...")

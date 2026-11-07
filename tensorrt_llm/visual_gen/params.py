@@ -84,6 +84,14 @@ class MediaRef(StrictBaseModel):
             )
         return self
 
+    def __repr_args__(self):
+        # A ``bytes`` payload is shown by size only, so a log line that prints a
+        # whole ``VisualGenParams`` does not carry the media itself.
+        for name, value in super().__repr_args__():
+            if name == "content" and isinstance(value, bytes):
+                value = f"<{len(value)} bytes>"
+            yield name, value
+
 
 def _reject_bare_refs(value: Any) -> Any:
     """Reject the bare path/bytes shorthand with an actionable message.
@@ -442,6 +450,10 @@ def _resolve_reference(content: Any, content_format: str) -> bytes:
         except Exception as exc:
             raise ValueError(f"reference URL could not be fetched: {exc}") from exc
     if content_format == "path":
+        # No directory check here on purpose: only the offline Python API
+        # reaches this branch, reading the caller's own files. Serve reads an
+        # HTTP request's path reference at its boundary, under the allowed
+        # directory, and hands the engine bytes.
         return _safe_read_local_file(content)
     if content_format == "base64":
         return _read_reference_payload(content)

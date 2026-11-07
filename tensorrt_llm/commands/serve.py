@@ -81,6 +81,7 @@ from tensorrt_llm.serve.multi_frontend import (LAUNCHER_UDS_ENV,
 from tensorrt_llm.serve.tool_parser import ToolParserFactory
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import (
     MODEL_TYPE_TO_TOOL_PARSER, resolve_auto_tool_parser)
+from tensorrt_llm.serve.visual_gen_utils import check_path_response_policy
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.usage import TerminalOutcome, apply_usage_session_config
 from tensorrt_llm.usage import config as _telemetry_config
@@ -1106,6 +1107,9 @@ def launch_visual_gen_server(
         visual_gen_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
+    # Refuse a misconfigured path-response switch before the model loads.
+    check_path_response_policy()
+
     # Only global rank 0 serves HTTP; in external multi-rank launch ranks > 0
     # must become workers before binding, else every rank on a multi-GPU node
     # races the same port and all but one die EADDRINUSE. VisualGen() on a

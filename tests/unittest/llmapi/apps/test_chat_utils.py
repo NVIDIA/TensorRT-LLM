@@ -900,7 +900,7 @@ class TestChatCompletionRequestSchemaValidation:
 class TestRequestLocalMediaPaths:
     """Local media references in a request are read only from the allowed directory."""
 
-    _ENV = "TRTLLM_MEDIA_ALLOWED_LOCAL_PATH"
+    _ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
 
     @pytest.fixture
     def media_dirs(self, tmp_path):
@@ -1059,6 +1059,35 @@ class TestRequestLocalMediaPaths:
         monkeypatch.setattr(os.path, "realpath", realpath_before_swap)
         with pytest.raises(ValueError, match="Local media paths are not accepted"):
             await self._load(f"file://{link}")
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(not os.path.isdir("/proc/self/fd"), reason="the check reads /proc/self/fd")
+    async def test_directory_swapped_for_symlink_after_resolution_refused(
+        self, monkeypatch, media_dirs
+    ):
+        """A directory swapped for a symlink after resolution does not open a file elsewhere."""
+        import posixpath
+
+        from PIL import Image
+
+        allowed, other = media_dirs
+        monkeypatch.setenv(self._ENV, str(allowed))
+        sub = allowed / "sub"
+        sub.mkdir()
+        Image.new("RGB", (8, 8), (0, 128, 255)).save(sub / "img.png")
+        target = os.path.realpath(sub / "img.png")
+        real_realpath = os.path.realpath
+
+        def realpath_then_swap(path, *args, **kwargs):
+            resolved = real_realpath(path, *args, **kwargs)
+            if resolved == target and not sub.is_symlink():
+                os.rename(sub, allowed / "sub.moved")
+                os.symlink(other, sub)
+            return resolved
+
+        monkeypatch.setattr(posixpath, "realpath", realpath_then_swap)
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            await self._load(f"file://{sub}/img.png")
 
     @pytest.mark.asyncio
     async def test_fifo_refused_without_blocking(self, monkeypatch, media_dirs):

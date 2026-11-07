@@ -134,9 +134,20 @@ class _VideoRoutesMixin:
 
     Concrete subclasses (``OpenAIServer``) supply ``self.generator``,
     ``self.media_storage_path``, ``self.video_gen_tasks``, ``self.model``,
-    ``self._adjusted_steady_clock``, and ``self.create_error_response`` from
-    their own initializer.
+    ``self._adjusted_steady_clock``, ``self._media_load_executor``, and
+    ``self.create_error_response`` from their own initializer.
     """
+
+    async def _parse_visual_gen_params(self, request):
+        """Run `parse_visual_gen_params` on the media-load pool.
+
+        Parsing may read ``format='path'`` references from disk. The pool bounds
+        how many requests read at once, and a read keeps its worker until it
+        finishes, even after its request is cancelled.
+        """
+        return await asyncio.get_running_loop().run_in_executor(
+            self._media_load_executor, parse_visual_gen_params, request, self.generator
+        )
 
     async def openai_video_generation_sync(self, raw_request: Request) -> Response:
         """Synchronous video generation endpoint.
@@ -160,7 +171,7 @@ class _VideoRoutesMixin:
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 request_format = _resolve_tensor_only_format(
                     request.format, params.extra_params, self.generator.extra_param_specs
                 )
@@ -410,7 +421,7 @@ class _VideoRoutesMixin:
             if path_error is not None:
                 return path_error
 
-            params = parse_visual_gen_params(request, self.generator)
+            params = await self._parse_visual_gen_params(request)
             # Synchronously validate the resolved params against the
             # loaded pipeline's extra-param specs / declared defaults
             # so unknown ``extra_params`` keys and similar engine-side

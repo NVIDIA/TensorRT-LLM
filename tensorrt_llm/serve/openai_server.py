@@ -148,8 +148,8 @@ from tensorrt_llm.serve.serving_extensions import load_builtin_extensions
 from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_metrics import (
     build_visual_gen_server_timings, build_visual_gen_timing_headers)
-from tensorrt_llm.serve.visual_gen_utils import (local_media_path_is_disallowed,
-                                                 parse_visual_gen_params)
+from tensorrt_llm.serve.visual_gen_utils import (check_path_response_policy,
+                                                 path_response_is_disabled)
 from tensorrt_llm.usage import TerminalOutcome, record_termination_observation
 from tensorrt_llm.version import __version__ as VERSION
 
@@ -688,6 +688,9 @@ class OpenAIServer(_VideoRoutesMixin):
         self.host = None
         self.port = None
 
+        if self._is_visual_gen:
+            check_path_response_policy()
+
         # Dedicated thread pools for the chat / completion path. Keeping
         # multimodal preprocessing and decode work off the asyncio default
         # executor avoids contention with unrelated `to_thread` callers and
@@ -885,6 +888,10 @@ class OpenAIServer(_VideoRoutesMixin):
             # down; the /metrics handler already treats that as no stats.
             self._metrics_stats_executor.shutdown(wait=False,
                                                   cancel_futures=True)
+            # Later media loads in this process use the default executor.
+            if BaseMediaIO._executor is self._media_load_executor:
+                BaseMediaIO.set_executor(None)
+            self._media_load_executor.shutdown(wait=False, cancel_futures=True)
 
         self.app = FastAPI(lifespan=lifespan)
         self.app.state.trust_kv_hints = os.getenv("TRTLLM_TRUST_KV_HINTS",
@@ -3917,7 +3924,7 @@ class OpenAIServer(_VideoRoutesMixin):
             # through to the outer ``except Exception`` → 500 so the
             # client doesn't get blamed for a server-internal failure.
             try:
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Generating image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )
@@ -4074,15 +4081,14 @@ class OpenAIServer(_VideoRoutesMixin):
             self, response_format: Optional[str]) -> Optional[Response]:
         """Return a 400 when ``response_format='path'`` but it is disabled.
 
-        Shares the switch with ``format='path'`` on the request side; see
-        :func:`local_media_path_is_disallowed`. Returns ``None`` when allowed.
+        See :func:`path_response_is_disabled`. Returns ``None`` when allowed.
         """
         if response_format != "path":
             return None
-        if local_media_path_is_disallowed():
+        if path_response_is_disabled():
             return self.create_error_response(
                 "response_format='path' is disabled on this server "
-                "(TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1); it returns "
+                "(TRTLLM_MEDIA_DISABLE_PATH_RESPONSE=1); it returns "
                 "server-side filesystem paths and is only meaningful for "
                 "co-located clients.",
                 err_type="BadRequestError",
@@ -4175,7 +4181,7 @@ class OpenAIServer(_VideoRoutesMixin):
                 path_error = self._reject_disabled_path(request.response_format)
                 if path_error is not None:
                     return path_error
-                params = parse_visual_gen_params(request, self.generator)
+                params = await self._parse_visual_gen_params(request)
                 logger.info(
                     f"Editing image: {image_id} with params: {params} and prompt: {request.prompt}"
                 )

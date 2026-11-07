@@ -57,7 +57,7 @@ def server(model_name: str, extra_encoder_options: bool,
     # The tests send local paths under the test data root; the server
     # process inherits this environment when it is launched.
     with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("TRTLLM_MEDIA_ALLOWED_LOCAL_PATH",
+        mp.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR",
                   str(llm_models_root() / "multimodals" / "test_data"))
         remote_server = RemoteMMEncoderServer(model_path, args)
     with remote_server:

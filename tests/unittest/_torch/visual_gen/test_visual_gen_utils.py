@@ -405,14 +405,15 @@ class TestInputReferenceResolution:
         # … and the payload read fails before any file is written, so nothing leaks.
         assert list(tmp_path.iterdir()) == []  # nothing is ever written to disk
 
-    def test_missing_file_uri_is_client_error(self, tmp_path):
+    def test_missing_file_uri_is_client_error(self, tmp_path, monkeypatch):
         # A file:// path that does not exist is a client 400, not a server 500.
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", str(tmp_path))
         generator = _StubVisualGen()
         missing = (tmp_path / "does_not_exist.png").as_uri()
         request = VideoGenerationRequest(
             prompt="x", image_reference={"content": missing, "format": "path"}
         )
-        with pytest.raises(ValueError, match="file could not be read"):
+        with pytest.raises(ValueError, match="could not be read"):
             _parse_and_prepare(request, generator)
 
 
@@ -967,40 +968,145 @@ class TestSafeLocalFileRead:
             _safe_read_local_file(str(link))
 
 
-class TestLocalMediaPathCanBeDisallowed:
-    """``format='path'`` reads server-side files, so a deployment can refuse it.
+class TestPathReferencePolicy:
+    """A ``format='path'`` reference follows the request local media policy.
 
-    Allowed by default: a co-located client naming a shared path is a real
-    setup, and the code cannot tell that deployment from an untrusted one.
+    The boundary reads the file itself, under the same variable as a chat media
+    part naming a local file: refused unless ``TRTLLM_MEDIA_ALLOWED_INPUT_DIR``
+    names a directory that holds it. ``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE`` only
+    governs ``response_format='path'``.
     """
 
+    _ALLOWED_ENV = "TRTLLM_MEDIA_ALLOWED_INPUT_DIR"
+    _DISABLE_ENV = "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE"
+
+    @pytest.fixture(autouse=True)
+    def _policy_unset(self, monkeypatch):
+        monkeypatch.delenv(self._ALLOWED_ENV, raising=False)
+        monkeypatch.delenv(self._DISABLE_ENV, raising=False)
+
     @staticmethod
-    def _request(fmt="path", content="/tmp/ref.png"):
+    def _png(directory: Path) -> Path:
+        buffer = BytesIO()
+        Image.new("RGB", (8, 8), (9, 8, 7)).save(buffer, format="PNG")
+        target = directory / "ref.png"
+        target.write_bytes(buffer.getvalue())
+        return target
+
+    @staticmethod
+    def _request(content: str):
         return VideoGenerationRequest(
-            prompt="x", image_reference={"content": content, "format": fmt}
+            prompt="x", image_reference={"content": content, "format": "path"}
         )
 
-    def test_path_is_accepted_by_default(self, monkeypatch):
-        monkeypatch.delenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", raising=False)
-        params = parse_visual_gen_params(self._request(), _StubVisualGen())
+    def test_refused_without_an_allowed_directory(self, tmp_path):
+        target = self._png(tmp_path)
 
-        assert params.image_reference[0].format == "path"
+        with pytest.raises(ValueError, match="Local media paths are not accepted"):
+            parse_visual_gen_params(self._request(str(target)), _StubVisualGen())
 
-    def test_path_is_refused_when_disallowed(self, monkeypatch):
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "1")
+    def test_read_to_bytes_inside_the_allowed_directory(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(self._ALLOWED_ENV, str(tmp_path))
+        target = self._png(tmp_path)
 
-        with pytest.raises(ValueError, match="is disallowed on this server"):
-            parse_visual_gen_params(self._request(), _StubVisualGen())
+        for content in (str(target), target.as_uri()):
+            params = parse_visual_gen_params(self._request(content), _StubVisualGen())
+            assert params.image_reference[0].format == "bytes"
+            assert params.image_reference[0].content == target.read_bytes()
 
-    def test_an_unrecognized_value_warns_and_stays_allowed(self, monkeypatch):
-        """Silently reading a typo as "1" would break working deployments, and
-        silently reading it as "0" would leave one that believes it is locked
-        down wide open. Neither is safe to do quietly."""
-        monkeypatch.setenv("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH", "true")
-        warnings: list[str] = []
-        monkeypatch.setattr(visual_gen_utils.logger, "warning", warnings.append)
+    def test_the_path_response_switch_does_not_affect_references(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(self._ALLOWED_ENV, str(tmp_path))
+        monkeypatch.setenv(self._DISABLE_ENV, "1")
+        target = self._png(tmp_path)
 
-        params = parse_visual_gen_params(self._request(), _StubVisualGen())
+        params = parse_visual_gen_params(self._request(str(target)), _StubVisualGen())
 
-        assert params.image_reference[0].format == "path"
-        assert any("TRTLLM_DISALLOW_LOCAL_MEDIA_PATH" in w for w in warnings)
+        assert params.image_reference[0].format == "bytes"
+
+
+class TestReferenceBounds:
+    """The ``path`` references of one request share a byte budget."""
+
+    def test_the_path_bytes_of_one_request_are_bounded(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TRTLLM_MEDIA_ALLOWED_INPUT_DIR", str(tmp_path))
+        target = TestPathReferencePolicy._png(tmp_path)
+        monkeypatch.setattr(
+            visual_gen_utils, "PATH_REFERENCE_MAX_TOTAL_BYTES", 2 * target.stat().st_size - 1
+        )
+        item = {"content": str(target), "format": "path"}
+        request = VideoGenerationRequest(prompt="x", image_reference=[item, item])
+
+        with pytest.raises(ValueError, match="bytes in total"):
+            parse_visual_gen_params(request, _StubVisualGen())
+
+
+class TestPathResponseSwitch:
+    """``TRTLLM_MEDIA_DISABLE_PATH_RESPONSE`` turns ``response_format='path'`` off."""
+
+    _ENV = "TRTLLM_MEDIA_DISABLE_PATH_RESPONSE"
+    _FORMER_ENV = "TRTLLM_DISALLOW_LOCAL_MEDIA_PATH"
+
+    @pytest.fixture(autouse=True)
+    def _switch_unset(self, monkeypatch):
+        monkeypatch.delenv(self._ENV, raising=False)
+        monkeypatch.delenv(self._FORMER_ENV, raising=False)
+
+    @staticmethod
+    def _capture(monkeypatch, method: str) -> list[str]:
+        messages: list[str] = []
+        monkeypatch.setattr(
+            visual_gen_utils.logger,
+            method,
+            lambda *msg, **kwargs: messages.append(" ".join(map(str, msg))),
+        )
+        return messages
+
+    def test_an_unrecognized_value_keeps_the_server_from_starting(self, monkeypatch):
+        """Reading a value such as ``true`` as "0" would leave a server that is
+        meant to be locked down wide open, so startup refuses it, and a request
+        that still sees it treats path responses as off."""
+        monkeypatch.setenv(self._ENV, "true")
+
+        with pytest.raises(ValueError, match=f"Unrecognized value for {self._ENV}"):
+            visual_gen_utils.check_path_response_policy()
+        assert visual_gen_utils.path_response_is_disabled() is True
+
+    @pytest.mark.parametrize("value", ["", "0"])
+    def test_the_switch_unset_or_zero_allows_path_responses(self, monkeypatch, value):
+        monkeypatch.setenv(self._ENV, value)
+
+        visual_gen_utils.check_path_response_policy()
+        assert visual_gen_utils.path_response_is_disabled() is False
+
+    @pytest.mark.parametrize("value", ["1", "true"])
+    def test_the_former_name_set_to_disable_keeps_the_server_from_starting(
+        self, monkeypatch, value
+    ):
+        """Ignoring the former name would turn path responses back on for a
+        deployment that relied on it, so the startup check refuses it."""
+        monkeypatch.setenv(self._FORMER_ENV, value)
+
+        with pytest.raises(ValueError, match=f"renamed.*{self._ENV}=1"):
+            visual_gen_utils.check_path_response_policy()
+
+    @pytest.mark.parametrize("value", ["", "0"])
+    def test_the_former_name_set_to_allow_only_warns(self, monkeypatch, value):
+        """``0`` or empty asked for the default, which still holds."""
+        monkeypatch.setenv(self._FORMER_ENV, value)
+        warnings = self._capture(monkeypatch, "warning")
+
+        visual_gen_utils.check_path_response_policy()
+        assert any(self._FORMER_ENV in w for w in warnings)
+        assert visual_gen_utils.path_response_is_disabled() is False
+
+    def test_the_startup_check_logs_a_disabled_switch(self, monkeypatch):
+        """Silent by default; the switch is reported when the server starts,
+        not at the first request that asks for a path response."""
+        infos = self._capture(monkeypatch, "info")
+
+        visual_gen_utils.check_path_response_policy()
+        assert infos == []
+
+        monkeypatch.setenv(self._ENV, "1")
+        visual_gen_utils.check_path_response_policy()
+        assert any("response_format='path' is disabled" in i for i in infos)
