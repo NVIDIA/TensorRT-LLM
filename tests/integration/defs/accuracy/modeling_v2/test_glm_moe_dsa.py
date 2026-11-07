@@ -833,9 +833,10 @@ class TestModelingV2Glm52Nvfp4Sm107LowLatency(LlmapiAccuracyTestHarness):
 
 
 _HIGH_THROUGHPUT_POINTS = (
-    pytest.param(7, 7, id="p05_tp16_ep16_b7_k7"),
-    pytest.param(10, 5, id="p06_tp16_ep16_b10_k5"),
-    pytest.param(20, 5, id="p07_tp16_ep16_b20_k5"),
+    # Full-corpus GSM8K references use the final request counters, as below.
+    pytest.param(7, 7, 5.088854684111103, id="p05_tp16_ep16_b7_k7"),
+    pytest.param(10, 5, 4.525905448220165, id="p06_tp16_ep16_b10_k5"),
+    pytest.param(20, 5, 4.530280420319592, id="p07_tp16_ep16_b20_k5"),
 )
 _HIGH_THROUGHPUT_ENV = {
     **_RANK_ENV,
@@ -976,10 +977,15 @@ def _drain_adp_stats(llm: LLM) -> list[dict]:
 class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
     @skip_no_rubin
     @pytest.mark.skip_less_mpi_world_size(_TP_SIZE)
-    @pytest.mark.parametrize("batch_size,draft_len", _HIGH_THROUGHPUT_POINTS)
+    @pytest.mark.parametrize("batch_size,draft_len,al_reference", _HIGH_THROUGHPUT_POINTS)
     def test_gsm8k_and_acceptance(
-        self, batch_size: int, draft_len: int, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ):
+        self,
+        batch_size: int,
+        draft_len: int,
+        al_reference: float,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
         assert os.environ.get("INTEGRATION_TEST") != "1", "This guard requires all 1319 samples"
         monkeypatch.setenv("TLLM_EVAL_MAX_IN_FLIGHT", str(_TP_SIZE * batch_size))
         monkeypatch.setenv("TLLM_EVAL_PARTIAL_SCORES_EVERY", "100")
@@ -1044,6 +1050,7 @@ class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
             **scores,
             "batch_size": batch_size,
             "draft_len": draft_len,
+            "al_reference": al_reference,
             **_request_acceptance_metrics(request_records),
         }
         acceptance_length = metrics["acceptance_length"]
@@ -1052,4 +1059,7 @@ class TestModelingV2Glm52Nvfp4Sm107HighThroughput(LlmapiAccuracyTestHarness):
         (tmp_path / "iteration_stats.json").write_text(json.dumps(stats) + "\n")
         print(f"[GLM high throughput] {json.dumps(metrics)}")
         assert all(_ACCURACY_FLOOR <= score <= 100.0 for score in scores.values())
-        assert 1.0 <= acceptance_length <= draft_len + 1
+        floor = 0.95 * al_reference
+        assert floor <= acceptance_length <= draft_len + 1, (
+            f"MTP AL {acceptance_length:.6f} is outside [{floor:.6f}, {draft_len + 1}]"
+        )

@@ -939,14 +939,6 @@ class Glm52Indexer(nn.Module):
             is_cute_dsl_available=IS_CUTLASS_DSL_AVAILABLE,
             sm_version=sm_version,
         )
-        if os.environ.get("TRTLLM_GVR_SELF_SAMPLING") is not None:
-            logger.warning_once(
-                "TRTLLM_GVR_SELF_SAMPLING is retired and ignored: the "
-                "self-sampling GVR engine is selected by the "
-                "use_self_sampling_topk sparse-attention config field "
-                "(default True) when enable_heuristic_topk is set.",
-                key="gvr_self_sampling_env_retired",
-            )
         if (
             self._enable_heuristic_topk
             and sparse_params.use_self_sampling_topk

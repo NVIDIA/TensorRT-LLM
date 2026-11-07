@@ -18,6 +18,8 @@ from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
 )
 from tensorrt_llm.logger import logger
 
+from ...kernels.moe.constants import GEN_TOKEN_BUCKETS
+
 
 def _construct_rubin_kernel(
     *, sm_version: int, common: dict, combine_format: str
@@ -206,7 +208,7 @@ class RubinDeferredMegaMoERunner(RubinMegaMoERunner):
 
 
 def query_rubin_kernel_properties(**kwargs):
-    if kwargs["max_tokens_per_rank"] not in (32, 64, 128, 192):
+    if kwargs["max_tokens_per_rank"] not in GEN_TOKEN_BUCKETS:
         return shared.query_megamoe_kernel_properties(**kwargs)
     kwargs = dict(kwargs)
     tactic = kwargs.pop("tactic", None)
@@ -327,7 +329,7 @@ def run_rubin_megamoe(
 
 
 # Compiler analysis must see both the output write and the peer-visible exchange
-# workspace mutation. Eager launches avoid dispatcher overhead, as current main does.
+# workspace mutation. Eager launches call the runner directly to avoid dispatcher overhead.
 run_rubin_megamoe_op = torch.library.custom_op(
     "trtllm::glm_rubin_megamoe", mutates_args=("combine_output", "shared_workspace")
 )(run_rubin_megamoe)

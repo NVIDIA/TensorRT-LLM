@@ -1,6 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Fused FP8 indexer preparation and optional direct indexer-cache write."""
+"""Fused FP8 indexer preparation and optional direct indexer-cache write.
+
+``TRTLLM_GLM_RUBIN_HIGH_THROUGHPUT_INDEXER_FUSED_PROLOGUE`` controls this target's
+fused path. It is read once at import: ``0`` disables it, any other value enables
+it, and the default is enabled. When unset, ``TRTLLM_DSA_INDEXER_FUSED_PROLOGUE``
+is accepted as a compatibility alias; the target-scoped name takes precedence.
+"""
 
 from __future__ import annotations
 
@@ -11,7 +17,13 @@ import torch
 import triton
 import triton.language as tl
 
-FUSED_PROLOGUE_ENABLED = os.environ.get("TRTLLM_DSA_INDEXER_FUSED_PROLOGUE", "1").strip() != "0"
+FUSED_PROLOGUE_ENABLED = (
+    os.environ.get(
+        "TRTLLM_GLM_RUBIN_HIGH_THROUGHPUT_INDEXER_FUSED_PROLOGUE",
+        os.environ.get("TRTLLM_DSA_INDEXER_FUSED_PROLOGUE", "1"),
+    ).strip()
+    != "0"
+)
 _PDL_ENABLED = os.environ.get("TRTLLM_ENABLE_PDL", "0").strip() == "1"
 
 

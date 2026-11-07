@@ -28,6 +28,7 @@ from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.layer_wise_benchmarks.calibrator import Mode
 
 from ... import native_ops
+from ...kernels.moe.constants import DEFERRED_TOPK_REDUCE_BUCKETS, GEN_TOKEN_BUCKETS
 from .megamoe_runner import (
     get_rubin_runner,
     query_rubin_kernel_properties,
@@ -345,13 +346,18 @@ class RubinMegaMoE(MegaMoECuteDsl):
 
     def _launch_megamoe_kernel(self, **kw):
         bucket = kw["launch_max_T"]
-        if bucket not in (32, 64, 128, 192):
+        if bucket not in GEN_TOKEN_BUCKETS:
             return super()._launch_megamoe_kernel(**kw)
         if self.tactic_autotune or kw.get("replica_plan") is not None:
             raise ValueError("GLM Rubin MegaMoE uses fixed generation tactics without dynamic EPLB")
         n = kw["num_tokens"]
         in_kernel = self._use_in_kernel_fc2_reduce(bucket)
-        deferred = bool(self._launch_defer and n > 0 and not in_kernel and bucket in (64, 128, 192))
+        deferred = bool(
+            self._launch_defer
+            and n > 0
+            and not in_kernel
+            and bucket in DEFERRED_TOPK_REDUCE_BUCKETS
+        )
         runner_args = dict(
             world_size=self.ep_size,
             local_rank=self.ep_rank,
