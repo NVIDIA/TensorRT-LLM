@@ -66,3 +66,24 @@ def test_replacing_the_prompt_drops_the_int32_buffer():
     np.testing.assert_array_equal(
         clone.__dict__["_prompt_token_ids_i32"], np.array([6, 7, 8], dtype=np.int32)
     )
+
+
+@pytest.mark.parametrize("as_tensor", [False, True])
+def test_prompt_len_counts_an_int32_prompt_without_a_list(as_tensor):
+    ids = _ids()
+    prompt = torch.from_numpy(ids.copy()) if as_tensor else ids
+    req = GenerationRequest(prompt_token_ids=prompt, sampling_params=SamplingParams(max_tokens=1))
+    assert req.prompt_len == len(ids)
+    assert req.__dict__["_prompt_token_ids"] is None
+    clone = pickle.loads(pickle.dumps(req))
+    assert clone.prompt_len == len(ids)
+    assert clone.__dict__["_prompt_token_ids"] is None
+
+
+@pytest.mark.parametrize("prompt", [[3, 4, 5], _ids(), np.array([[1, 2], [3, 4]], dtype=np.int32)])
+def test_prompt_len_matches_the_prompt_list(prompt):
+    req = GenerationRequest(prompt_token_ids=prompt, sampling_params=SamplingParams(max_tokens=1))
+    length = req.prompt_len
+    assert length == len(req.prompt_token_ids)
+    # Once the list is materialized, prompt_len reads it.
+    assert req.prompt_len == length
