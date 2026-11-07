@@ -1551,6 +1551,9 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                         real_subtile_idx = subtile_idx // 2
                     else:
                         real_subtile_idx = subtile_idx
+                    # Position in processing order. The early accumulator release below counts
+                    # processed subtiles, so it must not use the reversed index.
+                    iter_subtile_idx = real_subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
                         if reverse_subtile:
                             real_subtile_idx = (
@@ -1584,7 +1587,7 @@ class Sm100BlockScaledPersistentDenseGemmActFusionKernel:
                     # Async arrive accumulator buffer empty earlier when overlapping_accum is enabled
                     #
                     if cutlass.const_expr(self.overlapping_accum):
-                        if real_subtile_idx == self.iter_acc_early_release_in_epilogue:
+                        if iter_subtile_idx == self.iter_acc_early_release_in_epilogue:
                             # Fence for TMEM load
                             cute.arch.fence_view_async_tmem_load()
                             with cute.arch.elect_one():
