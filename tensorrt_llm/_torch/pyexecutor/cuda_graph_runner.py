@@ -2623,23 +2623,29 @@ class EncoderCUDAGraphRunner:
 
         # Captured H2D nodes read pinned host buffers. In CC mode, where H2D
         # is not captured, stage directly into the graph-resident CUDA buffers.
+        # Those H2D copies are non-blocking so the host does not wait for the
+        # stream; the driver stages a pageable source before the call returns.
         static_tensors = self.shared_static_tensors_cpu if self._capture_h2d_copy else self.shared_static_tensors
+        non_blocking = not self._capture_h2d_copy
 
         if self.is_encoder_decoder and _ENCODER_SOURCE_TO_SLOT in inputs:
             self._stage_encoder_decoder_inputs(key, inputs, static_tensors)
             return
 
         input_ids = inputs["input_ids"]
+        staged_input_ids = static_tensors["input_ids"]
         if isinstance(input_ids, list):
             actual_tokens = len(input_ids)
-            static_tensors["input_ids"][:actual_tokens].copy_(
-                torch.tensor(input_ids, dtype=torch.int32))
+            input_ids_host = torch.tensor(input_ids, dtype=torch.int32)
+            staged_input_ids[:actual_tokens].copy_(input_ids_host,
+                                                   non_blocking=non_blocking)
         elif isinstance(input_ids, torch.Tensor):
             actual_tokens = int(input_ids.shape[0])
-            static_tensors["input_ids"][:actual_tokens].copy_(input_ids)
+            staged_input_ids[:actual_tokens].copy_(input_ids,
+                                                   non_blocking=non_blocking)
         else:
             raise TypeError(f"Unsupported input_ids type: {type(input_ids)}")
-        static_tensors["input_ids"][actual_tokens:padded_num_tokens].fill_(0)
+        staged_input_ids[actual_tokens:padded_num_tokens].fill_(0)
 
         # Auto-generate packed position IDs without allocating one concatenated
         # tensor, or copy caller-provided values into the stable staging buffer.
@@ -2649,15 +2655,17 @@ class EncoderCUDAGraphRunner:
             offset = 0
             for seq_len in inputs["seq_lens"]:
                 staged_position_ids[offset:offset + seq_len].copy_(
-                    self._arange_max[:seq_len])
+                    self._arange_max[:seq_len], non_blocking=non_blocking)
                 offset += seq_len
         else:
             if isinstance(position_ids, list):
+                position_ids_host = torch.tensor(position_ids,
+                                                 dtype=torch.int32)
                 staged_position_ids[:actual_tokens].copy_(
-                    torch.tensor(position_ids, dtype=torch.int32))
+                    position_ids_host, non_blocking=non_blocking)
             elif isinstance(position_ids, torch.Tensor):
                 staged_position_ids[:actual_tokens].copy_(
-                    position_ids.flatten())
+                    position_ids.flatten(), non_blocking=non_blocking)
             else:
                 raise TypeError(
                     f"Unsupported position_ids type: {type(position_ids)}")
