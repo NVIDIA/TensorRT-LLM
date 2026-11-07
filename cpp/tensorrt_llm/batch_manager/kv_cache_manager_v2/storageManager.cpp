@@ -32,9 +32,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <cstddef>
 #include <limits>
 #include <numeric>
 #include <set>
@@ -998,9 +998,9 @@ void StorageManager::maybePrintKeepCopyStats()
     {
         return;
     }
-    int64_t const now = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch())
-                            .count();
+    int64_t const now
+        = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+              .count();
     if (mKeepCopyStats.lastPrintNs == 0)
     {
         mKeepCopyStats.lastPrintNs = now;
@@ -1044,7 +1044,8 @@ void StorageManager::writeThroughToDisk(CacheLevel hostLevel, std::vector<Shared
     std::map<LayerGroupId, std::vector<SharedPtr<Page>>> batches;
     for (auto const& page : pages)
     {
-        if (page->cacheLevel == hostLevel && page->isCommitted() && mRetainedByPage.find(page.get()) == mRetainedByPage.end())
+        if (page->cacheLevel == hostLevel && page->isCommitted()
+            && mRetainedByPage.find(page.get()) == mRetainedByPage.end())
         {
             batches[getMigrationBatchingLayerGroupId(diskLevel, hostLevel, page->lifeCycle)].push_back(page);
         }
@@ -1723,8 +1724,8 @@ std::optional<std::vector<Slot>> StorageManager::_batchedMigrate(CacheLevel dstL
         }
         throw;
     }
-    bool const retainSrcCopy = mKeepDiskCopy && updateSrc && !defrag && dstLevel < srcLevel
-        && cacheTier(srcLevel) == CacheTier::DISK;
+    bool const retainSrcCopy
+        = mKeepDiskCopy && updateSrc && !defrag && dstLevel < srcLevel && cacheTier(srcLevel) == CacheTier::DISK;
     try
     {
         thread_local std::vector<PageIndexPair> pageIndices;

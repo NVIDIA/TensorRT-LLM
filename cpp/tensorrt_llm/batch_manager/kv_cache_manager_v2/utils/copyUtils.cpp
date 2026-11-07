@@ -198,7 +198,7 @@ DiskIoConfig const& diskIoConfig() noexcept
     return config;
 }
 
-int64_t nowNs() noexcept
+int64_t currentNs() noexcept
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
@@ -217,6 +217,7 @@ int directFd(int fd) noexcept
         dev_t dev = 0;
         ino_t ino = 0;
     };
+
     static std::mutex mutex;
     static std::vector<Entry> table; // indexed by the buffered fd
     struct stat st = {};
@@ -318,11 +319,11 @@ void startDiskIoStatsThread()
                         uint64_t calls = 0, bytes = 0, queueNs = 0, serviceNs = 0;
                     };
                     Last last[2];
-                    int64_t lastNs = nowNs();
+                    int64_t lastNs = currentNs();
                     for (;;)
                     {
                         std::this_thread::sleep_for(std::chrono::seconds(interval));
-                        int64_t const t = nowNs();
+                        int64_t const t = currentNs();
                         double const windowS = static_cast<double>(t - lastNs) / 1e9;
                         DiskIoStats const* stats[2] = {&gReadStats, &gWriteStats};
                         char const* names[2] = {"disk_to_host", "host_to_disk"};
@@ -335,7 +336,8 @@ void startDiskIoStatsThread()
                             {
                                 double const gib = static_cast<double>(now.bytes - last[i].bytes) / (1ull << 30);
                                 std::fprintf(stderr,
-                                    "[kvCacheManagerV2] disk I/O stats: pid=%d dir=%s window_s=%.1f calls=%llu GiB=%.3f GiB_per_s=%.3f "
+                                    "[kvCacheManagerV2] disk I/O stats: pid=%d dir=%s window_s=%.1f calls=%llu "
+                                    "GiB=%.3f GiB_per_s=%.3f "
                                     "queue_ms_mean=%.3f service_ms_mean=%.3f busy_frac=%.3f\n",
                                     static_cast<int>(::getpid()), names[i], windowS,
                                     static_cast<unsigned long long>(calls), gib, gib / windowS,
@@ -386,16 +388,18 @@ CompletionFlags* completionFlags() noexcept
         if (cuMemHostAlloc(&host, kFlagSlots * sizeof(uint64_t), CU_MEMHOSTALLOC_PORTABLE | CU_MEMHOSTALLOC_DEVICEMAP)
             != CUDA_SUCCESS)
         {
-            TLLM_LOG_WARNING("[kvCacheManagerV2Utils] cuMemHostAlloc for disk I/O flags failed; disk I/O completes "
-                             "in the stream callback");
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] cuMemHostAlloc for disk I/O flags failed; disk I/O completes "
+                "in the stream callback");
             return nullptr;
         }
         std::memset(host, 0, kFlagSlots * sizeof(uint64_t));
         CUdeviceptr devicePtr = 0;
         if (cuMemHostGetDevicePointer(&devicePtr, host, 0) != CUDA_SUCCESS)
         {
-            TLLM_LOG_WARNING("[kvCacheManagerV2Utils] cuMemHostGetDevicePointer for disk I/O flags failed; disk I/O "
-                             "completes in the stream callback");
+            TLLM_LOG_WARNING(
+                "[kvCacheManagerV2Utils] cuMemHostGetDevicePointer for disk I/O flags failed; disk I/O "
+                "completes in the stream callback");
             cuMemFreeHost(host);
             return nullptr;
         }
@@ -439,12 +443,13 @@ struct DiskTransfer
     void finish() noexcept
     {
         auto& stats = isRead ? gReadStats : gWriteStats;
-        int64_t const end = nowNs();
+        int64_t const end = currentNs();
         int64_t const start = startNs.load();
         stats.calls.fetch_add(1, std::memory_order_relaxed);
-        stats.bytes.fetch_add(static_cast<uint64_t>(numTasks()) * static_cast<uint64_t>(numBytes),
-            std::memory_order_relaxed);
-        stats.queueNs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(start - enqueueNs, 0)), std::memory_order_relaxed);
+        stats.bytes.fetch_add(
+            static_cast<uint64_t>(numTasks()) * static_cast<uint64_t>(numBytes), std::memory_order_relaxed);
+        stats.queueNs.fetch_add(
+            static_cast<uint64_t>(std::max<int64_t>(start - enqueueNs, 0)), std::memory_order_relaxed);
         stats.serviceNs.fetch_add(static_cast<uint64_t>(std::max<int64_t>(end - start, 0)), std::memory_order_relaxed);
         if (!ok.load())
         {
@@ -483,7 +488,7 @@ public:
         transfer->remaining.store(numPieces);
         if (numPieces == 0)
         {
-            transfer->startNs.store(nowNs());
+            transfer->startNs.store(currentNs());
             transfer->finish();
             return;
         }
@@ -525,7 +530,7 @@ private:
             }
             DiskTransfer& transfer = *piece.transfer;
             int64_t expected = 0;
-            transfer.startNs.compare_exchange_strong(expected, nowNs());
+            transfer.startNs.compare_exchange_strong(expected, currentNs());
             if (!transfer.runPiece(piece.task, piece.offset, piece.length))
             {
                 transfer.ok.store(false);
@@ -576,7 +581,7 @@ CUDA_CB void hostFnRunDiskTransfer(void* userData) noexcept
 CUresult launchDiskTransfer(std::shared_ptr<DiskTransfer> transfer, CUstream stream) noexcept
 {
     startDiskIoStatsThread();
-    transfer->enqueueNs = nowNs();
+    transfer->enqueueNs = currentNs();
     CompletionFlags* const flags = completionFlags();
     if (flags == nullptr)
     {
@@ -621,7 +626,6 @@ bool asyncDiskIo() noexcept
 }
 
 } // namespace
-
 
 CUresult copyDiskToDisk(std::vector<Task<DiskAddress, DiskAddress>> tasks, ssize_t numBytes, CUstream stream) noexcept
 {
