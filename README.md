@@ -1,3 +1,6 @@
+<!-- SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. -->
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+
 <div align="center">
 
 TensorRT LLM
@@ -21,6 +24,9 @@ TensorRT LLM
 ## Tech Blogs
 
 <!-- Use github markdown link to link for the latest blog since the doc build has not happened yet. When the doc build is updated, it should be updated to the webpage link. -->
+
+* [11/04] WinoVAE: Faster Video Decoding in TensorRT-LLM
+✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog31_WinoVAE_Faster_Video_VAE_with_Winograd_Convolutions.md)
 
 * [10/14] KV Cache Compression in TensorRT LLM
 ✨ [➡️ link](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog30_KV_Cache_Compression_in_TensorRT-LLM.md)
