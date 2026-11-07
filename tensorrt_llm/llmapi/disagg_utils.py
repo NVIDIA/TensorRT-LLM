@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import ipaddress
 import logging
 import os
 import threading
@@ -297,10 +298,13 @@ def get_ctx_gen_server_addrs(
     ctx_server_urls = []
     gen_server_urls = []
     for cfg in server_configs:
+        hostname = cfg.hostname
+        if hostname and ':' in hostname:
+            hostname = f'[{hostname}]'
         if cfg.type == "ctx":
-            ctx_server_urls.append(f"{cfg.hostname}:{cfg.port}")
+            ctx_server_urls.append(f"{hostname}:{cfg.port}")
         else:
-            gen_server_urls.append(f"{cfg.hostname}:{cfg.port}")
+            gen_server_urls.append(f"{hostname}:{cfg.port}")
 
     return ctx_server_urls, gen_server_urls
 
@@ -485,8 +489,20 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
     ports = []
     if urls:
         for url in urls:
-            hostname, port_str = url.split(':')
-            port = int(port_str)
+            expected = f"Invalid server address {url!r}: expected host:port or [addr]:port"
+            try:
+                hostname, port_str = url.rsplit(':', 1)
+                port = int(port_str)
+            except ValueError as exc:
+                raise ValueError(expected) from exc
+            if hostname.startswith('[') and hostname.endswith(']'):
+                hostname = hostname[1:-1]
+                try:
+                    ipaddress.IPv6Address(hostname)
+                except ipaddress.AddressValueError as exc:
+                    raise ValueError(expected) from exc
+            elif not hostname or ':' in hostname or '[' in hostname or ']' in hostname:
+                raise ValueError(expected)
             hostnames.append(hostname)
             ports.append(port)
 
