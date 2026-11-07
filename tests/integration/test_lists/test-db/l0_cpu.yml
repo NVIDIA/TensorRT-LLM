@@ -186,6 +186,11 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_cache_dit.py
   - unittest/_torch/visual_gen/test_executor_lifecycle.py
   - unittest/_torch/visual_gen/test_flux2_load_weights.py
+  - unittest/_torch/visual_gen/test_flux3_bfl_keys.py
+  - unittest/_torch/visual_gen/test_flux3_load_weights.py
+  - unittest/_torch/visual_gen/test_flux3_packed.py
+  - unittest/_torch/visual_gen/test_flux3_pipeline.py
+  - unittest/_torch/visual_gen/test_flux3_quantization.py
   - unittest/_torch/visual_gen/test_flux_infer.py
   - unittest/_torch/visual_gen/test_cosmos3_guardrails.py
   - unittest/evaluate/visual_gen/test_generation_evaluation_pipeline.py
@@ -197,6 +202,7 @@ l0_cpu:
   - unittest/_torch/visual_gen/test_minimax_h3_tiled_vae.py
   - unittest/_torch/visual_gen/test_minimax_h3_scheduler_packing.py
   - unittest/_torch/visual_gen/test_model_loader.py
+  - unittest/_torch/visual_gen/test_pipeline_torch_compile.py
   - unittest/_torch/visual_gen/test_ltx2_transformer.py
   - unittest/_torch/visual_gen/test_cosmos3_step_precision.py
   - unittest/_torch/visual_gen/test_quant_static_guard.py
