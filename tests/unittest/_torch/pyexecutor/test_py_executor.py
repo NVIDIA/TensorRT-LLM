@@ -1853,21 +1853,20 @@ class TestDisaggTerminationGuard:
 
         effects.terminate_request.assert_called_once_with(req)
 
-    def test_pp1_does_not_double_terminate_on_transfer_complete(self):
-        """PP=1: the early path already terminated the request (and removed it
-        from active_requests). The coordinator's release must skip
-        re-terminating it (force_terminate_ctx_for_partial_reuse=True) to
-        avoid a double free_resources (nvbug/5961736)."""
+    def test_pp1_retries_deferred_termination_on_transfer_complete(self):
+        """The early path cannot free KV while a transfer owns it. Once the
+        final claim is released, the departed request must be terminated even
+        when the PP=1 early-termination optimization was requested."""
         req = Mock()
         coordinator, _, effects = _make_transfer_coordinator(
-            active_requests=[],  # already removed + terminated by early path
+            active_requests=[],  # early termination deferred until transfer release
             force_terminate_ctx_for_partial_reuse=True,
         )
         coordinator._transfers.end_transfer.return_value = True
 
         coordinator.release_transfer(req)
 
-        effects.terminate_request.assert_not_called()
+        effects.terminate_request.assert_called_once_with(req)
 
 
 # ---------------------------------------------------------------------------

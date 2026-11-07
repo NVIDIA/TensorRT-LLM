@@ -3498,7 +3498,9 @@ class PyExecutor:
                            attention_dp_rank: Optional[int] = None,
                            host_step_time_ms: Optional[float] = None,
                            prev_device_step_time_ms: Optional[float] = None,
-                           gpu_forward_time_ms: Optional[float] = None):
+                           gpu_forward_time_ms: Optional[float] = None,
+                           kv_transfer_outcomes: Optional[tuple[int, int,
+                                                                int]] = None):
         """Append one iteration's finalized stats to the export buffer.
 
         The normal Attention-DP path fans out rank-local rows before calling
@@ -3524,11 +3526,15 @@ class PyExecutor:
             gpu_forward_time_ms: Batch-matched GPU forward time captured by
                 the events surrounding this batch's ``_forward_step``.
                 Surfaces as ``gpuForwardTimeMS`` in the /metrics JSON.
+            kv_transfer_outcomes: Rank-local cumulative request success/error/timeout counts.
         """
         # Non-ADP appends immediately, so the latest KV stats belong to this
         # IterationStats. ADP appends later and passes the saved iter-matched
         # KV stats explicitly.
         if not self.enable_attention_dp:
+            coordinator = self.__dict__.get("_disagg_coordinator")
+            kv_transfer_outcomes = (coordinator.transfer_outcomes
+                                    if coordinator is not None else None)
             kv_iter_stats = self._latest_kv_iter_stats
             # Same reasoning for the per-loop timings: non-ADP captures them
             # at append time. ADP passes the values that were saved with the
@@ -3567,6 +3573,9 @@ class PyExecutor:
                 local_dict["prevDeviceStepTimeMS"] = prev_device_step_time_ms
             if gpu_forward_time_ms is not None:
                 local_dict["gpuForwardTimeMS"] = gpu_forward_time_ms
+            if kv_transfer_outcomes is not None:
+                local_dict["kvTransferOutcomes"] = dict(
+                    zip(("success", "error", "timeout"), kv_transfer_outcomes))
             local_dict["schedulerMode"] = scheduler_mode
             local_dict["rank"] = self.dist.tp_rank
             # Buffer for _flush_iter_stats_synced; in-place tp_allgather would
@@ -3585,6 +3594,7 @@ class PyExecutor:
         #   [5] prev_device_step_time_ms: Optional[float]
         #   [6] scheduler_mode: "overlap" | "non_overlap"
         #   [7] gpu_forward_time_ms: Optional[float]
+        #   [8] kv_transfer_outcomes: Optional[tuple[int, int, int]]
         with self.stats_lock:
             if (not _stats_buffer_is_unbounded(self.max_stats_len)
                     and len(self.stats) > self.max_stats_len):
@@ -3592,7 +3602,7 @@ class PyExecutor:
             self.stats.append(
                 (stats, req_stats, kv_iter_stats, attention_dp_rank,
                  host_step_time_ms, prev_device_step_time_ms, scheduler_mode,
-                 gpu_forward_time_ms))
+                 gpu_forward_time_ms, kv_transfer_outcomes))
 
     def _process_iter_stats(
         self,
@@ -3664,10 +3674,13 @@ class PyExecutor:
                                         micro_batch_id,
                                         batch_state.scheduled_batch_stats)
         if self.enable_attention_dp:
+            coordinator = self.__dict__.get("_disagg_coordinator")
             self._adp_iter_stats.queue(
                 stats,
                 req_stats,
                 kv_iter_stats=self._latest_kv_iter_stats,
+                kv_transfer_outcomes=(coordinator.transfer_outcomes
+                                      if coordinator is not None else None),
                 is_rank0=self.dist.rank == 0,
                 host_step_time_ms=host_step_time_ms,
                 prev_device_step_time_ms=prev_device_step_time_ms,
@@ -8264,7 +8277,8 @@ class PyExecutor:
                         host_step_time_ms=record.host_step_time_ms,
                         prev_device_step_time_ms=record.
                         prev_device_step_time_ms,
-                        gpu_forward_time_ms=record.gpu_forward_time_ms)
+                        gpu_forward_time_ms=record.gpu_forward_time_ms,
+                        kv_transfer_outcomes=record.kv_transfer_outcomes)
             total_num_active_requests = sum(s.num_active_requests
                                             for s in all_rank_states)
             total_num_live_requests = total_num_active_requests + sum(

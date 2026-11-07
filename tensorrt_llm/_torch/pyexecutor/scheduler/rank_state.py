@@ -67,6 +67,7 @@ class RankIterStatsPayload:
     _ITER_STATS_FIELD_COUNT: ClassVar[int] = 9
     _KV_LOAD_FIELD_COUNT: ClassVar[int] = 3
     _SNAPSHOT_WIRE_VERSION: ClassVar[int] = -1
+    _TRANSFER_WIRE_VERSION: ClassVar[int] = -2
     _SNAPSHOT_HEADER_SIZE: ClassVar[int] = 4
 
     has_iter_stats: int = 0
@@ -83,6 +84,7 @@ class RankIterStatsPayload:
     kv_load_timestamp_ns: int = 0
     kv_cache_stats: RankKvCacheStats | None = None
     cross_kv_cache_stats: RankKvCacheStats | None = None
+    kv_transfer_outcomes: tuple[int, int, int] | None = None
 
     def serialize(self, include_kv_cache_load: bool = False) -> list[int | float]:
         """Serialize to a flat list for allgather transport."""
@@ -105,11 +107,17 @@ class RankIterStatsPayload:
                     self.kv_load_timestamp_ns,
                 ]
             )
-        if self.kv_cache_stats is not None or self.cross_kv_cache_stats is not None:
+        if (
+            self.kv_cache_stats is not None
+            or self.cross_kv_cache_stats is not None
+            or self.kv_transfer_outcomes is not None
+        ):
             # The negative version cannot be confused with has_iter_stats (0/1).
             # Presence flags frame both snapshots and the independent load fields.
             values = [
-                self._SNAPSHOT_WIRE_VERSION,
+                self._TRANSFER_WIRE_VERSION
+                if self.kv_transfer_outcomes is not None
+                else self._SNAPSHOT_WIRE_VERSION,
                 int(include_kv_cache_load),
                 int(self.kv_cache_stats is not None),
                 int(self.cross_kv_cache_stats is not None),
@@ -118,6 +126,8 @@ class RankIterStatsPayload:
             for snapshot in (self.kv_cache_stats, self.cross_kv_cache_stats):
                 if snapshot is not None:
                     values.extend(snapshot)
+        if self.kv_transfer_outcomes is not None:
+            values.extend(self.kv_transfer_outcomes)
         return values
 
     @classmethod
@@ -135,7 +145,7 @@ class RankIterStatsPayload:
         """
         if (
             len(data) < cls._SNAPSHOT_HEADER_SIZE
-            or data[0] != cls._SNAPSHOT_WIRE_VERSION
+            or data[0] not in (cls._SNAPSHOT_WIRE_VERSION, cls._TRANSFER_WIRE_VERSION)
             or any(flag not in (0, 1) for flag in data[1 : cls._SNAPSHOT_HEADER_SIZE])
         ):
             raise ValueError("Invalid KV snapshot payload header")
@@ -144,6 +154,7 @@ class RankIterStatsPayload:
             + cls._ITER_STATS_FIELD_COUNT
             + int(data[1]) * cls._KV_LOAD_FIELD_COUNT
             + int(data[2] + data[3]) * RankKvCacheStats.wire_size()
+            + (3 if data[0] == cls._TRANSFER_WIRE_VERSION else 0)
         )
 
     @classmethod
@@ -170,6 +181,11 @@ class RankIterStatsPayload:
                 result.cross_kv_cache_stats = RankKvCacheStats.deserialize(
                     values[cursor : cursor + RankKvCacheStats.wire_size()]
                 )
+            if values[0] == cls._TRANSFER_WIRE_VERSION:
+                counts = values[-3:]
+                if any(value < 0 or value != int(value) for value in counts):
+                    raise ValueError("Transfer outcome counters must be nonnegative integers")
+                result.kv_transfer_outcomes = tuple(int(value) for value in counts)
             return result
         scalar_field_count = cls._ITER_STATS_FIELD_COUNT + cls._KV_LOAD_FIELD_COUNT
         if len(values) > scalar_field_count:

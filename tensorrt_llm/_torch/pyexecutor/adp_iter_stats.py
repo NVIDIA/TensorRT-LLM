@@ -94,6 +94,7 @@ class ADPIterStatsRecord:
     host_step_time_ms: Optional[float] = None
     prev_device_step_time_ms: Optional[float] = None
     gpu_forward_time_ms: Optional[float] = None
+    kv_transfer_outcomes: tuple[int, int, int] | None = None
 
 
 class ADPIterStatsBuffer:
@@ -153,9 +154,11 @@ class ADPIterStatsBuffer:
         host_step_time_ms: Optional[float] = None,
         prev_device_step_time_ms: Optional[float] = None,
         gpu_forward_time_ms: Optional[float] = None,
+        kv_transfer_outcomes: tuple[int, int, int] | None = None,
     ) -> None:
         """Queue local stats; rank 0 also keeps objects needed for fanout."""
         payload = self.make_payload(stats)
+        payload.kv_transfer_outcomes = kv_transfer_outcomes
         iter_id = payload.iter_stats_iter
 
         if iter_id in self._payloads and iter_id not in self._synthetic_iters:
@@ -358,6 +361,7 @@ class ADPIterStatsBuffer:
                         host_step_time_ms=host_step_time_ms,
                         prev_device_step_time_ms=prev_device_step_time_ms,
                         gpu_forward_time_ms=gpu_forward_time_ms,
+                        kv_transfer_outcomes=rank_state.iter_stats.kv_transfer_outcomes,
                     )
                 )
 
