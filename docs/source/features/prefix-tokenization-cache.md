@@ -14,9 +14,18 @@ whole prompt. The new prompt may also rewrite the last tokens of the cached one
 (those after the seam described below), as a chat template does when it
 replaces the previous turn's generation prefix with the response.
 
+Agentic clients also rewrite the end of the history between turns, for example
+by trimming a tool result or replacing the last message, so the new prompt is
+no longer an extension of the cached one. The cache records a checkpoint every
+256 tokens of a cached prompt. When a new prompt diverges from a cached one, the
+cache reuses the cached ids up to the last checkpoint that still lies a full
+checkpoint interval inside their longest common prefix, and tokenizes only the
+rest.
+
 Tokenizing a tail in isolation is not generally identical to tokenizing the
 whole prompt, because BPE merges can straddle the split. The cache therefore
-backs off a fixed number of tokens from the end of the cached prefix,
+backs off a fixed number of tokens from the end of the cached prefix (for a
+diverging prompt, at least one checkpoint interval before the divergence),
 re-tokenizes from there, and accepts the splice only if the re-tokenized ids
 equal the cached ids over that seam. Otherwise the prompt is tokenized in full.
 The output is always identical to tokenizing the whole prompt.
@@ -62,7 +71,10 @@ feature you turned on.
   `add_special_tokens=False`, so they benefit. `/v1/completions` defaults to
   `add_special_tokens=True` and is not accelerated.
 - A prompt that reuses a cached entry replaces that entry, so a conversation
-  costs one entry regardless of how many turns it has. Lookup is bucketed by a
+  costs one entry regardless of how many turns it has. A prompt that diverges
+  from a cached entry before its seam is added next to it instead: the
+  divergence may be a branch, such as a subagent started from a shared history,
+  and the original conversation can still continue from the old entry. Lookup is bucketed by a
   hash of the first `TLLM_PREFIX_TOKEN_CACHE_MIN_CHARS` characters, and each
   entry keeps a short probe of the characters before its seam so that
   conversations sharing a long system preamble are told apart without
@@ -73,9 +85,51 @@ feature you turned on.
 - An unexpected exception inside the cache disables it, with a warning, and the
   request is tokenized normally. A cache problem never fails a request.
 - The cache logs its configuration at startup and, every 1000 cache-eligible
-  requests, an `INFO` line with the hit rate, the number of re-synchronization
-  fallbacks, and its occupancy, so a cache that is enabled but never hitting is
-  visible in the server log.
+  requests, an `INFO` line with the hit rate (and how many hits were on
+  diverging prompts), the number of re-synchronization fallbacks, how many
+  prompts were routed to another frontend and how many were tokenized locally
+  because routing failed (see below), and its occupancy, so a cache that is
+  enabled but never hitting is visible in the server log.
+
+## Multiple serving frontends
+
+Use a single serving frontend (`num_serve_frontends: 1`, the default) when you
+enable the cache for multi-turn traffic. Multiple frontends are available only
+with the classic IPC executor, so this section applies only there.
+
+The cache lives in the memory of one frontend process and is not shared
+between processes. With `num_serve_frontends: K`, the K frontend processes
+share the serving port through `SO_REUSEPORT`, and the kernel assigns each new
+TCP connection to one of them without looking at the request. A client that
+opens a new connection per request, as many benchmark clients do, therefore
+sends each turn of a conversation to an arbitrary frontend. That frontend
+usually has not seen the conversation's previous turn, so the prompt is
+tokenized in full.
+
+On an agentic multi-turn trace with prompts of about 160k tokens on average,
+at one session, the p90 time spent in the frontend was about 165 ms with 8
+frontends and 44 ms with one. Decode throughput per user was the same up to
+32 concurrent sessions, because at that concurrency the frontend is not the
+bottleneck.
+
+Multiple frontends help when a single Python frontend cannot keep up, typically
+at high request rates with short prompts. That is not the workload this cache
+targets.
+
+If you need several frontends, set
+`TLLM_PREFIX_TOKEN_CACHE_ROUTE_BY_CONVERSATION=1` to tokenize each conversation
+in one frontend. A chat request's conversation id (the same id attention DP
+routes by, from `conversation_params.conversation_id` or headers such as
+`X-Correlation-ID`) is hashed to an owner frontend, and the frontend the
+request arrived at sends the prompt text to the owner over a local Unix socket
+and gets back the token ids; the request itself stays where it arrived. A
+request without a conversation id is tokenized locally, and so is one whose
+owner does not answer within 5 seconds or cannot tokenize the prompt; the
+latter are counted as route failures in the periodic log line. An owner that
+did not answer is not asked again for 30 seconds. The switch is
+off by default and has no effect with a single frontend or with the cache
+disabled. On the trace above with 8 frontends, it brought the p90 frontend time
+at one session from about 165 ms to about 58 ms.
 
 ## Measured effect
 
@@ -97,3 +151,8 @@ The splice was also checked against real `gpt2`, Llama-3, and Qwen3
 tokenizers on 300 randomly grown multi-turn prompts each, with deltas
 deliberately starting mid-word: 300/300 identical ids, 280 cache hits, and 0
 re-synchronization fallbacks per tokenizer.
+
+Splicing diverging prompts was checked on 300 multi-turn prompts whose history
+is rewritten between turns: all 300 matched tokenizing the whole prompt, 99.3%
+were cache hits, and tokenization took about a tenth of the time of
+tokenizing every prompt in full.
