@@ -33,6 +33,8 @@ Publishes no descriptor and leaves ``can_implement`` undefined, so no request
 can reach it.
 """
 
+from dataclasses import replace
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -47,7 +49,12 @@ from tensorrt_llm._torch.utils import (
     relu2,
 )
 
-from ..activation import DEFAULT_MOE_ACTIVATION, MoEActivation, MoEActivationSupport
+from ..activation import (
+    DEFAULT_MOE_ACTIVATION,
+    ActivationParamShape,
+    MoEActivation,
+    MoEActivationSupport,
+)
 from ..impl_base import MoEImplBase, apply_moe_impl_construction_state
 from ..impl_contract import MoERunContext, identity_quant_of
 from ..quantization import MoEWeightLoadingMode, NVFP4MarlinFusedMoEMethod
@@ -129,12 +136,40 @@ class MarlinFusedMoEBase(MoEImplBase):
     capabilities = MARLIN_CAPABILITIES
     input_requirement = MARLIN_INPUT_REQUIREMENT
 
-    # The Marlin epilogue takes no activation constants, and
-    # ``_apply_activation`` only distinguishes these three -- any other gated
-    # kind would silently run SiLU, any other non-gated kind ReLU.
+    # The Marlin epilogue is ``_apply_activation``. It only distinguishes these
+    # four -- any other gated kind would silently run SiLU, any other non-gated
+    # kind ReLU. Only SwigluBias reads the constants; ``resolve_activation_support``
+    # narrows the rest.
     activation_support = MoEActivationSupport(
-        kinds=frozenset({ActivationType.Swiglu, ActivationType.Geglu, ActivationType.Relu2})
+        kinds=frozenset(
+            {
+                ActivationType.Swiglu,
+                ActivationType.SwigluBias,
+                ActivationType.Geglu,
+                ActivationType.Relu2,
+            }
+        ),
+        alpha_beta=ActivationParamShape.UNIFORM_SCALAR,
+        limit=ActivationParamShape.UNIFORM_SCALAR,
     )
+
+    def resolve_activation_support(self) -> MoEActivationSupport:
+        """Take the constants for SwigluBias only.
+
+        The class declaration admits them so selection can pick Marlin for
+        SwigluBias, and ``check_marlin_capabilities`` turns them down for any
+        other kind. Narrowed here too, so a unit built directly with, say, a
+        clamped plain SwiGLU raises at construction instead of running
+        unclamped.
+        """
+        support = type(self).activation_support
+        if ActivationType(self.activation.kind) is ActivationType.SwigluBias:
+            return support
+        return replace(
+            support,
+            alpha_beta=ActivationParamShape.UNSUPPORTED,
+            limit=ActivationParamShape.UNSUPPORTED,
+        )
 
     def __init__(
         self,
@@ -232,22 +267,34 @@ class MarlinFusedMoEBase(MoEImplBase):
     def _apply_activation(self, gemm1_out: torch.Tensor) -> torch.Tensor:
         """Apply the activation, returning [tokens, intermediate_size].
 
-        ``gemm1_out`` is [tokens, 2 * intermediate_size] for a gated kind and
-        [tokens, intermediate_size] otherwise.
+        ``gemm1_out`` is [tokens, intermediate_size] for a non-gated kind. For a
+        gated kind it is [tokens, 2 * intermediate_size] in the layout
+        ``w3_w1_weight`` is loaded in, the CUTLASS ``[w3; w1]``: the up
+        projection first, the gate second.
+
+        Only SwigluBias reads the ``act_*`` constants, as CUTLASS's
+        ``SwigluBiasAdaptor`` does: ``gate * sigmoid(act_alpha * gate) *
+        (up + act_beta)``, with the gate clamped from above and up on both sides
+        when ``act_clamp`` is set. It runs in FP32 and rounds once at the end.
         """
         inter_size = self.intermediate_size_per_partition
-        if is_gated_activation(self.activation_type):
-            gate = gemm1_out[:, :inter_size]
-            up = gemm1_out[:, inter_size : 2 * inter_size]
-            if self.activation_type == ActivationType.Geglu:
-                return F.gelu(gate) * up
-            else:
-                return F.silu(gate) * up  # SwiGLU
-        else:
+        if not is_gated_activation(self.activation_type):
             if self.activation_type == ActivationType.Relu2:
                 return relu2(gemm1_out)
-            else:
-                return F.relu(gemm1_out)
+            return F.relu(gemm1_out)
+
+        up = gemm1_out[:, :inter_size]
+        gate = gemm1_out[:, inter_size : 2 * inter_size]
+        if self.activation_type == ActivationType.SwigluBias:
+            gate, up = gate.float(), up.float()
+            if self.act_clamp is not None:
+                gate = gate.clamp(max=self.act_clamp)
+                up = up.clamp(min=-self.act_clamp, max=self.act_clamp)
+            out = gate * torch.sigmoid(gate * self.act_alpha) * (up + self.act_beta)
+            return out.to(gemm1_out.dtype)
+        if self.activation_type == ActivationType.Geglu:
+            return F.gelu(gate) * up
+        return F.silu(gate) * up  # SwiGLU
 
     def _ensure_workspace(self, device: torch.device) -> torch.Tensor:
         if not hasattr(self, "_marlin_workspace") or self._marlin_workspace is None:

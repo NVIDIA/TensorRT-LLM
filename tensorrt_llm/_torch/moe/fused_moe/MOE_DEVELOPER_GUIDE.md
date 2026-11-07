@@ -918,12 +918,17 @@ always applies the clamp functor. It is substituted *before* coercion, so a
 `PER_EXPERT_TENSOR` backend gets it broadcast like any other scalar, and
 `MoEActivationSupport` rejects it outright next to `limit=UNSUPPORTED`.
 
-TRTLLM-Gen is the one exception, and it is a per-class one: its clamp is a
+TRTLLM-Gen is one exception, and it is a per-class one: its clamp is a
 per-expert tensor for the FP4 fused-activation cubins but a by-value `float`
 for the FP8 block-scale kernel (`DevKernel.h`, `float swigluLimit`), so
 `TRTLLMGenFp8BlockScalesBase` overrides `resolve_activation_support` to narrow
 the shape while the rest of the family falls through to the class attribute.
-`resolve_activation_support` is probed with `getattr` for exactly that reason.
+Marlin is the other, per kind: its class declares scalar constants so selection
+can serve `SwigluBias`, and `MarlinFusedMoEBase.resolve_activation_support`
+narrows them to `UNSUPPORTED` for the kinds `_apply_activation` runs without
+them, so a directly built unit with a clamped plain SwiGLU raises at
+construction. `resolve_activation_support` is probed with `getattr` for these
+overrides.
 `ConfigurableMoE.create_weights` installs the slots ahead of each allocation,
 guarded so a pass that is not allocating does not re-run the in-place division
 `NVFP4TRTLLMGenFusedMoEBaseMethod` applies to `beta` and `clamp`.
@@ -940,8 +945,10 @@ and still reject the format it arrives with. The gpt-oss package (per-expert
 bias plus filled `alpha` / `beta` / `limit`, summarized as
 `MoEProblem.swiglu_gptoss_style`) is declined by every specialized backend whose
 `kinds` omit `SwigluBias` (the CuteDSL grouped-GEMM leaves, the B12x leaves,
-`DeepGemmFusedMoE`, `TrtllmCutedslDenseGemmNvfp4Impl`, the Marlin leaves). The
-TRTLLM-Gen and CUTLASS leaves admit it per format through
+`DeepGemmFusedMoE`, `TrtllmCutedslDenseGemmNvfp4Impl`). The Marlin leaves run
+`SwigluBias` with scalar constants in `_apply_activation` and turn down the
+expert bias, so they serve MiniMax-M3 and not gpt-oss. The TRTLLM-Gen and
+CUTLASS leaves admit the gpt-oss package per format through
 `supports_gptoss_style` (on CUTLASS: unquantized, MXFP8, NVFP4 and the three
 MXFP4 formats). The kernel takes the three constants for every format; what
 limits the set is the weight methods. W8A16 and W4A8_AWQ keep a bias shape that

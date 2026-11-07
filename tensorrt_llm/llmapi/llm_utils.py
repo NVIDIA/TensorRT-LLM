@@ -440,6 +440,9 @@ class CachedModelLoader:
 
         self._hf_model_dir = self._download_hf_model_if_needed(
             self.model_loader.model_obj, revision=self.llm_args.revision)
+        # ModelLoader took _model_dir at construction, when a hub id had no
+        # local directory yet; the quant config below is read from it.
+        self.model_loader._model_dir = self._hf_model_dir
 
         if self.llm_args.quant_config.quant_algo is not None:
             logger.warning(

@@ -38,6 +38,7 @@ from tensorrt_llm._torch.moe.fused_moe.activation import (
     ActivationParamShape,
     MoEActivationSupport,
     SwigluActivation,
+    SwigluBiasActivation,
 )
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
@@ -1169,6 +1170,51 @@ def test_pinned_marlin_identity_resolves_to_its_leaf(quant_algo, impl_id):
         report = resolve_moe_impl(_marlin_model_config(quant_algo), impl_id=impl_id)
     assert impl_class_for(report).descriptor.identity.canonical() == impl_id
     assert report.selected_by == "pinned"
+
+
+_MARLIN_FORMATS = (
+    pytest.param(QuantAlgo.NVFP4, MarlinCudaNvfp4Impl, id="nvfp4"),
+    pytest.param(QuantAlgo.W4A16_NVFP4, MarlinCudaW4a16Nvfp4Impl, id="w4a16_nvfp4"),
+)
+
+# MiniMax-M3's routed experts: SwigluBias with scalar constants, no expert bias.
+_MINIMAX_SWIGLU_BIAS = SwigluBiasActivation(gate_sigmoid_scale=1.702, linear_offset=1.0, clamp=7.0)
+
+
+@pytest.mark.parametrize("quant_algo, expected", _MARLIN_FORMATS)
+def test_marlin_serves_swiglu_bias_without_an_expert_bias(quant_algo, expected):
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(
+            _marlin_model_config(quant_algo), activation=_MINIMAX_SWIGLU_BIAS, bias=False
+        )
+    assert impl_class_for(report) is expected
+    assert not report.degraded
+
+
+@pytest.mark.parametrize("quant_algo, expected", _MARLIN_FORMATS)
+@pytest.mark.parametrize(
+    "activation, bias, detail",
+    [
+        pytest.param(
+            SwigluActivation(clamp=7.0),
+            False,
+            "only applies activation constants for SwigluBias",
+            id="clamped_swiglu",
+        ),
+        pytest.param(_MINIMAX_SWIGLU_BIAS, True, "takes no expert bias", id="expert_bias"),
+    ],
+)
+def test_marlin_leaf_declines_what_its_epilogue_does_not_apply(
+    quant_algo, expected, activation, bias, detail
+):
+    """``_apply_activation`` drops a plain SwiGLU's clamp and has no expert-bias slot."""
+    with override_moe_environment(_marlin_environment()):
+        report = resolve_moe_impl(
+            _marlin_model_config(quant_algo), activation=activation, bias=bias
+        )
+    rejection = next(r for r in report.rejected if r.legacy_backend == expected.__name__)
+    assert rejection.reason is MoERejectReason.ACTIVATION_UNSUPPORTED
+    assert detail in rejection.detail
 
 
 # =====================================================================
