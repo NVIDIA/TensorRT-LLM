@@ -207,11 +207,6 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._dummy_slot_index: int = self.pool_size
         self._dummy_request_ids: Set[int] = set()
 
-        # Pre-allocated CPU staging buffers for prepare() to avoid
-        # repeated pinned-memory allocation every round.
-        self._cpu_batch_indices: Optional[torch.Tensor] = None
-        self._cpu_nondummy_mask: Optional[torch.Tensor] = None
-
         # Retained slots: completed requests whose SA states remain in the
         # pool for cross-request search. OrderedDict preserves insertion
         # (completion) order for FIFO eviction.
@@ -376,6 +371,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         # Copy pending host states to GPU
         if self._pending_copies:
+            copied_host_states = False
             for rid in list(self._pending_copies):
                 if rid in self._host_states_native and rid in self._request_to_slot:
                     slot = self._request_to_slot[rid]
@@ -385,14 +381,21 @@ class SuffixAutomatonManager(BaseResourceManager):
                         slot,
                         self.max_seq_len,
                     )
+                    copied_host_states = True
             self._pending_copies.clear()
+            # copy_state_to_slot issues a raw cudaMemcpyAsync that the pinned-memory
+            # allocator does not track. A finished or canceled request can free its
+            # host state while the copy is still queued, so wait for the copies here.
+            if copied_host_states:
+                torch.cuda.current_stream().synchronize()
 
         # Flush deferred active-slot-mask updates.  add_request/remove_request
         # queue updates because the GPU tensor may not exist yet at that point;
         # here _ensure_workspace has already run so the tensor is available.
         if self._pending_mask_updates and self._gpu_active_slot_mask is not None:
             for slot, value in self._pending_mask_updates.items():
-                self._gpu_active_slot_mask[slot] = value
+                # fill_ avoids the blocking copy of a Python scalar into one element.
+                self._gpu_active_slot_mask[slot].fill_(value)
             self._pending_mask_updates.clear()
 
         # Map each request ID to its slot. Unknown IDs (e.g. CUDA graph
@@ -401,29 +404,23 @@ class SuffixAutomatonManager(BaseResourceManager):
         num_requests = len(request_ids)
         slots = [self._request_to_slot.get(rid, self._dummy_slot_index) for rid in request_ids]
 
-        # Reuse pre-allocated pinned CPU buffers to avoid costly
-        # pinned-memory allocation every round.
-        if self._cpu_batch_indices is None or self._cpu_batch_indices.shape[0] < num_requests:
-            buf_size = self.max_num_requests
-            self._cpu_batch_indices = torch.zeros(
-                buf_size, dtype=torch.int32, pin_memory=prefer_pinned()
-            )
-            self._cpu_nondummy_mask = torch.zeros(
-                buf_size, dtype=torch.int32, pin_memory=prefer_pinned()
-            )
+        # Fresh pinned tensors on every call: the pinned-memory allocator keeps
+        # each one alive and unchanged until its async copy has run.
+        pinned = prefer_pinned()
+        # [num_requests], int32
+        batch_indices = torch.tensor(slots, dtype=torch.int32, pin_memory=pinned)
+        # [num_requests], int32
+        nondummy_mask = torch.tensor(
+            [0 if s == self._dummy_slot_index else 1 for s in slots],
+            dtype=torch.int32,
+            pin_memory=pinned,
+        )
 
-        batch_indices = self._cpu_batch_indices[:num_requests]
-        nondummy_mask = self._cpu_nondummy_mask[:num_requests]
-        for i, s in enumerate(slots):
-            batch_indices[i] = s
-            nondummy_mask[i] = 0 if s == self._dummy_slot_index else 1
-
+        # Stream-ordered: the non_blocking copies below are on the current
+        # stream, so any kernel launched on the same stream afterwards will
+        # see the updated values.
         self._gpu_batch_indices[:num_requests].copy_(batch_indices, non_blocking=True)
         self._gpu_nondummy_mask[:num_requests].copy_(nondummy_mask, non_blocking=True)
-        # Stream-ordered: the non_blocking copies above are on the current
-        # stream, so any kernel launched on the same stream afterwards will
-        # see the updated values. No device-wide sync needed.
-        torch.cuda.current_stream().synchronize()
 
     def extend(
         self,

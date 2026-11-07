@@ -127,6 +127,24 @@ def test_prepare_buffers_noop_when_disabled():
     assert m.full_draft_probs is None
 
 
+def test_padding_onehot_rows_are_written_without_host_sync():
+    # Padding rows get a one-hot placeholder distribution over the published
+    # width; other rows and the columns past that width stay unchanged.
+    m = _alloc_meta(draft_probs_last_dim=V - 4)
+    SpecMetadata.prepare_rejection_sampling_buffers(m)
+    m.draft_probs.fill_(0.5)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        SpecMetadata.write_padding_onehot_draft_probs(m, [1, 5], K - 1)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    expected = torch.full_like(m.draft_probs, 0.5)
+    expected[[1, 5], : K - 1, : V - 4] = 0.0
+    expected[[1, 5], : K - 1, 0] = 1.0
+    assert torch.equal(m.draft_probs, expected)
+
+
 def _valid_state():
     return types.SimpleNamespace(
         is_ragged_verify=False,

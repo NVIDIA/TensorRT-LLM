@@ -618,13 +618,21 @@ class MTPWorker(SpecWorkerBase):
                 (num_sequences, max_length, packed_seq_cuda.shape[1]),
                 dtype=packed_seq_cuda.dtype,
                 device=packed_seq_cuda.device)
-            # get mask
-            seq_indices = torch.arange(
-                max_length, device=seq_lens_cuda.device).unsqueeze(0).expand(
-                    num_sequences, -1)
-            mask = seq_indices < seq_lens_cuda.unsqueeze(1)
+            # Scatter with (row, column) indices of a size known on the host;
+            # a boolean-mask write would wait for the GPU to count the mask.
+            num_packed = packed_seq_cuda.shape[0]
+            device = seq_lens_cuda.device
+            sequence_ids = torch.arange(num_sequences, device=device)
+            # [num_packed], row of each packed token
+            rows = torch.repeat_interleave(sequence_ids,
+                                           seq_lens_cuda,
+                                           output_size=num_packed)
+            # [num_sequences], packed offset where each sequence starts
+            starts = torch.cumsum(seq_lens_cuda, 0) - seq_lens_cuda
+            # [num_packed], column of each packed token within its row
+            cols = torch.arange(num_packed, device=device) - starts[rows]
             # unpack
-            result[mask] = packed_seq_cuda
+            result[rows, cols] = packed_seq_cuda
             return result
 
         batch_size = attn_metadata.num_seqs

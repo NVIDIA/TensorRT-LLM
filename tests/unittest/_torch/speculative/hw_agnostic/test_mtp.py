@@ -1150,13 +1150,20 @@ class TestMTPUpdateMTPHiddenStates(unittest.TestCase):
         mtpworker = MTPWorker(spec_config)
         mtpworker.is_thop = is_thop
 
-        mtpworker.update_mtp_hidden_states(
-            input_ids=input_ids,
-            hidden_states=hidden_states,
-            num_accepted_tokens=num_accepted_tokens,
-            spec_metadata=spec_metadata,
-            attn_metadata=attn_metadata,
-        )
+        # The Python path, including the context unpack, must not wait for the GPU.
+        torch.cuda.synchronize()
+        if not is_thop:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            mtpworker.update_mtp_hidden_states(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
+                num_accepted_tokens=num_accepted_tokens,
+                spec_metadata=spec_metadata,
+                attn_metadata=attn_metadata,
+            )
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
 
         # Verify
         mtp_past_hidden_states_pool = (
