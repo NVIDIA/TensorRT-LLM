@@ -258,7 +258,7 @@ class GrpcRequestManager:
 def create_sampling_params_from_proto(
     proto_config: pb2.SamplingConfig,
     output_config: pb2.OutputConfig,
-    max_tokens: int,
+    max_tokens: Optional[int] = None,
     stop: Optional[List[str]] = None,
     stop_token_ids: Optional[List[int]] = None,
     ignore_eos: bool = False,
@@ -274,7 +274,9 @@ def create_sampling_params_from_proto(
     Args:
         proto_config: Protobuf SamplingConfig message
         output_config: Protobuf OutputConfig message
-        max_tokens: Maximum tokens to generate
+        max_tokens: Maximum tokens to generate. None or 0 (the proto3 default of
+            an omitted field) leaves it unset, so the executor derives the budget
+            from ``max_seq_len`` and the prompt length.
         stop: Stop strings (tokenized by TRT-LLM's _setup())
         stop_token_ids: Stop token IDs
         ignore_eos: Whether to ignore end-of-sequence token
@@ -290,7 +292,7 @@ def create_sampling_params_from_proto(
     # Build kwargs for SamplingParams
     # KEY OPTIMIZATION: detokenize=False skips Python detokenization!
     kwargs = {
-        "max_tokens": max_tokens,
+        "max_tokens": max_tokens or None,
         "detokenize": False,
     }
 
