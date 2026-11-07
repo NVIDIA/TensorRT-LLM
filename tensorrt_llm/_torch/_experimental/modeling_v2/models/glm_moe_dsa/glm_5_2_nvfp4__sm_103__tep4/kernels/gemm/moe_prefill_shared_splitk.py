@@ -379,7 +379,11 @@ def shared_splitk_kernel(
         # A runtime acc[cta_rank * CHUNK + ...] index can instead require local
         # storage; do not infer a register layout from source array syntax.
         if cta_rank < cutlass.Int32(reducers):
-            while not prims.mbarrier_try_wait_parity(reduce_full, 0):
+            # The peers' st.async complete-tx releases at cluster scope; a CTA-scope
+            # acquire does not order the mailbox reads below after it.
+            while not prims.mbarrier_try_wait_parity(
+                reduce_full, 0, scope=prims.MBarrierScope.CLUSTER
+            ):
                 pass
             cute.arch.fence_acq_rel_cta()
             if is_owner_lane:

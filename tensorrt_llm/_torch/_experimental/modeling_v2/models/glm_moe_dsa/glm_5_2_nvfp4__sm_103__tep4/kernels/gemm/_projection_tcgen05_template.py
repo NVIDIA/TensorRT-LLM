@@ -658,7 +658,11 @@ def kernel(
         # index is a constant. Indexing a register array with a runtime value
         # (acc[cta_rank * CHUNK + ...]) forces the whole array to local memory.
         if cta_rank < cutlass.Int32(reducers):
-            while not prims.mbarrier_try_wait_parity(reduce_full, 0):
+            # The peers' st.async complete-tx releases at cluster scope; a CTA-scope
+            # acquire does not order the mailbox reads below after it.
+            while not prims.mbarrier_try_wait_parity(
+                reduce_full, 0, scope=prims.MBarrierScope.CLUSTER
+            ):
                 pass
             cute.arch.fence_acq_rel_cta()
             if is_owner_lane:

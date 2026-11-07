@@ -1767,6 +1767,12 @@ def moe_gather_grouped_gemm_act_fusion_kernel(
                 tile_sched_params.raster_along_m,
             )
 
+        # The in-loop wait leaves the newest TMA store pending. Drain its SMEM source
+        # read before the CTA can exit; the barrier below holds the other epilogue
+        # warps until then.
+        if warp_idx == epilog_warp_id[0]:
+            prims.cp_async_bulk_wait_group(0, read=True)
+
         # Deallocate TMEM after persistent loop — epilogue warps sync
         prims.barrier_cta_sync(epilog_sync_bar_id, thread_count=threads_in_epilogue)
         if warp_idx == 0:
