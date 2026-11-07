@@ -3407,6 +3407,19 @@ class OpenAIServer(_VideoRoutesMixin):
             for initial_response in initial_responses:
                 yield initial_response
 
+            # The promise yields itself as each result, so a promise that is
+            # already finished is its own first and last result and the
+            # stream ends with that result's terminal event.
+            first_response = await anext(promise, promise)
+            raw_request.state.server_first_token_time = (
+                self._adjusted_steady_clock.now())
+            pp_results = first_response.outputs[
+                0]._postprocess_result if self.postproc_worker_enabled else post_processor(
+                    first_response, args)
+            for pp_res in pp_results:
+                yield pp_res
+            # The loop below binds nothing when there is only one result.
+            res = first_response
             async for res in promise:
                 pp_results = res.outputs[
                     0]._postprocess_result if self.postproc_worker_enabled else post_processor(
