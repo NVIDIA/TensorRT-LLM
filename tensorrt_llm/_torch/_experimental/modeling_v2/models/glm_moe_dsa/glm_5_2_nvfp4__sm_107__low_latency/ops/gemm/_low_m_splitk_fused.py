@@ -66,6 +66,7 @@ from ._low_m_splitk import (
     _align_up,
     _detect_leading_dim,
     _from_dlpack_dynamic,
+    _mbarrier_wait_acquire_cluster,
     _smem_bytes,
     _store_shared_remote_v4,
     default_tactic,
@@ -809,7 +810,8 @@ class SplitKFusedEpilogueGemmKernel(SplitKDenseGemmKernel):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbarrier_wait_acquire_cluster(bar_reduce, 0)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
@@ -1393,7 +1395,8 @@ class SplitKIndexerQTailGemmKernel(SplitKFusedEpilogueGemmKernel):
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                # The peers' st.async complete-tx releases at cluster scope.
+                _mbarrier_wait_acquire_cluster(bar_reduce, 0)
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
@@ -1579,7 +1582,8 @@ class SplitKIndexerQTailGemmKernel(SplitKFusedEpilogueGemmKernel):
                 )
             if epi_tid == 0:
                 cute.arch.mbarrier_arrive_and_expect_tx(bar_amax, self.cta_n * 4)
-            cute.arch.mbarrier_wait(bar_amax, 0)
+            # The pair CTA's st.async complete-tx releases at cluster scope.
+            _mbarrier_wait_acquire_cluster(bar_amax, 0)
             for g in cutlass.range_constexpr(groups_per_thread):
                 amaxes[g] = cute.arch.fmax(amaxes[g], sAmaxPeer[rows[g]])
 
