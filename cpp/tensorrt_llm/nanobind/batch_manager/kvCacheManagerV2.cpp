@@ -2790,6 +2790,21 @@ void KvCacheManagerV2Bindings::initBindings(nb::module_& m)
         },
         nb::arg("manager"), nb::arg("cache_level") = kv::kHotLevel.value(), nb::call_guard<nb::gil_scoped_release>());
     mIntrospection.def(
+        "disk_copy_counters",
+        [](kv::KvCacheManager& manager)
+        {
+            auto const c = manager.storage().diskCopyCounters();
+            nb::dict counters;
+            counters["retained"] = c.retained;
+            counters["created"] = c.created;
+            counters["reused"] = c.reused;
+            counters["reclaimed"] = c.reclaimed;
+            counters["dropped"] = c.dropped;
+            counters["write_through_pages"] = c.writeThroughPages;
+            return counters;
+        },
+        nb::arg("manager"));
+    mIntrospection.def(
         "grains_for_slots",
         [](kv::SlotCount numSlots, std::vector<size_t> const& slotSizeList, size_t granularity,
             std::optional<std::vector<int32_t>> const& pools)

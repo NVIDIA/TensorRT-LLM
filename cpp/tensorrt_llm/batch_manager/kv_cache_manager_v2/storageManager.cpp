@@ -869,6 +869,12 @@ bool StorageManager::keepDiskCopyEnabled() const noexcept
     return mKeepDiskCopy;
 }
 
+StorageManager::DiskCopyCounters StorageManager::diskCopyCounters() const noexcept
+{
+    return {mRetainedCopies.size(), mKeepCopyStats.created, mKeepCopyStats.reused, mKeepCopyStats.reclaimed,
+        mKeepCopyStats.dropped, mWriteThroughPages};
+}
+
 SlotCount StorageManager::numRetainedCopies(CacheLevel level, std::optional<PoolGroupIndex> pgIdx) const
 {
     auto const& counts = mNumRetainedCopies.at(level);
