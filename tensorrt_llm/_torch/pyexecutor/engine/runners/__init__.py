@@ -15,7 +15,6 @@ from .decoder import DecoderRunner
 from .encoder import EncoderRunner
 from .encoder_decoder import EncoderDecoderRunner
 from .mm_encoder import MultimodalEncoderRunner
-from .pooling import PoolingRunner
 
 if TYPE_CHECKING:
     from .interface import ModelRunner
@@ -33,14 +32,11 @@ def resolve_runner_type(
     llm_args: TorchLlmArgs,
 ) -> type[ModelRunner]:
     """Resolve the startup runner class without constructing its dependencies."""
-    if llm_args.encode_only and not llm_args.mm_encoder_only:
-        return EncoderRunner
-
     if llm_args.mm_encoder_only:
         return MultimodalEncoderRunner
 
-    if not model.model_config.is_generation:
-        return PoolingRunner
+    if llm_args.encode_only or not model.model_config.is_generation:
+        return EncoderRunner
 
     if model.model_config.is_encoder_decoder:
         return EncoderDecoderRunner

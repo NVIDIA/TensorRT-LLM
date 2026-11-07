@@ -75,6 +75,7 @@ def executor(monkeypatch):
     ex.virtual_memory_pools = None
     ex.sampler = object()
     ex.dwdp_manager = None
+    ex.dense_dwdp_manager = None
     ex.pending_encoder_steps = [object()]
     ex.active_requests = [object()]
     ex.responses = {17: object()}
@@ -134,6 +135,28 @@ def test_release_preserves_model_and_orders_gpu_teardown(executor):
     assert not ex.request_accumulated and not ex.control_requests
     assert ex.waiting_queue is None and ex._pending_adp_dummy_request is None
     assert ex._resources_released and not ex._closed
+
+
+@pytest.mark.parametrize("field", ["dwdp_manager", "dense_dwdp_manager"])
+def test_release_exits_a_bound_dwdp_manager_after_the_caches(
+    executor: tuple[PyExecutor, list], field: str
+) -> None:
+    """A bound DWDP manager, expert or standalone dense, is exited last and detached.
+
+    Releasing the profiling phase exits it as shutdown does, so the creator binds the DWDP
+    managers to the serving phase only; the final shutdown exits it no second time.
+    """
+    ex, events = executor
+    manager = Mock()
+    manager.__exit__ = Mock(side_effect=lambda *_args: events.append(field))
+    setattr(ex, field, manager)
+
+    ex.release_resources()
+
+    assert events[-2:] == ["cache", field]
+    assert getattr(ex, field) is None
+    ex.shutdown()
+    manager.__exit__.assert_called_once_with(None, None, None)
 
 
 def test_release_before_worker_start_does_not_wait_for_shutdown(executor):
@@ -274,6 +297,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         virtual_memory_pools=None,
         kv_connector_manager=None,
         dwdp_manager=None,
+        dense_dwdp_manager=None,
         max_seq_len=128,
         max_num_sequences=2,
         waiting_queue_policy=executor_module.WaitingQueuePolicy.FCFS,
@@ -293,6 +317,7 @@ def test_rebind_resets_phase_state_and_profile_windows(executor, monkeypatch):
         "virtual_memory_pools",
         "kv_connector_manager",
         "dwdp_manager",
+        "dense_dwdp_manager",
         "max_seq_len",
     }
     # Queue policy constructs a queue; sequence capacity comes from the engine.
