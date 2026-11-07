@@ -93,6 +93,7 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     _stack_state_views,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+    _demoted_recurrent_state_priority,
     _low_priority_recurrent_state,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
@@ -4449,8 +4450,29 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
 
 def test_low_priority_recurrent_state_demotes_only_recurrent_pages() -> None:
     attention = AttnLifeCycle.make(None, None, 32)
-    assert _low_priority_recurrent_state(0, attention) == PAGE_PRIORITY_DEFAULT
-    assert _low_priority_recurrent_state(3, object()) == PAGE_PRIORITY_MIN
+    callback = _low_priority_recurrent_state(30)
+    assert callback(0, attention) == PAGE_PRIORITY_DEFAULT
+    assert callback(3, object()) == 30
+
+
+@pytest.mark.parametrize(
+    ("offload_min_priority", "expected"),
+    [
+        (30, 30),  # default floor: evicted before default pages, still offloaded
+        (0, PAGE_PRIORITY_MIN),
+        (-5, PAGE_PRIORITY_MIN),
+        (PAGE_PRIORITY_DEFAULT - 1, PAGE_PRIORITY_DEFAULT - 1),
+        (PAGE_PRIORITY_DEFAULT, PAGE_PRIORITY_MIN),
+        (100, PAGE_PRIORITY_MIN),
+    ],
+)
+def test_demoted_recurrent_state_priority_stays_offloadable(
+    offload_min_priority: int, expected: int
+) -> None:
+    priority = _demoted_recurrent_state_priority(offload_min_priority)
+    assert priority == expected
+    if offload_min_priority < PAGE_PRIORITY_DEFAULT:
+        assert offload_min_priority <= priority < PAGE_PRIORITY_DEFAULT
 
 
 @pytest.mark.parametrize(
@@ -4475,9 +4497,10 @@ def test_v2_hybrid_low_priority_snapshot_prompt_len(
     mgr.mapping = SimpleNamespace(rank=0)
     mgr.local_num_mamba_layers = num_mamba_layers
     mgr._low_priority_snapshot_prompt_len = threshold
+    mgr._low_priority_callback = _low_priority_recurrent_state(30)
     req = SimpleNamespace(is_dummy=is_dummy, prompt_len=prompt_len)
     callback = mgr._context_priority_callback(req)
-    assert callback is (_low_priority_recurrent_state if demoted else None)
+    assert callback is (mgr._low_priority_callback if demoted else None)
 
     create_kv_cache = MagicMock(return_value=None)
     monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)

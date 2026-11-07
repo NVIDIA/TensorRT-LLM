@@ -68,6 +68,7 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
+    DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY,
     AttnLifeCycle,
     BatchDesc,
     BufferConfig,
@@ -116,11 +117,27 @@ _INFORWARD_SNAPSHOT_MAX_ROWS = 8
 _INFORWARD_SNAPSHOT_STAGING_BYTES = 512 << 20
 
 
-def _low_priority_recurrent_state(_ordinal: int, life_cycle: object) -> int:
-    """Lowest eviction priority for recurrent-state pages, default for attention pages."""
-    if isinstance(life_cycle, AttnLifeCycle):
-        return PAGE_PRIORITY_DEFAULT
+def _demoted_recurrent_state_priority(cold_tier_offload_min_priority: int) -> int:
+    """Eviction priority of demoted recurrent-state pages.
+
+    GPU eviction drops pages below ``cold_tier_offload_min_priority`` instead of offloading
+    them, so demoted pages take that floor: evicted before default-priority pages, yet still
+    offloaded to a host tier. A floor above the default offloads no default page either.
+    """
+    if cold_tier_offload_min_priority < PAGE_PRIORITY_DEFAULT:
+        return max(PAGE_PRIORITY_MIN, cold_tier_offload_min_priority)
     return PAGE_PRIORITY_MIN
+
+
+def _low_priority_recurrent_state(priority: int) -> PagePriorityCallback:
+    """Page priority callback: ``priority`` for recurrent-state pages, default for attention."""
+
+    def callback(_ordinal: int, life_cycle: object) -> int:
+        if isinstance(life_cycle, AttnLifeCycle):
+            return PAGE_PRIORITY_DEFAULT
+        return priority
+
+    return callback
 
 
 def _insert_draft_pool_ratio(
@@ -230,6 +247,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
     # Prompts shorter than this create their recurrent-state pages at the lowest
     # eviction priority (mamba_state_config.low_priority_snapshot_prompt_len).
     _low_priority_snapshot_prompt_len = 0
+    _low_priority_callback: Optional[PagePriorityCallback] = None
 
     # Construction and cache configuration
 
@@ -327,6 +345,14 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
         if kv_cache_config.enable_block_reuse:
             self._low_priority_snapshot_prompt_len = (
                 kv_cache_config.mamba_state_config.low_priority_snapshot_prompt_len
+            )
+            offload_min_priority = kv_cache_config.cold_tier_offload_min_priority
+            self._low_priority_callback = _low_priority_recurrent_state(
+                _demoted_recurrent_state_priority(
+                    DEFAULT_COLD_TIER_OFFLOAD_MIN_PRIORITY
+                    if offload_min_priority is None
+                    else offload_min_priority
+                )
             )
         num_cuda_graph_padding_dummy_slots = _get_num_cuda_graph_padding_dummy_slots(
             spec_config, max_batch_size
@@ -2058,7 +2084,7 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             and not req.is_dummy
             and req.prompt_len < self._low_priority_snapshot_prompt_len
         ):
-            return _low_priority_recurrent_state
+            return self._low_priority_callback
         return None
 
     @override
