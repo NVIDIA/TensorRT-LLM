@@ -21,17 +21,20 @@ sparse backend uses `VSACuTeDSLAttention` in `attention.backends.sparse.vsa` ins
 """
 
 import math
-from typing import Any, NamedTuple, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._torch.attention.backends.sparse.skip_softmax import SkipSoftmaxParams
 from tensorrt_llm._torch.visual_gen.cuda_graph_runner import resolved_extra_key
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.visual_gen.args import QuantAttentionConfig
 
 from .....attention.backends.interface import PredefinedAttentionMask
+from ....cache import ForwardPlan, PagedKVTables
 from ..interface import AttentionBackend, AttentionTensorLayout
+from ..paged_rollout import forward_over_paged_rollout
 
 _cute_dsl_import_error: BaseException | None = None
 try:
@@ -204,6 +207,7 @@ class _CacheKey(NamedTuple):
     enable_ex2_emulation: bool
     enable_skip_correction: bool
     gpu_arch_str: str
+    page_size: int = 0  # 0: contiguous K/V. Otherwise tokens per page (combined-HND)
 
 
 _COMPILE_CACHE: dict = {}
@@ -244,13 +248,15 @@ def _get_or_compile(key: _CacheKey, compile_args: tuple):
             key.enable_ex2_emulation,
             key.enable_skip_correction,
             use_tma_store=key.use_tma_store,
+            page_size=key.page_size or None,
+            paged_kv_layout="combined_hnd" if key.page_size else "separate_nhd",
         )
     logger.info(
         f"Compiling CuTe DSL FMHA kernel for {key.qk_cutlass_dtype.__name__}/"
         f"{key.pv_cutlass_dtype.__name__} head_dim={key.head_dim} "
         f"mask={key.mask_type.name} persistent={key.is_persistent} "
         f"lse={key.with_lse} on {key.gpu_arch_str} ..."
-        f"qk_sf_vec={key.qk_sf_vec} "
+        f"qk_sf_vec={key.qk_sf_vec} page_size={key.page_size} "
     )
     compiled = cute.compile(fmha, *compile_args)
     _COMPILE_CACHE[key] = compiled
@@ -527,11 +533,8 @@ def cute_dsl_fmha_fwd(
             lse_cute,
             None,  # sink
             cute_typing.Float32(scale_softmax_log2_value),
-            scale_softmax_log2_tensor_cute,
             cute_typing.Float32(scale_softmax_value),
-            scale_softmax_tensor_cute,
             cute_typing.Float32(scale_output_value),
-            scale_output_tensor_cute,
             skip_threshold_log2,
             ws_left,
             ws_right,
@@ -539,8 +542,120 @@ def cute_dsl_fmha_fwd(
             None,  # total_softmax_count
             stream,
             False,  # use_pdl
+            None,  # page_table
+            None,  # o_sf_tensor
+            None,  # o_sf_scale
+            None,  # o_sf_start_index
+            None,  # dynamic_work_counter
+            scale_softmax_log2_tensor_cute,
+            scale_softmax_tensor_cute,
+            scale_output_tensor_cute,
         )
 
+    compiled = _get_or_compile(key, launch_args)
+    compiled(*launch_args)
+
+
+@torch.compiler.disable
+def cute_dsl_paged_fmha_fwd(
+    q: torch.Tensor,
+    kv_pool: torch.Tensor,
+    page_table: torch.Tensor,
+    cu_seqlens_kv: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    sm_scale: float,
+) -> None:
+    """Full attention of fixed-length query sequences over paged K/V.
+
+    Sequence ``b`` attends to the first ``cu_seqlens_kv[b + 1] - cu_seqlens_kv[b]`` tokens of
+    the pages ``page_table[b]`` lists, in order; a sequence's last page may be partial.
+
+    Args:
+        q: ``[B, S, H_q, D]``.
+        kv_pool: one layer's pool ``[num_pages, 2, H_kv, page_size, D]`` (plane 0 K, plane 1 V).
+        page_table: ``[B, max_pages]`` int32 pool pages.
+        cu_seqlens_kv: ``[B + 1]`` int32 cumulative K/V lengths.
+        out: ``[B, S, H_q, D]``, written.
+    """
+    _check_cute_runtime_available()
+    batch_size, seq_len_q, num_heads_q, head_dim = q.shape
+    _, planes, num_heads_kv, page_size, kv_head_dim = kv_pool.shape
+    if planes != 2 or kv_head_dim != head_dim or num_heads_q % num_heads_kv:
+        raise ValueError(
+            f"q {tuple(q.shape)} does not fit the [pages, 2, H_kv, page_size, D] pool "
+            f"{tuple(kv_pool.shape)}"
+        )
+    if page_table.dim() != 2 or page_table.shape[0] != batch_size:
+        raise ValueError(f"page_table must be [{batch_size}, max_pages], got {page_table.shape}")
+    if cu_seqlens_kv.shape != (batch_size + 1,):
+        raise ValueError(f"cu_seqlens_kv must be [{batch_size + 1}], got {cu_seqlens_kv.shape}")
+    if q.dtype != kv_pool.dtype or out.dtype != q.dtype:
+        raise ValueError(f"q, kv and out dtypes differ: {q.dtype}, {kv_pool.dtype}, {out.dtype}")
+    if not q.is_contiguous() or not out.is_contiguous():
+        raise ValueError("q and out must be contiguous.")
+    device = q.device
+    gpu_arch_str = _get_gpu_arch(device)
+    dtype = _torch_to_cutlass_dtype(q.dtype)
+    num_head_groups = num_heads_q // num_heads_kv
+    q_5d = q.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, head_dim)
+    o_5d = out.view(batch_size, seq_len_q, num_heads_kv, num_head_groups, head_dim)
+    launch_args = (
+        _to_cute_tensor(q_5d, leading_dim=4),
+        from_dlpack(kv_pool[:, 0], assumed_align=32).mark_layout_dynamic(leading_dim=3),
+        from_dlpack(kv_pool[:, 1], assumed_align=32).mark_layout_dynamic(leading_dim=3),
+        _to_cute_tensor(o_5d, leading_dim=4),
+        (
+            batch_size,
+            seq_len_q,
+            seq_len_q,
+            page_table.shape[1] * page_size,  # bounds the K/V lengths
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            head_dim,
+        ),
+        None,  # cum_seqlen_q
+        _to_cute_tensor(cu_seqlens_kv, leading_dim=0),
+        None,  # lse
+        None,  # sink
+        cute_typing.Float32(sm_scale * math.log2(math.exp(1.0))),
+        cute_typing.Float32(sm_scale),
+        cute_typing.Float32(1.0),  # scale_output
+        None,  # skip_softmax_threshold_log2
+        None,  # window_size_left
+        None,  # window_size_right
+        None,  # skip_softmax_count
+        None,  # total_softmax_count
+        cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream),
+        False,  # use_pdl
+        from_dlpack(page_table, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+    )
+    key = _CacheKey(
+        qk_cutlass_dtype=dtype,
+        pv_cutlass_dtype=dtype,
+        out_cutlass_dtype=dtype,
+        qk_acc_dtype=cutlass.Float32,
+        pv_acc_dtype=cutlass.Float32,
+        head_dim=head_dim,
+        head_dim_v=head_dim,
+        mma_tiler_mn=(128, 128),
+        qk_sf_vec=0,
+        is_persistent=True,
+        mask_type=fmha_utils.MaskEnum.RESIDUAL_MASK,
+        with_lse=False,
+        with_sink=False,
+        with_scale_softmax_tensor=False,
+        with_scale_output_tensor=False,
+        with_scale_v_channels=False,
+        has_window=False,
+        has_skip_softmax=False,
+        use_tma_store=True,
+        enable_ex2_emulation=gpu_arch_str == "sm_100a",
+        enable_skip_correction=True,
+        page_size=page_size,
+        gpu_arch_str=gpu_arch_str,
+    )
     compiled = _get_or_compile(key, launch_args)
     compiled(*launch_args)
 
@@ -761,8 +876,10 @@ class CuTeDSLAttention(AttentionBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         is_causal: bool,
+        with_lse: bool,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor | None]:
+        """The output and, with ``with_lse``, the kernel's base-2 LSE ``[B, S, H]``."""
         batch_size, seq_len_q, num_heads, _ = q.shape
         value_head_dim = v.shape[-1]
         output_dtype = torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
@@ -774,12 +891,10 @@ class CuTeDSLAttention(AttentionBackend):
             dtype=output_dtype,
             device=q.device,
         )
-        lse = torch.empty(
-            batch_size,
-            seq_len_q,
-            num_heads,
-            dtype=torch.float32,
-            device=q.device,
+        lse = (
+            torch.empty(batch_size, seq_len_q, num_heads, dtype=torch.float32, device=q.device)
+            if with_lse
+            else None
         )
 
         # V is tensor-scaled by default. MXFP8/NVFP4 with v_block_size=1 use an (H, D) scale.
@@ -863,6 +978,7 @@ class CuTeDSLAttention(AttentionBackend):
         v: torch.Tensor,
         *,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.FULL,
+        kv: Optional[ForwardPlan] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -875,12 +991,25 @@ class CuTeDSLAttention(AttentionBackend):
             k: Key tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             attention_mask: Attention mask type (CAUSAL or FULL)
+            kv: A ``ForwardPlan`` from a ``PagedRolloutKVCache``. When given, ``k``/``v``
+                are the new tokens only: they are staged in the cache and each causal block
+                attends to the cache's fixed region, its window and the new tokens up to its
+                end. The first ``kv.num_tokens`` rows are real; rows past them are padding,
+                neither written nor attended, and their output rows are zero.
 
         Returns:
             Output tensor [batch_size, seq_len, num_heads, head_dim]
         """
-        output, _ = self.forward_with_lse(q, k, v, attention_mask=attention_mask, **kwargs)
-        return output
+        if kv is not None:
+            if not self.support_kv_cache():
+                raise NotImplementedError(
+                    "K/V cache attention does not combine with quantized, sparse or "
+                    "skip-softmax attention."
+                )
+            return forward_over_paged_rollout(self, self.layer_idx, q, k, v, kv, attention_mask)
+        q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
+        output, _ = self._fwd(q, k, v, is_causal, with_lse=False, **kwargs)
+        return output if output.dtype == origin_dtype else output.to(origin_dtype)
 
     def forward_with_lse(
         self,
@@ -895,19 +1024,54 @@ class CuTeDSLAttention(AttentionBackend):
 
         Returns:
             output: [batch_size, seq_len, num_heads, head_dim]
-            lse:    [batch_size, num_heads, seq_len] - log-sum-exp per query position,
-                    always in float32. Used for numerically stable combination of
+            lse:    [batch_size, num_heads, seq_len] - natural-log log-sum-exp per query
+                    position, always in float32. Used for numerically stable combination of
                     partial attention results in Attention2D parallelism.
         """
         q, k, v, is_causal, origin_dtype = self._prepare_inputs(q, k, v, attention_mask)
-        output, lse = self._fwd(q, k, v, is_causal, **kwargs)
+        output, lse = self._fwd(q, k, v, is_causal, with_lse=True, **kwargs)
         if output.dtype != origin_dtype:
             output = output.to(origin_dtype)
-        return output, lse.transpose(1, 2)
+        # The kernel's LSE is in base 2; the contract is the natural logarithm.
+        return output, (lse * math.log(2.0)).transpose(1, 2)
+
+    def forward_paged_kv(
+        self, q: torch.Tensor, kv_pool: torch.Tensor, tables: PagedKVTables
+    ) -> torch.Tensor:
+        """See ``AttentionBackend.forward_paged_kv``."""
+        if not self.support_kv_cache():
+            raise NotImplementedError(
+                "paged K/V do not combine with quantized, sparse or skip-softmax attention."
+            )
+        q = q.contiguous()
+        out = torch.empty_like(q)
+        cute_dsl_paged_fmha_fwd(
+            q, kv_pool, tables.page_table, tables.cu_seqlens_kv, out, sm_scale=self.scale
+        )
+        return out
 
     @classmethod
     def support_lse(cls) -> bool:
         return True
+
+    def support_kv_cache(self) -> bool:
+        return (
+            self.quant_attention_config is None
+            and self.sparse_params is None
+            and self.skip_softmax_threshold_scale is None
+        )
+
+    def support_kv_cache_page_size(
+        self, tokens_per_page: int, dtype: Optional[torch.dtype] = None
+    ) -> bool:
+        """The paged kernel takes pages of 8 to 128 tokens dividing its 128-key tile, of
+        bf16 or fp16, on SM100/SM103."""
+        return (
+            self.support_kv_cache()
+            and tokens_per_page in (8, 16, 32, 64, 128)
+            and dtype in (None, torch.bfloat16, torch.float16)
+            and get_sm_version() in (100, 103)
+        )
 
     @property
     def preferred_layout(self) -> AttentionTensorLayout:
