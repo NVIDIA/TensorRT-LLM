@@ -1915,11 +1915,60 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
             and not self.has_inflight_transfer(req)
         )
 
+    def supports_logical_context_cancellation(self, req: Optional[LlmRequest] = None) -> bool:
+        """Whether this request has independently retained context-transfer ownership.
+
+        Args:
+            req: The request to check, or None to check the runtime capability.
+
+        Returns:
+            True only for the qualified, immutable-ID context-first profile.
+        """
+        if getattr(self, "_context_first_ownership", False) is not True:
+            return False
+        if req is None:
+            return True
+        params = req.py_disaggregated_params
+        return (
+            req.is_context_only_request
+            and params is not None
+            and params.schedule_style == DisaggScheduleStyle.CONTEXT_FIRST
+            and type(params.disagg_request_id) is int
+            and params.disagg_request_id >= 0
+        )
+
+    def request_logical_context_cancellation(self, req: LlmRequest) -> bool:
+        """Close context admission without releasing an outstanding transfer.
+
+        Args:
+            req: The exact context request to cancel.
+
+        Returns:
+            Whether cancellation was accepted. This does not authorize resource
+            release; the normal send reaper must still observe safe retirement.
+        """
+        if not self.supports_logical_context_cancellation(req):
+            return False
+        rid = get_unique_rid(req)
+        session = self._send_sessions.get(rid)
+        if session is None:
+            # No publication exists, or the previous session already retired.
+            # Do not let a later executor pass create another send for this ID.
+            req.py_kv_send_session_retired = True
+            return True
+        if not getattr(session, "_enforce_physical_ownership", False):
+            return False
+        session.cancel()
+        # Keep both the native session and its request root until every physical
+        # operation settles. Repeated cancellation joins the same drain window.
+        return True
+
     def cancel_request(self, req: LlmRequest) -> bool:
         """Cancel the transfer for the given request.
 
-        Returns False if any task is mid-write (TRANSFERRING); caller must
-        retry next iteration. Returns True when safe to free KV memory.
+        Returns False while physical access or qualified context group retirement
+        is pending; caller must keep progressing and retry. Returns True when
+        this transceiver no longer holds the request's resources.
         """
         rid = get_unique_rid(req)
 
@@ -1939,6 +1988,12 @@ class KvCacheTransceiverV2(KvCacheTransceiver):
                         instance=self._instance_name,
                         dp_rank=self._dp_rank,
                     )
+
+        if self.supports_logical_context_cancellation(req):
+            # Local quiescence cannot remove a TP participant's retirement vote.
+            # Keep the session until the normal send reaper agrees across ranks.
+            accepted = self.request_logical_context_cancellation(req)
+            return accepted and rid not in self._send_sessions
 
         # Not yet started (generation-first wait queue).
         self._wait_reqs.pop(rid, None)

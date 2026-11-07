@@ -18,7 +18,7 @@ These tests validate the session state machine using the real
 TxSession/RxSession classes with lightweight stub sender/receiver objects.
 """
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -1258,17 +1258,13 @@ def _make_transfer_state_transceiver(session=None, rid: int = 42):
     from tensorrt_llm._torch.disaggregation.transceiver import KvCacheTransceiverV2
 
     sessions = {rid: session} if session is not None else {}
-    transceiver = SimpleNamespace(
-        _wait_reqs={},
-        _send_sessions=dict(sessions),
-        _send_reqs={rid: MagicMock()} if session is not None else {},
-        _recv_sessions={},
-        _recv_reqs={},
-    )
-    # Real teardown, so the predicate is checked against the actual bookkeeping.
-    transceiver._retire_send_session = MethodType(
-        KvCacheTransceiverV2._retire_send_session, transceiver
-    )
+    transceiver = object.__new__(KvCacheTransceiverV2)
+    transceiver._context_first_ownership = False
+    transceiver._wait_reqs = {}
+    transceiver._send_sessions = dict(sessions)
+    transceiver._send_reqs = {rid: MagicMock()} if session is not None else {}
+    transceiver._recv_sessions = {}
+    transceiver._recv_reqs = {}
     return transceiver
 
 

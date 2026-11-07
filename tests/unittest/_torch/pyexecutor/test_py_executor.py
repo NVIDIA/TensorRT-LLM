@@ -4387,6 +4387,7 @@ class TestOneModelMTPDraftTokenScheduling:
         ex.speculation_permanently_disabled = False
         ex.active_requests = active_requests
         ex.waiting_queue = []
+        ex.canceled_req_ids = []
 
         ex._fetch_and_activate_new_requests = Mock(return_value=[])
         ex._pad_attention_dp_dummy_request = Mock()
