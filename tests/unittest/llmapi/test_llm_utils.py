@@ -89,6 +89,8 @@ def test_cached_model_loader_reads_quant_config_after_hub_download(
             "quant_method": "mxfp8"
         }}))
     llm_args = TorchLlmArgs(model="example/model", gpus_per_node=1)
+    monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.local_mpi_rank",
+                        lambda: 0)
     download = MagicMock(return_value=tmp_path)
     monkeypatch.setattr("tensorrt_llm.llmapi.llm_utils.download_hf_model",
                         download)
