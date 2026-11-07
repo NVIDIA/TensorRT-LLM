@@ -468,6 +468,36 @@ def get_moe_layer_ids(text_config: PretrainedConfig) -> Tuple[List[int], List[in
     return dense, moe
 
 
+def _get_index_projection_quant_config(
+    model_config: "ModelConfig[PretrainedConfig]", layer_idx: Optional[int]
+) -> Optional[QuantConfig]:
+    """Return the quant config the checkpoint declares for the index projections.
+
+    ``index_q_proj`` and ``index_k_proj`` load into one fused ``index_qk_proj``
+    that ``apply_layerwise_quant_config`` cannot match by name, so their
+    per-layer entries are read here. Without such entries the projection
+    stays unquantized.
+    """
+    quant_config_dict = getattr(model_config, "quant_config_dict", None)
+    if quant_config_dict is None or layer_idx is None:
+        return None
+    prefix = f"model.layers.{layer_idx}.self_attn"
+    q_config = quant_config_dict.get(f"{prefix}.index_q_proj")
+    k_config = quant_config_dict.get(f"{prefix}.index_k_proj")
+    if q_config is None and k_config is None:
+        return None
+    if (
+        q_config is None
+        or k_config is None
+        or (q_config.quant_algo, q_config.group_size) != (k_config.quant_algo, k_config.group_size)
+    ):
+        raise ValueError(
+            f"{prefix}.index_q_proj and {prefix}.index_k_proj load into one fused "
+            f"projection and need the same quantization, got {q_config} and {k_config}."
+        )
+    return q_config
+
+
 # Outside ``language_model.*``: deferred multimodal branches.
 _VL_PREFIXES = ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
 
@@ -1245,7 +1275,9 @@ class MiniMaxM3Attention(Attention):
                     dtype=config.torch_dtype,
                     mapping=self.qkv_proj.mapping,
                     tensor_parallel_mode=TensorParallelMode.COLUMN,
-                    quant_config=None,
+                    # Quantized when the checkpoint declares per-layer entries
+                    # for the index projections; None keeps them unquantized.
+                    quant_config=_get_index_projection_quant_config(model_config, layer_idx),
                     weights_loading_config=WeightsLoadingConfig(
                         weight_mode=WeightMode.FUSED_GATE_UP_LINEAR
                     ),

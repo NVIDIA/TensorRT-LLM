@@ -828,3 +828,113 @@ def test_sparse_view_writes_native_hnd_storage_without_copy(monkeypatch):
     assert index_nhd.data_ptr() == index_hnd.data_ptr()
     torch.testing.assert_close(manager.get_index_k_buffer(0, "HND"), index_hnd)
     torch.testing.assert_close(index_hnd, before[:, 2, :1])
+
+
+# Bytes per token for local layers 0/1/2 (dense global 11, sparse global 27,
+# shared Eagle global 60), each with 4 KV heads x head_dim 128 (K + V), plus a
+# 128-wide index-K on the sparse layer: 256 B in BF16, 128 B in FP8.
+# BF16 K/V is 2048 B per layer and FP8 K/V is 1024 B. With NVFP4 only the
+# sparse layer is NVFP4 (512 B data + 64 B FP8 block scales); the dense and
+# Eagle layers keep FP8 K/V (1024 B), the Eagle layer on P32 physical pages.
+_M3_LAYER_BYTES_PER_TOKEN = {
+    (DataType.BF16, "bf16"): [2048, 2048 + 256, 2048],
+    (DataType.BF16, "fp8"): [2048, 2048 + 128, 2048],
+    (DataType.FP8, "bf16"): [1024, 1024 + 256, 1024],
+    (DataType.FP8, "fp8"): [1024, 1024 + 128, 1024],
+    (DataType.NVFP4, "bf16"): [1024, 576 + 256, 1024],
+    (DataType.NVFP4, "fp8"): [1024, 576 + 128, 1024],
+}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("main_dtype", [DataType.BF16, DataType.FP8, DataType.NVFP4])
+@pytest.mark.parametrize("index_dtype", ["bf16", "fp8"])
+def test_m3_budget_estimate_covers_actual_paged_buffers(
+    main_dtype: DataType, index_dtype: str
+) -> None:
+    manager = MiniMaxM3KVCacheManagerV2.__new__(MiniMaxM3KVCacheManagerV2)
+    manager.dtype = main_dtype
+    manager.kv_cache_type = CacheType.SELF
+    manager.kv_factor = 2
+    manager.num_kv_heads_per_layer = [4, 4, 4]
+    manager.head_dim_per_layer = [128, 128, 128]
+    manager.num_local_layers = 3
+    # Nonidentity PP mapping: local layers 0/1/2 are global layers 11/27/60.
+    manager.pp_layers = [11, 27, 60]
+    manager.layer_offsets = {11: 0, 27: 1, 60: 2}
+    manager.sparse_layer_ids = {27}
+    manager.disable_index_value_layer_ids = {27}
+    manager._shared_draft_layer_ids = [60]
+    manager.sparse_index_dim = 128
+    manager.indexer_kv_dtype = index_dtype
+    manager.tokens_per_block = 128
+    manager._ledger_tokens_per_block = 128
+    manager._generation_kv_capacity_headroom = 1
+    manager.max_num_tokens = 8192
+    manager.max_seq_len = 8192
+    manager.max_batch_size = 1
+    manager.max_beam_width = 1
+    manager.enable_partial_reuse = False
+    manager.max_draft_len = 0
+    manager.max_attention_window_vec = [None, None, None]
+    manager.max_cuda_graph_batch_size = None
+    manager.num_extra_kv_tokens = 0
+    manager.enable_swa_scratch_reuse = False
+    manager.enable_block_reuse = False
+    manager.block_reuse_policy = kv_cache_manager_v2.BlockReusePolicy.ALL_REUSABLE
+    manager.reuse_match_backoff = 0
+    manager.enable_stats = False
+    manager._has_cp_helix = False
+    manager.layer_specs = None
+
+    config = manager._build_base_config(
+        KvCacheConfig(
+            pool_ratio=[1.0],
+            enable_block_reuse=False,
+            max_util_for_resume=0.9,
+            enable_partial_reuse=False,
+        ),
+        tokens_per_block=manager.tokens_per_block,
+        cache_tiers=[kv_cache_manager_v2.GpuCacheTierConfig(quota=1 << 20)],
+    )
+    config = manager._build_cache_config(config)
+    config = manager._remove_zero_size_buffers(config)
+
+    # Independently total final allocator descriptors. Eagle P32 buffers use
+    # their physical-page override; all other buffers use the ledger P128.
+    actual_bytes_per_token = []
+    for layer in config.layers:
+        layer_bytes = 0
+        for buffer in layer.buffers:
+            tokens_per_page = buffer.tokens_per_block_override or manager.tokens_per_block
+            assert buffer.size % tokens_per_page == 0
+            layer_bytes += buffer.size // tokens_per_page
+        actual_bytes_per_token.append(layer_bytes)
+    expected_layer_bytes = _M3_LAYER_BYTES_PER_TOKEN[(main_dtype, index_dtype)]
+    assert actual_bytes_per_token == expected_layer_bytes
+    estimated_layer_bytes, _ = manager._get_runtime_cache_size_layer_components()
+    assert estimated_layer_bytes == expected_layer_bytes
+    assert [
+        sum(buffer.role == Role.INDEX_KEY for buffer in layer.buffers) for layer in config.layers
+    ] == [0, 1, 0]
+
+    expected_index_bytes = 128 * (2 if index_dtype == "bf16" else 1)
+    assert manager.get_layer_bytes_per_token(1, Role.INDEX_KEY) == expected_index_bytes
+    assert manager.get_layer_bytes_per_token(0, Role.INDEX_KEY) == 0
+    assert manager.get_layer_bytes_per_token(2, Role.INDEX_KEY) == 0
+    for role in (Role.KEY, Role.VALUE):
+        assert manager.get_layer_bytes_per_token(1, role) == (
+            KVCacheManagerV2.get_layer_bytes_per_token(manager, 1, role)
+        )
+    if main_dtype == DataType.NVFP4:
+        for role in (Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE):
+            assert manager.get_layer_bytes_per_token(1, role) == (
+                KVCacheManagerV2.get_layer_bytes_per_token(manager, 1, role)
+            )
+        scale_roles = {Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE}
+        assert all(buffer.role not in scale_roles for buffer in config.layers[0].buffers)
+        assert all(buffer.role not in scale_roles for buffer in config.layers[2].buffers)
+
+    configured_footprint = sum(actual_bytes_per_token) * manager.max_num_tokens
+    estimated_quota = manager._get_quota_from_max_tokens(manager.max_num_tokens)
+    assert estimated_quota >= configured_footprint
