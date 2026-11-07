@@ -6425,7 +6425,10 @@ def runLLMBuild(
         "TRTLLM_BUILD_SOURCE_COMMIT=${env.gitlabCommit}",
         "TRTLLM_VERSION_OVERRIDE=${version_override}",
     ]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --version-override \"\${TRTLLM_VERSION_OVERRIDE}\" --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
+        if (version_override) {
+            sh "cd tensorrt_llm/ && python3 scripts/bump_version.py \"\${TRTLLM_VERSION_OVERRIDE}\""
+        }
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' --extra-cmake-vars ENABLE_BOLT_COMPATIBLE=ON ${buildArgs}${platNameArg}")
     }
 
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
@@ -7777,7 +7780,7 @@ def launchTestJobs(pipeline, testFilter, globalVars)
         parallelJobs, parallelJobsFiltered, multiGpuJobs, testFilter)
 
     if (globalVars[RUN_MODE] == "nightly_release") {
-        parallelJobsFiltered = sanityCheckJobs
+        parallelJobsFiltered = docBuildJobs + sanityCheckJobs
     }
 
     echo "Check the passed GitLab bot testFilter parameters."
