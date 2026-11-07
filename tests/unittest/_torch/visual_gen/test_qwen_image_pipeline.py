@@ -13,9 +13,12 @@ combination) and the non-CFG path, on CPU.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
+from tensorrt_llm._torch.visual_gen.batching import BatchInfo
 from tensorrt_llm._torch.visual_gen.models.qwen_image import QwenImagePipeline
+from tensorrt_llm._torch.visual_gen.models.qwen_image.request_batch import QwenImageBatchLayout
 from tensorrt_llm._torch.visual_gen.profiler import VisualGenProfiler
 
 
@@ -35,15 +38,21 @@ class _RecordingTransformer(torch.nn.Module):
         encoder_hidden_states,
         img_shapes,
         return_dict,
+        request_batch=None,
     ):
         self.calls.append(
             {
                 "hidden_states_shape": tuple(hidden_states.shape),
                 "timestep": timestep.clone(),
                 "encoder_hidden_states": encoder_hidden_states.clone(),
-                "encoder_hidden_states_mask": encoder_hidden_states_mask.clone(),
+                "encoder_hidden_states_mask": (
+                    None
+                    if encoder_hidden_states_mask is None
+                    else encoder_hidden_states_mask.clone()
+                ),
                 "img_shapes": img_shapes,
                 "return_dict": return_dict,
+                "request_batch": request_batch,
             }
         )
         values = [-0.5, 0.25, 1.5, -1.0] if encoder_hidden_states[0, 0, 0] < 0 else [1, 2, 3, 4]
@@ -107,6 +116,7 @@ def _pipeline_with_test_doubles():
         dtype,
         device,
         generator,
+        batch_info=None,
     ):
         captured["prepared_latents"] = {
             "batch_size": batch_size,
@@ -198,6 +208,54 @@ def test_forward_defaults_missing_negative_prompt_to_empty_string_for_cfg():
         pipe.scheduler.step_calls[0]["noise_pred"],
         _expanded_noise([1, 2, 3, 4], batch_size=1, seq_len=6),
     )
+
+
+@pytest.mark.cpu_only
+def test_forward_routes_each_cfg_request_layout():
+    """Conditional and negative calls retain their own unpadded request layouts."""
+    pipe, _ = _pipeline_with_test_doubles()
+
+    def encode(prompts, device, max_sequence_length):
+        lengths = [len(prompt) for prompt in prompts]
+        width = max(lengths)
+        sign = -1.0 if prompts[0] == "bad!" else 1.0
+        embeds = torch.full((len(prompts), width, 3), sign, device=device)
+        mask = torch.arange(width, device=device)[None, :] < torch.tensor(lengths)[:, None]
+        return embeds, None if mask.all() else mask
+
+    pipe._encode_prompt = encode
+    pipe.forward(
+        prompt=["a", "bbb", "cc"],
+        negative_prompt="bad!",
+        height=32,
+        width=48,
+        num_inference_steps=2,
+        negative_prompt_cfg_scale=3.0,
+        seed=5,
+        max_sequence_length=16,
+        sigmas=[1.0, 0.5],
+        _batch_info=BatchInfo((11, 12), (1, 2), (5, 7)),
+    )
+
+    conditional = QwenImageBatchLayout((1, 2), (1, 3), (True, False))
+    negative = QwenImageBatchLayout((1, 2), (4, 4), (True, True))
+    assert [call["request_batch"] for call in pipe.transformer.calls] == [
+        conditional,
+        negative,
+        conditional,
+        negative,
+    ]
+    for positive_call, negative_call in zip(
+        pipe.transformer.calls[::2], pipe.transformer.calls[1::2]
+    ):
+        assert positive_call["encoder_hidden_states"].shape == (3, 3, 3)
+        assert negative_call["encoder_hidden_states"].shape == (3, 4, 3)
+        assert positive_call["encoder_hidden_states_mask"].tolist() == [
+            [True, False, False],
+            [True, True, True],
+            [True, True, False],
+        ]
+        assert negative_call["encoder_hidden_states_mask"] is None
 
 
 def test_forward_runs_negative_prompt_cfg_pipeline():

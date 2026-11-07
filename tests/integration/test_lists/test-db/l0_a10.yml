@@ -143,7 +143,6 @@ l0_a10:
   - unittest/visual_gen/test_executor_shared_tensor_ipc.py
   - unittest/visual_gen/test_iteration_stats.py
   - unittest/visual_gen/test_media_encoding.py
-  - unittest/_torch/visual_gen/test_qwen_image_infer.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline.py
   - unittest/_torch/visual_gen/test_qwen_image_pipeline_config.py
   - unittest/_torch/visual_gen/test_qwen_image_layered_pipeline_config.py

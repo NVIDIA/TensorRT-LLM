@@ -115,6 +115,8 @@ class BasePipeline(nn.Module):
     """
 
     supports_image_edit: bool = False
+    # Opt in only after implementing per-request noise and batched media output.
+    supports_dynamic_batching: bool = False
 
     @classmethod
     def resolve_variant(cls, config: "DiffusionPipelineConfig") -> Type["BasePipeline"]:
