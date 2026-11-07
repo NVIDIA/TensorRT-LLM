@@ -67,6 +67,7 @@ def test_prompt_logprobs_computation_and_streaming_cache(
     def make_response(context_logits):
         result = SimpleNamespace(
             context_logits=context_logits,
+            context_prompt_logprob_rows=None,
             is_final=False,
             get_result=lambda: SimpleNamespace(output_token_ids=[[13]]))
         return SimpleNamespace(client_id=1,
@@ -712,6 +713,7 @@ def test_prompt_logprobs_preserve_token_alignment_and_streaming_cache(
     response_result = SimpleNamespace(
         is_final=False,
         context_logits=torch.tensor([[0., 1., 2., 3.]] * 3),
+        context_prompt_logprob_rows=None,
         get_result=lambda: SimpleNamespace(output_token_ids=[[0]]),
     )
 
