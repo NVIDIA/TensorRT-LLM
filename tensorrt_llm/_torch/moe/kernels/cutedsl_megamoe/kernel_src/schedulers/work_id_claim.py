@@ -10,7 +10,12 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import Boolean, Int32, Int64, extract_mlir_values, new_from_mlir_values
 
-from ...helpers.ptx_helpers import mbarrier_arrive_expect_tx_on_peer, nanosleep, store_i32_to_peer_cluster_smem_async
+from ...helpers.ptx_helpers import (
+    mbarrier_arrive_expect_tx_on_peer,
+    mbarrier_wait_parity_acquire_cluster,
+    nanosleep,
+    store_i32_to_peer_cluster_smem_async,
+)
 
 
 class GridStrideWorkIdState:
@@ -418,7 +423,12 @@ def _claim_atomic_counter_work_id(
             mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
     work_id_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    # The leader's st.async and remote arrive release at cluster scope: acquire at
+    # cluster scope before reading the broadcast slot.
+    mbarrier_wait_parity_acquire_cluster(
+        cluster_pipeline.sync_object_full.get_barrier(work_id_state.consumer_state.index),
+        work_id_state.consumer_state.phase,
+    )
     linear_work_id = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
     cluster_pipeline.sync_object_empty.arrive(work_id_state.consumer_state.index, Int32(0))
@@ -482,7 +492,11 @@ def broadcast_atomic_counter_ready(
             )
     work_id_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    # Cluster-scope acquire: the slot was written by the leader CTA's st.async.
+    mbarrier_wait_parity_acquire_cluster(
+        cluster_pipeline.sync_object_full.get_barrier(work_id_state.consumer_state.index),
+        work_id_state.consumer_state.phase,
+    )
     ready_payload = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
     cluster_pipeline.sync_object_empty.arrive(
@@ -575,7 +589,11 @@ def broadcast_atomic_counter_ready_or_claim(
             )
     work_id_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(work_id_state.consumer_state)
+    # Cluster-scope acquire: the slot was written by the leader CTA's st.async.
+    mbarrier_wait_parity_acquire_cluster(
+        cluster_pipeline.sync_object_full.get_barrier(work_id_state.consumer_state.index),
+        work_id_state.consumer_state.phase,
+    )
     payload = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
     cluster_pipeline.sync_object_empty.arrive(
@@ -616,7 +634,11 @@ def initialize_fixed_group_mixed_cga_work_id_state(
                 mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
         atomic_counter_state.producer_state.advance()
 
-        cluster_pipeline.consumer_wait(atomic_counter_state.consumer_state)
+        # Cluster-scope acquire: the slot was written by the leader CTA's st.async.
+        mbarrier_wait_parity_acquire_cluster(
+            cluster_pipeline.sync_object_full.get_barrier(atomic_counter_state.consumer_state.index),
+            atomic_counter_state.consumer_state.phase,
+        )
         fallback_ordinal = broadcast_tensor[0]
         cute.arch.fence_acq_rel_cta()
         cluster_pipeline.sync_object_empty.arrive(atomic_counter_state.consumer_state.index, Int32(0))
@@ -708,7 +730,11 @@ def _claim_fixed_group_fallback_work_id(
             mbarrier_arrive_expect_tx_on_peer(full_barrier_pointer, Int32(4), lane_idx)
     atomic_counter_state.producer_state.advance()
 
-    cluster_pipeline.consumer_wait(atomic_counter_state.consumer_state)
+    # Cluster-scope acquire: the slot was written by the leader CTA's st.async.
+    mbarrier_wait_parity_acquire_cluster(
+        cluster_pipeline.sync_object_full.get_barrier(atomic_counter_state.consumer_state.index),
+        atomic_counter_state.consumer_state.phase,
+    )
     claimed_payload = broadcast_tensor[0]
     cute.arch.fence_acq_rel_cta()
     cluster_pipeline.sync_object_empty.arrive(atomic_counter_state.consumer_state.index, Int32(0))

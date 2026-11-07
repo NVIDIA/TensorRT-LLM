@@ -206,7 +206,11 @@ def mbarrier_arrive_expect_tx_on_peer(
     loc: Optional[ir.Location] = None,
     ip: Optional[ir.InsertionPoint] = None,
 ) -> None:
-    """Declare an expected peer-CTA SMEM transaction."""
+    """Declare an expected peer-CTA SMEM transaction.
+
+    The arrive releases at cluster scope: the waiting thread is in the peer CTA, so
+    the default ``.release.cta`` would not synchronize with its acquire.
+    """
     mbarrier_address = llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip)
     llvm.inline_asm(
         res=None,
@@ -218,9 +222,45 @@ def mbarrier_arrive_expect_tx_on_peer(
         asm_string="""{{
             .reg .u32 remote_mbar;
             mapa.shared::cluster.u32 remote_mbar, $0, $1;
-            mbarrier.arrive.expect_tx.shared::cluster.b64 _, [remote_mbar], $2;
+            mbarrier.arrive.expect_tx.release.cluster.shared::cluster.b64 _, [remote_mbar], $2;
         }}""",
         constraints="r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def mbarrier_wait_parity_acquire_cluster(
+    mbarrier_pointer,
+    phase: Int32,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """Wait for an mbarrier phase of this CTA with ``.acquire.cluster`` semantics.
+
+    A peer CTA's ``st.async`` complete-tx and its remote arrive release at cluster
+    scope; the default ``.acquire.cta`` wait does not synchronize with threads of
+    another CTA, so data they wrote into this CTA's SMEM would be read unordered.
+    """
+    mbarrier_address = llvm.ptrtoint(T.i32(), mbarrier_pointer.llvm_ptr, loc=loc, ip=ip)
+    llvm.inline_asm(
+        res=None,
+        operands_=[
+            mbarrier_address,
+            Int32(phase).ir_value(loc=loc, ip=ip),
+        ],
+        asm_string="""{{
+            .reg .pred phase_complete;
+            WAIT_LOOP:
+            mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 phase_complete, [$0], $1, 10000000;
+            @!phase_complete bra WAIT_LOOP;
+        }}""",
+        constraints="r,r",
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -800,6 +840,7 @@ __all__ = [
     "exit",
     "lds128_v4_b32",
     "mbarrier_arrive_expect_tx_on_peer",
+    "mbarrier_wait_parity_acquire_cluster",
     "movmatrix_b16",
     "nanosleep",
     "read_clock64",
