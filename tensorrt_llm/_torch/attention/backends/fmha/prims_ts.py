@@ -866,9 +866,7 @@ class PrimsTSFmha(PhasedFmha):
             q_bshd, q_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(q_bshd)
             k_bshd, k_dequant_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(k_bshd)
             softmax_scale = (
-                q_dequant_scale.float()
-                * k_dequant_scale.float()
-                * softmax_scale
+                q_dequant_scale.float() * k_dequant_scale.float() * softmax_scale
             ).reshape(1)
         output_scale = 1.0
         vc_params = None
