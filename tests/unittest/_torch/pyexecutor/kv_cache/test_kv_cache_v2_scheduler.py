@@ -26,6 +26,7 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.ced_replay import EncoderReplay, encoder_replay_tokens
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
     BlockReusePolicy,
+    DataType,
     KVCacheManagerV2,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
@@ -59,6 +60,7 @@ def make_dense_budget_manager() -> KVCacheManagerV2:
     manager.is_estimating_kv_cache = False
     manager.kv_compression_manages_history = False
     manager.sparse_metadata_batch = None
+    manager.mixed_precision_low_dtype = None
     manager.max_attention_window_vec = [None]
     manager._ledger_tokens_per_block = 32
     manager.num_extra_kv_tokens = 0
@@ -120,6 +122,7 @@ def test_dense_v2_admission_counts_shared_pool_lifecycles_and_guard() -> None:
         ("mapping", SimpleNamespace(cp_size=2)),
         ("kv_compression_manages_history", True),
         ("sparse_metadata_batch", object()),
+        ("mixed_precision_low_dtype", DataType.NVFP4),
         ("max_attention_window_vec", [64]),
     ],
 )
@@ -129,6 +132,52 @@ def test_dense_v2_admission_does_not_estimate_other_cost_models(field: str, valu
     assert not manager.kv_block_budget_applies()
     assert manager.get_request_kv_block_budget(Mock()) is None
     manager._get_storage_statistics.assert_not_called()
+
+
+def test_dense_v2_admission_does_not_charge_full_history_to_mixed_precision() -> None:
+    manager = make_dense_budget_manager()
+    manager.mixed_precision_low_dtype = DataType.NVFP4
+    manager.mixed_precision_high_layers = {0: 1}
+    manager.first_n, manager.last_n = 0, 31
+    # The appended high layer retains a window but is absent from this vector.
+    assert manager.max_attention_window_vec == [None]
+    manager.impl.get_life_cycle_pool_group_indices.return_value = [0, 1]
+    manager._get_storage_statistics.return_value = [
+        SimpleNamespace(total=32, available=32),
+        SimpleNamespace(total=2, available=2),
+    ]
+    executor = SimpleNamespace(
+        resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+        _validate_encoder_output_len=Mock(),
+    )
+    request = SimpleNamespace(orig_prompt_len=128, max_new_tokens=128, py_beam_width=1)
+    PyExecutor._validate_request_budget(executor, request)
+    manager._get_storage_statistics.assert_not_called()
+
+
+@pytest.mark.parametrize("first_chunk", [False, True])
+def test_dense_v2_resize_preserves_state_beyond_page_table_and_can_retry(first_chunk: bool) -> None:
+    manager = make_dense_budget_manager()
+    manager._has_cp_helix = False
+    manager.max_blocks_per_seq = 4
+    manager._connector_reservations_enabled = Mock(return_value=False)
+    manager._fill_fresh_kv_pages = Mock()
+    manager._log_window_crossing = Mock()
+    cache = Mock(capacity=32, history_length=32)
+    cache.resize.return_value = True
+    manager.kv_cache_map[1] = cache
+    request = SimpleNamespace(
+        py_request_id=1,
+        is_disagg_generation_init_state=False,
+        context_current_position=32,
+        is_first_context_chunk=first_chunk,
+    )
+    assert not manager.resize_context(request, 128)
+    cache.resize.assert_not_called()
+    assert (cache.capacity, cache.history_length) == (32, 32)
+    assert cache.suspend.call_count == int(first_chunk)
+    assert manager.resize_context(request, 32)
+    cache.resize.assert_called_once_with(64)
 
 
 def test_dense_v2_admission_requires_subclasses_to_opt_in() -> None:

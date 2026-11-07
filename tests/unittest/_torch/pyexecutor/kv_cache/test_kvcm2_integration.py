@@ -4050,8 +4050,14 @@ def _try_run_context(manager: KVCacheManagerV2, request: _ContextRequest) -> boo
     return True
 
 
-def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits() -> None:
-    """Reject a never-fit context before allocation and keep the pool usable."""
+@pytest.mark.parametrize("is_disagg", [False, True])
+def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits(
+    is_disagg: bool,
+) -> None:
+    """Check admission, guarded oversized resizing, and subsequent native allocation."""
+    from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+    from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManager, ResourceManagerType
+
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     torch.cuda.init()
@@ -4072,6 +4078,7 @@ def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits() ->
         max_num_tokens=max_seq_len,
         mapping=Mapping(),
         dtype=DataType.HALF,
+        is_disagg=is_disagg,
     )
     request = _ContextRequest(1, list(range(max_seq_len)), max_seq_len, "small-pool")
     try:
@@ -4079,14 +4086,38 @@ def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits() ->
         budget_request = SimpleNamespace(
             orig_prompt_len=max_seq_len, max_new_tokens=1, py_beam_width=1
         )
-        required, capacity = manager.get_request_kv_block_budget(budget_request)
-        assert required > capacity
-        assert request.py_request_id not in manager.kv_cache_map
+        executor = SimpleNamespace(
+            resource_manager=ResourceManager({ResourceManagerType.KV_CACHE_MANAGER: manager}),
+            _validate_encoder_output_len=lambda _request: None,
+        )
+        if is_disagg:
+            assert manager.get_request_kv_block_budget(budget_request) is None
+            PyExecutor._validate_request_budget(executor, budget_request)
+            capacity = (
+                manager.max_seq_len + manager.num_extra_kv_tokens
+            ) // manager.tokens_per_block
+        else:
+            required, capacity = manager.get_request_kv_block_budget(budget_request)
+            assert required > capacity
+            with pytest.raises(ValueError, match="exceeds its GPU-primary capacity"):
+                PyExecutor._validate_request_budget(executor, budget_request)
+
+        # Direct callers and configurations outside dense admission still get
+        # an allocation failure rather than a native page-index span exception.
+        assert manager.prepare_context(request)
+        cache = manager.kv_cache_map[request.py_request_id]
+        before = cache.capacity, cache.history_length
+        assert not manager.resize_context(request, max_seq_len)
+        assert (cache.capacity, cache.history_length) == before
+        assert not cache.is_active
+        assert manager.prepare_context(request)
+        assert manager.resize_context(request, 32)
+        assert cache.capacity == 32 + manager.num_extra_kv_tokens
+        manager.free_resources(request)
 
         request = _ContextRequest(2, list(range(32)), 32, "short")
         budget_request.orig_prompt_len = 32
-        required, capacity = manager.get_request_kv_block_budget(budget_request)
-        assert required <= capacity
+        PyExecutor._validate_request_budget(executor, budget_request)
         assert manager.prepare_context(request)
         assert manager.resize_context(request, 32)
         cache = manager.kv_cache_map[request.py_request_id]
@@ -4100,13 +4131,18 @@ def test_context_larger_than_kv_pool_fails_admission_and_short_request_fits() ->
             - 1
         )
         budget_request.orig_prompt_len = boundary
-        assert manager.get_request_kv_block_budget(budget_request) == (capacity, capacity)
+        if not is_disagg:
+            required, budget_capacity = manager.get_request_kv_block_budget(budget_request)
+            assert required == budget_capacity == capacity
+            assert required <= manager.max_blocks_per_seq
+        assert capacity <= manager.max_blocks_per_seq
         request = _ContextRequest(3, list(range(boundary)), boundary, "boundary")
         assert manager.prepare_context(request)
         assert manager.resize_context(request, boundary)
         budget_request.orig_prompt_len += 1
-        required, capacity = manager.get_request_kv_block_budget(budget_request)
-        assert required > capacity
+        if not is_disagg:
+            required, capacity = manager.get_request_kv_block_budget(budget_request)
+            assert required > capacity
     finally:
         manager.free_resources(request)
         manager.shutdown()
