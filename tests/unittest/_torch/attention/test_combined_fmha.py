@@ -15,6 +15,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from fmha_test_utils import FakeAttention, FakePhasedFmha
 
@@ -25,6 +26,8 @@ from tensorrt_llm._torch.attention.backends.interface import (
     AttentionInputType,
 )
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2, Role
+
+pytestmark = pytest.mark.cpu_only
 
 
 def test_combined_fmha_delegates_phases_and_prepares_max_workspace() -> None:

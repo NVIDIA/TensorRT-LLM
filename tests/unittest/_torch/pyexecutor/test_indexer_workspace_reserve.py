@@ -21,6 +21,8 @@ from tensorrt_llm._torch.attention.backends.sparse.params import (
 )
 from tensorrt_llm._torch.pyexecutor._util import get_indexer_mqa_logits_workspace_reserve
 
+pytestmark = pytest.mark.cpu_only
+
 
 def test_workspace_bytes_match_runtime_element_budget(monkeypatch):
     monkeypatch.setenv("TLLM_INDEXER_MQA_LOGITS_ELEM_BUDGET", "1024")

@@ -20,6 +20,7 @@ from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import (
 )
 
 
+@pytest.mark.cpu_only
 def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
     """Keep target and draft work on the caller stream before manager handoff."""
     event = mock.Mock()
@@ -78,6 +79,7 @@ def test_execute_eviction_round_uses_current_stream_and_hands_back_to_target():
         ("union_only_per_head", "eviction_mode='union'"),
     ],
 )
+@pytest.mark.cpu_only
 def test_speculative_admission_gates_raise(gate, match):
     from tensorrt_llm._torch.pyexecutor._util import validate_kv_cache_compression_compatibility
     from tensorrt_llm.llmapi.llm_args import DFlashDecodingConfig, MTPDecodingConfig
@@ -105,6 +107,7 @@ def test_speculative_admission_gates_raise(gate, match):
         )
 
 
+@pytest.mark.cpu_only
 def test_compressed_count_is_monotone_and_tracks_confirmed_length():
     manager = _make_triattention(budget=4, beta=4)
     target = manager.kv_cache_manager
@@ -169,6 +172,7 @@ def test_compressed_count_is_monotone_and_tracks_confirmed_length():
         assert call.kwargs == {}
 
 
+@pytest.mark.cpu_only
 def test_request_admission_does_not_grow_workspace():
     manager = _make_triattention(budget=128, beta=64)
     assert manager._selection_width_capacity == 256
@@ -217,6 +221,7 @@ def test_request_admission_does_not_grow_workspace():
     manager._build_score_runtime.assert_not_called()
 
 
+@pytest.mark.cpu_only
 def test_request_admission_accepts_unaligned_sequence_limit_without_growth():
     manager = _make_triattention(budget=128, beta=64)
     manager._selection_width_capacity = 256
@@ -261,6 +266,7 @@ def test_block_offset_snapshot_width_is_aligned_and_capped():
     assert host.shape[-1] == 8 and device_table.shape[-1] == 8
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("fail_second", [False, True])
 def test_serial_eviction_publishes_each_completed_request(fail_second):
     """A later failure cannot hide target/draft compaction already completed."""
@@ -308,6 +314,7 @@ def test_serial_eviction_publishes_each_completed_request(fail_second):
     assert draft_caches[1].resize.call_count == (0 if fail_second else 1)
 
 
+@pytest.mark.cpu_only
 def test_batch_workspace_reuses_allocator_and_reports_oom():
     """Cached allocations bypass driver queries; only allocation OOM is recovered."""
     from tensorrt_llm._torch.kv_cache_compression.triattention.triattention import logger
