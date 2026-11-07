@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -471,6 +471,16 @@ public:
         ar_fusion::allreduce_fusion_op(m_params);
     }
 
+    // Two-shot with a small grid, then right away (no host sync) two-shot with the larger grid of token_num tokens.
+    void run_twoshot_grid_growth(int token_num, int hidden_dim)
+    {
+        m_params.use_oneshot = false;
+        m_params.size = (m_world_size + 1) * hidden_dim;
+        ar_fusion::allreduce_fusion_op(m_params);
+        m_params.size = token_num * hidden_dim;
+        ar_fusion::allreduce_fusion_op(m_params);
+    }
+
     ~TestRunner()
     {
         TLLM_NCCL_CHECK(ncclCommDestroy(m_nccl_comm));
@@ -666,6 +676,44 @@ TEST(Kernel_AllReduceFusion, AllReduceFusionAccuracyDifferentDType)
         }
 #endif
     }
+#undef TEST_AR_FUSION
+}
+
+// A two-shot launch whose grid is larger than the previous one's must not pass its barrier on a stale flag left in
+// the slot of a CTA that was not launched before.
+TEST(Kernel_AllReduceFusion, AllReduceFusionTwoShotGridGrowth)
+{
+#define TEST_AR_FUSION(DType, FusionPattern)                                                                           \
+    {                                                                                                                  \
+        using Runner = TestRunner<DType, FusionPattern>;                                                               \
+        Runner runner(token_num, hidden_dim);                                                                          \
+        if (rank == 0)                                                                                                 \
+        {                                                                                                              \
+            printf("[Verify] pattern %-20s, two-shot token_num %d -> %d, hidden_dim %-4d ...", #FusionPattern,         \
+                world_size + 1, token_num, hidden_dim);                                                                \
+        }                                                                                                              \
+        for (int i = 0; i < iter; ++i)                                                                                 \
+        {                                                                                                              \
+            runner.reset_io();                                                                                         \
+            runner.run_once(&Runner::run_twoshot_grid_growth, token_num, hidden_dim);                                  \
+            runner.verify(token_num, hidden_dim);                                                                      \
+        }                                                                                                              \
+        if (rank == 0)                                                                                                 \
+        {                                                                                                              \
+            printf("\033[32mPass!\033[0m\n");                                                                          \
+        }                                                                                                              \
+    }
+
+    auto& comm = mpi::MpiComm::world();
+    auto world_size = comm.getSize();
+    auto rank = comm.getRank();
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
+    int iter = 20;
+    int hidden_dim = 7168;
+    int token_num = 16 * world_size;
+    TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kAllReduce);
+    TEST_AR_FUSION(half, ar_fusion::AllReduceFusionPattern::kARResidualRMSNorm);
 #undef TEST_AR_FUSION
 }
 
