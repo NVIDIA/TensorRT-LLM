@@ -2678,6 +2678,59 @@ class TestDeadlockDetection:
 
 
 class TestPEFT:
+    @pytest.mark.parametrize("retained_adapter", [None, 0, 1])
+    @pytest.mark.parametrize("pending_termination", [False, True])
+    def test_executor_defers_lora_while_cancelled_request_retains_adapter(
+        self, retained_adapter, pending_termination
+    ):
+        """Do not reuse hidden adapter capacity before normal cancellation cleanup."""
+        from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
+
+        mgr = make_kv_cache_manager()
+        peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
+        engine = object.__new__(PyExecutor)
+        engine.scheduler = make_scheduler(mgr, peft_cache_manager=peft)
+        engine.kv_cache_manager = mgr
+        engine._maybe_record_hang_diagnostic_phase = Mock()
+        engine._get_ctx_mla_kv_len_cap = lambda: None
+        engine.is_encoder_decoder = False
+        engine.enable_attention_dp = False
+        engine.enable_batch_waiting = False
+        engine.inflight_req_ids = set()
+        held = make_ctx_request(0, 100, is_first_context_chunk=False, lora_task_id=retained_adapter)
+        other_adapter = make_ctx_request(1, 100, lora_task_id=1)
+        no_adapter = make_ctx_request(2, 100)
+        active = (
+            [other_adapter, no_adapter]
+            if pending_termination
+            else [held, other_adapter, no_adapter]
+        )
+        engine.active_requests = active.copy()
+        engine._pending_response_terminations = [held] if pending_termination else []
+        engine.previous_batch = SimpleNamespace(
+            scheduled_requests=SimpleNamespace(context_requests=[held])
+        )
+        engine._cancelled_disagg_model_request_ids = lambda: set() if pending_termination else {0}
+
+        # Repeated passes cannot make the retained adapter evictable. Exercise
+        # the real scheduler and PEFT budget, not only its input list.
+        for _ in range(2):
+            batch, _, _ = engine._schedule()
+            expected = [2, 1] if retained_adapter is None else [2]
+            assert ids(batch.context_requests) == expected
+            assert engine.active_requests == active
+            assert engine._pending_response_terminations == ([held] if pending_termination else [])
+            mgr.free_resources.assert_not_called()
+
+        # The ordinary post-batch cleanup removes the cancelled owner. LoRA
+        # admission resumes even while its old cancellation ID is still known.
+        if pending_termination:
+            engine._pending_response_terminations.clear()
+        else:
+            engine.active_requests.remove(held)
+        batch, _, _ = engine._schedule()
+        assert ids(batch.context_requests) == [2, 1]
+
     def test_no_peft_manager(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, peft_cache_manager=None)
