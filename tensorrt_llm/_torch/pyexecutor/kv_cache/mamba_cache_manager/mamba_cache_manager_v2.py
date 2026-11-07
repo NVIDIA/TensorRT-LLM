@@ -1038,17 +1038,39 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
             result = layout_policy._build_cache_config(self, result)
         return self._with_draft_pool_ratio(result)
 
-    def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
-        """Give appended draft layers of their own lifecycle a pool share.
+    def _pool_ratio_group_name(
+        self, layer_id: LayerId, role: DataRole, key: tuple, is_draft: bool
+    ) -> str:
+        """Name of the layer group that ``(layer_id, role)`` represents in pool_ratio messages."""
+        if is_draft:
+            return "draft"
+        if key[0] == "ssm":
+            return "ssm"
+        if self._attention_cache_layout_policy is not None:
+            if role == Role.MLA_HP_TAIL:
+                return "mla_hp_tail"
+            if layer_id in getattr(self, "_fp8_mla_manager_layer_ids", ()):
+                return "fp8_mla"
+            if layer_id in getattr(self, "_cache_manager_layer_ids", ()):
+                return "fp4_mla"
+        window = key[0]
+        if window is None or window >= self.max_seq_len:
+            return "attention"
+        return f"attention(window={window})"
 
-        A configured ``pool_ratio`` lists the target's lifecycles; the draft
-        lifecycle's share is inserted for token parity (see
-        ``_insert_draft_pool_ratio``). A full-length ``pool_ratio`` is checked
-        against that share instead. Native lifecycles are registered in layer
-        and buffer order.
+    def _with_draft_pool_ratio(self, config: KVCacheManagerConfigPy) -> KVCacheManagerConfigPy:
+        """Resolve a configured ``pool_ratio`` to one share per native layer group.
+
+        Native layer groups are registered in layer and buffer order (Kimi K3
+        with a DSpark drafter: ssm, fp4_mla, fp8_mla, draft, mla_hp_tail). A
+        list one entry short of that names every group but the draft one, whose
+        share is inserted for token parity (see ``_insert_draft_pool_ratio``);
+        a full-length list is checked against that share instead. The resolved
+        split is logged with the group names and checked by
+        ``_check_pool_ratio_floors``.
         """
         ratio = config.initial_pool_ratio
-        if ratio is None or not self._appended_draft_layer_specs:
+        if ratio is None:
             return config
         keys: List[tuple] = []
         block_bytes: List[int] = []
@@ -1080,30 +1102,153 @@ class MambaHybridCacheManagerV2(KVCacheManagerV2, MambaHybridCacheManager):
                 (draft_keys if is_draft else target_keys).add(key)
         has_draft_group = len(draft_keys) == 1 and not draft_keys & target_keys
         draft_group = keys.index(next(iter(draft_keys))) if has_draft_group else None
+        names = [
+            self._pool_ratio_group_name(layer_id, role, key, group == draft_group)
+            for group, ((layer_id, role), key) in enumerate(zip(representatives, keys))
+        ]
         groups = ", ".join(
-            f"{group}: layer {layer_id} {role}" + (" (draft)" if group == draft_group else "")
-            for group, (layer_id, role) in enumerate(representatives)
+            f"{group}: {name} (layer {layer_id} {role})"
+            for group, (name, (layer_id, role)) in enumerate(zip(names, representatives))
         )
         full_history = [
             key[0] != "ssm" and (key[0] is None or key[0] >= self.max_seq_len) for key in keys
         ]
         self._pool_ratio_groups = representatives
-        if len(ratio) == len(keys):
+        draft_inserted = len(ratio) != len(keys)
+        if not draft_inserted:
             if draft_group is not None:
                 self._check_draft_pool_share(ratio, block_bytes, full_history, draft_group, groups)
-            return config
-        if draft_group is None or len(ratio) != len(keys) - 1:
-            raise ValueError(
-                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give one per target "
-                f"layer group ({len(keys) - 1}) or one per layer group ({len(keys)}). "
-                f"Layer groups in order: {groups}"
+        elif draft_group is None or len(ratio) != len(keys) - 1:
+            target_count = (
+                f"one per target layer group ({len(keys) - 1}) or "
+                if draft_group is not None
+                else ""
             )
-        return replace(
-            config,
-            initial_pool_ratio=_insert_draft_pool_ratio(
-                ratio, block_bytes, full_history, draft_group
-            ),
+            raise ValueError(
+                f"kv_cache_config.pool_ratio has {len(ratio)} entries; give {target_count}"
+                f"one per layer group ({len(keys)}). Layer groups in order: {groups}"
+            )
+        else:
+            config = replace(
+                config,
+                initial_pool_ratio=_insert_draft_pool_ratio(
+                    ratio, block_bytes, full_history, draft_group
+                ),
+            )
+        resolved = config.initial_pool_ratio
+        logger.info(
+            "kv_cache_config.pool_ratio by layer group: "
+            + ", ".join(
+                f"{group}: {name}={share:.4f}"
+                + (" (inserted)" if draft_inserted and group == draft_group else "")
+                for group, (name, share) in enumerate(zip(names, resolved))
+            )
         )
+        # Position of each layer group's entry in the configured list.
+        positions: List[Optional[int]] = list(range(len(keys)))
+        if draft_inserted:
+            positions = [
+                None if group == draft_group else group - int(group > draft_group)
+                for group in positions
+            ]
+        self._check_pool_ratio_floors(
+            resolved,
+            block_bytes,
+            keys,
+            full_history,
+            names,
+            positions,
+            draft_group,
+            config.cache_tiers[0].quota,
+            config.tokens_per_block,
+            groups,
+        )
+        return config
+
+    # A full-history group pinned at its floor caps every full-history group
+    # at that many blocks; another one holding this many times more is
+    # mis-sized rather than deliberately over-provisioned.
+    _POOL_RATIO_FLOOR_IMBALANCE = 4.0
+
+    @classmethod
+    def _check_pool_ratio_floors(
+        cls,
+        ratio: Sequence[float],
+        block_bytes: Sequence[int],
+        keys: Sequence[tuple],
+        full_history: Sequence[bool],
+        names: Sequence[str],
+        positions: Sequence[Optional[int]],
+        draft_group: Optional[int],
+        gpu_quota: int,
+        tokens_per_block: int,
+        groups: str,
+    ) -> None:
+        """Reject a pool_ratio that leaves a target attention group at its allocator floor.
+
+        The GPU allocator raises every attention group to a floor of blocks
+        (``StorageManager::computeSlotsFromConstraints``): a sliding window's
+        own span, and for a full-history group the largest such span, which is
+        one ``max_seq_len`` request when the manager holds near-full-length
+        windows (Kimi K3's FP8 and draft groups). A share below the floor is
+        silently clamped to it. Every full-history group holds the same
+        tokens, so one pinned at the floor while another full-history group
+        holds several times more blocks means the list is in the wrong order
+        (ValueError); any other attention group below its floor gets a warning.
+        """
+
+        def swa_floor(key: tuple) -> int:
+            window, num_sink_blocks = key[0], key[1]
+            return num_sink_blocks + (window + tokens_per_block - 2) // tokens_per_block + 1
+
+        attention = [key[0] != "ssm" for key in keys]
+        full_floor = max(
+            [1] + [swa_floor(key) for key, attn in zip(keys, attention) if attn and key[0]]
+        )
+        blocks = [share * gpu_quota / size for share, size in zip(ratio, block_bytes)]
+        floors = [
+            (full_floor if key[0] is None else swa_floor(key)) if attn else 0
+            for key, attn in zip(keys, attention)
+        ]
+
+        def describe(group: int) -> str:
+            position = positions[group]
+            where = f"pool_ratio[{position}]" if position is not None else "the inserted share"
+            return (
+                f"layer group {group} ({names[group]}, {where} = {ratio[group]:.4f}) gets "
+                f"{blocks[group]:.0f} blocks, at or below its floor of {floors[group]}"
+            )
+
+        targets = [
+            group
+            for group in range(len(keys))
+            if full_history[group] and attention[group] and group != draft_group
+        ]
+        for group in targets:
+            if blocks[group] > floors[group]:
+                continue
+            effective = max(blocks[group], floors[group])
+            richer = [
+                other
+                for other in targets
+                if blocks[other] >= cls._POOL_RATIO_FLOOR_IMBALANCE * effective
+            ]
+            if richer:
+                raise ValueError(
+                    f"kv_cache_config.pool_ratio: {describe(group)}, while "
+                    + ", ".join(
+                        f"layer group {other} ({names[other]}) gets {blocks[other]:.0f}"
+                        for other in richer
+                    )
+                    + ". Full-history groups hold the same tokens, so the list is likely "
+                    f"in another order than the layer groups. Layer groups in order: {groups}"
+                )
+        for group in range(len(keys)):
+            if attention[group] and group != draft_group and blocks[group] <= floors[group]:
+                logger.warning(
+                    f"kv_cache_config.pool_ratio: {describe(group)}; the allocator raises it to "
+                    f"the floor. Layer groups in order: {groups}"
+                )
 
     @staticmethod
     def _check_draft_pool_share(

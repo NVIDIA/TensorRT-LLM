@@ -301,9 +301,121 @@ def test_draft_pool_ratio_full_list_is_checked_against_token_parity():
 def test_draft_pool_ratio_arity_error_names_the_layer_group_order():
     manager, config = _draft_pool_ratio_manager_and_config([0.25] * 4)
     with pytest.raises(
-        ValueError, match=r"Layer groups in order: 0: layer 0 .*2: layer 2 .*\(draft\)"
+        ValueError,
+        match=r"Layer groups in order: 0: attention \(layer 0 .*1: ssm .*2: draft \(layer 2 ",
     ):
         manager._with_draft_pool_ratio(config)
+
+
+# Kimi K3 with a DSpark drafter, one representative layer per layer group in
+# registration order. Bytes per 128-token block: 22 FP4 MLA layers, 2 FP8 MLA
+# layers, 1 FP8 draft layer, 22 HP rings of 16 + 3 BF16 tokens.
+_K3_MAX_SEQ_LEN = 996672
+_K3_FP4_BLOCK_BYTES = 22 * 128 * 360
+_K3_FP8_BLOCK_BYTES = 2 * 128 * 576
+_K3_GPU_QUOTA = 96 << 30
+# The PR order [ssm, fp4_mla, fp8_mla, mla_hp_tail] (draft inserted) and the
+# same shares in hot pool-group order [fp8_mla, mla_hp_tail, fp4_mla, ssm].
+_K3_LAYER_GROUP_ORDER = [0.14, 0.635, 0.205, 0.02]
+_K3_POOL_GROUP_ORDER = [0.205, 0.02, 0.635, 0.14]
+
+
+def _k3_pool_ratio_manager_and_config(pool_ratio):
+    manager = object.__new__(MambaHybridCacheManagerV2)
+    manager._appended_draft_layer_specs = {3: None}
+    manager.max_seq_len = _K3_MAX_SEQ_LEN
+    manager._pool_ratio_groups = []
+    manager._attention_cache_layout_policy = Fp4MlaV2CacheLayoutPolicy
+    manager._cache_manager_layer_ids = [LayerId(1)]
+    manager._fp8_mla_manager_layer_ids = [LayerId(2)]
+    config = KVCacheManagerConfig(
+        tokens_per_block=128,
+        cache_tiers=[GpuCacheTierConfig(quota=_K3_GPU_QUOTA)],
+        layers=[
+            SsmLayerConfig(layer_id=LayerId(0), buffers=[BufferConfig(role="ssm", size=64 << 20)]),
+            AttentionLayerConfig(
+                layer_id=LayerId(1), buffers=[BufferConfig(role="key", size=_K3_FP4_BLOCK_BYTES)]
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(2),
+                buffers=[BufferConfig(role="key", size=_K3_FP8_BLOCK_BYTES)],
+                sliding_window_size=_K3_MAX_SEQ_LEN + 2,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(3),
+                buffers=[BufferConfig(role="key", size=128 * 576)],
+                sliding_window_size=_K3_MAX_SEQ_LEN + 4,
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(4),
+                buffers=[BufferConfig(role=Role.MLA_HP_TAIL, size=22 * 19 * 576 * 2)],
+                sliding_window_size=19,
+            ),
+        ],
+        initial_pool_ratio=pool_ratio,
+        commit_min_snapshot=True,
+    )
+    return manager, config
+
+
+def _capture_log(monkeypatch, level):
+    from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
+        mamba_cache_manager_v2 as module,
+    )
+
+    messages = []
+    monkeypatch.setattr(module.logger, level, messages.append)
+    return messages
+
+
+def test_k3_pool_ratio_in_layer_group_order_logs_the_resolved_split(monkeypatch):
+    infos = _capture_log(monkeypatch, "info")
+    warnings = _capture_log(monkeypatch, "warning")
+    manager, config = _k3_pool_ratio_manager_and_config(_K3_LAYER_GROUP_ORDER)
+
+    resolved = manager._with_draft_pool_ratio(config).initial_pool_ratio
+
+    assert len(resolved) == 5 and sum(resolved) == pytest.approx(1.0)
+    assert [resolved[i] / (1 - resolved[3]) for i in (0, 1, 2, 4)] == pytest.approx(
+        _K3_LAYER_GROUP_ORDER
+    )
+    assert warnings == []
+    (line,) = [m for m in infos if "pool_ratio by layer group" in m]
+    assert "0: ssm=" in line and "1: fp4_mla=" in line and "2: fp8_mla=" in line
+    assert "3: draft=" in line and "(inserted)" in line and "4: mla_hp_tail=" in line
+
+
+def test_k3_pool_ratio_in_pool_group_order_is_rejected():
+    manager, config = _k3_pool_ratio_manager_and_config(_K3_POOL_GROUP_ORDER)
+
+    with pytest.raises(
+        ValueError,
+        match=r"layer group 1 \(fp4_mla, pool_ratio\[1\] = .*while layer group 2 \(fp8_mla\)",
+    ):
+        manager._with_draft_pool_ratio(config)
+
+
+def test_pool_ratio_group_at_floor_without_a_richer_group_warns(monkeypatch):
+    warnings = _capture_log(monkeypatch, "warning")
+    # Two full-history groups (the second windowed past max_seq_len) share a
+    # floor of 10 blocks; the first gets 8, the second 16: a small quota, not
+    # a misordered list.
+    MambaHybridCacheManagerV2._check_pool_ratio_floors(
+        ratio=[0.5, 0.5],
+        block_bytes=[100, 50],
+        keys=[(None, 0, None), (1100, 0, None)],
+        full_history=[True, True],
+        names=["attention", "attention"],
+        positions=[0, 1],
+        draft_group=None,
+        gpu_quota=1600,
+        tokens_per_block=128,
+        groups="0: attention, 1: attention",
+    )
+
+    (warning,) = warnings
+    assert "layer group 0 (attention, pool_ratio[0] = 0.5000) gets 8 blocks" in warning
+    assert "floor of 10" in warning
 
 
 def test_base_manager_hooks_read_appended_draft_specs():
