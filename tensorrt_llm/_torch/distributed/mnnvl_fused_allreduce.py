@@ -314,7 +314,11 @@ class MnnvlAllReduceNorm:
         if rows < TWO_SHOT_ROWS:
             return True
         tpc = _tokens_per_cta(rows, _ctas_per_token(rows, self.hidden, self._sms), self._sms)
-        return tpc == 1 or 1024 + tpc * self.hidden * 2 <= self._smem_bytes
+        # kernel_mt: FP32 warp sums, eight Int32 flags, and BF16 residuals.
+        # Supported hidden sizes keep all three allocations 16-byte aligned.
+        warp_sums_bytes = tpc * (self.hidden // (8 * 32)) * 4
+        smem_bytes = warp_sums_bytes + 8 * 4 + tpc * self.hidden * 2
+        return tpc == 1 or smem_bytes <= self._smem_bytes
 
     @staticmethod
     def moe_fold_supported(
