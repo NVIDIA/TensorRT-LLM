@@ -10,6 +10,7 @@ from tensorrt_llm._torch.moe.custom_ops import cute_dsl_megamoe_custom_op as sha
 from tensorrt_llm._torch.moe.custom_ops.cute_dsl_megamoe_custom_op import (
     megamoe_activation_sf_bytes_per_row,
 )
+from tensorrt_llm._torch.moe.expert_statistic import ExpertStatistic
 from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
 from tensorrt_llm._torch.moe.fused_moe.create_moe import create_moe
 from tensorrt_llm._torch.moe.fused_moe.impl_contract import MoERunContext
@@ -445,6 +446,7 @@ class RubinFusedCommScheduler(FusedCommMoEScheduler):
             and moe.layer_load_balancer is None
             and routing_aux is None
             and get_active_route_capture() is None
+            and not ExpertStatistic.should_record()
             and get_calibrator().mode is Mode.NONE
             and not moe._enable_perfect_router_expert_ids
         ):

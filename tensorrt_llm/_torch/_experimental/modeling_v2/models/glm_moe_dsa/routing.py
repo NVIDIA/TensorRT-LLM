@@ -11,9 +11,10 @@ raises that error.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
-from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
+from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig, PrefillCudaGraphBackend
 from tensorrt_llm.quantization.mode import QuantAlgo
 from tensorrt_llm.quantization.modelopt_config import (
     canonicalize_quant_algo,
@@ -185,6 +186,23 @@ def route(
         and kv_cache_quant_algo == QuantAlgo.NVFP4
         and model_config.moe_backend == "MEGAMOE_CUTEDSL"
     ):
+        if (
+            llm_args.moe_config.load_balancer is not None
+            or model_config.moe_load_balancer is not None
+        ):
+            raise NoTarget(
+                "GLM high-throughput requires fixed expert placement; "
+                "moe_config.load_balancer (EPLB) is not supported"
+            )
+        if os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1":
+            raise NoTarget(
+                "MEGAMOE_TACTIC_AUTOTUNE=1 is not supported by the "
+                "GLM high-throughput MegaMoE kernels"
+            )
+        if llm_args.prefill_cuda_graph_backend == PrefillCudaGraphBackend.PIECEWISE:
+            raise NoTarget(
+                "GLM high-throughput does not support prefill_cuda_graph_backend='piecewise'"
+            )
         # fmt: off
         # isort: off
         from .glm_5_2_nvfp4__sm_107__high_throughput.modeling import ModelingV2Glm52Nvfp4Sm107HighThroughput

@@ -16,7 +16,7 @@ _SPLITS = {
 _BALANCED_SHAPES = {(rows, 6) for rows in range(54, 108, 6)} | {(56, 8)}
 _ENVELOPE = 1048576
 _WORKSPACE_ELEMENTS = (2048 + 160 * 16384 * 8) // 4
-_workspaces: dict[tuple[int, int], torch.Tensor] = {}
+_workspaces: dict[int, torch.Tensor] = {}
 _launchers: dict[tuple[int, int, int, int], tuple] = {}
 
 
@@ -59,9 +59,12 @@ def supports(
 
 
 def workspace(scores: torch.Tensor) -> torch.Tensor:
-    key = (scores.get_device(), torch.cuda.current_stream(scores.device).cuda_stream)
+    """Keep the eager warmup slab alive across capture streams and graph pools."""
+    key = scores.get_device()
     buffer = _workspaces.get(key)
     if buffer is None:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Warm Rubin GVR workspace before CUDA graph capture")
         buffer = torch.zeros(_WORKSPACE_ELEMENTS, dtype=torch.int32, device=scores.device)
         _workspaces[key] = buffer
     return buffer

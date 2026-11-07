@@ -17,6 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
+from tensorrt_llm._torch.flashinfer_utils import get_env_enable_pdl
+
 FUSED_PROLOGUE_ENABLED = (
     os.environ.get(
         "TRTLLM_GLM_RUBIN_HIGH_THROUGHPUT_INDEXER_FUSED_PROLOGUE",
@@ -24,7 +26,7 @@ FUSED_PROLOGUE_ENABLED = (
     ).strip()
     != "0"
 )
-_PDL_ENABLED = os.environ.get("TRTLLM_ENABLE_PDL", "0").strip() == "1"
+_PDL_ENABLED = get_env_enable_pdl()
 
 
 @triton.jit
@@ -139,45 +141,22 @@ def _dsa_indexer_prologue_fused_kernel(
     UE8M0: tl.constexpr,
     WRITE_CACHE: tl.constexpr,
     USE_PDL: tl.constexpr,
-    LAUNCH_DEPENDENTS: tl.constexpr,
-    PREWAIT: tl.constexpr,
     WRITE_Q: tl.constexpr,
 ):
     tok = tl.program_id(0)
     hblk = tl.program_id(1)
     HALF: tl.constexpr = ROPE_DIM // 2
-    if PREWAIT:
-        # Positions, cos/sin, the K LayerNorm and the slot mappings: written before the
-        # kernels this one depends on run.
-        tok64 = tok.to(tl.int64)
-        d = tl.arange(0, D)
-        is_rope, partner, cs_col, neg = _rope_terms(d, ROPE_DIM, INTERLEAVE)
-        k_prog = hblk == 0
-        pos = tl.load(pos_ptr + tok).to(tl.int64)
-        cs_row = cos_sin_ptr + pos * cos_sin_stride
-        cos_v = tl.load(cs_row + cs_col, mask=is_rope, other=1.0)
-        sin_v = tl.load(cs_row + HALF + cs_col, mask=is_rope, other=0.0)
-        lw = tl.load(ln_w_ptr + d, mask=k_prog, other=0.0).to(tl.float32)
-        lb = tl.load(ln_b_ptr + d, mask=k_prog, other=0.0).to(tl.float32)
-        lwp = tl.load(ln_w_ptr + partner, mask=k_prog, other=0.0).to(tl.float32)
-        lbp = tl.load(ln_b_ptr + partner, mask=k_prog, other=0.0).to(tl.float32)
-        if WRITE_CACHE:
-            slot = tl.load(slot_fp8_ptr + tok, mask=k_prog & (tok < n_write), other=-1)
-            slot_s = tl.load(slot_scale_ptr + tok, mask=k_prog & (tok < n_write), other=-1)
     if USE_PDL:
         tl.extra.cuda.gdc_wait()
-        if LAUNCH_DEPENDENTS:
-            tl.extra.cuda.gdc_launch_dependents()
 
-    if not PREWAIT:
-        tok64 = tok.to(tl.int64)
-        d = tl.arange(0, D)
-        is_rope, partner, cs_col, neg = _rope_terms(d, ROPE_DIM, INTERLEAVE)
+    tok64 = tok.to(tl.int64)
+    d = tl.arange(0, D)
+    is_rope, partner, cs_col, neg = _rope_terms(d, ROPE_DIM, INTERLEAVE)
 
-        pos = tl.load(pos_ptr + tok).to(tl.int64)
-        cs_row = cos_sin_ptr + pos * cos_sin_stride
-        cos_v = tl.load(cs_row + cs_col, mask=is_rope, other=1.0)
-        sin_v = tl.load(cs_row + HALF + cs_col, mask=is_rope, other=0.0)
+    pos = tl.load(pos_ptr + tok).to(tl.int64)
+    cs_row = cos_sin_ptr + pos * cos_sin_stride
+    cos_v = tl.load(cs_row + cs_col, mask=is_rope, other=1.0)
+    sin_v = tl.load(cs_row + HALF + cs_col, mask=is_rope, other=0.0)
 
     if WRITE_Q:
         # ---------------- Q: HEADS_PER_PROG heads of this token ----------------
@@ -185,12 +164,6 @@ def _dsa_indexer_prologue_fused_kernel(
         q_row = q_ptr + tok64 * q_stride_tok + h[:, None].to(tl.int64) * q_stride_head
         qx = tl.load(q_row + d[None, :]).to(tl.float32)
         qp = tl.load(q_row + partner[None, :]).to(tl.float32)
-        if PREWAIT:
-            # Every load from the kernels this one waits for, before the first store.
-            w = tl.load(w_ptr + tok64 * w_stride + h).to(tl.float32)
-            k_row = k_ptr + tok64 * k_stride
-            kx = tl.load(k_row + d, mask=k_prog, other=0.0).to(tl.bfloat16).to(tl.float32)
-            kxp = tl.load(k_row + partner, mask=k_prog, other=0.0).to(tl.bfloat16).to(tl.float32)
         q_rot = _apply_rope(qx, qp, cos_v[None, :], sin_v[None, :], neg[None, :])
         qv = tl.where(is_rope[None, :], q_rot, qx).to(tl.bfloat16).to(tl.float32)
         q_amax = tl.max(tl.abs(qv), axis=1)
@@ -202,30 +175,22 @@ def _dsa_indexer_prologue_fused_kernel(
         tl.store(q_scale_ptr + tok64 * H + h, q_scale)
 
         # weights * q_scale * (softmax_scale * n_heads^-0.5), same op order as _scale().
-        if not PREWAIT:
-            w = tl.load(w_ptr + tok64 * w_stride + h).to(tl.float32)
+        w = tl.load(w_ptr + tok64 * w_stride + h).to(tl.float32)
         tl.store(w_out_ptr + tok64 * H + h, (w * q_scale) * weight_scale)
-    elif PREWAIT:
-        # K only: the K row, right after the wait.
-        k_row = k_ptr + tok64 * k_stride
-        kx = tl.load(k_row + d, mask=k_prog, other=0.0).to(tl.bfloat16).to(tl.float32)
-        kxp = tl.load(k_row + partner, mask=k_prog, other=0.0).to(tl.bfloat16).to(tl.float32)
 
     # ---------------- K: once per token ----------------
     if hblk == 0:
-        if not PREWAIT:
-            k_row = k_ptr + tok64 * k_stride
-            kx = tl.load(k_row + d).to(tl.bfloat16).to(tl.float32)
-            kxp = tl.load(k_row + partner).to(tl.bfloat16).to(tl.float32)
+        k_row = k_ptr + tok64 * k_stride
+        kx = tl.load(k_row + d).to(tl.bfloat16).to(tl.float32)
+        kxp = tl.load(k_row + partner).to(tl.bfloat16).to(tl.float32)
         mean = tl.sum(kx, axis=0) / D
         kc = kx - mean
         var = tl.sum(kc * kc, axis=0) / D
         rstd = tl.math.rsqrt(var + eps)
-        if not PREWAIT:
-            lw = tl.load(ln_w_ptr + d).to(tl.float32)
-            lb = tl.load(ln_b_ptr + d).to(tl.float32)
-            lwp = tl.load(ln_w_ptr + partner).to(tl.float32)
-            lbp = tl.load(ln_b_ptr + partner).to(tl.float32)
+        lw = tl.load(ln_w_ptr + d).to(tl.float32)
+        lb = tl.load(ln_b_ptr + d).to(tl.float32)
+        lwp = tl.load(ln_w_ptr + partner).to(tl.float32)
+        lbp = tl.load(ln_b_ptr + partner).to(tl.float32)
         kn = (kc * rstd * lw + lb).to(tl.bfloat16).to(tl.float32)
         knp = ((kxp - mean) * rstd * lwp + lbp).to(tl.bfloat16).to(tl.float32)
         k_rot = _apply_rope(kn, knp, cos_v, sin_v, neg)
@@ -240,9 +205,8 @@ def _dsa_indexer_prologue_fused_kernel(
 
         if WRITE_CACHE:
             if tok < n_write:
-                if not PREWAIT:
-                    slot = tl.load(slot_fp8_ptr + tok)
-                    slot_s = tl.load(slot_scale_ptr + tok)
+                slot = tl.load(slot_fp8_ptr + tok)
+                slot_s = tl.load(slot_scale_ptr + tok)
                 if (slot >= 0) & (slot_s >= 0):
                     # 4-byte chunks, each chunk base unravelled (as the scatter kernel).
                     chunk = slot + (d // 4) * 4
@@ -283,8 +247,6 @@ def dsa_indexer_prologue_fused(
     slot_mapping_fp8: Optional[torch.Tensor] = None,
     slot_mapping_scale: Optional[torch.Tensor] = None,
     num_cache_tokens: int = 0,
-    launch_dependents: bool = False,
-    prewait: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """One-launch indexer prologue.
 
@@ -297,13 +259,6 @@ def dsa_indexer_prologue_fused(
         k_cache / slot_mapping_*: when given, the first ``num_cache_tokens`` K rows
             are also written into the indexer K cache (same layout and slot rule
             as ``indexer_k_cache_scatter_op``).
-        launch_dependents: with PDL, let the dependent kernel launch right after
-            this kernel's griddepcontrol.wait. Only for a dependent that reads
-            this kernel's outputs after its own wait.
-        prewait: with PDL, load the positions, the cos/sin rows, the LayerNorm
-            weight and bias and the slot mappings before this kernel's
-            griddepcontrol.wait. Only when the positions and slot mappings were
-            written before the kernels this one depends on started.
 
     Returns (q_fp8 [N, H, D], k_fp8 [N, D], k_scale [N, 1], weights [N, H] fp32,
     q_scale [N, H, 1]) -- the ``pre_indexer_proj`` FP8 contract.
@@ -374,8 +329,6 @@ def dsa_indexer_prologue_fused(
         UE8M0=bool(use_ue8m0),
         WRITE_CACHE=write_cache,
         USE_PDL=_PDL_ENABLED,
-        LAUNCH_DEPENDENTS=_PDL_ENABLED and launch_dependents,
-        PREWAIT=_PDL_ENABLED and prewait,
         WRITE_Q=True,
         num_warps=4,
         launch_pdl=_PDL_ENABLED,
