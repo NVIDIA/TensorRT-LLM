@@ -20,13 +20,14 @@ import importlib
 import itertools
 import logging
 import os
+import socket
 import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 import torch
@@ -74,6 +75,7 @@ from tensorrt_llm._torch.moe.fused_moe.cutedsl import (
     TrtllmCutedslDenseGemmNvfp4Impl,
     TrtllmCutedslGroupedGemmBf16Impl,
     TrtllmCutedslGroupedGemmNvfp4Impl,
+    TrtllmCutedslGroupedGemmNvfp4PlusImpl,
 )
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12 import CuteDslFc12FusedMoENvfp4Runner
 from tensorrt_llm._torch.moe.fused_moe.cutedsl.runners import CuteDslFusedMoENvfp4Runner
@@ -124,6 +126,7 @@ from tensorrt_llm._torch.moe.fused_moe.mega_moe import (
     MegaMoEDeepGemm,
     TrtllmCutedslMegaMoeNvfp4Impl,
 )
+from tensorrt_llm._torch.moe.fused_moe.mega_moe import mega_moe_deepgemm as mega_moe_deepgemm_module
 from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
     IMPL_PRIORITY,
     _reject_unsupported_activation,
@@ -442,6 +445,7 @@ def test_import_deep_gemm_rejects_pre_situ_mega_moe_api(monkeypatch):
 
     deep_gemm = SimpleNamespace(
         fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_block_m_for_mega_moe=lambda *args: 16,
         get_symm_buffer_for_mega_moe=lambda: None,
         transform_sf_into_required_layout=lambda: None,
         transform_weights_for_mega_moe=lambda: None,
@@ -469,6 +473,7 @@ def test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout(monkeypatch):
 
     deep_gemm = SimpleNamespace(
         fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_block_m_for_mega_moe=lambda *args: 16,
         get_symm_buffer_for_mega_moe=lambda: None,
         transform_sf_into_required_layout=lambda: None,
         transform_weights_for_mega_moe=lambda: None,
@@ -483,6 +488,34 @@ def test_import_deep_gemm_rejects_mega_moe_without_barrier_timeout(monkeypatch):
         quantization_module._import_deep_gemm()
 
     deep_gemm.set_barrier_timeout_seconds = lambda seconds: None
+    assert quantization_module._import_deep_gemm() is deep_gemm
+
+
+def test_import_deep_gemm_rejects_mega_moe_without_block_m_heuristic(monkeypatch):
+    """MegaMoE primes its token tiles through DeepGEMM's block-M heuristic."""
+    import tensorrt_llm
+    import tensorrt_llm._torch.moe.fused_moe.quantization as quantization_module
+
+    def fp8_fp4_mega_moe(*, situ_beta=None, situ_linear_beta=None):
+        pass
+
+    def per_token_cast_to_fp8(*, use_packed_ue8m0=False):
+        pass
+
+    deep_gemm = SimpleNamespace(
+        fp8_fp4_mega_moe=fp8_fp4_mega_moe,
+        get_symm_buffer_for_mega_moe=lambda: None,
+        transform_sf_into_required_layout=lambda: None,
+        transform_weights_for_mega_moe=lambda: None,
+        per_token_cast_to_fp8=per_token_cast_to_fp8,
+        set_barrier_timeout_seconds=lambda seconds: None,
+    )
+    monkeypatch.setattr(tensorrt_llm, "deep_gemm", deep_gemm)
+
+    with pytest.raises(quantization_module._MegaMoEUnavailable, match="get_block_m_for_mega_moe"):
+        quantization_module._import_deep_gemm()
+
+    deep_gemm.get_block_m_for_mega_moe = lambda *args: 16
     assert quantization_module._import_deep_gemm() is deep_gemm
 
 
@@ -1599,6 +1632,45 @@ def test_configurable_moe_load_weights_invalidates_wrapper_transform_guard():
     assert configurable_moe._weights_transformed is False
 
 
+@pytest.mark.cpu_only
+def test_moe_weight_owner_declares_transform_guard_before_load() -> None:
+    """A staged receiver can mark a never-loaded expert-weight owner transformed.
+
+    Post-transform receivers install already transformed expert bytes without
+    calling `load_weights()`. `ModelLoader._mark_weights_transformed` only marks
+    modules that carry the guard, so it must exist from construction on the
+    backend that sits behind the `_weights_removed` `ConfigurableMoE` wrapper.
+    """
+    from tensorrt_llm._torch.moe.fused_moe.impl_blocks import MoEWeightOwnerMixin
+    from tensorrt_llm._torch.pyexecutor.model_loader import ModelLoader
+
+    assert MoEWeightOwnerMixin._weights_transformed is False
+    # `__new__` rather than the constructor: the guard is a class-level
+    # declaration and needs no mapping, kernels, or weights.
+    backend = TrtllmCutlassUnquantizedImpl.__new__(TrtllmCutlassUnquantizedImpl)
+    torch.nn.Module.__init__(backend)
+    backend.quant_method = SimpleNamespace(transform_weights=MagicMock())
+    assert backend._weights_transformed is False
+
+    wrapper = ConfigurableMoE.__new__(ConfigurableMoE)
+    torch.nn.Module.__init__(wrapper)
+    wrapper._weights_removed = True
+    wrapper.backend = backend
+    model = torch.nn.Module()
+    model.experts = wrapper
+
+    ModelLoader._mark_weights_transformed(model)
+
+    assert backend._weights_transformed is True
+    assert wrapper._weights_transformed is False
+    # The walk itself must skip the marked backend; the backend's own guard
+    # would also stop the quantization transform, so spy on the hook it calls.
+    backend.transform_weights = MagicMock(wraps=backend.transform_weights)
+    ModelLoader._walk_transform(model)
+    backend.transform_weights.assert_not_called()
+    backend.quant_method.transform_weights.assert_not_called()
+
+
 def test_moe_nvfp4_activation_quantization_capability():
     assert NVFP4FusedMoEMethod.quantizes_nvfp4_activations
     assert not W4A16NVFP4CutlassFusedMoEMethod.quantizes_nvfp4_activations
@@ -1660,6 +1732,7 @@ def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_
         x=torch.zeros(2, 8),
         x_sf=None,
         x_ready_event=None,
+        sort_tables=None,
         token_selected_experts=torch.tensor([[3], [1]], dtype=torch.int32),
         token_final_scales=None,
         comm_plan=SimpleNamespace(
@@ -1678,7 +1751,7 @@ def test_cutedsl_finalize_weights_once_with_the_router_weight_on_the_input(leaf_
         leaf_cls.run_moe(backend, ctx)
 
 
-# The CuteDSL NVFP4 leaves all bind the shared ``quantize_input_nvfp4``.
+# The CuteDSL NVFP4 leaves use ``quantize_input_nvfp4`` directly or through a wrapper.
 _CUTEDSL_NVFP4_LEAVES = pytest.mark.parametrize(
     "leaf_cls",
     [TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE, TrtllmCutedslDenseGemmNvfp4Impl],
@@ -2566,14 +2639,16 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     moe.ep_size = 8
     mpi_comm = MagicMock()
-    mpi_comm.bcast.return_value = ("127.0.0.1", "29500")
+    mpi_comm.bcast.return_value = ("10.0.0.5", 29500, False, None)
     local_mpi_comm = MagicMock()
     init_process_group = MagicMock()
     set_device = MagicMock()
+    tcp_store = MagicMock()
 
     monkeypatch.setattr(dist, "is_available", lambda: True)
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
     monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(dist, "TCPStore", tcp_store)
     monkeypatch.setattr(utils, "mpi_world_size", lambda: 8)
     monkeypatch.setattr(utils, "mpi_rank", lambda: 3)
     monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
@@ -2588,12 +2663,212 @@ def test_megamoe_cutedsl_mpi_bootstrap_keeps_executor_cuda_device(monkeypatch):
     set_device.assert_not_called()
     # Split_type is a collective; it must not run in this bootstrap.
     local_mpi_comm.assert_not_called()
+    # A non-zero rank connects to the store rank 0 broadcast.
+    tcp_store.assert_called_once_with("10.0.0.5", 29500, 8, is_master=False, timeout=ANY)
+    # A resolvable rank-0 address needs no host-topology check.
+    mpi_comm.allgather.assert_not_called()
     init_process_group.assert_called_once_with(
         backend="cuda:nccl,cpu:gloo",
+        store=tcp_store.return_value,
         rank=3,
         world_size=8,
         device_id=torch.device("cuda", 2),
     )
+
+
+def _patch_megamoe_cutedsl_bootstrap(monkeypatch, *, rank, world, bcast, allgather=None):
+    """Patch MPI and torch.distributed for a bootstrap with ``world`` ranks."""
+    import tensorrt_llm._utils as utils
+
+    mpi_comm = MagicMock()
+    mpi_comm.bcast.side_effect = bcast
+    if allgather is not None:
+        mpi_comm.allgather.side_effect = allgather
+    init_process_group = MagicMock()
+    monkeypatch.setattr(dist, "is_available", lambda: True)
+    monkeypatch.setattr(dist, "is_initialized", lambda: False)
+    monkeypatch.setattr(dist, "init_process_group", init_process_group)
+    monkeypatch.setattr(utils, "mpi_world_size", lambda: world)
+    monkeypatch.setattr(utils, "mpi_rank", lambda: rank)
+    monkeypatch.setattr(utils, "mpi_comm", lambda: mpi_comm)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
+    moe.ep_size = world
+    return moe, mpi_comm, init_process_group
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_rank0_hosts_store_on_bound_port(monkeypatch):
+    """Rank 0 binds the store itself and ignores a previous LLM's MASTER_* env.
+
+    Drawing a free port and letting ``init_process_group`` bind it later leaves
+    a window in which another socket can take the port. An MPI worker also
+    outlives the LLM that exported MASTER_ADDR / MASTER_PORT, so honoring them
+    would hand the next LLM in a reused worker pool the previous port.
+    """
+    monkeypatch.setenv("MASTER_ADDR", "10.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    store = MagicMock(port=41234)
+    tcp_store = MagicMock(return_value=store)
+    monkeypatch.setattr(dist, "TCPStore", tcp_store)
+    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(socket, "gethostbyname", lambda name: "192.168.0.10")
+    moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=0, world=4, bcast=lambda obj, root: obj
+    )
+
+    moe._maybe_init_torch_dist_under_mpi()
+
+    tcp_store.assert_called_once_with(
+        "192.168.0.10", 0, 4, is_master=True, timeout=ANY, wait_for_workers=False
+    )
+    mpi_comm.bcast.assert_called_once_with(("192.168.0.10", 41234, False, None), root=0)
+    mpi_comm.allgather.assert_not_called()
+    init_process_group.assert_called_once_with(
+        backend="cuda:nccl,cpu:gloo", store=store, rank=0, world_size=4, device_id=None
+    )
+    assert os.environ["MASTER_ADDR"] == "10.0.0.1"
+    assert os.environ["MASTER_PORT"] == "29500"
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_store_failure_raises_on_every_rank(monkeypatch):
+    """Rank 0's store failure goes out in the bcast so no rank waits for it."""
+    error = dist.DistNetworkError("address already in use")
+    monkeypatch.setattr(dist, "TCPStore", MagicMock(side_effect=error))
+    sent = []
+
+    def bcast(obj, root):
+        sent.append(obj)
+        return obj
+
+    moe, _, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=0, world=4, bcast=bcast
+    )
+    with pytest.raises(RuntimeError, match="could not host the torch.distributed rendezvous"):
+        moe._maybe_init_torch_dist_under_mpi()
+    init_process_group.assert_not_called()
+
+    # A peer receives that payload and raises without touching the store.
+    peer_store = MagicMock()
+    monkeypatch.setattr(dist, "TCPStore", peer_store)
+    peer, _, peer_init = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=2, world=4, bcast=lambda obj, root: sent[0]
+    )
+    with pytest.raises(RuntimeError, match="address already in use"):
+        peer._maybe_init_torch_dist_under_mpi()
+    peer_store.assert_not_called()
+    peer_init.assert_not_called()
+
+
+def _unresolvable_hostname(name):
+    raise socket.gaierror("Name or service not known")
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_loopback_on_single_host(monkeypatch):
+    """With an unresolvable hostname, loopback serves ranks on rank 0's host."""
+    store = MagicMock(port=41234)
+    tcp_store = MagicMock(return_value=store)
+    monkeypatch.setattr(dist, "TCPStore", tcp_store)
+    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(socket, "gethostbyname", _unresolvable_hostname)
+    moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch,
+        rank=0,
+        world=4,
+        bcast=lambda obj, root: obj,
+        allgather=lambda obj: [obj] * 4,
+    )
+
+    moe._maybe_init_torch_dist_under_mpi()
+
+    tcp_store.assert_called_once_with(
+        "127.0.0.1", 0, 4, is_master=True, timeout=ANY, wait_for_workers=False
+    )
+    mpi_comm.bcast.assert_called_once_with(("127.0.0.1", 41234, True, None), root=0)
+    mpi_comm.allgather.assert_called_once_with("node0")
+    init_process_group.assert_called_once()
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_loopback_across_hosts_raises_on_every_rank(
+    monkeypatch,
+):
+    """Loopback cannot reach rank 0 from another host; every rank must raise.
+
+    A peer on another host would otherwise dial its own loopback and wait
+    alone until the store timeout while rank 0 waits in init_process_group.
+    """
+    hostnames = ["node0", "node0", "node1", "node1"]
+    monkeypatch.setattr(socket, "gethostbyname", _unresolvable_hostname)
+    monkeypatch.setattr(dist, "TCPStore", MagicMock(return_value=MagicMock(port=41234)))
+    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    sent = []
+
+    def bcast(obj, root):
+        sent.append(obj)
+        return obj
+
+    moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch, rank=0, world=4, bcast=bcast, allgather=lambda obj: hostnames
+    )
+    with pytest.raises(RuntimeError, match="span several hosts"):
+        moe._maybe_init_torch_dist_under_mpi()
+    init_process_group.assert_not_called()
+
+    # A peer on the other host receives the same payload, joins the same
+    # allgather, and raises before dialing the loopback store.
+    peer_store = MagicMock()
+    monkeypatch.setattr(dist, "TCPStore", peer_store)
+    monkeypatch.setattr(socket, "gethostname", lambda: "node1")
+    peer, peer_comm, peer_init = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch,
+        rank=2,
+        world=4,
+        bcast=lambda obj, root: sent[0],
+        allgather=lambda obj: hostnames,
+    )
+    with pytest.raises(RuntimeError, match="span several hosts"):
+        peer._maybe_init_torch_dist_under_mpi()
+    peer_comm.allgather.assert_called_once_with("node1")
+    peer_store.assert_not_called()
+    peer_init.assert_not_called()
+
+
+def test_megamoe_cutedsl_mpi_bootstrap_resolved_loopback_across_hosts_raises(monkeypatch):
+    """A hostname that resolves to loopback is treated like an unresolvable one.
+
+    Debian and Ubuntu map the hostname to 127.0.1.1 in /etc/hosts, so
+    resolution succeeds, but a rank on another host still cannot reach it.
+    """
+    hostnames = ["node0", "node0", "node1", "node1"]
+    monkeypatch.setattr(socket, "gethostbyname", lambda name: "127.0.1.1")
+    monkeypatch.setattr(socket, "gethostname", lambda: "node0")
+    monkeypatch.setattr(dist, "TCPStore", MagicMock(return_value=MagicMock(port=41234)))
+    moe, mpi_comm, init_process_group = _patch_megamoe_cutedsl_bootstrap(
+        monkeypatch,
+        rank=0,
+        world=4,
+        bcast=lambda obj, root: obj,
+        allgather=lambda obj: hostnames,
+    )
+    with pytest.raises(RuntimeError, match=r"got loopback 127\.0\.1\.1.*span several hosts"):
+        moe._maybe_init_torch_dist_under_mpi()
+    mpi_comm.bcast.assert_called_once_with(("127.0.1.1", 41234, True, None), root=0)
+    mpi_comm.allgather.assert_called_once_with("node0")
+    init_process_group.assert_not_called()
+
+
+def test_megamoe_cutedsl_init_raises_bootstrap_failure(monkeypatch):
+    """A failed bootstrap must fail construction, not fall back to single rank.
+
+    Every torch.distributed error is a RuntimeError. If ``__init__`` swallowed
+    one, the next MegaMoE layer would retry ``init_process_group`` on this rank
+    alone under a new default-group name, and every rank would hang in the gloo
+    address exchange until the process-group timeout.
+    """
+    bootstrap = MagicMock(side_effect=dist.DistNetworkError("address already in use"))
+    monkeypatch.setattr(MegaMoECuteDsl, "_maybe_init_torch_dist_under_mpi", bootstrap)
+    with pytest.raises(dist.DistNetworkError, match="address already in use"):
+        _make_megamoe_cutedsl_for_ctor_test()
+    bootstrap.assert_called_once()
 
 
 @pytest.mark.cpu_only
@@ -2855,6 +3130,141 @@ def test_megamoe_deepgemm_cache_derived_state_allocates_symm_buffer():
 
     moe._alloc_symm_buffer.assert_called_once_with()
     quant_method.cache_derived_state.assert_called_once_with(moe)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tuning_mode, capturing", [(True, False), (False, False), (True, True)])
+def test_megamoe_deepgemm_primes_reachable_tiles_before_staging(
+    monkeypatch, tuning_mode, capturing
+):
+    monkeypatch.setattr(mega_moe_deepgemm_module, "_MEGA_MOE_PRIMED_TILES", set())
+    moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+    torch.nn.Module.__init__(moe)
+    moe.max_num_tokens = 8
+    moe.hidden_size = 4
+    moe.intermediate_size = 6
+    moe.ep_size = 8
+    moe.num_slots = 384
+    moe.dtype = torch.bfloat16
+    moe.routing_method = SimpleNamespace(experts_per_token=2)
+    moe.dg_activation = "swiglu"
+    moe.act_clamp = 10.0
+    moe.act_alpha = None
+    moe.act_beta = None
+    moe.fast_math = True
+    moe._t_l1 = ("fc1", "sf1")
+    moe._t_l2 = ("fc2", "sf2")
+    moe._kernels_primed = False
+    buf = SimpleNamespace(
+        x=torch.ones((12, 4)),
+        x_sf=torch.ones((12, 1)),
+        topk_idx=torch.zeros((12, 2), dtype=torch.int64),
+        topk_weights=torch.ones((12, 2)),
+        num_max_tokens_per_rank=12,
+    )
+    moe._symm_buffer = buf
+    tiles = [16, 32, 16, 64, 32, 32, 32, 128, 192]
+    launches = []
+
+    def launch(output, first_weights, second_weights, buffer, **kwargs):
+        assert first_weights == moe._t_l1
+        assert second_weights == moe._t_l2
+        assert buffer is buf
+        assert kwargs == dict(
+            activation="swiglu",
+            activation_clamp=10.0,
+            fast_math=True,
+            situ_beta=None,
+            situ_linear_beta=None,
+        )
+        assert output.dtype == torch.bfloat16
+        launches.append((output.shape[0], buf.topk_idx.clone()))
+        output.zero_()
+
+    moe._dg = SimpleNamespace(
+        get_block_m_for_mega_moe=MagicMock(side_effect=lambda *args: tiles[args[3]]),
+        fp8_fp4_mega_moe=launch,
+    )
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=tuning_mode))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    ctx = SimpleNamespace(
+        x=torch.full((2, 4), 3.0),
+        x_sf=torch.full((2, 1), 4.0),
+        token_selected_experts=torch.tensor([[1, 2], [3, 4]]),
+        token_final_scales=torch.full((2, 2), 0.5),
+        output_dtype=torch.float32,
+    )
+
+    output = moe.run_moe(ctx)
+    moe.run_moe(ctx)
+
+    assert output.shape == (2, 4)
+    assert output.dtype == torch.float32
+    if tuning_mode and not capturing:
+        assert [count for count, _ in launches] == [0, 1, 3, 7, 8, 2, 2]
+        assert all(torch.all(routes == -1) for _, routes in launches[:-2])
+        assert moe._kernels_primed
+        assert moe._dg.get_block_m_for_mega_moe.call_count == 9
+        for token_count, query in enumerate(moe._dg.get_block_m_for_mega_moe.call_args_list):
+            assert query.args == (8, 384, 12, token_count, 2, "fp8xfp4")
+    else:
+        assert [count for count, _ in launches] == [2, 2]
+        assert not moe._kernels_primed
+        moe._dg.get_block_m_for_mega_moe.assert_not_called()
+    assert torch.equal(buf.x[:2], ctx.x)
+    assert torch.equal(buf.x_sf[:2], ctx.x_sf)
+    assert torch.equal(buf.topk_idx[:2], ctx.token_selected_experts)
+    assert torch.equal(buf.topk_weights[:2], ctx.token_final_scales)
+    assert all(torch.equal(routes[:2], ctx.token_selected_experts) for _, routes in launches[-2:])
+
+
+@pytest.mark.cpu_only
+def test_megamoe_deepgemm_primes_each_geometry_once_per_process(monkeypatch):
+    """Layers that share a geometry reuse the tiles the first of them compiled."""
+    monkeypatch.setattr(mega_moe_deepgemm_module, "_MEGA_MOE_PRIMED_TILES", set())
+    monkeypatch.setattr(AutoTuner, "get", lambda: SimpleNamespace(is_tuning_mode=True))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    def make_layer(hidden_size):
+        moe = MegaMoEDeepGemm.__new__(MegaMoEDeepGemm)
+        torch.nn.Module.__init__(moe)
+        moe.max_num_tokens = 3
+        moe.hidden_size = hidden_size
+        moe.intermediate_size = 6
+        moe.ep_size = 8
+        moe.num_slots = 16
+        moe.routing_method = SimpleNamespace(experts_per_token=2)
+        moe.dg_activation = "swiglu"
+        moe.act_clamp = None
+        moe.act_alpha = None
+        moe.act_beta = None
+        moe.fast_math = True
+        moe._t_l1 = None
+        moe._t_l2 = None
+        moe._kernels_primed = False
+        moe._symm_buffer = SimpleNamespace(
+            x=torch.ones((4, hidden_size)),
+            x_sf=torch.ones((4, 1)),
+            topk_idx=torch.zeros((4, 2), dtype=torch.int64),
+            topk_weights=torch.ones((4, 2)),
+            num_max_tokens_per_rank=4,
+        )
+        moe._dg = SimpleNamespace(
+            get_block_m_for_mega_moe=MagicMock(return_value=16),
+            fp8_fp4_mega_moe=MagicMock(),
+        )
+        return moe
+
+    first, same_geometry, other_geometry = make_layer(4), make_layer(4), make_layer(8)
+    for layer in (first, same_geometry, other_geometry):
+        layer._prime_kernels()
+
+    assert first._dg.get_block_m_for_mega_moe.call_count == 4
+    first._dg.fp8_fp4_mega_moe.assert_called_once()
+    same_geometry._dg.get_block_m_for_mega_moe.assert_not_called()
+    same_geometry._dg.fp8_fp4_mega_moe.assert_not_called()
+    other_geometry._dg.fp8_fp4_mega_moe.assert_called_once()
+    assert all(layer._kernels_primed for layer in (first, same_geometry, other_geometry))
 
 
 def test_megamoe_deepgemm_mpi_bootstrap_replaces_outer_launcher_world(monkeypatch):
@@ -3871,6 +4281,8 @@ def test_nvfp4_streaming_stages_pre_quant_scales_for_finalization() -> None:
         rtol=0,
         atol=0,
     )
+    # DWDP setup compares the ranks' copies by the dtype the checkpoint stores the scale in.
+    assert module.fc31_act_scale_checkpoint_dtype == torch.float32
 
 
 @pytest.mark.cpu_only
@@ -4560,6 +4972,7 @@ QUANT_ALGOS_TO_TEST = [
     QuantAlgo.MXFP8,
     QuantAlgo.W8A16,
     QuantAlgo.W4A8_AWQ,
+    QuantAlgo.NVFP4_PLUS,
 ]
 
 # Backend types to test
@@ -4602,6 +5015,7 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(256, 6, 4096, 2048),  # DeepSeek-V4-Flash
     MoeModelConfig(384, 6, 7168, 3072),  # DeepSeek-V4-Pro
+    MoeModelConfig(384, 6, 5120, 2304),  # DeepSeek-V4.1-Flash
     MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
     MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
     MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
@@ -6013,6 +6427,40 @@ def test_w4a16_nvfp4_fc1_row_alignment_gate(moe_tp_size, rejected):
         assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
 
 
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size, moe_tp_size, rejected",
+    [
+        # DeepSeek-V4-Flash routed experts.
+        (4096, 2048, 16, False),
+        # A 192-wide FC2 input has 6 scale columns, not whole 128x4 tiles.
+        (4096, 1536, 8, True),
+        # 72-byte scale rows are not whole 16-byte FC1 scale gathers.
+        (2304, 2048, 1, True),
+    ],
+    ids=["aligned", "intermediate_unaligned", "hidden_unaligned"],
+)
+def test_nvfp4_plus_shape_alignment_gate(
+    hidden_size: int, intermediate_size: int, moe_tp_size: int, rejected: bool
+) -> None:
+    """With one scale per 32 values, NVFP4_PLUS needs 256 FC1 rows per shard
+    and a hidden size that is a multiple of 512."""
+    problem = dataclasses.replace(
+        _nvfp4_problem(intermediate_size, "Swiglu"),
+        quant=QuantAlgo.NVFP4_PLUS.value,
+        hidden_size=hidden_size,
+    )
+    deployment = dataclasses.replace(
+        _deployment_at_moe_tp(moe_tp_size),
+        env=MoEEnvironment(sm=107, available_deps=(MoEDep.CUTEDSL_RUBIN,)),
+    )
+    verdict = TrtllmCutedslGroupedGemmNvfp4PlusImpl.can_implement(problem, deployment)
+    if rejected:
+        assert verdict.reject_reason is MoERejectReason.SHAPE_UNALIGNED
+    else:
+        assert verdict.reject_reason is not MoERejectReason.SHAPE_UNALIGNED
+
+
 @pytest.mark.parametrize(
     "backend_cls",
     [TrtllmCutlassNvfp4Impl, TrtllmCutedslGroupedGemmNvfp4Impl, CuteDslFc12FusedMoE],
@@ -6413,6 +6861,9 @@ def _chunking_moe(backend, num_chunks: int) -> SimpleNamespace:
         routing_method=SimpleNamespace(
             experts_per_token=1, requires_separated_routing=True, apply=route
         ),
+        # The scheduler reads this before asking for a sorted route; the stub's
+        # backends never produce one, so it must decline.
+        sort_routing_applies=False,
         calculate_num_chunks=lambda all_rank_num_tokens: num_chunks,
         split_chunk=lambda n, k: [n // k + (i < n % k) for i in range(k)],
         determine_communication_method=no_op,

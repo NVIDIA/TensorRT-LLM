@@ -387,14 +387,23 @@ def test_nested_graph_capture_restores_previous_owner(monkeypatch):
 def tensor_scope_events(monkeypatch):
     events = []
 
-    def collect_tensors(value, tensors):
+    def collect_tensors(value, tensors, visited=None, include_dataclasses=True):
         if value is not None:
             tensors.extend(value)
+
+    def collect_module_call_tensors(args, kwargs):
+        tensors = []
+        collect_tensors((args, kwargs), tensors)
+        return tensors
 
     monkeypatch.setattr(
         nccl_window_tensor_scope,
         "_cuda_tensors",
         collect_tensors,
+    )
+    monkeypatch.setattr(nccl_window_tensor_scope, "_output_cuda_tensors", collect_tensors)
+    monkeypatch.setattr(
+        nccl_window_tensor_scope, "_module_call_cuda_tensors", collect_module_call_tensors
     )
 
     def begin(tensors):
@@ -964,3 +973,94 @@ def test_decoder_warmup_scope_uses_device_buffer_for_host_only_batch(
                 ScheduledRequests(), None, enable_spec_decode=False, runtime_draft_len=0
             )
     assert events == ["begin", "forward", "end"]
+
+
+def test_fast_tensor_collectors_match_generic_traversal() -> None:
+    from tensorrt_llm._torch.utils import Fp4QuantizedTensor, MxFp8QuantizedTensor
+
+    class Ids(list):
+        pass
+
+    @dataclass
+    class Metadata:
+        seq_lens: torch.Tensor
+        request_ids: Ids
+
+    with FakeTensorMode():
+        hidden, residual, packed, scale, fp8, fp8_scale, seq_lens = (
+            torch.empty(2, device="cuda") for _ in range(7)
+        )
+    cpu = torch.ones(2)
+    fp4 = Fp4QuantizedTensor(packed, scale)
+    mxfp8 = MxFp8QuantizedTensor(fp8, fp8_scale)
+    metadata = Metadata(seq_lens, Ids(range(5)))
+    nested = [hidden, (fp4, None, 3), {"m": metadata, "t": residual}]
+    nested.append(nested)
+    values = [
+        hidden,
+        cpu,
+        None,
+        7,
+        "name",
+        fp4,
+        mxfp8,
+        metadata,
+        nested,
+        (hidden, residual),
+        (hidden, metadata, [residual, hidden]),
+        {"a": fp4, "b": (mxfp8, seq_lens)},
+    ]
+
+    def generic(value, include_dataclasses=True):
+        tensors = []
+        nccl_window_tensor_scope._cuda_tensors(
+            value, tensors, include_dataclasses=include_dataclasses
+        )
+        return list(map(id, tensors))
+
+    for value in values:
+        tensors = []
+        nccl_window_tensor_scope._output_cuda_tensors(value, tensors)
+        assert list(map(id, tensors)) == generic(value)
+
+    args = (hidden, nested, metadata, None, fp4)
+    kwargs = {"residual": residual, "metadata": metadata, "pair": (mxfp8, nested), "n": 2}
+    kwargs["args_alias"] = args
+    kwargs["kwargs_cycle"] = kwargs
+    tensors = nccl_window_tensor_scope._module_call_cuda_tensors(args, kwargs)
+    assert list(map(id, tensors)) == generic((args, kwargs), include_dataclasses=False)
+
+    args = (hidden, kwargs)
+    kwargs["args_alias"] = args
+    tensors = nccl_window_tensor_scope._module_call_cuda_tensors(args, kwargs)
+    assert list(map(id, tensors)) == generic((args, kwargs), include_dataclasses=False)
+
+
+@pytest.mark.parametrize("instance_forward", [False, True])
+def test_eager_decoder_layer_scope_keeps_module_call_fast_path(
+    instance_forward: bool,
+) -> None:
+    from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
+
+    class TestLayer(DecoderLayer):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states
+
+    layer = TestLayer()
+    if instance_forward:
+        layer.forward = lambda hidden_states: hidden_states
+    original_forward = layer.forward
+    original_signature = inspect.signature(layer.forward)
+    handles = nccl_window_tensor_scope.install_eager_nccl_window_tensor_scopes(layer)
+    output = torch.ones(1)
+    try:
+        assert not layer._forward_pre_hooks and not layer._forward_hooks
+        assert inspect.signature(layer.forward) == original_signature
+        assert layer(output) is output and layer(output) is output
+    finally:
+        for handle in handles:
+            handle.remove()
+            handle.remove()
+    assert ("forward" in layer.__dict__) is instance_forward
+    assert layer.forward == original_forward
+    assert layer(output) is output

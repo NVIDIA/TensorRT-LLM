@@ -80,7 +80,14 @@ l0_gb300:
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_verify_parity.py
   - unittest/_torch/modules/kimi_kda/test_kda_mtp_decode_cute_parity.py
   - unittest/_torch/modules/kimi_kda/test_kimi_kda_fused_verify_parity.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_decode_dispatch.py
+  - unittest/_torch/modules/kimi_k3_attn_res/test_attn_res_persistent_sm_reserve.py
   - unittest/_torch/visual_gen/kernels/parallel
+  # Ungrouped noaux_tc top-16 + moe_sort routing kernel and the MoE tables hand-off.
+  - unittest/_torch/moe/test_kimi_k3_route_sort.py
+  - unittest/_torch/moe/test_moe_sorted_routing.py
+  # Router-logits kernel in the MoE gate (the kernel test runs with kernels/parallel above).
+  - unittest/_torch/moe/test_kimi_k3_moe_gate.py::test_router_logits_kernel_matches_router_gemm
   # Qwen3.5 decode kernels: low-M warp-MMA GEMM, TRTLLM-gen NVFP4 MoE decode / route fronts, draft experts,
   # GDN fused target verify.
   - unittest/_torch/modules/test_low_m_mma_gemm.py
@@ -121,6 +128,10 @@ l0_gb300:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-tp4] TIMEOUT (120)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV41::test_gsm8k_dspark[nvfp4-dp4] TIMEOUT (120)
   - accuracy/test_glm53_flash.py::TestGLM53FlashFP8::test_mtp[tp_size=4-ep_size=4] TIMEOUT (60)
+  # qwen4_exp target, pre-merge: tep4 with three drafts and IndexShare, gsm8k and then
+  # 3k-6k-token pass keys with their acceptance-length floor. The other layouts and KV dtypes
+  # run post-merge (l0_gb300_multi_gpus).
+  - accuracy/modeling_v2/test_qwen4_exp.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_mtp3_gsm8k_and_long_context TIMEOUT (60)
 
 # K3 collectives and decode-path exchanges, four ranks in one NVLink domain.
 - condition:

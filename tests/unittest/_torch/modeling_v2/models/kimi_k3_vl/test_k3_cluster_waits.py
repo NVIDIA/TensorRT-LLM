@@ -56,6 +56,8 @@ MAILBOXES = {
         "kb_full",
         "mail_full",
     ),
+    # The router-logits kernel's cross-CTA running-sum mailbox.
+    "tensorrt_llm._torch.moe.kernels.blackwell.kimi_k3_router_logits": ("mbox_full",),
     # rms_full: stage 0 only (filled by the cluster CTAs' st.async pushes); its other stages are completed by this
     # CTA's own arrive or bulk copy.
     "tensorrt_llm._torch._experimental.modeling_v2.models.kimi_k3_vl.kernels.k3_sandwich.k3_sandwich_kernel": (
