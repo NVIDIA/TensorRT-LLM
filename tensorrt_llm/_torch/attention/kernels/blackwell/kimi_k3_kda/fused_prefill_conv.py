@@ -29,13 +29,23 @@ for tokens i+D..., then commits the refills as one group. Thus pack p retires gr
 including every token it consumes. A lane refills a slot only after its own lds_v4 of
 that slot in program order; partial tails still commit one final group.
 
+Compilation: the token count, the sequence count and the state-pool size are runtime
+values of the compiled kernel (symbolic dimensions, see `compile_prefill_conv`). A
+serving process compiles one specialization per static layout class: heads, strides,
+dtypes and the alignment flags of `_specialization`. A new batch shape does not compile
+again, except that a batch of more than 65535 sequences takes the second specialization
+(see Launch).
+
 Launch: one-warp CTAs on grid (channel blocks, runs, sequences). Every CTA
 grid-strides over the runs of its sequence with the run count taken from the
-device-side length (starts), so max_seqlen only sizes grid.y (parallelism), never
-which tokens are processed: an understated or overstated bound still covers every
-token. grid.y is also capped at 65535. Only when B > 65535 does a shape-selected
-specialization grid-stride over sequences as well. A max_seqlen that is a CUDA tensor
-is never read on the host (T is used as the bound).
+device-side length (starts), so grid.y only sets parallelism, never which tokens are
+processed or how: any grid.y >= 1 covers every token and gives the same bits. The grid
+is a rectangle, so the host picks grid.y from the batch shape to balance the serial chain
+of the longest sequence against the CTAs that shorter sequences launch only to exit (see
+`_grid_runs`). max_seqlen is only an upper bound on that longest sequence. grid.y is
+also capped at 65535. Only when B > 65535 does a shape-selected specialization
+grid-stride over sequences as well. A max_seqlen that is a CUDA tensor is never read on
+the host (T is used as the bound).
 
 State pool: run 0 of each sequence (one warp per 256 channels) owns the slot's rows for
 its channels: it reads the old history, then writes the final three raw inputs after
@@ -53,6 +63,7 @@ semantics would need a cross-sequence ordering of state reads and writes that on
 launch does not provide.
 """
 
+import math
 from collections.abc import Callable
 from functools import cache
 
@@ -1098,31 +1109,52 @@ FORCE_W = 1
 FORCE_MB = 16
 
 
-def _pick_tokens(heads, max_seqlen, batch):
-    # Enough warps to fill the machine; longer runs amortise the 3-token halo.
-    lanes_c = (3 * heads * 128 + WARP_CH - 1) // WARP_CH
-    for L in (32, 16):
-        warps = lanes_c * batch * ((max_seqlen + L - 1) // L)
-        if warps >= 160 * 48:
-            return L
-    return 8
-
-
 def _align(t):
     return t.data_ptr() % 16
 
 
-def _layout_key(t, *, dynamic_dim=None, dynamic_stride=None):
-    """Keep only layout properties that specialize the convolution."""
-    shape = tuple(None if i == dynamic_dim else n for i, n in enumerate(t.shape))
-    stride = tuple(None if i == dynamic_stride else s for i, s in enumerate(t.stride()))
-    return (shape, stride, t.dtype)
+# Names of the layout dimensions that change from one batch to the next. The cache key holds
+# these names instead of the values, and the compiled kernel takes them as runtime values
+# (`cute.sym_int`), so a new token or sequence count reuses the compilation. The rest of a
+# layout (head count, strides, dtypes) stays in the key by value, because the kernel bakes it
+# into its address arithmetic.
+TOKENS = "tokens"  # src rows == q/k/v tokens
+SEQS = "seqs"  # slots / has_init length
+STARTS = "starts"  # starts length: SEQS + 1, checked by the caller, but its own symbol
+POOL = "pool"  # conv-state pool slots
+# Strides of the leading q/k/v dimension (extent 1). Each equals tokens * H * 128, so a value
+# in the key would bring the token count back, though the stride never addresses memory. They
+# are 64-bit symbols because they can exceed int32 for a tensor of nearly 2**31 elements.
+BATCH_STRIDES = ("batch_stride_q", "batch_stride_k", "batch_stride_v")
+
+
+def _conv_layouts(src, weight, conv_state, starts, slots, has_init, q, k, v) -> tuple:
+    """Return the cache-key layout (shape, stride, dtype) of each of the nine operands.
+
+    A dimension that changes from batch to batch is one of the names above instead of a
+    value. For example, `src` as the fused q/k/v/g projection of a 3-head layer gives
+    ``(("tokens", 1536), (1536, 1), torch.bfloat16)``.
+
+    The function builds plain tuples because it runs on every launch.
+    """
+    return (
+        ((TOKENS, src.shape[1]), src.stride(), src.dtype),
+        ((*weight.shape,), weight.stride(), weight.dtype),
+        ((POOL, *conv_state.shape[1:]), conv_state.stride(), conv_state.dtype),
+        ((STARTS,), starts.stride(), starts.dtype),
+        ((SEQS,), slots.stride(), slots.dtype),
+        ((SEQS,), has_init.stride(), has_init.dtype),
+        *(
+            ((t.shape[0], TOKENS, *t.shape[2:]), (batch_stride, *t.stride()[1:]), t.dtype)
+            for batch_stride, t in zip(BATCH_STRIDES, (q, k, v))
+        ),
+    )
 
 
 @cache
 def compile_prefill_conv(
     device: torch.device,
-    layouts: tuple[tuple[tuple[int | None, ...], tuple[int | None, ...], torch.dtype], ...],
+    layouts: tuple[tuple[tuple[int | str, ...], tuple[int | str, ...], torch.dtype], ...],
     tokens_per_warp: int,
     unroll: int,
     depth: int,
@@ -1134,7 +1166,14 @@ def compile_prefill_conv(
     st_vec: bool,
     seq_loop: bool,
 ) -> Callable:
-    """Compile and cache a convolution layout without retaining caller-owned tensors."""
+    """Compile and cache a convolution layout without retaining caller-owned tensors.
+
+    A string in `layouts` is a symbolic dimension, a runtime argument of the compiled kernel.
+    Equal strings are the same dimension; see `_conv_layouts`.
+    """
+    # The kernel bakes the source row stride and the state strides into its address arithmetic.
+    if not isinstance(layouts[0][1][0], int) or not all(isinstance(n, int) for n in layouts[2][1]):
+        raise TypeError("The source row stride and the state strides must be static integers")
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("Warm KDA convolution layout before CUDA graph capture")
@@ -1143,17 +1182,23 @@ def compile_prefill_conv(
             torch.int32: (cutlass.Int32, 4),
             torch.bool: (cutlass.Boolean, 1),
         }
-        tokens, batch, pool, offsets = (cute.sym_int() for _ in range(4))
-        # starts has B + 1 entries; its length is validated by the caller.
-        extents = (tokens, None, pool, offsets, batch, batch, tokens, tokens, tokens)
+        symbols = {}
+
+        def dim(value):
+            if not isinstance(value, str):
+                return value
+            if value not in symbols:
+                symbols[value] = cute.sym_int64() if value in BATCH_STRIDES else cute.sym_int()
+            return symbols[value]
+
         args = [
             make_fake_tensor(
                 dtypes[dtype][0],
-                tuple(extent if n is None else n for n in shape),
-                stride=tuple(cute.sym_int() if s is None else s for s in stride),
+                tuple(dim(n) for n in shape),
+                stride=tuple(dim(n) for n in stride),
                 assumed_align=dtypes[dtype][1],
             )
-            for (shape, stride, dtype), extent in zip(layouts, extents)
+            for shape, stride, dtype in layouts
         ]
         op = KdaConv(
             layouts[1][0][0] // 384,
@@ -1173,6 +1218,84 @@ def compile_prefill_conv(
         stream = cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
         # Grid size and stream remain runtime arguments, not cache-key inputs.
         return cute.compile(op, *args, cutlass.Int32(1), stream, options="--enable-tvm-ffi")
+
+
+# Ratio used by `_grid_runs`: the latency of one run of a CTA that has the GPU to itself,
+# divided by the launch cost of a CTA that exits at once. On SM107 (212 SMs) it is about
+# 3.4 us / 0.45 ns, and the rule scores about the same for ratios from 5000 to 9000. SM100
+# and SM103 are not measured: they have fewer SMs and less HBM bandwidth, so their best
+# grid.y is somewhat smaller.
+GRID_RUN_LATENCY_RATIO = 7500
+
+
+def _grid_runs(tokens: int, batch: int, max_seqlen: int, channels: int, run_tokens: int) -> int:
+    """Return grid.y, the CTAs per (channel block, sequence) of the launch.
+
+    Each CTA loops over the rest of its sequence's runs. The grid is a rectangle, so grid.y
+    trades two costs:
+
+    - With few CTAs per sequence, the longest sequence is a serial chain of
+      ceil(longest / grid.y) runs.
+    - With many, every shorter sequence launches CTAs that exit at once,
+      grid.y * (batch - 1) * channel_blocks of them.
+
+    The sum is smallest at sqrt(GRID_RUN_LATENCY_RATIO * longest / (channel_blocks * (batch - 1))).
+    The mean run count of the other sequences is the lower bound: below it, fewer CTAs save
+    nothing on average (idle CTAs appear only for sequences shorter than the mean) and only
+    lengthen the chains of the others. One sequence, or equal ones, get a CTA per run.
+
+    Args:
+        tokens: token count of the batch.
+        batch: sequence count.
+        max_seqlen: upper bound on the longest sequence.
+        channels: convolution channels, 3 * heads * 128.
+        run_tokens: tokens in one run of a CTA.
+    """
+    # Run counts round up. No sequence is longer than the batch's token count.
+    longest = -(-max(1, min(max_seqlen, tokens)) // run_tokens)
+    if batch < 2:
+        return min(longest, MAX_GRID_YZ)
+    blocks = -(-channels // WARP_CH)
+    others = -(-max(-(-tokens // run_tokens) - longest, 0) // (batch - 1))
+    balanced = math.ceil(math.sqrt(GRID_RUN_LATENCY_RATIO * longest / (blocks * (batch - 1))))
+    return min(longest, max(others, balanced), MAX_GRID_YZ)
+
+
+def _specialization(
+    src: torch.Tensor,
+    weight: torch.Tensor,
+    conv_state: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    batch: int,
+    max_seqlen: int,
+) -> tuple[tuple, int]:
+    """Return the static compile parameters of a launch and its grid.y.
+
+    The parameters depend on the operand layouts, never on the batch contents: the tile
+    shape, the alignment class of each operand (vector or elementwise memory path) and
+    seq_loop, the one choice that depends on the batch count (it differs only above 65535
+    sequences). grid.y is a runtime argument of the compiled kernel.
+
+    Returns:
+        ``(spec, grid_y)``. spec is ``(L, U, D, W, MB, src_vec, w_vec, out_vec, st_vec,
+        seq_loop)``, the trailing arguments of `compile_prefill_conv`.
+    """
+    L, D, W = FORCE_L, FORCE_D, FORCE_W
+    U = min(8, L)
+    # Vector (cp.async) source path only for a 16-byte-aligned base and row stride.
+    src_vec = src.stride(1) == 1 and src.stride(0) % 8 == 0 and _align(src) == 0
+    w_vec = _align(weight) == 0 and weight.is_contiguous()
+    out_vec = all(_align(t) == 0 and t.is_contiguous() for t in (q, k, v))
+    # 16-byte state rows per lane (8 channels x 3 taps) need a dense [C, 3] slot layout,
+    # a 16-byte-aligned base and a slot stride divisible by 8 elements.
+    ss = conv_state.stride()
+    st_vec = ss[1] == 3 and ss[2] == 1 and ss[0] % 8 == 0 and _align(conv_state) == 0
+    grid_y = _grid_runs(src.shape[0], batch, max_seqlen, weight.shape[0], L * W)
+    seq_loop = batch > MAX_GRID_YZ  # shape-only choice
+    spec = (L, U, D, W, FORCE_MB, src_vec, w_vec, out_vec, st_vec, seq_loop)
+    return spec, grid_y
 
 
 def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seqlen, q, k, v):
@@ -1212,10 +1335,17 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
         or any(not t.is_contiguous() for t in (starts, slots, has_init))
     ):
         raise ValueError("Prepare contiguous int32 starts/slots and bool initial-state flags")
+
     # The scalar fallback uses CuTe layout arithmetic with int32 extents.
     # Reject overflowing layouts before launch rather than wrap an address.
-    if any(
-        sum((n - 1) * stride for n, stride in zip(t.shape, t.stride())) >= 2**31 for t in tensors
+    # The kernel forms a state slot's base in Int64 (slot * stride), so for the
+    # pool only one slot's extent must fit int32. KV cache manager V2 keeps the
+    # states of all layers of a slot together, so a large pool passes int32 as a whole.
+    def span(shape, strides):
+        return sum((n - 1) * stride for n, stride in zip(shape, strides))
+
+    if any(span(t.shape, t.stride()) >= 2**31 for t in tensors if t is not conv_state) or (
+        span(conv_state.shape[1:], conv_state.stride()[1:]) >= 2**31
     ):
         raise ValueError("KDA convolution tensor offsets must fit int32")
     writable = (conv_state, q, k, v)
@@ -1223,58 +1353,15 @@ def fused_prefill_conv(src, weight, conv_state, starts, slots, has_init, max_seq
         for other in (src, weight, starts, slots, has_init, *writable[:i]):
             if output.untyped_storage().data_ptr() == other.untyped_storage().data_ptr():
                 raise ValueError("KDA convolution outputs/state must use disjoint storage")
-    heads = weight.shape[0] // 384
     batch = slots.shape[0]
-    if batch == 0 or heads == 0:
+    if batch == 0 or weight.shape[0] // 384 == 0:
         return
     if isinstance(max_seqlen, torch.Tensor) and max_seqlen.device.type != "cpu":
         # Reading a device bound would sync (and break graph capture); T bounds every length.
         max_seqlen = src.shape[0]
-    max_seqlen = int(max_seqlen)
-    L = FORCE_L or _pick_tokens(heads, max(max_seqlen, 1), batch)
-    D = FORCE_D
-    W = FORCE_W or 4
-    U = min(8, L)
-    sr = src.stride(0)
-    # Vector (cp.async) source path only for a 16-byte-aligned base and row stride.
-    src_vec = src.stride(1) == 1 and sr % 8 == 0 and _align(src) == 0
-    w_vec = _align(weight) == 0 and weight.is_contiguous()
-    out_vec = all(_align(t) == 0 and t.is_contiguous() for t in (q, k, v))
-    # 16-byte state rows per lane (8 channels x 3 taps) need a dense [C, 3] slot layout,
-    # a 16-byte-aligned base and a slot stride divisible by 8 elements.
-    ss = conv_state.stride()
-    st_vec = ss[1] == 3 and ss[2] == 1 and ss[0] % 8 == 0 and _align(conv_state) == 0
-    stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
-    # grid.y only sets parallelism (CTAs loop over the device-side run count): no
-    # sequence is longer than T, so a looser bound only adds idle CTAs and an
-    # understated one only makes CTAs loop.
-    seqlen_bound = max(1, min(max_seqlen, src.shape[0]))
-    run_tokens = L * W
-    grid_y = min((seqlen_bound + run_tokens - 1) // run_tokens, MAX_GRID_YZ)
-    seq_loop = batch > MAX_GRID_YZ  # shape-only choice
-    # Token count, batch size and pool capacity are runtime extents. The
-    # singleton leading output stride also varies with the token count.
-    layouts = (
-        _layout_key(src, dynamic_dim=0),
-        _layout_key(weight),
-        _layout_key(conv_state, dynamic_dim=0),
-        _layout_key(starts, dynamic_dim=0),
-        _layout_key(slots, dynamic_dim=0),
-        _layout_key(has_init, dynamic_dim=0),
-        *(_layout_key(t, dynamic_dim=1, dynamic_stride=0) for t in (q, k, v)),
-    )
+    spec, grid_y = _specialization(src, weight, conv_state, q, k, v, batch, int(max_seqlen))
     fn = compile_prefill_conv(
-        src.device,
-        layouts,
-        L,
-        U,
-        D,
-        W,
-        FORCE_MB,
-        src_vec,
-        w_vec,
-        out_vec,
-        st_vec,
-        seq_loop,
+        src.device, _conv_layouts(src, weight, conv_state, starts, slots, has_init, q, k, v), *spec
     )
+    stream = cuda.CUstream(torch.cuda.current_stream(src.device).cuda_stream)
     fn(src, weight, conv_state, starts, slots, has_init, q, k, v, grid_y, stream)
