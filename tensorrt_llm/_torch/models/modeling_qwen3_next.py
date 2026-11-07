@@ -1417,8 +1417,6 @@ class Qwen3NextForCausalLM(SpecDecOneEngineForCausalLM[Qwen3NextModel,
     ):
         decode_kernels = _uses_decode_kernels(model_config)
         if decode_kernels:
-            # Every AllReduce this model builds: no NCCL_SYMMETRIC.
-            model_config.extra_attrs["allreduce_exclude_nccl_symmetric"] = True
             # Its FP4 MoE layers tune for the decode steps.
             model_config.extra_attrs["moe_decode_tuning"] = True
             # Its MNNVL all-reduces run the residual RMSNorm fusions on the CuTe DSL kernels.

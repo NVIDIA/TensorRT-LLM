@@ -1064,3 +1064,24 @@ def test_eager_decoder_layer_scope_keeps_module_call_fast_path(
     assert ("forward" in layer.__dict__) is instance_forward
     assert layer.forward == original_forward
     assert layer(output) is output
+
+
+def test_promote_synchronized_releases_reads_epoch_before_sync(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "get_nccl_window_buffer_release_epoch",
+        lambda: events.append("epoch") or 7,
+    )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.cuda, "synchronize", lambda: events.append("synchronize")
+    )
+    monkeypatch.setattr(
+        nccl_window_graph.torch.ops.trtllm,
+        "promote_nccl_window_buffer_releases",
+        lambda device, epoch: events.append(("promote", device, epoch)),
+    )
+
+    nccl_window_graph.promote_synchronized_nccl_window_releases()
+
+    assert events == ["epoch", "synchronize", ("promote", 0, 7)]
