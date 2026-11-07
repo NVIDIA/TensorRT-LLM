@@ -1145,6 +1145,18 @@ def main():
     script_prefix = "\n".join(script_prefix_lines)
 
     srun_args_lines = remove_whitespace_lines(srun_args_lines)
+    # Slurm forwards only the last occurrence of a SPANK option. Merge the
+    # inherited overrides with the per-role additions so BASH_ENV survives.
+    container_env_names = []
+    other_srun_args = []
+    for arg in srun_args_lines:
+        if arg.startswith("--container-env="):
+            container_env_names.extend(arg.split("=", 1)[1].split(","))
+        else:
+            other_srun_args.append(arg)
+    if container_env_names:
+        other_srun_args.append("--container-env=" + ",".join(dict.fromkeys(container_env_names)))
+    srun_args_lines = other_srun_args
     srun_args_lines = ["srunArgs=("] + [f'  "{line}"' for line in srun_args_lines] + [")"]
     srun_args = "\n".join(srun_args_lines)
 

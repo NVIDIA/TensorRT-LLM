@@ -2629,24 +2629,22 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     envVarsToExport[varName] = env."${varName}"
                 }
 
+                // Slurm forwards only the last value of a repeated SPANK option.
+                // Keep BASH_ENV and the other overrides in one --container-env list.
+                def containerEnvNames = ['NVIDIA_IMEX_CHANNELS', 'BASH_ENV', 'SKIP_INSTALL']
+                if (ENABLE_UPLOAD_TEST_RESULTS) {
+                    containerEnvNames.add('S3_SECRET_KEY')
+                }
+                containerEnvNames.add('GITHUB_CLONE_TOKEN')
+                containerEnvNames.addAll(envVarsToExport.keySet())
                 def srunArgs = [
                     "--container-name=multi_node_test-\${SLURM_JOB_ID}",
                     "--container-image=$containerImageArg",
                     "--container-workdir=$jobWorkspace",
                     "--container-mounts=$mounts",
                     "--no-container-mount-home",
-                    "--container-env=NVIDIA_IMEX_CHANNELS",
-                    // Preserve the job hook over the image's BASH_ENV default.
-                    "--container-env=BASH_ENV",
-                    "--container-env=SKIP_INSTALL"
+                    "--container-env=${containerEnvNames.join(',')}"
                 ]
-                if (ENABLE_UPLOAD_TEST_RESULTS) {
-                    srunArgs.add("--container-env=S3_SECRET_KEY")
-                }
-                srunArgs.add("--container-env=GITHUB_CLONE_TOKEN")
-                envVarsToExport.each { varName, varValue ->
-                    srunArgs.add("--container-env=${varName}")
-                }
 
                 def exemptionComment = ""
                 if (SlurmConfig.needsIdleGpuExemption(cluster)) {
