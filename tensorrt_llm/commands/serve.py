@@ -1504,6 +1504,14 @@ def launch_visual_gen_server(
     "Expose per-rank KV occupancy for OpenEngine routing, independently of KV events.",
     status="prototype")
 @stability_option(
+    "--openengine-grpc-server",
+    type=click.Choice(["grpcio", "pygrpc-native"]),
+    default="grpcio",
+    help="gRPC server for OpenEngine. pygrpc-native runs the HTTP/2 and "
+    "gRPC work in Rust outside the GIL and needs "
+    "`pip install \"tensorrt_llm[openengine-native]\"`.",
+    status="prototype")
+@stability_option(
     "--served_model_name",
     type=str,
     default=None,
@@ -1606,6 +1614,7 @@ def serve(
     openengine_enable_load_metrics: bool,
     openengine_metrics_port: Optional[int],
     openengine_metrics_host: Optional[str],
+    openengine_grpc_server: str,
     enable_visual_gen: bool,
     served_model_name: Optional[str],
     visual_gen_args: Optional[str],
@@ -1651,6 +1660,11 @@ def serve(
     if openengine_metrics_port is not None and openengine_metrics_port == port:
         raise click.UsageError(
             "--openengine-metrics-port must differ from --port")
+    if openengine_grpc_server != "grpcio" and (not grpc or grpc_protocol
+                                               != "openengine"):
+        raise click.UsageError(
+            "--openengine-grpc-server requires --grpc --grpc-protocol openengine"
+        )
 
     if moe_cluster_parallel_size is not None:
         logger.warning(
@@ -1926,7 +1940,8 @@ def serve(
                         metrics_host=openengine_metrics_host,
                         metrics_port=8001 if openengine_metrics_port is None
                         else openengine_metrics_port,
-                        subagent_affinity_auth_key=internal_disagg_auth_key)
+                        subagent_affinity_auth_key=internal_disagg_auth_key,
+                        grpc_server=openengine_grpc_server)
         else:
             # Default: launch OpenAI HTTP server
             launch_server(
