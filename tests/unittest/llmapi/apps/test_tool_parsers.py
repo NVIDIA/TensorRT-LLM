@@ -7777,12 +7777,13 @@ def _glm_parity(parser_cls, text, tools, chunkings=None):
 
 _GLM_SCHEMAS = {
     kind: dict(type=kind)
-    for kind in ("string", "integer", "number", "boolean", "object", "array")
+    for kind in ("string", "integer", "number", "boolean", "object", "array",
+                 "null")
 }
 _GLM_SCHEMAS.update({"any": {}, "$ref": {"$ref": "#/$defs/F"}, "none": None})
 
-# Declared strings are delivered verbatim, whatever they look like, markup
-# included.
+# Declared strings, and values with no resolvable type, are delivered verbatim,
+# whatever they look like, markup included.
 _GLM_STRING_VALUES = [
     "99797", "true", "1e3", "null", "0099797", " padded \n", "", "北京",
     'say "hi"', "C:\\Users\\test.txt", "line one\nline two", '{"k": "v"}',
@@ -7796,10 +7797,11 @@ _GLM_STRING_VALUES = [
     "almost the whole tag </arg_value", "a</arg_value><"
 ]
 
-# (raw value, schema, delivered value). Other declared types decode, keeping
-# the text when the result is not strict JSON; with no resolvable type ("none",
-# "any", "$ref") only strict JSON decodes.
-_GLM_TYPED_VALUES = [(value, "string", value) for value in _GLM_STRING_VALUES]
+# (raw value, schema, delivered value). A declared string and a value with no
+# resolvable type ("none", "any", "$ref") are delivered as written; other
+# declared types decode, keeping the text when the result is not strict JSON.
+_GLM_TYPED_VALUES = [(value, schema, value) for schema in ("string", "none")
+                     for value in _GLM_STRING_VALUES]
 _GLM_TYPED_VALUES += [
     ("42", "integer", 42),
     ('"42"', "integer", 42),
@@ -7822,19 +7824,34 @@ _GLM_TYPED_VALUES += [
     ("1j", "number", "1j"),
     ("b'x'", "array", "b'x'"),
     ("not json", "object", "not json"),
-    ("8000", "none", 8000),
-    ('{"a": [1, 2]}', "none", dict(a=[1, 2])),
-    ("true", "none", True),
-    ("null", "none", None),
+    ("null", "null", None),
+    ("8000", "null", 8000),
+    ("8000", "none", "8000"),
+    ('{"a": [1, 2]}', "none", '{"a": [1, 2]}'),
     ("ls -la", "none", "ls -la"),
-    ("", "none", ""),
     ("NaN", "none", "NaN"),
     ("'single'", "none", "'single'"),
-    ('{"a": 1}', "any", dict(a=1)),
-    ('{"a": 1}', "$ref", dict(a=1)),
+    ('{"a": 1}', "any", '{"a": 1}'),
+    ('{"a": 1}', "$ref", '{"a": 1}'),
 ]
 
 _GLM_VALUES = sorted({row[0] for row in _GLM_TYPED_VALUES})
+
+# (declared tool, call name, key, raw value, delivered value). Only a type the
+# schema gives the key decodes its value; without one the value is the text the
+# model wrote.
+_UNTYPED_PROPERTY = {"description": "free-form"}
+_GLM_TYPING_CASES = [
+    (_glm_typed_tool("f", n="integer"), "no_such_tool", "n", "42", "42"),
+    (_glm_typed_tool("f", n="integer"), "f", "extra", '{"a":1}', '{"a":1}'),
+    (_glm_tool("f", {"v": _UNTYPED_PROPERTY}), "f", "v", "true", "true"),
+    (_glm_typed_tool("f", n="integer"), "f", "n", "42", 42),
+    (_glm_typed_tool("f", flag="boolean"), "f", "flag", "true", True),
+]
+_GLM_TYPING_CASE_IDS = [
+    "undeclared tool", "undeclared key", "property without a type",
+    "declared integer", "declared boolean"
+]
 
 _GLM_TOOLS = [_glm_typed_tool("f", code="string", n="integer", opts="object")]
 
@@ -7856,10 +7873,11 @@ _GLM_ARGUMENT_TEXTS = [
     (_glm_pairs(("n", "3"), ("code", "a<")), dict(n=3, code="a<")),
     (_glm_pairs(("code", "a</arg_valu"),
                 ("n", "3")), dict(code="a</arg_valu", n=3)),
-    # Each argument is typed alone, and an object value still closes the call.
+    # Each argument is typed alone (`budget` is undeclared, so it stays text),
+    # and an object value still closes the call.
     (_glm_pairs(("code", "w"), ("n", "3"), ("budget", "8000"), ("note", ""),
                 ("opts", '{"verbose": true}')),
-     dict(code="w", n=3, budget=8000, note="", opts=dict(verbose=True))),
+     dict(code="w", n=3, budget="8000", note="", opts=dict(verbose=True))),
     ("<arg_key>code</arg_key><arg_value>ls -la", None),
     ("<arg_key>n</arg_key><arg_value>5", None),
     ("<arg_key>code</arg_key><arg_value>ls</think>", None),
@@ -7937,6 +7955,17 @@ class TestGlmStreamingMatchesWholeParse:
             properties = {} if schema is None else {"v": schema}
             _glm_parity(parser_cls, text, [_glm_tool("f", properties)],
                         [("whole", [text]), ("per character", list(text))])
+
+    @pytest.mark.parametrize("tool,name,key,raw,expected",
+                             _GLM_TYPING_CASES,
+                             ids=_GLM_TYPING_CASE_IDS)
+    def test_only_a_declared_type_decodes_a_value(self, parser_cls, tool, name,
+                                                  key, raw, expected):
+        text = _glm_call(parser_cls, name, (key, raw))
+
+        _, calls = _glm_parity(parser_cls, text, [tool])
+
+        assert calls == [(name, {key: expected})]
 
     @pytest.mark.parametrize("argument_text,expected", _GLM_ARGUMENT_TEXTS)
     def test_argument_text(self, parser_cls, argument_text, expected):
