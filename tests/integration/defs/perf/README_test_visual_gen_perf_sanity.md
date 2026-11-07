@@ -84,13 +84,17 @@ The config folder can be overridden with:
 
 ### Current Naming Pattern
 
-VisualGen family YAMLs currently use underscore-separated names with a hardware
-suffix, for example:
+VisualGen family YAMLs use model-based names. Hardware-specific recipes may
+include a hardware suffix. Recipes shared across GPU architectures use a
+platform-neutral name, such as `ltx2.yaml`; supported GPUs are listed in
+`metadata.supported_gpus`.
+
+Examples:
 
 - `wan21_t2v_14b_blackwell.yaml`
 - `wan22_i2v_a14b_blackwell.yaml`
 - `flux2_blackwell.yaml`
-- `ltx2_blackwell.yaml`
+- `ltx2.yaml`
 
 ### YAML Structure
 
@@ -224,15 +228,13 @@ Important:
 
 - VisualGen perf sanity uses static pytest cases, like `test_perf_sanity.py`
 - Do **not** add pytest `--perf` for VisualGen perf sanity runs
-- VisualGen `PerfSanity` stages should not be routed through the legacy
-  `perfMode` path used by `test_perf.py`
 
 ## How to Add a Test Case
 
 1. **Locate (or create) the family YAML** under
    `tests/scripts/perf-sanity/visual_gen/`. Use an existing file if the model
    family already has one; otherwise create a new file following the naming
-   pattern `<family>_<hardware>.yaml`.
+   guidance above.
 
 2. **Add a `server_configs` entry.** Each entry needs a unique `name`, a
    `model_path` (or rely on `metadata.model_name`), a `server_config` block,
@@ -298,7 +300,7 @@ extraction in `build_visual_gen_db_entry` and treat it as a baseline reset.
 pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg_upload-wan21_t2v_14b_blackwell-wan21_14b_nvfp4_trtllm_cfg2_ulysses4_teacache_on]
 
 # Run all server recipes from one family YAML without uploading
-pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2_blackwell]
+pytest perf/test_visual_gen_perf_sanity.py::test_visual_gen_e2e[vg-ltx2]
 ```
 
 Set `LLM_MODELS_ROOT` to the shared model cache before running locally:

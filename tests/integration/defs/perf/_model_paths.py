@@ -16,6 +16,7 @@
 
 # Model PATH of local dir synced from internal LLM models repo
 MODEL_PATH_DICT = {
+    "muse_spark_open_nvfp4": "Muse-Spark-Open-816B-A42B-NVFP4",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "llama_v3.1_8b_instruct_fp4": "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",

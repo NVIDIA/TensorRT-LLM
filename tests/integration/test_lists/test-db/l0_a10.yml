@@ -31,6 +31,8 @@ l0_a10:
   - unittest/_torch/modeling/test_modeling_phi3.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
   - unittest/_torch/modeling/test_modeling_cohere2.py
+  # The 8B real-checkpoint classes are covered by the accuracy tests instead.
+  - unittest/_torch/modeling/test_modeling_apertus.py -k "not TestApertus8BInstruct and not TestApertus1p5_8B"
   - unittest/_torch/modeling/test_modeling_parakeet.py
   - unittest/_torch/modeling/test_modeling_radio.py
   - unittest/_torch/modeling/test_modeling_glm.py
@@ -43,6 +45,8 @@ l0_a10:
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_capacity_only.py
   - unittest/_torch/pyexecutor/kv_cache/sharing
   - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_branch_snapshot.py
+  - unittest/_torch/pyexecutor/kv_cache/test_helix_agg_preemption.py
+  - unittest/_torch/pyexecutor/kv_cache/test_kv_cache_v2_adp_dummy_draft_rollback.py
   - unittest/_torch/pyexecutor/connectors/test_kv_cache_layout.py
   - unittest/_torch/pyexecutor/kv_cache/test_kv_connector_v2_prefix_real_manager.py
   - unittest/_torch/pyexecutor/test_error_classification.py
@@ -62,6 +66,7 @@ l0_a10:
   - unittest/others/test_cache_transceiver_precheck_config.py
   - unittest/others/test_cache_transceiver_precheck_run.py
   - unittest/others/test_cuda_architecture_check.py
+  - unittest/others/test_import_cuda_context.py
   - unittest/others/test_lora_manager.py
   - unittest/others/test_tracing.py
   - unittest/grpc/test_grpc_optional.py
