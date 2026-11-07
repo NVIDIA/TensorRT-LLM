@@ -879,6 +879,16 @@
       "path": "kv_cache_config.mixed_precision_last_n"
     },
     {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_recompute_last_n"
+    },
+    {
+      "capture_policy": "bool",
+      "kind": "value",
+      "path": "kv_cache_config.mixed_precision_reuse_last_n_from_low"
+    },
+    {
       "capture_policy": "list[float]|none",
       "kind": "value",
       "path": "kv_cache_config.pool_ratio"

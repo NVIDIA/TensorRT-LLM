@@ -33,7 +33,10 @@ from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantMode
 
 from ..dsa.backend import _get_nvfp4_mla_kv_cache_amax
-from ..mixed_precision_high_rows import overlay_mixed_precision_high_rows
+from ..mixed_precision_high_rows import (
+    overlay_mixed_precision_high_rows,
+    restore_mixed_precision_high_rows,
+)
 from .cache_manager import get_token_bytes
 from .compressor import Compressor
 from .indexer import DeepseekV4Indexer
@@ -421,6 +424,17 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             num_pool_tokens = data_pool.numel() // (
                 (self.head_dim + kv_cache_manager.nvfp4_residual_dim) // 2
             )
+            restore = metadata.mixed_precision_high_restore
+            if restore and attention_input_type != AttentionInputType.generation_only:
+                self._restore_mixed_precision_high_rows(
+                    metadata,
+                    restore.get(self.compress_ratio),
+                    data_pool,
+                    scale_pool,
+                    num_pool_tokens,
+                    compressed_buffer_ptr - compress_pool_base_ptr,
+                    block_table_compressed,
+                )
             # The previous layer has already enqueued its attention on this stream.
             # Release its Python reference before allocating the next scratch so
             # the caching allocator can reuse the storage in stream order.
@@ -495,6 +509,41 @@ class DeepseekV4TrtllmAttention(TrtllmAttention):
             forward_args.sparse_runtime_params.aux_kv_cache_pool_ptr = scratch.data_ptr()
 
         return global_indices, None
+
+    def _restore_mixed_precision_high_rows(
+        self,
+        metadata: DeepseekV4TrtllmAttentionMetadata,
+        plan: tuple[torch.Tensor, torch.Tensor] | None,
+        data_pool: torch.Tensor,
+        scale_pool: torch.Tensor,
+        num_pool_tokens: int,
+        layer_offset_bytes: int,
+        block_table_compressed: torch.Tensor,
+    ) -> None:
+        """Fill fresh last-N high rows from the NVFP4 compressed pool, decoded as the read decodes them."""
+        if plan is None:
+            return
+        requests, rows = plan
+        manager = metadata.kv_cache_manager
+        rows_per_page = manager.tokens_per_block // self.compress_ratio
+        row_bytes = (self.head_dim + manager.nvfp4_residual_dim) // 2
+        # Pool row of compressed row j, as deepseek_v4_local_to_global_indices computes it.
+        pages = block_table_compressed[requests.long(), (rows // rows_per_page).long()].long()
+        pool_rows = layer_offset_bytes // row_bytes + pages * rows_per_page + rows % rows_per_page
+        decoded = torch.empty(
+            (rows.numel(), 1, self.head_dim), dtype=torch.float8_e4m3fn, device=rows.device
+        )
+        # The gather rewrites its index tensor in place, so it gets a temporary one.
+        torch.ops.trtllm.nvfp4_mla_kv_cache_gather_direct(
+            data_pool,
+            scale_pool,
+            pool_rows.to(torch.int32).view(-1, 1),
+            decoded,
+            self._nvfp4_compress_scale_quant_orig,
+            manager.nvfp4_residual_dim,
+            num_pool_tokens,
+        )
+        restore_mixed_precision_high_rows(self, metadata, decoded, requests, rows)
 
     def sparse_kv_predict(
         self,

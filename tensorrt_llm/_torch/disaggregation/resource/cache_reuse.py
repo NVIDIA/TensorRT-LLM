@@ -21,6 +21,7 @@ import numpy as np
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
+from tensorrt_llm.runtime.kv_cache_manager_v2 import ReusePolicy
 
 from .page import AttentionLayerGroup
 
@@ -127,17 +128,35 @@ class _CacheReuseAdapterV2(CacheReuseAdapter):
 
         V2 transfer groups are indexed by the native layer-group ID. OPTIONAL
         groups not selected at resume have incomplete status; PRIVATE groups
-        never supply a reusable prefix, even when REQUIRED groups hit.
+        never supply a reusable prefix, even when REQUIRED groups hit. A
+        SINK_REQUIRED_ONLY group without its window still holds the claimed sinks.
         """
         scalar = self._global_cached_token_count(req)
         if scalar == 0:
             return [0] * len(layer_groups)
         statuses = self._mgr.kv_cache_map[req.py_request_id].reuse_status
         tpb = self.tokens_per_block
-        return [
-            min(scalar, statuses[group].endpoint // tpb * tpb) if statuses[group].complete else 0
-            for group in range(len(layer_groups))
-        ]
+        cached = []
+        for group in range(len(layer_groups)):
+            status = statuses[group]
+            if status.complete:
+                cached.append(min(scalar, status.endpoint // tpb * tpb))
+            elif status.policy == ReusePolicy.SINK_REQUIRED_ONLY:
+                # The transfer must not write the shared sink pages.
+                cached.append(min(scalar, self._sink_tokens(group)))
+            else:
+                cached.append(0)
+        return cached
+
+    def _sink_tokens(self, group: int) -> int:
+        """Tokens in the sink blocks of a layer group, rounded up to whole blocks."""
+        tpb = self.tokens_per_block
+        layer = next(
+            layer
+            for layer in self._mgr.kv_cache_manager_py_config.layers
+            if self._mgr.layer_to_pool_mapping_dict[layer.layer_id] == group
+        )
+        return -(-layer.num_sink_tokens // tpb) * tpb
 
     def get_block_ids(self, req, group_idx, lg):  # noqa: ARG002
         # V2 already returns per-cache-level pool slot indices (not logical block

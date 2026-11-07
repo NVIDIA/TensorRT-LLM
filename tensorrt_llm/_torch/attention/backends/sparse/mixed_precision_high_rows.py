@@ -9,6 +9,7 @@ Mixed-precision high page table: a page index if the token is held there, else -
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -499,3 +500,97 @@ def overlay_mixed_precision_high_rows(
             BLOCK_R=block_rows,
             BLOCK_W=128,
         )
+
+
+def take_mixed_precision_high_restore(
+    metadata: "DSAtrtllmAttentionMetadata", manager, cached_token_lens
+) -> list[tuple[int, int, int]]:
+    """`(batch row, first token, end token)` of each context request that restores in this forward.
+
+    A context request that reused a prefix without the high-precision copy of its last N tokens
+    holds fresh high pages there; this forward fills them from the low pool before anything reads
+    them. The requests are taken from `manager`, so each restores once.
+    """
+    pending = manager.mixed_precision_restore_requests
+    if not pending or metadata.num_contexts == 0:
+        return []
+    request_ids = metadata.request_ids[: metadata.num_contexts]
+    rows = [row for row, request_id in enumerate(request_ids) if request_id in pending]
+    if not rows:
+        return []
+    pending.difference_update(request_ids[row] for row in rows)
+    tokens_per_block = manager.tokens_per_block
+    table = np.full((len(rows), manager.max_blocks_per_seq), -1, dtype=np.int32)
+    # Every high layer holds the same pages, so one table serves them all.
+    high_layer = next(iter(manager.mixed_precision_high_layers.values()))
+    manager._fill_page_table(high_layer, [request_ids[row] for row in rows], table)
+    # The sink pages came with the prefix; every later page the request holds is fresh.
+    sinks = -(-manager.first_n // tokens_per_block)
+    spans = []
+    for index, row in enumerate(rows):
+        fresh = np.flatnonzero(table[index, sinks:] >= 0)
+        end = int(cached_token_lens[row])
+        start = min((sinks + int(fresh[0])) * tokens_per_block, end) if fresh.size else end
+        spans.append((row, start, end))
+    return spans
+
+
+def mixed_precision_high_restore_rows(
+    spans: list[tuple[int, int, int]], tokens_per_row: int = 1
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Flat `(batch rows, row positions)` that `spans` cover; a row covers `tokens_per_row` tokens.
+
+    A DeepSeek-V4 compressed row exists once all of its tokens are cached. A fresh page starts on a
+    block boundary, a multiple of every compression ratio.
+    """
+    requests, positions = [], []
+    for row, start, end in spans:
+        first, last = start // tokens_per_row, end // tokens_per_row
+        requests += [row] * (last - first)
+        positions += range(first, last)
+    if not positions:
+        return None
+    device = torch.device("cuda", torch.cuda.current_device())
+    return (
+        torch.tensor(requests, dtype=torch.int32).to(device),
+        torch.tensor(positions, dtype=torch.int32).to(device),
+    )
+
+
+def restore_mixed_precision_high_rows(
+    owner: "TrtllmAttention",
+    metadata: "DSAtrtllmAttentionMetadata",
+    rows: torch.Tensor,
+    requests: torch.Tensor,
+    positions: torch.Tensor,
+) -> None:
+    """Store `rows`, decoded from the low pool as the read decodes them, at `(request, position)`.
+
+    The FP8 high pool holds rows as the FP8 scratch does, so they are copied without a scale.
+    """
+    kv_cache, block_table = _mixed_precision_high_pool(metadata, owner)
+    if kv_cache is None:
+        return
+    rows = rows.flatten(1)
+    row_width = kv_cache.shape[-1]
+    assert rows.shape[1] == row_width, (rows.shape, row_width)
+    _store_mixed_precision_high_rows_kernel[(rows.shape[0],)](
+        rows,
+        requests,
+        positions,
+        block_table,
+        block_table.stride(0),
+        block_table.shape[0],
+        block_table.shape[1],
+        kv_cache,
+        kv_cache.shape[0],
+        kv_cache.shape[1],
+        kv_cache,  # scale (unused)
+        kv_cache,  # cos/sin (unused)
+        0,
+        APPLY_SCALE=False,
+        ROTATE=False,
+        ROW_WIDTH=row_width,
+        ROPE_DIM=0,
+        BLOCK_SIZE=max(16, triton.next_power_of_2(row_width)),
+    )

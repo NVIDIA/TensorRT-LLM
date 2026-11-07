@@ -5129,11 +5129,13 @@ _MIXED_PRECISION_KV_DTYPES = tuple(f"mixed_nvfp4_{high}"
 
 
 class MixedPrecisionKV(NamedTuple):
-    """Layout of a mixed-precision KV cache, parsed from KvCacheConfig."""
+    """Settings of a mixed-precision KV cache, parsed from KvCacheConfig."""
     low: str
     high: str
     first_n: int
     last_n: int
+    reuse_last_n_from_low: bool = False
+    recompute_last_n: bool = False
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
@@ -5280,6 +5282,25 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Mixed-precision KV only: number of most recent tokens per sequence kept at "
         "the mixed-precision high dtype (the second part of the mixed dtype). Tokens are kept "
         "in whole cache pages.")
+
+    mixed_precision_reuse_last_n_from_low: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Mixed-precision KV only: reuse a cached prefix in full even when the high-precision "
+        "copy of its last N tokens was evicted. The first forward then restores that copy from "
+        "the low-precision history, so those tokens keep low precision. When False (default), "
+        "reuse stops where the high-precision copy is still complete and the rest is recomputed."
+    )
+
+    mixed_precision_recompute_last_n: bool = Field(
+        default=False,
+        status="prototype",
+        description=
+        "Mixed-precision KV only, with mixed_precision_reuse_last_n_from_low: when the high-precision "
+        "copy of a reused prefix's last N tokens was evicted, reuse the prefix only up to before them "
+        "and recompute them, so they keep the high precision. The N tokens before them are restored "
+        "from the low-precision history as context for that recomputation.")
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -5515,7 +5536,9 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             return None
         return MixedPrecisionKV(match["low"], match["high"],
                                 self.mixed_precision_first_n,
-                                self.mixed_precision_last_n)
+                                self.mixed_precision_last_n,
+                                self.mixed_precision_reuse_last_n_from_low,
+                                self.mixed_precision_recompute_last_n)
 
     @model_validator(mode='after')
     def reject_fp8_ds_mla_pool_rebalance(self) -> 'KvCacheConfig':
@@ -5682,6 +5705,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             raise ValueError(
                 "Mixed-precision KV requires mixed_precision_first_n or "
                 "mixed_precision_last_n to be greater than zero.")
+        if (self.mixed_precision_recompute_last_n
+                and not self.mixed_precision_reuse_last_n_from_low):
+            raise ValueError("mixed_precision_recompute_last_n requires "
+                             "mixed_precision_reuse_last_n_from_low.")
         return self
 
     @field_validator('pool_ratio')

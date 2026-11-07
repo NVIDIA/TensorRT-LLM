@@ -14,6 +14,10 @@ from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import prefer_pinned
 
 from ..dsa.metadata import DSAtrtllmAttentionMetadata
+from ..mixed_precision_high_rows import (
+    mixed_precision_high_restore_rows,
+    take_mixed_precision_high_restore,
+)
 from .indexer import DeepseekV4Indexer
 from .offload import SparseOffloadState
 from .params import (
@@ -734,6 +738,7 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
         """Repoint sparse fields to the draft buffers for a draft forward."""
         # Draft layers have no mixed-precision high layer while the draft manager is in use.
         self.swap_for_draft("mixed_precision_high_block_table", None)
+        self.swap_for_draft("mixed_precision_high_restore", None)
         if self.draft_sliding_block_tables is None:
             return None
         saved_state = {field: getattr(self, field) for field in self._DRAFT_SPARSE_FIELDS}
@@ -847,6 +852,19 @@ class DeepseekV4TrtllmAttentionMetadata(DSAtrtllmAttentionMetadata):
 
         # For block offsets
         self.prepare_for_block_tables()
+        if self.mixed_precision_high_block_table:
+            # Restoring requests fill the fresh last-N high rows of every compression ratio.
+            spans = take_mixed_precision_high_restore(
+                self, self.kv_cache_manager, cached_token_lens
+            )
+            self.mixed_precision_high_restore = (
+                {
+                    ratio: mixed_precision_high_restore_rows(spans, ratio)
+                    for ratio in self.mixed_precision_high_block_table
+                }
+                if spans
+                else None
+            )
 
         # For indexer k cache (only needed when sparse layers exist)
         if has_sparse_layers:
