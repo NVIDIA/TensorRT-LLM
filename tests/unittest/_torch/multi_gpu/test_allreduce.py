@@ -65,11 +65,11 @@ def _run_nccl_nvfp4_auxiliary_device_case(auxiliary: str, other_device: str,
     bias = inputs["bias"] if auxiliary == "bias" else None
     with pytest.raises(RuntimeError,
                        match=f"{auxiliary} must be on the input device"):
-        torch.ops.trtllm.allreduce(x, inputs["residual"],
-                                         inputs["norm_weight"], inputs["scale"],
-                                         bias, None, [tensorrt_llm.mpi_rank()],
-                                         AllReduceStrategy.NCCL, fusion_op,
-                                         1e-6, False)
+        torch.ops.trtllm.allreduce(x, inputs["residual"], inputs["norm_weight"],
+                                   inputs["scale"], bias, None,
+                                   [tensorrt_llm.mpi_rank()],
+                                   AllReduceStrategy.NCCL, fusion_op, 1e-6,
+                                   False)
     # A device error must be reported before launching either local tail and
     # leave the CUDA context usable for subsequent work.
     torch.testing.assert_close(x + 1, torch.full_like(x, 1.25))
