@@ -7,7 +7,7 @@ computes the same FP8 MQA logits over the whole context and the same top-2048. I
 scores only its contiguous shard of the request's indexer keys (``glm_dsa_hist_shard_meta`` builds
 the shard's context length and block table), and ``glm_dsa_hist_topk`` finds every row's exact
 top-2048 over all shards by exchanging key histograms through a private multicast workspace; every
-rank ends with the same rows. See ``cpp/tensorrt_llm/kernels/glmMoeDsaRubin/glmDsaHistTopK.h``.
+rank ends with the same rows. See ``csrc/glmDsaHistTopK.h``.
 """
 
 from __future__ import annotations
