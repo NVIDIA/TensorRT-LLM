@@ -2154,11 +2154,14 @@ def test_cutedsl_situ_betas_reach_the_kernel_cache_key(monkeypatch):
     tuner = AutoTuner.get()
     choose_one = tuner.choose_one
     identities = set()
+    # The FC1 act-fusion op the CuteDSL MoE dispatches to on this SM.
+    act_fusion_arch = "rubin" if get_sm_version() == 107 else "blackwell"
+    act_fusion_op = f"trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_{act_fusion_arch}"
 
     def fixed_tactic(custom_op, runners, tuning_config, inputs, **kwargs):
         if custom_op == "CuteDslFusedMoE::run_moe_nvfp4":
             return runners[0], -1
-        if custom_op == "trtllm::cute_dsl_nvfp4_gather_grouped_gemm_act_fusion_blackwell":
+        if custom_op == act_fusion_op:
             identities.add(runners[0].unique_id())
             return runners[0], -1
         return choose_one(custom_op, runners, tuning_config, inputs, **kwargs)
@@ -2219,7 +2222,9 @@ def test_cutedsl_situ_betas_reach_the_kernel_cache_key(monkeypatch):
         )
         outputs[(gate_softcap, linear_softcap)] = actual
 
-    assert len(identities) == len(outputs), "each soft-cap must participate in runner.unique_id()"
+    assert len(identities) == len(outputs), (
+        f"each soft-cap must participate in the {act_fusion_op} runner.unique_id()"
+    )
     first = outputs[(4.0, 25.0)]
     for betas, output in outputs.items():
         if betas != (4.0, 25.0):
