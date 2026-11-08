@@ -51,11 +51,15 @@ from ..accuracy_core import (
 from . import llguidance_panel, multimodal, ruler, spec_evidence
 from ._env import scoped_env_overrides
 
-# The targets assert their own SM at construction: certification is per GPU
-# architecture, and a receipt from another one says nothing here.
+# Certification is per GPU architecture, and a receipt from another one says nothing here:
+# each gate class runs only on its target's architecture.
 skip_not_sm103 = pytest.mark.skipif(
     get_sm_version() != 103,
-    reason="mistral_large4 modeling_v2 targets are certified on sm_103 only",
+    reason="the mistral_large4 sm_103 modeling_v2 targets are certified on sm_103 only",
+)
+skip_not_sm107 = pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="the mistral_large4 sm_107 modeling_v2 targets are certified on sm_107 only",
 )
 
 
@@ -145,6 +149,17 @@ def _iteration_coverage(llm: LLM, path: Path, coverage: dict):
         assert not worker.is_alive(), "Iteration reader did not stop"
 
 
+@contextlib.contextmanager
+def _phase_timing(timings: dict, phase: str):
+    started = time.monotonic()
+    print(f"Accuracy phase {phase}: started", flush=True)
+    try:
+        yield
+    finally:
+        timings[phase] = time.monotonic() - started
+        print(f"Accuracy phase {phase}: {timings[phase]:.3f} s", flush=True)
+
+
 class _Nvfp4Target(LlmapiAccuracyTestHarness):
     """The gate of one target: every test runs at each deployment the target serves.
 
@@ -180,7 +195,6 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         layout = cls.LAYOUTS[int(name.removeprefix(cls.LAYOUT))]
         return layout, (_BOUNDS_1M if ctx == "1m" else _BOUNDS)
 
-    @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_gsm8k(self, deployment):
         """The identity accuracy gate, at the harness default protocol.
@@ -214,7 +228,6 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
     class GSM8K24Shot(GSM8K):
         MAX_INPUT_LEN = 8192
 
-    @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_gsm8k_24shot(self, deployment):
         """24-shot GSM8K, where the indexer's selection prunes every prompt.
@@ -247,7 +260,6 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
     )
 
-    @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_passkey_retrieval(self, deployment):
         """The long-context witness: a passkey recalled from a ~30000-token prompt.
@@ -286,7 +298,6 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 answer = llm.generate([prompt], params)[0].outputs[0].text
                 assert str(key) in answer, (depth, tokens, answer)
 
-    @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("profile", ["quick", "full", "long_lite", "long_full"])
     def test_accuracy(self, deployment, profile, tmp_path, monkeypatch, record_property):
@@ -299,6 +310,28 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         multimodal panel and GSM8K as in quick / full. long_full also gates its 64K / 128K RULER
         means on references/ruler.yaml.
         """
+        self._run_accuracy(
+            deployment, profile, tmp_path, monkeypatch, record_property, use_dspark=True
+        )
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("profile", ["full", "long_full"])
+    def test_accuracy_without_dspark(
+        self, deployment, profile, tmp_path, monkeypatch, record_property
+    ):
+        """The complete accuracy and cache protocol with native DSpark disabled.
+
+        ``full`` covers the 32K datasets; ``long_full`` covers the long-context datasets and
+        1M witnesses. Only draft acceptance and speculative execution evidence are omitted.
+        """
+        self._run_accuracy(
+            deployment, profile, tmp_path, monkeypatch, record_property, use_dspark=False
+        )
+
+    def _run_accuracy(
+        self, deployment, profile, tmp_path, monkeypatch, record_property, *, use_dspark: bool
+    ):
+        run_started = time.monotonic()
         layout, bounds = self.serving(deployment)
         envelope = max(ruler.cell_counts(profile))
         if bounds["max_seq_len"] < envelope:
@@ -329,25 +362,38 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             # One attention-DP rank prefills a 1M request alone, about 15 minutes per row: the
             # quick 1M case stops at 128K there, and long_full keeps the 1M rows.
             rows = [row for row in rows if row["max_length"] <= 131072]
+        gpu_arch = f"sm_{get_sm_version()}"
         root = (
-            Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path)) / f"{deployment}-{profile}"
+            Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path))
+            / gpu_arch
+            / f"{deployment}-{profile}{'' if use_dspark else '-spec-off'}"
         )
         root.mkdir(parents=True, exist_ok=False)
         record_property("artifacts", str(root))
+        record_property("gpu_arch", gpu_arch)
+        record_property("dspark", use_dspark)
         # 16 sequences per rank under attention DP (each rank batches its own), 16 in all
         # otherwise.
         concurrency = 16 * world if attention_dp else 16
         monkeypatch.setenv("TLLM_EVAL_MAX_IN_FLIGHT", str(concurrency))
         failures = []
-        spec_config = DSparkDecodingConfig(
-            max_draft_len=self.DRAFT_LENGTH,
-            speculative_model=model_path,
+        spec_config = (
+            DSparkDecodingConfig(
+                max_draft_len=self.DRAFT_LENGTH,
+                speculative_model=model_path,
+            )
+            if use_dspark
+            else None
         )
+        timings = {}
         summary = {
+            "gpu_arch": gpu_arch,
             "deployment": deployment,
             "profile": profile,
             "reuse": True,
-            "speculative_config": spec_config.model_dump(mode="json"),
+            "dspark": use_dspark,
+            "speculative_config": spec_config.model_dump(mode="json") if spec_config else None,
+            "phase_wall_s": timings,
         }
         llm_kwargs = dict(
             kv_cache_config=self.KV.model_copy(update={"enable_block_reuse": True}),
@@ -362,7 +408,9 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
         started = time.monotonic()
         try:
             factory = (
-                partial(spec_evidence.traced_llm, trace=root / "spec-trace") if is_long else LLM
+                partial(spec_evidence.traced_llm, trace=root / "spec-trace")
+                if is_long and use_dspark
+                else LLM
             )
             with (
                 scoped_env_overrides(llm_kwargs["env_overrides"]) as rank_env,
@@ -373,7 +421,10 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 ) as llm,
             ):
                 ready = time.monotonic()
-                summary["speculative_config"] = llm.args.speculative_config.model_dump(mode="json")
+                assert (llm.args.speculative_config is not None) == use_dspark
+                summary["speculative_config"] = (
+                    llm.args.speculative_config.model_dump(mode="json") if use_dspark else None
+                )
                 summary["startup_s"] = ready - started
                 assert llm.args.kv_cache_config.enable_block_reuse
                 with _iteration_coverage(llm, root / "ruler-iterations.jsonl", coverage) as (
@@ -381,19 +432,21 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                     _,
                 ):
                     try:
-                        summary["ruler"] = ruler.evaluate(
-                            llm,
-                            rows,
-                            profile,
-                            root,
-                            concurrency,
-                            self.MODEL_NAME,
-                            collect_spec=is_long,
-                        )
+                        with _phase_timing(timings, "ruler"):
+                            summary["ruler"] = ruler.evaluate(
+                                llm,
+                                rows,
+                                profile,
+                                root,
+                                concurrency,
+                                self.MODEL_NAME,
+                                collect_spec=is_long and use_dspark,
+                            )
                     except AssertionError as error:
                         failures.append(str(error))
                     try:
-                        summary["multimodal"] = multimodal.evaluate(llm, profile, root)
+                        with _phase_timing(timings, "multimodal"):
+                            summary["multimodal"] = multimodal.evaluate(llm, profile, root)
                         failures.extend(
                             f"multimodal: {failure}"
                             for failure in summary["multimodal"]["failures"]
@@ -442,13 +495,14 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                                 chat_template_kwargs={"reasoning_effort": "low"},
                             )
                         try:
-                            summary[task.DATASET] = task.evaluate(
-                                llm, extra_evaluator_kwargs=kwargs, **evaluate_kwargs
-                            )
+                            with _phase_timing(timings, task.DATASET):
+                                summary[task.DATASET] = task.evaluate(
+                                    llm, extra_evaluator_kwargs=kwargs, **evaluate_kwargs
+                                )
                         except AssertionError as error:
                             failures.append(f"{task.DATASET}: {error}")
                     failures.extend(f"{task.DATASET} iteration reader: {error}" for error in errors)
-                    if isinstance(task, GSM8K):
+                    if isinstance(task, GSM8K) and use_dspark:
                         try:
                             al = acceptance_length_from_iteration_stats(spec_stats)
                             summary["gsm8k_acceptance_length"] = al
@@ -491,7 +545,7 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                         )
                 summary["test_wall_s"] = time.monotonic() - ready
             summary["teardown_s"] = time.monotonic() - ready - summary["test_wall_s"]
-            if is_long:
+            if is_long and use_dspark:
                 longest_bin = max(row["max_length"] for row in rows)
                 need = min(
                     ruler.LONG_WITNESS_TOKENS,
@@ -499,34 +553,40 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
                 )
                 summary["spec_evidence"] = spec_evidence.evaluate(root, need, world, attention_dp)
                 failures.extend(summary["spec_evidence"]["failures"])
-            if profile in ("full", "long_full"):
+            if use_dspark and profile in ("full", "long_full"):
                 # Release the target and draft completely before starting the other arm.
                 # Same specialization, reuse, bounds and evaluator; only speculation differs.
                 origin = root / "spec-off"
                 origin.mkdir()
                 task = GSM8K(self.MODEL_NAME)
+                spec_off_started = time.monotonic()
                 with (
                     scoped_env_overrides(llm_kwargs["env_overrides"]) as rank_env,
                     LLM(model_path, **dict(llm_kwargs, env_overrides=rank_env)) as llm,
                 ):
+                    spec_off_ready = time.monotonic()
+                    summary["spec_off_startup_s"] = spec_off_ready - spec_off_started
                     with _iteration_coverage(llm, origin / "iterations.jsonl", {}) as (
                         errors,
                         _,
                     ):
                         try:
-                            score = task.evaluate(
-                                llm,
-                                extra_evaluator_kwargs=dict(
-                                    num_fewshot=5,
-                                    log_samples=True,
-                                    output_path=str(origin / f"{task.DATASET}.json"),
-                                    output_dir=str(origin / task.DATASET),
-                                ),
-                            )
+                            with _phase_timing(timings, "gsm8k_spec_off"):
+                                score = task.evaluate(
+                                    llm,
+                                    extra_evaluator_kwargs=dict(
+                                        num_fewshot=5,
+                                        log_samples=True,
+                                        output_path=str(origin / f"{task.DATASET}.json"),
+                                        output_dir=str(origin / task.DATASET),
+                                    ),
+                                )
                             summary["gsm8k_spec_off"] = score
                         except AssertionError as error:
                             failures.append(f"GSM8K spec OFF: {error}")
                     failures.extend(f"Spec OFF iteration reader: {error}" for error in errors)
+                    spec_off_completed = time.monotonic()
+                summary["spec_off_teardown_s"] = time.monotonic() - spec_off_completed
                 if task.DATASET in summary and "gsm8k_spec_off" in summary:
                     delta = summary[task.DATASET] - summary["gsm8k_spec_off"]
                     summary["gsm8k_delta_pp"] = delta
@@ -540,13 +600,14 @@ class _Nvfp4Target(LlmapiAccuracyTestHarness):
             failures.append(f"{type(error).__name__}: {error}")
             raise
         finally:
+            summary["total_wall_s"] = time.monotonic() - run_started
             summary["failures"] = list(failures)
             (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         assert not failures, failures
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_Nvfp4Target):
-    """mistral-large-4-nvfp4 / sm_103 / tep, the language model."""
+class _TepTarget(_Nvfp4Target):
+    """The tep layout, the language model."""
 
     # Tensor-parallel attention with expert-parallel experts: the attention heads and the routed
     # experts both sharded over every rank, attention DP off -- four ways on one node, or eight
@@ -560,8 +621,8 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_Nvfp4Target):
     }
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_Nvfp4Target):
-    """mistral-large-4-nvfp4 / sm_103 / dep, the language model."""
+class _DepTarget(_Nvfp4Target):
+    """The dep layout, the language model."""
 
     # Attention data parallel over every rank (each holds the whole attention and serves its
     # own requests) with the routed experts split by expert over every rank, four on one node
@@ -574,8 +635,8 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_Nvfp4Target):
     }
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4Target):
-    """mistral-large-4-nvfp4 / sm_103 / tp, the language model."""
+class _TpTarget(_Nvfp4Target):
+    """The tp layout, the language model."""
 
     # Tensor parallel throughout: the attention heads sharded over every rank and every routed
     # expert on every rank, cut to its share of the width, attention DP off -- four ways on one
@@ -597,7 +658,6 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4Target):
         ),
     }
 
-    @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_llguidance(self, tmp_path, record_property):
         """Guided decoding with llguidance on tp4 with native DSpark, over frontend-rendered chat ids.
@@ -607,9 +667,15 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4Target):
         """
         layout, bounds = self.serving("tp4")
         model_path = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR", self.MODEL_PATH)
-        root = Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path)) / "tp4-llguidance"
+        gpu_arch = f"sm_{get_sm_version()}"
+        root = (
+            Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path))
+            / gpu_arch
+            / "tp4-llguidance"
+        )
         root.mkdir(parents=True, exist_ok=False)
         record_property("artifacts", str(root))
+        record_property("gpu_arch", gpu_arch)
         with (
             scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
             LLM(
@@ -627,6 +693,43 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4Target):
             ) as llm,
         ):
             summary = llguidance_panel.evaluate(llm, root)
+        summary["gpu_arch"] = gpu_arch
         (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         failures = [failure for failure in summary["failures"] if failure.startswith("FAIL")]
         assert not failures, failures
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_TepTarget):
+    """mistral-large-4-nvfp4 / sm_103 / tep, the language model."""
+
+    pytestmark = skip_not_sm103
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_DepTarget):
+    """mistral-large-4-nvfp4 / sm_103 / dep, the language model."""
+
+    pytestmark = skip_not_sm103
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_TpTarget):
+    """mistral-large-4-nvfp4 / sm_103 / tp, the language model."""
+
+    pytestmark = skip_not_sm103
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm107Tep(_TepTarget):
+    """mistral-large-4-nvfp4 / sm_107 / tep, the language model."""
+
+    pytestmark = skip_not_sm107
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm107Dep(_DepTarget):
+    """mistral-large-4-nvfp4 / sm_107 / dep, the language model."""
+
+    pytestmark = skip_not_sm107
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm107Tp(_TpTarget):
+    """mistral-large-4-nvfp4 / sm_107 / tp, the language model."""
+
+    pytestmark = skip_not_sm107
