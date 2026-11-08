@@ -78,20 +78,26 @@ def test_branch_snapshot_ctx_chunk_config_reports_overrides(
 
 
 @pytest.mark.parametrize(
-    ("ctx_chunk_config", "configured_policy", "warned"),
+    ("ctx_chunk_config", "configured_policy", "warning_key", "warning_text"),
     [
-        (None, None, True),
-        ((FCFS, 256), FCFS, True),
-        ((FCFS, 256), None, False),
-        ((FORCE, 32), FORCE, False),
+        (None, None, "hybrid_reuse_enables_chunking", "turns on chunked prefill"),
+        ((FCFS, 256), FCFS, "hybrid_reuse_replaces_chunking_policy", "replaces"),
+        ((FCFS, 256), None, None, None),
+        ((FORCE, 32), FORCE, None, None),
     ],
 )
 def test_hybrid_reuse_ctx_chunk_config_reports_overrides(
     ctx_chunk_config: tuple | None,
     configured_policy: ContextChunkingPolicy | None,
-    warned: bool,
+    warning_key: str | None,
+    warning_text: str | None,
 ) -> None:
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
         result = _hybrid_reuse_ctx_chunk_config(ctx_chunk_config, 32, configured_policy)
     assert result == (FORCE, 32)
-    assert logger.warning_once.called == warned
+    if warning_key is None:
+        logger.warning_once.assert_not_called()
+    else:
+        logger.warning_once.assert_called_once()
+        assert logger.warning_once.call_args.kwargs["key"] == warning_key
+        assert warning_text in logger.warning_once.call_args.args[0]
