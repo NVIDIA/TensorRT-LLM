@@ -650,34 +650,49 @@ def test_fused_verify_mxfp8_output_gating(allow, with_output, low_m, use_pdl):
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (10, 7),
     reason="the MXFP8 verify epilogue feeds the Rubin (SM107) CuTe MXFP8 GEMM",
 )
-def test_fused_verify_mxfp8_output_matches_bf16_projection():
-    """SM107: epilogue-quantized o_proj input matches the BF16 core path, which a one-wave PDL
-    verify hands the low-M o_proj GEMM even where the MXFP8 output is allowed."""
+@pytest.mark.parametrize("force_low_m", [False, True], ids=["o_proj_range", "low_m_o_proj"])
+def test_fused_verify_mxfp8_output_matches_bf16_projection(monkeypatch, force_low_m):
+    """SM107: epilogue-quantized o_proj input matches the BF16 core path; with PDL the verify
+    hands the BF16 core to an o_proj that runs its low-M GEMM on the verify rows
+    (``force_low_m``: whatever o_proj's GEMM range for this weight on the device)."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_kimi_k3_kda_mtp_ops import v2_verify_applies
     from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
     from tensorrt_llm._torch.models.modeling_kimi_linear import _Fp8BlockScaleWeightReadLinear
 
     if not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
         pytest.skip("needs the Rubin CuTe DSL")
     batch = 4
+    rows = batch * (M + 1)
     runtime = _make_runtime(seed=11)
     runtime.finalize_decode_weights()
-    runtime.o_proj = _Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
-    assert runtime.o_proj.supports_prequantized_input
-    assert runtime.o_proj.takes_prequantized_input(batch * (M + 1))
+    o_proj = _Fp8BlockScaleWeightReadLinear.from_linear(runtime.o_proj)
+    o_proj.post_load_weights()
+    runtime.o_proj = o_proj
+    assert o_proj.supports_prequantized_input
+    if force_low_m:
+        # The verify reads o_proj's GEMM selection only through takes_prequantized_input.
+        monkeypatch.setattr(o_proj, "takes_prequantized_input", lambda num_rows: True)
+    pdl_bf16_core = o_proj.takes_prequantized_input(rows) and v2_verify_applies(
+        H, batch, M, torch.device("cuda")
+    )
+    assert pdl_bf16_core or not force_low_m
     calls = _capture_mtp_verify(runtime)
-    x = (torch.randn(batch * (M + 1), HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
+    x = (torch.randn(rows, HIDDEN, device="cuda") * 0.5).to(torch.bfloat16)
 
     runtime._use_pdl = True
-    bf16_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
-    bf16_out = runtime._project_output(bf16_core)
+    bf16_out = runtime._project_output(_run_one_verify_round(runtime, x, batch, seed=12))
+    pdl_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
+    pdl_out = runtime._project_output(pdl_core)
     # Without PDL the two-CTA kernel's MXFP8 epilogue costs no programmatic launch.
     runtime._use_pdl = False
     mxfp8_core = _run_one_verify_round(runtime, x, batch, seed=12, allow_prequantized_output=True)
     mxfp8_out = runtime._project_output(mxfp8_core)
 
-    assert [call["mxfp8_output"] for call in calls] == [False, True]
+    assert [call["mxfp8_output"] for call in calls] == [False, not pdl_bf16_core, True]
     assert calls[0]["use_pdl"]
-    assert isinstance(bf16_core, torch.Tensor)
+    assert calls[1]["use_pdl"] is pdl_bf16_core
+    assert isinstance(pdl_core, torch.Tensor) is pdl_bf16_core
     assert mxfp8_core.activation.dtype is torch.float8_e4m3fn
     assert mxfp8_core.scale.dtype is torch.uint8
     assert _rep("mxfp8 vs bf16 o_proj input", mxfp8_out, bf16_out)
+    assert _rep("PDL verify vs bf16 o_proj input", pdl_out, bf16_out)
