@@ -399,6 +399,77 @@ def test_dense_gemm_swiglu_fp4out(m: int, k: int, inter: int):
     assert _sf_match(c_sf, ref_sf, m, inter) > 0.95, "fp4-out SwiGLU SF match < 95%"
 
 
+def _mma_n256_tactics(runner, inputs):
+    """The runner's valid tactics with a 256-wide MMA N tile, one per tile shape."""
+    tactics = {}
+    for tactic in runner.get_valid_tactics(inputs, profile=None):
+        mma_tiler_mn, _, use_prefetch = tactic
+        if mma_tiler_mn[1] == 256 and not use_prefetch:
+            tactics.setdefault(mma_tiler_mn, tactic)
+    assert tactics, "no valid tactic with a 256-wide MMA N tile"
+    return list(tactics.values())
+
+
+# A 256-wide MMA N tile overlaps the two TMEM accumulator buffers
+# (overlapping_accum): every other tile walks its epilogue subtiles in reverse
+# and releases the accumulator early. The ops' default tactic uses a 128-wide
+# N tile, so these tests force N=256 and use shapes with more tiles than SMs,
+# so that each persistent CTA also runs reversed tiles.
+@skip_pre_blackwell
+@skip_rubin
+@pytest.mark.parametrize("m, k, inter", [(4096, 512, 8192)])
+def test_dense_gemm_swiglu_fp4out_mma_n256(m: int, k: int, inter: int):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4SwigluFP4OutBlackwellRunner,
+    )
+
+    torch.manual_seed(0)
+    a_bf16 = torch.randint(-5, 5, (m, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    a, a_sf, a_gsf = _quantize_nvfp4(a_bf16)
+    b, b_sf, b_il, b_sf_il, b_gsf = _swiglu_weight(inter, k)
+    alpha = (a_gsf * b_gsf).view(1)
+
+    ref = _swiglu_ref(a, b, a_sf, b_sf, alpha).to(torch.bfloat16)
+    norm_const = (1.0 / (ref.abs().max().float() / (FP8_E4M3_MAX * FP4_E2M1_MAX))).view(1)
+    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(ref, norm_const, SF_VEC, False, True)
+
+    runner = CuteDSLNVFP4SwigluFP4OutBlackwellRunner()
+    inputs = [a, b_il, a_sf, b_sf_il, alpha, norm_const]
+    for tactic in _mma_n256_tactics(runner, inputs):
+        c, c_sf = runner.forward(inputs, tactic=tactic)
+        assert c.shape == (m, inter // 2)
+        assert _nibble_match(c, ref_fp4) > 0.95, f"{tactic}: SwiGLU nibble match < 95%"
+        assert _sf_match(c_sf, ref_sf, m, inter) > 0.95, f"{tactic}: SwiGLU SF match < 95%"
+
+
+@skip_pre_blackwell
+@skip_rubin
+@pytest.mark.parametrize("m, k, n", [(4096, 512, 8192)])
+def test_dense_gemm_gelu_fp4out_mma_n256(m: int, k: int, n: int):
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+        CuteDSLNVFP4GeluFP4OutBlackwellRunner,
+    )
+
+    torch.manual_seed(0)
+    a_bf16 = torch.randint(-5, 5, (m, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    b_bf16 = torch.randint(-5, 5, (n, k), dtype=torch.int32, device="cuda").to(torch.bfloat16)
+    a, a_sf, a_gsf = _quantize_nvfp4(a_bf16)
+    b, b_sf, b_gsf = _quantize_nvfp4(b_bf16)
+    alpha = (a_gsf * b_gsf).view(1)
+
+    ref = F.gelu(_gemm_ref(a, b, a_sf, b_sf, alpha), approximate="tanh").to(torch.bfloat16)
+    norm_const = (1.0 / (ref.abs().max().float() / (FP8_E4M3_MAX * FP4_E2M1_MAX))).view(1)
+    ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(ref, norm_const, SF_VEC, False, True)
+
+    runner = CuteDSLNVFP4GeluFP4OutBlackwellRunner()
+    inputs = [a, b, a_sf, b_sf, alpha, norm_const]
+    for tactic in _mma_n256_tactics(runner, inputs):
+        c, c_sf = runner.forward(inputs, tactic=tactic)
+        assert c.shape == (m, n // 2)
+        assert _nibble_match(c, ref_fp4) > 0.95, f"{tactic}: GELU nibble match < 95%"
+        assert _sf_match(c_sf, ref_sf, m, n) > 0.95, f"{tactic}: GELU SF match < 95%"
+
+
 # ---------------------------------------------------------------------------
 # fp4-out fallback / switching condition (module-level dispatch in MLP.forward).
 # fp4-out is selected only when m >= _FP4OUT_MIN_M; below it the (still-fused)
