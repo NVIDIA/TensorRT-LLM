@@ -24,11 +24,21 @@ from kv_cache_utils import fill_kv_cache_logical
 
 import tensorrt_llm
 from tensorrt_llm._torch.attention.backends.fmha import gqa_kv_replica_fused as F
+from tensorrt_llm._torch.attention.backends.fmha.flashinfer_trtllm_gen import (
+    _get_generation_workspace_layout,
+)
 from tensorrt_llm._torch.attention.backends.fmha.gqa_decode import (
     GqaDecodeFmha,
     GqaDecodeSetup,
+    GqaKvReplicaFmha,
     GqaSegmentedFmha,
     GqaSplitKvFmha,
+)
+from tensorrt_llm._torch.attention.backends.fmha.gqa_kv_replica import kv_replica_partial_merge_free
+from tensorrt_llm._torch.attention.backends.fmha.gqa_segmented_decode import (
+    reserve_segment_attention_workspace,
+    segment_attention_softmax_bytes,
+    segment_attention_workspace,
 )
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
@@ -332,3 +342,115 @@ def test_kv_replica_fused_partial_matches_reference(q_len: int, lens: list) -> N
         assert torch.equal(torch.isneginf(lse), torch.isneginf(ref_lse))
         if fin.any():
             assert (lse[fin] - ref_lse[fin]).abs().amax().item() < 0.05
+
+
+def _prefix_partial_ref(q_all, kv_pool, tables, seq_lens, q_len, page, bmm1):
+    """FP32 (O, base-2 LSE) of every group head over member 0's pages ((j // page) % cp == 0) of each request's prefix
+    [0, L - q_len), in the [cp, rows, hq, D] / [cp, rows, hq] layout of kv_replica_partial_merge_free's partials."""
+    cp, rows, hq, d = q_all.shape
+    b = rows // q_len
+    dev = q_all.device
+    own = torch.arange(0, tables.shape[2], cp, device=dev)
+    k = kv_pool[tables[:, 0].index_select(1, own).long(), 0].float()  # [b, n_own, page, D]
+    v = kv_pool[tables[:, 1].index_select(1, own).long(), 0].float()
+    pos = own[:, None] * page + torch.arange(page, device=dev)[None, :]
+    q = q_all.float().reshape(cp, b, q_len, hq, d).permute(1, 2, 0, 3, 4).reshape(b, q_len, -1, d)
+    s = torch.einsum("btgd,bnpd->btgnp", q, k) * bmm1
+    vis = pos[None] < (seq_lens.long() - q_len)[:, None, None]
+    s = s.masked_fill(~vis[:, None, None], float("-inf"))
+    m = s.amax(dim=(3, 4), keepdim=True)
+    p = torch.exp(s - m)
+    den = p.sum(dim=(3, 4))
+    o = torch.einsum("btgnp,bnpd->btgd", p, v) / den[..., None]
+    lse = m.squeeze(-1).squeeze(-1) * 1.4426950408889634 + torch.log2(den)
+    o = o.reshape(b, q_len, cp, hq, d).permute(2, 0, 1, 3, 4).reshape(cp, rows, hq, d)
+    return o, lse.reshape(b, q_len, cp, hq).permute(2, 0, 1, 3).reshape(cp, rows, hq)
+
+
+@pytest.mark.parametrize(
+    "max_batch,tokens_per_gen_step,softmax_bytes",
+    [
+        # Qwen3.5-397B FP4 TP4, batch 512 (nvbugs/7046451): 1024 FMHA requests of 16 folded heads
+        (512, 1, 34603008),
+        # with three draft tokens: 512 requests of 64 folded heads
+        (512, 4, 68157440),
+    ],
+)
+def test_kv_replica_segment_workspace_holds_largest_call(
+    max_batch: int, tokens_per_gen_step: int, softmax_bytes: int
+) -> None:
+    """GqaKvReplicaFmha's reserved workspace takes its largest segment attention call, whose softmax stats overflow
+    the trtllm-gen decode's own FMHA workspace (nvbugs/7046451)."""
+    cp, hq, page, max_kv_len = 2, 8, 32, 262144  # KV group of two TP ranks, 8 local q heads
+    group_heads = cp * hq
+    largest = GqaKvReplicaFmha._largest_segment_call(max_batch, tokens_per_gen_step, group_heads)
+    assert segment_attention_softmax_bytes(*largest) == softmax_bytes
+    for b in range(1, max_batch + 1):
+        for q_len in range(1, tokens_per_gen_step + 1):
+            num_requests = b * GqaKvReplicaFmha._num_segments(b, q_len)
+            assert (
+                segment_attention_softmax_bytes(num_requests, q_len * group_heads) <= softmax_bytes
+            )
+
+    # The largest call: max_batch requests of tokens_per_gen_step tokens.
+    b, q_len = max_batch, tokens_per_gen_step
+    segments = GqaKvReplicaFmha._num_segments(b, q_len)
+    assert (b * segments, q_len * group_heads) == largest
+    dev = torch.device("cuda", 0)
+    g = torch.Generator(device="cuda").manual_seed(b + q_len)
+    lens = (torch.randint(q_len + 1, q_len + 300, (b,), device="cuda", generator=g)).to(torch.int32)
+    max_pages = (int(lens.max()) + page - 1) // page
+    nblocks = b * 2 * max_pages + 8
+    kv = (torch.randn(nblocks, 1, page, HEAD_DIM, device="cuda", generator=g) * 0.6).to(
+        torch.float8_e4m3fn
+    )
+    tables = torch.randperm(nblocks, device="cuda", generator=g)[: b * 2 * max_pages]
+    tables = tables.to(torch.int32).view(b, 2, max_pages).contiguous()
+    q_all = (
+        torch.randn(b * q_len, cp, hq, HEAD_DIM, device="cuda", generator=g)
+        .to(torch.float8_e4m3fn)
+        .permute(1, 0, 2, 3)
+    )
+    counter = torch.zeros(largest[0] * largest[1] + 1024, dtype=torch.int32, device="cuda")
+
+    def run(workspace):
+        return kv_replica_partial_merge_free(
+            q_all,
+            kv,
+            tables,
+            lens,
+            max_kv_len,
+            q_len,
+            cp,
+            0,
+            segments,
+            1.0 / 16,
+            1.0,
+            workspace,
+            counter,
+            False,
+        )
+
+    fmha_bytes = int(
+        _get_generation_workspace_layout(torch.bfloat16, b, b * q_len, hq, HEAD_DIM, 1, 64)[
+            "trtllm_gen_workspace_size"
+        ]
+    )
+    with pytest.raises(RuntimeError, match="trtllm_gen_softmax_workspace"):
+        run(torch.empty(fmha_bytes, dtype=torch.uint8, device=dev))
+    reserve_segment_attention_workspace(dev, softmax_bytes + fmha_bytes)
+    o, lse, _, _, valid = run(segment_attention_workspace(dev))
+    torch.cuda.synchronize()
+
+    # LSE merge of this member's segments vs the reference over its pages
+    seg_valid = valid[0].bool()[None, :, :, None]  # [1, S, rows, 1]
+    seg_lse = torch.where(seg_valid, lse, float("-inf"))
+    m = seg_lse.amax(dim=1)
+    w = torch.exp2(seg_lse - m[:, None])
+    merged_o = (w[..., None] * o.float()).sum(dim=1) / w.sum(dim=1)[..., None]
+    merged_lse = m + torch.log2(w.sum(dim=1))
+    ref_o, ref_lse = _prefix_partial_ref(q_all, kv, tables, lens, q_len, page, 1.0 / 16)
+    rf = ref_o.bfloat16().float()
+    rel = ((merged_o - rf).abs() / rf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-3)).amax()
+    assert rel.item() < 0.07, rel.item()
+    assert (merged_lse - ref_lse).abs().amax().item() < 0.05

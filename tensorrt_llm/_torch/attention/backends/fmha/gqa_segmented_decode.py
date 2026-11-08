@@ -22,7 +22,7 @@ At small batch the trtllm-gen in-kernel split-KV reduction dominates. Instead:
 """
 
 import math
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import torch
 import triton
@@ -37,6 +37,45 @@ if IS_FLASHINFER_AVAILABLE:
     import flashinfer
 
 LOG2E = 1.4426950408889634
+# Query rows of a segmented call folded per KV head (q_len x heads per KV head).
+MAX_FOLDED_ROWS = 64
+
+# FlashInfer's trtllm-gen decode with an LSE output (csrc/trtllm_fmha_kernel_launcher.cu) takes float2 softmax stats
+# for round_up(max_q_len, 256) rows of every (request, head) plus a 1 MiB guard off the front of its workspace; the
+# multi-CTA scratch gets the rest.
+_SOFTMAX_STATS_ROWS = 256  # round_up(max_q_len = 1, 256)
+_SOFTMAX_STATS_GUARD_BYTES = 1 << 20
+
+# device index -> workspace of the segment attention calls, shared by every layer: the calls are ordered on one stream.
+_WORKSPACES: Dict[int, torch.Tensor] = {}
+
+
+def segment_attention_softmax_bytes(num_requests: int, num_heads: int) -> int:
+    """Workspace bytes FlashInfer takes for the softmax stats of a segment_attention call of num_requests one-token
+    requests of num_heads (folded) heads, ahead of the multi-CTA scratch."""
+    return 8 * _SOFTMAX_STATS_ROWS * num_requests * num_heads + _SOFTMAX_STATS_GUARD_BYTES
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def reserve_segment_attention_workspace(device: torch.device, nbytes: int) -> None:
+    """Grow this device's segment attention workspace to at least nbytes. Only outside CUDA graph capture: callers
+    reserve their largest call before capture, so captured graphs keep valid addresses."""
+    idx = _device_index(device)
+    workspace = _WORKSPACES.get(idx)
+    if workspace is None or workspace.numel() < nbytes:
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "The segmented decode workspace must be allocated before CUDA graph capture."
+            )
+        _WORKSPACES[idx] = torch.empty(nbytes, dtype=torch.uint8, device=torch.device("cuda", idx))
+
+
+def segment_attention_workspace(device: torch.device) -> Optional[torch.Tensor]:
+    """This device's segment attention workspace (reserve_segment_attention_workspace), None before a reservation."""
+    return _WORKSPACES.get(_device_index(device))
 
 
 @triton.jit
@@ -304,7 +343,8 @@ def segment_attention(
 
     Calls FlashInfer's trtllm-gen decode op directly (the op behind ``trtllm_batch_decode_with_kv_cache``), skipping
     the public wrapper's per-call argument validation. Launched without PDL: the FMHA may read the segment tables /
-    lengths, which the kernel right before it writes, before its dependency wait.
+    lengths, which the kernel right before it writes, before its dependency wait. The workspace holds
+    segment_attention_softmax_bytes(seg_q.shape[0], seg_q.shape[1]) of softmax stats ahead of the multi-CTA scratch.
     """
     num_requests, num_heads, _ = seg_q.shape
     sm_count = flashinfer.decode.get_device_sm_count(seg_q.device)
@@ -369,7 +409,7 @@ def segmented_decode_supported(
         and batch * num_segments <= 256
         and 1 <= q_len <= 16
         and num_heads % num_kv_heads == 0
-        and q_len * (num_heads // num_kv_heads) <= 64
+        and q_len * (num_heads // num_kv_heads) <= MAX_FOLDED_ROWS
         and head_dim in (64, 128, 256)
         and window_left < 0
         and not has_sinks

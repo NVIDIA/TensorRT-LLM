@@ -28,6 +28,7 @@ They apply the output gate the module offers (``AttentionForwardArgs.output_gate
 decode kernel for a call whose runtime layout their kernel does not take.
 """
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -44,7 +45,14 @@ from . import gqa_kv_replica_fused, gqa_split_kv_decode
 from .flashinfer_trtllm_gen import FlashInferTrtllmGenFmha, _get_generation_workspace_layout
 from .gqa_kv_replica import EXCHANGE_CHANNELS, kv_replica_decode, kv_replica_fused_decode
 from .gqa_kv_replica_fused import kv_replica_fused_state, kv_replica_fused_supported
-from .gqa_segmented_decode import segmented_decode, segmented_decode_supported
+from .gqa_segmented_decode import (
+    MAX_FOLDED_ROWS,
+    reserve_segment_attention_workspace,
+    segment_attention_softmax_bytes,
+    segment_attention_workspace,
+    segmented_decode,
+    segmented_decode_supported,
+)
 from .gqa_split_kv_decode import (
     split_kv_decode,
     split_kv_decode_buffers,
@@ -312,6 +320,35 @@ class GqaDecodeFmha(FlashInferTrtllmGenFmha):
                     "The GQA decode counter buffer must be allocated before CUDA graph capture."
                 )
             self._counter_buffer = torch.zeros(slots, dtype=torch.int32, device=device)
+
+    def _reserve_segment_workspace(
+        self, q: torch.Tensor, num_requests: int, num_heads: int
+    ) -> None:
+        """Reserve the workspace of this library's largest segment attention call (num_requests x num_heads,
+        gqa_segmented_decode.py) before CUDA graph capture: FlashInfer's softmax stats, then a multi-CTA scratch of
+        the size the trtllm-gen decode gets (its slice of the attention workspace)."""
+        attn = self.attn
+        layout = _get_generation_workspace_layout(
+            q.dtype, 1, 1, attn.num_heads, attn.head_dim, attn.num_kv_heads, attn.rope_params.dim
+        )
+        reserve_segment_attention_workspace(
+            q.device,
+            segment_attention_softmax_bytes(num_requests, num_heads)
+            + int(layout["trtllm_gen_workspace_size"]),
+        )
+
+    @staticmethod
+    def _segment_workspace(
+        device: torch.device, num_requests: int, num_heads: int, fmha_workspace: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """The reserved workspace when it holds a segment attention call of num_requests x num_heads plus a scratch
+        of fmha_workspace's size, else None (the call then takes the trtllm-gen decode)."""
+        workspace = segment_attention_workspace(device)
+        need = (
+            segment_attention_softmax_bytes(num_requests, num_heads)
+            + fmha_workspace.numel() * fmha_workspace.element_size()
+        )
+        return workspace if workspace is not None and workspace.numel() >= need else None
 
     @staticmethod
     def _run_fold_prologue(params: FmhaParams, plan: KvAppendPlan) -> None:
@@ -755,6 +792,63 @@ class GqaKvReplicaFmha(_GqaKvReplicaFmha):
         group_heads = self._kv_replicas * self.attn.num_heads
         return segment_requests * q_len * group_heads <= self._counter_slots(metadata)
 
+    @staticmethod
+    @functools.lru_cache(maxsize=None)
+    def _largest_segment_call(
+        max_num_requests: int, tokens_per_gen_step: int, group_heads: int
+    ) -> Tuple[int, int]:
+        """(FMHA requests, folded heads) of the segment attention call with the most softmax stats over the calls
+        of up to max_num_requests requests of q_len <= tokens_per_gen_step: b * segments requests of q_len x
+        group_heads, largest at b = max_num_requests or 2 (the segments drop from two to one above two requests)."""
+        calls = (
+            (b * GqaKvReplicaFmha._num_segments(b, q_len), q_len * group_heads)
+            for b in (max_num_requests, min(max_num_requests, 2))
+            for q_len in range(1, tokens_per_gen_step + 1)
+        )
+        return max(calls, key=lambda call: call[0] * call[1])
+
+    def prepare_workspace(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        metadata: "TrtllmAttentionMetadata",
+        forward_args: AttentionForwardArgs,
+        workspace: torch.Tensor,
+    ) -> None:
+        super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
+        self._reserve_segment_workspace(
+            q,
+            *self._largest_segment_call(
+                metadata.max_num_requests,
+                self._tokens_per_gen_step,
+                self._kv_replicas * self.attn.num_heads,
+            ),
+        )
+
+    def _run_dedicated(
+        self,
+        params: FmhaParams,
+        q: torch.Tensor,
+        kv_pool: torch.Tensor,
+        block_tables: torch.Tensor,
+        max_kv_len: int,
+        bmm1_scale,
+        bmm2_scale,
+        fmha_workspace: torch.Tensor,
+    ) -> bool:
+        q_len = params.input_seq_length
+        # Same shapes and reservation on every member of the KV group, so the group falls back together.
+        workspace = self._segment_workspace(
+            q.device,
+            q.shape[0] // q_len * self._num_segments(params.num_requests, q_len),
+            q_len * self._kv_replicas * params.attn.num_heads,
+            fmha_workspace,
+        )
+        return workspace is not None and super()._run_dedicated(
+            params, q, kv_pool, block_tables, max_kv_len, bmm1_scale, bmm2_scale, workspace
+        )
+
     def _run_kv_replica(
         self,
         params,
@@ -1028,6 +1122,28 @@ class GqaSegmentedFmha(GqaDecodeFmha):
     ) -> None:
         super().prepare_workspace(q, k, v, metadata, forward_args, workspace)
         self._ensure_counter_buffer(metadata, q.device)
+        attn = self.attn
+        self._reserve_segment_workspace(
+            q,
+            *self._largest_segment_call(
+                metadata.max_num_requests,
+                attn.gqa_decode.tokens_per_gen_step,
+                attn.num_heads,
+                attn.num_kv_heads,
+            ),
+        )
+
+    @staticmethod
+    def _largest_segment_call(
+        max_num_requests: int, tokens_per_gen_step: int, num_heads: int, num_kv_heads: int
+    ) -> Tuple[int, int]:
+        """(FMHA requests, folded heads) of the largest segment attention call: _SEGMENTS per request of up to
+        _SEGMENTED_MAX_BATCH requests, each KV head folding q_len x group <= MAX_FOLDED_ROWS query rows."""
+        group = num_heads // num_kv_heads
+        return (
+            min(max_num_requests, _SEGMENTED_MAX_BATCH) * _SEGMENTS,
+            num_kv_heads * min(tokens_per_gen_step * group, MAX_FOLDED_ROWS),
+        )
 
     def _run_dedicated(
         self,
@@ -1041,6 +1157,12 @@ class GqaSegmentedFmha(GqaDecodeFmha):
         fmha_workspace: torch.Tensor,
     ) -> bool:
         attn = params.attn
+        q_len = params.input_seq_length
+        workspace = self._segment_workspace(
+            q.device, q.shape[0] // q_len * _SEGMENTS, q_len * attn.num_heads, fmha_workspace
+        )
+        if workspace is None:
+            return False
         gate = self._gate(params)
         segmented_decode(
             q,
@@ -1053,7 +1175,7 @@ class GqaSegmentedFmha(GqaDecodeFmha):
             _SEGMENTS,
             bmm1_scale,
             bmm2_scale,
-            fmha_workspace,
+            workspace,
             self._counter_buffer,
             params.output,
             self._enable_pdl,
