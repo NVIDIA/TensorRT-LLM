@@ -88,20 +88,6 @@ def _low_priority_recurrent_state(_ordinal: int, life_cycle: object) -> int:
     return PAGE_PRIORITY_MIN
 
 
-class _StateSlotKDAReplayState(KDAReplayState):
-    """``KDAReplayState`` whose replay buffers live in the recurrent-state slot.
-
-    The SM107 KDA kernels (the fused verify, the replay conv-window commit) address the replay
-    caches and the accepted-draft counts by the recurrent-state slot, so the manager declares the
-    replay buffers with the recurrent state rather than as a replay region of their own.
-    """
-
-    @property
-    @override
-    def replay_shares_state_slot(self) -> bool:
-        return True
-
-
 class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
     """``KimiK3HybridCacheManager`` with KDA mid-chunk snapshots (see the module).
 
@@ -109,11 +95,13 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
     reuse is on and the manager is not a draft model's; this class keeps them off.
 
     The KDA replay buffers of speculative decoding share the recurrent-state slot
-    (:class:`_StateSlotKDAReplayState`), and the KV cache size estimate counts them per state slot.
+    and the KV cache size estimate counts them per state slot.
 
     With block reuse on, the recurrent snapshot and reuse counters are logged at INFO at most once a
     minute, and the pool ratio a unified draft pool resolves to is logged once.
     """
+
+    _replay_shares_state_slot = True
 
     # Step alignment, in tokens, at which the model's KDA prefill stores a snapshot inside a context
     # step; 0: no mid-chunk snapshots.
@@ -149,19 +137,6 @@ class KimiK3Sm107CacheManager(KimiK3HybridCacheManager):
         super().__init__(*args, **kwargs)
         self._kda_midchunk_snapshot_alignment = self._get_kda_midchunk_snapshot_alignment()
         self._low_priority_snapshot_prompt_len = self._get_low_priority_snapshot_prompt_len()
-
-    @override
-    def _initialize_spec_state(self):
-        state = super()._initialize_spec_state()
-        if not isinstance(state, KDAReplayState) or state.replay_shares_state_slot:
-            return state
-        self._kda_replay = _StateSlotKDAReplayState(
-            state.num_speculative_tokens,
-            stochastic_rounding=self._mamba_ssm_stochastic_rounding,
-            draft_records=state.draft_records,
-        )
-        self._kda_replay.validate(self._state_layout)
-        return self._kda_replay
 
     @classmethod
     @override

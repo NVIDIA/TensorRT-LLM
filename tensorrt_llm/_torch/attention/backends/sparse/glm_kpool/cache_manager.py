@@ -155,6 +155,7 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
                 num_spec,
                 stochastic_rounding=self._mamba_ssm_stochastic_rounding,
                 draft_records=self._requested_draft_records,
+                replay_shares_state_slot=self._requested_draft_records,
             )
             self._kda_replay.validate(self._state_layout)
             return self._kda_replay
@@ -606,6 +607,8 @@ class Glm5NextCacheManager(MambaHybridCacheManagerV2):
         kv_cache_config: KvCacheConfig,
         **kwargs,
     ) -> int:
+        if kwargs.get("kda_draft_records", False):
+            return 0
         return KDAReplayRegion.estimate_fixed_bytes(
             model_config, mapping, max_batch_size, kv_cache_config.max_util_for_resume, **kwargs
         )
