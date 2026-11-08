@@ -66,6 +66,7 @@ used, to keep the compiler's start-up short.
 import hashlib
 import os
 import sys
+import threading
 import time
 
 SHARE_DIR_ENV = "TLLM_JIT_SHARE_DIR"
@@ -86,6 +87,8 @@ _installed = False
 _slot: int | None = None
 _kernel_sharing_depth = 0
 _cute_salt: str | None = None
+# .claim: (claim, failed) of the kernel this thread claimed and has not stored.
+_unstored = threading.local()
 
 
 class KernelBusy(RuntimeError):
@@ -185,11 +188,33 @@ class sharing_kernels:
     def __exit__(self, *exc_info):
         global _kernel_sharing_depth
         _kernel_sharing_depth -= 1
+        _release_unstored_claim()
         return False
 
 
 def _kernel_sharing_active() -> bool:
     return _kernel_sharing_depth > 0 and bool(os.environ.get(SHARE_DIR_ENV))
+
+
+def _release_unstored_claim() -> str | None:
+    """Mark the kernel this thread claimed failed if it has not stored it, and return its claim.
+
+    A runner stores the kernel it claimed right after compiling it, before it
+    looks up another, so a claim still open at the thread's next lookup or store
+    is one whose compile raised. The ``.failed`` file stops the other processes
+    waiting for it.
+    """
+    pending = getattr(_unstored, "claim", None)
+    if pending is None:
+        return None
+    _unstored.claim = None
+    claim, failed = pending
+    try:
+        with open(failed, "w") as f:
+            f.write("compile raised\n")
+    except OSError:
+        pass
+    return claim
 
 
 class SharedKernelCache(dict):
@@ -200,7 +225,8 @@ class SharedKernelCache(dict):
     kernel when another process exported it, waits for it when another process
     is compiling it (or, inside :class:`defer_busy_builds`, raises
     :class:`KernelBusy`), and otherwise claims it, so that the store that
-    follows exports it.
+    follows exports it. A claimed kernel whose compile raises is marked failed
+    at the thread's next lookup or store, which the waiting processes see.
     """
 
     def __init__(self, owner: str, entries=()):
@@ -219,6 +245,7 @@ class SharedKernelCache(dict):
         return name, base + ".o", base + ".claim", base + ".failed", base + ".json"
 
     def __contains__(self, key) -> bool:
+        failed_here = _release_unstored_claim()
         if dict.__contains__(self, key):
             return True
         if not _kernel_sharing_active():
@@ -227,11 +254,14 @@ class SharedKernelCache(dict):
         if paths is None:
             return False
         name, obj, claim, failed, meta = paths
+        if failed_here == claim:
+            return False  # Its compile raised here; the runner compiles it again.
         start = time.time()
         os.makedirs(os.path.dirname(obj), exist_ok=True)
         action = "cute-loaded"
         if not os.path.exists(obj):
             if _claim(claim):
+                _unstored.claim = (claim, failed)
                 return False  # This process compiles it; the store exports it.
             if _claim_is_stale(claim):
                 return False
@@ -257,6 +287,10 @@ class SharedKernelCache(dict):
         if paths is None:
             return
         name, obj, claim, failed, meta = paths
+        pending = getattr(_unstored, "claim", None)
+        if pending is not None and pending[0] == claim:
+            _unstored.claim = None
+        _release_unstored_claim()
         if os.path.exists(obj):
             return
         start = time.time()

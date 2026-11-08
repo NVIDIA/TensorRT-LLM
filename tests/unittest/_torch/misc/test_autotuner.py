@@ -2462,7 +2462,8 @@ def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
         first[(1, "tile")] = "kernel"
         assert (1, "tile") in second
         assert second[(1, "tile")] == ("loaded", "kernel")
-        assert (2, "tile") not in first  # claimed, never exported
+        # Another process claimed (2, "tile") and has not exported it yet.
+        open(second._paths((2, "tile"))[2], "w").close()
         with jit_share.defer_busy_builds(), pytest.raises(jit_share.KernelBusy):
             _ = (2, "tile") in second
         assert (2, "tile") not in second
@@ -2470,6 +2471,33 @@ def test_shared_kernel_cache_exports_and_loads(monkeypatch, tmp_path):
         assert object() not in first  # its repr holds an address: not shared
         assert claims() == before
     assert (1, "tile") not in jit_share.SharedKernelCache("Runner")
+
+
+def test_shared_kernel_cache_marks_a_raised_compile_failed(
+        monkeypatch, tmp_path):
+    """A claimed kernel that is never stored (its compile raised) is marked
+    failed at the thread's next lookup, or when tuning ends: this process
+    compiles it again without waiting for its own claim, and another process
+    (a second instance here) stops waiting for it."""
+    waits = []
+    wait = jit_share._wait
+
+    def record_wait(obj, failed):
+        waits.append(os.path.exists(failed))
+        return wait(obj, failed)
+
+    monkeypatch.setenv(jit_share.SHARE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(jit_share._WAIT_ENV, "600")
+    monkeypatch.setattr(jit_share, "_cute_identity", lambda: "test")
+    monkeypatch.setattr(jit_share, "_wait", record_wait)
+    here, other = (jit_share.SharedKernelCache("Runner") for _ in range(2))
+    with jit_share.sharing_kernels():
+        assert (1, "tile") not in here  # claimed; its compile raises
+        assert (1, "tile") not in here  # compiled here again
+        assert (1, "tile") not in other
+        assert (2, "tile") not in here  # claimed; tuning ends before a store
+    assert waits == [True]
+    assert len(list((tmp_path / "cute").glob("*.failed"))) == 2
 
 
 def test_build_across_ranks_runs_only_claimed_items(monkeypatch, tmp_path):
