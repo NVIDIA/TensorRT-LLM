@@ -16,7 +16,11 @@ import torch
 import torch.nn.functional as F
 from _torch.helpers import calc_diff, per_block_cast_to_fp8_e8m0
 
+import tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale as triton_moe
 from tensorrt_llm._torch.moe.fused_moe.fused_moe_triton_fp8_block_scale import (
+    _BLOCK_SIZE_M,
+    _BLOCK_SIZE_M_LARGE,
+    _block_size_m,
     run_triton_fp8_block_scale_moe,
 )
 from tensorrt_llm._torch.moe.fused_moe.interface import ActivationType
@@ -120,6 +124,10 @@ SHAPES = [
     MoeShape("tiny_topk1", num_tokens=64, hidden=256, intermediate=512, num_experts=8, top_k=1),
     # Enough rows per expert for the prefill block size
     MoeShape("tiny_prefill", num_tokens=256, hidden=256, intermediate=512, num_experts=8, top_k=2),
+    # The same, through the unfused second-GEMM store
+    MoeShape(
+        "tiny_prefill_topk1", num_tokens=512, hidden=256, intermediate=512, num_experts=8, top_k=1
+    ),
     MoeShape(
         "laguna_corr",
         num_tokens=64,
@@ -141,6 +149,15 @@ SHAPES = [
 # The BF16 reference is intentionally simple and slow, so keep the large shape
 # available for manual experiments but out of the correctness parametrization.
 CORRECTNESS_SHAPES = [s for s in SHAPES if s.name != "laguna_bench"]
+
+# Global shapes split over EP_SIZE ranks: 64 and 16 rows per local expert slot,
+# so both tile heights.
+EP_SIZE = 2
+EP_SHAPES = [
+    MoeShape("ep2_prefill", num_tokens=256, hidden=256, intermediate=512, num_experts=16, top_k=2),
+    MoeShape("ep2_decode", num_tokens=64, hidden=256, intermediate=512, num_experts=16, top_k=2),
+]
+SHAPES_BY_NAME = {s.name: s for s in SHAPES + EP_SHAPES}
 
 
 def _make_inputs(
@@ -191,6 +208,47 @@ def _make_inputs(
     )
 
 
+def _local_slot_inputs(
+    inputs: dict[str, torch.Tensor | int | float | None], ep_size: int, ep_rank: int
+) -> dict[str, torch.Tensor | int | float | None]:
+    """What one EP rank's ``TrtllmTritonFp8BlockScalesImpl.run_moe`` passes: the
+    weights of its experts only, and every pair of another rank's expert
+    clamped onto an edge slot with a zero scale (``_local_slot_ids``)."""
+    num_local_experts = inputs["w3_w1"].shape[0] // ep_size
+    slot_start = ep_rank * num_local_experts
+    offsets = inputs["token_selected_experts"] - slot_start
+    local_ids = offsets.clamp(0, num_local_experts - 1)
+    local = slice(slot_start, slot_start + num_local_experts)
+    return {
+        **inputs,
+        "token_selected_experts": local_ids,
+        "token_final_scales": inputs["token_final_scales"] * (local_ids == offsets),
+        "w3_w1": inputs["w3_w1"][local],
+        "w3_w1_scales": inputs["w3_w1_scales"][local],
+        "w2": inputs["w2"][local],
+        "w2_scales": inputs["w2_scales"][local],
+    }
+
+
+def _assert_matches_reference(out: torch.Tensor, ref: torch.Tensor, name: str) -> None:
+    """Cosine difference of the whole output and of every token, so that one
+    wrong or missing row cannot hide in the aggregate."""
+    diff = calc_diff(out, ref).item()
+    assert diff < 1e-2, f"shape={name} cosine-diff={diff:.4e} exceeds 1e-2"
+
+    x, y = out.double(), ref.double()
+    denominator = (x * x + y * y).sum(dim=-1)
+    # A row both sides leave at zero (no pair of this rank's experts) matches.
+    row_diff = torch.where(
+        denominator > 0, 1 - 2 * (x * y).sum(dim=-1) / denominator.clamp_min(1e-300), 0.0
+    )
+    worst = row_diff.argmax().item()
+    worst_diff = row_diff[worst].item()
+    assert worst_diff < 1e-2, (
+        f"shape={name} token {worst} cosine-diff={worst_diff:.4e} exceeds 1e-2"
+    )
+
+
 ACTIVATIONS = [
     pytest.param(int(ActivationType.Swiglu), id="swiglu"),
     pytest.param(int(ActivationType.Geglu), id="geglu"),
@@ -209,8 +267,7 @@ def test_fp8_matches_bf16_reference(shape: MoeShape, activation_type: int) -> No
     assert out_fp8.shape == out_ref.shape == (shape.num_tokens, shape.hidden)
     assert out_fp8.dtype == torch.bfloat16
 
-    diff = calc_diff(out_fp8, out_ref).item()
-    assert diff < 1e-2, f"shape={shape.name} cosine-diff={diff:.4e} exceeds 1e-2"
+    _assert_matches_reference(out_fp8, out_ref, shape.name)
 
 
 @skip_unsupported
@@ -228,8 +285,7 @@ def test_swiglu_clamp_matches_bf16_reference(shape: MoeShape) -> None:
     out_ref = _run_moe_bf16_reference(**inputs)
     out_unclamped = run_triton_fp8_block_scale_moe(**{**inputs, "swiglu_limit": None})
 
-    diff = calc_diff(out_fp8, out_ref).item()
-    assert diff < 1e-2, f"shape={shape.name} cosine-diff={diff:.4e} exceeds 1e-2"
+    _assert_matches_reference(out_fp8, out_ref, shape.name)
     assert not torch.allclose(out_fp8, out_unclamped), "the clamp changed nothing"
 
 
@@ -243,3 +299,82 @@ def test_clamp_is_rejected_for_a_non_swiglu_activation() -> None:
 
     with pytest.raises(ValueError, match="clamps SwiGLU only"):
         run_triton_fp8_block_scale_moe(**inputs)
+
+
+def test_block_size_m_threshold() -> None:
+    """Pins the switch to the large tile, and which test shapes take it, so that
+    moving the threshold cannot silently drop the 64-row path from the tests."""
+    assert _block_size_m(256, 2, 8) == _BLOCK_SIZE_M_LARGE
+    assert _block_size_m(255, 2, 8) == _BLOCK_SIZE_M
+
+    def block_size_m(name: str) -> int:
+        s = SHAPES_BY_NAME[name]
+        num_local_experts = s.num_experts // (EP_SIZE if s in EP_SHAPES else 1)
+        return _block_size_m(s.num_tokens, s.top_k, num_local_experts)
+
+    for name in ("tiny_prefill", "tiny_prefill_topk1", "ep2_prefill"):
+        assert block_size_m(name) == _BLOCK_SIZE_M_LARGE, name
+    for name in ("tiny", "tiny_topk1", "ep2_decode"):
+        assert block_size_m(name) == _BLOCK_SIZE_M, name
+
+
+@skip_unsupported
+@pytest.mark.parametrize(
+    ("name", "block_size_m"),
+    [
+        ("tiny", _BLOCK_SIZE_M),
+        ("tiny_prefill", _BLOCK_SIZE_M_LARGE),
+        ("tiny_prefill_topk1", _BLOCK_SIZE_M_LARGE),
+    ],
+)
+def test_one_block_size_reaches_the_alignment_and_both_gemms(
+    name: str, block_size_m: int, monkeypatch
+) -> None:
+    """The kernel reads one expert id per BLOCK_SIZE_M rows of the alignment, so
+    the alignment and both GEMMs must get the same block size."""
+    seen = []
+    align = triton_moe.moe_align_block_size
+    gemm = triton_moe._invoke_bf16act_fp8w_moe_kernel
+
+    def recording_align(topk_ids, block_size, num_experts):
+        seen.append(block_size)
+        return align(topk_ids, block_size, num_experts)
+
+    def recording_gemm(*args, block_size_m, **kwargs):
+        seen.append(block_size_m)
+        return gemm(*args, block_size_m=block_size_m, **kwargs)
+
+    monkeypatch.setattr(triton_moe, "moe_align_block_size", recording_align)
+    monkeypatch.setattr(triton_moe, "_invoke_bf16act_fp8w_moe_kernel", recording_gemm)
+    run_triton_fp8_block_scale_moe(**_make_inputs(SHAPES_BY_NAME[name]))
+
+    assert seen == [block_size_m] * 3
+
+
+@skip_unsupported
+@pytest.mark.parametrize("shape", EP_SHAPES, ids=lambda s: s.name)
+def test_ep_ranks_sum_to_bf16_reference(shape: MoeShape) -> None:
+    """Each rank computes the pairs of other ranks' experts on its edge slots with
+    a zero scale; the ranks' outputs must still add up to the whole MoE."""
+    inputs = _make_inputs(shape)
+
+    out_ref = _run_moe_bf16_reference(**inputs)
+    out_fp8 = sum(
+        run_triton_fp8_block_scale_moe(**_local_slot_inputs(inputs, EP_SIZE, ep_rank)).float()
+        for ep_rank in range(EP_SIZE)
+    )
+
+    _assert_matches_reference(out_fp8.bfloat16(), out_ref, shape.name)
+
+
+@skip_unsupported
+def test_each_block_size_is_tuned_separately() -> None:
+    """BLOCK_SIZE_M is in the autotune key, so that one tile height never runs
+    the config tuned for the other."""
+    for name in ("tiny", "tiny_prefill"):
+        run_triton_fp8_block_scale_moe(**_make_inputs(SHAPES_BY_NAME[name]))
+
+    tuned = {key[:3] for key in triton_moe._fused_moe_bf16act_fp8w_kernel.cache}
+    hidden, intermediate = SHAPES_BY_NAME["tiny"].hidden, SHAPES_BY_NAME["tiny"].intermediate
+    for n, k in ((2 * intermediate, hidden), (hidden, intermediate)):
+        assert {(n, k, _BLOCK_SIZE_M), (n, k, _BLOCK_SIZE_M_LARGE)} <= tuned, (n, k, tuned)
