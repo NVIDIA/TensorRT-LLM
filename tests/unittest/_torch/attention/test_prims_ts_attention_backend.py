@@ -606,7 +606,7 @@ def test_prims_ts_context_lazy_rescale_with_late_key_block(
     wrapper.plan(
         device=device,
         batch_size=1,
-        max_seq_len_q=q_len,
+        max_q_len=q_len,
         max_kv_len=kv_len,
         num_qo_heads=1,
         num_kv_heads=1,
@@ -617,7 +617,7 @@ def test_prims_ts_context_lazy_rescale_with_late_key_block(
         out_dtype=dtype,
         page_size=page_size,
         mask_type="dense",
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
     )
     wrapper.run(query, k_cache, v_cache, qo_indptr, block_tables, seq_lens, out=output)
     torch.testing.assert_close(output, expected, rtol=1e-2, atol=1e-2)
@@ -1404,18 +1404,54 @@ _CACHE_FREE_CASE = dict(
 )
 
 
-@pytest.mark.parametrize("outlier", [1.0, 10.0])
 @pytest.mark.parametrize(
-    ("qk_dtype", "v_dtype", "vc_attention", "vc_repair_budget", "vc_smooth", "seq_len"),
+    (
+        "qk_dtype",
+        "v_dtype",
+        "vc_attention",
+        "vc_repair_budget",
+        "vc_smooth",
+        "seq_len",
+        "outlier",
+        "cuda_graph",
+    ),
     [
-        ("bf16", "fp8", False, 0.0, True, 256),
-        ("fp8", "fp8", False, 0.0, True, 256),
-        ("bf16", "fp8", True, 0.0, True, 256),
-        ("bf16", "fp8", True, 0.0, False, 200),
-        ("bf16", "fp8", True, 0.01, True, 200),
-        ("fp8", "fp8", True, 0.0, True, 200),
-        ("fp8", "fp8", True, 0.0, False, 256),
-        ("fp8", "fp8", True, 0.01, True, 256),
+        pytest.param(
+            "bf16",
+            "fp8",
+            False,
+            0.0,
+            True,
+            200,
+            1.0,
+            True,
+            id="bf16-qk-fp8-v-partial-cuda-graph",
+        ),
+        pytest.param(
+            "fp8",
+            "fp8",
+            False,
+            0.0,
+            True,
+            256,
+            1.0,
+            True,
+            id="fp8-qkv-cuda-graph",
+        ),
+        ("bf16", "fp8", False, 0.0, True, 200, 10.0, False),
+        ("fp8", "fp8", False, 0.0, True, 256, 10.0, False),
+        ("bf16", "fp8", True, 0.0, True, 256, 1.0, False),
+        ("bf16", "fp8", True, 0.0, True, 256, 10.0, False),
+        ("bf16", "fp8", True, 0.0, False, 200, 1.0, False),
+        ("bf16", "fp8", True, 0.0, False, 200, 10.0, False),
+        ("bf16", "fp8", True, 0.01, True, 200, 1.0, False),
+        ("bf16", "fp8", True, 0.01, True, 200, 10.0, False),
+        ("fp8", "fp8", True, 0.0, True, 200, 1.0, False),
+        ("fp8", "fp8", True, 0.0, True, 200, 10.0, False),
+        ("fp8", "fp8", True, 0.0, False, 256, 1.0, False),
+        ("fp8", "fp8", True, 0.0, False, 256, 10.0, False),
+        ("fp8", "fp8", True, 0.01, True, 256, 1.0, False),
+        ("fp8", "fp8", True, 0.01, True, 256, 10.0, False),
     ],
 )
 def test_prims_ts_cache_free_fp8_recipes(
@@ -1427,6 +1463,7 @@ def test_prims_ts_cache_free_fp8_recipes(
     vc_smooth: bool,
     seq_len: int,
     outlier: float,
+    cuda_graph: bool,
 ) -> None:
     """Cache-free recipes plan FP8 operands, fold the per-tensor scales, and match SDPA.
 
@@ -1435,6 +1472,8 @@ def test_prims_ts_cache_free_fp8_recipes(
     logits are unchanged. Each sample is checked against SDPA. The VC rows cover both
     V-Smooth phases, inside the window with tile means and after it on the plain
     demean-off plan, and a length that is not a multiple of the 128-token tile.
+    The CUDA graph rows replay quantization and attention with changed Q/K/V,
+    covering both float/tensor and tensor/tensor global-scale combinations.
     """
     from tensorrt_llm._torch.attention.backends.prims_ts.context import BatchPrefillTSWrapper
     from tensorrt_llm.visual_gen.args import QuantAttentionConfig
@@ -1447,17 +1486,17 @@ def test_prims_ts_cache_free_fp8_recipes(
     )
     plans: list[dict] = []
     runs: list[dict] = []
-    check_graph = not vc_attention and qk_dtype == "fp8" and outlier == 1.0
     forward_calls: list[tuple] = []
-    if check_graph:
+    if cuda_graph:
         from tensorrt_llm._torch.attention.backends.fmha.prims_ts import PrimsTSFmha
 
+        assert not vc_attention
         forward = PrimsTSFmha._forward_without_kv_cache
 
-        def recording_forward(self, *args, **kwargs):
+        def recording_forward(self: PrimsTSFmha, *args: object, **kwargs: object) -> None:
             # The library keeps only a weak reference to its owning attention.
             forward_calls.append((self.attn, self, args, kwargs))
-            return forward(self, *args, **kwargs)
+            forward(self, *args, **kwargs)
 
         monkeypatch.setattr(PrimsTSFmha, "_forward_without_kv_cache", recording_forward)
 
@@ -1543,27 +1582,33 @@ def test_prims_ts_cache_free_fp8_recipes(
         rtol=BF16_RTOL,
     )
 
-    if check_graph:
+    if cuda_graph:
         ((_owner, library, args, kwargs),) = forward_calls
         q_input, k_input, v_input = args[:3]
-        original_q, original_v = q_input.clone(), v_input.clone()
+        captured_output = args[4].output
+        assert captured_output is not None
+        original_q, original_k, original_v = q_input.clone(), k_input.clone(), v_input.clone()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             forward(library, *args, **kwargs)
         # Replay the warmed adapter, including quantization and its live scales.
-        for q_gain, v_gain in ((2.0, 4.0), (0.25, 0.5)):
+        for q_gain, k_gain, v_gain in ((3.0, 0.7, 0.3), (0.3, 1.7, 3.0)):
             q_input.copy_(original_q * q_gain)
+            k_input.copy_(original_k * k_gain)
             v_input.copy_(original_v * v_gain)
+            captured_output.zero_()
             graph.replay()
             expected = (
                 torch.nn.functional.scaled_dot_product_attention(
                     bhsd(q_input), bhsd(k_input), bhsd(v_input)
                 )
                 .transpose(1, 2)
-                .reshape_as(out)
+                .reshape_as(captured_output)
             )
+            relative_error = (captured_output.float() - expected).norm() / expected.norm()
+            assert relative_error.item() < 0.15
             torch.testing.assert_close(
-                out.float() / v_gain,
+                captured_output.float() / v_gain,
                 expected / v_gain,
                 atol=FP8_ATOL + BF16_ATOL,
                 rtol=BF16_RTOL,
