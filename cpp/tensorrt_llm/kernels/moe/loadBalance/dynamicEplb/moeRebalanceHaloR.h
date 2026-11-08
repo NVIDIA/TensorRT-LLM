@@ -59,7 +59,8 @@ enum MoeRebalanceHaloRCounter : int
 //!      plans the layer's replicas with one warp and builds the route prefix of every selected expert; the other CTAs
 //!      compute stable per-expert ordinals and write the physical slot of every route.
 //!   2. Route release. Each CTA checks every status word and then adds 1 to `routeCounter` with a system-scope
-//!      release. A route consumer on another stream waits until the counter has grown by `ctas`.
+//!      release. A route consumer on another stream waits for the launch's completion event and then until the
+//!      counter has grown by `ctas`.
 //!   3. Relay. Each CTA copies its share of the expert bundles this rank receives: the receivers of a bundle that do
 //!      not hold it yet (all of them without a residency table) split it into slices, and each pulls its slices from
 //!      the owner and stores them into the helper slot of every such receiver.
@@ -132,9 +133,12 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
 //! bind time: a launch-time module load or stack resize would wait for kernels that spin on work queued after it.
 MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int ep, int experts, int ctas);
 
-//! Enqueues one launch on `stream`; returns the launch error, if any.
-cudaError_t launchMoeRebalanceHaloR(
-    MoeRebalanceHaloRLaunch const& launch, MoeRebalanceHaloRParams const& params, cudaStream_t stream);
+//! Enqueues one launch on `stream`; returns the launch error, if any. `launched` becomes the launch's completion event
+//! (cudaLaunchAttributeLaunchCompletionEvent), which nominally triggers once every CTA has begun (CUDA may delay it to
+//! the kernel's end): a route consumer on another stream waits for it before its route wait, so CUDA sees that the
+//! wait follows the kernel.
+cudaError_t launchMoeRebalanceHaloR(MoeRebalanceHaloRLaunch const& launch, MoeRebalanceHaloRParams const& params,
+    cudaStream_t stream, cudaEvent_t launched);
 
 } // namespace kernels
 

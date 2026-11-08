@@ -929,9 +929,10 @@ def _case_gate_under_hog(layers: _Layers, use_graph: bool) -> list:
     return failures
 
 
-def _capture(layers: _Layers, layer_ids: list):
+def _capture(layers: _Layers, layer_ids: list, keep_graph: bool = False):
     """Capture layer calls as the breakable runner does: warm up eagerly on its capture stream,
-    then capture there. Returns the graph, the static routes per layer and the warmup's failures."""
+    then capture there. Returns the graph, the static routes per layer and the warmup's failures.
+    ``keep_graph`` keeps the captured cudaGraph_t for inspection (``raw_cuda_graph``)."""
     layers.eager = [torch.cuda.Stream(device=layers.device) for _ in range(2)]
     capture = torch.cuda.Stream(device=layers.device)
     static = {layer: layers.routes(500 + layer, layers.max_tokens) for layer in layer_ids}
@@ -944,7 +945,7 @@ def _capture(layers: _Layers, layer_ids: list):
     failures = []
     for layer in layer_ids:
         failures += layers.check(layer, static[layer])
-    graph = torch.cuda.CUDAGraph()
+    graph = torch.cuda.CUDAGraph(keep_graph=keep_graph)
     with torch.cuda.graph(graph, stream=capture):
         for layer in layer_ids:
             layers.layer_call(layer, static[layer], capturing=True)
@@ -1068,6 +1069,205 @@ def _case_graphs_capturing_switch(layers: _Layers) -> list:
     return failures
 
 
+def _driver_call(result):
+    """Unpack a cuda.bindings driver call; raise on an error."""
+    from cuda.bindings import driver
+
+    error, *values = result
+    if error != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"CUDA driver call failed: {error!r}")
+    return values[0] if len(values) == 1 else values
+
+
+class _GraphView:
+    """The nodes and edges of a captured graph, with its HALO-R kernels and route waits.
+
+    The route wait is the graph's only batched stream memory operation.
+    """
+
+    def __init__(self, raw) -> None:
+        from cuda.bindings import driver
+
+        count = _driver_call(driver.cuGraphGetNodes(raw, 0))[1]
+        nodes = _driver_call(driver.cuGraphGetNodes(raw, count))[0][:count]
+        self.nodes = [int(node) for node in nodes]
+        self.handles = dict(zip(self.nodes, nodes))
+        self.halo_kernels = set()
+        self.route_waits = set()
+        self.kernels = set()
+        for node in nodes:
+            kind = _driver_call(driver.cuGraphNodeGetType(node))
+            if kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_BATCH_MEM_OP:
+                self.route_waits.add(int(node))
+            elif kind == driver.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
+                self.kernels.add(int(node))
+                params = _driver_call(driver.cuGraphKernelNodeGetParams(node))
+                if int(params.func):
+                    name = _driver_call(driver.cuFuncGetName(params.func))
+                else:
+                    name = _driver_call(driver.cuKernelGetName(params.kern))
+                if "haloRFusedKernel" in (name.decode() if isinstance(name, bytes) else str(name)):
+                    self.halo_kernels.add(int(node))
+        count = _driver_call(driver.cuGraphGetEdges(raw, 0))[3]
+        sources, targets, data, count = _driver_call(driver.cuGraphGetEdges(raw, count))
+        # (from, to, from_port); port 0 is full completion of the upstream node.
+        self.edges = [
+            (int(sources[i]), int(targets[i]), int(data[i].from_port)) for i in range(count)
+        ]
+
+    def ancestors(self, node: int, full_only: bool) -> set:
+        """Every node with a path to ``node``; ``full_only`` follows full-completion edges only."""
+        parents = {}
+        for source, target, port in self.edges:
+            if not full_only or port == 0:
+                parents.setdefault(target, []).append(source)
+        seen, stack = set(), [node]
+        while stack:
+            for parent in parents.get(stack.pop(), []):
+                if parent not in seen:
+                    seen.add(parent)
+                    stack.append(parent)
+        return seen
+
+    def adversarial_order(self) -> list:
+        """A topological order that runs every node CUDA lets run early as early as it can:
+        among ready nodes, non-kernel nodes first, then kernels, HALO-R kernels last."""
+        indegree = {node: 0 for node in self.nodes}
+        children = {}
+        for source, target, _ in self.edges:
+            indegree[target] += 1
+            children.setdefault(source, []).append(target)
+        rank = {node: index for index, node in enumerate(self.nodes)}
+
+        def priority(node: int) -> tuple:
+            return (node in self.kernels, node in self.halo_kernels, rank[node])
+
+        ready = sorted((node for node, degree in indegree.items() if degree == 0), key=priority)
+        order = []
+        while ready:
+            node = ready.pop(0)
+            order.append(node)
+            for child in children.get(node, []):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+            ready.sort(key=priority)
+        if len(order) != len(self.nodes):
+            raise RuntimeError("the captured graph has a cycle")
+        return order
+
+
+def _case_graphs_route_wait_edge(layers: _Layers) -> list:
+    """In a captured graph, every route wait follows its own HALO-R kernel through the launch's completion event.
+
+    The kernel writes the route counter that the wait spins on, which CUDA does
+    not see. Without a graph edge from the kernel, the wait and the kernel sit
+    on sibling branches, and a schedule that runs the wait first deadlocks with
+    no trap. The edge must leave the kernel's launch completion port, not wait
+    for the kernel's end, or MAIN would lose the relay's overlap.
+    """
+    from cuda.bindings import runtime
+
+    count = len(layers.groups)
+    graph, _, failures = _capture(layers, list(range(count)), keep_graph=True)
+    view = _GraphView(runtime.cudaGraph_t(init_value=graph.raw_cuda_graph()))
+    rank = layers.rank
+    if len(view.halo_kernels) != count or len(view.route_waits) != count:
+        failures.append(
+            f"rank {rank}: {len(view.halo_kernels)} HALO-R kernels and {len(view.route_waits)} "
+            f"route waits captured, expected {count} of each"
+        )
+        graph.reset()
+        return failures
+    # The i-th layer's route wait follows the kernels of layers 0..i (its own through the launch completion port)
+    # and, by full completion, only those of the earlier layers, through their joins.
+    reached = []
+    for wait in view.route_waits:
+        every = view.ancestors(wait, full_only=False) & view.halo_kernels
+        full = view.ancestors(wait, full_only=True) & view.halo_kernels
+        reached.append((len(every), len(full)))
+    reached.sort()
+    expected = [(layer + 1, layer) for layer in range(count)]
+    if reached != expected:
+        failures.append(
+            f"rank {rank}: (HALO-R kernels before each route wait, of them by full completion) {reached}, "
+            f"expected {expected}"
+        )
+    graph.reset()
+    return failures
+
+
+# A serialized replay that has not finished after this long is deadlocked; a healthy one takes milliseconds.
+_SERIALIZED_TIMEOUT_S = 60
+
+
+def _case_graphs_serialized(layers: _Layers) -> list:
+    """Replay the captured layers in one adversarial serial schedule; it must finish and copy correctly.
+
+    CUDA may run the independent branches of a graph in any order, one after
+    the other. The clone of the captured graph is chained along
+    ``_GraphView.adversarial_order``, which runs every node as early as its
+    edges allow, so a route wait without an edge from its kernel runs first
+    and never passes.
+    """
+    from cuda.bindings import driver, runtime
+
+    count = len(layers.groups)
+    rank = layers.rank
+    graph, static, failures = _capture(layers, list(range(count)), keep_graph=True)
+    raw = runtime.cudaGraph_t(init_value=graph.raw_cuda_graph())
+    clone = _driver_call(driver.cuGraphClone(raw))
+    view = _GraphView(clone)
+    linked = {(source, target) for source, target, _ in view.edges}
+    order = view.adversarial_order()
+    sources, targets = [], []
+    for source, target in zip(order, order[1:]):
+        if (source, target) not in linked:
+            sources.append(view.handles[source])
+            targets.append(view.handles[target])
+    if sources:
+        _driver_call(driver.cuGraphAddDependencies(clone, sources, targets, None, len(sources)))
+    executable = _driver_call(driver.cuGraphInstantiate(clone, 0))
+    stream = layers.eager[0]
+    handle = driver.CUstream(init_value=int(stream.cuda_stream))
+    for step in range(1, 21):
+        routes = [layers.routes(100 * step + layer, layers.max_tokens) for layer in range(count)]
+        with torch.cuda.stream(stream):
+            for layer in range(count):
+                static[layer].copy_(routes[layer])
+            _driver_call(driver.cuGraphLaunch(executable, handle))
+        deadline = time.monotonic() + _SERIALIZED_TIMEOUT_S
+        while not stream.query() and time.monotonic() <= deadline:
+            time.sleep(0.01)
+        timed_out = not stream.query()
+        # Every rank learns of a deadlock anywhere, so no rank waits for a peer that will not return.
+        if MPI.COMM_WORLD.allreduce(timed_out, op=MPI.LOR):
+            # The context cannot be torn down behind a deadlocked replay.
+            layers.dead = True
+            failures.append(
+                f"rank {rank}: serialized replay {step} "
+                + (
+                    f"did not finish within {_SERIALIZED_TIMEOUT_S} s"
+                    if timed_out
+                    else "deadlocked on a peer"
+                )
+            )
+            # Process exit behind a deadlocked graph may hang until the worker's watchdog; keep the failure.
+            print(failures[-1], file=sys.stderr, flush=True)
+            return failures
+        layers.replayed(list(range(count)))
+        torch.cuda.synchronize()
+        MPI.COMM_WORLD.Barrier()
+        for layer in range(count):
+            failures += layers.check(layer, routes[layer])
+        if failures:
+            break
+    _driver_call(driver.cuGraphExecDestroy(executable))
+    _driver_call(driver.cuGraphDestroy(clone))
+    graph.reset()
+    return failures
+
+
 def _break_launch(layers: _Layers, kind: str, layer: int, main: torch.cuda.Stream) -> None:
     """Queue on MAIN what makes the next launch of ``layer`` on this rank fail, before its routes."""
     if kind == "status_word":
@@ -1164,6 +1364,13 @@ _CASES = {
         _AUXILIARY_SMS,
         "shared_banks",
     ),
+    "graphs_route_wait_edge": (
+        _case_graphs_route_wait_edge,
+        3,
+        _AUXILIARY_SMS,
+        "per_layer_resident",
+    ),
+    "graphs_serialized": (_case_graphs_serialized, 3, _AUXILIARY_SMS, "per_layer_resident"),
 }
 _TRAPS = ("status_word", "ready_drain_timeout", "grid_rendezvous_timeout")
 for _kind in _TRAPS:

@@ -698,13 +698,13 @@ def test_native_submit_orders_copy_after_main_and_poisons_on_any_cuda_error():
             "cudaStream_t const execution = currentExecutionStream();",
             "poisonOnError(cudaEventRecord(mInputReady, execution)",
             "poisonOnError(cudaStreamWaitEvent(mCopyStream, mInputReady, 0)",
-            "poisonOnError(kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream)",
+            "kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream, mLaunched)",
         ),
     )
     # Capture is allowed: every value the launch hands the device is constant.
     assert "cudaStreamIsCapturing" not in submit and "kReadyGeneration," in source
     # Every CUDA call of a launch goes through the sticky poison.
-    calls = re.findall(r"(\w*)\((cuda\w+|kernels::launch\w+)\(", submit)
+    calls = re.findall(r"(\w*)\(\s*(cuda\w+|kernels::launch\w+)\(", submit)
     assert calls and all(wrapper == "poisonOnError" for wrapper, _ in calls)
     poison = _function_body(source, "void poisonOnError(cudaError_t error")
     assert "mPoison = error;" in poison
@@ -839,7 +839,16 @@ def test_kernel_runs_in_the_remote_memory_sync_domain():
         ),
     )
     launch = _function_body(kernel_source, "cudaError_t launchMoeRebalanceHaloR(")
-    assert "config.numAttrs = launch.attributeCount;" in launch
+    # The prepared attributes, then the launch completion event that MAIN's route wait waits for.
+    _assert_in_order(
+        launch,
+        (
+            "std::copy_n(launch.attributes, launch.attributeCount, attributes);",
+            "completion.id = cudaLaunchAttributeLaunchCompletionEvent;",
+            "completion.val.launchCompletionEvent.event = launched;",
+            "config.numAttrs = launch.attributeCount + 1;",
+        ),
+    )
     # Every edge out of the remote domain is system scope.
     assert '"red.release.sys.global.add.u64 [%0], 1;"' in kernel_source
     publish = _function_body(kernel_source, "void publishReady(")
@@ -1238,6 +1247,8 @@ def test_native_route_wait_and_join_are_constant_and_poisoned_together():
         wait,
         (
             "requireOperational();",
+            # The launch completion event is the CUDA-visible edge from the kernel to the wait.
+            "poisonOnError(cudaStreamWaitEvent(stream, mLaunched, 0)",
             "operations[0].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;",
             "operations[0].waitValue.value64 = static_cast<cuuint64_t>(mLaunch.ctas);",
             "operations[0].waitValue.flags = CU_STREAM_WAIT_VALUE_GEQ;",

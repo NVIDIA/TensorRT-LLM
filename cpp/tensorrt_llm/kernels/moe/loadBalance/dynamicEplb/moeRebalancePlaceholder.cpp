@@ -70,7 +70,8 @@ MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int, int, int)
     throwHaloRUnsupported();
 }
 
-cudaError_t launchMoeRebalanceHaloR(MoeRebalanceHaloRLaunch const&, MoeRebalanceHaloRParams const&, cudaStream_t)
+cudaError_t launchMoeRebalanceHaloR(
+    MoeRebalanceHaloRLaunch const&, MoeRebalanceHaloRParams const&, cudaStream_t, cudaEvent_t)
 {
     return cudaErrorNotSupported;
 }

@@ -951,7 +951,9 @@ set wrong has a test that catches it:
   `validate_per_layer_dynamic_eplb_cuda_graph` admits only for HALO-R, every
   value a layer call hands the device is constant: READY is 1, drained and
   reset by the next launch before its count exchange; the route wait waits for
-  `auxiliary_sms` and resets the counter in one batched stream memory
+  the launch's completion event (nominally, every CTA has begun), which makes it a graph
+  successor of the kernel so that no schedule runs it first, then for
+  `auxiliary_sms`, and resets the counter in one batched stream memory
   operation; MAIN may change between layer calls behind a MAIN-to-MAIN fence;
   and `finish` joins COPY into MAIN. The fence sees only host layer calls:
   after a capture the host's MAIN stays the capture stream while replays run on

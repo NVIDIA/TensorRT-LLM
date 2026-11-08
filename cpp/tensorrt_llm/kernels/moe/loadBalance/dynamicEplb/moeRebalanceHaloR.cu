@@ -607,16 +607,25 @@ MoeRebalanceHaloRLaunch prepareMoeRebalanceHaloRLaunch(int ep, int experts, int 
     return launch;
 }
 
-cudaError_t launchMoeRebalanceHaloR(
-    MoeRebalanceHaloRLaunch const& launch, MoeRebalanceHaloRParams const& params, cudaStream_t stream)
+cudaError_t launchMoeRebalanceHaloR(MoeRebalanceHaloRLaunch const& launch, MoeRebalanceHaloRParams const& params,
+    cudaStream_t stream, cudaEvent_t launched)
 {
+    // The prepared attributes, then the launch completion event.
+    constexpr std::size_t kPrepared = sizeof(MoeRebalanceHaloRLaunch::attributes) / sizeof(cudaLaunchAttribute);
+    cudaLaunchAttribute attributes[kPrepared + 1]{};
+    std::copy_n(launch.attributes, launch.attributeCount, attributes);
+    cudaLaunchAttribute& completion = attributes[launch.attributeCount];
+    completion.id = cudaLaunchAttributeLaunchCompletionEvent;
+    completion.val.launchCompletionEvent.event = launched;
+    completion.val.launchCompletionEvent.flags = cudaEventRecordDefault;
+
     cudaLaunchConfig_t config{};
     config.gridDim = dim3(static_cast<unsigned>(launch.ctas));
     config.blockDim = dim3(kFusedThreads);
     config.dynamicSmemBytes = static_cast<std::size_t>(launch.dynamicSharedBytes);
     config.stream = stream;
-    config.attrs = const_cast<cudaLaunchAttribute*>(launch.attributes);
-    config.numAttrs = launch.attributeCount;
+    config.attrs = attributes;
+    config.numAttrs = launch.attributeCount + 1;
     void* arguments[] = {const_cast<MoeRebalanceHaloRParams*>(&params)};
     return cudaLaunchKernelExC(&config, reinterpret_cast<void const*>(&haloRFusedKernel), arguments);
 }

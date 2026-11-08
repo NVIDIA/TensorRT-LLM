@@ -81,13 +81,20 @@ T* checkedPointer(std::int64_t value, char const* name)
 //! launches share, the copy stream (COPY) and the events that fork COPY from the calling stream (MAIN) and join it
 //! back, and prepares the launch, so that each step of a layer call is one native call:
 //!
-//!     submit_fused: MAIN record input_ready; COPY wait input_ready -> fused kernel
-//!     wait_routes:  MAIN wait route counter >= ctas, then write 0 (one batched stream memory operation)
+//!     submit_fused: MAIN record input_ready; COPY wait input_ready -> fused kernel, which records launched
+//!     wait_routes:  MAIN wait launched; MAIN wait route counter >= ctas, then write 0 (one batched stream memory
+//!                   operation)
 //!     join:         COPY record copy_idle; MAIN wait copy_idle
 //!
 //! Every launch follows the MAIN work queued before it, which includes the previous consumer of the helper slots this
 //! launch overwrites. The values are constant (READY 1, route target `ctas`), so every step can be captured into a
 //! CUDA graph and replayed, in any interleaving with eager calls.
+//!
+//! CUDA does not see the route counter, so the route wait alone would leave the kernel and the wait unordered: a
+//! captured graph would hold them on sibling branches, and any schedule that runs the wait first (one hardware queue, a
+//! serializing profiler) would deadlock with no trap. `launched` is the launch's completion event, which nominally
+//! triggers once every CTA has begun (CUDA may delay it to the kernel's end); waiting for it first makes the kernel
+//! precede the wait in every schedule, and the relay can still overlap MAIN's work after the route release.
 //!
 //! A CUDA error in any call poisons the context: every later call fails with it, and the owner rebuilds the group.
 class MoeRebalanceHaloRState : public torch::CustomClassHolder
@@ -185,14 +192,16 @@ public:
 
         c10::cuda::CUDAGuard const deviceGuard(device);
         mLaunch = kernels::prepareMoeRebalanceHaloRLaunch(ep, experts, ctas);
-        checkCudaResult(
-            cudaEventCreateWithFlags(&mInputReady, cudaEventDisableTiming), "cudaEventCreate(HALO-R input ready)");
-        cudaError_t const error = cudaEventCreateWithFlags(&mCopyIdle, cudaEventDisableTiming);
-        if (error != cudaSuccess)
+        // A launch completion event must disable timing; the other two need none.
+        for (cudaEvent_t* event : {&mInputReady, &mCopyIdle, &mLaunched})
         {
-            mCopyIdle = nullptr;
-            releaseEvents();
-            checkCudaResult(error, "cudaEventCreate(HALO-R copy idle)");
+            cudaError_t const error = cudaEventCreateWithFlags(event, cudaEventDisableTiming);
+            if (error != cudaSuccess)
+            {
+                *event = nullptr;
+                releaseEvents();
+                checkCudaResult(error, "cudaEventCreate(HALO-R)");
+            }
         }
         // The launches read and write these by address; retaining them prevents allocator reuse.
         mTensors = {std::move(outSlots), std::move(outIds), std::move(outOwners), std::move(peerBases),
@@ -235,12 +244,14 @@ public:
         cudaStream_t const execution = currentExecutionStream();
         poisonOnError(cudaEventRecord(mInputReady, execution), "cudaEventRecord(HALO-R input ready)");
         poisonOnError(cudaStreamWaitEvent(mCopyStream, mInputReady, 0), "cudaStreamWaitEvent(HALO-R input ready)");
-        poisonOnError(kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream), "HALO-R kernel launch");
+        poisonOnError(
+            kernels::launchMoeRebalanceHaloR(mLaunch, params, mCopyStream, mLaunched), "HALO-R kernel launch");
     }
 
-    //! Orders `stream` (MAIN) after the route release of the last launch: it waits until every CTA has added 1 to the
-    //! route counter and then resets it, in one batched memory operation that holds no SM. The next launch's adds
-    //! follow input_ready, which MAIN records after the reset. Capturable.
+    //! Orders `stream` (MAIN) after the route release of the last launch: it waits for the launch's completion event,
+    //! then until every CTA has added 1 to the route counter, and then resets it, in one batched memory operation that
+    //! holds no SM. The next launch's adds follow input_ready, which MAIN records after the reset. Capturable, in the
+    //! capture of the launch: the event wait becomes the graph edge from the kernel to the route wait.
     void waitRoutes(std::int64_t streamHandle)
     {
         std::lock_guard<std::mutex> lock(mMutex);
@@ -249,6 +260,7 @@ public:
         auto const stream = reinterpret_cast<cudaStream_t>(streamHandle);
         TORCH_CHECK(stream != mCopyStream, "the route wait must not run on the copy stream");
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
+        poisonOnError(cudaStreamWaitEvent(stream, mLaunched, 0), "cudaStreamWaitEvent(HALO-R launched)");
         CUstreamBatchMemOpParams operations[2]{};
         operations[0].waitValue.operation = CU_STREAM_MEM_OP_WAIT_VALUE_64;
         operations[0].waitValue.address = reinterpret_cast<CUdeviceptr>(mParams.routeCounter);
@@ -337,7 +349,7 @@ private:
     void releaseEvents() noexcept
     {
         // A pending record completes normally after its event is destroyed.
-        for (cudaEvent_t* event : {&mInputReady, &mCopyIdle})
+        for (cudaEvent_t* event : {&mInputReady, &mCopyIdle, &mLaunched})
         {
             if (*event != nullptr)
             {
@@ -356,6 +368,7 @@ private:
     cudaStream_t mCopyStream{nullptr};
     cudaEvent_t mInputReady{nullptr};
     cudaEvent_t mCopyIdle{nullptr};
+    cudaEvent_t mLaunched{nullptr};
     cudaError_t mPoison{cudaSuccess};
     bool mBound{false};
 };

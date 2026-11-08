@@ -10,7 +10,8 @@ scheduler buffers. Only the copy endpoint differs. Its one kernel runs on the
 
     MAIN: ... routes -> record input_ready
     COPY: wait input_ready -> HALO-R: READY drain -> scheduler -> route release -> relay -> READY 1
-    MAIN: wait route counter >= auxiliary_sms, write 0 (first route consumer) -> MegaMoE
+    MAIN: wait launched (nominally, every HALO-R CTA has begun); wait route counter >= auxiliary_sms, write 0
+          (first route consumer) -> MegaMoE
     MAIN: (finish) wait copy_idle, recorded on COPY
 
 The scheduler role plans the layer's replicas and writes every route's
@@ -388,7 +389,7 @@ class HaloRRelayEndpoint:
             return generation
 
     def wait_routes(self, stream_handle: int) -> None:
-        """Queue MAIN's route wait on ``stream_handle``: counter >= CTAs, then reset it to 0."""
+        """Queue MAIN's route wait on ``stream_handle``: launched, counter >= CTAs, then reset it to 0."""
         with self._lock:
             self._require_operational()
             try:
