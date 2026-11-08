@@ -409,6 +409,33 @@ def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(mo
     assert env.group.scheduler_stream is env.group.copy_stream
 
 
+def test_a_capture_that_ends_within_a_layer_call_skips_its_waits_and_aborts(
+    monkeypatch,
+) -> None:
+    """A failure that ends a capture mid-call must not leave an eager wait for a kernel that never runs."""
+    env = _build(monkeypatch)
+    group, trace, state = env.group, env.trace, env.state
+    _layer_call(group, 4)
+    # A layer call captured whole queues its route wait and join in the capture.
+    state.capturing = True
+    trace.clear()
+    _layer_call(group, 4)
+    assert [entry[0] for entry in trace if entry[0] in ("route_wait", "join")] == [
+        "route_wait",
+        "join",
+    ]
+    # A failure ends the capture before MegaMoE's route wait; the abort path then
+    # releases the plan eagerly, on the stream that was capturing.
+    group.plan_finish(group.plan_schedule(_Routes(4)), defer_wait=True)
+    state.capturing = False
+    trace.clear()
+    group.wait_for_routes()
+    group.finish()
+    assert not any(entry[0] in ("route_wait", "join") for entry in trace)
+    with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
+        group.plan_schedule(_Routes(4))
+
+
 @pytest.mark.parametrize("auxiliary_sms", [2, 4, 8, 16])
 def test_constant_ready_and_route_target_with_the_route_wait_deferred(monkeypatch, auxiliary_sms):
     env = _build(monkeypatch, auxiliary_sms=auxiliary_sms)

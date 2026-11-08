@@ -1080,6 +1080,63 @@ def _case_graphs_capturing_switch(layers: _Layers) -> list:
     return failures
 
 
+class _CaptureFailure(Exception):
+    """Stands for an error raised inside a captured layer call, such as a graph-pool OOM."""
+
+
+def _case_graphs_failed_capture(layers: _Layers) -> list:
+    """A failure ends the capture between a layer's launch and its route wait.
+
+    The abort path then releases the plan eagerly on the stream that was
+    capturing. That must not wait for the captured kernel, which never runs,
+    and the group must refuse its next launch until it is rebuilt.
+    """
+    rank = layers.rank
+    group = layers.groups[0]
+    failures = []
+    capture = torch.cuda.Stream(device=layers.device)
+    routes = layers.routes(0, layers.max_tokens)
+    # Warm up eagerly on the capture stream, as the breakable runner does.
+    capture.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture):
+        layers.layer_call(0, routes)
+    torch.cuda.synchronize()
+    MPI.COMM_WORLD.Barrier()
+    failures += layers.check(0, routes)
+    graph = torch.cuda.CUDAGraph()
+    previous = torch.cuda.current_stream()
+    try:
+        with torch.cuda.graph(graph, stream=capture):
+            group.plan(routes, defer_wait=True)
+            raise _CaptureFailure()
+    except _CaptureFailure:
+        pass
+    except RuntimeError as error:
+        # The launch forked COPY into the capture and nothing joined it back, so
+        # ending the capture fails (cudaErrorStreamCaptureUnjoined), chained to
+        # the failure that ended it, as in the breakable runner.
+        if not isinstance(error.__context__, _CaptureFailure):
+            raise
+    # A failed capture end skips restoring the current stream.
+    torch.cuda.set_stream(previous)
+    if torch.cuda.is_current_stream_capturing():
+        failures.append(f"rank {rank}: a stream is still capturing after the failed capture")
+    with torch.cuda.stream(capture):
+        group.wait_for_routes()
+        group.finish()
+    # Without the fix, an eager route wait on the capture stream never passes and this hangs.
+    torch.cuda.synchronize()
+    MPI.COMM_WORLD.Barrier()
+    try:
+        with torch.cuda.stream(capture):
+            group.plan(routes, defer_wait=True)
+        failures.append(f"rank {rank}: the group launched again after its capture failed")
+    except RuntimeError as error:
+        if "rebuild" not in str(error):
+            failures.append(f"rank {rank}: unexpected error {error}")
+    return failures
+
+
 def _driver_call(result):
     """Unpack a cuda.bindings driver call; raise on an error."""
     from cuda.bindings import driver
@@ -1383,6 +1440,7 @@ _CASES = {
         "per_layer_resident",
     ),
     "graphs_serialized": (_case_graphs_serialized, 3, _AUXILIARY_SMS, "per_layer_resident"),
+    "graphs_failed_capture": (_case_graphs_failed_capture, 1, _AUXILIARY_SMS, "shared_banks"),
 }
 _TRAPS = ("status_word", "ready_drain_timeout", "grid_rendezvous_timeout")
 for _kind in _TRAPS:

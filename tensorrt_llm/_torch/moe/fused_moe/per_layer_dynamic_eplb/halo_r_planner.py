@@ -274,6 +274,7 @@ class HaloRRelayEndpoint:
         self._local_release_generation = 0
         self._collective_safe_generation = 0
         self._handoff_aborted = False
+        self._launch_captured = False
 
     def _require_operational(self) -> None:
         if self._handoff_aborted or self.ctx is None:
@@ -376,6 +377,7 @@ class HaloRRelayEndpoint:
             if outputs is not self._outputs:
                 raise RuntimeError("outputs are not from the bound CUDA scheduler")
             self._require_live_bank_reusable()
+            self._launch_captured = torch.cuda.is_current_stream_capturing()
             try:
                 torch.ops.trtllm.moe_rebalance_halo_r_submit_fused(
                     self._handle, routes, spin_cycles
@@ -387,6 +389,21 @@ class HaloRRelayEndpoint:
             generation = self._generation
             self._generation = generation + 1
             return generation
+
+    def launch_capture_ended(self) -> bool:
+        """Whether the last launch was captured into a graph whose capture has ended.
+
+        Such a launch runs only when that graph replays, and a failed capture
+        discards the graph, so an eager route wait or join for it would wait
+        for a kernel that never runs. A layer call stays within one capture,
+        so this holds only when a failure ends the capture mid-call.
+        """
+        return self._launch_captured and not torch.cuda.is_current_stream_capturing()
+
+    def abandon_captured_launch(self) -> None:
+        """Abort the handoff after a launch whose capture ended within its layer call."""
+        with self._lock:
+            self._handoff_aborted = True
 
     def wait_routes(self, stream_handle: int) -> None:
         """Queue MAIN's route wait on ``stream_handle``: launched, counter >= CTAs, then reset it to 0."""
@@ -703,6 +720,11 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
     def _wait_route_epoch(self, stream_handle: int) -> None:
         # A constant target and a reset after it, in one batched memory
         # operation, so a captured route wait replays exactly.
+        if self.broadcaster.launch_capture_ended():
+            # A failure ended the capture of this layer call (the plan is being
+            # released by the abort path): the kernel never runs, so its route
+            # release never comes. finish() then aborts the endpoint.
+            return
         self.broadcaster.wait_routes(stream_handle)
 
     def plan_finish(
@@ -719,8 +741,17 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         eager call's kernel tail must precede a replay of the same layer.
         MAIN waits only for the tail after READY: MegaMoE, queued before,
         already waited for READY.
+
+        If a failure ended the capture of this layer call, the captured
+        kernel never runs: COPY holds nothing to join, the route wait was
+        skipped, and the endpoint is aborted, so the group must be rebuilt
+        before its next launch.
         """
+        capture_ended = self.broadcaster.launch_capture_ended()
         super().finish(completion_event)
+        if capture_ended:
+            self.broadcaster.abandon_captured_launch()
+            return
         self.broadcaster.join()
 
 
