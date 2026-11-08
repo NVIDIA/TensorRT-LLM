@@ -10,7 +10,7 @@ import triton.language as tl
 
 _BLOCK_SHAPE = [128, 128]  # [group_k, group_n] for FP8 block-scale
 _BLOCK_SIZE_M = 16
-# Used when experts average at least _LARGE_M_MIN_ROWS rows (prefill), so each
+# Used when experts average at least _LARGE_M_MIN_ROWS rows, so that each
 # weight tile is loaded once per 64 rows instead of once per 16.
 _BLOCK_SIZE_M_LARGE = 64
 _LARGE_M_MIN_ROWS = 32
@@ -193,12 +193,14 @@ def _build_moe_gemm_autotune_configs():
     """Config grid for `_fused_moe_bf16act_fp8w_kernel`.
 
     Constraints:
-        - BLOCK_SIZE_M is not tuned: the caller passes the block size used by
-          `moe_align_block_size`, which lays out `expert_ids_out` with one
-          expert per BLOCK_SIZE_M-token chunk. The GEMM loads
+        - BLOCK_SIZE_M is not tuned. The MoE alignment kernels
+          (`_moe_expert_ids_kernel` etc.) lay out `expert_ids_out` with one
+          expert per BLOCK_SIZE_M-token chunk (`_BLOCK_SIZE_M` or
+          `_BLOCK_SIZE_M_LARGE`, picked by `_block_size_m`). The GEMM loads
           `expert_ids[pid_m]` assuming the same chunk size, so mismatched
           values produce wrong outputs (autotune cannot detect this; it
-          benchmarks runtime, not numerics). It is part of the autotune key.
+          benchmarks runtime, not numerics). The caller passes it, and it is
+          part of the autotune key.
         - BLOCK_SIZE_K <= group_k (=128): the kernel loads ONE scale per
           K-tile, so larger K-tiles would alias multiple block scales.
     """
