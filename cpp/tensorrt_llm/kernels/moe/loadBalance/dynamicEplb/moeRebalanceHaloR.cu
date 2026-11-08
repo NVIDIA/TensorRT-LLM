@@ -527,11 +527,14 @@ void checkMoeRebalanceHaloRParams(MoeRebalanceHaloRParams const& params, int cta
         params.ep, params.experts, params.helpers, params.sendCount, params.sendWeight, params.localRank);
     TLLM_CHECK_WITH_INFO(params.routeCapacity > 0 && params.routeCapacity <= INT_MAX / params.ep,
         "Invalid HALO-R route capacity %d", params.routeCapacity);
-    // A candidate key stores weighted rows above the order byte; an expert's rows are bounded by all routed tokens.
+    // A candidate key stores rows * (1 + send_weight) above the order byte. A step moves at most the receiver's room
+    // below the balanced target, ceil(total / ep), and each rank routes at most routeCapacity rows, so rows never
+    // exceed routeCapacity.
     TLLM_CHECK_WITH_INFO(
-        static_cast<long long>(params.ep) * params.routeCapacity * (1 + params.sendWeight) < halo_r::kMaxWeightedRows,
-        "HALO-R route capacity %d at ep=%d and send_weight=%d overflows the planner's candidate keys",
-        params.routeCapacity, params.ep, params.sendWeight);
+        static_cast<long long>(params.routeCapacity) * (1 + params.sendWeight) < halo_r::kMaxWeightedRows,
+        "HALO-R route capacity %d (max_num_tokens x top_k per rank) at send_weight=%d overflows the planner's "
+        "candidate keys",
+        params.routeCapacity, params.sendWeight);
     TLLM_CHECK_WITH_INFO(params.planes >= 1 && params.planes <= halo_r::kRelayMaxPlanes,
         "HALO-R relay supports 1 to %d weight planes, got %d", halo_r::kRelayMaxPlanes, params.planes);
     TLLM_CHECK_WITH_INFO(reinterpret_cast<std::uintptr_t>(params.readyFlags) % sizeof(std::uint64_t) == 0
