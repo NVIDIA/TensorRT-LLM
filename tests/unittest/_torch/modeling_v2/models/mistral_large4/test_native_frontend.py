@@ -132,3 +132,16 @@ def test_the_checkpoint_loads_mistral_common_for_every_reader():
     llm = _llm(path, "mistral_large_4")
     assert type(BaseLLM._try_load_tokenizer(llm)) is MistralTokenizer
     assert BaseLLM._try_load_generation_config(llm) is None
+
+
+def test_the_standalone_renderer_loads_no_hf_processor():
+    # trtllm-serve leaves the HF processor out for the native format; a renderer that loaded
+    # the checkpoint's PixtralProcessor would fingerprint the processor's chat template too.
+    path = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR")
+    if not path:
+        pytest.skip("needs MISTRAL_LARGE4_CHECKPOINT_DIR")
+    from tensorrt_llm.serve.render.resources import RenderResources
+
+    rendered = RenderResources.load(path, checkpoint_format="mistral_large_4")
+    assert rendered.processor is None
+    assert type(rendered.tokenizer) is MistralTokenizer
