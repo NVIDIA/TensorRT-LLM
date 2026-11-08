@@ -114,6 +114,7 @@ def adopt_drafter(shell, plan: "_dispatch.Plan") -> None:
             declined=plan.declined,
             verify_pdl=distributed_head_sampler,
             late_join=plan.enabled("drafter_preamble_late_join"),
+            rejection=plan.enabled("rejection_fold"),
         )
     if plan.enabled("drafter_hops"):
         from .kernels.drafter_hops import hops as _drafter_hops
