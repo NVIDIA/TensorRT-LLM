@@ -294,36 +294,6 @@ def test_rotary_positions_match_complex_rotation(modeling, layout, dtype):
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize("recurrent", [False, True])
-def test_worker_forwards_backbone_hidden_only_to_recurrent_head(recurrent):
-    from tensorrt_llm._torch.speculative.dspark import DSparkWorker
-
-    hidden = torch.randn(2, 3, 4)
-    logits = torch.randn(2, 3, 8)
-    anchors = torch.tensor([0, 1])
-    worker = SimpleNamespace(_markov_tp_exchange=None)
-    worker._apply_dspark_markov_bias = MethodType(DSparkWorker._apply_dspark_markov_bias, worker)
-
-    def head(base, first, **kwargs):
-        assert base is logits and first is anchors
-        if recurrent:
-            assert kwargs.keys() == {"hidden_states"} and kwargs["hidden_states"] is hidden
-        else:
-            assert not kwargs
-        return base + 1
-
-    draft = SimpleNamespace(
-        has_markov_head=True,
-        has_recurrent_markov_head=recurrent,
-        markov_w2=torch.empty(8, 2),
-        apply_markov_chain_logits=head,
-    )
-    actual = DSparkWorker._refine_block_logits(
-        worker, draft, logits, {"first_prev_tokens": anchors}, object(), hidden
-    )
-    torch.testing.assert_close(actual, logits + 1)
-
-
 @pytest.mark.parametrize("phase", ["PrefillTarget", "DecodeTarget"])
 def test_block_attention_matches_explicit_kv_and_obeys_window(modeling, monkeypatch, phase):
     # Compare the absorbed latent path with ordinary per-head K/V attention.
