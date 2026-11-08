@@ -26,6 +26,39 @@ add_modeling_v2_target(
   ARCHS 100f
   SOURCES *.cu *.cpp)
 
+# Preserve the C1 megakernel specialization and native Rubin code generation.
+set(mega_source
+    "${CMAKE_CURRENT_SOURCE_DIR}/../glm_5_2_nvfp4__sm_107__low_latency/csrc/glmMegakernel.cu"
+)
+set_property(
+  SOURCE "${mega_source}"
+  APPEND
+  PROPERTY COMPILE_DEFINITIONS
+           GLM52_FC2_SPARSE_WIDE=1
+           GLM52_OWNER_FC1_OVERLAP=1
+           GLM52_ROUTER_LG=2
+           GLM52_CAND_FILTER_ROLL=0
+           GLM52_SEL_BATCH_MMA=1
+           GLM52_LEAN=1
+           GLM52_FLAGS_MODE=5
+           GLM52_IO_MODE=3
+           GLM52_STAMPS_MODE=1
+           GLM52_SETUP_MODE=1
+           GLM52_LISTS_MODE=2
+           GLM52_TOPK_UNION=1
+           GLM52_TOPK_RSH=1
+           GLM52_STATIC_FLAGS=2752ll
+           GLM52_SMEM_MAIN=200704)
+set_property(
+  SOURCE "${mega_source}" APPEND
+  PROPERTY COMPILE_OPTIONS --maxrregcount=200 --ftz=false --prec-div=true
+           --prec-sqrt=true)
+if(107 IN_LIST CMAKE_CUDA_ARCHITECTURES_ORIG)
+  set_property(
+    SOURCE "${mega_source}" APPEND
+    PROPERTY COMPILE_OPTIONS --generate-code=arch=compute_107a,code=sm_107a)
+endif()
+
 add_modeling_v2_target(
   glm_moe_dsa glm_5_2_nvfp4__sm_107__low_latency
   ARCHS 100f
