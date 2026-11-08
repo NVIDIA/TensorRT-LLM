@@ -22,9 +22,11 @@ import socket
 import traceback
 import uuid
 from contextlib import aclosing, asynccontextmanager
-from typing import AsyncGenerator, Callable, Optional
+from types import AsyncGeneratorType
+from typing import AsyncGenerator, Awaitable, Callable, Optional
 
 import aiohttp
+import anyio
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -71,7 +73,9 @@ from tensorrt_llm.serve.perf_metrics import (DisaggPerfMetricsCollector,
                                              PerfMetricsJsonlWriter,
                                              PerfMetricsMiddleware,
                                              combine_disagg_metrics)
-from tensorrt_llm.serve.responses_utils import (ServerArrivalTimeMiddleware,
+from tensorrt_llm.serve.responses_utils import (ClosingStreamingResponse,
+                                                ServerArrivalTimeMiddleware,
+                                                UCompletionResponseOrGenerator,
                                                 get_steady_clock_now_in_seconds,
                                                 guard_responses_stream,
                                                 stream_error_event)
@@ -446,6 +450,78 @@ class OpenAIDisaggServer:
                 f"subagent:{uuid.uuid4()}")
         req.conversation_params.subagent_affinity_id = parent
 
+    @staticmethod
+    async def _await_context_request(
+        entry_point: Callable[[UCompletionRequest, Optional[ResponseHooks]],
+                              Awaitable[UCompletionResponseOrGenerator]],
+        req: UCompletionRequest, hooks: Optional[ResponseHooks], raw_req: Request,
+    ) -> UCompletionResponseOrGenerator:
+        """Observe disconnects before the response has started listening.
+
+        Cancellation drains the service's bounded control delivery, not physical retirement.
+        A stream that completed concurrently is closed rather than abandoned before its first read.
+
+        Args:
+            entry_point: Context-first service entry point.
+            req: Original client request.
+            hooks: Optional response/timing callbacks.
+            raw_req: Connection whose disconnect cancels the request.
+
+        Returns:
+            The service response or a stream whose cleanup is already active.
+
+        Raises:
+            _ClientDisconnected: The client disconnected during the prelude.
+            asyncio.CancelledError: The caller cancelled the handler.
+        """
+        stop_watching = False
+
+        async def watch_disconnect() -> None:
+            while not stop_watching:
+                if await raw_req.is_disconnected() or stop_watching:
+                    return
+                await asyncio.sleep(0.1)
+
+        work = asyncio.create_task(entry_point(req, hooks))
+        disconnected = asyncio.create_task(watch_disconnect())
+        returned = False
+        try:
+            await asyncio.wait((work, disconnected), return_when=asyncio.FIRST_COMPLETED)
+            if disconnected.done():
+                disconnected.result()
+                raise _ClientDisconnected()
+            result = work.result()
+            returned = True
+            return result
+        finally:
+            # Request.is_disconnected() can consume task cancellation in its cancel scope.
+            stop_watching = True
+            disconnected.cancel()
+            if not returned:
+                work.cancel()
+            settled = asyncio.gather(work, disconnected, return_exceptions=True)
+            cancelled_during_cleanup = False
+            with anyio.CancelScope(shield=True):
+                while not settled.done():
+                    try:
+                        await asyncio.shield(settled)
+                    except asyncio.CancelledError:
+                        cancelled_during_cleanup = True
+                        returned = False
+                if not returned and not work.cancelled() and work.exception() is None:
+                    result = work.result()
+                    if isinstance(result, AsyncGeneratorType):
+                        closing = asyncio.create_task(result.aclose())
+                        closed = asyncio.gather(closing, return_exceptions=True)
+                        while not closed.done():
+                            try:
+                                await asyncio.shield(closed)
+                            except asyncio.CancelledError:
+                                cancelled_during_cleanup = True
+                        closing.result()
+            if cancelled_during_cleanup:
+                raise asyncio.CancelledError
+
     def _wrap_entry_point(self,
                           entry_point: Callable,
                           request_type: type = UCompletionRequest,
@@ -475,22 +551,24 @@ class OpenAIDisaggServer:
                 hooks = self.response_hooks_cls(
                     raw_req, self._perf_metrics_collector.queue_latency_seconds,
                     self._collect_perf_metrics)
-                response_or_generator = await entry_point(req, hooks)
+                protected_context = self._service.context_cancellation_enabled
+                if protected_context:
+                    response_or_generator = await self._await_context_request(
+                        entry_point, req, hooks, raw_req)
+                else:
+                    response_or_generator = await entry_point(req, hooks)
                 if req.stream:
                     stream = response_or_generator
-                    if isinstance(req, ResponsesRequest):
-                        # A relayed Responses stream that fails ends with an
-                        # `error` event, even before its first frame.
+                    if isinstance(req, ResponsesRequest) and not protected_context:
+                        # A relayed Responses stream that fails early ends with
+                        # an `error` event; other protocols end on a sentinel.
                         stream = guard_responses_stream(stream,
                                                         stream_error_event)
-                    # Hold the headers until the first chunk: a chat or
-                    # completion stream that fails before it (e.g. a generation
-                    # server's KV-cache transfer error) becomes an HTTP error,
-                    # not a 200 whose body is cut off.
                     if hold_headers_until_first_chunk:
                         stream = await self._start_stream(stream, raw_req)
                     self._perf_metrics_collector.total_responses.inc()
-                    return StreamingResponse(
+                    response_type = ClosingStreamingResponse if protected_context else StreamingResponse
+                    return response_type(
                         content=stream,
                         media_type="text/event-stream")
                 self._perf_metrics_collector.total_responses.inc()
@@ -576,6 +654,25 @@ class OpenAIDisaggServer:
                                      return_exceptions=True)
                 await stream.aclose()
 
+    @staticmethod
+    async def _close_adapted_context_stream(
+        source: AsyncGenerator[str | bytes | None, None],
+        adapted: AsyncGenerator[str, None],
+    ) -> AsyncGenerator[str | None, None]:
+        """Retain source cleanup even before an adapter's first frame is consumed.
+
+        Args:
+            source: Protected OpenAI stream that owns CTX cancellation.
+            adapted: Anthropic framing of that same stream.
+
+        Yields:
+            An initial private sentinel, then unchanged Anthropic frames.
+        """
+        async with aclosing(source), aclosing(adapted):
+            yield None
+            async for frame in adapted:
+                yield frame
+
     async def anthropic_messages(self, request: AnthropicMessagesRequest,
                                  raw_request: Request) -> Response:
         """Serve Anthropic Messages through the disaggregated chat pipeline."""
@@ -603,10 +700,17 @@ class OpenAIDisaggServer:
         disagg_request_id = getattr(raw_request.state, "disagg_request_id",
                                     None)
         if isinstance(openai_response, StreamingResponse):
+            adapted = reframe_openai_stream(openai_response.body_iterator,
+                                           model=request.model,
+                                           request_id=disagg_request_id)
+            if isinstance(openai_response, ClosingStreamingResponse):
+                adapted = self._close_adapted_context_stream(
+                    openai_response.body_iterator, adapted)
+                await adapted.__anext__()
+                return ClosingStreamingResponse(content=adapted,
+                                                 media_type="text/event-stream")
             return StreamingResponse(
-                content=reframe_openai_stream(openai_response.body_iterator,
-                                              model=request.model,
-                                              request_id=disagg_request_id),
+                content=adapted,
                 media_type="text/event-stream",
             )
 

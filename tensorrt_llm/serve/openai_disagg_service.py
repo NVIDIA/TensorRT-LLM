@@ -16,8 +16,11 @@ import asyncio
 import json
 import os
 import re
-from typing import Callable, Optional
+from contextlib import AsyncExitStack, aclosing
+from typing import AsyncGenerator, Callable, Optional
 
+import aiohttp
+import anyio
 from fastapi import HTTPException
 
 from tensorrt_llm._utils import get_global_steady_clock_now_in_seconds
@@ -32,7 +35,11 @@ from tensorrt_llm.serve.anthropic_protocol import (
     AnthropicCountTokensRequest,
     AnthropicCountTokensResponse,
 )
-from tensorrt_llm.serve.disagg_coordinator import CoordinatorClient, DisaggCoordinator
+from tensorrt_llm.serve.disagg_coordinator import (
+    CoordinatorClient,
+    DisaggCoordinator,
+    context_cancellation_enabled,
+)
 from tensorrt_llm.serve.openai_client import OpenAIClient
 from tensorrt_llm.serve.openai_protocol import (
     ChatCompletionRequest,
@@ -55,7 +62,9 @@ from tensorrt_llm.serve.responses_utils import (
     ResponseHooks,
     UCompletionResponseOrGenerator,
     done_generator,
+    guard_responses_stream,
     responses_done_generator,
+    stream_error_event,
 )
 from tensorrt_llm.serve.router import CoordinatorDelegatingRouter, KvCacheAwareRouter, Router
 
@@ -115,6 +124,7 @@ class _SseErrorObserver:
         self._pending = bytearray()
         self._scan_from = 0
         self._responses_api = responses_api
+        self.completed = False
 
     def feed(self, chunk: str | bytes) -> bool:
         """Report a complete top-level error event in LF/CRLF worker SSE.
@@ -137,12 +147,20 @@ class _SseErrorObserver:
                 for line in event.splitlines()
                 if line.startswith(b"data:")
             )
+            if data == b"[DONE]" and not self._responses_api:
+                self.completed = True
+                continue
             try:
                 payload = json.loads(data)
             except ValueError:
                 continue
             if not isinstance(payload, dict):
                 continue
+            if self._responses_api and payload.get("type") in (
+                "response.completed",
+                "response.incomplete",
+            ):
+                self.completed = True
             found_error = isinstance(payload.get("error"), dict) or (
                 self._responses_api and payload.get("type") in ("error", "response.failed")
             )
@@ -154,6 +172,165 @@ class _SseErrorObserver:
         # delimiter needs revisiting; CRLF/CRLF has at most three prior bytes.
         self._scan_from = 0 if found_error else max(0, len(self._pending) - 3)
         return found_error
+
+
+class _ContextCancellation:
+    """Keep the CTX cancellation address across HTTP completion and GEN placement."""
+
+    _DELIVERY_BUDGET_SECONDS = 10.0
+    _ATTEMPT_TIMEOUT_SECONDS = 5.0
+
+    def __init__(self, client: OpenAIClient) -> None:
+        """Retain the control client without creating another resource owner.
+
+        Args:
+            client: Native HTTP context client with bounded control requests.
+        """
+        self._client = client
+        self._server: str | None = None
+        self._token: str | None = None
+        self._stream_cleanup = AsyncExitStack()
+        self._delivery: asyncio.Task[None] | None = None
+
+    def add_stream_cleanup(
+        self, source: AsyncGenerator[str | bytes, None], on_close: Callable[[], None]
+    ) -> None:
+        """Keep source cleanup active through wrappers that do not forward close.
+
+        Args:
+            source: Primed GEN stream that owns HTTP and router cleanup.
+            on_close: Idempotent bookkeeping for a completed or abandoned stream.
+        """
+        self._stream_cleanup.callback(on_close)
+        self._stream_cleanup.push_async_callback(source.aclose)
+
+    async def reserve(self, server: str, request_id: int) -> str:
+        """Obtain a submission identity, including a response racing with cancellation.
+
+        Args:
+            server: Selected context worker's shared HTTP address.
+            request_id: Immutable context-first pairing ID.
+
+        Returns:
+            Single-use admission token, retained here for later cancellation.
+        """
+        self._server = server
+        reservation = asyncio.create_task(
+            self._client.reserve_context_cancellation(server, request_id)
+        )
+        try:
+            self._token = await asyncio.shield(reservation)
+        except asyncio.CancelledError:
+            # Do not lose a late reservation response when cancellation wins the race.
+            settled = asyncio.gather(reservation, return_exceptions=True)
+            with anyio.CancelScope(shield=True):
+                while not settled.done():
+                    try:
+                        await asyncio.shield(settled)
+                    except asyncio.CancelledError:
+                        # Direct Task.cancel() is independent of AnyIO scopes.
+                        pass
+            if not reservation.cancelled() and reservation.exception() is None:
+                self._token = reservation.result()
+            raise
+        return self._token
+
+    async def _deliver_cancellation(self) -> None:
+        """Try idempotent delivery twice within one fixed ten-second control budget.
+
+        A routing receipt does not confirm worker handling or physical retirement.
+        On failure, the transfer timeout remains responsible for the logical
+        transfer outcome; unresolved access remains owned through the quiescence
+        grace and fail-close policy. The reservation window is not that bound.
+        """
+        deadline = asyncio.get_running_loop().time() + self._DELIVERY_BUDGET_SECONDS
+        error: BaseException | None = None
+        for _ in range(2):
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(
+                    self._client.cancel_context_cancellation(self._server, self._token),
+                    timeout=min(self._ATTEMPT_TIMEOUT_SECONDS, remaining),
+                )
+            except aiohttp.ClientResponseError as failure:
+                error = failure
+                if failure.status < 500:
+                    break
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as failure:
+                error = failure
+            except (aiohttp.ClientError, ValueError) as failure:
+                error = failure
+                break
+            else:
+                self._token = None
+                return
+        logger.warning(
+            f"Context cancellation delivery is unconfirmed ({type(error).__name__}); "
+            "the transfer timeout and physical-quiescence grace/fail-close policy remain active"
+        )
+
+    async def cancel(self) -> None:
+        """Share bounded cancellation delivery without resetting its budget.
+
+        The token is cleared only after a routing receipt. Repeated caller
+        cancellation cannot cancel delivery, reopen admission, or extend the
+        worker's transfer or quiescence deadlines.
+        """
+        if self._token is None:
+            return
+        if self._delivery is None:
+            self._delivery = asyncio.create_task(self._deliver_cancellation())
+        settled = asyncio.gather(self._delivery, return_exceptions=True)
+        with anyio.CancelScope(shield=True):
+            while not settled.done():
+                try:
+                    await asyncio.shield(settled)
+                except asyncio.CancelledError:
+                    # Direct Task.cancel() must not cancel shared delivery.
+                    pass
+        error = settled.result()[0]
+        if isinstance(error, BaseException):
+            logger.warning(
+                f"Context cancellation delivery is unconfirmed ({type(error).__name__}); "
+                "the transfer timeout and physical-quiescence grace/fail-close policy remain active"
+            )
+
+    async def stream(
+        self,
+        response: AsyncGenerator[str | bytes, None],
+        responses_api: bool,
+    ) -> AsyncGenerator[str | bytes | None, None]:
+        """Own CTX cancellation until a returned stream completes or closes.
+
+        Args:
+            response: Existing GEN stream, which may not yet have sent its POST.
+            responses_api: Whether to preserve Responses terminal-error framing.
+
+        Yields:
+            An initial private sentinel, then unchanged response frames.
+        """
+        success = False
+        observer = _SseErrorObserver(responses_api=responses_api)
+        failed = False
+        try:
+            async with self._stream_cleanup, aclosing(response):
+                # Prime cleanup before returning even when GEN has not sent its POST.
+                yield None
+                guarded = (
+                    guard_responses_stream(response, stream_error_event)
+                    if responses_api
+                    else response
+                )
+                async with aclosing(guarded):
+                    async for chunk in guarded:
+                        failed = observer.feed(chunk) or failed
+                        yield chunk
+            success = not failed and observer.completed
+        finally:
+            if not success:
+                await self.cancel()
 
 
 class OpenAIDisaggregatedService(OpenAIService):
@@ -200,6 +377,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         self._ctx_client = None
         self._gen_client = None
         self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+        self.context_cancellation_enabled = context_cancellation_enabled(config)
         # Token counting is stateless and cheap, so it is spread over the
         # context workers round-robin rather than going through the router,
         # which would charge the pick against KV-cache-aware load accounting.
@@ -314,6 +492,37 @@ class OpenAIDisaggregatedService(OpenAIService):
     async def _send_disagg_request_ctx_first(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
     ) -> UCompletionResponseOrGenerator:
+        cancellation = (
+            _ContextCancellation(self._ctx_client) if self.context_cancellation_enabled else None
+        )
+        success = False
+        try:
+            response = await self._send_disagg_request_ctx_first_impl(request, hooks, cancellation)
+            if cancellation is not None and request.stream:
+                response = cancellation.stream(response, isinstance(request, ResponsesRequest))
+                await response.__anext__()
+            success = True
+            return response
+        finally:
+            if not success and cancellation is not None:
+                await cancellation.cancel()
+
+    async def _send_disagg_request_ctx_first_impl(
+        self,
+        request: UCompletionRequest,
+        hooks: Optional[ResponseHooks],
+        cancellation: "_ContextCancellation | None",
+    ) -> UCompletionResponseOrGenerator:
+        """Run the existing context-first path with optional cancellation routing.
+
+        Args:
+            request: Original client request.
+            hooks: Optional request timing/response callbacks.
+            cancellation: Protected CTX control identity, or None for legacy behavior.
+
+        Returns:
+            Original CTX completion or existing GEN response/stream.
+        """
         # ctx_response contains a http response with ContextPhaseParams attached after prefill compute is done
 
         arrival_time = self._get_arrival_time(hooks)
@@ -346,6 +555,17 @@ class OpenAIDisaggregatedService(OpenAIService):
                 ctx_server, _ = await self._ctx_router.get_next_server(
                     ctx_req, exclude_server=gen_server, req_id=disagg_request_id
                 )
+                if cancellation is not None:
+                    try:
+                        ctx_req.disaggregated_params.context_cancellation_token = (
+                            await cancellation.reserve(ctx_server, disagg_request_id)
+                        )
+                    except (Exception, asyncio.CancelledError):
+                        # The HTTP client owns router cleanup only once send_request starts.
+                        await self._ctx_router.finish_request(
+                            ctx_req, success=False, req_id=disagg_request_id
+                        )
+                        raise
                 ctx_response = await self._ctx_client.send_request(
                     ctx_req, server=ctx_server, hooks=hooks, req_id=disagg_request_id
                 )
@@ -364,7 +584,7 @@ class OpenAIDisaggregatedService(OpenAIService):
                     length_ticket = await self._output_length_priority.assign(
                         gen_req, placed_later=not gen_server
                     )
-            except Exception:
+            except (Exception, asyncio.CancelledError):
                 if gen_server:
                     await self._gen_router.finish_request(
                         request, success=False, req_id=gen_reservation_id
@@ -405,6 +625,11 @@ class OpenAIDisaggregatedService(OpenAIService):
                     self._output_length_priority.abandon(length_ticket)
                 raise
             if length_ticket is not None:
+                if cancellation is not None and request.stream:
+                    cancellation.add_stream_cleanup(
+                        gen_response,
+                        lambda: self._output_length_priority.abandon(length_ticket),
+                    )
                 gen_response = self._output_length_priority.track(gen_response, length_ticket)
             return gen_response
         else:
@@ -485,6 +710,7 @@ class OpenAIDisaggregatedService(OpenAIService):
     ) -> UCompletionRequest:
         if ctx_response:
             request.disaggregated_params = _ctx_handoff_slots(ctx_response)[0].disaggregated_params
+            request.disaggregated_params.context_cancellation_token = None
             request.disaggregated_params.request_type = "generation_only"
             request.disaggregated_params.schedule_style = self._schedule_style
             request.disaggregated_params.ctx_usage = _ctx_usage_info(ctx_response)
