@@ -109,6 +109,7 @@ import torch
 from tensorrt_llm._torch.models.modeling_musespark_open import MuseSparkOpenLogitsProcessor
 from tensorrt_llm._torch.modules import low_m_gemm as _low_m
 from tensorrt_llm._torch.modules.linear import Linear, TensorParallelMode
+from tensorrt_llm._torch.modules.logit_soft_cap import soft_capped_logits
 from tensorrt_llm._torch.speculative.dflash import DFlashWorker
 from tensorrt_llm.logger import logger
 
@@ -750,7 +751,7 @@ class TargetHead:
     def materialize(self, logits: torch.Tensor) -> torch.Tensor:
         """The built-in processor's FP32 capped logits for the pending row; consumes it."""
         gathered = self._gather_now(logits)
-        return _hs.reference_capped(
+        return soft_capped_logits(
             logits if gathered is None else gathered, self.multiplier, self.soft_cap
         )
 
