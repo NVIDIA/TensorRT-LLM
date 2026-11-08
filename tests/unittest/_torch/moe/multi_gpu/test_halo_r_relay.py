@@ -733,6 +733,17 @@ def _case_balanced_and_empty(layers: _Layers) -> list:
     return failures
 
 
+def _case_default_stream(layers: _Layers) -> list:
+    """MAIN may be the legacy default stream, as in an eager script without an execution stream."""
+    main = torch.cuda.default_stream()
+    failures = []
+    for step in range(3):
+        routes = layers.routes(step, layers.max_tokens - 17 * (layers.rank % 8))
+        layers.call(0, routes, main)
+        failures += layers.check(0, routes)
+    return failures
+
+
 def _case_alternating_layers(layers: _Layers) -> list:
     """Three layers: on two shared helper banks, layer 2 refills the bank of layer 0; per-layer
     helper slots give every layer its own set."""
@@ -1330,6 +1341,7 @@ _CASES = {
     "reference_aux16": (_case_reference, 1, 16, "shared_banks"),
     "reference_production_bundle": (_case_reference, 1, _AUXILIARY_SMS, "shared_banks"),
     "balanced_and_empty": (_case_balanced_and_empty, 1, _AUXILIARY_SMS, "shared_banks"),
+    "default_stream": (_case_default_stream, 1, _AUXILIARY_SMS, "shared_banks"),
     "resident_repeat": (_case_resident_repeat, 1, _AUXILIARY_SMS, "per_layer_resident"),
     "resident_sequence": (_case_resident_sequence, 1, _AUXILIARY_SMS, "per_layer_resident"),
     "resident_layers": (_case_alternating_layers, 3, _AUXILIARY_SMS, "per_layer_resident"),

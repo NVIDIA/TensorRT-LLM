@@ -251,12 +251,12 @@ public:
     //! Orders `stream` (MAIN) after the route release of the last launch: it waits for the launch's completion event,
     //! then until every CTA has added 1 to the route counter, and then resets it, in one batched memory operation that
     //! holds no SM. The next launch's adds follow input_ready, which MAIN records after the reset. Capturable, in the
-    //! capture of the launch: the event wait becomes the graph edge from the kernel to the route wait.
+    //! capture of the launch: the event wait becomes the graph edge from the kernel to the route wait. MAIN may be the
+    //! legacy default stream (handle 0), as for HALO-Q's route wait.
     void waitRoutes(std::int64_t streamHandle)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         requireOperational();
-        TORCH_CHECK(streamHandle != 0, "the route wait needs MAIN's stream handle");
         auto const stream = reinterpret_cast<cudaStream_t>(streamHandle);
         TORCH_CHECK(stream != mCopyStream, "the route wait must not run on the copy stream");
         c10::cuda::CUDAGuard const deviceGuard(c10::Device(c10::DeviceType::CUDA, mDevice));
