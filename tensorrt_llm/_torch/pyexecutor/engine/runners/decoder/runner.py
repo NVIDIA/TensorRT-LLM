@@ -497,6 +497,7 @@ class DecoderRunner(ScheduledModelRunner):
         return cuda_graph_runner
 
     def _cuda_graph_runner_config(self) -> CUDAGraphRunnerConfig:
+        sampling_variants = getattr(self._config.cuda_graph_config, "sampling_variants", None)
         return CUDAGraphRunnerConfig(
             use_cuda_graph=self._config.cuda_graph_config is not None,
             cuda_graph_padding_enabled=self._config.cuda_graph_padding_enabled,
@@ -517,6 +518,7 @@ class DecoderRunner(ScheduledModelRunner):
             short_long_seq_len_threshold=self._short_long_seq_len_threshold(),
             private_metadata_buffers=self.runtime_hooks.skips_unchanged_metadata_uploads,
             enable_in_graph_sampling=self._config.enable_in_graph_sampling,
+            sampling_variants=None if sampling_variants is None else frozenset(sampling_variants),
             # Speculative steps rewrite every input token and position, so
             # captured graphs can read the persistent buffers directly.
             static_input_ids=(
@@ -722,6 +724,13 @@ class DecoderRunner(ScheduledModelRunner):
                 and context_plan is None
                 and not (ced_enabled and scheduled_requests.num_context_requests > 0)
             )
+            if (
+                key is None
+                and not is_dummy
+                and spec_metadata is not None
+                and scheduled_requests.num_context_requests == 0
+            ):
+                self._graphs.warn_uncaptured_sampling_variant(spec_metadata)
             if can_run_graph:
                 attn_metadata = selection.attn_metadata
                 spec_metadata = selection.spec_metadata

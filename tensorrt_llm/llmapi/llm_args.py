@@ -267,6 +267,32 @@ class DecodeCudaGraphConfig(BaseCudaGraphConfig):
     mode: Literal["decode"] = Field(
         default="decode", description="CUDA graph configuration mode.")
 
+    sampling_variants: Optional[List[Literal[
+        "greedy", "advanced", "temperature_only"]]] = Field(
+            default=None,
+            min_length=1,
+            description=
+            "Sampling variants captured as CUDA graphs with one-engine speculative "
+            "decoding. 'greedy' serves decode batches whose requests all decode "
+            "greedily; 'advanced' serves batches with a sampled request (temperature, "
+            "top-k, top-p, min-p, seeds, penalties or rejection sampling); "
+            "'temperature_only' serves sampled batches whose sampled requests set only "
+            "a temperature, on models that sample vocabulary-sharded logits (tensor "
+            "parallelism without attention DP), and when it is not listed those batches "
+            "use 'advanced'. By default every variant the engine supports is captured. "
+            "A decode batch of an unlisted variant runs eagerly, so list every variant "
+            "the workload sends; under attention DP the whole step then runs eagerly "
+            "on every rank.",
+            status="prototype")
+
+    @field_validator("sampling_variants")
+    @classmethod
+    def validate_sampling_variants(
+            cls, v: Optional[List[str]]) -> Optional[List[str]]:
+        if v is not None and len(set(v)) != len(v):
+            raise ValueError("sampling_variants must not repeat a variant")
+        return v
+
     @staticmethod
     def _merge_schedule_keys(batch_sizes: List[int],
                              schedule: dict[int, int]) -> List[int]:
@@ -8577,6 +8603,38 @@ class TorchLlmArgs(BaseLlmArgs):
         else:
             self.decoding_config = None
 
+        return self
+
+    @model_validator(mode="after")
+    def validate_cuda_graph_sampling_variants(self) -> 'TorchLlmArgs':
+        """Reject sampling variants that these arguments already rule out."""
+        variants = getattr(self.cuda_graph_config, "sampling_variants", None)
+        if variants is None:
+            return self
+        spec_config = self.speculative_config
+        # AUTO becomes suffix-automaton decoding, a one-engine mode, when the executor starts.
+        if spec_config is None or not (
+                isinstance(spec_config, AutoDecodingConfig)
+                or spec_config.spec_dec_mode.use_one_engine()):
+            raise ValueError(
+                "cuda_graph_config.sampling_variants applies to one-engine "
+                "speculative decoding only")
+        if getattr(spec_config, "enable_confidence_scheduling", False):
+            raise ValueError(
+                "cuda_graph_config.sampling_variants does not apply with confidence "
+                "scheduling, which plans each step's CUDA graph before the step's "
+                "sampling variant is known")
+        from tensorrt_llm._torch.speculative.interface import \
+            supports_sharded_target_sampling
+        if "temperature_only" in variants and not supports_sharded_target_sampling(
+                spec_config,
+                types.SimpleNamespace(
+                    tp_size=self.tensor_parallel_size,
+                    enable_attention_dp=self.enable_attention_dp)):
+            raise ValueError(
+                "cuda_graph_config.sampling_variants lists 'temperature_only', which "
+                "needs MTP-Eagle one-model decoding without relaxed acceptance, "
+                "with tensor parallelism and without attention DP")
         return self
 
     @model_validator(mode="after")
