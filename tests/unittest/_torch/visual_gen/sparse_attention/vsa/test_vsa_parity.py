@@ -24,7 +24,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from utils.util import isSM100Family
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.attention.backends.fmha.prims_ts_block_sparse import PrimsTSBlockSparseFmha
 from tensorrt_llm._torch.visual_gen.attention.attention import Attention, QKVMode, apply_rotary_emb
@@ -40,9 +40,9 @@ from tensorrt_llm._torch.visual_gen.config import (
 from tensorrt_llm.visual_gen.args import AttentionConfig, VideoSparseAttentionConfig
 
 _REQUIRES_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="VSA needs CUDA")
-_REQUIRES_SM100 = pytest.mark.skipif(
-    not isSM100Family(),
-    reason="CuTe DSL and PrimTS block-sparse parity requires SM100 or SM103",
+_REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
+    getSMVersion() not in (100, 103, 107),
+    reason="CuTe DSL and PrimTS block-sparse parity requires SM100, SM103, or SM107",
 )
 _BACKENDS = pytest.mark.parametrize("backend", ["CUTEDSL", "TRTLLM"])
 
@@ -158,7 +158,7 @@ def test_vsa_backends_match_dense_at_sparsity_zero(backend: str) -> None:
     torch.testing.assert_close(out_vsa, out_dense, rtol=1e-2, atol=1e-2)
 
 
-@_REQUIRES_SM100
+@_REQUIRES_PRIMTS_GPU
 def test_vsa_backends_match_each_other_on_ragged_input(monkeypatch: pytest.MonkeyPatch) -> None:
     """CuTeDSL and TRTLLM implement the same sparse VSA fine-stage semantics.
 
@@ -210,7 +210,7 @@ def test_vsa_backends_match_each_other_on_ragged_input(monkeypatch: pytest.Monke
     torch.testing.assert_close(outputs["CUTEDSL"], outputs["TRTLLM"], rtol=1e-2, atol=1e-2)
 
 
-@_REQUIRES_SM100
+@_REQUIRES_PRIMTS_GPU
 def test_vsa_trtllm_cuda_graph_replays_live_routes() -> None:
     """Captured VSA recomputes routes when graph-stable input storage changes."""
 

@@ -43,8 +43,8 @@ from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.quantization.mode import QuantMode
 
 _REQUIRES_PRIMTS_GPU = pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="PrimTS block-sparse attention requires SM100 or SM103",
+    getSMVersion() not in (100, 103, 107),
+    reason="PrimTS block-sparse attention requires SM100, SM103, or SM107",
 )
 
 
@@ -241,8 +241,8 @@ def _paged_case():
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("sm, expected", [(100, True), (103, True), (107, False)])
-def test_default_block_sparse_selection_keeps_blackwell_scope(monkeypatch, sm, expected) -> None:
+@pytest.mark.parametrize("sm", [100, 103, 107])
+def test_default_block_sparse_selection_shares_dense_architectures(monkeypatch, sm) -> None:
     from tensorrt_llm._torch.attention.backends.fmha import prims_ts as prims_ts_fmha
     from tensorrt_llm._torch.attention.backends.fmha.registry import get_enabled_fmha_lib_classes
 
@@ -258,7 +258,7 @@ def test_default_block_sparse_selection_keeps_blackwell_scope(monkeypatch, sm, e
 
     attention = SimpleNamespace(skip_correction_threshold=0.0, is_mla_enable=False)
     assert cls in get_enabled_fmha_lib_classes()
-    assert cls.is_available(attention) is expected
+    assert cls.is_available(attention)
     assert prims_ts_fmha.PrimsTSFmha.is_available(attention)
 
 
