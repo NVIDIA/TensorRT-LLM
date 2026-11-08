@@ -668,26 +668,42 @@ class HaloRSlotSchedulerGroup(RebalanceSlotSchedulerGroup):
         )
         ep_comm.barrier()
 
-        self.broadcaster = HaloRRelayEndpoint(
-            scheduler=self.scheduler,
-            route_counter=self._route_epoch,
-            arena=arena,
-            pool=pool,
-            home_experts=self.home_experts,
-            copy_stream=self.copy_stream,
-            helper_residency=bool(helper_residency),
-            first_run_spin_cycles=int(spin_bound.warmup_cycles),
+        # Each rank maps every peer's helper chunks and builds its native
+        # context; either can fail on one rank only (VMM resources, for
+        # example). The ranks exchange the outcome where they would meet at a
+        # barrier, so every rank raises the root cause instead of waiting for
+        # a failed peer.
+        error: Exception | None = None
+        try:
+            self.broadcaster = HaloRRelayEndpoint(
+                scheduler=self.scheduler,
+                route_counter=self._route_epoch,
+                arena=arena,
+                pool=pool,
+                home_experts=self.home_experts,
+                copy_stream=self.copy_stream,
+                helper_residency=bool(helper_residency),
+                first_run_spin_cycles=int(spin_bound.warmup_cycles),
+            )
+            # Set this layer's READY row to 1, as a launch before the first
+            # would leave it, so that every launch drains it before its count
+            # exchange, whatever its epoch. The device synchronization keeps a
+            # late write from erasing a peer's first READY; the exchange below
+            # extends it to every rank.
+            with torch.cuda.device(self.device):
+                arena.terminal_flags_tensor().view(torch.int64).fill_(_READY_GENERATION)
+                torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 - shared with the peers, then raised
+            error = exc
+        outcomes = list(
+            ep_comm.allgather(None if error is None else f"{type(error).__name__}: {error}")
         )
-
-        # Set this layer's READY row to 1, as a launch before the first would
-        # leave it, so that every launch drains it before its count exchange,
-        # whatever its epoch. The device synchronization keeps a late write
-        # from erasing a peer's first READY; the barrier extends it to every
-        # rank.
-        with torch.cuda.device(self.device):
-            arena.terminal_flags_tensor().view(torch.int64).fill_(_READY_GENERATION)
-            torch.cuda.synchronize(self.device)
-        ep_comm.barrier()
+        failures = [f"rank {rank}: {outcome}" for rank, outcome in enumerate(outcomes) if outcome]
+        if failures or len(outcomes) != ep_size:
+            raise RuntimeError(
+                f"HALO-R producer setup of layer {layer_idx} failed on {len(failures)} of "
+                f"{ep_size} EP ranks: " + "; ".join(failures)
+            ) from error
 
         # The previous consumer precedes the next launch's EP count exchange.
         self.lease = _LiveBankLeaseProvider(self)

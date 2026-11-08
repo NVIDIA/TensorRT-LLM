@@ -146,7 +146,14 @@ class _Env(SimpleNamespace):
 
 
 def _build(
-    monkeypatch, *, auxiliary_sms=4, ep_size=8, spin_bound=None, helper_residency=False
+    monkeypatch,
+    *,
+    auxiliary_sms=4,
+    ep_size=8,
+    spin_bound=None,
+    helper_residency=False,
+    fail_create=False,
+    peer_setup_error=None,
 ) -> _Env:
     trace = []
     state = SimpleNamespace(
@@ -269,6 +276,8 @@ def _build(
     def create(*args):
         trace.append(("create", len(args)))
         state.create_args = args
+        if fail_create:
+            raise RuntimeError("cuMemMap failed: CUDA_ERROR_OUT_OF_MEMORY")
         return SimpleNamespace(name="ctx")
 
     ops = SimpleNamespace(
@@ -322,6 +331,9 @@ def _build(
         if isinstance(value, tuple):
             # A residency reset: every peer reports the same, unless a test makes rank 0 differ.
             return [state.peer_reset or value] + [value] * (ep_size - 1)
+        if value is None or isinstance(value, str):
+            # The setup outcome of this rank (1); rank 0 fails if a test says so.
+            return [peer_setup_error, value] + [None] * (ep_size - 2)
         return [bytes([r]) for r in range(ep_size)]
 
     ep_comm = SimpleNamespace(
@@ -403,7 +415,7 @@ def test_construction_follows_halo_q_collective_order_and_sets_its_attributes(mo
         "create",
         "fill",
         "synchronize",
-        "barrier",
+        "allgather",
     ]
     assert [name for name in order if name in expected] == expected
     # The READY row starts at 1, so the first launch drains it like every other.
@@ -444,6 +456,18 @@ def test_a_capture_that_ends_within_a_layer_call_skips_its_waits_and_aborts(
     assert not any(entry[0] in ("route_wait", "join") for entry in trace)
     with pytest.raises(RuntimeError, match="quiesced group rebuild required"):
         group.plan_schedule(_Routes(4))
+
+
+def test_a_peer_setup_failure_raises_on_this_rank_instead_of_waiting(monkeypatch) -> None:
+    with pytest.raises(RuntimeError, match=r"failed on 1 of 8 EP ranks: rank 0: OSError: map"):
+        _build(monkeypatch, peer_setup_error="OSError: map")
+
+
+def test_a_local_setup_failure_reaches_every_peer_before_it_raises(monkeypatch) -> None:
+    with pytest.raises(RuntimeError, match=r"rank 1: RuntimeError: cuMemMap failed") as raised:
+        _build(monkeypatch, fail_create=True)
+    # The local root cause is chained.
+    assert "CUDA_ERROR_OUT_OF_MEMORY" in str(raised.value.__cause__)
 
 
 @pytest.mark.parametrize("auxiliary_sms", [2, 4, 8, 16])
