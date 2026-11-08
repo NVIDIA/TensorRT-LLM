@@ -441,8 +441,8 @@ def _hybrid_reuse_ctx_chunk_config(
     if ctx_chunk_config is None:
         logger.warning_once(
             "enable_block_reuse on a hybrid linear-attention model turns on "
-            "chunked prefill with the FORCE_CHUNK policy, although "
-            "enable_chunked_prefill is False.",
+            "chunked prefill, which is otherwise disabled, with the "
+            "FORCE_CHUNK policy.",
             key="hybrid_reuse_enables_chunking")
     elif (configured_policy is not None
           and configured_policy != ContextChunkingPolicy.FORCE_CHUNK):
