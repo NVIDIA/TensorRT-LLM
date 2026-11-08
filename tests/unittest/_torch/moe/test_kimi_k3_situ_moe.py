@@ -60,24 +60,34 @@ situ_supported = pytest.mark.skipif(
 )
 
 
-@pytest.fixture
-def _single_rank_nccl_process_group(monkeypatch):
+@pytest.fixture(scope="module")
+def _single_rank_nccl_module_group():
+    # One communicator per module: creating and destroying it per test crashed
+    # Rubin runs with SIGBUS in the MegaMoE buffer barrier after ~10 cycles.
     if dist.is_initialized():
         yield
         return
-    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
-    monkeypatch.setenv("MASTER_PORT", str(get_free_port()))
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    torch.cuda.set_device(0)
-    dist.init_process_group(backend="nccl", rank=0, world_size=1)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("MASTER_ADDR", "127.0.0.1")
+        mp.setenv("MASTER_PORT", str(get_free_port()))
+        mp.setenv("RANK", "0")
+        mp.setenv("WORLD_SIZE", "1")
+        mp.setenv("LOCAL_RANK", "0")
+        torch.cuda.set_device(0)
+        dist.init_process_group(backend="nccl", rank=0, world_size=1)
+        try:
+            yield
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+
+
+@pytest.fixture
+def _single_rank_nccl_process_group(_single_rank_nccl_module_group):
     try:
         yield
     finally:
         _MEGA_MOE_SYMM_BUFFER_CACHE.clear()
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 @dataclasses.dataclass
