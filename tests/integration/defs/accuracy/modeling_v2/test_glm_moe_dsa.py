@@ -280,6 +280,7 @@ _DATASET_PATH = f"{llm_models_root()}/datasets/openai/gsm8k"
 _RANK_ENV = {
     "TRTLLM_DSA_INDEXER_BF16": "1",
     "TLLM_SPEC_DECODE_FORCE_NUM_ACCEPTED_TOKENS": "0",
+    "TRTLLM_GLM5_MEGAKERNEL": os.environ.get("TRTLLM_GLM5_MEGAKERNEL", "0"),
 }
 
 
@@ -421,7 +422,9 @@ def _assert_optimized_paths(llm: LLM, trace_dir: Path, *, optimized: bool = True
     # These kernels are exclusive to the GLM optimized decode and MTP paths.
     # Requiring every TP rank prevents a route-selection or warmup-only pass.
     required_kernels = (
-        "routingFusedRouterKernel",
+        "glm52PlainLayerKernel"
+        if _RANK_ENV["TRTLLM_GLM5_MEGAKERNEL"] == "1"
+        else "routingFusedRouterKernel",
         "draftEhprojTableKernel",
         "draftSampleGlueKernel",
     )
