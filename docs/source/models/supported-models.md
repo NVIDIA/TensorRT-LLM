@@ -38,6 +38,7 @@ The following is a table of supported models for the PyTorch backend:
 | `MiniCPMV4_6ForConditionalGeneration` [^14]| MiniCPM-V 4.6                    | `openbmb/MiniCPM-V-4.6`                      |
 | `MiniMaxM3SparseForConditionalGeneration` [^12]| MiniMax-M3                       | `MiniMaxAI/MiniMax-M3`                      |
 | `MistralForCausalLM`                 | Mistral                            | `mistralai/Mistral-7B-v0.1`                  |
+| `MistralLarge4ForCausalLM` [^26]     | Mistral Large 4                    | `mistralai/Mistral-Large-4-1T-A52B-NVFP4`    |
 | `MixtralForCausalLM`                 | Mixtral                            | `mistralai/Mixtral-8x7B-v0.1`                |
 | `MllamaForConditionalGeneration`     | Llama 3.2                          | `meta-llama/Llama-3.2-11B-Vision`            |
 | `MuseSparkForConditionalGeneration` [^25] | Muse Spark Open                 | `meta-models/Muse-Spark-Open-816B-A42B-NVFP4`        |
@@ -109,6 +110,7 @@ statuses for the same architecture in the two matrices.
 | `Gemma4UnifiedForConditionalGeneration` | Yes                | Yes        | Yes                        | No                    | Yes             | No                         | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `Step3p7ForConditionalGeneration`| Yes               | Yes        | Yes                        | Untested              | Untested        | MTP                        | Yes           | No             | Yes                      | Yes                   | Yes             |
 | `MiniMaxM3SparseForConditionalGeneration` [^12] | Yes               | Yes        | Yes                        | Untested              | Untested        | EAGLE-3 (Linear), DSpark [^21] | Yes           | No             | N/A                      | Yes                   | Yes             |
+| `MistralLarge4ForCausalLM` [^26] | Yes               | Yes        | Yes                        | Yes [^27]             | Yes             | DSpark                     | Yes           | Yes            | N/A                      | Untested              | Yes             |
 
 [^1]: Chunked Prefill for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120.
 [^2]: KV cache reuse for MLA can only be enabled on SM90/SM100/SM103/SM107/SM120/SM121 and in BF16/FP8 KV cache dtype.
@@ -131,6 +133,8 @@ statuses for the same architecture in the two matrices.
 [^23]: Text-only decision model. `trtllm-serve embeddings` detects the native checkpoint and selects the FlashInfer attention backend automatically. Python `LLM.encode` callers must set `model_kwargs.architectures` to `[PplxDeciderForDecision]`. The embedding vector contains the 255 raw decision logits; apply the checkpoint's calibration and candidate normalization in the caller.
 [^24]: DeepSeek-V4.1 uses CSA2 sparse attention; see [DeepSeek-V4.1 CSA2](../features/sparse-attention.md#deepseek-v41-csa2). Checkpoints with candidate-consumer layers, including the released one, run only on SM100-family GPUs with a DeepGEMM build that includes the sparse MQA-logits kernels; otherwise model construction fails. Checkpoints without such layers can also use the SM90 and SM120/SM121 attention routes. The Engram tables live in pinned host memory, placed on a GPU's host NUMA node when the GPUs report one. When that node lacks free memory, model loading evicts the node's page cache, which every process on the node loses, and retries. Set `TRTLLM_ENGRAM_EVICT_PAGE_CACHE=0` to skip the eviction; such a node's tables then fall back to host memory that can span NUMA nodes, which can slow lookups.
 [^25]: Muse Spark Open is supported on NVIDIA Blackwell GPUs (`SM100` family); the validated deployment is TP4/EP4 on one 4-GPU GB300 NVL node — see the [Muse Spark Open deployment guide](../deployment-guide/deployment-guide-for-musespark-open-on-trtllm.md). Supports text, image, video, and audio inputs. On `SM103`, chunked prefill and KV cache reuse require the FP8 KV cache dtype (head-dimension-64 paged-context FMHA constraint); disaggregated serving runs only on the NIXL cache-transceiver backend with the Python transceiver runtime; some disaggregated configurations additionally require `TLLM_FMHA_LIBS=-fallback` in the server environment and, on GB300 (aarch64), `UCX_TLS=cuda_copy,cuda_ipc,sm,self,tcp`. Speculative decoding uses a DFlash2 drafter ([`nvidia/Muse-Spark-Open-816B-A42B-DFlash2`](https://huggingface.co/nvidia/Muse-Spark-Open-816B-A42B-DFlash2)).
+[^26]: Mistral Large 4 runs only on NVIDIA GB300 (`SM103`) from the NVFP4 checkpoint in the Mistral format (`checkpoint_format: mistral_large_4`); the FP8 checkpoint and the Hugging Face format are not supported. The architecture name is the one TensorRT LLM assigns when it reads the checkpoint's `params.json`. It is served by three modeling_v2 targets, tensor-parallel attention with expert-parallel experts, attention data parallelism with expert-parallel experts, and tensor parallelism, each on 4 GPUs or on 8 GPUs over two nodes, with contexts of up to 1,048,576 tokens. Speculative decoding uses the DSpark draft in the checkpoint (3 draft tokens). See the [Mistral Large 4 deployment guide](../deployment-guide/deployment-guide-for-mistral-large-4-on-trtllm.md).
+[^27]: Validated for one TEP4 context server and one TEP4 generation server at a 32K-token context, without speculative decoding.
 
 # Encoder-Decoder Feature Support Matrix (PyTorch Backend)
 
@@ -181,6 +185,7 @@ not used to mark a feature as supported here.
 | `Qwen3_5ForConditionalGeneration`    | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen3_5MoeForConditionalGeneration` | Yes               | Yes        | Untested        | Yes           | No             | Untested              | Yes                       | L + I + V |
 | `Qwen4ExpForConditionalGeneration`   | Untested          | Untested   | Untested        | Yes           | Untested       | Yes                   | No                        | L + I     |
+| `MistralLarge4ForCausalLM` [^26]     | Yes               | Yes        | Yes             | Yes           | Yes            | Untested              | Untested                  | L + I     |
 
 Note:
 - L: Language
