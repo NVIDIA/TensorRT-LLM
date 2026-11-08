@@ -32,11 +32,16 @@ def native_checkpoint():
     return path, {key: headers[key] for key in keys}
 
 
+@pytest.fixture(params=[103, 107], ids=["sm103", "sm107"])
+def target_sm(request):
+    return request.param
+
+
 @pytest.fixture(params=["tep", "dep", "tp"])
-def modeling(request):
+def modeling(request, target_sm):
     return importlib.import_module(
         "tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4."
-        f"mistral_large_4_nvfp4__sm_103__{request.param}.modeling"
+        f"mistral_large_4_nvfp4__sm_{target_sm}__{request.param}.modeling"
     )
 
 
@@ -158,7 +163,9 @@ def test_indexer_preserves_request_geometry(
 
 
 @pytest.mark.parametrize("with_images", [False, True])
-def test_target_image_embeddings_preserve_worker_token_ids(modeling, monkeypatch, with_images):
+def test_target_image_embeddings_preserve_worker_token_ids(
+    modeling, monkeypatch, with_images, target_sm
+):
     ids = torch.tensor([1, 2, 3])
     embed = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     image_rows = torch.full((2, 4), -7.0)
@@ -179,7 +186,7 @@ def test_target_image_embeddings_preserve_worker_token_ids(modeling, monkeypatch
     monkeypatch.setattr(modeling, "_image_rows", lambda *args: image_rows)
     monkeypatch.setattr(modeling, "tanh_softcap", lambda x, cap: cap * torch.tanh(x / cap))
     family = modeling.__name__.split("__")[-1].split(".")[0].capitalize()
-    target = getattr(modeling, f"ModelingV2MistralLarge4Nvfp4Sm103{family}")
+    target = getattr(modeling, f"ModelingV2MistralLarge4Nvfp4Sm{target_sm}{family}")
     result = target.forward(
         shell,
         attn_metadata=object(),
@@ -202,7 +209,7 @@ def test_target_image_embeddings_preserve_worker_token_ids(modeling, monkeypatch
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_native_shell_connects_guided_decoder_to_worker(modeling, enabled):
+def test_native_shell_connects_guided_decoder_to_worker(modeling, enabled, target_sm):
     from tensorrt_llm._torch.speculative.interface import SpecWorkerBase
 
     decoder = object()
@@ -210,7 +217,7 @@ def test_native_shell_connects_guided_decoder_to_worker(modeling, enabled):
     worker.set_guided_decoder = MethodType(SpecWorkerBase.set_guided_decoder, worker)
     shell = SimpleNamespace(spec_worker=worker if enabled else None)
     family = modeling.__name__.split("__")[-1].split(".")[0].capitalize()
-    target = getattr(modeling, f"ModelingV2MistralLarge4Nvfp4Sm103{family}")
+    target = getattr(modeling, f"ModelingV2MistralLarge4Nvfp4Sm{target_sm}{family}")
     assert target.set_guided_decoder(shell, decoder) is enabled
     assert worker.guided_decoder is (decoder if enabled else None)
 

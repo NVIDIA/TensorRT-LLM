@@ -330,10 +330,10 @@ def evaluate(
         def generate(batch: list[dict], salts: list[str | None], phase: str) -> list:
             check_reuse = phase != "benchmark"
             scheduling = None
-            if collect_spec and llm.args.enable_attention_dp and check_reuse:
+            if profile.startswith("long") and llm.args.enable_attention_dp and check_reuse:
                 # Keep the longest warm request and its cold partner on the rank that ran
                 # the cache probes. Otherwise a small panel can put every request on a
-                # different rank, never exercising verification and prefill together.
+                # different rank, never exercising decode and prefill together.
                 pair = max(range(0, len(batch), 2), key=lambda i: len(batch[i]["prompt_ids"]))
                 scheduling = [
                     SchedulingParams(attention_dp_rank=0, attention_dp_relax=False)
@@ -392,7 +392,7 @@ def evaluate(
                 profile,
                 attention_dp_size=(
                     llm.args.tensor_parallel_size
-                    if collect_spec and llm.args.enable_attention_dp
+                    if profile.startswith("long") and llm.args.enable_attention_dp
                     else 1
                 ),
             )

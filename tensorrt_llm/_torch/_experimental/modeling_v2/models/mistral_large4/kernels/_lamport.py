@@ -94,11 +94,12 @@ def ensure_process_group(rank: int, world: int) -> None:
         if rank == 0:
             import socket
 
+            from tensorrt_llm._torch.disaggregation.native.utils import get_local_ip
+
             with socket.socket() as sock:
                 sock.bind(("", 0))
                 port = sock.getsockname()[1]
-            # The bare hostname does not resolve on every node; its address does.
-            addr = (socket.gethostbyname(socket.gethostname()), port)
+            addr = (get_local_ip(), port)
         host, port = comm.bcast(addr, root=0)
         os.environ["MASTER_ADDR"] = host
         os.environ["MASTER_PORT"] = str(port)

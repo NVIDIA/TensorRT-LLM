@@ -85,6 +85,18 @@ _MISTRAL_LARGE4_NVFP4_TP_TARGET = (
     "models.mistral_large4.mistral_large_4_nvfp4__sm_103__tp.modeling."
     "ModelingV2MistralLarge4Nvfp4Sm103Tp"
 )
+_MISTRAL_LARGE4_NVFP4_SM107_TEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_107__tep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm107Tep"
+)
+_MISTRAL_LARGE4_NVFP4_SM107_DEP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_107__dep.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm107Dep"
+)
+_MISTRAL_LARGE4_NVFP4_SM107_TP_TARGET = (
+    "models.mistral_large4.mistral_large_4_nvfp4__sm_107__tp.modeling."
+    "ModelingV2MistralLarge4Nvfp4Sm107Tp"
+)
 
 
 def _qualified(target) -> str:
@@ -1706,14 +1718,15 @@ def test_glm52_without_an_fp8_kv_cache_does_not_match():
         modeling_v2_resolve(config, _llm_args("require"))
 
 
-# --- Mistral-Large-4-1T-A52B-NVFP4 on sm103 ----------------------------------------
+# --- Mistral-Large-4-1T-A52B-NVFP4 on sm103 and sm107 ------------------------------
 
 
 @pytest.fixture
 def _mistral_large4_sm(_on_sm10x):
-    """The Mistral-Large-4 targets are certified on sm_103 only; on sm_100 they route nowhere."""
+    """The Mistral-Large-4 targets are certified on sm_103 and sm_107; on sm_100 they route
+    nowhere. `_on_sm10x` covers sm_100 and sm_103, so the sm_107 cases set the capability."""
     if _on_sm10x != (10, 3):
-        pytest.skip("the Mistral-Large-4 targets are certified on sm_103 only")
+        pytest.skip("the Mistral-Large-4 targets are certified on sm_103 and sm_107 only")
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
@@ -1723,6 +1736,55 @@ def test_mistral_large4_nvfp4_tep4_matches(mode):
     assert (
         _qualified(modeling_v2_resolve(config, _llm_args(mode))) == _MISTRAL_LARGE4_NVFP4_TEP_TARGET
     )
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("mode", ["auto", "require"])
+@pytest.mark.parametrize(
+    "mapping,target",
+    [
+        (_TEP4, _MISTRAL_LARGE4_NVFP4_SM107_TEP_TARGET),
+        (_TEP8, _MISTRAL_LARGE4_NVFP4_SM107_TEP_TARGET),
+        (_DEP4, _MISTRAL_LARGE4_NVFP4_SM107_DEP_TARGET),
+        (_DEP8, _MISTRAL_LARGE4_NVFP4_SM107_DEP_TARGET),
+        (_TP4, _MISTRAL_LARGE4_NVFP4_SM107_TP_TARGET),
+        (_TP8, _MISTRAL_LARGE4_NVFP4_SM107_TP_TARGET),
+    ],
+    ids=["tep4", "tep8", "dep4", "dep8", "tp4", "tp8"],
+)
+def test_mistral_large4_nvfp4_sm107_topologies_match(monkeypatch, mode, mapping, target):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    config = _model_config(_mistral_large4_nvfp4_config(), **mapping)
+    assert _qualified(modeling_v2_resolve(config, _llm_args(mode))) == target
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize(
+    "mapping",
+    [
+        dict(_TEP8, world_size=16, tp_size=16, moe_ep_size=16),
+        dict(_TEP8, tp_size=4, pp_size=2, moe_ep_size=4),
+        dict(_TEP4, moe_ep_size=2, moe_tp_size=2),
+        dict(_DEP4, enable_lm_head_tp_in_adp=True),
+    ],
+)
+def test_mistral_large4_nvfp4_sm107_refuses_other_topologies(monkeypatch, mapping):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    config = _model_config(_mistral_large4_nvfp4_config(), **mapping)
+    assert modeling_v2_resolve(config, _llm_args("auto")) is None
+    with pytest.raises(ValueError, match=r"compute capability \(10, 7\)"):
+        modeling_v2_resolve(config, _llm_args("require"))
+
+
+@pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("mapping", [_TEP4, _TEP8, _DEP4, _DEP8, _TP4, _TP8])
+def test_mistral_large4_nvfp4_sm107_refuses_non_native_speculation(monkeypatch, mapping):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    config = _model_config(
+        _mistral_large4_nvfp4_config(), spec_config=MTPDecodingConfig(max_draft_len=1), **mapping
+    )
+    with pytest.raises(ValueError, match=r"compute capability \(10, 7\)"):
+        modeling_v2_resolve(config, _llm_args("require"))
 
 
 def _flip(values, i):
@@ -2176,8 +2238,8 @@ def test_mistral_large4_refusal_states_the_ranks_each_target_serves():
     message = str(excinfo.value)
     assert (
         "the mistral_large4 targets are Mistral-Large-4-1T-A52B-NVFP4 (ModelOpt MIXED_PRECISION: "
-        "NVFP4 routed experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 in the "
-        "tep, dep and tp layouts" in message
+        "NVFP4 routed experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 or sm107 "
+        "in the tep, dep and tp layouts" in message
     )
     assert "each target serves 4 ranks on one node or 8 ranks over two nodes of four" in message
     for served in (
@@ -2479,6 +2541,8 @@ def test_mistral_large4_nvfp4_dep8_with_speculative_decoding_does_not_match():
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
 @pytest.mark.parametrize("world", [4, 8])
+@pytest.mark.parametrize("sm", [103, 107])
+@pytest.mark.parametrize("with_images", [False, True])
 @pytest.mark.parametrize(
     "parallel,target",
     [
@@ -2487,9 +2551,13 @@ def test_mistral_large4_nvfp4_dep8_with_speculative_decoding_does_not_match():
         ("tp", _MISTRAL_LARGE4_NVFP4_TP_TARGET),
     ],
 )
-def test_mistral_large4_native_dspark_routes_each_topology(tmp_path, world, parallel, target):
+def test_mistral_large4_native_dspark_routes_each_topology(
+    tmp_path, monkeypatch, world, parallel, target, sm, with_images
+):
     import json
 
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (sm // 10, sm % 10))
+    target = target.replace("sm_103", f"sm_{sm}").replace("Sm103", f"Sm{sm}")
     (tmp_path / "params.json").write_text(
         json.dumps(
             {
@@ -2514,7 +2582,9 @@ def test_mistral_large4_native_dspark_routes_each_topology(tmp_path, world, para
 
     resolve_dspark_checkpoint(spec, str(tmp_path))
     config = _model_config(
-        _mistral_large4_nvfp4_config(),
+        _mistral_large4_nvfp4_config(
+            **({"vision_config": SimpleNamespace(**_ML4_VISION)} if with_images else {})
+        ),
         spec_config=spec,
         world_size=world,
         tp_size=world,
@@ -2554,20 +2624,26 @@ _ML4_VISION = dict(
 
 
 @pytest.mark.usefixtures("_mistral_large4_sm")
+@pytest.mark.parametrize("sm", [103, 107])
 @pytest.mark.parametrize(
     "mapping, target",
     [
         (_TEP4, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
         (_DEP4, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
         (_TP4, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
+        (_TEP8, _MISTRAL_LARGE4_NVFP4_TEP_TARGET),
+        (_DEP8, _MISTRAL_LARGE4_NVFP4_DEP_TARGET),
+        (_TP8, _MISTRAL_LARGE4_NVFP4_TP_TARGET),
     ],
-    ids=["tep4", "dep4", "tp4"],
+    ids=["tep4", "dep4", "tp4", "tep8", "dep8", "tp8"],
 )
-def test_mistral_large4_nvfp4_with_a_vision_encoder_serves_images(mapping, target):
+def test_mistral_large4_nvfp4_with_a_vision_encoder_serves_images(monkeypatch, mapping, target, sm):
     from tensorrt_llm._torch._experimental.modeling_v2.models.mistral_large4.routing import (
         serves_images,
     )
 
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (sm // 10, sm % 10))
+    target = target.replace("sm_103", f"sm_{sm}").replace("Sm103", f"Sm{sm}")
     pretrained_config = _mistral_large4_nvfp4_config(vision_config=SimpleNamespace(**_ML4_VISION))
     config = _model_config(pretrained_config, **mapping)
     assert _qualified(modeling_v2_resolve(config, _llm_args("require"))) == target

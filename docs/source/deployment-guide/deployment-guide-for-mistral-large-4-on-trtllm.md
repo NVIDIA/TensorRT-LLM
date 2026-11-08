@@ -9,13 +9,15 @@ SPDX-License-Identifier: Apache-2.0
 
 This guide describes how to serve Mistral Large 4 with TensorRT LLM on NVIDIA GB300 GPUs. It covers obtaining the checkpoint and its format, the supported deployments, installing the software, launching `trtllm-serve` on one or two nodes, the model-specific API behavior, example requests, accuracy verification and the known limitations. The configurations below are validated on GB300, most of them by the accuracy tests in `tests/integration/defs/accuracy/modeling_v2/test_mistral_large4.py`; configurations outside these tables are not validated.
 
+This source checkout also supports NVIDIA VR200 (`sm_107`) for all six parallel layouts, with DSpark enabled or disabled. See [VR200 Accuracy Validation](#vr200-accuracy-validation) for the verified scope. The installation and launch recipes below describe GB300; VR200 requires a source checkout containing the SM107 targets.
+
 Mistral Large 4 is a Mixture-of-Experts model with about 1T parameters, 49B of them active per token (52B including the embedding and output layers). It takes text and image input, supports a context of up to 1,048,576 tokens, and uses latent attention with a sparse top-k indexer. Like Mistral Large 3, it is published on Hugging Face in the Mistral format: `params.json` for the configuration, `tekken.json` for the tokenizer and `consolidated-*.safetensors` for the weights. TensorRT LLM loads its text model as the architecture `MistralLarge4ForCausalLM`; the checkpoint itself names no architecture. The repository also ships Hugging Face tokenizer, chat-template, processor and generation-config files, but no Transformers `config.json`. TensorRT LLM reads the Mistral-format files only; see [Checkpoint Format](#checkpoint-format).
 
 TensorRT LLM serves Mistral Large 4 through **modeling_v2** targets (`tensorrt_llm/_torch/_experimental/modeling_v2/models/mistral_large4/`). A modeling_v2 target is one implementation for one combination of checkpoint, GPU architecture and parallel layout. When the model is loaded, TensorRT LLM picks the target from the checkpoint's quantization, the GPU's compute capability, the parallel mapping and the speculative-decoding configuration. There is no other implementation of this architecture, so a deployment that no target claims fails to load. modeling_v2 is a prototype feature.
 
 ## Prerequisites
 
-* GPU: NVIDIA GB300 (`sm_103`). Other GPUs are not supported: no target claims another compute capability.
+* GPU for the deployment recipes below: NVIDIA GB300 (`sm_103`). VR200 (`sm_107`) is also supported by this source checkout, with the validation scope described below.
   * The 4-GPU deployments (TEP4, DEP4 and TP4) run on one node with 4 GPUs.
   * The 8-GPU deployments (TEP8, DEP8, TP8) run on two nodes with 4 GPUs each. Both nodes must be in the same multi-node NVLink domain.
 * Multi-node launcher: Slurm with the pyxis/enroot container plugin and PMIx (`srun --mpi=pmix`), or an equivalent MPI launcher, to start one rank per GPU.
@@ -60,6 +62,8 @@ Every Mistral Large 4 configuration must set `checkpoint_format: mistral_large_4
 Without `checkpoint_format`, TensorRT LLM expects the Hugging Face format, which needs a `config.json`, and fails with an error that names `mistral_large_4`. Mistral Large 4 is not served from the Hugging Face format.
 
 ## Supported Configurations
+
+The validation results in this section describe GB300. VR200 supports the same layouts; its accuracy coverage is listed in [VR200 Accuracy Validation](#vr200-accuracy-validation).
 
 | Deployment | GPUs | Checkpoint | Parallel settings | Validated `max_seq_len` |
 | :-- | --: | :-- | :-- | :-- |
@@ -541,9 +545,18 @@ GPQA Diamond and MMMU run with `reasoning_effort: low`.
 
 The 8-GPU cases run on two nodes with 4 GPUs each, under `trtllm-llmapi-launch`. The test lists `tests/integration/test_lists/test-db/l0_gb300_multi_gpus.yml` and `l0_gb300_multi_nodes_node2_gpu8.yml` show the cases that CI runs.
 
+### VR200 Accuracy Validation
+
+The gate classes `TestModelingV2MistralLarge4Nvfp4Sm107Tep`, `TestModelingV2MistralLarge4Nvfp4Sm107Dep` and `TestModelingV2MistralLarge4Nvfp4Sm107Tp` in `tests/integration/defs/accuracy/modeling_v2/test_mistral_large4.py` define the VR200 accuracy configurations: `test_accuracy` runs with DSpark and `test_accuracy_without_dspark` without it. Validation covered 24 base configurations: TEP4, TP4, DEP4, TEP8, TP8 and DEP8, each at `max_seq_len` 32768 and 1048576, with DSpark enabled and disabled:
+
+* The six TEP4, TP4 and DEP4 configurations at `max_seq_len` 1048576 each passed `full` and `long_full`, for 12 panels covering GSM8K, MMMU, GPQA Diamond, RULER, image, cache and execution-coverage checks.
+* The other 18 configurations each passed the complete 1,319-question GSM8K evaluation.
+
+All 30 workloads passed with the existing accuracy references and tolerances unchanged. Each core `long_full` panel includes three fixed 1M-token NIAH/VT retrieval cases, in addition to the 64K and 128K sets. The 8-GPU 1M configurations were validated with GSM8K only, not with long prompts. The separate llguidance and disaggregated-serving recipes have not been validated on VR200.
+
 ## Known Limitations
 
-* **GB300 only.** No other GPU, including GB200 and B200, is supported.
+* **GPU architectures.** GB300 (`sm_103`) and VR200 (`sm_107`) are supported. Other GPUs, including GB200 and B200, are not supported.
 * **NVFP4 checkpoint only.** Other exports of Mistral Large 4, including the FP8 checkpoint, are refused at load time.
 * **Mistral format only.** The checkpoint is read through `checkpoint_format: mistral_large_4`; the Hugging Face format is not supported. The Hugging Face files in the repository are not read, so the sampling defaults in its `generation_config.json` do not apply.
 * **Responses API.** Use `/v1/chat/completions`. On this revision `/v1/responses` drops image inputs, and with speculative decoding every `/v1/responses` request returns HTTP 400 because the request asks for log probabilities.
@@ -556,7 +569,7 @@ The 8-GPU cases run on two nodes with 4 GPUs each, under `trtllm-llmapi-launch`.
 * **Speculative decoding.** Only DSpark with the draft in the NVFP4 checkpoint, with 3 draft tokens. Guided decoding must be enabled explicitly with it (see `guided_decoding_backend` in [Key YAML Options](#key-yaml-options)).
 * **Image count.** The server does not limit the number of images per prompt.
 * **Long contexts.** A 1M-token request holds about 46 GiB of KV cache on each rank, so the 4-GPU deployments hold only one or two such requests at a time. TEP and TP keep a full copy of the KV cache on each rank; for many concurrent requests, use DEP.
-* **Disaggregated serving.** Validated only for TEP4 to TEP4 at a 32K-token context without speculative decoding.
+* **Disaggregated serving.** Validated on GB300 only for TEP4 to TEP4 at a 32K-token context without speculative decoding.
 * **Determinism.** Greedy decoding is not bitwise reproducible across runs and batch compositions; scores vary by a few tenths of a point between runs.
 
 ## Troubleshooting Tips
