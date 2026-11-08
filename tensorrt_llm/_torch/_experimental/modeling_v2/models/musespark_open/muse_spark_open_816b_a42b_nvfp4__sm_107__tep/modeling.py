@@ -352,7 +352,8 @@ order:
   ``draft_head``'s while ``draft_head`` accepts only the built-in class;
 * ``context_kv_fork``, which re-classes the worker on top of those, binds the
   fork point on the LM head's GEMM call and is armed per decode step by
-  ``DecodeTarget``;
+  ``DecodeTarget`` (with ``paged_context_commit``, a paged context's commit is one
+  launch);
 * ``verify_fold`` (with ``rejection_fold``, also on rejection-sampled steps) and
   ``path_walk_tail`` on top of that (on a folded step its prepare takes the context-K/V
   fork's side chain);
@@ -1241,6 +1242,7 @@ _TEP4_BITWISE_PATHS = frozenset(
         "path_walk_tail",
         "drafter_block_conv",
         "context_kv_fork",
+        "paged_context_commit",
         "split_sampler",
     }
 )

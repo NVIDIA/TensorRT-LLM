@@ -359,6 +359,12 @@ FAST_PATHS: Tuple[FastPath, ...] = (
         ("fused_accept",),
     ),
     FastPath(
+        "paged_context_commit",
+        "the context-K/V fork's commit over a paged drafter context in one launch",
+        "draft",
+        ("context_kv_fork",),
+    ),
+    FastPath(
         "rejection_fold",
         "a rejection-sampled step's bookkeeping folded into one launch after the rejection sampler",
         "draft",
