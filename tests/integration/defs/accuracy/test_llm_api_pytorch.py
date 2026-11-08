@@ -3092,8 +3092,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8"],
                              ids=["bf16-kv", "fp8-kv"])
     def test_prims_ts_bfloat16(self, mocker, kv_cache_dtype):
-        if get_sm_version() not in (100, 103):
-            pytest.skip("PrimTS requires SM100 or SM103")
+        if get_sm_version() not in (100, 103, 107):
+            pytest.skip("PrimTS requires SM100, SM103, or SM107")
 
         calls = _count_prims_ts_phase_calls(mocker)
         env = {
