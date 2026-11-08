@@ -102,10 +102,14 @@ def entry_point(name: str) -> str:
 
 
 def server_argv(spec: dict[str, Any], port: int) -> list[str]:
-    """The server's command line: its ranks' launch, ``trtllm-serve``, the checkpoint and flags."""
+    """The server's command line: its ranks' launch, ``trtllm-serve``, the checkpoint and flags.
+
+    On node 0 of a multi-node job (``gang.py lead``) the ranks span every node of the job.
+    """
     world = max(1, int(spec.get("world_size", 1)))
+    hosts = runtime.gang_mpi_hosts()
     return [
-        *runtime.rank_launch(world, entry_point("trtllm-llmapi-launch")),
+        *runtime.rank_launch(world, entry_point("trtllm-llmapi-launch"), hosts=hosts),
         entry_point("trtllm-serve"),
         str(spec["model"]),
         "--host",

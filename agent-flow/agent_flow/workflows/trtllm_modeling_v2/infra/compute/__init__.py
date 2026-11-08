@@ -22,4 +22,7 @@ SCHEDULER_PATH = GPU_DIR / "scheduler.py"
 #: The submit/wait/status/cancel client, as a file a shell's ``python3`` can run.
 SPOOLCTL_PATH = GPU_DIR / "spoolctl.py"
 
-__all__ = ["GPU_DIR", "SCHEDULER_PATH", "SPOOLCTL_PATH"]
+#: The launcher of one engine across the nodes of a multi-node job, run by path on every node.
+GANG_PATH = GPU_DIR / "gang.py"
+
+__all__ = ["GANG_PATH", "GPU_DIR", "SCHEDULER_PATH", "SPOOLCTL_PATH"]

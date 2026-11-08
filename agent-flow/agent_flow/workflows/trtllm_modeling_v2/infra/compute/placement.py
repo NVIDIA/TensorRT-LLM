@@ -5,7 +5,8 @@
 
 Each watcher's record (:func:`scheduler.watcher_records`) says what it holds, what waits and
 whether it is in hand-over; ``handover/acks/`` whether its successor was submitted. A spool can
-take a job when a live watcher would admit it and the job can finish there (:func:`_judge`). The
+take a job when a live watcher would admit it and the job can finish there (:func:`_judge`); a
+multi-node job also needs that many live nodes of one allocation on the spool. The
 gate pool passes over a spool whose best watcher is in hand-over even when the job would fit
 (:attr:`SpoolView.pickable`): a session with its allocation ahead of it is the better home.
 """
@@ -43,11 +44,13 @@ class JobNeeds:
     #: The ``wall`` header in seconds; ``None`` takes the session's default (0 is none).
     wall_s: float | None
     holds_gpus: bool
+    #: Whole nodes of one allocation the job holds (``nodes=N``, MULTI-NODE JOBS).
+    nodes: int = 1
 
     @classmethod
     def from_script(cls, name: str, script: str) -> "JobNeeds":
         spec = _sched.job_spec_from_script(name, script)
-        return cls(gpus=spec.gpus, wall_s=spec.wall_s, holds_gpus=spec.holds_gpus)
+        return cls(gpus=spec.gpus, wall_s=spec.wall_s, holds_gpus=spec.holds_gpus, nodes=spec.nodes)
 
     def wall_on(self, default_wall_s: float) -> float:
         """The wall limit this job runs under on a session whose default is ``default_wall_s``."""
@@ -146,6 +149,15 @@ def rank(view: SpoolView) -> tuple:
     )
 
 
+def _live_nodes(records: list[Mapping[str, Any]]) -> int:
+    """The most distinct hosts one allocation has live among ``records``, as a gang forms them."""
+    hosts: dict[str, set[str]] = {}
+    for record in records:
+        allocation = str(record.get("slurm_job") or record.get("watcher"))
+        hosts.setdefault(allocation, set()).add(str(record.get("host") or record.get("watcher")))
+    return max((len(found) for found in hosts.values()), default=0)
+
+
 def assess(spool: str | Path, job: JobNeeds, *, stale_s: float, now: float) -> SpoolView:
     """What ``spool`` can do for ``job`` now: through its best live watcher, or why not."""
     root = Path(spool)
@@ -159,6 +171,14 @@ def assess(spool: str | Path, job: JobNeeds, *, stale_s: float, now: float) -> S
             path=root, reasons=[f"its watcher is not alive (last heartbeat {span(age)} ago)"]
         )
     views = [_judge(root, record, job, now) for record in live]
+    if job.nodes > 1:
+        nodes = _live_nodes(live)
+        if nodes < job.nodes:
+            for view in views:
+                view.reasons.append(
+                    f"the job asks for {job.nodes} nodes of one allocation and this spool has "
+                    f"{nodes} live"
+                )
     able = [v for v in views if v.can_take]
     if able:
         return min(able, key=rank)

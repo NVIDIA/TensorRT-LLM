@@ -210,9 +210,17 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         devices = ()
     else:
         devices = tuple(range(gpus))
-    environment = resolve_environment(task_data, devices=devices, world_size=world)
+    # A member wider than one node is one engine across several, in a multi-node job.
+    environment = resolve_environment(task_data, devices=devices).at_width(world)
     # The unit's own, without a variant's overlay: what a relative variant is judged against.
-    unit_environment = resolve_environment(declared, devices=devices, world_size=world)
+    unit_environment = resolve_environment(declared, devices=devices).at_width(world)
+    if spec is not None:
+        # The disaggregated test places its own engines, one node's worth each.
+        environment, unit_environment = (
+            replace(environment, nodes=1),
+            replace(unit_environment, nodes=1),
+        )
+    nodes = spec.nodes if spec else environment.nodes
     if args.python:
         environment = replace(environment, python=args.python)
         unit_environment = replace(unit_environment, python=args.python)
@@ -227,7 +235,7 @@ def run_gate(args: argparse.Namespace) -> check_result.GateResult:
         # A worker's own gate run queues after the run's checks and before perf work.
         executor = select_command_executor(
             environment, name_prefix=f"gate-{args.name}", gpus=str(gpus), tree=tree,
-            priority=FEATURE, nodes=spec.nodes if spec else 1,
+            priority=FEATURE, nodes=nodes,
         )  # fmt: skip
         runner = shell_runner_for(executor)
         runner = pin.runner(runner) if pin is not None else check_runtime.in_tree(runner, tree)

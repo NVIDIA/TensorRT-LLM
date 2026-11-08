@@ -248,3 +248,26 @@ def test_quantized_core_has_one_kv_dtype_source_and_structural_hybrid_hints(tmp_
         {"text_config": {"layer_types": ["linear_attention", "full_attention"]}}
     )
     assert derive.hybrid_marker({"architectures": ["Unseen"]}) is None
+
+
+def test_a_member_wider_than_a_node_takes_the_sites_devices_per_node_and_asks_for_a_session(
+    tmp_path,
+):
+    site = dict(device={"arch": "sm_100", "gpus_per_node": 4})
+    with pytest.raises(derive.DeriveError, match=r"tep8 \(2 nodes\) is wider than one node"):
+        _derive(tmp_path, "tep4 tep8", **site)
+    environment = {
+        "kind": "session_spool",
+        "python": "/opt/venv/bin/python",
+        "spool": str(tmp_path / "spool"),
+        "env": {"TMPDIR": SCRATCH, "CLAUDE_CODE_TMPDIR": SCRATCH},
+        "sessions": [
+            {"name": "gates", "spool": str(tmp_path / "spool"), "role": "gates", "nodes": 2}
+        ],
+    }
+    path = _derive(tmp_path, "tep4 tep8", clean=True, environment=environment, **site)
+    spec = load_and_validate_task_yaml(path)
+    assert spec["environment"]["gpus_per_node"] == 4
+    assert task_schema.member_nodes(spec, "tep8") == 2
+    report = (path.parent / derive.REPORT_FILENAME).read_text()
+    assert "tep8 (2 nodes)" in report

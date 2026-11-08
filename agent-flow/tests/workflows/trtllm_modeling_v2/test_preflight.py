@@ -149,8 +149,12 @@ def _fake_boot(fails: dict[str, str], booted: list):
 def test_a_unified_substrate_is_proven_by_the_first_member_the_stock_path_serves(
     tmp_path, monkeypatch
 ):
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
+        resolve_environment,
+    )
+
     task = _task(tmp_path, parallel="unified", members=["tp4", "tep4", "dep4"])
-    environment = SimpleNamespace(world_size=4)
+    environment = resolve_environment(task, world_size=4)
     booted, notes = [], []
     misaligned = {"tp4": "AssertionError: M % 128 == 0"}
     monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", _fake_boot(misaligned, booted))
@@ -383,3 +387,96 @@ def test_every_anchor_is_found_by_what_identifies_it_in_this_checkout():
         ):
             unfindable.append(f"{key}: a search found {list(found[:3])}")
     assert not unfindable, f"anchors a search cannot find by what identifies them: {unfindable}"
+
+
+def _spanning_task(tmp_path, **environment):
+    task = _task(tmp_path, parallel="unified", members=["tep4", "tep8"])
+    task["environment"].update(gpus_per_node=4, **environment)
+    return task
+
+
+def test_a_member_wider_than_a_node_needs_a_gates_session_of_its_nodes(tmp_path):
+    task = _spanning_task(tmp_path)
+    with pytest.raises(PreflightError, match=r"tep8 \(2 nodes\) is wider than one node of 4 GPUs"):
+        preflight.check_member_placement(task, 8)
+    task["environment"].update(kind="session_spool", spool="/s/gates")
+    with pytest.raises(PreflightError, match="the declared gate sessions provide 1 node"):
+        preflight.check_member_placement(task, 8)
+    task["environment"]["sessions"] = [
+        {"name": "work", "spool": "/s/work", "role": "work", "nodes": 2},
+        {"name": "gates", "spool": "/s/gates", "role": "gates"},
+    ]
+    with pytest.raises(PreflightError, match="`nodes: 2`"):
+        preflight.check_member_placement(task, 8)
+    task["environment"]["sessions"][1]["nodes"] = 2
+    (note,) = preflight.check_member_placement(task, 8)
+    assert "tep8 (2 nodes)" in note and "node 0's mpirun starts every rank" in note
+    task["members"] = ["tep6"]
+    assert "tep6 leaves devices of a node idle" in preflight.check_member_placement(task, 8)[1]
+    task["environment"]["gpus_per_node"] = 8
+    assert preflight.check_member_placement(task, 8) == []
+
+
+def _probe_says(**verdict):
+    line = preflight.GANG_PROBE_MARKER + json.dumps(verdict)
+    return CommandResult(returncode=0, stdout=f"rank chatter\n{line}\n")
+
+
+def test_a_member_wider_than_a_node_is_probed_then_booted_across_its_nodes(tmp_path, monkeypatch):
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute import GANG_PATH
+    from agent_flow.workflows.trtllm_modeling_v2.infra.compute.environment import (
+        resolve_environment,
+    )
+
+    gates = {"name": "gates", "spool": "/s/gates", "role": "gates", "nodes": 2}
+    task = _spanning_task(tmp_path, kind="session_spool", spool="/s/gates", sessions=[gates])
+    task["parallel"] = "tep8"
+    environment = resolve_environment(task, world_size=8)
+    calls, booted = [], []
+    said = {"world": 8, "mpi_sum": 8, "nccl_sum": 8.0, "hosts": ["nodeA", "nodeB"]}
+
+    def gang_runner(nodes):
+        def run(command, env=None, timeout=0):
+            calls.append((nodes, command))
+            return _probe_says(**said)
+
+        return run
+
+    def run_boot_gate(engine, *, member=None, runner=None, **_):
+        booted.append((member, engine.world_size, engine.nodes, runner))
+        return GateResult(name="boot[off]", member=member, passed=True, detail="generated")
+
+    monkeypatch.setattr(preflight.boot_checks, "run_boot_gate", run_boot_gate)
+    notes = []
+    preflight.substrate_gate(
+        task, environment, shell_runner="one-node", workdir=tmp_path, notes=notes,
+        gang_runner=gang_runner,
+    )  # fmt: skip
+    ((nodes, command),) = calls
+    assert nodes == 2
+    assert f"{GANG_PATH} lead --nodes 2 --ranks 8 -- /opt/venv/bin/python -c" in command
+    assert "from mpi4py import MPI" in command and "trtllm-llmapi-launch" not in command
+    assert "8 ranks on nodeA, nodeB formed one MPI world and summed 8 over NCCL" in notes[0]
+    # The boot is the member's own: 8 ranks across 2 nodes, through the multi-node runner.
+    ((member, width, spans, runner),) = booted
+    assert (member, width, spans) == (None, 8, 2) and runner != "one-node"
+
+    # Without an address for its rendezvous NCCL is not probed, and the note says why.
+    del said["nccl_sum"]
+    said["nccl"] = "rank 0's host name does not resolve ([Errno -2] Name or service not known)"
+    notes.clear()
+    preflight.substrate_gate(
+        task, environment, shell_runner="one-node", workdir=tmp_path, notes=notes,
+        gang_runner=gang_runner,
+    )  # fmt: skip
+    assert "formed one MPI world; NCCL not probed: rank 0's host name does not" in notes[0]
+    # A probe whose ranks did not land on every node stops the run before a model loads,
+    # as does a rendezvous that failed.
+    whole = {"world": 8, "mpi_sum": 8, "nccl_sum": 8.0, "hosts": ["nodeA", "nodeB"]}
+    for broken in ({"hosts": ["nodeA"]}, {"nccl": "error: rank 0 could not host it"}):
+        said.clear()
+        said.update(whole, **broken)
+        with pytest.raises(PreflightError, match="the 8-rank probe across 2 nodes exited 0"):
+            preflight.check_gang_substrate(environment.at_width(8), gang_runner(2))
+    with pytest.raises(PreflightError, match="no multi-node runner"):
+        preflight.substrate_gate(task, environment, shell_runner="one-node", workdir=tmp_path)

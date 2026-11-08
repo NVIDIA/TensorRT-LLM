@@ -134,18 +134,36 @@ def reap(pids: set[int], grace_s: float = 30.0) -> list[int]:
     return signalled
 
 
-def rank_launch(world_size: int, launcher: str = "trtllm-llmapi-launch") -> list[str]:
+#: Set by ``gang.py lead`` on node 0 of a multi-node job: each node's host and slots, as
+#: ``mpirun --host`` takes them (``hostA:4,hostB:4``). Absent everywhere else.
+GANG_MPI_HOSTS_ENV = "MV2FLOW_GANG_MPI_HOSTS"
+
+
+def gang_mpi_hosts(environ: Mapping[str, str] | None = None) -> str | None:
+    """The hosts an engine's ranks span when this process leads a multi-node job, else ``None``."""
+    value = (os.environ if environ is None else environ).get(GANG_MPI_HOSTS_ENV, "").strip()
+    return value or None
+
+
+def rank_launch(
+    world_size: int, launcher: str = "trtllm-llmapi-launch", *, hosts: str | None = None
+) -> list[str]:
     """The argv prefix that creates ``world_size`` ranks for one server, or none for one.
 
     Slurm task variables are cleared so the launcher reads the new MPI world's
-    rank and size instead of the enclosing one-task allocation.
+    rank and size instead of the enclosing one-task allocation. ``hosts``
+    (:func:`gang_mpi_hosts`) spreads the ranks over a multi-node job's nodes,
+    filling each host's slots in rank order, so rank ``r`` lands on node
+    ``r // slots`` as TensorRT-LLM's mapping assumes; without it every rank
+    starts on this node.
     """
     if world_size <= 1:
         return []
     scrub = [arg for name in MULTI_TASK_SLURM_VARS for arg in ("-u", name)]
+    placement = ["--host", hosts, "--map-by", "slot"] if hosts else ["--oversubscribe"]
     return [
         "env", *scrub,
-        "mpirun", "-n", str(world_size), "--oversubscribe", "--allow-run-as-root", launcher,
+        "mpirun", "-n", str(world_size), *placement, "--allow-run-as-root", launcher,
     ]  # fmt: skip
 
 

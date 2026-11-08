@@ -34,6 +34,7 @@ from ...checks import check_config, check_runtime
 from ...checks import disagg as disagg_checks
 from ...checks.check_config import resolve_llm_api_options, speculation_flags
 from ...checks.runtime_evidence import reports_unsupported_architecture
+from ...infra.compute import GANG_PATH
 from ...infra.compute import environment as environment_mod
 from ...infra.compute.commands import CommandResult, CommandSpec, LocalCommandExecutor
 from ...infra.compute.environment import RunEnvironment, resolve_environment, scheduler_owns_devices
@@ -49,6 +50,8 @@ from ...spec.task_schema import (
     derive_family,
     derive_slug,
     features_through,
+    gpus_per_node,
+    member_nodes,
     members_for,
     parse_parallel_segment,
     resolve_per_unit,
@@ -544,6 +547,52 @@ def check_disagg_placement(task_data: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def gate_session_nodes(task_data: Mapping[str, Any]) -> int:
+    """The most nodes one session that takes gate jobs holds; 1 for a bare ``environment.spool``."""
+    sessions = sessions_from_task(task_data)
+    return max([s.nodes for s in sessions if s.role in GATE_ROLES] or [1])
+
+
+def check_member_placement(task_data: Mapping[str, Any], world_size: int) -> list[str]:
+    """Every member wider than one node has a multi-node gates session to run as one engine on.
+
+    Such a member's checks run in multi-node jobs (``infra/compute/gang.py``): only a
+    ``session_spool`` session of that many nodes of one allocation admits them.
+    """
+    per_node = gpus_per_node(task_data)
+    members = sorted(
+        {m for unit in assembly_units(task_data) for m in members_for(task_data, unit, world_size)}
+    )
+    spans = {m: member_nodes(task_data, m) for m in members}
+    spans = {m: n for m, n in spans.items() if n > 1}
+    if not spans:
+        return []
+    environment = task_data.get("environment") or {}
+    available = gate_session_nodes(task_data)
+    widest = max(spans.values())
+    listed = ", ".join(f"{m} ({n} nodes)" for m, n in spans.items())
+    if environment.get("kind") != "session_spool" or available < widest:
+        raise PreflightError(
+            f"{listed} {'is' if len(spans) == 1 else 'are'} wider than one node of {per_node} "
+            f"GPUs: each runs as one engine across that many nodes, in a multi-node job of a "
+            f"`session_spool` gates session holding them; the declared gate sessions provide "
+            f"{available} node(s). Declare a gates session with `nodes: {widest}`, or gate "
+            f"members that fit one node."
+        )
+    notes = [
+        f"members wider than one node of {per_node} GPUs: {listed}; their checks run as one "
+        f"engine across a multi-node job (node 0's mpirun starts every rank, each other node "
+        f"starts its daemons through the spool)"
+    ]
+    partial = [m for m in spans if (parse_parallel_segment(m)[1] or 0) % per_node]
+    if partial:
+        notes.append(
+            f"{', '.join(partial)} leave{'s' if len(partial) == 1 else ''} devices of a node "
+            f"idle: a multi-node job holds whole nodes"
+        )
+    return notes
+
+
 def check_gate_budgets(task_data: Mapping[str, Any]) -> list[str]:
     """Every gate's time limit fits in one allocation of the sessions that run the gates.
 
@@ -849,6 +898,117 @@ def check_multirank_substrate(
         )
 
 
+#: What the cross-node probe's rank 0 prints its verdict behind.
+GANG_PROBE_MARKER = "MV2FLOW_GANG_PROBE "
+
+#: Every rank of one MPI world across the nodes. The world forms (``mpi4py``, as the LLM API's
+#: workers do) and sums one per rank; then NCCL forms over the same ranks and all-reduces, its
+#: rendezvous at rank 0's address as TensorRT-LLM's ``torch.distributed`` bootstrap resolves it
+#: (its host name, broadcast over MPI). A name that resolves to no address the other nodes reach
+#: is reported instead of waited on.
+GANG_PROBE_SOURCE = f"""
+import ipaddress, json, socket
+from mpi4py import MPI
+comm = MPI.COMM_WORLD
+rank, size = comm.Get_rank(), comm.Get_size()
+hosts = comm.allgather(socket.gethostname())
+verdict = {{"world": size, "mpi_sum": comm.allreduce(1), "hosts": sorted(set(hosts))}}
+store, said = None, None
+if rank == 0:
+    try:
+        addr = socket.gethostbyname(socket.gethostname())
+        if ipaddress.ip_address(addr).is_loopback:
+            said = f"rank 0's host name resolves to {{addr}}, which other nodes cannot reach"
+    except OSError as exc:
+        addr, said = None, f"rank 0's host name does not resolve ({{exc}})"
+    if said is None:
+        import torch.distributed as dist
+        try:
+            store = dist.TCPStore(addr, 0, size, is_master=True, wait_for_workers=False)
+        except RuntimeError as exc:
+            said = f"error: rank 0 could not host the NCCL rendezvous ({{exc!r}})"
+    found = (addr, store.port if store is not None else None, said)
+addr, port, said = comm.bcast(found if rank == 0 else None)
+if said is None:
+    import torch, torch.distributed as dist
+    torch.cuda.set_device(rank % torch.cuda.device_count())
+    if rank:
+        store = dist.TCPStore(addr, port, size, is_master=False)
+    dist.init_process_group("nccl", store=store, rank=rank, world_size=size)
+    total = torch.ones(1, device="cuda")
+    dist.all_reduce(total)
+    dist.barrier()
+    verdict["nccl_sum"] = total.item()
+    dist.destroy_process_group()
+else:
+    verdict["nccl"] = said
+if rank == 0:
+    print({GANG_PROBE_MARKER!r} + json.dumps(verdict), flush=True)
+"""
+
+
+def gang_probe_command(environment: RunEnvironment) -> str:
+    """The probe, one process per rank of ``environment``'s engine, across its nodes.
+
+    Launched as the gates launch an engine (``gang.py lead``), but each rank runs the probe
+    itself rather than the LLM API's launcher.
+    """
+    python = environment.python
+    lead = [python, str(GANG_PATH), "lead", "--nodes", str(environment.nodes)]
+    argv = [*lead, "--ranks", str(environment.ntasks), "--", python, "-c", GANG_PROBE_SOURCE]
+    return f"{environment.prefix} {shlex.join(argv)}".strip()
+
+
+def check_gang_substrate(environment: RunEnvironment, runner: Any) -> str:
+    """One MPI world across ``environment``'s nodes, and an NCCL all-reduce over it, or raise.
+
+    A launch agent that cannot start a node's daemons, a host the others cannot reach or a fabric
+    NCCL cannot use hangs a cross-node engine rather than failing it: found here in a minute,
+    not after a model has loaded. NCCL is not probed when rank 0's host name gives the other
+    nodes no address to meet it at; the note says so.
+    """
+    command = gang_probe_command(environment)
+    result = runner(command, None, MULTIRANK_PROBE_TIMEOUT_S)
+    output = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}"
+    verdict: dict[str, Any] | None = None
+    for line in output.splitlines():
+        if line.startswith(GANG_PROBE_MARKER):
+            try:
+                verdict = json.loads(line[len(GANG_PROBE_MARKER) :])
+            except json.JSONDecodeError:
+                verdict = None
+    world, nodes = environment.ntasks, environment.nodes
+    said = str((verdict or {}).get("nccl") or "")
+    if (
+        verdict is None
+        or verdict.get("world") != world
+        or verdict.get("mpi_sum") != world
+        or len(verdict.get("hosts") or ()) != nodes
+        or said.startswith("error:")
+        or (not said and verdict.get("nccl_sum") != world)
+    ):
+        why = (
+            f"timed out after {MULTIRANK_PROBE_TIMEOUT_S}s"
+            if getattr(result, "timed_out", False)
+            else f"exited {getattr(result, 'returncode', '?')}"
+        )
+        tail = "\n".join(output.strip().splitlines()[-30:])
+        raise PreflightError(
+            f"the {world}-rank probe across {nodes} nodes {why} without one MPI world of {world} "
+            f"ranks on {nodes} hosts summing over NCCL ({verdict}). It launches as a cross-node "
+            f"engine does; a hang here is typically a host or interface another node cannot "
+            f"reach (`OMPI_MCA_oob_tcp_if_include`, `NCCL_SOCKET_IFNAME` in `environment.env`)."
+            f"\n\ncommand:\n  {command}\n\nlast lines:\n{tail}"
+        )
+    hosts = ", ".join(verdict["hosts"])
+    if said:
+        return (
+            f"cross-node probe: {world} ranks on {hosts} formed one MPI world; NCCL not probed: "
+            f"{said}"
+        )
+    return f"cross-node probe: {world} ranks on {hosts} formed one MPI world and summed {world} over NCCL"
+
+
 #: How long the substrate gate may take; it loads real weights.
 SUBSTRATE_TIMEOUT_S = 1800
 
@@ -879,14 +1039,40 @@ def _substrate_members(
     return list(members_for(task_data, None, environment.world_size))
 
 
+#: Builds the runner a multi-node job of that many nodes goes through.
+GangRunner = Callable[[int], Any]
+
+
+def _member_environment(environment: RunEnvironment, member: str | None) -> RunEnvironment:
+    """``environment`` at ``member``'s width (the run's own for ``None``), across its nodes."""
+    width = parse_parallel_segment(member)[1] if member else None
+    return environment.at_width(width or environment.world_size)
+
+
+def _substrate_runner(
+    environment: RunEnvironment, shell_runner: Any, gang_runner: GangRunner | None
+) -> Any:
+    """The runner one engine of ``environment`` boots through: a multi-node job's when it spans."""
+    if environment.nodes <= 1:
+        return shell_runner
+    if gang_runner is None:
+        raise PreflightError(
+            f"the substrate gate would boot an engine across {environment.nodes} nodes, and "
+            f"this preflight has no multi-node runner"
+        )
+    return gang_runner(environment.nodes)
+
+
 def _substrate_boot(
     task_data: Mapping[str, Any],
     environment: RunEnvironment,
     shell_runner: Any,
     workdir: str | Path,
+    gang_runner: GangRunner | None = None,
 ):
     """One substrate boot, under the stock path and no features.
 
+    Each member boots at its own width, across the nodes it spans (``gang_runner``).
     Returns ``(result, failures)``: the first member's result that passed, or
     else the first member's failure, and ``(member, result)`` for every
     member that failed before it.
@@ -894,11 +1080,12 @@ def _substrate_boot(
     members = _substrate_members(task_data, environment)
     failures: list[tuple[str, Any]] = []
     for member in members:
+        engine = _member_environment(environment, member)
         result = boot_checks.run_boot_gate(
-            environment,
+            engine,
             task_data=task_data,
             spec=boot_checks.BootSpec(prompts=("The capital of France is",), max_tokens=4),
-            runner=shell_runner,
+            runner=_substrate_runner(engine, shell_runner, gang_runner),
             timeout=SUBSTRATE_TIMEOUT_S,
             mode=check_runtime.MODE_OFF,
             features=[],
@@ -919,6 +1106,7 @@ def substrate_gate(
     shell_runner: Any,
     workdir: str | Path,
     notes: list[str] | None = None,
+    gang_runner: GangRunner | None = None,
 ) -> None:
     """Prove this host can *generate a token* under the run's exact config.
 
@@ -936,10 +1124,25 @@ def substrate_gate(
     named in the note, since they are layouts the target must serve without
     a stock reference to boot beside.
 
+    A member wider than one node boots across the nodes it spans, through
+    ``gang_runner`` (a multi-node job of that many nodes), after a probe of one
+    MPI world and one NCCL all-reduce across them (:func:`check_gang_substrate`).
+
     ``workdir`` is where the boot's driver spec is written. The proxy attempt
     writes under ``workdir/proxy``.
     """
-    result, failures = _substrate_boot(task_data, environment, shell_runner, workdir)
+    # One probe per node count, at the widest engine of that many nodes.
+    spanning: dict[int, RunEnvironment] = {}
+    for member in _substrate_members(task_data, environment):
+        engine = _member_environment(environment, member)
+        widest = spanning.get(engine.nodes)
+        if engine.nodes > 1 and (widest is None or engine.ntasks > widest.ntasks):
+            spanning[engine.nodes] = engine
+    for _, engine in sorted(spanning.items(), key=lambda item: item[0]):
+        said = check_gang_substrate(engine, _substrate_runner(engine, shell_runner, gang_runner))
+        if notes is not None:
+            notes.append(said)
+    result, failures = _substrate_boot(task_data, environment, shell_runner, workdir, gang_runner)
     if not result.passed and not _reports_unsupported_architecture(result):
         raise PreflightError(
             "substrate gate failed: this host cannot generate a token under the "
@@ -975,6 +1178,7 @@ def substrate_gate(
             environment,
             shell_runner,
             Path(workdir) / "proxy",
+            gang_runner,
         )
         if not proxy_result.passed:
             raise PreflightError(
@@ -1061,6 +1265,7 @@ def run_preflight(
     notes.extend(check_variant_anchors(task_data, world_size))
     notes.extend(check_launch_settings(task_data))
     notes.extend(check_disagg_placement(task_data))
+    notes.extend(check_member_placement(task_data, world_size))
     notes.extend(check_gate_budgets(task_data))
     notes.extend(check_speculation_support(task_data))
     notes.extend(check_capture_lists(task_data))
@@ -1166,8 +1371,13 @@ __all__ = [
     "PreflightResult",
     "SpecInconsistencyError",
     "UnsupportedSpeculationError",
+    "GANG_PROBE_MARKER",
     "check_capture_lists",
     "check_disagg_placement",
+    "check_gang_substrate",
+    "check_member_placement",
+    "gang_probe_command",
+    "gate_session_nodes",
     "check_gate_budgets",
     "check_variant_anchors",
     "check_kv_cache_configs",

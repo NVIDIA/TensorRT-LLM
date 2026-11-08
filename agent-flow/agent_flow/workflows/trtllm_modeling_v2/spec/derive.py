@@ -31,6 +31,7 @@ from typing import Any, Mapping
 
 import yaml
 
+from ..infra.compute.sessions import GATE_ROLES
 from ..operators import tree_anchors
 from .schema_keys import reject_unknown_keys
 from .task_schema import (
@@ -44,6 +45,7 @@ from .task_schema import (
     PROFILE_STANDARD,
     PROFILES,
     SPECULATORS,
+    nodes_for_width,
     parse_parallel_segment,
 )
 
@@ -596,6 +598,8 @@ def derive_spec(
         "environment": dict(site["environment"]),
         "accuracy": accuracy,
     }
+    narrowed = [m for listed in goal.unit_members.values() for m in listed]
+    _spanning_members(spec, site, [*members, *narrowed], note, questions)
     kv_variants = {
         f"kv_{dtype}": {
             "unit": "core",
@@ -786,6 +790,40 @@ def disagg_layout(
         return width, 2
     per_engine = -(-width // gpus_per_node)
     return gpus_per_node, 2 * per_engine
+
+
+def _spanning_members(
+    spec: dict[str, Any], site: Mapping[str, Any], members: list[str], note, questions: list[str]
+) -> None:
+    """Members wider than one node: the devices per node they are measured against, and a session.
+
+    Such a member runs as one engine across a multi-node job; the flow knows it spans only from
+    ``environment.gpus_per_node``, taken from the site's ``device`` block when the environment
+    does not say, and its checks need a gates session holding that many nodes.
+    """
+    environment = spec["environment"]
+    per_node = environment.get("gpus_per_node") or (site.get("device") or {}).get("gpus_per_node")
+    spans = {}
+    for member in dict.fromkeys(members):
+        nodes = nodes_for_width(parse_parallel_segment(member)[1], per_node)
+        if nodes > 1:
+            spans[member] = nodes
+    if not spans:
+        return
+    if not environment.get("gpus_per_node"):
+        environment["gpus_per_node"] = note("environment.gpus_per_node", per_node, "site device")
+    listed = ", ".join(f"{m} ({n} nodes)" for m, n in spans.items())
+    note(f"members {listed}", "one engine across a multi-node job each", "site device")
+    widest = max(spans.values())
+    sessions = [s for s in environment.get("sessions") or () if s.get("role", "any") in GATE_ROLES]
+    available = max([int(s.get("nodes") or 1) for s in sessions] or [1])
+    if environment.get("kind") != "session_spool" or available < widest:
+        questions.append(
+            f"{listed} {'is' if len(spans) == 1 else 'are'} wider than one node of {per_node} "
+            f"GPUs: declare a gates session of `nodes: {widest}` in the site's "
+            f"environment.sessions (a `session_spool` environment), or name members that fit "
+            f"one node"
+        )
 
 
 def _disagg(

@@ -37,15 +37,17 @@ MULTI-NODE JOBS
     <spool>/gangs/<name>/ready/<watcher>   a member drained for it
     <spool>/gangs/<name>/go.json           every node is drained: each starts its part
     <spool>/gangs/<name>/parts/<rank>.json how each node's part ended
+    <spool>/gangs/<name>/relay/            what the job's parts hand each other (``gang.py``)
 
 A job declaring ``nodes=N`` holds N whole nodes of one allocation: one watcher per node, all on
 this spool (a session of ``nodes: N``). The watcher that admits it leads: it picks N-1 live peers
 of its allocation and records them; each stops admitting GPU work and, once drained, says it is
 ready. When all are, the leader claims the job, writes ``go.json`` and every node runs the same
-script under ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS`` and
-``MV2FLOW_JOB_MASTER``, rank 0's log at ``logs/<name>.log``, rank r's at ``logs/<name>.node<r>.log``.
-A part that fails stops the others; the job's receipt waits for every part and carries the
-first that failed. One multi-node job holds a spool's nodes at a time.
+script under ``MV2FLOW_JOB_NODES``, ``MV2FLOW_JOB_NODE_RANK``, ``MV2FLOW_JOB_HOSTS``,
+``MV2FLOW_JOB_MASTER`` and ``MV2FLOW_JOB_GANG_DIR`` (``gangs/<name>``), rank 0's log at
+``logs/<name>.log``, rank r's at ``logs/<name>.node<r>.log``. A part that fails stops the others;
+the job's receipt waits for every part and carries the first that failed. One multi-node job
+holds a spool's nodes at a time. ``gang.py`` runs one engine across such a job's nodes.
 
 LOST ALLOCATIONS
 ================
@@ -1534,6 +1536,7 @@ class Scheduler:
                     "MV2FLOW_JOB_NODE_RANK": str(gang["rank"]),
                     "MV2FLOW_JOB_HOSTS": ",".join(gang["hosts"]),
                     "MV2FLOW_JOB_MASTER": gang["hosts"][0],
+                    "MV2FLOW_JOB_GANG_DIR": str(self.paths.gangs / gang["name"]),
                 }
             )
         header = (
