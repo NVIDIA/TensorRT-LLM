@@ -421,6 +421,24 @@ requests that bypass the handoff retain the configured retry policy. With
 remote-tail replay disabled, ordinary disaggregated requests retain their
 configured retry policy, including the transient TCP retry budget.
 
+### Bounding the graceful stop of a server
+
+A server can still have request handlers running when it is told to stop, for
+example when a benchmark client leaves while its last requests are in flight. By
+default the OpenAI HTTP server waits for every one of them. The prototype setting
+`serve_graceful_shutdown_timeout_s: N` bounds that wait: after a shutdown signal,
+the server waits at most `N` seconds for running request handlers (uvicorn's
+`timeout_graceful_shutdown`), then cancels them and shuts down as usual. It
+applies to the LLM, embedding and multimodal-encoder servers of `trtllm-serve`,
+in every frontend process; the disaggregated router keeps its own
+`--request_timeout` for the requests it forwards. It is off by default.
+[Bounding the Graceful Stop](../commands/trtllm-serve/trtllm-serve.rst#bounding-the-graceful-stop)
+in the `trtllm-serve` reference describes it for every server.
+
+```yaml
+serve_graceful_shutdown_timeout_s: 30
+```
+
 ## Environment Variables
 
 TRT-LLM uses some environment variables to control the behavior of disaggregated service.
