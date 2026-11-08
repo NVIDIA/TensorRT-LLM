@@ -819,13 +819,20 @@ class CUDAGraphRunner:
                 (key.batch_size * self.max_beam_width - key.num_contexts) *
                 token_per_generation)
 
-    def capture(self,
-                key: KeyType,
-                forward_fn: Callable,
-                initial_inputs: Dict[str, Any],
-                enable_spec_decode: bool = False,
-                postprocess_fn: Optional[Callable] = None) -> Any:
-        """Warm up and/or capture the forward pass for a graph key."""
+    def capture(
+        self,
+        key: KeyType,
+        forward_fn: Callable,
+        initial_inputs: Dict[str, Any],
+        enable_spec_decode: bool = False,
+        postprocess_fn: Optional[Callable] = None,
+        capture_scope: Callable[
+            [], contextlib.AbstractContextManager] = contextlib.nullcontext
+    ) -> Any:
+        """Warm up and/or capture the forward pass for a graph key.
+
+        ``capture_scope`` encloses the graph capture, not the warmup forwards before it.
+        """
         batch_size = key.batch_size
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
@@ -912,7 +919,7 @@ class CUDAGraphRunner:
             # setup/capture; release its reference before entering.
             output = None
             graph_pool = self.memory_pool or torch.cuda.graph_pool_handle()
-            with nccl_window_graph_capture(graph, graph_pool):
+            with capture_scope(), nccl_window_graph_capture(graph, graph_pool):
                 # A pre-replay hook reads the static inputs before the replay, so their copies must land before it.
                 prologue_pack = (None if self._pre_replay_hooks else
                                  step_inputs.capture_prologue())

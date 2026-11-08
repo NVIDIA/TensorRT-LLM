@@ -65,6 +65,9 @@ from .warmup import WarmupAgreement
 # schedule more, and their breaks run eagerly.
 _BREAK_GRAPH_NUM_CONTEXTS = (1, 2)
 
+# "1": the final executor captures its graphs in one pass when every rank can keep them.
+SKIP_WARMUP_PASS_ENV = "TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS"
+
 
 def _make_single_token_context_graph_batch(
     scheduled_requests: ScheduledRequests,
@@ -231,6 +234,8 @@ class DecoderCudaGraphs:
         # Promoted context rows carry no per-sequence extra model inputs.
         self._context_promotion_supported = context_promotion_supported
         self._force_lora_graph_for_capture: bool | None = None
+        # Metadata tensor addresses of each graph a single capture pass took.
+        self._captured_tensor_ptrs: list[tuple[KeyType, Any, dict[str, int]]] | None = None
 
     def forward_discarded_warmup(
         self,
@@ -341,15 +346,20 @@ class DecoderCudaGraphs:
         """Allocate the padding dummies while the KV cache is still empty."""
         self.cuda_graph_runner.preallocate_padding_dummies(resource_manager)
 
-    def warmup_and_capture(self, resource_manager: ResourceManager) -> None:
+    def warmup_and_capture(
+        self, resource_manager: ResourceManager, *, allow_single_pass: bool = False
+    ) -> None:
         """Warm up every graph shape, then capture them all.
 
         Attention kernels can switch implementations at smaller batch sizes and
         require a larger workspace, so the first pass grows the workspace to
         its maximum size. The second pass runs the final per-shape warmup and
-        captures without resizing the workspace.
+        captures without resizing the workspace. ``allow_single_pass`` lets
+        ``TLLM_CUDA_GRAPH_SKIP_WARMUP_PASS=1`` try one pass first.
         """
         with self.cuda_graph_runner.allow_capture():
+            if allow_single_pass and self._capture_in_one_pass(resource_manager):
+                return
             self.cuda_graph_runner.is_warmup_only = True
             try:
                 self.run_cuda_graph_warmup(resource_manager)
@@ -361,6 +371,68 @@ class DecoderCudaGraphs:
             # serving timeouts. The warmup-only pass above keeps the warmup ones.
             with moe_comm_serving_timeouts():
                 self.run_cuda_graph_warmup(resource_manager)
+
+    def _capture_in_one_pass(self, resource_manager: ResourceManager) -> bool:
+        """Capture every graph without the warm-up-only pass; on False no graph is left.
+
+        The graphs stay only if, on every rank, no graph's metadata tensor moved by the last capture.
+        """
+        if not self.cuda_graph_runner.enabled:
+            return False
+        # Every rank joins, so a rank without the switch keeps all ranks on two passes.
+        wanted = os.environ.get(SKIP_WARMUP_PASS_ENV, "0") == "1"
+        if not self._agreement.agree_flag(wanted and self._single_pass_supported()):
+            return False
+        self._captured_tensor_ptrs = []
+        try:
+            self.run_cuda_graph_warmup(resource_manager, capture_prefill=False)
+            moved = sorted(
+                {
+                    f"{type(metadata).__name__}.{name}"
+                    for _, metadata, ptrs in self._captured_tensor_ptrs
+                    for name, ptr in ptrs.items()
+                    if not isinstance(tensor := getattr(metadata, name, None), torch.Tensor)
+                    or tensor.data_ptr() != ptr
+                }
+            )
+        finally:
+            self._captured_tensor_ptrs = None
+        if self._agreement.agree_flag(not moved):
+            with moe_comm_serving_timeouts():
+                self._capture_prefill_cuda_graphs(resource_manager)
+            logger.info(
+                f"Captured {len(self.cuda_graph_runner.graphs)} CUDA graphs without the "
+                "warm-up-only pass"
+            )
+            return True
+        logger.warning(
+            "Capturing the CUDA graphs again after a warm-up-only pass: a captured graph's "
+            f"metadata tensor moved on some rank (on this rank: {moved or 'none'})"
+        )
+        self.cuda_graph_runner.clear()
+        return False
+
+    def _single_pass_supported(self) -> bool:
+        """Whether one capture pass prepares everything the warm-up-only pass would."""
+        from tensorrt_llm._torch.modules.linear import MXFP8LinearMethod
+
+        return (
+            not self.cuda_graph_runner.graphs
+            # Their tactics are tuned in the warm-up-only pass.
+            and self._lora.cuda_graph_manager is None
+            and not any(
+                isinstance(method := getattr(module, "quant_method", None), MXFP8LinearMethod)
+                and method.needs_flashinfer_autotune
+                for module in self.model.modules()
+            )
+            # Subclasses that capture more shapes rely on the warm-up-only pass.
+            and type(self)._capture_additional_cuda_graphs
+            is DecoderCudaGraphs._capture_additional_cuda_graphs
+            # Ranks that cannot agree keep the two passes.
+            and not (
+                self._agreement.is_distributed_forward() and self._agreement.allgather() is None
+            )
+        )
 
     def _prepare_capture_batch(
         self,
@@ -579,7 +651,20 @@ class DecoderCudaGraphs:
                     inputs,
                     enable_spec_decode=enable_spec_decode,
                     postprocess_fn=postprocess_inputs,
+                    # Serving replays the timeouts current at capture.
+                    capture_scope=moe_comm_serving_timeouts,
                 )
+                if self._captured_tensor_ptrs is not None:
+                    graph_metadata = self.cuda_graph_runner.graph_metadata[key]
+                    for name in ("attn_metadata", "spec_metadata"):
+                        if (metadata := graph_metadata[name]) is not None:
+                            self._captured_tensor_ptrs.append(
+                                (
+                                    key,
+                                    metadata,
+                                    self.cuda_graph_runner._snapshot_graph_tensor_ptrs(metadata),
+                                )
+                            )
 
             if self.cuda_graph_runner.is_warmup_only:
                 outputs = capture_outputs
@@ -680,7 +765,9 @@ class DecoderCudaGraphs:
             draft_lengths.append(0)
         return [(bs, draft_len) for bs in cuda_graph_batch_sizes for draft_len in draft_lengths]
 
-    def run_cuda_graph_warmup(self, resource_manager: ResourceManager) -> None:
+    def run_cuda_graph_warmup(
+        self, resource_manager: ResourceManager, *, capture_prefill: bool = True
+    ) -> None:
         """Warm up or capture CUDA graphs for the configured graph shapes."""
         is_warmup_only = self.cuda_graph_runner.is_warmup_only
         metric_name = (
@@ -742,7 +829,7 @@ class DecoderCudaGraphs:
                     self._capture_additional_cuda_graphs(resource_manager)
         # Piecewise graphs have separate capture machinery and do not use the
         # whole-model attention workspace. Capture them only on the second pass.
-        if not is_warmup_only:
+        if not is_warmup_only and capture_prefill:
             self._capture_prefill_cuda_graphs(resource_manager)
 
     def _capture_generation_cuda_graphs(self, resource_manager: ResourceManager) -> None:
