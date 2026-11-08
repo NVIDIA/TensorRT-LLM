@@ -101,8 +101,9 @@ Models whose preference selects the V2 manager when the setting is `auto`:
 Separately, Gemma4 hybrid attention and sparse-attention models are routed to
 V2 unconditionally: their per-layer buffer layouts cannot be represented by V1's
 unified pool, so `use_kv_cache_manager_v2` does not apply to them. Skip Softmax
-Attention is the exception: it changes only the attention kernel, keeps the
-dense KV cache layout, and follows `use_kv_cache_manager_v2` like a dense model.
+Attention is the exception: it changes only the attention kernel and keeps the
+dense KV cache layout, so `use_kv_cache_manager_v2` applies to it as to a dense
+model, and a Gemma4 hybrid attention model with Skip Softmax still uses V2.
 
 For a model whose `layer_types` mixes sliding-window and full-attention layers
 and that publishes a single `sliding_window` (GPT-OSS, Gemma3), the V2 manager

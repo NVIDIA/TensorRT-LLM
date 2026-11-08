@@ -419,7 +419,8 @@ framework wiring is:
   the kernel-side fast path.
 
 Because the KV cache keeps the dense layout, a kernel-level algorithm uses the
-dense KV cache manager that `use_kv_cache_manager_v2` selects.
+dense KV cache manager: `use_kv_cache_manager_v2` selects V1 or V2, and a model
+with variable per-layer KV geometry always uses V2.
 
 Skip Softmax Attention follows this pattern — see the
 [BLASST tech blog](../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.md)

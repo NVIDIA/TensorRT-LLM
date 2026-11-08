@@ -44,8 +44,9 @@ def get_sparse_attn_kv_cache_manager(
     elif sparse_attention_config.algorithm == "deepseek_v4":
         return DeepseekV4CacheManager
     elif sparse_attention_config.algorithm == "skip_softmax":
-        # Skip Softmax changes only the attention kernel; the KV cache keeps
-        # the dense layout and follows the dense manager selection.
+        # Skip Softmax changes only the attention kernel and keeps the dense
+        # KV cache. get_kv_cache_manager_cls routes models through the dense
+        # manager selection; this maps an already chosen version to its class.
         return KVCacheManagerV2 if use_kv_cache_manager_v2 else KVCacheManager
     elif sparse_attention_config.algorithm == "minimax_m3":
         return MiniMaxM3KVCacheManagerV2
