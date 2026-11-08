@@ -2374,7 +2374,6 @@ def test_megamoe_replica_plan_supplies_launch_facts_and_route_wait():
 def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     moe = MegaMoECuteDsl.__new__(MegaMoECuteDsl)
     torch.nn.Module.__init__(moe)
-    moe._last_staged_T = {8: 6}
     trace = []
     moe._wait_rebalance_routes = lambda replica_plan=None: trace.append(("wait", replica_plan))
     bufs = SimpleNamespace(
@@ -2401,12 +2400,54 @@ def test_megamoe_staging_widens_int32_routes_after_the_route_wait():
     # One copy widens the int32 routes into the int64 kernel index buffer.
     assert bufs.topk_idx_local.dtype == torch.int64
     assert torch.equal(bufs.topk_idx_local[:3], routes.to(torch.int64))
-    # Rows a previous launch wrote, and only those, are reset to -1.
-    assert torch.equal(bufs.topk_idx_local[3:6], torch.full((3, 4), -1, dtype=torch.int64))
-    assert torch.equal(bufs.topk_idx_local[6:], torch.full((2, 4), 5, dtype=torch.int64))
+    # Every row past the live ones is reset to -1, whatever earlier launches wrote.
+    assert torch.equal(bufs.topk_idx_local[3:], torch.full((5, 4), -1, dtype=torch.int64))
     assert torch.equal(bufs.topk_weights[:3], weights)
     assert not bufs.topk_weights[3:].any()
     assert trace == [("wait", "plan")]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device to capture a graph")
+def test_megamoe_staging_cuda_graph_replay_resets_rows_an_eager_launch_wrote():
+    """Staging captured in a CUDA graph at 2 tokens, an eager launch of 6 tokens into the
+    same bucket, then a replay of the graph: the kernel routes every row whose expert id
+    is valid, so the replay must leave -1 in every row past its 2 tokens."""
+    moe = _make_megamoe_cutedsl_for_ctor_test()
+    max_tokens, top_k, device = 8, 4, torch.device("cuda")
+    idx_dtype = moe._topk_idx_dtype
+    bufs = SimpleNamespace(
+        activation=torch.zeros(max_tokens, 16, dtype=torch.uint8, device=device),
+        activation_sf=torch.zeros(max_tokens, 4, dtype=torch.uint8, device=device),
+        topk_weights=torch.zeros(max_tokens, top_k, dtype=torch.float32, device=device),
+        topk_idx_local=torch.full((max_tokens, top_k), -1, dtype=idx_dtype, device=device),
+    )
+
+    def launch(num_tokens: int, expert: int):
+        # Inputs live outside the capture, like a graph's static input buffers.
+        inputs = dict(
+            x=torch.ones(num_tokens, 16, dtype=torch.uint8, device=device),
+            x_sf=torch.ones(num_tokens, 4, dtype=torch.uint8, device=device),
+            topk_idx=torch.full((num_tokens, top_k), expert, dtype=idx_dtype, device=device),
+            topk_weights=torch.full((num_tokens, top_k), 0.25, dtype=torch.float32, device=device),
+        )
+        return lambda: moe._stage_inputs(
+            bufs=bufs, **inputs, num_tokens=num_tokens, top_k=top_k, stage_activation=True
+        )
+
+    decode, mixed = launch(2, expert=1), launch(6, expert=7)
+    # Warm up at the captured size, as a graph runner does before it captures.
+    decode()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode()
+    mixed()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    routes = bufs.topk_idx_local.cpu()
+    assert torch.equal(routes[:2], torch.full((2, top_k), 1, dtype=idx_dtype))
+    assert torch.equal(routes[2:], torch.full((6, top_k), -1, dtype=idx_dtype)), routes.tolist()
+    assert not bufs.topk_weights[2:].any()
 
 
 @pytest.mark.cpu_only
