@@ -18,7 +18,10 @@ from unittest.mock import Mock, patch
 import pytest
 
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import KVCacheManagerV2
-from tensorrt_llm._torch.pyexecutor.py_executor_creator import _branch_snapshot_ctx_chunk_config
+from tensorrt_llm._torch.pyexecutor.py_executor_creator import (
+    _branch_snapshot_ctx_chunk_config,
+    _hybrid_reuse_ctx_chunk_config,
+)
 from tensorrt_llm.llmapi.llm_args import ContextChunkingPolicy
 
 pytestmark = pytest.mark.cpu_only
@@ -71,4 +74,24 @@ def test_branch_snapshot_ctx_chunk_config_reports_overrides(
 ) -> None:
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
         _branch_snapshot_ctx_chunk_config(ctx_chunk_config, RECORDS, 32, configured_policy)
+    assert logger.warning_once.called == warned
+
+
+@pytest.mark.parametrize(
+    ("ctx_chunk_config", "configured_policy", "warned"),
+    [
+        (None, None, True),
+        ((FCFS, 256), FCFS, True),
+        ((FCFS, 256), None, False),
+        ((FORCE, 32), FORCE, False),
+    ],
+)
+def test_hybrid_reuse_ctx_chunk_config_reports_overrides(
+    ctx_chunk_config: tuple | None,
+    configured_policy: ContextChunkingPolicy | None,
+    warned: bool,
+) -> None:
+    with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.logger") as logger:
+        result = _hybrid_reuse_ctx_chunk_config(ctx_chunk_config, 32, configured_policy)
+    assert result == (FORCE, 32)
     assert logger.warning_once.called == warned
