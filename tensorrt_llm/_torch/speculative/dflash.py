@@ -516,6 +516,47 @@ def dflash_noise_block_embedding(
     return noise_embed_2d
 
 
+def dflash_draft_block_embedding(
+    draft_model: nn.Module,
+    bonus: torch.Tensor,
+    mask_token_id: int,
+    block_size: int,
+    trained_mask_embedding: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """The drafter's input block per request, [len(bonus), block_size, hidden].
+
+    A drafter that embeds its own block, for example with learned
+    position-specific mask embeddings, implements ``embed_draft_block(bonus,
+    block_size)``; the worker supplies only the accepted anchor tokens and the
+    block width. Any other drafter gets :func:`dflash_noise_block_embedding`
+    over its token embedding.
+    """
+    embed_block = getattr(draft_model, "embed_draft_block", None)
+    if embed_block is not None:
+        return embed_block(bonus, block_size)
+    return dflash_noise_block_embedding(
+        draft_model.draft_model_full.model.embed_tokens,
+        bonus,
+        mask_token_id,
+        block_size,
+        trained_mask_embedding,
+    )
+
+
+def dflash_block_forward(draft_model: nn.Module, attn_metadata, **block_inputs) -> torch.Tensor:
+    """Run the drafter's block forward over this step's generation requests.
+
+    A drafter whose block forward depends on the step's attention metadata, for
+    example one that selects a prefill or a decode implementation per step,
+    implements ``dflash_forward_with_metadata(*, attn_metadata, **block_inputs)``.
+    Any other drafter implements ``dflash_forward(**block_inputs)``.
+    """
+    forward_with_metadata = getattr(draft_model, "dflash_forward_with_metadata", None)
+    if forward_with_metadata is None:
+        return draft_model.dflash_forward(**block_inputs)
+    return forward_with_metadata(attn_metadata=attn_metadata, **block_inputs)
+
+
 def dflash_position_ceiling(max_ctx: int, block_size: int, max_draft_len: int) -> int:
     """Positions a drafter that indexes absolute positions must be able to encode.
 
@@ -850,6 +891,19 @@ class DFlashWorker(SpecWorkerBase):
     accumulates across steps - each step adds newly accepted tokens'
     projected hidden states to a per-request buffer, giving the draft
     model the full history of target features.
+
+    The draft model supplies the model math through methods the worker calls:
+
+    * ``project_target_hidden(hidden)`` projects captured target features
+      into context entries. A drafter without it drafts without target
+      context.
+    * ``embed_draft_block(bonus, block_size)`` (optional) builds the input
+      block itself; see :func:`dflash_draft_block_embedding`. Such a drafter
+      keeps the eager context preparation, because the fused paged-latent
+      preparation embeds the block from the token embedding.
+    * ``dflash_forward_with_metadata(*, attn_metadata, **block_inputs)``
+      (optional) replaces ``dflash_forward`` for a block forward that depends
+      on the step's attention metadata; see :func:`dflash_block_forward`.
 
     Reference: https://arxiv.org/pdf/2602.06036
     """
@@ -2370,13 +2424,9 @@ class DFlashWorker(SpecWorkerBase):
 
         if num_gens > 0:
             with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-                block_forward = getattr(draft_model, "dflash_forward_with_metadata", None)
-                block_kwargs = {}
-                if block_forward is None:
-                    block_forward = draft_model.dflash_forward
-                else:
-                    block_kwargs["attn_metadata"] = attn_metadata
-                hidden_states_out = block_forward(
+                hidden_states_out = dflash_block_forward(
+                    draft_model,
+                    attn_metadata,
                     noise_embedding=inputs["noise_embedding"],
                     query_positions=inputs["query_positions"],
                     num_ctx_per_req=inputs["num_ctx_per_req"],
@@ -2386,7 +2436,6 @@ class DFlashWorker(SpecWorkerBase):
                     ctx_kv_cache=inputs["ctx_kv_cache"],
                     ctx_page_table=inputs["ctx_page_table"],
                     block_placement=inputs["block_placement"],
-                    **block_kwargs,
                 )
 
                 # Gather K logits per gen request from the block outputs.
@@ -2802,16 +2851,9 @@ class DFlashWorker(SpecWorkerBase):
             query_position_ids = ctx_len_now.unsqueeze(1) + j_block.unsqueeze(0)
             ctx_position_ids = ctx_len_gen.unsqueeze(1) + offsets_kp1.unsqueeze(0)
 
-            embed_block = getattr(draft_model, "embed_draft_block", None)
-            if embed_block is not None:
-                # A learned position-specific mask is model math; the worker
-                # supplies the accepted anchor and the runtime block width.
-                noise_embed_2d = embed_block(bonus, query_tokens_per_req)
-            else:
-                embed_tokens = draft_model.draft_model_full.model.embed_tokens
-                noise_embed_2d = dflash_noise_block_embedding(
-                    embed_tokens, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
-                )
+            noise_embed_2d = dflash_draft_block_embedding(
+                draft_model, bonus, mask_token_id, query_tokens_per_req, trained_mask_embedding
+            )
 
             # Accumulate new accepted features into context buffers
             if has_target_features:
