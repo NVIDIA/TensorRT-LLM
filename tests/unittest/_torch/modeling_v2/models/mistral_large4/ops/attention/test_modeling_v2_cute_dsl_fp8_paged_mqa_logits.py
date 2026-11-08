@@ -4,7 +4,7 @@
 
 The cells are the Mistral Large 4 FP8 target's at its 9216 envelope, the
 Mistral Large 4 NVFP4 target's at its 32768 envelope (on 32- and 64-token pages)
-and the NVFP4 tp4, tep4 and dep4 targets' at max_seq_len 1048576 with chunked
+and the NVFP4 tp4, tep4 and dep4 deployments' at max_seq_len 1048576 with chunked
 prefill.
 """
 

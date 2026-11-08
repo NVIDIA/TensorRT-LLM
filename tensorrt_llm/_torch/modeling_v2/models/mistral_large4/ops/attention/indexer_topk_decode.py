@@ -36,22 +36,22 @@ _ML4 = dict(next_n=1, width=9216, index_topk=2048, aux_rows=16)
 #: The NVFP4 target's: the same call at its max_seq_len of 32768, a multiple
 #: of the scorer's 256-column alignment, so the scorer's rows are 32768 wide.
 _ML4_32K = dict(next_n=1, width=32768, index_topk=2048, aux_rows=16)
-#: The NVFP4 tep4 target at its 1M envelope (max_seq_len 1048576, chunked
+#: The NVFP4 tep4 deployment at its 1M envelope (max_seq_len 1048576, chunked
 #: prefill): the scorer's rows are 1048576 wide at every decode step, the
 #: short prompts' included, since its column count is frozen at max_seq_len.
-#: The NVFP4 tp4 target at the same envelope makes the same call (scorer
+#: The NVFP4 tp4 deployment at the same envelope makes the same call (scorer
 #: width, decode batches, the 16-sequence arena), so these cells cover it too.
-#: So does the NVFP4 tep8 target (the tep4 target at eight ranks, the indexer
+#: So does the NVFP4 tep8 deployment (the tep4 deployment at eight ranks, the indexer
 #: replicated) at its 1M envelope: the same call on every rank.
 _ML4_1M = dict(next_n=1, width=1048576, index_topk=2048, aux_rows=16)
-#: The NVFP4 dep4 target at the checkpoint's own context: max_seq_len 1048576,
+#: The NVFP4 dep4 deployment at the checkpoint's own context: max_seq_len 1048576,
 #: the scorer's column count (a multiple of 256, so its rows are contiguous).
 #: From 200000 columns every row is split across 10 blocks whatever the row
 #: count, so 16 rows fill the 16-sequence scratch exactly; `blocks_per_row` is
 #: that split, which the test reads back off the scratch. Only the dep4
-#: target's cells use it (its own file named it `_ML4_1M`): it is `_ML4_1M` plus
+#: deployment's cells use it (its own file named it `_ML4_1M`): it is `_ML4_1M` plus
 #: `blocks_per_row=10`, the key by which the test routes them to the dep4
-#: target's drivers.
+#: deployment's drivers.
 _ML4_1M_DEP4 = dict(next_n=1, width=1048576, index_topk=2048, aux_rows=16, blocks_per_row=10)
 #: DSpark K=3 at the 1M envelope, including overlap/verification headroom.
 #: The scorer pads each row to 1048832 columns; 16 requests verify 64 rows.
@@ -95,13 +95,13 @@ class IndexerTopkDecode(OpWrapper):
     # engine's 16-sequence arena. The NVFP4 target's (`_ML4_32K`, its 32768
     # envelope): the same call at width 32768, where a row is split across 10
     # blocks at 1..15 rows and 9 at 16, so its cells drive 15 and 16 rows. At
-    # its 1M envelope (`_ML4_1M`, the tep4 target's and, at eight ranks, the tep8
-    # target's): width 1048576, where every row count 1..16 splits 10 ways, so
+    # its 1M envelope (`_ML4_1M`, the tep4 deployment's and, at eight ranks, the tep8
+    # deployment's): width 1048576, where every row count 1..16 splits 10 ways, so
     # 16 rows fill the 16-sequence arena exactly; seq_lens up to 1048576, the
-    # decode graph captured at full length. The tp4 target at that envelope
+    # decode graph captured at full length. The tp4 deployment at that envelope
     # adds ends at the per-block spans, the blocks' boundary columns as winners
     # and the graphs captured at the engine's own capture lengths.
-    # The dep4 target at max_seq_len 1048576 (`_ML4_1M_DEP4`): width 1048576, 10
+    # The dep4 deployment at max_seq_len 1048576 (`_ML4_1M_DEP4`): width 1048576, 10
     # blocks per row at every row count 1..16, the scratch the arena's exact
     # 327680 elements at 16 rows. Its boot captures the long-family decode
     # graphs on a warm-up dummy of max_seq_len - 1 keys beside 1-key padding
@@ -597,7 +597,7 @@ class IndexerTopkDecode(OpWrapper):
       the reference's set in every row: every end 1..32768 at width 32768,
       at 15 and at 16 rows; and at width 1048576, 16 rows a call, every end
       1..32768, every end 1015809..1048576 and 32768 random ends between,
-      plus 1024 random ends one row a call; and, in the dep4 target's sweep
+      plus 1024 random ends one row a call; and, in the dep4 deployment's sweep
       at width 1048576, 16 rows a call, every end 1..40960, 16384 drawn ends
       past it and the last 1024 ends to 1048576.
     - A block's columns are read in 16-byte vectors from its own start

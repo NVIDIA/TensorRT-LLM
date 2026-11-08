@@ -108,13 +108,13 @@ _ML4_1M = dict(
 #: four columns.
 _ML4_1M_V2 = dict(_ML4_1M, table_width=32772)
 
-#: The tp4 and tep4 targets on the fp8_ds_mla pool at 1048576: the engine's 32772-column table
+#: The tp4 and tep4 deployments on the fp8_ds_mla pool at 1048576: the engine's 32772-column table
 #: and the 107917-block bound, at the 63 owners' stride 2016. Their boots at this envelope held
 #: 69011 blocks (2208352 tokens; tp4) and 72757 blocks (2328224 tokens; tep4) per rank, inside
 #: the bound.
 _ML4_1M_DS = dict(_ML4_1M_V2, pool_layers=63)
 
-#: The tep8 target on the fp8_ds_mla pool at 1048576: the engine's 32772-column table and the
+#: The tep8 deployment on the fp8_ds_mla pool at 1048576: the engine's 32772-column table and the
 #: eight-rank 147456-block bound (`_ML4_32K_DS_8GPU`'s), at the 63 owners' stride 2016. Its boot
 #: at this envelope held 3658432 tokens, 114326 blocks, per rank, inside the bound.
 _ML4_1M_TEP8_DS = dict(_ML4_1M_DS, pool_blocks=147456)
@@ -137,7 +137,7 @@ _ML4_1M_DEP4 = dict(
     block_size=32, topk=2048, pool_layers=72, table_rows=16, table_width=32772, pool_blocks=107917
 )
 
-#: The dep4 target on the fp8_ds_mla pool at 1048576: the same 16 x 32772 table and
+#: The dep4 deployment on the fp8_ds_mla pool at 1048576: the same 16 x 32772 table and
 #: 107917-block bound at the 63 owners' stride 2016. The dep4 boot on this pool held 64633
 #: blocks (2068256 tokens) on every rank, inside the bound.
 _ML4_1M_DEP4_DS = dict(_ML4_1M_DEP4, pool_layers=63)
@@ -190,7 +190,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     # chunk's rows sit behind the request's cached prefix, so a step packs chunk
     # tails whose positions reach far past its own row count.
     #
-    # The tp4 target ("ML4 1M tp4") makes the same calls at the same envelope:
+    # The tp4 deployment ("ML4 1M tp4") makes the same calls at the same envelope:
     # `md.block_table`, the stride of the pool mapping, the step's index-mode
     # context rows and a mixed step's generation rows from
     # `PrefillTarget._attention`, and the step's 72 calls from
@@ -201,7 +201,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     # fewer, more behind a shorter prefix) and the request's cached prefix (the
     # rest). Each part is drawn by strata, and the columns come in random order.
     #
-    # The tp4 and tep4 targets on the fp8_ds_mla pool ("ML4 1M fp8_ds_mla" and
+    # The tp4 and tep4 deployments on the fp8_ds_mla pool ("ML4 1M fp8_ds_mla" and
     # "ML4 1M tep4 fp8_ds_mla") pass stride 63 x 32 = 2016 and each layer's
     # `latent_pool_row(kv_source)` (`_ML4_DS_STEP`) at three sites: the step's 72
     # calls from `DecodeTarget._attention`; a mixed step's generation rows from
@@ -211,7 +211,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     # `PrefillTarget._attn_ctx`. `layer_ids="owner_rows_0_62"` is every owner row
     # of the 63-owner page, one call each.
     #
-    # The NVFP4 dep4 target at max_seq_len 1048576 ("dep4 1M") keeps those call
+    # The NVFP4 dep4 deployment at max_seq_len 1048576 ("dep4 1M") keeps those call
     # sites, each rank running its own requests, and steps of at most 32768
     # rows; what grows is the position (to 1048575) and the table (the 32772
     # columns the engine allocates). A chunk's rows sit behind the request's
@@ -221,7 +221,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     # replays it on the step's data: `replay_kv_lens` names the replays' contexts
     # (without it a graph cell replays the capture's contexts reversed).
     #
-    # The dep4 target on the fp8_ds_mla pool ("dep4 1M fp8_ds_mla") passes stride
+    # The dep4 deployment on the fp8_ds_mla pool ("dep4 1M fp8_ds_mla") passes stride
     # 63 x 32 = 2016 and each layer's `latent_pool_row(kv_source)` (`_ML4_DS_STEP`)
     # at three sites: the step's 72 calls from `DecodeTarget._attention`; a mixed
     # step's generation rows from `PrefillTarget._attention`, whose requests are
@@ -236,7 +236,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     # holding the same page. `order="chunk"` is the split above.
     # `layer_ids="owner_rows_0_62"` is every owner row of the 63-owner page.
     #
-    # The tep8 target on the fp8_ds_mla pool passes stride 63 x 32 = 2016 and
+    # The tep8 deployment on the fp8_ds_mla pool passes stride 63 x 32 = 2016 and
     # each layer's `latent_pool_row(kv_source)` (`_ML4_DS_STEP`). At 32768 its
     # calls are the "ML4 fp8_ds_mla tep8/tp8/dep8" cells': only its pool grows,
     # to page ids up to 147455. At max_seq_len 1048576 ("ML4 1M tep8
@@ -1587,11 +1587,11 @@ class ConvertReqIndexToGlobal(OpWrapper):
     read, not driven: the engine repeats one dummy request, the cells give each
     dummy a page of its own); rows are independent, and one live row behind 15
     dummies is a cell.
-    Its NVFP4 tep4 target also serves max_seq_len 1048576 with chunked
+    Its NVFP4 tep4 deployment also serves max_seq_len 1048576 with chunked
     prefill: steps of up to 32768 rows,
     chunks behind cached prefixes, positions to 1048575, and the engine's
     32772-column table (cells at 32768 and 32772 columns).
-    Its NVFP4 tp4 target makes the same calls at the same envelope. In index
+    Its NVFP4 tp4 deployment makes the same calls at the same envelope. In index
     mode a chunk step's context rows reach the op after the q-split's
     all-gather has filled every row of the selection buffer, so one call covers
     all of the step's context rows. When the indexer is skipped (dense causal),
@@ -1600,7 +1600,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     one capture, a far-end batch-16 graph whose pages fit the pool, a 32768-row
     chunk whose rows select from both their own chunk and the cached prefix,
     and four chunks packed behind prefixes up to 1032192. Its NVFP4 dep4
-    target serves max_seq_len 1048576 with chunked prefill too: steps of up to
+    deployment serves max_seq_len 1048576 with chunked prefill too: steps of up to
     32768 rows per rank, chunks behind cached prefixes, positions to 1048575,
     and the DSA metadata's 16 x 32772 table (`block_table`, `max_num_sequences`
     rows by the V2 manager's `max_blocks_per_seq`). The metadata writes each
@@ -1613,7 +1613,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
     dep4 cells capture those shapes and replay them on live data.
 
     On the fp8_ds_mla latent pool (`MistralLarge4CacheManager`: pages for the
-    63 KV owners only) the tp4, tep4 and tep8 targets pass `stride_factor =
+    63 KV owners only) the tp4, tep4 and tep8 deployments pass `stride_factor =
     len(kv_owner_layers) * tokens_per_block = 63 * 32 = 2016` and, as
     `layer_id`, `latent_pool_row(kv_source)`: 0..38 for layers 0..38, 35 for
     each sharer 39, 43, ..., 71, and 39..62 for the owners between (cells:
@@ -1640,7 +1640,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
       1040000-token prompt's last 24192 rows behind 1015808 packed with a
       fresh 7-row prompt. Context rows that address a bf16 workspace add
       their request's workspace offset instead and do not call the op.
-    The dep4 target passes the same stride and owner rows over its own
+    The dep4 deployment passes the same stride and owner rows over its own
     `md.block_table` (16 x 32772); the "dep4 1M fp8_ds_mla" cells certify its
     three call shapes:
     - `DecodeTarget._attention`: the step's 72 calls, captured at the padded
@@ -1682,7 +1682,7 @@ class ConvertReqIndexToGlobal(OpWrapper):
                   is exact up to 2**31 - 1; layer 40 wraps to -2**31, and
                   `is_valid` refuses it. The FP8 envelope's 18432-block pool
                   reaches row 42467327, the NVFP4 target's 107917-block bound row
-                  248640767 (11.6% of 2**31), the tep8, tp8 and dep8 targets'
+                  248640767 (11.6% of 2**31), the tep8, tp8 and dep8 deployments'
                   147456-block bound on the 2016-stride fp8_ds_mla pool row 297271295
                   (13.8% of 2**31); the far-end cells hand requests each pool's top
                   pages: exact. Block 932067 of a 72-layer fp8 latent

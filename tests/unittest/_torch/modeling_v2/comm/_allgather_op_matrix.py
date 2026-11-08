@@ -1128,7 +1128,7 @@ def _account(i: int, before: Dict[str, int]) -> None:
 
 
 def _gather(x: torch.Tensor, spec: Dict[str, Any]) -> torch.Tensor:
-    """The call the dep4 and dep8 targets make, with the arguments the cell states."""
+    """The call the dep4 and dep8 deployments make, with the arguments the cell states."""
     return entry.allgather(x, spec["sizes"], GROUP, process_group=spec["process_group"])
 
 
@@ -1673,7 +1673,7 @@ def _int_fraction_moved(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _split_gather(x: torch.Tensor, sizes: List[int]) -> torch.Tensor:
-    """The call the tep4, tp4 and tep8 targets make: the share, q_sizes, the TP group, MPI."""
+    """The call the tep4, tp4 and tep8 deployments make: the share, q_sizes, the TP group, MPI."""
     return entry.allgather(x, sizes, GROUP, process_group=None)
 
 
@@ -1685,7 +1685,7 @@ def check_mpi_split_sizes_are_the_engines() -> None:
     GROUP as its TP group: the default one and the one with the MoE
     tensor-parallel over the same ranks (tep4's and tp4's at four ranks), and
     the one with moe_ep over every rank and moe_tp 1 (tep8's at eight ranks, as
-    the tep8 target builds it). Unsplit below 8192, and at every tc a cell names
+    the tep8 deployment builds it). Unsplit below 8192, and at every tc a cell names
     the (q_begin, q_end, q_sizes) `_q_split` gives. So the cells' shares are the
     targets', and a change to the engine's split fails here first.
     """
@@ -1972,7 +1972,7 @@ def _indices_payload_and_gate(rows: torch.Tensor, other: torch.Tensor, tc: int, 
 def check_mpi_split_copy_back_cells() -> None:
     """Every `payload="indices"` q-split cell, through the target's copy-back.
 
-    The tp4 target's own form of the call, on rows shaped as its top-k leaves
+    The tp4 deployment's own form of the call, on rows shaped as its top-k leaves
     them (`_indices`). One selection buffer per rank, as the target keeps one
     per step: per call its rows [0, tc) are set to the sentinel, the rank's
     share of a fresh payload is written at [q_begin, q_end), and the view is

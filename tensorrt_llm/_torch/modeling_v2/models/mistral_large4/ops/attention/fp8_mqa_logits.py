@@ -66,11 +66,11 @@ _PACKED_16_32K = [
     for n in (1, 7, 33, 100, 255, 257, 513, 1023, 1025, 2047, 2049, 4095, 4097, 8191, 8193, 882)
 ]
 
-#: The NVFP4 tep4, tp4 and tep8 targets at their 1M envelope (max_seq_len 1048576,
+#: The NVFP4 tep4, tp4 and tep8 deployments at their 1M envelope (max_seq_len 1048576,
 #: chunked prefill in 32768-token steps): the last chunk of a 1048576-token
 #: prompt, behind its 1015808-token cached prefix. Each chunk is scored against
 #: the request's whole KV, cached + new, so this step's keys are 1048576. The
-#: dep4 target's cells use it too: the 32nd and last indexer chunk of a
+#: dep4 deployment's cells use it too: the 32nd and last indexer chunk of a
 #: 1048576-token prompt at its 1M envelope (chunked prefill in 32768-token
 #: chunks), 32768 new tokens over 1015808 cached, so the chunk gathers
 #: n_k = 1048576 keys and its row t sees keys [0, 1015809 + t).
@@ -98,18 +98,18 @@ _FINAL_TOKENS_2X1M = [(1048575, 1), (1048575, 1)]
 #: Three requests' final chunks packed up to the 2**28 budget: two near-1M
 #: prompts' 50-token tails and a 277613-token prompt's 13-token tail,
 #: 113 x 2373713 = 268,229,569 packed logits. 2373713 keys sit just under the
-#: 2,373,856-token per-rank pool of the tp4 target's delivered boot, which bounds
+#: 2,373,856-token per-rank pool of the tp4 deployment's delivered boot, which bounds
 #: a packed chunk's keys while block reuse is off.
 _FINAL_CHUNKS_POOL = [(1048000, 50), (1048000, 50), (277600, 13)]
 
-#: A packed indexer chunk at the dep4 target's 1M envelope: the engine groups
+#: A packed indexer chunk at the dep4 deployment's 1M envelope: the engine groups
 #: whole requests into one chunk while sum(new) x sum(cached + new) <= 2**28,
 #: so 16 requests' 16-token last chunks over 65520 cached keys each are one
 #: 1048576-key block of 256 rows, each request's windows inside its own 65536
 #: keys.
 _PACKED_16_TAILS_1M = [(65520, 16) for _ in range(16)]
 
-#: Under the tep8 target's query split (eight ranks, a step of 8192 or more
+#: Under the tep8 deployment's query split (eight ranks, a step of 8192 or more
 #: context query tokens) rank r scores rows [4096 r, 4096 (r + 1)) of a
 #: 32768-token chunk against the keys up to its share's end, cached +
 #: 4096 (r + 1): the request's rows up to there are the step. Rank 3's share of
@@ -139,16 +139,16 @@ class Fp8MqaLogits(OpWrapper):
     # `rows`, when present, is the query tile `[lo, hi)` the call scores,
     # passed as views into the step's buffers the way a tiling caller slices
     # them; without it the call scores the whole step. The "Mistral Large 4 1M"
-    # cells are the tep4 and tp4 targets' calls at their 1M envelope: each
+    # cells are the tep4 and tp4 deployments' calls at their 1M envelope: each
     # scores every indexer prefill chunk in query tiles of floor(2**28 / n_k)
     # rows, cut from the chunk's first row. The "Mistral Large 4 tep8 1M" cells are
-    # the tep8 target's, which tiles the same way from the first row of its
+    # the tep8 deployment's, which tiles the same way from the first row of its
     # rank's share of the chunk under the engine's query split; `share`, when
     # present, is that share `[lo, hi)` of the step's rows (the whole step below
     # the split threshold), the rows a tile is cut from. Rank 7's last tile at
     # 1048576, 524288, 262144, 131072 and 65536 keys and the 16 packed chunk
     # tails are the "Mistral Large 4 1M" cells of the same calls. `budget`, when
-    # present (the dep4 target's 1M cells), is the logits budget whose
+    # present (the dep4 deployment's 1M cells), is the logits budget whose
     # floor(budget / keys)-row tiles the call is one of (the whole step when it
     # has no `rows`).
     CELLS: tuple[Cell, ...] = (
@@ -383,7 +383,7 @@ class Fp8MqaLogits(OpWrapper):
             "the first's 4-row query block",
             spec=dict(**_INDEXER, seqs=[(983040, 5), (983040, 5)], budget=2**28),
         ),
-        # The dep4 target's calls (dep8 alike) with the split-KV schedule
+        # The dep4 deployment's calls (dep8 alike) with the split-KV schedule
         # (`split_kv`): its 2**26-element tiles at the 1M envelope and its
         # 2**24-element tiles at max_seq_len 32768, each scored with the schedule
         # `mqa_logits_schedule` builds over the tile's own windows and keys.
@@ -473,7 +473,7 @@ class Fp8MqaLogits(OpWrapper):
             "against its own 983045 keys from key 0",
             spec=dict(**_INDEXER, seqs=[(983040, 5)], budget=2**26, split_kv=True),
         ),
-        # The tep4 target's calls (tep8 alike) with the split-KV schedule: its 2**28-element
+        # The tep4 deployment's calls (tep8 alike) with the split-KV schedule: its 2**28-element
         # tiles at the 1M envelope, cut from the first row of the rank's share of a chunk under
         # the engine's query split, and the pieces of a packed chunk cut per request
         # past max_seq_len. At max_seq_len 32768 its 2**24 tiles are the dep4 cells' above.
@@ -652,7 +652,7 @@ class Fp8MqaLogits(OpWrapper):
         Cell(
             why="Mistral Large 4 tep8 1M, one request's part of a packed chunk past 1M keys: two "
             "5-token final chunks over 983040-token prefixes pack into one engine chunk of "
-            "1966090 keys, which the tep8 target scores per request, each part 5 rows against "
+            "1966090 keys, which the tep8 deployment scores per request, each part 5 rows against "
             "its request's own 983045 keys, windows of 983041..983045",
             spec=dict(**_INDEXER, seqs=[(983040, 5)]),
         ),
@@ -678,7 +678,7 @@ class Fp8MqaLogits(OpWrapper):
     column `j` of row `i` is key `cu_seq_len_k_start[i] + j`; `reference`
     implements both, no cell drives them.
 
-    At the NVFP4 tep4 and tp4 targets' 1M envelope (max_seq_len 1048576,
+    At the NVFP4 tep4 and tp4 deployments' 1M envelope (max_seq_len 1048576,
     chunked prefill in 32768-token steps) each indexer prefill chunk is scored
     against its requests' whole KV, cached + new, so one request's N reaches
     1048576, in query tiles of floor(2**28 / N) rows cut from the chunk's first
@@ -700,7 +700,7 @@ class Fp8MqaLogits(OpWrapper):
     2097152 keys, the second window starting at 2**20) and three final chunks
     at the packing budget (113 rows, 2373713 keys, windows from 0, 1048050 and
     2096100). With block reuse off a packed chunk's keys are bounded by the
-    rank's KV pool, 2,373,856 tokens at the tp4 target's delivered boot, 143
+    rank's KV pool, 2,373,856 tokens at the tp4 deployment's delivered boot, 143
     above the widest cell; with block reuse on, requests sharing a cached
     prefix each count it, and a chunk can reach 16 x 1048576 = 2**24 keys at
     the packing cap, outside the cells. The kernel reads each window bound and
@@ -713,7 +713,7 @@ class Fp8MqaLogits(OpWrapper):
     dep4's 1966090, tp4's 2373713). The short final chunks of two near-1M
     prompts can share a chunk of about 2**21 keys (two 5-token tails over
     983040-token prefixes: 1,966,090, scored whole and split per request in
-    dep4's cells, below, and split per request by the tep8 target); tep4's and
+    dep4's cells, below, and split per request by the tep8 deployment); tep4's and
     tep8's cells score no packed chunk whole, tp4's two above do, at 2097152
     and 2373713 keys.
 
@@ -741,7 +741,7 @@ class Fp8MqaLogits(OpWrapper):
     multiple of 4 raises (below). So gather each request's keys into buffers of
     their own, or copy the scales.
 
-    The NVFP4 tep8 target at the same envelope tiles the same way, at eight
+    The NVFP4 tep8 deployment at the same envelope tiles the same way, at eight
     ranks: under the engine's query split (`_split_prefill_queries` in
     `_torch/attention/backends/sparse/dsa/indexer.py`, a step of 8192 or more
     context query tokens) rank r scores the chunk's rows [count r / 8,
@@ -756,7 +756,7 @@ class Fp8MqaLogits(OpWrapper):
     7's 254-row tail of the 1048559-token envelope prompt's 32751-token last
     chunk (shares 4093 + 7 x 4094), the 255-row tail of an unsplit 8191-row
     chunk at 1048576 keys, and one request's 5 rows against its 983045 keys,
-    the part of the packed 1966090-key chunk above that the tep8 target scores
+    the part of the packed 1966090-key chunk above that the tep8 deployment scores
     per request. Every tile of each of those shares is bitwise its rows of a
     call over up to four tiles of the share, and every rank's first and last
     tile of the 1M prompt's last chunk (32768 and 32751 tokens) over its

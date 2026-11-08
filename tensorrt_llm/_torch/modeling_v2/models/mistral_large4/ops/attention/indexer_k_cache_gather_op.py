@@ -94,19 +94,19 @@ _ML4_64 = dict(head_dim=128, tokens_per_block=64)
 _ML4_32K_P64_MANAGER = dict(_ML4_64, pool_layers=44, max_tokens=65536, max_seq_len=32768)
 _ML4_32K_P64_FAR = dict(_ML4_64, pool_layers=44, num_blocks=54784, tail=True, large=True)
 
-#: The NVFP4 tep4 target at its own context ("1M" cells): max_seq_len 1048576 with
+#: The NVFP4 tep4 deployment at its own context ("1M" cells): max_seq_len 1048576 with
 #: chunked prefill in 32768-token steps, on V2 views of the 44-row indexer pool.
 _ML4_1M_V2 = dict(_ML4, layout="v2", pool_layers=44)
 #: The most keys one step's full-KV mapping holds: every token of the delivered
 #: tep4 boot's pool (2373024 tokens, 74157 pages), as two 1M prompts' KV and a
 #: third's. V2 hands out 78051 slots for that quota.
 _ML4_1M_POOL_LENS = (1048576, 1048576, 275872)
-#: The NVFP4 tp4 target at the same context ("1M tp4" cells): its delivered boot left a
+#: The NVFP4 tp4 deployment at the same context ("1M tp4" cells): its delivered boot left a
 #: rank 2373856 tokens (74183 pages; its 1M boot, 2352000), so its packed corner is two
 #: 1M prompts' KV and a third's 276704 keys, every page of a 74183-block pool.
 _ML4_1M_TP4_POOL_LENS = (1048576, 1048576, 276704)
 
-#: The NVFP4 dep4 target at its own context (the "dep4 1M" cells): max_seq_len
+#: The NVFP4 dep4 deployment at its own context (the "dep4 1M" cells): max_seq_len
 #: 1048576 with chunked prefill in 32768-token steps, on V2 views of the 44-row
 #: indexer pool. 36864 blocks hold a 1M prompt's 32768 pages and a mixed step's
 #: decode pages (6.8 GB of indexer pool).
@@ -119,7 +119,7 @@ _DEP4_1M_CASE_D = dict(
     _ML4, layout="v2", pool_layers=44, num_blocks=61442, seq_lens=[5, 5], cached=[983040, 983040]
 )
 
-#: The NVFP4 tep8 target at its own context ("1M tep8" cells), on the "1M" cells' views.
+#: The NVFP4 tep8 deployment at its own context ("1M tep8" cells), on the "1M" cells' views.
 #: The most keys one step's full-KV mapping holds on a tep8 rank: every token of
 #: the delivered tep8 boot's pool (3680512 tokens, 115016 pages, at max_seq_len
 #: 32768), as three 1M prompts' KV and a fourth's.
@@ -157,25 +157,25 @@ class IndexerKCacheGatherOp(OpWrapper):
     # 32768 analogue, and its weights leave a pool of up to ~95K blocks rather
     # than ~17K. The "32768, 64-token pages" cells repeat the 32768 ones over
     # 64-token pages: the same prompts and windows, pools of the same bytes in
-    # half the blocks. The tep8, tp8 and dep8 targets (the "tep8/tp8/dep8"
+    # half the blocks. The tep8, tp8 and dep8 deployments (the "tep8/tp8/dep8"
     # cell; the indexer is whole on every rank, replicated at tep8 and tp8, data
     # parallel at dep8) make the same call, a rank holding a smaller share of
     # those weights, on a V2 pool of up to ~144K slots.
     #
-    # The NVFP4 tep4 target at max_seq_len 1048576 (the "1M" cells) runs it with
+    # The NVFP4 tep4 deployment at max_seq_len 1048576 (the "1M" cells) runs it with
     # chunked prefill: once per indexer prefill chunk, over the chunk's whole KV
     # (cached + new) in the step's full-KV mappings. Its cells gather a 1M
     # prompt's KV, start a window at key 2^20 behind one, take each query-split
     # rank's share, pack 16 chunk tails, use a real V2 manager built at 1048576,
     # address the far pool, and gather as many keys as the delivered pool holds.
     #
-    # The NVFP4 tp4 target (the "1M tp4" cells) makes the same call at the same
+    # The NVFP4 tp4 deployment (the "1M tp4" cells) makes the same call at the same
     # context. Its cells add real V2 managers at max_seq_len 1048576 whose quota
     # is exactly their prompts' pages (one 1M prompt; a 1M prompt behind a
     # 32768-key one, gathered from key 32768) and every token of its own boot
     # pool in one window.
     #
-    # The NVFP4 dep4 target at max_seq_len 1048576 (the "dep4 1M" cells) runs it
+    # The NVFP4 dep4 deployment at max_seq_len 1048576 (the "dep4 1M" cells) runs it
     # with chunked prefill: once per indexer prefill chunk, over the chunk's whole
     # KV (cached + new) in the step's full-KV mapping, each rank on its own
     # requests. Its cells take a 1M chunk's view from a real V2 manager built at
@@ -184,7 +184,7 @@ class IndexerKCacheGatherOp(OpWrapper):
     # one window, read the 1M window's edge key counts, address the far pool, and
     # gather the packed corner past max_seq_len both whole and split per request.
     #
-    # The NVFP4 tep8 target at max_seq_len 1048576 (the "1M tep8" cells) makes the
+    # The NVFP4 tep8 deployment at max_seq_len 1048576 (the "1M tep8" cells) makes the
     # same call, but cuts a chunk the engine packs past max_seq_len keys at its
     # request boundaries, so one call gathers at most one request's keys, from
     # that request's offset in the full-KV mappings. Its cells take q-split ranks
@@ -1018,7 +1018,7 @@ class IndexerKCacheGatherOp(OpWrapper):
     `num_tokens` is every context key of the step, up to 32768; a mixed step's
     decode slots follow them in the mapping.
 
-    With chunked prefill on (the NVFP4 tep4, tp4 and dep4 targets at
+    With chunked prefill on (the NVFP4 tep4, tp4 and dep4 deployments at
     max_seq_len 1048576, max_num_tokens 32768) every chunk after a request's
     first has a cached prefix. `Indexer.prepare_for_chunked_prefill` then plans
     the indexer's chunks with `plan_mla_chunked_prefill_chunks`, and once any
@@ -1041,12 +1041,12 @@ class IndexerKCacheGatherOp(OpWrapper):
         tp4 boot at max_seq_len 1048576 left 2352000). Two 5-token last chunks
         over 983040-token prefixes pack into one chunk of 1966090 keys (the
         dep4 boot's pool holds 1983872 tokens per rank); split at the request
-        boundary, as the dep4 target's indexer may do, it is two calls,
+        boundary, as the dep4 deployment's indexer may do, it is two calls,
         (0, 983045) and (983045, 983045);
       a request cut by a rank's share under the engine's query split: from its
         offset to its cached keys plus the share's end, cached + 8192 (r + 1)
         keys for rank r of a 32768-row chunk.
-    Under attention DP (the dep4 target) the engine does not split the
+    Under attention DP (the dep4 deployment) the engine does not split the
     indexer's prefill queries across ranks, so a rank's calls cover its own
     requests whole.
     The 1M cells' V2 views are rebuilt as above, but one: a real V2 manager at
@@ -1078,7 +1078,7 @@ class IndexerKCacheGatherOp(OpWrapper):
     In the "dep4 1M" mixed-step cell the decode slots stand behind a 1M window
     as in the regular mapping.
 
-    The NVFP4 tep8 target at max_seq_len 1048576 makes tep4's calls but one:
+    The NVFP4 tep8 deployment at max_seq_len 1048576 makes tep4's calls but one:
     a chunk the engine packs past max_seq_len keys is cut at its request
     boundaries (`_per_request_chunks` in the target), one call per request over
     that request's own keys from its offset in the full-KV mappings, so a call
@@ -1143,7 +1143,7 @@ class IndexerKCacheGatherOp(OpWrapper):
                      boundary 2^31 / 2^32 bytes
                      probed at 4982833151 (72 rows x 16384 blocks, V1 and V2)
                      and at 20363870207 (44 rows x 109568 slots, the NVFP4
-                     tep4 target's largest pool, V1 and V2: past 2^34), there
+                     tep4 deployment's largest pool, V1 and V2: past 2^34), there
                      also with a 1M prompt's 1048576 keys (V2, dep4 1M), the
                      same bytes at 64-token pages (54784 slots, V1 and V2),
                      and at slot 27405400700, the last scale of a 147456-slot

@@ -164,7 +164,7 @@ class _Nvfp4AccuracyDiagnostics(LlmapiAccuracyTestHarness):
                 assert str(key) in answer, (depth, tokens, answer)
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep4(_Nvfp4AccuracyDiagnostics):
+class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_Nvfp4AccuracyDiagnostics):
     """mistral-large-4-nvfp4 / sm_103 / tep4, the language model."""
 
     MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
@@ -196,7 +196,7 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Tep4(_Nvfp4AccuracyDiagnostics):
     PARALLEL = TEP4
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep4(_Nvfp4AccuracyDiagnostics):
+class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_Nvfp4AccuracyDiagnostics):
     """mistral-large-4-nvfp4 / sm_103 / dep4, the language model."""
 
     MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
@@ -229,7 +229,7 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Dep4(_Nvfp4AccuracyDiagnostics):
     PARALLEL = DEP4
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp4(_Nvfp4AccuracyDiagnostics):
+class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4AccuracyDiagnostics):
     """mistral-large-4-nvfp4 / sm_103 / tp4, the language model."""
 
     MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
@@ -392,31 +392,31 @@ class TestModelingV2MistralLarge4Nvfp4Sm103Dep8(_Nvfp4AccuracyDiagnostics):
 # the certified recipe (max_seq_len = max_num_tokens = 32768, chunked prefill off).
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep4Ctx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tep4):
+class TestModelingV2MistralLarge4Nvfp4Sm103TepCtx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tep):
     """mistral-large-4-nvfp4 / sm_103 / tep4 at the 1M envelope, the language model."""
 
     BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Tep4.BOUNDS,
+        TestModelingV2MistralLarge4Nvfp4Sm103Tep.BOUNDS,
         max_seq_len=1048576,
         enable_chunked_prefill=True,
     )
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep4Ctx1m(TestModelingV2MistralLarge4Nvfp4Sm103Dep4):
+class TestModelingV2MistralLarge4Nvfp4Sm103DepCtx1m(TestModelingV2MistralLarge4Nvfp4Sm103Dep):
     """mistral-large-4-nvfp4 / sm_103 / dep4 at the 1M envelope, the language model."""
 
     BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Dep4.BOUNDS,
+        TestModelingV2MistralLarge4Nvfp4Sm103Dep.BOUNDS,
         max_seq_len=1048576,
         enable_chunked_prefill=True,
     )
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp4Ctx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tp4):
+class TestModelingV2MistralLarge4Nvfp4Sm103TpCtx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tp):
     """mistral-large-4-nvfp4 / sm_103 / tp4 at the 1M envelope, the language model."""
 
     BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Tp4.BOUNDS,
+        TestModelingV2MistralLarge4Nvfp4Sm103Tp.BOUNDS,
         max_seq_len=1048576,
         enable_chunked_prefill=True,
     )
@@ -533,15 +533,15 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
         means on references/ruler.yaml.
         """
         target = {
-            "tep4": TestModelingV2MistralLarge4Nvfp4Sm103Tep4,
-            "dep4": TestModelingV2MistralLarge4Nvfp4Sm103Dep4,
-            "tp4": TestModelingV2MistralLarge4Nvfp4Sm103Tp4,
+            "tep4": TestModelingV2MistralLarge4Nvfp4Sm103Tep,
+            "dep4": TestModelingV2MistralLarge4Nvfp4Sm103Dep,
+            "tp4": TestModelingV2MistralLarge4Nvfp4Sm103Tp,
             "tep8": TestModelingV2MistralLarge4Nvfp4Sm103Tep8,
             "dep8": TestModelingV2MistralLarge4Nvfp4Sm103Dep8,
             "tp8": TestModelingV2MistralLarge4Nvfp4Sm103Tp8,
-            "tep4_1m": TestModelingV2MistralLarge4Nvfp4Sm103Tep4Ctx1m,
-            "dep4_1m": TestModelingV2MistralLarge4Nvfp4Sm103Dep4Ctx1m,
-            "tp4_1m": TestModelingV2MistralLarge4Nvfp4Sm103Tp4Ctx1m,
+            "tep4_1m": TestModelingV2MistralLarge4Nvfp4Sm103TepCtx1m,
+            "dep4_1m": TestModelingV2MistralLarge4Nvfp4Sm103DepCtx1m,
+            "tp4_1m": TestModelingV2MistralLarge4Nvfp4Sm103TpCtx1m,
             "tep8_1m": TestModelingV2MistralLarge4Nvfp4Sm103Tep8Ctx1m,
             "dep8_1m": TestModelingV2MistralLarge4Nvfp4Sm103Dep8Ctx1m,
             "tp8_1m": TestModelingV2MistralLarge4Nvfp4Sm103Tp8Ctx1m,
@@ -798,7 +798,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
         Cases (llguidance_panel): JSON, JSON after a reasoning section, and mistral-common's tool
         grammars under tool_choice auto, required and named.
         """
-        target = TestModelingV2MistralLarge4Nvfp4Sm103Tp4
+        target = TestModelingV2MistralLarge4Nvfp4Sm103Tp
         model_path = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR", self.MODEL_PATH)
         root = Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path)) / "tp4-llguidance"
         root.mkdir(parents=True, exist_ok=False)

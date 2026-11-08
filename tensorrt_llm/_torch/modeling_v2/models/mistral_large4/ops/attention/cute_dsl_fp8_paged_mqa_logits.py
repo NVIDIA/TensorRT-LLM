@@ -126,7 +126,7 @@ _ML4_1M_POOL_44_TEP4 = dict(layout="v2", pool_layers=44, num_blocks=74157, table
 #: pages, padded to a multiple of 4 (the manager cell measures it).
 _ML4_1M_DEP4_POOL_44 = dict(layout="v2", pool_layers=44, num_blocks=65536, table_width=32772)
 
-#: The tep8 target makes tep4's call at 1048576 (its 32 indexer heads
+#: The tep8 deployment makes tep4's call at 1048576 (its 32 indexer heads
 #: replicated on every rank) on a rank's own pool: the delivered tep8 boot read
 #: 3680512 KV tokens per rank, 115016 V2 slots of 32 tokens (`max_num_blocks` is
 #: the slot count, as for tep4's 74157), and `_ML4_32K_8GPU_MAX_BLOCKS` bounds
@@ -180,7 +180,7 @@ class CuteDslFp8PagedMqaLogits(OpWrapper):
     # cells over 64-token pages: the same lengths, rows and replays, a 516-column
     # table and pools of the same bytes in half the blocks. The eight-GPU cell
     # ("NVFP4 32768 tep8/tp8/dep8") is the call of the tep8, tp8 and dep8
-    # targets, the 32 indexer heads whole on every rank (replicated at tep8 and
+    # deployments, the 32 indexer heads whole on every rank (replicated at tep8 and
     # tp8, data parallel at dep8), on the larger pool a rank holds beside its
     # smaller share of the weights -- the far end of the 147456-block bound
     # (past 2^34, `large`). The NVFP4 target at max_seq_len 1048576 with
@@ -194,7 +194,7 @@ class CuteDslFp8PagedMqaLogits(OpWrapper):
     # only for a quota of at least 32769 blocks, about 50 GiB) and the far end
     # of the 109568-block pool.
     #
-    # The NVFP4 tep4 target at max_seq_len 1048576 with chunked prefill
+    # The NVFP4 tep4 deployment at max_seq_len 1048576 with chunked prefill
     # ("NVFP4 1M") keeps both call sites (DecodeTarget._indexer, captured;
     # PrefillTarget._indexer's generation rows of a mixed step, eager); what
     # grows is the row (1048576 columns), the context lengths (to 1048576) and
@@ -205,14 +205,14 @@ class CuteDslFp8PagedMqaLogits(OpWrapper):
     # it took 115 GiB of the device), and read a 1048576-key sequence from the
     # pool's last pages. The kernel is compiled once for every row and table
     # width (both are symbolic in `CuteDSLPagedMQALogitsRunner._compile`), so
-    # the 1M rows run the kernel the 32768 rows do. The tep8 target at 1048576
+    # the 1M rows run the kernel the 32768 rows do. The tep8 deployment at 1048576
     # ("NVFP4 1M tep8") makes the tep4 call; its cells are the tep4 cells plus
     # a rank's own pools: boot's capture shape on the 115016-block pool the
     # tep8 boot measured, and a 1048576-key sequence at the far end of the
     # 147456-block bound (past 2^34), both `large` (pool and the test's copy
     # of it pass 40 GiB).
     #
-    # The NVFP4 dep4 target at max_seq_len 1048576 with chunked prefill
+    # The NVFP4 dep4 deployment at max_seq_len 1048576 with chunked prefill
     # ("dep4 1M") keeps both call sites (DecodeTarget._indexer, captured;
     # PrefillTarget._indexer's generation rows of a mixed step, eager); what
     # grows is the row (1048576 columns), the context lengths (to 1048576) and

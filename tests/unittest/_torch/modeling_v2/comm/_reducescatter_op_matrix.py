@@ -1514,7 +1514,7 @@ def _account(i: int, before: Dict[str, int]) -> None:
 
 
 def _combine(x: torch.Tensor, spec: Dict[str, Any]) -> torch.Tensor:
-    """The call the dep4 and dep8 targets make, with the arguments the cell states."""
+    """The call the dep4 and dep8 deployments make, with the arguments the cell states."""
     return entry.reducescatter(x, spec["sizes"], GROUP, process_group=spec["process_group"])
 
 

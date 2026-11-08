@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU test for the indexer_k_cache_gather_op entry.
 
-The "dep4 1M" cells are the ones the Mistral Large 4 NVFP4 dep4 target passes at
+The "dep4 1M" cells are the ones the Mistral Large 4 NVFP4 dep4 deployment passes at
 max_seq_len 1048576 with chunked prefill, where a chunk gathers its requests'
 whole KV (`cached` + new keys) from the step's full-KV mapping.
 """
@@ -32,10 +32,10 @@ assert len(_ML4_PATTERN) == 72 and _ML4_PATTERN.count("F") == 44
 #: The engine's token budget per step at the 1M envelope (the chunk size); a
 #: manager at max_seq_len 32768 or below gets its max_seq_len.
 MAX_NUM_TOKENS = 32768
-#: The tep4 and tp4 targets' TP ranks: from q_split_threshold context rows on, the
+#: The tep4 and tp4 deployments' TP ranks: from q_split_threshold context rows on, the
 #: engine splits a 32768-row chunk 8192 rows per rank.
 TP_RANKS = 4
-#: The tep8 target's: 4096 rows of a 32768-row chunk per rank (a cell's
+#: The tep8 deployment's: 4096 rows of a 32768-row chunk per rank (a cell's
 #: `qsplit_ranks`).
 TEP8_RANKS = 8
 #: The block-table width a V2 manager hands out (`max_blocks_per_seq`), measured
@@ -773,7 +773,7 @@ def test_tep8_windows_are_the_engines_chunks() -> None:
     rank r's chunk of a 1M prompt's last 32768 rows (`plan_mla_chunked_prefill_chunks`,
     `Indexer.prepare_one_prefill_chunk`) is `_qsplit_shares`' window: 1019904 keys on
     rank 0, 1032192 on rank 3. Two 983045-key requests' 5-token tails pack into one
-    chunk of 1966090 keys, past max_seq_len, which the tep8 target gathers per
+    chunk of 1966090 keys, past max_seq_len, which the tep8 deployment gathers per
     request, the second from key 983045."""
     from tensorrt_llm._torch.attention.backends.sparse.dsa.indexer import (
         Indexer,

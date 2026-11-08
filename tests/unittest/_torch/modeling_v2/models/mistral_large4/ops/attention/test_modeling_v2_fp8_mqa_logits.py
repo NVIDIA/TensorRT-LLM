@@ -30,7 +30,7 @@ RMS_ULP = 8
 #: rows per call, 1820 at 9216 keys and 512 at 32768.
 LOGITS_BUDGET = 2**24
 
-#: The tep4, tp4 and tep8 targets' budget at their 1M envelope: floor(2**28 / keys)
+#: The tep4, tp4 and tep8 deployments' budget at their 1M envelope: floor(2**28 / keys)
 #: rows per call, 256 at 1048576 keys and 8192 at 32768, about 1 GiB of fp32
 #: logits.
 LOGITS_BUDGET_1M = 2**28
@@ -478,7 +478,7 @@ _TEP8_SHARES = {
 def test_tep8_share_tiles_are_bitwise_rows_of_wider_calls(spec) -> None:
     """Every tile of a tep8 rank's share is bitwise its rows of a call over up to four tiles.
 
-    The tep8 target cuts floor(2**28 / keys)-row tiles from its share's first
+    The tep8 deployment cuts floor(2**28 / keys)-row tiles from its share's first
     row, not the chunk's. The share is scored in calls of `WIDE_TILES` tiles
     from it, and every tile is bitwise the rows of the call it falls in, the
     first and last tiles the cells gate included, and the tiles that start
@@ -657,7 +657,7 @@ def test_guard_refuses_an_inverted_window() -> None:
             op(q, kv, w, inverted, ke)
 
 
-#: The dep4 target's split-KV calls.
+#: The dep4 deployment's split-KV calls.
 _SPLIT_KV = [c for c in op.CELLS if c.spec.get("split_kv")]
 
 
@@ -672,7 +672,7 @@ def test_split_kv_schedule_is_bitwise_the_grid_stride_call(cell) -> None:
     block's smallest window start rounded down to 4, then every 256). The cleaner that
     writes -inf outside the windows runs grid-stride in both. So the whole [T, N] view,
     -inf entries and row padding stride included, is bitwise the schedule-less call's, and
-    the dep4 target's 2**26 tiles keep the certification of the grid-stride path. A
+    the dep4 deployment's 2**26 tiles keep the certification of the grid-stride path. A
     schedule is reused across calls: the target builds one per tile and step and scores
     every indexer layer's keys with it, so a second call with the same schedule and
     other keys of the same count is bitwise its own grid-stride call too.
