@@ -209,6 +209,7 @@ add_tllm_gtest(
   trtllm_gen_fmha
   tllm::common_environment
   CUDA::cuda_driver
+  $<$<BOOL:${ENABLE_MULTI_DEVICE}>:NCCL::nccl>
   LABELS
   "unit;kernels;fmha;gpu")
 add_tllm_gtest(
