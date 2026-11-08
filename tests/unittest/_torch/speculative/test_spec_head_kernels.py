@@ -14,7 +14,7 @@
 # limitations under the License.
 """The one-kernel speculative decode step head writes what the native head writes."""
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -22,6 +22,7 @@ import torch
 
 from tensorrt_llm._torch.attention.backends.trtllm import TrtllmAttentionMetadata
 from tensorrt_llm._torch.pyexecutor.engine.runners.decoder.inputs import DecoderInputPreparer
+from tensorrt_llm._torch.pyexecutor.runtime_hooks import DEFAULT_RUNTIME_HOOKS
 from tensorrt_llm._torch.speculative.spec_head_kernels import fused_spec_head_prep, spec_decode_head
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
@@ -231,8 +232,12 @@ def test_head_matches_native_preprocess_inputs(num_ctx, num_gen, num_chunked, he
             previous_pos_id_offsets_cuda=pos_offsets, previous_kv_lens_offsets_cuda=kv_offsets
         ),
         mapping=mapping,
+        runtime_hooks=DEFAULT_RUNTIME_HOOKS,
         get_runtime_tokens_per_gen_step=lambda d: d + 1,
         spec_decode_kv_range=DecoderInputPreparer.spec_decode_kv_range,
+    )
+    native._kv_lens_corrected_in_preprocess = MethodType(
+        DecoderInputPreparer._kv_lens_corrected_in_preprocess, native
     )
     ref = DecoderInputPreparer.preprocess_inputs(
         native, step(11), enable_spec_decode=True, runtime_draft_len=draft_len
