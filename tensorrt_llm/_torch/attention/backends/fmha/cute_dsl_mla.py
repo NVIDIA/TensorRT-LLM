@@ -57,6 +57,12 @@ _SPLIT_PLAN_MIN_TILES = 4
 # 14K-256K KV, B1-B16): with it the wave-quantized makespan picks the measured
 # optimum within 5%.
 _SPLIT_PLAN_PIECE_COST_TILES = 60
+# The plan kernel is one program over the batch, padded to a power of two of at
+# least one warp: its candidate cuts are each a reduction over the batch, so a
+# block sized for the maximum request count would make every launch pay for
+# _SPLIT_PLAN_MAX_REQUESTS lanes.
+_SPLIT_PLAN_MIN_BLOCK = 32
+_SPLIT_PLAN_LANES_PER_WARP = 256
 # ``assumed_align`` the decode runner compiles the page table and the KV
 # lengths with; their runtime pointers must keep it.
 _KERNEL_INPUT_ALIGN_BYTES = 16
@@ -164,6 +170,7 @@ def launch_mla_split_kv_plan(
             or not tensor.is_cuda
         ):
             raise ValueError(f"{name} must be a contiguous CUDA int32 vector of >= {num_requests}")
+    block = max(_SPLIT_PLAN_MIN_BLOCK, triton.next_power_of_2(num_requests))
     _mla_split_kv_plan_kernel[(1,)](
         cache_seqs,
         plan,
@@ -175,9 +182,19 @@ def launch_mla_split_kv_plan(
         MIN_TILES=_SPLIT_PLAN_MIN_TILES,
         PIECE_COST=_SPLIT_PLAN_PIECE_COST_TILES,
         MAX_PIECES=_SPLIT_PLAN_MAX_SPLIT,
-        BLOCK=_SPLIT_PLAN_MAX_REQUESTS,
-        num_warps=4,
+        BLOCK=block,
+        num_warps=max(1, min(4, block // _SPLIT_PLAN_LANES_PER_WARP)),
     )
+
+
+def mla_split_kv_plan_geometry(num_heads: int, seq_len_q: int) -> tuple[int, int]:
+    """``(rows_per_request, wave_clusters)`` of the CuTe DSL MLA decode for the planner."""
+    from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import CuteDSLNVMlaDecodeBlackwellRunner
+
+    runner = CuteDSLNVMlaDecodeBlackwellRunner
+    rows_per_request = runner.get_num_q_tiles(num_heads, seq_len_q)
+    wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
+    return rows_per_request, wave_clusters
 
 
 class CuteDslMlaFmha(PhasedFmha):
@@ -841,10 +858,6 @@ class CuteDslMlaFmha(PhasedFmha):
         reuse it (``_invalidate_mla_scheduler_buffers`` resets the key when the
         lengths change). None (uniform split) when it cannot be planned here.
         """
-        from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
-            CuteDSLNVMlaDecodeBlackwellRunner,
-        )
-
         if not 0 < batch_size <= _SPLIT_PLAN_MAX_REQUESTS:
             return None
         plan = getattr(meta, "_cute_dsl_mla_split_plan", None)
@@ -854,9 +867,7 @@ class CuteDslMlaFmha(PhasedFmha):
                 return None
             plan = torch.empty(capacity, dtype=torch.int32, device=cache_seqs.device)
             meta._cute_dsl_mla_split_plan = plan
-        runner = CuteDSLNVMlaDecodeBlackwellRunner
-        rows_per_request = runner.get_num_q_tiles(num_heads, seq_len_q)
-        wave_clusters = max(runner._get_max_active_blocks() // runner._CLUSTER_SHAPE_MNK[0], 1)
+        rows_per_request, wave_clusters = mla_split_kv_plan_geometry(num_heads, seq_len_q)
         key = (batch_size, rows_per_request, wave_clusters, cache_seqs.data_ptr(), plan.data_ptr())
         if getattr(meta, "_cute_dsl_mla_split_plan_key", None) != key:
             launch_mla_split_kv_plan(

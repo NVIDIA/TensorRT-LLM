@@ -65,7 +65,11 @@ from tensorrt_llm._torch.pyexecutor.config_utils import (
 )
 from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDA_GRAPH_DUMMY_REQUEST_ID
 from tensorrt_llm._torch.pyexecutor.kv_cache.kv_cache_manager_v2 import (
+    PAGE_PRIORITY_DEFAULT,
+    PAGE_PRIORITY_MIN,
     BlockReusePolicy,
+    KVCacheLayerOwner,
+    KVCacheLayerSpec,
     KVCacheManagerV2,
     Role,
 )
@@ -87,6 +91,10 @@ from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager import (
 from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common import (
     MambaAcceptanceBatch,
     _stack_state_views,
+)
+from tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.mamba_cache_manager_v2 import (
+    _demoted_recurrent_state_priority,
+    _low_priority_recurrent_state,
 )
 from tensorrt_llm._torch.pyexecutor.llm_request import (
     ATTENTION_DP_DUMMY_REQUEST_ID,
@@ -121,6 +129,7 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.runtime.kv_cache_manager_v2 import (
     GPU_LEVEL,
     AttentionLayerConfig,
+    AttnLifeCycle,
     BatchDesc,
     BufferConfig,
     DataRole,
@@ -2484,6 +2493,45 @@ def test_v2_hybrid_estimator_counts_dummy_states_without_attention_capacity(
     ) == (11, expected_intercept)
 
 
+def test_v2_hybrid_estimator_prices_appended_draft_layers_per_token(monkeypatch):
+    """Appended draft layers add their bytes per token to the slope; the drafter's block
+    width adds no intercept, since its tokens are priced per token like the target's."""
+    monkeypatch.setattr(
+        KVCacheManager,
+        "get_cache_size_per_token",
+        lambda *args, **kwargs: 11,
+    )
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.pyexecutor.kv_cache.mamba_cache_manager.common._get_local_mamba_cache_layout",
+        lambda *args, **kwargs: (
+            SimpleNamespace(get_states_bytes_per_layer=lambda mapping: 64),
+            1,
+            1,
+        ),
+    )
+    mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+    draft = KVCacheLayerSpec(
+        global_layer_id=3,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.FP8,
+        num_kv_heads=1,
+        head_dim=576,
+        buffer_roles=(Role.KEY,),
+    )
+
+    def estimate(**kwargs):
+        return MambaHybridCacheManagerV2.get_cache_size_per_token(
+            object(), mapping, max_batch_size=4, kv_cache_config=KvCacheConfig(), **kwargs
+        )
+
+    base_slope, base_intercept = estimate()
+    for width in (0, 8):
+        assert estimate(layer_specs=(draft,), shared_draft_block_width=width) == (
+            base_slope + 576,
+            base_intercept,
+        )
+
+
 def test_v2_hybrid_attention_bound_is_snapshot_alignment_agnostic():
     model_config = _hybrid_cache_sizing_model_config(["linear_attention", "full_attention"])
     mapping = Mapping(world_size=1, rank=0, tp_size=1, pp_size=1)
@@ -2570,7 +2618,9 @@ def _fp4_mla_hybrid_manager_stub(
     mgr.max_seq_len = 128
     mgr.max_num_tokens = 128
     mgr.num_extra_kv_tokens = 0
+    # What KVCacheManagerV2.__init__ derives without a spec config.
     mgr._kv_reserve_draft_tokens = 0
+    mgr._generation_kv_capacity_headroom = 1
     mgr.tokens_per_block = FP4_MLA_TOKENS_PER_BLOCK
     mgr.kv_factor = 1
     mgr._num_reserved_dummy_slots = 0
@@ -2598,7 +2648,7 @@ def _configure_fp4_mla_hybrid(mgr, pretrained_config) -> KVCacheManagerConfig:
         tokens_per_block=FP4_MLA_TOKENS_PER_BLOCK,
         cache_tiers=[GpuCacheTierConfig(quota=1 << 20)],
         layers=_base_attention_layer_configs(4),
-        initial_pool_ratio=[1.0],
+        initial_pool_ratio=None,
     )
     return MambaHybridCacheManagerV2._build_cache_config(mgr, base_config)
 
@@ -2793,8 +2843,11 @@ def _build_v2_hybrid_fp4_mla(
     enable_block_reuse: bool = False,
     periodic_snapshot_interval: int = 0,
     additional_snapshot_offsets_from_end: tuple[int, ...] = (),
+    layer_specs=None,
+    pool_ratio=None,
 ) -> MambaHybridCacheManagerV2:
-    """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1."""
+    """A real hybrid V2 manager: KDA layer 0 and FP4 MLA layer 1, then any
+    appended draft layers."""
     monkeypatch.setenv(FP4_MLA_ATTENTION_BACKEND_ENV, "triton")
     monkeypatch.delenv(KIMI_K3_FP8_KV_LAYERS_ENV, raising=False)
     return MambaHybridCacheManagerV2(
@@ -2812,6 +2865,7 @@ def _build_v2_hybrid_fp4_mla(
             dtype="nvfp4",
             enable_block_reuse=enable_block_reuse,
             enable_partial_reuse=False,
+            pool_ratio=pool_ratio,
             mamba_state_config=MambaStateConfig(
                 periodic_snapshot_interval=periodic_snapshot_interval,
                 additional_snapshot_offsets_from_end=list(additional_snapshot_offsets_from_end),
@@ -2832,6 +2886,7 @@ def _build_v2_hybrid_fp4_mla(
             num_hidden_layers=2, kv_lora_rank=32, qk_rope_head_dim=64
         ),
         is_disagg=is_disagg,
+        layer_specs=layer_specs,
     )
 
 
@@ -2870,6 +2925,67 @@ def test_v2_hybrid_fp4_disagg_page_table_covers_every_role(
         }
         paged_ids = sorted(ll.global_layer_id for lg in paged_groups for ll in lg.local_layers)
         assert paged_ids == [2, 3]
+    finally:
+        mgr.shutdown()
+
+
+def _fp8_draft_layer_spec(global_layer_id: int) -> KVCacheLayerSpec:
+    return KVCacheLayerSpec(
+        global_layer_id=global_layer_id,
+        owner=KVCacheLayerOwner.DRAFT,
+        dtype=DataType.FP8,
+        num_kv_heads=1,
+        head_dim=96,
+        buffer_roles=(Role.KEY,),
+    )
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp4_hosts_fp8_draft_layers_in_their_own_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mgr = _build_v2_hybrid_fp4_mla(
+        monkeypatch, is_disagg=True, layer_specs=(_fp8_draft_layer_spec(2),)
+    )
+    try:
+        assert mgr.get_draft_kv_cache_view() is mgr
+        assert mgr.draft_layer_ids == (2,)
+        assert mgr.get_kv_cache_dtype(2) == DataType.FP8
+        draft_pool = int(mgr.kv_cache_pool_mapping[2][0])
+        assert draft_pool not in {int(mgr.kv_cache_pool_mapping[1][0])}
+        assert mgr._draft_manager_layer_ids == (LayerId(2),)
+        view = mgr.get_buffers(2, kv_layout="HND")
+        assert view.dtype == torch.float8_e4m3fn
+        assert tuple(view.shape[1:]) == (1, 1, FP4_MLA_TOKENS_PER_BLOCK, 96)
+
+        page_table = build_page_table_from_manager(mgr)
+        draft_groups = [
+            lg
+            for lg in page_table.layer_groups
+            if isinstance(lg, AttentionLayerGroup)
+            and [ll.global_layer_id for ll in lg.local_layers] == [4]
+        ]
+        # FP4 MLA transfer ids: draft layer 2 travels as 2 * 2.
+        assert len(draft_groups) == 1
+        assert [view.pool_role for view in draft_groups[0].pool_views] == [
+            frozenset({str(Role.KEY)})
+        ]
+    finally:
+        mgr.shutdown()
+
+
+@skip_no_cuda
+def test_v2_hybrid_fp4_target_pool_ratio_gains_the_draft_share(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Lifecycles: KDA state, FP4 MLA, draft, HP ring; the ratio lists the three targets.
+    mgr = _build_v2_hybrid_fp4_mla(
+        monkeypatch, layer_specs=(_fp8_draft_layer_spec(2),), pool_ratio=[0.3, 0.6, 0.1]
+    )
+    try:
+        # The native manager takes one ratio per lifecycle; the draft share was inserted.
+        assert len(mgr.impl.layer_grouping) == 4
+        assert mgr.draft_layer_ids == (2,)
     finally:
         mgr.shutdown()
 
@@ -3998,6 +4114,30 @@ def test_v2_inforward_snapshot_commits_point_and_restores_prompt_end_state():
         mgr.shutdown()
 
 
+@pytest.mark.parametrize(
+    "any_point, alignment, pos, point, expected",
+    [
+        (False, 1, 0, 3968, 4000),  # the last point: the chunk runs to the prompt end
+        (False, 1, 0, 2944, None),  # an earlier point ends the chunk
+        (True, 64, 0, 2944, 3968),  # ... unless the layers take any point: end at the next one
+        (True, 64, 64, 2900, None),  # P not a multiple of the alignment from the chunk start
+        (True, 64, 2942, 2944, None),  # fewer chunk tokens before P than the conv window
+        (True, 64, 0, 3000, None),  # not a snapshot point
+    ],
+)
+def test_v2_inforward_snapshot_end(any_point, alignment, pos, point, expected):
+    manager = SimpleNamespace(
+        inforward_snapshot_any_point=any_point,
+        inforward_snapshot_alignment=alignment,
+        inforward_snapshot_min_main=3,
+        inforward_snapshot_max_tail=4096,
+    )
+    request = SimpleNamespace(prompt_len=4000, expect_snapshot_points=[2900, 2944, 3968])
+    assert MambaHybridCacheManagerV2.inforward_snapshot_end(manager, request, pos, point) == (
+        expected
+    )
+
+
 @skip_no_cuda
 def test_v2_inforward_snapshot_plan_drops_a_mark_in_a_mixed_batch():
     mgr = _build_v2_inforward_snapshot_manager()
@@ -4369,6 +4509,66 @@ def test_v2_hybrid_debug_logs_prefix_reuse_only_on_rank_zero(
             "content_divergence_tokens=112 "
             "latest_recurrent_snapshot_tokens=64"
         )
+
+
+def test_low_priority_recurrent_state_demotes_only_recurrent_pages() -> None:
+    attention = AttnLifeCycle.make(None, None, 32)
+    callback = _low_priority_recurrent_state(30)
+    assert callback(0, attention) == PAGE_PRIORITY_DEFAULT
+    assert callback(3, object()) == 30
+
+
+@pytest.mark.parametrize(
+    ("offload_min_priority", "expected"),
+    [
+        (30, 30),  # default floor: evicted before default pages, still offloaded
+        (0, PAGE_PRIORITY_MIN),
+        (-5, PAGE_PRIORITY_MIN),
+        (PAGE_PRIORITY_DEFAULT - 1, PAGE_PRIORITY_DEFAULT - 1),
+        (PAGE_PRIORITY_DEFAULT, PAGE_PRIORITY_MIN),
+        (100, PAGE_PRIORITY_MIN),
+    ],
+)
+def test_demoted_recurrent_state_priority_stays_offloadable(
+    offload_min_priority: int, expected: int
+) -> None:
+    priority = _demoted_recurrent_state_priority(offload_min_priority)
+    assert priority == expected
+    if offload_min_priority < PAGE_PRIORITY_DEFAULT:
+        assert offload_min_priority <= priority < PAGE_PRIORITY_DEFAULT
+
+
+@pytest.mark.parametrize(
+    ("threshold", "prompt_len", "is_dummy", "num_mamba_layers", "demoted"),
+    [
+        (16384, 1000, False, 1, True),
+        (16384, 16384, False, 1, False),
+        (16384, 1000, True, 1, False),
+        (16384, 1000, False, 0, False),
+        (0, 1000, False, 1, False),
+    ],
+)
+def test_v2_hybrid_low_priority_snapshot_prompt_len(
+    monkeypatch: pytest.MonkeyPatch,
+    threshold: int,
+    prompt_len: int,
+    is_dummy: bool,
+    num_mamba_layers: int,
+    demoted: bool,
+) -> None:
+    mgr = object.__new__(MambaHybridCacheManagerV2)
+    mgr.mapping = SimpleNamespace(rank=0)
+    mgr.local_num_mamba_layers = num_mamba_layers
+    mgr._low_priority_snapshot_prompt_len = threshold
+    mgr._low_priority_callback = _low_priority_recurrent_state(30)
+    req = SimpleNamespace(is_dummy=is_dummy, prompt_len=prompt_len)
+    callback = mgr._context_priority_callback(req)
+    assert callback is (mgr._low_priority_callback if demoted else None)
+
+    create_kv_cache = MagicMock(return_value=None)
+    monkeypatch.setattr(KVCacheManagerV2, "_create_kv_cache", create_kv_cache)
+    mgr._create_kv_cache(1, None, None, custom_priority_callback=callback)
+    assert create_kv_cache.call_args.kwargs["custom_priority_callback"] is callback
 
 
 @pytest.mark.parametrize(("rank", "expected_log_count"), [(0, 1), (3, 0)])

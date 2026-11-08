@@ -2236,7 +2236,8 @@ def test_cutedsl_fc12_survives_autotune_warmup():
     gate = _make_test_gate(num_experts=num_experts)
 
     torch.manual_seed(91)
-    x = torch.randn(8, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    # More tokens than the small-batch kernel serves, so the call reaches the FC12 kernel.
+    x = torch.randn(64, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
     act_scale = float(x.abs().max().float() / (448 * 6))
     w1 = [
         torch.randn(inter, hidden, dtype=torch.bfloat16, device="cuda") * 0.05
@@ -2280,6 +2281,144 @@ def test_cutedsl_fc12_survives_autotune_warmup():
     profiled = autotuner.stats.tuned_op_profiled_configs.get(custom_op, 0)
     assert profiled > 0, f"{custom_op} was never profiled; the warmup branch did not run"
     assert not autotuner.stats.failed_profiling_count.get(custom_op, set())
+
+
+@nvfp4_moe_supported
+@pytest.mark.parametrize("num_tokens", [1, 8, 32])
+def test_cutedsl_fc12_small_batch_matches_fc12_kernel(num_tokens):
+    """Up to 32 tokens a SiTU FC12 layer runs the small-batch kernel: the same NVFP4 MoE on the
+    same weights as the FC12 kernel, which still serves the layer when the small-batch path is
+    turned off. The two sum the expert partials in different orders."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+    torch.manual_seed(93)
+    x = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1, w2, w3 = (
+        [
+            torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * 0.05
+            for _ in range(num_experts)
+        ]
+        for rows, cols in ((inter, hidden), (hidden, inter), (inter, hidden))
+    )
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+    backend = moe.backend
+    assert backend.small_batch_max_tokens == 32
+
+    router_logits = gate.compute_logits(x)
+    small_batch = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    torch.cuda.synchronize()
+    assert backend._small_batch_counters is not None, "the small-batch kernel did not run"
+    assert int(backend._small_batch_counters.abs().sum().item()) == 0
+
+    backend.small_batch_max_tokens = 0
+    fc12 = moe.forward(x, router_logits, all_rank_num_tokens=None).float()
+    assert torch.isfinite(small_batch).all() and small_batch.abs().max() > 0
+    rel = (small_batch - fc12).norm() / fc12.norm().clamp_min(1e-30)
+    assert rel < 3e-2, f"relative difference to the FC12 kernel {rel:.3e}"
+
+
+@nvfp4_moe_supported
+def test_cutedsl_fc12_die_major_weights():
+    """Die-major placement on a two-domain device: a MoE whose model did not opt in keeps the
+    default layout; after the opt-in (``allow_die_major_weights``, what Kimi K3 calls at
+    construction) the expert parameters keep their shapes, and the small-batch kernel (8 tokens)
+    and the FC12 kernel (64 tokens) read them: the same NVFP4 MoE as on the default placement."""
+    from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_RUBIN_AVAILABLE
+    from tensorrt_llm._torch.locality_domain_utils import is_locality_domain_enabled
+
+    if get_sm_version() != 107 or not IS_CUTLASS_DSL_RUBIN_AVAILABLE:
+        pytest.skip("CUTEDSL_FC12 needs SM107 and CuTe DSL Rubin support")
+    if not is_locality_domain_enabled():
+        pytest.skip("needs two locality domains")
+
+    num_experts, hidden, inter = _TP_EXPERTS, _TP_HIDDEN, _TP_INTERMEDIATE
+    gate = _make_test_gate(num_experts=num_experts)
+    torch.manual_seed(95)
+    x = torch.randn(64, hidden, dtype=torch.bfloat16, device="cuda") * 0.5
+    act_scale = float(x.abs().max().float() / (448 * 6))
+    w1, w2, w3 = (
+        [
+            torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * 0.05
+            for _ in range(num_experts)
+        ]
+        for rows, cols in ((inter, hidden), (hidden, inter), (inter, hidden))
+    )
+    bank = [_quantize_expert_to_nvfp4(w1[e], w2[e], w3[e], act_scale) for e in range(num_experts)]
+    moe = _make_nvfp4_moe(gate, num_experts=num_experts, moe_backend="CUTEDSL_FC12")
+    _stream_nvfp4_bank(moe, bank)
+    moe.backend._weights_transformed = False
+    moe.post_load_weights()
+    backend = moe.backend
+    # no opt-in: main's layout on a two-domain device
+    assert not backend._die_major_applies() and not backend.weights_die_major
+
+    inputs = {n: (x[:n], gate.compute_logits(x[:n])) for n in (8, 64)}
+    default = {
+        n: moe.forward(xs, logits, all_rank_num_tokens=None).float()
+        for n, (xs, logits) in inputs.items()
+    }
+    shapes = [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)]
+    backend.allow_die_major_weights()
+    assert backend._die_major_applies()
+    backend._place_weights_die_major()
+    assert backend.weights_die_major
+    assert [p.shape for p in (backend.w3_w1_weight, backend.w2_weight_scale)] == shapes
+    for n, (xs, logits) in inputs.items():
+        die_major = moe.forward(xs, logits, all_rank_num_tokens=None).float()
+        rel = (die_major - default[n]).norm() / default[n].norm().clamp_min(1e-30)
+        assert rel < 1e-2, f"{n} tokens: relative difference to the default placement {rel:.3e}"
+
+
+def test_die_major_weights_need_the_model_opt_in():
+    """Die-major placement is a model's opt-in: backends decline by default, and the FC12
+    backend places nothing before ``allow_die_major_weights`` was called (on any device)."""
+    from tensorrt_llm._torch.moe.fused_moe import MoEImplBase
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslFusedFc12Nvfp4Impl
+
+    declined = SimpleNamespace()
+    MoEImplBase.allow_die_major_weights(declined)
+    assert not vars(declined)
+    backend = object.__new__(TrtllmCutedslFusedFc12Nvfp4Impl)
+    assert not backend._die_major_applies()
+    backend.allow_die_major_weights()
+    assert backend._die_major_allowed
+
+
+def test_die_major_unmet_names_the_condition(monkeypatch):
+    """After the opt-in, the FC12 backend names the condition that keeps the loaded layout (what
+    ``post_load_weights`` logs once) and applies die-major weights when none is unmet."""
+    import importlib
+
+    from tensorrt_llm._torch.moe.fused_moe.cutedsl import TrtllmCutedslFusedFc12Nvfp4Impl
+    from tensorrt_llm._torch.pyexecutor import dwdp
+
+    fused_fc12 = importlib.import_module("tensorrt_llm._torch.moe.fused_moe.cutedsl.fused_fc12")
+    monkeypatch.setattr(dwdp, "get_global_dwdp_manager", lambda: None)
+    monkeypatch.setattr(fused_fc12, "is_locality_domain_enabled", lambda: False)
+    backend = object.__new__(TrtllmCutedslFusedFc12Nvfp4Impl)
+    backend.allow_die_major_weights()
+    # Kimi K3 under MoE TP4: 768 intermediate per rank on the 3584-wide latent
+    backend.intermediate_size_per_partition, backend.hidden_size = 768, 3584
+    backend._using_load_balancer = lambda: False
+    assert "locality domains" in backend._die_major_unmet()
+    assert not backend._die_major_applies()
+    monkeypatch.setattr(fused_fc12, "is_locality_domain_enabled", lambda: True)
+    assert backend._die_major_unmet() is None and backend._die_major_applies()
+    backend._using_load_balancer = lambda: True
+    assert "EPLB" in backend._die_major_unmet()
+    backend._using_load_balancer = lambda: False
+    backend.intermediate_size_per_partition = 64
+    assert "128-row" in backend._die_major_unmet()
 
 
 def test_fp8_block_scaled_dequantization():

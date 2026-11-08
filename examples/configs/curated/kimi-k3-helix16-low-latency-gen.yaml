@@ -1,0 +1,40 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Kimi K3 NVFP4 disaggregated generation (decode) worker for 1-4 concurrent
+# requests on 16 Rubin GPUs: Helix context parallelism over the 16 ranks for
+# attention, the routed experts as MoE TP4 x EP4. Pair it with a context
+# worker using the same kv_cache_config.tokens_per_block.
+#
+# max_num_tokens 32 (4 requests x 8 tokens with 7 draft tokens) keeps every
+# MoE call within the CUTEDSL_FC12 small-batch kernel, which then also places
+# the expert weights die-major. enable_min_latency runs the MoE tail and the
+# shared expert of steps of up to 8 rows as single lossy kernels; drop it where
+# accuracy must match the default kernels. Add the speculative_config of your
+# drafter.
+context_parallel_size: 16
+cp_config:
+  cp_type: HELIX
+  tokens_per_block: 128
+  use_nccl_for_alltoall: false
+moe_tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+max_batch_size: 4
+max_num_tokens: 32
+enable_min_latency: true
+trust_remote_code: true
+cuda_graph_config:
+  batch_sizes:
+  - 1
+  - 2
+  - 3
+  - 4
+  enable_padding: true
+moe_config:
+  backend: CUTEDSL_FC12
+kv_cache_config:
+  dtype: nvfp4
+  tokens_per_block: 128
+  free_gpu_memory_fraction: 0.8
+cache_transceiver_config:
+  backend: NIXL

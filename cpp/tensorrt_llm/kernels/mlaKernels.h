@@ -150,6 +150,14 @@ struct MlaParams
     // `quant_q_buf`. Context preprocessing must still rotate/cache K.
     bool q_rope_applied = false;
 
+    // Non-absorption context MLA: `k_buf` / `v_buf` point to contiguous FP8 E4M3 K
+    // [total_kv_len, head_num * (qk_nope_head_dim + qk_rope_head_dim)] and V
+    // [total_kv_len, head_num * v_head_dim], which the FMHA reads as they are.
+    bool fp8_kv_input = false;
+    // With `fp8_kv_input`: `quant_q_buf` already holds the FP8 Q, so the context
+    // quantization only writes the BMM scales.
+    bool fp8_q_input = false;
+
     // DSv4 fused inverse-RoPE + FP8 quant epilogue parameters.
     Dsv4EpilogueFusionParams dsv4_epilogue_fusion;
 

@@ -289,6 +289,18 @@ def _runtime(moe, logits):
     from tensorrt_llm._torch.models.modeling_kimi_linear import KimiK3MoERuntime
 
     runtime = KimiK3MoERuntime.__new__(KimiK3MoERuntime)
+    runtime._shared_sms = 0
+    runtime.latent_up_rows = None
+    runtime._own_latent_all_reduce = None
+    runtime._moe_front_ws = None
+    runtime._moe_front_plan = None
+    runtime._min_latency = False
+    runtime._moe_tail_wexp = None
+    runtime._shared_frags = None
+    runtime._shared_ws = None
+    runtime._shared_world = 0
+    runtime._column_parallel_tail_supported = False
+    runtime._latent_up_mxfp8_supported = False
     torch.nn.Module.__init__(runtime)
     runtime.gate = type("Gate", (), {"compute_logits": staticmethod(lambda value: logits)})()
     runtime.routed_experts = moe
@@ -407,6 +419,61 @@ def test_nvfp4_input_scale_only_where_the_forward_takes_the_input_as_is(blocker)
     assert ConfigurableMoE.nvfp4_input_scale(moe, 8) is expected
 
 
+@pytest.mark.parametrize(
+    "num_tokens, comm, max_tokens, expected",
+    [
+        (8, None, 32, True),
+        (32, None, 32, True),
+        (33, None, 32, False),
+        (0, None, 32, False),
+        (8, "comm", 32, False),
+        (8, None, 0, False),
+    ],
+)
+def test_pushes_output_where_the_backend_pushes_and_no_comm(num_tokens, comm, max_tokens, expected):
+    """``ConfigurableMoE.pushes_output`` takes an output push only at the token counts the backend
+    declares (``output_push_max_tokens``, 0 by default) and without a comm strategy."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.configurable_moe import ConfigurableMoE
+    from tensorrt_llm._torch.moe.fused_moe.impl_base import MoEImplBase
+
+    assert MoEImplBase.output_push_max_tokens(object()) == 0
+    moe = SimpleNamespace(
+        comm=comm, backend=SimpleNamespace(output_push_max_tokens=lambda: max_tokens)
+    )
+    assert ConfigurableMoE.pushes_output(moe, num_tokens) is expected
+
+
+@pytest.mark.parametrize("supplied", ["prerouted", "sorted_routing", "output_push"])
+@pytest.mark.parametrize("blocker", ["comm", "chunked"])
+def test_scheduler_rejects_caller_supplied_args_it_cannot_honour(blocker, supplied):
+    """The scheduler raises instead of dropping caller-supplied routing or an output push on a
+    forward with more than one chunk or a comm strategy."""
+    from types import SimpleNamespace
+
+    from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
+
+    moe = SimpleNamespace(
+        comm=object() if blocker == "comm" else None,
+        use_dp=False,
+        calculate_num_chunks=lambda _: 2 if blocker == "chunked" else 1,
+        backend=SimpleNamespace(capabilities=SimpleNamespace(supports_moe_lora=False)),
+        determine_communication_method=lambda *_: None,
+    )
+    scheduler = ExternalCommMoEScheduler(moe)
+    with pytest.raises(ValueError, match="one chunk without communication"):
+        scheduler.forward(
+            torch.zeros(4, 8),
+            torch.zeros(4, 16),
+            do_finalize=True,
+            output_dtype=torch.bfloat16,
+            all_rank_num_tokens=[4],
+            use_dp_padding=False,
+            **{supplied: object()},
+        )
+
+
 @cute_dsl
 @pytest.mark.parametrize("m", [1, 8, 16])
 def test_latent_down_nvfp4_output_feeds_routed_experts(monkeypatch, m):
@@ -479,12 +546,14 @@ def test_grouped_gemm_backend_keeps_every_sm():
 @pytest.mark.skipif(not _fc12_available(), reason="CUTEDSL_FC12 needs SM107 and CuTe DSL internal")
 @pytest.mark.parametrize("m", [8, 64])
 def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
-    """Beside the fused FC12 grid the shared expert never leads: its GEMMs keep to the SMs FC12
-    leaves free (torch's SM carveout, set only while it is issued on the side stream) and FC12
-    launches with that SM reserve. The routed output equals the unreserved kernel's."""
+    """Beside the routed grid the shared expert never leads: its GEMMs keep to the SMs the routed
+    kernel leaves free (torch's SM carveout, set only while it is issued on the side stream) and
+    the routed kernel (fused FC12; the small-batch kernel up to its token limit) launches with
+    that SM reserve. The routed output equals the unreserved kernel's."""
     from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
     from tensorrt_llm._torch.models import modeling_kimi_linear
     from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
+    from tensorrt_llm._torch.moe.custom_ops import cute_dsl_small_batch_moe_custom_op as small_batch
 
     shared_sms = modeling_kimi_linear._SHARED_EXPERT_SMS_BESIDE_ROUTED_GRID
     logits, bias = _logits(m, seed=97 + m)
@@ -508,6 +577,13 @@ def test_shared_expert_runs_beside_fc12_on_reserved_sms(monkeypatch, m):
         return real_reserved(full, cluster_size, reserve)
 
     monkeypatch.setattr(cute_dsl_custom_ops, "reserved_max_active_clusters", recording_reserved)
+    real_small_batch_ctas = small_batch._persistent_ctas
+
+    def recording_small_batch_ctas(device_index, reserve):
+        reserves.append(reserve)
+        return real_small_batch_ctas(device_index, reserve)
+
+    monkeypatch.setattr(small_batch, "_persistent_ctas", recording_small_batch_ctas)
     carveouts = []
     real_shared = runtime.shared_experts.forward
 

@@ -127,7 +127,7 @@ def _static_reason(mla) -> Optional[str]:
         return f"o_proj tensor-parallel size {o_tp_size} is not {SUPPORTED_TP_SIZE}"
     if mla.mapping.has_cp_helix() or mla.num_heads_tp != mla.num_heads_tp_cp:
         return "helix context parallelism"
-    if type(mla)._apply_output_gate is not MLA._apply_output_gate:
+    if type(mla)._gate_and_project_output is not MLA._gate_and_project_output:
         return "module overrides the output gate"
     hooks = mla.sparse_attn_hooks
     if hooks is not None and (type(hooks).project_output is not MLASparseHooks.project_output):

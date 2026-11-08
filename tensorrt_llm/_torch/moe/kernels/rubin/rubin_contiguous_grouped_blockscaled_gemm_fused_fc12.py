@@ -1050,6 +1050,26 @@ def ld_acquire_gpu(base_tensor, index, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def sm_id(*, loc=None, ip=None):
+    """``%smid`` of the executing thread."""
+    result = llvm.inline_asm(
+        cutlass.Int32.mlir_type,
+        [],
+        "mov.u32 $0, %smid;",
+        "=r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
+    return cutlass.Int32(result)
+
+
+# Int32 words between the two locality domains' work counters of one phase (one 128-byte line
+# each) with ``die_claim``.
+DIE_COUNTER_STRIDE = 32
+
+
+@dsl_user_op
 def nanosleep(ns, *, loc=None, ip=None):
     """Back off a polling warp while it waits for FC1 readiness."""
     llvm.inline_asm(
@@ -1215,6 +1235,15 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
     :param situ_beta: Gate-side SiTU constant; required for ``SiTu`` only.
     :param situ_linear_beta: Linear-side SiTU constant; required for ``SiTu`` only.
     :param scheduler: Persistent work-ID scheduler: ``static`` or ``l2_atomic``.
+    :param die_major: B and SFB of both phases hold die-major expert weights (see
+        ``die_major_layout``): tensors ``(N / 2, K, 2 L)`` whose slot ``e`` is the first half of
+        expert ``e``'s N rows and slot ``L + e`` the second half. N tile ``n`` of expert ``e``
+        is read from slot ``e`` or ``L + e``; the tiles and their arithmetic are unchanged.
+    :param sm_domain_words: With ``die_major``, the ``l2_atomic`` scheduler and 1-CTA clusters:
+        the locality domain of every SM (``pack_sm_domain_words``). Each phase then keeps one
+        work counter per domain, handing out the tiles whose B rows that domain homes; a CTA
+        claims from its SM's domain and afterwards steals from the other one. Empty: one
+        counter per phase.
     FC1 B and SFB must already use gate16/up16 order (tile N 128/256).
     FC1 output remains in logical channel order; FC2 weight layout is unchanged.
     """
@@ -1233,6 +1262,8 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         activation_type: ActivationType = ActivationType.Swiglu,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        die_major: bool = False,
+        sm_domain_words: Tuple[int, ...] = (),
     ):
         self.sf_vec_size = sf_vec_size
         self.topk = topk
@@ -1250,6 +1281,18 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
         )
         self.num_scheduler_stage = 1
         self.scheduler_response_bytes = cutlass.Int64.width // 8
+        self.die_major = die_major
+        self.die_claim = len(sm_domain_words) > 0
+        if self.die_claim and not (
+            die_major
+            and self.use_l2_atomic_scheduler
+            and not self.use_cluster_scheduler_response
+        ):
+            raise ValueError(
+                "per-domain claiming needs die-major weights, the l2_atomic scheduler "
+                "and 1-CTA clusters"
+            )
+        self.sm_domain_words = tuple(sm_domain_words)
         if swiglu_limit < 0:
             swiglu_limit = float("inf")
         self.swiglu_limit = swiglu_limit
@@ -2437,10 +2480,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
             self.cta_tile_shape_mnk,
             self.cluster_shape_mn,
         )
-        fc1_ready_expected = cutlass.Int32(
-            cute.ceil_div(fc1_b.shape[0], self.mma_tiler[1])
-            * self.mma_cta_group_int
-        )
+        # FC1 N tiles per M tile (die-major B holds half of every expert's rows per slot)
+        fc1_n_tiles = cute.ceil_div(fc1_b.shape[0], self.mma_tiler[1])
+        if cutlass.const_expr(self.die_major):
+            fc1_n_tiles = fc1_n_tiles * 2
+        fc1_ready_expected = cutlass.Int32(fc1_n_tiles * self.mma_cta_group_int)
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             self.fc2_tile_sched_params, max_active_clusters
         )
@@ -2834,6 +2878,68 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     - lbeta_f32
                 )
                 tCompute[i] = (tanh_g * sigmoid_f32(g, fastmath=True)) * tanh_u
+
+    @cute.jit
+    def _sm_domain(self, smid: cutlass.Int32) -> cutlass.Int32:
+        """Locality domain of the SM with ``%smid`` ``smid`` (0 beyond the table)."""
+        word = cutlass.Int32(0)
+        for i in cutlass.range_constexpr(len(self.sm_domain_words)):
+            if (smid >> 5) == i:
+                word = cutlass.Int32(self.sm_domain_words[i])
+        return (word >> (smid & 31)) & 1
+
+    @cute.jit
+    def _die_claim(
+        self,
+        counter: cute.Tensor,
+        queue: cutlass.Int32,
+        own_die: cutlass.Int32,
+        num_m_tiles: cutlass.Int32,
+        half_n_tiles: cutlass.Int32,
+    ):
+        """Claim this CTA's next tile of one phase from the per-domain counters (``die_claim``).
+
+        Domain ``q``'s counter (word ``q * DIE_COUNTER_STRIDE`` of ``counter``) hands out the
+        tiles ``(m, q * half_n_tiles + j)``, ``j < half_n_tiles``, whose die-major B rows that
+        domain homes, each once. The CTA claims from ``queue`` and moves to the other domain's
+        counter once ``own_die``'s is drained. Called by the whole scheduler warp; lane 0 claims.
+
+        Returns the claimed tile (invalid once both counters are drained) and the queue to claim
+        from next.
+        """
+        tidx, _, _ = cute.arch.thread_idx()
+        num_tiles = num_m_tiles * half_n_tiles
+        linear_idx = cutlass.Int32(0)
+        cur_queue = queue
+        if tidx % 32 == 0:
+            linear_idx = cute.arch.atomic_add(
+                counter.iterator + cur_queue * cutlass.Int32(DIE_COUNTER_STRIDE),
+                cutlass.Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
+            if linear_idx >= num_tiles:
+                if cur_queue == own_die:
+                    cur_queue = cutlass.Int32(1) - own_die
+                    linear_idx = cute.arch.atomic_add(
+                        counter.iterator + cur_queue * cutlass.Int32(DIE_COUNTER_STRIDE),
+                        cutlass.Int32(1),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+        linear_idx = cute.arch.shuffle_sync(linear_idx, 0)
+        cur_queue = cute.arch.shuffle_sync(cur_queue, 0)
+        m_tile = linear_idx // half_n_tiles
+        n_tile = linear_idx - m_tile * half_n_tiles + cur_queue * half_n_tiles
+        work_tile = utils.WorkTileInfo(
+            (
+                cute.arch.make_warp_uniform(m_tile),
+                cute.arch.make_warp_uniform(n_tile),
+                cute.arch.make_warp_uniform(cutlass.Int32(0)),
+            ),
+            cute.arch.make_warp_uniform(linear_idx < num_tiles),
+        )
+        return work_tile, cute.arch.make_warp_uniform(cur_queue)
 
     # GPU device kernel
     @cute.kernel
@@ -3443,13 +3549,28 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     cute.arch.block_idx(),
                     cute.arch.grid_dim(),
                 )
-            work_tile = fc1_tile_sched.initial_work_tile_info()
+            num_non_exiting_tiles_value = num_non_exiting_tiles[0]
+            # Per-domain claiming: this SM's domain and the domain whose counter the CTA
+            # claims from (its own until drained, then the other one).
+            own_die = cutlass.Int32(0)
+            die_queue = cutlass.Int32(0)
+            fc1_half_n_tiles = cutlass.Int32(0)
+            if cutlass.const_expr(self.die_claim):
+                own_die = self._sm_domain(sm_id())
+                fc1_half_n_tiles = cutlass.Int32(cute.size(tFC1BgB, mode=[1]))
+                work_tile, die_queue = self._die_claim(
+                    fc1_scheduler_counter,
+                    own_die,
+                    own_die,
+                    num_non_exiting_tiles_value,
+                    fc1_half_n_tiles,
+                )
+            else:
+                work_tile = fc1_tile_sched.initial_work_tile_info()
 
             tile_info_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.num_tile_stage
             )
-
-            num_non_exiting_tiles_value = num_non_exiting_tiles[0]
 
             is_continue = cutlass.Boolean(1)
             while work_tile.is_valid_tile and is_continue:
@@ -3513,6 +3634,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                 fc1_scheduler_consumer_state
                             )
                             fc1_scheduler_consumer_state.advance()
+                        elif cutlass.const_expr(self.die_claim):
+                            work_tile, die_queue = self._die_claim(
+                                fc1_scheduler_counter,
+                                die_queue,
+                                own_die,
+                                num_non_exiting_tiles_value,
+                                fc1_half_n_tiles,
+                            )
                         else:
                             work_tile = fc1_tile_sched.claim_next_work_local()
                     else:
@@ -3554,7 +3683,18 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                     cute.arch.block_idx(),
                     cute.arch.grid_dim(),
                 )
-            fc2_work_tile = fc2_tile_sched.initial_work_tile_info()
+            fc2_half_n_tiles = cutlass.Int32(0)
+            if cutlass.const_expr(self.die_claim):
+                fc2_half_n_tiles = cutlass.Int32(cute.size(tFC2BgB, mode=[1]))
+                fc2_work_tile, die_queue = self._die_claim(
+                    fc2_scheduler_counter,
+                    own_die,
+                    own_die,
+                    num_non_exiting_tiles_value,
+                    fc2_half_n_tiles,
+                )
+            else:
+                fc2_work_tile = fc2_tile_sched.initial_work_tile_info()
             fc2_is_continue = cutlass.Boolean(1)
             while fc2_work_tile.is_valid_tile and fc2_is_continue:
                 fc2_tile_coord = fc2_work_tile.tile_idx
@@ -3612,6 +3752,14 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                                 fc2_scheduler_consumer_state
                             )
                             fc2_scheduler_consumer_state.advance()
+                        elif cutlass.const_expr(self.die_claim):
+                            fc2_work_tile, die_queue = self._die_claim(
+                                fc2_scheduler_counter,
+                                die_queue,
+                                own_die,
+                                num_non_exiting_tiles_value,
+                                fc2_half_n_tiles,
+                            )
                         else:
                             fc2_work_tile = fc2_tile_sched.claim_next_work_local()
                     else:
@@ -4151,28 +4299,28 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                             scheduler_throttle_producer_state
                         )
                         scheduler_throttle_producer_state.advance()
-                mma_tile_coord_mnl = (
-                    tile_info[0] // cute.size(tiled_mma.thr_id.shape),
-                    tile_info[1],
-                    tile_info[2],
-                )
+                # B / SFB coordinates of N tile tile_info[1] of expert tile_info[2]: a
+                # die-major slot holds one half of every expert's N tiles.
+                b_n = tile_info[1]
+                b_l = tile_info[2]
+                if cutlass.const_expr(self.die_major):
+                    fc1_half_n = cutlass.Int32(cute.size(tFC1BgB, mode=[1]))
+                    if b_n >= fc1_half_n:
+                        b_n = b_n - fc1_half_n
+                        b_l = b_l + cutlass.Int32(cute.size(tFC1BgB, mode=[3])) // 2
                 #
                 # Slice to per mma tile index
                 #
                 # ((atom_v, rest_v), loopK)
-                tFC1BgB_slice = tFC1BgB[
-                    (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
-                ]
+                tFC1BgB_slice = tFC1BgB[(None, b_n, None, b_l)]
 
                 # Apply SFB slicing hack when cta_tile_shape_n=64
-                slice_n = mma_tile_coord_mnl[1]
+                slice_n = b_n
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
-                    slice_n = mma_tile_coord_mnl[1] // 2
+                    slice_n = b_n // 2
 
                 # ((atom_v, rest_v), RestK)
-                tFC1BgSFB_slice = tFC1BgSFB[
-                    (None, slice_n, None, mma_tile_coord_mnl[2])
-                ]
+                tFC1BgSFB_slice = tFC1BgSFB[(None, slice_n, None, b_l)]
 
                 # Peek (try_wait) B buffer empty for k_tile = prefetch_k_tile_cnt
                 fc1_b_producer_state.reset_count()
@@ -4265,6 +4413,11 @@ class Sm107BlockScaledContiguousGroupedGemmFusedFc12Kernel:
                         scheduler_throttle_producer_state.advance()
                 fc2_n_tile = tile_info[1]
                 fc2_expert = tile_info[2]
+                if cutlass.const_expr(self.die_major):
+                    fc2_half_n = cutlass.Int32(cute.size(tFC2BgB, mode=[1]))
+                    if fc2_n_tile >= fc2_half_n:
+                        fc2_n_tile = fc2_n_tile - fc2_half_n
+                        fc2_expert = fc2_expert + cutlass.Int32(cute.size(tFC2BgB, mode=[3])) // 2
                 fc2_b_gmem = tFC2BgB[
                     (None, fc2_n_tile, None, fc2_expert)
                 ]

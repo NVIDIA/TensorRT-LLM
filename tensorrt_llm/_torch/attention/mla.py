@@ -18,7 +18,7 @@ import math
 import os
 import weakref
 from contextlib import nullcontext
-from typing import Dict, Optional, cast
+from typing import Dict, Optional, Tuple, cast
 
 import torch
 from torch import nn
@@ -64,6 +64,7 @@ from .backends.interface import AttentionBackend, PositionalEmbeddingParams, Pre
 from .backends.sparse.hooks import get_sparse_mla_hooks
 from .backends.sparse.mixed_precision_high_rows import store_mixed_precision_high_rows
 from .backends.utils import create_attention
+from .kernels.mla_kv_fp8 import mla_kv_to_fp8
 from .rotary_embedding import RotaryEmbedding
 
 
@@ -132,6 +133,35 @@ def _create_mla_outputs_fake(hidden_states: torch.Tensor, layer_idx: str) -> tor
     return create_mla_outputs_impl(hidden_states, layer_idx)
 
 
+def _helix_gen_zero_kv_mask(attn_metadata: AttentionMetadata, num_tokens: int) -> torch.Tensor:
+    """Bool ``[num_tokens]`` mask of the generation tokens this Helix CP rank owns no KV for."""
+    # TrtllmAttentionMetadata fills helix_zero_kv_tokens once per step
+    # together with the other Helix spec buffers.
+    if (
+        isinstance(attn_metadata, TrtllmAttentionMetadata)
+        and attn_metadata._helix_spec_tokens_valid
+    ):
+        # Speculative verify groups: KV ownership is per-TOKEN. A rank
+        # owning only the tail page of a group has zero visible KV for
+        # the group's leading tokens while its per-sequence kv_len is
+        # nonzero, so the per-sequence mask below misses those rows.
+        # Their decode rows are fully masked with a finite sentinel,
+        # making partial_o an average over (possibly uninitialized)
+        # pool values; the combine multiplies by corr = 0 and
+        # 0 * NaN would poison the token on every CP rank — sanitize
+        # by the per-token bound instead.
+        return attn_metadata.helix_zero_kv_tokens[:num_tokens]
+    # MLA processes only the generation token slice here, so build
+    # the mask from [num_contexts, num_seqs). Skip this expansion
+    # when the more precise per-token bounds above are valid.
+    return _helix_zero_kv_mask(
+        attn_metadata,
+        num_tokens,
+        seq_start=attn_metadata.num_contexts,
+        num_seqs=attn_metadata.num_generations,
+    )
+
+
 @torch.library.custom_op(
     "trtllm::mla_custom_op_inplace",
     mutates_args=("output",),
@@ -144,6 +174,8 @@ def mla_custom_op_inplace(
     latent_cache_gen: Optional[torch.Tensor],
     hidden_states_fp4: Optional[torch.Tensor] = None,
     hidden_states_sf: Optional[torch.Tensor] = None,
+    prequantized_activation: Optional[torch.Tensor] = None,
+    prequantized_scale: Optional[torch.Tensor] = None,
 ) -> None:
     metadata, mla_layer = _extract_mla_extra_attrs(layer_idx)
     if hidden_states_fp4 is not None or hidden_states_sf is not None:
@@ -161,6 +193,11 @@ def mla_custom_op_inplace(
         metadata,
         attn_output=[output],
         latent_cache_gen=latent_cache_gen,
+        prequantized_input=(
+            None
+            if prequantized_activation is None
+            else (prequantized_activation, prequantized_scale)
+        ),
     )
 
 
@@ -229,6 +266,12 @@ def fp8_block_scaling_bmm_out(
 
 
 class MLA(nn.Module):
+    # A model's opt-in: the cached-KV context paths may hand the attention op
+    # FP8 Q / K / V (see _supports_fp8_cached_kv_context).
+    fp8_cached_kv_context_opt_in: bool = False
+    # Whether they do; resolved once in create_weights().
+    _fp8_cached_kv_context: bool = False
+
     def __init__(
         self,
         *,
@@ -364,15 +407,15 @@ class MLA(nn.Module):
                 "fuse_qkv_a_proj=True; the separate q_a_proj layout is not "
                 "supported with sparse MLA."
             )
-        if self.sparse_attn_hooks is not None and type(self)._apply_output_gate is not (
-            MLA._apply_output_gate
+        if self.sparse_attn_hooks is not None and type(self)._gate_and_project_output is not (
+            MLA._gate_and_project_output
         ):
-            # _apply_output_gate is defined against the dense output path, where
-            # attn_output[0] is o_proj's input. Sparse hooks own _create_outputs
-            # and _project_output, so the tensor's rank, shape and projection
-            # differ and the gate would not compose.
+            # _gate_and_project_output is defined against the dense output path,
+            # where attn_output[0] is o_proj's input. Sparse hooks own
+            # _create_outputs and _project_output, so the tensor's rank, shape
+            # and projection differ and the gate would not compose.
             raise NotImplementedError(
-                f"{type(self).__name__} overrides _apply_output_gate, which is "
+                f"{type(self).__name__} overrides _gate_and_project_output, which is "
                 "only defined for the dense MLA output path; it cannot be "
                 "combined with sparse MLA hooks."
             )
@@ -578,6 +621,11 @@ class MLA(nn.Module):
             else self.aux_stream
         )
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
+        # Helix CP hook: a subclass that runs work beside the generation
+        # all-to-all sets an event here; it is recorded on the current stream
+        # right before the all-to-all is enqueued, so work that only depends on
+        # the module input can wait on it.
+        self.helix_exchange_event: Optional[torch.cuda.Event] = None
         need_absorption = self.sparse_attn_hooks is None or self.sparse_attn_hooks.need_absorption
         if need_absorption:
             self.kv_a_layernorm = RMSNorm(
@@ -731,6 +779,7 @@ class MLA(nn.Module):
             self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
         self._fused_q_fp8_ctx_ok = False
+        self._fp8_cached_kv_context = False
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
         self.out_scale = None
@@ -823,6 +872,7 @@ class MLA(nn.Module):
         self._locality_domain_v_b_proj_shards = None
         self._weights_transformed = False
         self._init_fused_q_fp8_context()
+        self._fp8_cached_kv_context = self._supports_fp8_cached_kv_context()
 
     def apply_rope(
         self,
@@ -847,6 +897,7 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         attn_metadata: AttentionMetadata,
         helix_v_up: bool = False,
+        helix_output: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """Run absorbed attention; under Helix CP also exchange and combine the partials.
@@ -854,6 +905,8 @@ class MLA(nn.Module):
         With ``helix_v_up`` the V up-projection is applied to this rank's
         partial outputs before the all-to-all, so the result holds
         ``num_heads_tp_cp * v_head_dim`` values per token instead of latents.
+        ``helix_output`` is then the caller's buffer for that result, which an
+        override may write and return in place of a new tensor.
         """
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
@@ -872,34 +925,13 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            helix_kv_bounds = getattr(attn_metadata, "helix_kv_bounds", None)
-            # helix_kv_bounds is non-None only on TrtllmAttentionMetadata,
-            # where _helix_spec_tokens_valid is a declared field.
-            if helix_kv_bounds is not None and attn_metadata._helix_spec_tokens_valid:
-                # Speculative verify groups: KV ownership is per-TOKEN. A rank
-                # owning only the tail page of a group has zero visible KV for
-                # the group's leading tokens while its per-sequence kv_len is
-                # nonzero, so the per-sequence mask above misses those rows.
-                # Their decode rows are fully masked with a finite sentinel,
-                # making partial_o an average over (possibly uninitialized)
-                # pool values; the combine multiplies by corr = 0 and
-                # 0 * NaN would poison the token on every CP rank — sanitize
-                # by the per-token bound instead.
-                zero_kv_mask = helix_kv_bounds[: partial_o.shape[0]] == 0
-            else:
-                # MLA processes only the generation token slice here, so build
-                # the mask from [num_contexts, num_seqs). Skip this expansion
-                # when the more precise per-token bounds above are valid.
-                zero_kv_mask = _helix_zero_kv_mask(
-                    attn_metadata,
-                    partial_o.shape[0],
-                    seq_start=attn_metadata.num_contexts,
-                    num_seqs=attn_metadata.num_generations,
-                )
+            zero_kv_mask = _helix_gen_zero_kv_mask(attn_metadata, partial_o.shape[0])
             value_dim = kv_lora_rank
             if helix_v_up:
                 partial_o = self._helix_project_v_partials(partial_o)
                 value_dim = self.v_head_dim
+            if self.helix_exchange_event is not None:
+                self.helix_exchange_event.record()
             return _helix_post_process(
                 partial_o,
                 softmax_stats,
@@ -989,9 +1021,14 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
-        """Run the dense or sparse implementation of the shared MLA module."""
+        """Run the dense or sparse implementation of the shared MLA module.
+
+        ``prequantized_input`` is described in :meth:`takes_prequantized_input`.
+        """
         if self.sparse_attn_hooks is not None:
+            assert prequantized_input is None, "sparse MLA takes no prequantized input"
             self.sparse_attn_hooks.forward(
                 self,
                 position_ids,
@@ -1012,6 +1049,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 attn_output[0],
                 latent_cache_gen=latent_cache_gen,
+                prequantized_input=prequantized_input,
             )
 
     def _project_q_by_phase(
@@ -1053,6 +1091,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: torch.Tensor,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """
         Forward pass for the MLA module. Writes result into output tensor in-place.
@@ -1063,6 +1102,9 @@ class MLA(nn.Module):
             attn_metadata (AttentionMetadata): The attention metadata.
             output (torch.Tensor): The output tensor to write results into.
             latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
+            prequantized_input (Optional[Tuple[torch.Tensor, torch.Tensor]]): The
+                quantized form of every hidden_states row for the fused q_a /
+                kv_a projection (see :meth:`takes_prequantized_input`).
         """
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
@@ -1082,7 +1124,8 @@ class MLA(nn.Module):
             q = hidden_states
         else:
             if self.fuse_qkv_a_proj:
-                q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
+                qkv_a = self._project_qkv_a(hidden_states, prequantized_input)
+                q, compressed_kv, k_pe = qkv_a.split(
                     [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], -1
                 )
             else:
@@ -1323,22 +1366,27 @@ class MLA(nn.Module):
         assert full_compressed_kv.is_contiguous()
         assert full_k_pe.is_contiguous()
 
-        # compute full_k_nope and full_v from full_compressed_kv
-        full_kv = self._project_context_kv(full_compressed_kv)
-        full_k_nope, full_v = full_kv.split(
-            [
-                self.num_context_heads * self.qk_nope_head_dim,
-                self.num_context_heads * self.v_head_dim,
-            ],
-            -1,
-        )
+        q_fp8 = None
+        if self._fp8_cached_kv_context:
+            q_fp8 = self._quantize_q_fp8(q)
+            full_k, full_v = self._expand_kv_to_fp8(full_compressed_kv, full_k_pe)
+        else:
+            # compute full_k_nope and full_v from full_compressed_kv
+            full_kv = self._project_context_kv(full_compressed_kv)
+            full_k_nope, full_v = full_kv.split(
+                [
+                    self.num_context_heads * self.qk_nope_head_dim,
+                    self.num_context_heads * self.v_head_dim,
+                ],
+                -1,
+            )
 
-        full_k_nope = full_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
-        full_k = maybe_compiled_cat(
-            (full_k_nope, full_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
-        )
-        full_k = full_k.view(-1, self.num_context_heads * self.qk_head_dim)
+            full_k_nope = full_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
+            full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            full_k = maybe_compiled_cat(
+                (full_k_nope, full_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
+            )
+            full_k = full_k.view(-1, self.num_context_heads * self.qk_head_dim)
 
         # release pytorch activation memory
         full_compressed_kv = None
@@ -1358,6 +1406,7 @@ class MLA(nn.Module):
                 latent_cache=None,
                 out_scale=self.out_scale,
                 output=output,
+                **self._fp8_q_forward_args(q_fp8),
             ),
         )
 
@@ -1509,6 +1558,8 @@ class MLA(nn.Module):
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
         trtllm_attention.mla_rope_append_paged_kv_assign_q(q, latent_cache, attn_metadata)
+        # With FP8 attention inputs, Q is quantized once for every partition.
+        q_fp8 = self._quantize_q_fp8(q) if self._fp8_cached_kv_context else None
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
@@ -1561,23 +1612,28 @@ class MLA(nn.Module):
                 ),
             )
 
-            # up proj to uncompressed kv
-            # [tokens, 2, h, kv_dim], without rope_dim
-            chunked_kv = self._project_context_kv(chunked_compressed_kv)
-            chunked_k_nope, chunked_v = chunked_kv.split(
-                [
-                    self.num_context_heads * self.qk_nope_head_dim,
-                    self.num_context_heads * self.v_head_dim,
-                ],
-                -1,
-            )
+            if self._fp8_cached_kv_context:
+                chunked_k, chunked_v = self._expand_kv_to_fp8(chunked_compressed_kv, chunked_k_pe)
+            else:
+                # up proj to uncompressed kv
+                # [tokens, 2, h, kv_dim], without rope_dim
+                chunked_kv = self._project_context_kv(chunked_compressed_kv)
+                chunked_k_nope, chunked_v = chunked_kv.split(
+                    [
+                        self.num_context_heads * self.qk_nope_head_dim,
+                        self.num_context_heads * self.v_head_dim,
+                    ],
+                    -1,
+                )
 
-            chunked_k_nope = chunked_k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
-            chunked_k = maybe_compiled_cat(
-                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
-            )
-            chunked_k = chunked_k.view(-1, self.num_context_heads * self.qk_head_dim)
+                chunked_k_nope = chunked_k_nope.view(
+                    -1, self.num_context_heads, self.qk_nope_head_dim
+                )
+                chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
+                chunked_k = maybe_compiled_cat(
+                    (chunked_k_nope, chunked_k_pe.expand(-1, self.num_context_heads, -1)), dim=-1
+                )
+                chunked_k = chunked_k.view(-1, self.num_context_heads * self.qk_head_dim)
 
             # release pytorch activation memory
             chunked_compressed_kv = None
@@ -1606,6 +1662,7 @@ class MLA(nn.Module):
                     softmax_stats_tensor=self.temp_softmax_stats_tensor,
                     chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
                     output=temp_attn_output,
+                    **self._fp8_q_forward_args(q_fp8),
                 ),
             )
             # merge attn result
@@ -1620,24 +1677,26 @@ class MLA(nn.Module):
             )
 
         # deal with the uncached kv
-        kv = self._project_context_kv(compressed_kv)
         _, k_pe = latent_cache.view([-1, self.kv_lora_rank + self.qk_rope_head_dim]).split(
             [self.kv_lora_rank, self.qk_rope_head_dim], -1
         )
         # final round of attention
+        if self._fp8_cached_kv_context:
+            k, v = self._expand_kv_to_fp8(compressed_kv, k_pe)
+        else:
+            kv = self._project_context_kv(compressed_kv)
+            k_nope, v = kv.split(
+                [
+                    self.num_context_heads * self.qk_nope_head_dim,
+                    self.num_context_heads * self.v_head_dim,
+                ],
+                -1,
+            )
 
-        k_nope, v = kv.split(
-            [
-                self.num_context_heads * self.qk_nope_head_dim,
-                self.num_context_heads * self.v_head_dim,
-            ],
-            -1,
-        )
-
-        k_nope = k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
-        k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_context_heads, -1)), dim=-1)
-        k = k.view(-1, self.num_context_heads * self.qk_head_dim)
+            k_nope = k_nope.view(-1, self.num_context_heads, self.qk_nope_head_dim)
+            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+            k = maybe_compiled_cat((k_nope, k_pe.expand(-1, self.num_context_heads, -1)), dim=-1)
+            k = k.view(-1, self.num_context_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
@@ -1660,6 +1719,7 @@ class MLA(nn.Module):
                 softmax_stats_tensor=self.temp_softmax_stats_tensor,
                 chunked_prefill_buffer_batch_size=attn_metadata.runtime_features.chunked_prefill_buffer_batch_size,
                 output=temp_attn_output,
+                **self._fp8_q_forward_args(q_fp8),
             ),
         )
         temp_merge_op = attn_metadata.merge_op_tensor[chunked_loop_num]
@@ -1774,15 +1834,25 @@ class MLA(nn.Module):
             # (block-reuse without chunked_prefill) recompiles per shape and
             # may stall inside inductor's compile worker.
             if trtllm_attention.has_cached_kv_for_mla_context_warmup(attn_metadata):
-                self.cached_warmup_forward_context_with_cached_kv(
-                    self.num_context_heads,
-                    self.qk_nope_head_dim,
-                    self.qk_rope_head_dim,
-                    self.kv_lora_rank,
-                    self.v_head_dim,
-                    q.dtype,
-                    q.device,
-                )
+                if self._fp8_cached_kv_context:
+                    self.cached_warmup_expand_kv_to_fp8(
+                        self.num_context_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                        q.device,
+                    )
+                else:
+                    self.cached_warmup_forward_context_with_cached_kv(
+                        self.num_context_heads,
+                        self.qk_nope_head_dim,
+                        self.qk_rope_head_dim,
+                        self.kv_lora_rank,
+                        self.v_head_dim,
+                        q.dtype,
+                        q.device,
+                    )
             if (
                 trtllm_attention.is_chunked_prefill_for_mla_context(attn_metadata)
                 and get_sm_version() >= 100
@@ -2111,6 +2181,7 @@ class MLA(nn.Module):
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
             helix_v_up=helix_v_up,
+            helix_output=output if helix_v_up else None,
             **kwargs,
         )
         fused_q = None
@@ -2155,6 +2226,76 @@ class MLA(nn.Module):
             raise NotImplementedError(f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
 
         return output
+
+    def _supports_fp8_cached_kv_context(self) -> bool:
+        """Whether cached-KV context attention can hand the attention op FP8 Q / K / V.
+
+        The op's FP8 context MLA FMHA (``TrtllmAttention.has_fp8_context_mla``)
+        otherwise copies its BF16 Q, K and V to FP8 on every call, i.e. once per
+        cached-KV partition, after a BF16 concat of k_nope and k_pe. Requires
+        the model's opt-in (``fp8_cached_kv_context_opt_in``), dense attention
+        without Helix CP and the 128 / 64 / 128 head dimensions of the op's FP8
+        copy kernel. The FP8 Q / K / V written here are plain
+        conversions: ``TrtllmAttention`` keeps its KV quantization scale at 1.
+        """
+        mha = self.mha
+        return (
+            self.fp8_cached_kv_context_opt_in
+            and isinstance(mha, TrtllmAttention)
+            and mha.has_fp8_context_mla
+            and mha.sparse_params is None
+            and not self.mapping.has_cp_helix()
+            and (self.qk_nope_head_dim, self.qk_rope_head_dim, self.v_head_dim) == (128, 64, 128)
+        )
+
+    def _quantize_q_fp8(self, q: torch.Tensor) -> torch.Tensor:
+        """Q in FP8 as the attention op's context copy quantizes it (its unit
+        KV quantization scale)."""
+        return torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+            q, self.mha.kv_scale_orig_quant
+        )[0]
+
+    def _fp8_q_forward_args(self, q_fp8: Optional[torch.Tensor]) -> dict:
+        """Attention-op arguments that hand it ``q_fp8`` as the already-quantized FP8 Q."""
+        if q_fp8 is None:
+            return {}
+        return {"quant_q_buffer": q_fp8, "quant_scale_qkv": self.mha.kv_scale_orig_quant}
+
+    def _expand_kv_to_fp8(
+        self, compressed_kv: torch.Tensor, k_pe: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """kv_b_proj, then FP8 K ``[T, H * qk_head_dim]`` and V ``[T, H * v_head_dim]`` in one
+        pass, the bytes the attention op's context copy writes for the BF16 K and V."""
+        return mla_kv_to_fp8(
+            self._project_context_kv(compressed_kv),
+            k_pe.view(-1, self.qk_rope_head_dim),
+            self.num_context_heads,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
+
+    @staticmethod
+    @functools.cache
+    def cached_warmup_expand_kv_to_fp8(
+        num_heads, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank, v_head_dim, device
+    ):
+        """Compile the FP8 K / V kernel before the first cached-KV context step.
+
+        k_pe is contiguous for loaded chunks and a ``latent_cache`` view for the
+        current tokens; both specialize alike.
+        """
+        num_tokens = 2
+        kv = torch.zeros(
+            num_tokens,
+            num_heads * (qk_nope_head_dim + v_head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        latent = torch.zeros(
+            num_tokens, kv_lora_rank + qk_rope_head_dim, dtype=torch.bfloat16, device=device
+        )
+        for k_pe in (latent[:, kv_lora_rank:].contiguous(), latent[:, kv_lora_rank:]):
+            mla_kv_to_fp8(kv, k_pe, num_heads, qk_nope_head_dim, v_head_dim)
 
     def _init_fused_q_fp8_context(self) -> None:
         """Resolve the static half of the context-phase fused FP8-Q gate (see
@@ -2368,8 +2509,11 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor],
         attn_output: list[torch.Tensor],
         latent_cache_gen: Optional[torch.Tensor],
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """Run the dense or sparse registered custom-op implementation."""
+        if self.sparse_attn_hooks is not None:
+            assert prequantized_input is None, "sparse MLA takes no prequantized input"
         if self.sparse_attn_hooks is not None and self.sparse_attn_hooks.forward_custom_op(
             self,
             hidden_states,
@@ -2384,6 +2528,7 @@ class MLA(nn.Module):
             raise RuntimeError("MLA custom ops require exactly one output tensor.")
 
         if isinstance(hidden_states, Fp4QuantizedTensor):
+            assert prequantized_input is None, "an NVFP4 input takes no prequantized input"
             maybe_bcg_mla_custom_op_inplace(
                 hidden_states.unquantized_hidden_states,
                 position_ids,
@@ -2400,28 +2545,35 @@ class MLA(nn.Module):
                 self.layer_idx_str,
                 output,
                 latent_cache_gen,
+                prequantized_activation=(
+                    None if prequantized_input is None else prequantized_input[0]
+                ),
+                prequantized_scale=None if prequantized_input is None else prequantized_input[1],
             )
 
-    def _apply_output_gate(
+    def _gate_and_project_output(
         self,
         hidden_states: torch.Tensor,
-        attn_output: torch.Tensor,
+        attn_output: list[torch.Tensor],
+        position_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
     ) -> torch.Tensor:
-        """Transform the attention output before the output projection.
+        """Apply the optional output gate and the output projection.
 
-        ``attn_output`` is the row-parallel ``o_proj``'s input and
+        ``attn_output[0]`` is the row-parallel ``o_proj``'s input and
         ``hidden_states`` is the unquantized module input, so an override that
         derives a gate from ``hidden_states`` must match ``o_proj``'s input
-        sharding. Runs on both the ``register_to_config`` and eager branches,
-        and ahead of the helix-CP reduce-scatter.
+        sharding and apply it ahead of the helix-CP reduce-scatter. Runs on
+        both the ``register_to_config`` and eager branches.
 
         Dense output path only: ``__init__`` rejects an override combined with
         sparse MLA hooks, which replace ``o_proj`` and may hand
         ``attn_output[0]`` on in a different rank and layout.
 
-        The base is the identity.
+        The base has no gate.
         """
-        return attn_output
+        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
 
     def _project_output(
         self,
@@ -2464,6 +2616,27 @@ class MLA(nn.Module):
             self.layer_idx,
         )
 
+    def takes_prequantized_input(self, num_rows: int, attn_metadata: AttentionMetadata) -> bool:
+        """Whether :meth:`forward` on ``num_rows`` rows consumes their quantized form
+        (``prequantized_input``: an activation and its scale, in the layout the
+        subclass's :meth:`_project_qkv_a` reads) instead of quantizing the rows
+        itself. The base MLA never does.
+        """
+        return False
+
+    def _project_qkv_a(
+        self,
+        hidden_states: torch.Tensor,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    ) -> torch.Tensor:
+        """The fused q_a / kv_a projection of ``hidden_states``.
+
+        A subclass whose :meth:`takes_prequantized_input` can be true overrides
+        this to project ``prequantized_input`` instead; the base takes none.
+        """
+        assert prequantized_input is None, f"{type(self).__name__} takes no prequantized input"
+        return self.kv_a_proj_with_mqa(hidden_states)
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2471,13 +2644,14 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        prequantized_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         hidden_states = _helix_cp_allgather_input(
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
         # Unquantized view of the module input, used by create_mla_outputs and
-        # by _apply_output_gate.
+        # by _gate_and_project_output.
         output_hidden_states = hidden_states
         if isinstance(hidden_states, Fp4QuantizedTensor):
             assert hidden_states.unquantized_hidden_states is not None, (
@@ -2495,6 +2669,7 @@ class MLA(nn.Module):
                 position_ids,
                 attn_output,
                 latent_cache_gen,
+                prequantized_input,
             )
         else:
             attn_output = self._create_outputs(hidden_states, attn_metadata)
@@ -2504,10 +2679,12 @@ class MLA(nn.Module):
                 attn_metadata,
                 attn_output=attn_output,
                 latent_cache_gen=latent_cache_gen,
+                prequantized_input=prequantized_input,
             )
 
-        attn_output[0] = self._apply_output_gate(output_hidden_states, attn_output[0])
-        return self._project_output(attn_output, position_ids, attn_metadata, all_reduce_params)
+        return self._gate_and_project_output(
+            output_hidden_states, attn_output, position_ids, attn_metadata, all_reduce_params
+        )
 
     def resmooth_parameters(self, module_weight, module_weight_scale, recipe=(1, 128, 128)):
         weight, weight_scale = fp8_utils.resmooth_to_fp8_e8m0(module_weight, module_weight_scale)

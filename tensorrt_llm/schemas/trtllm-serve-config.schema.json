@@ -1101,6 +1101,22 @@
           "title": "Confidence Min Predicted Gain",
           "type": "number"
         },
+        "context_kv_dtype": {
+          "default": "auto",
+          "description": "Storage dtype of a standalone MLA DSpark drafter's context KV (one latent per token and drafter layer) in its paged draft KV cache. 'auto' keeps the drafter's weight dtype (BF16). 'fp8' stores FP8 E4M3 latents at a unit per-tensor scale, halving the draft cache bytes per token; the block decode then reads them with the FP8 CuTe DSL MLA decode, so a drafting server needs attention_backend CUTEDSL (the MLA drafter's AUTO choice). Lossy. The context and generation servers of disaggregated serving must set the same value.",
+          "enum": [
+            "auto",
+            "fp8"
+          ],
+          "title": "Context Kv Dtype",
+          "type": "string"
+        },
+        "context_kv_only": {
+          "default": false,
+          "description": "Set on the context servers of disaggregated serving with a standalone MLA DSpark drafter. A context server never drafts: it builds the drafter's context KV from the target hidden states during prefill. With this set it loads only what that needs (the context projection and each drafter layer's latent projection and norm) and emits placeholder draft tokens. Requires disaggregated serving.",
+          "title": "Context Kv Only",
+          "type": "boolean"
+        },
         "decoding_type": {
           "const": "DSpark",
           "default": "DSpark",
@@ -4069,6 +4085,17 @@
           },
           "title": "Enable Branch Snapshot",
           "type": "boolean"
+        },
+        "low_priority_snapshot_prompt_len": {
+          "default": 0,
+          "description": "Context requests whose prompt is shorter than this many tokens create their recurrent-state pages (live state and snapshots) at the lowest eviction priority; attention pages keep the default priority. 0 disables. Requires KV cache manager V2 and block reuse.",
+          "minimum": 0,
+          "status": "prototype",
+          "telemetry": {
+            "exclude": true
+          },
+          "title": "Low Priority Snapshot Prompt Len",
+          "type": "integer"
         },
         "periodic_snapshot_interval": {
           "default": 0,
@@ -7268,7 +7295,7 @@
     },
     "enable_min_latency": {
       "default": false,
-      "description": "If true, enable min-latency mode. Currently only used for Llama4.",
+      "description": "If true, enable min-latency mode for Llama4 and Kimi K3. For Kimi K3 it runs lossy decode kernels on generation steps of at most 8 rows: the MoE tail and the shared expert read BF16 activations instead of MXFP8, apply the RMSNorm scale late and use approximate tanh / sigmoid. Leave it unset where accuracy must match the default kernels or batches exceed 8 rows. It also packs a Kimi K3 CUDA-graph decode step's small input uploads into one copy and one scatter launch (lossless), and the executor loop runs with a 200 us Python thread switch interval.",
       "status": "beta",
       "title": "Enable Min Latency",
       "type": "boolean"

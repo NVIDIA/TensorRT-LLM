@@ -96,10 +96,13 @@ def _make_layer(layer_idx, attn_weight, moe_weight, rank, token_sliced):
     layer.seen_all_rank_num_tokens = []
 
     class _MoE(nn.Module):
-        def forward(self, x, all_rank_num_tokens, return_parts=False):
+        def forward(self, x, all_rank_num_tokens, return_parts=False, column_parallel_tail=False):
             assert return_parts
             layer.seen_all_rank_num_tokens.append(all_rank_num_tokens)
             return torch.tanh(x @ moe_weight), torch.zeros_like(x)
+
+        def moe_front_releases_early(self, like):
+            return False
 
     layer.block_sparse_moe = _MoE()
     return layer

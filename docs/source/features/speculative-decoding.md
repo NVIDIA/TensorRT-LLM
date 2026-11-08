@@ -180,18 +180,24 @@ target pages. The draft layers keep the drafter's own dtype, so an FP8 target KV
 cache (`kv_cache_config.dtype: fp8`) is paired with a BF16 draft cache.
 
 In disaggregated serving, direct worker launches require
-`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` on both the context and generation workers
-to enable shared draft-KV transfer. The `disaggregated_mpi_worker` launcher
-enables this setting automatically when both servers enable compatible
-speculation and use the same `tensor_parallel_size` and
-`enable_attention_dp`.
+`TRTLLM_DISAGG_SHARED_DRAFT_KV=1` (or `auto`, which shares wherever the layout
+allows it) on both the context and generation workers to enable shared
+draft-KV transfer. The `disaggregated_mpi_worker` launcher enables this setting
+automatically when both servers enable compatible speculation and shard
+attention alike: the same `tensor_parallel_size`, where `enable_attention_dp`
+counts as 1 because every rank keeps all KV heads.
 
 When sharing is enabled, the context server's draft pages are transferred to
 the generation server with the target pages, so the drafter starts generation
 with the prompt context instead of an empty one. This requires the draft layers
 to have the target's rank-local KV-head count; the draft dtype and head
 dimension may differ, except that an NVFP4 target KV cache requires an
-identical draft layout. Both servers must use the same layout.
+identical draft layout unless both caches are K-only (MLA). Both servers must
+use the same layout.
+
+Hybrid recurrent/attention targets whose cache manager opts in (Kimi K3) keep
+a standalone DSpark MLA drafter's layers after their own, with the CUTEDSL,
+TRTLLM or VANILLA drafter backend.
 
 The drafter keeps a separate draft KV cache manager instead when any of the
 following applies: context parallelism larger than 1, a per-layer KV-head count
@@ -351,3 +357,20 @@ The field name `speculative_model_dir` can also be used as an alias for `specula
       max_draft_len: 4
       speculative_model_dir: /path/to/draft/model
 ```
+
+### DSpark attention projection precision
+
+`TRTLLM_DSPARK_LINEAR_BACKEND=bf16|fp8` selects the attention projection
+precision of the embedded DeepSeek-V4 DSpark drafter. When unset, projections
+use FP8 on Rubin SM107 with TP=1 or attention DP, and BF16 otherwise. Set
+bf16 to use dequantized BF16 draft weights. An explicit fp8 selection
+requires TP=1 or attention DP; unsupported tensor-parallel mappings are
+rejected during initialization. Non-Rubin FP8 is opt-in and requires workload
+accuracy and acceptance-length validation.
+
+### Packed FP4 MLA wave planning
+
+`TRTLLM_FP4_MLA_PACKED_WAVE_PLAN=1` enables the optional wave-simulation
+planner for packed FP4 MLA decode. The default is disabled (0); the
+rule-based split plan remains active. Validate end-to-end latency on the
+serving workload before enabling wave simulation.

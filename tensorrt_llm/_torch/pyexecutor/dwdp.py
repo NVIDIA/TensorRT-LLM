@@ -81,6 +81,11 @@ from tensorrt_llm.llmapi.llm_args import DwdpConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+# Device memory a DWDP worker keeps outside the PyTorch cap: its peer weight
+# gathers and the KV cache manager's copy launches allocate through the driver
+# while serving, next to context chunks that fill the cap.
+DWDP_DRIVER_MEMORY_RESERVE = 1024**3
+
 _global_dwdp_manager: Optional["DwdpManager"] = None
 
 

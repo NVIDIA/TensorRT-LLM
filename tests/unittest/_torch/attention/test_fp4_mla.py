@@ -693,6 +693,9 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     )
     metadata.helix_local_slots = torch.full_like(metadata.helix_position_offsets, untouched)
     metadata.helix_kv_bounds = torch.full_like(metadata.helix_position_offsets, untouched)
+    metadata.helix_zero_kv_tokens = torch.ones_like(
+        metadata.helix_position_offsets, dtype=torch.bool
+    )
     metadata.kv_lens_cuda = torch.full((num_seqs + 3,), untouched, dtype=torch.int32, device="cuda")
 
     metadata.recompute_helix_spec_buffers(num_tokens, tokens_per_seq)
@@ -707,12 +710,14 @@ def test_recompute_helix_spec_buffers_matches_elementwise_reference(
     gen = slice(0, num_tokens)
     torch.testing.assert_close(metadata.helix_local_slots[gen], expected_slots)
     torch.testing.assert_close(metadata.helix_kv_bounds[gen], expected_bounds)
+    assert torch.equal(metadata.helix_zero_kv_tokens[gen], expected_bounds == 0)
     torch.testing.assert_close(
         metadata.kv_lens_cuda[1 : 1 + num_seqs],
         expected_bounds.view(num_seqs, tokens_per_seq)[:, -1],
     )
     assert (metadata.helix_local_slots[num_tokens:] == untouched).all()
     assert (metadata.helix_kv_bounds[num_tokens:] == untouched).all()
+    assert metadata.helix_zero_kv_tokens[num_tokens:].all()
     assert metadata.kv_lens_cuda[0].item() == untouched
     assert (metadata.kv_lens_cuda[1 + num_seqs :] == untouched).all()
     # Any group of the sequence that this rank does not own writes no slot.
@@ -2952,6 +2957,70 @@ def test_fp4_mla_attention_decode_cutedsl_packed_matches_reference(
         packed_queries=True,
         split_kv=split_kv,
     )
+
+
+@pytest.mark.skipif(
+    _is_cutedsl_unavailable(),
+    reason="requires Rubin SM107 and the CuTeDSL runtime",
+)
+@pytest.mark.parametrize("masked", [False, True], ids=["full-tiles", "causal-tail"])
+def test_fp4_mla_rowmax_readers_wait_for_correction_warps(
+    monkeypatch: pytest.MonkeyPatch, masked: bool
+) -> None:
+    """Delaying the second score half must not expose the next tile's row max."""
+    from collections import OrderedDict
+
+    import cutlass as ctm
+    import cutlass.cute as cute
+    from cutlass.experimental import primitives as prims
+
+    from tensorrt_llm._torch.attention.backends.fp4_mla import fp4_mla_cutedsl_mufu16 as kernel
+
+    original_load = kernel._load_p4_n256_atomic_running_rowmax
+    original_load_with_validity = kernel._load_p4_n256_atomic_running_rowmax_with_validity
+
+    @cute.jit
+    def delayed_load(
+        row_max: ctm.Array,
+        warp_idx: ctm.Int32,
+        tidx: ctm.Int32,
+        producer_warp_base: ctm.Int32,
+    ) -> ctm.Float32:
+        if warp_idx >= ctm.Int32(4):
+            prims.nanosleep(ctm.Int32(1000000))
+        return original_load(row_max, warp_idx, tidx, producer_warp_base)
+
+    @cute.jit
+    def delayed_load_with_validity(
+        row_max: ctm.Array,
+        warp_idx: ctm.Int32,
+        tidx: ctm.Int32,
+        producer_warp_base: ctm.Int32,
+    ) -> tuple[ctm.Float32, ctm.Boolean]:
+        if warp_idx >= ctm.Int32(4):
+            prims.nanosleep(ctm.Int32(1000000))
+        return original_load_with_validity(row_max, warp_idx, tidx, producer_warp_base)
+
+    monkeypatch.setattr(kernel, "_load_p4_n256_atomic_running_rowmax", delayed_load)
+    monkeypatch.setattr(
+        kernel, "_load_p4_n256_atomic_running_rowmax_with_validity", delayed_load_with_validity
+    )
+    # Force compilation of the delayed helpers and keep that executable out of other tests.
+    monkeypatch.setattr(kernel, "_FUSED_COMPILE_CACHE", {})
+    monkeypatch.setattr(kernel, "_FUSED_EXECUTOR_CACHE", OrderedDict())
+    monkeypatch.setattr(kernel, "_PREPARED_FUSED_CALL_CACHE", OrderedDict())
+    for seed in (41, 53, 67):
+        _assert_fp4_mla_attention_decode_accuracy(
+            monkeypatch,
+            backend="cutedsl",
+            fused_v_transpose=False,
+            num_heads=128,
+            seq_lens=[258 if masked else 512],
+            seed=seed,
+            query_len_per_seq=4 if masked else 1,
+            packed_queries=True,
+            split_kv=1,
+        )
 
 
 @pytest.mark.skipif(

@@ -435,6 +435,7 @@ def test_capture_taps_the_next_layers_aggregated_stream():
         num_attn_res_snapshots=num_layers,
         helix_a2a=None,
         helix_a2a_first_layer=num_layers,
+        _fp4_mla_metadata_stream=None,
     )
 
     KimiLinearModel.forward(
@@ -600,6 +601,7 @@ def test_aux_capture_tail_follows_the_same_switch(monkeypatch, aggregated):
         num_attn_res_snapshots=num_layers,
         helix_a2a=None,
         helix_a2a_first_layer=num_layers,
+        _fp4_mla_metadata_stream=None,
     )
 
     mkl.KimiLinearModel.forward(

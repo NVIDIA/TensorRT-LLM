@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import math
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -1364,6 +1365,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
             ``CONVERSATION_CONTENT_STRIDE`` blocks.  ``0`` disables
             following: new conversation_ids go to the least-loaded server
             and request content is never hashed for them.
+        new_conversation_follow_load_factor: When set, server load is the
+            estimated uncached prompt tokens in flight, and a new
+            conversation follows its match only if that server's load exceeds
+            the least-loaded server's by at most ``factor * matched tokens``.
+            ``inf`` always follows; ``None`` keeps the content-weight load.
     """
 
     CHAR_PER_TOKEN = 5  # approximately 4 characters per token + 1 space
@@ -1381,6 +1387,7 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                  use_harmony: Optional[bool] = None,
                  enable_tokenization_cache: bool = False,
                  new_conversation_min_match_blocks: int = 32,
+                 new_conversation_follow_load_factor: Optional[float] = None,
                  **kwargs):
         super().__init__(server_role, servers, metadata_server_cfg,
                          metadata_server, **kwargs)
@@ -1392,11 +1399,22 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
 
         if new_conversation_min_match_blocks < 0:
             raise ValueError("new_conversation_min_match_blocks must be >= 0")
+        if (new_conversation_follow_load_factor is not None
+                and not new_conversation_follow_load_factor >= 0):
+            raise ValueError("new_conversation_follow_load_factor must be >= 0")
         self._match_threshold = match_threshold
         self._use_token_ids = use_token_ids
         self._hash_skip_count = hash_skip_count
         self._max_sessions = max_sessions
         self._new_conv_min_match_blocks = new_conversation_min_match_blocks
+        self._follow_load_factor = new_conversation_follow_load_factor
+        # Server load counts the estimated uncached prompt tokens of the
+        # requests in flight instead of their content weight.
+        self._backlog_load = (new_conversation_min_match_blocks > 0 and
+                              new_conversation_follow_load_factor is not None)
+        # conversation_id -> estimated prompt tokens of its latest request,
+        # kept only with backlog load.
+        self._conv_num_tokens: dict[str, int] = {}
         self._disagg_node_id = kwargs.get("disagg_node_id", 0)
 
         # conversation_id -> strided block hashes of its first request (LRU),
@@ -1427,8 +1445,8 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         }
         # id(request) -> (server, weight, monotonic_timestamp)
         self._req_content_entry: dict[int, tuple[str, int, float]] = {}
-        # Coordinator-delegated path only: disagg req_id -> server, between
-        # select and finish (id(request) can't cross the HTTP hop).
+        # Coordinator-delegated path only: disagg req_id -> (server, load),
+        # between select and finish (id(request) can't cross the HTTP hop).
         self._coord_pending: dict = {}
 
     # ── content-based load tracking ──
@@ -1700,16 +1718,55 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         content_hashes = self._conv_content.pop(conv_id, None)
         if content_hashes is not None:
             self._conv_content_trie.remove(conv_id, content_hashes)
+        self._conv_num_tokens.pop(conv_id, None)
 
-    def _place_conversation(self, conv_id: str,
-                            content_hashes: Optional[list[int]],
-                            exclude_server: Optional[str]) -> str:
+    def _request_tokens(self, request: OpenAIRequest) -> tuple[int, float]:
+        """``(estimated prompt tokens, tokens per content block)`` of *request*.
+
+        Text is estimated at ``CHAR_PER_TOKEN`` characters per token, and so is
+        a content block of code points.
+        """
+        token_ids = self._try_extract_token_ids(request)
+        if token_ids is not None:
+            return (sum(len(ids)
+                        for ids in token_ids), float(self._tokens_per_block))
+        num_tokens = max(
+            len(self._extract_text(request)) // self.CHAR_PER_TOKEN, 1)
+        block_tokens = (self._tokens_per_block if self._use_token_ids else
+                        self._tokens_per_block / self.CHAR_PER_TOKEN)
+        return num_tokens, float(block_tokens)
+
+    def _known_conversation_load(self, conv_id: str,
+                                 num_tokens: Optional[int]) -> Optional[int]:
+        """Backlog estimate of a request of a pinned conversation.
+
+        The growth of its prompt since the conversation's previous request,
+        which is what the context server computes; at least one block.
+        """
+        if num_tokens is None:
+            return None
+        previous = self._conv_num_tokens.get(conv_id)
+        self._conv_num_tokens[conv_id] = num_tokens
+        if previous is None:
+            return num_tokens
+        return max(num_tokens - previous, self._tokens_per_block)
+
+    def _place_conversation(
+            self,
+            conv_id: str,
+            content_hashes: Optional[list[int]],
+            exclude_server: Optional[str],
+            num_tokens: Optional[int] = None,
+            block_tokens: Optional[float] = None) -> tuple[str, Optional[int]]:
         """Pin *conv_id*, which has no routable server, to a server.
 
         It follows the earlier conversation whose first request shares the
         longest prefix with *content_hashes* when that prefix is long enough
-        and specific to a few conversations (see the class docstring), else
-        goes to the least-loaded server.  Call with ``self._lock`` held.
+        and specific to a few conversations (see the class docstring), and,
+        given *num_tokens*, within ``new_conversation_follow_load_factor``;
+        else it goes to the least-loaded server.  Returns the server and the
+        request's backlog estimate (``None`` without *num_tokens*).  Call with
+        ``self._lock`` held.
         """
         self._forget_conversation_content(conv_id)
         match_id, depth = None, 0
@@ -1728,10 +1785,26 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                 content_hashes[:depth])
             server_share = len(self._conv_content) // len(self._servers)
             follow = sharers <= max(1, server_share)
+        match_tokens = 0
+        least_loaded = None
+        declined = False
+        if follow:
+            match_tokens = int(match_blocks *
+                               (block_tokens or self._tokens_per_block))
+            if (num_tokens is not None and self._follow_load_factor is not None
+                    and not math.isinf(self._follow_load_factor)):
+                match_server = self._session_table[match_id][0]
+                least_loaded = self._select_least_loaded(exclude_server)
+                declined = (least_loaded is not None
+                            and least_loaded != match_server
+                            and self._get_server_load(match_server) -
+                            self._get_server_load(least_loaded)
+                            > self._follow_load_factor * match_tokens)
+                follow = not declined
         if follow:
             server = self._session_table[match_id][0]
         else:
-            server = self._select_least_loaded(exclude_server)
+            server = least_loaded or self._select_least_loaded(exclude_server)
             if server is None:
                 raise ValueError(
                     f"No available servers after excluding {exclude_server}")
@@ -1740,10 +1813,15 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         self._update_session(conv_id, server, [])
         if content_hashes:
             self._remember_conversation_content(conv_id, content_hashes)
+        load = None
+        if num_tokens is not None:
+            self._conv_num_tokens[conv_id] = num_tokens
+            load = (max(num_tokens - match_tokens, self._tokens_per_block)
+                    if follow else num_tokens)
         logger.debug(f"ConversationRouter: NEW conv_id={conv_id} -> "
                      f"server={server}, matched_blocks={match_blocks}, "
-                     f"sharers={sharers}")
-        return server
+                     f"sharers={sharers}, declined_for_load={declined}")
+        return server, load
 
     # ── public interface ──
 
@@ -1763,7 +1841,11 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         # conversation_id without a routable server is hashed, to place it,
         # in a thread so that the event loop keeps dispatching meanwhile.
         if conv_id:
-            weight = self._estimate_content_weight(request)
+            num_tokens = block_tokens = weight = None
+            if self._backlog_load:
+                num_tokens, block_tokens = self._request_tokens(request)
+            else:
+                weight = self._estimate_content_weight(request)
             content_hashes = None
             if self._needs_content(conv_id, exclude_server):
                 content_hashes = await asyncio.to_thread(
@@ -1773,12 +1855,15 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
                     # Sticky hit: keep the pinned server, refresh LRU only.
                     server = self._session_table[conv_id][0]
                     self._session_table.move_to_end(conv_id)
+                    load = self._known_conversation_load(conv_id, num_tokens)
                 else:
                     # New conversation_id (or its server is gone/excluded).
-                    server = self._place_conversation(conv_id, content_hashes,
-                                                      exclude_server)
+                    server, load = self._place_conversation(
+                        conv_id, content_hashes, exclude_server, num_tokens,
+                        block_tokens)
                 await self._register_request(server, request)
-                self._add_content_load(server, request, weight)
+                self._add_content_load(server, request,
+                                       weight if load is None else load)
                 return server, {
                     "server_info": self._server_info.get(server, {})
                 }
@@ -1837,15 +1922,26 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
     # content_routing_key(), so only those requests are hashed.
 
     def routing_key(self, request: OpenAIRequest):
-        """The conversation_id (or None); no tokenization on the worker."""
-        return self._get_conversation_id(request)
+        """The conversation_id (or None); no tokenization on the worker.
+
+        With backlog load: ``{"conversation_id", "num_tokens"}``.
+        """
+        conv_id = self._get_conversation_id(request)
+        if not conv_id or not self._backlog_load:
+            return conv_id
+        num_tokens, _ = self._request_tokens(request)
+        return {"conversation_id": conv_id, "num_tokens": num_tokens}
 
     def content_routing_key(self, request: OpenAIRequest) -> dict:
         """Routing key carrying the content needed to place a new conversation."""
-        return {
+        key = {
             "conversation_id": self._get_conversation_id(request),
             "block_hashes": self._conversation_content_hashes(request),
         }
+        if self._backlog_load:
+            key["num_tokens"], key["block_tokens"] = self._request_tokens(
+                request)
+        return key
 
     async def get_next_server_by_key(self,
                                      routing_key,
@@ -1858,33 +1954,42 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         placement needs the request content.
         """
         conv_id = routing_key
-        content_hashes = None
+        content_hashes = num_tokens = block_tokens = None
         if isinstance(routing_key, dict):
             conv_id = routing_key["conversation_id"]
-            content_hashes = routing_key["block_hashes"]
+            content_hashes = routing_key.get("block_hashes")
+            num_tokens = routing_key.get("num_tokens")
+            block_tokens = routing_key.get("block_tokens")
         self._validate_servers_available()
         async with self._lock:
+            load = None
             if conv_id and self._is_routable_session(conv_id, exclude_server):
                 server = self._session_table[conv_id][0]
                 self._session_table.move_to_end(conv_id)
+                load = self._known_conversation_load(conv_id, num_tokens)
             elif conv_id:
                 if (content_hashes is None
                         and self._needs_content(conv_id, exclude_server)):
                     return None, {ROUTING_CONTENT_REQUIRED: True}, req_id
-                server = self._place_conversation(conv_id, content_hashes,
-                                                  exclude_server)
+                server, load = self._place_conversation(conv_id, content_hashes,
+                                                        exclude_server,
+                                                        num_tokens,
+                                                        block_tokens)
             else:
                 server = self._select_least_loaded(exclude_server)
                 if server is None:
                     raise ValueError(
                         f"No available servers after excluding {exclude_server}"
                     )
-            # Request-count load (no request object at the coordinator). Keyed by
-            # the disagg req_id -- the sole id crossing the HTTP hop on /finish.
+            # The backlog estimate when the key carries a token count, else
+            # request-count load (no request object at the coordinator). Keyed
+            # by the disagg req_id -- the sole id crossing the HTTP hop on
+            # /finish.
+            load = 1 if load is None else load
             self._server_content_load[server] = (
-                self._server_content_load.get(server, 0) + 1)
+                self._server_content_load.get(server, 0) + load)
             if req_id is not None:
-                self._coord_pending[req_id] = server
+                self._coord_pending[req_id] = (server, load)
         return server, {
             "server_info": self._server_info.get(server, {})
         }, req_id
@@ -1894,10 +1999,13 @@ class ConversationRouter(BlockHashMixin, LoadBalancingMixin, Router):
         if req_id is None:
             return
         async with self._lock:
-            server = self._coord_pending.pop(req_id, None)
-            if server and server in self._server_content_load:
+            pending = self._coord_pending.pop(req_id, None)
+            if pending is None:
+                return
+            server, load = pending
+            if server in self._server_content_load:
                 self._server_content_load[server] = max(
-                    0, self._server_content_load[server] - 1)
+                    0, self._server_content_load[server] - load)
 
 
 class CoordinatorDelegatingRouter(Router):

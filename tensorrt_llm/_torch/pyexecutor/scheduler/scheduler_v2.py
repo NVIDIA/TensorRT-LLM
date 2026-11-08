@@ -51,6 +51,7 @@ class ScheduleAction(enum.Enum):
     SCHEDULED = "scheduled"  # success — payload contains tokens etc.
     SKIP = "skip"  # skip this request, continue the loop
     STOP = "stop"  # stop the scheduling loop
+    DEFER = "defer"  # retry this request after the rest of this iteration's order
 
 
 class _RecomputePauseState:
@@ -293,10 +294,13 @@ class KVCacheV2Scheduler(RequestScheduler):
         # this many tokens (py_uncached_prefill_tokens) goes to the tail of the
         # iteration's context order from its first chunk on, FCFS within each
         # class, and takes whatever budget the others leave: reordered, never
-        # capped. Without an estimate a request is never demoted; mid-prefill
-        # the exact remainder releases it once no more than the threshold is
-        # left. Gating at the door (not from the second chunk on) keeps long
-        # requests from parking mid-prefill with their KV blocks held.
+        # capped. The estimate is checked against the prefix cache: an estimate
+        # above the threshold, or a missing one, is probed once against the
+        # radix tree; a request holding its cache is judged by its exact
+        # remainder; a request ordered as short whose first prepare shows a long
+        # remainder goes behind the rest of the iteration. Gating at the door
+        # (not from the second chunk on) keeps long requests from parking
+        # mid-prefill with their KV blocks held.
         demote_uncached = int(os.environ.get("TLLM_V2_CTX_DEMOTE_UNCACHED_TOKENS", "0"))
         self._ctx_demote_uncached_tokens = max(0, demote_uncached) if self.chunking_enabled else 0
         # A request demoted this many iterations is let through for good: it
@@ -305,6 +309,8 @@ class KVCacheV2Scheduler(RequestScheduler):
             0, int(os.environ.get("TLLM_V2_CTX_DEMOTE_MAX_ITERS", "0"))
         )
         self._ctx_demote_skips: dict[int, int] = {}
+        # First-chunk requests ordered as short on the router's estimate alone this iteration.
+        self._ctx_unverified_short: set[int] = set()
         if self._ctx_demote_uncached_tokens:
             logger.info(
                 f"KVCacheV2Scheduler: demoting context requests with more than "
@@ -748,6 +754,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         starved_ctx: RequestList = []
         if self._ctx_starvation_iterations is not None:
             pending_ctx, starved_ctx = self._split_starved_ctx(pending_ctx)
+            # A starved request is not deferred again after its first prepare.
+            self._ctx_unverified_short.difference_update(r.py_request_id for r in starved_ctx)
         # After any reordering: pre-grown requests go first in each pass so no
         # other request takes the budget their replay needs (stable sort).
         if self._swa_scratch_reuse:
@@ -770,13 +778,20 @@ class KVCacheV2Scheduler(RequestScheduler):
                 if self._prefix_wait_planner is not None and (pending_ctx or starved_ctx)
                 else {}
             )
+        if self._ctx_demote_uncached_tokens and prefix_waits:
+            # The probe of a waiting request predates the prefix it waits for; it
+            # is probed again once it stops waiting. An aged-out request keeps its mark.
+            for req in pending_ctx:
+                if req.py_request_id in prefix_waits and req.py_uncached_prefill_tokens is not None:
+                    req.py_uncached_prefill_probed = False
         # Starved requests are scheduled after the others, but their first shares
         # and request slots are held back while the others fill the budget.
         starved_shares = self._starved_ctx_shares(starved_ctx, budget)
         budget.hold(sum(starved_shares), len(starved_ctx))
         held = 0
         ctx_stopped = False
-        for starved_pass, ctx_requests in ((False, pending_ctx), (True, starved_ctx)):
+        # The first pass walks its own copy: a DEFER re-appends its request to it.
+        for starved_pass, ctx_requests in ((False, list(pending_ctx)), (True, starved_ctx)):
             if starved_pass:
                 if not starved_ctx:
                     break
@@ -865,6 +880,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
                     if action is ScheduleAction.SKIP:
                         continue
+                    if action is ScheduleAction.DEFER:
+                        # Ordered as short, prepared, found long: it goes behind the
+                        # rest of this pass and counts as demoted for aging.
+                        demoted_ids.add(req.py_request_id)
+                        ctx_requests.append(req)
+                        continue
                     has_chunking = has_chunking or chunking_flag
                     scheduled_ctx.append(req)
                     if self._prefix_wait_planner is not None:
@@ -952,30 +973,58 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     # ---- Long-prefill demotion ----
 
+    def _refresh_uncached_estimate(self, req: LlmRequest) -> None:
+        """Replace the router's estimate of a request's uncached prompt, when it is
+        missing or above the threshold, by a read-only radix probe: at most once per
+        request (a whole-prompt walk), and not for a started request or one holding
+        its cache, which :meth:`_is_long_context` judges by its exact remainder."""
+        if (
+            req.state_value == self._encoder_init_state_value
+            or req.py_uncached_prefill_probed
+            or req.context_current_position > 0
+            or self._holds_context_cache(req)
+        ):
+            return
+        estimate = req.py_uncached_prefill_tokens
+        if estimate is not None and estimate <= self._ctx_demote_uncached_tokens:
+            return
+        req.py_uncached_prefill_probed = True
+        reused = self.kv_cache_manager.probe_context_reuse(req)
+        if reused is not None:
+            estimate = max(req.prompt_len - reused, 0)
+        elif estimate is None:
+            estimate = req.context_remaining_length
+        req.py_uncached_prefill_tokens = estimate
+
     def _is_long_context(self, req: LlmRequest) -> bool:
-        """Whether the router's uncached-prefill estimate exceeds the threshold
-        and, once mid-prefill, more than the threshold is actually left. A
-        request without an estimate (none published, or dropped by the aging
-        bound) is never long. No radix probe here: it would walk the whole
-        prompt for every request on every iteration."""
+        """Whether more than the threshold of the request's prompt is uncached.
+
+        A started request, or one holding its cache, is judged by its exact
+        remainder; otherwise the estimate (after :meth:`_refresh_uncached_estimate`)
+        decides. A request the aging bound let through has no estimate and is
+        marked probed, so it is never long.
+        """
         if req.state_value == self._encoder_init_state_value:
             return False
+        threshold = self._ctx_demote_uncached_tokens
         estimate = req.py_uncached_prefill_tokens
-        if estimate is None or estimate <= self._ctx_demote_uncached_tokens:
+        if estimate is None and req.py_uncached_prefill_probed:
             return False
-        return not (
-            req.context_current_position > 0
-            and req.context_remaining_length <= self._ctx_demote_uncached_tokens
-        )
+        if req.context_current_position > 0 or self._holds_context_cache(req):
+            return req.context_remaining_length > threshold
+        return estimate is not None and estimate > threshold
 
     def _defer_long_context(self, pending_ctx: RequestList) -> tuple[RequestList, set[int]]:
         """Move long requests to the tail of this iteration's context order.
 
-        Returns the new order and the ids demoted.
+        Returns the new order and the ids demoted. Also records the requests
+        kept on the estimate alone, which their first prepare checks again.
         """
         keep: RequestList = []
         deferred: RequestList = []
+        self._ctx_unverified_short = set()
         for req in pending_ctx:
+            self._refresh_uncached_estimate(req)
             if self._is_long_context(req):
                 aged_out = (
                     self._ctx_demote_max_iters > 0
@@ -992,6 +1041,13 @@ class KVCacheV2Scheduler(RequestScheduler):
                 # skipped, not suspended, so enough of them fill the pool and
                 # no context request can allocate.
                 req.py_uncached_prefill_tokens = None
+                req.py_uncached_prefill_probed = True
+            elif (
+                req.py_uncached_prefill_tokens is not None
+                and req.context_current_position == 0
+                and not self._holds_context_cache(req)
+            ):
+                self._ctx_unverified_short.add(req.py_request_id)
             keep.append(req)
         return keep + deferred, {req.py_request_id for req in deferred}
 
@@ -1458,7 +1514,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         remaining_budget = budget.remaining_tokens
         pre_prepare_context_remaining = req.context_remaining_length
         force_chunk = self.chunking_policy == ContextChunkingPolicy.FORCE_CHUNK
-        inforward_point = None
+        inforward_point = inforward_end = None
         if self._inforward_snapshot_rows:
             # A mark from an earlier pass whose batch did not run this request
             # must not outlive that pass.
@@ -1473,6 +1529,17 @@ class KVCacheV2Scheduler(RequestScheduler):
             if self._preempt_for_resume(req, preempt_for_pages):
                 return ScheduleAction.STOP, 0, False
             return ScheduleAction.SKIP, 0, False
+
+        if req.py_request_id in self._ctx_unverified_short:
+            # Ordered as short on the router's estimate alone; the reuse claimed
+            # just now makes the remainder exact. Once per request per iteration.
+            self._ctx_unverified_short.discard(req.py_request_id)
+            if req.context_remaining_length > self._ctx_demote_uncached_tokens:
+                # The failed admission releases the claim; keep the exact
+                # remainder as the estimate for later iterations.
+                req.py_uncached_prefill_tokens = req.context_remaining_length
+                req.py_uncached_prefill_probed = True
+                return ScheduleAction.DEFER, 0, False
 
         # Calculate chunk size from remaining budget
         #    (context_remaining_length is now correct after block reuse)
@@ -1509,9 +1576,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             chunk_size = _get_forced_context_chunk_size(req)
             budget_context_remaining = context_remaining
             if self._inforward_snapshot_rows_left > 0 and not has_recovery:
-                inforward_point = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
-                if inforward_point is not None:
-                    chunk_size = context_remaining
+                inforward = self._inforward_snapshot_point(req, chunk_size, remaining_budget)
+                if inforward is not None:
+                    inforward_point, inforward_end = inforward
+                    chunk_size = inforward_end - req.context_current_position
         else:
             budget_context_remaining = (
                 context_remaining
@@ -1593,7 +1661,10 @@ class KVCacheV2Scheduler(RequestScheduler):
 
         chunking_flag = req.context_chunk_size < req.context_remaining_length
 
-        if inforward_point is not None and req.context_chunk_size == context_remaining:
+        if (
+            inforward_point is not None
+            and req.context_current_position + req.context_chunk_size == inforward_end
+        ):
             req.py_mamba_inforward_snapshot_point = inforward_point
             self._inforward_snapshot_rows_left -= 1
 
@@ -1601,26 +1672,21 @@ class KVCacheV2Scheduler(RequestScheduler):
 
     def _inforward_snapshot_point(
         self, req: LlmRequest, chunk_size: int, remaining_budget: Optional[int]
-    ) -> Optional[int]:
-        """The snapshot point P a forced chunk ends at, if the chunk can run through the prompt end instead.
+    ) -> Optional[tuple[int, int]]:
+        """``(P, end)``: the snapshot point P a forced chunk ends at, and the end
+        the chunk can run to instead (``inforward_snapshot_end``: the prompt end,
+        or the following snapshot point).
 
-        The GDN layers then record the state at P inside the forward
+        The recurrent layers then record the state at P inside the forward
         (MambaHybridCacheManagerV2 in-forward snapshots), which saves the extra
-        context iteration of the short tail [P, prompt end).
+        context iteration of the stretch [P, end).
         """
-        manager = self.kv_cache_manager
         pos = req.context_current_position
         point = pos + chunk_size
-        end = req.prompt_len
-        points = req.expect_snapshot_points
-        if not points or point != points[-1] or not point < end:
+        if pos + req.context_remaining_length != req.prompt_len:
             return None
-        if pos + req.context_remaining_length != end:
-            return None
-        if (
-            end - point > manager.inforward_snapshot_max_tail
-            or point - pos < manager.inforward_snapshot_min_main
-        ):
+        end = self.kv_cache_manager.inforward_snapshot_end(req, pos, point)
+        if end is None:
             return None
         if remaining_budget is not None and end - pos > remaining_budget:
             return None
@@ -1629,7 +1695,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         mm_data = getattr(req, "py_multimodal_data", None)
         if isinstance(mm_data, dict) and mm_data.get("mm_bidirectional_blocks", False):
             return None
-        return point
+        return point, end
 
     def _reuse_claim_limit(self, req: LlmRequest) -> int | None:
         """Pair the two pools on one depth before either claims.

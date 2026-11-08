@@ -52,6 +52,9 @@ def _draft_manager(*, layer_groups, layer_scales):
 
 def _worker(*, unified):
     worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
     worker._ctx_layer_ids = (0, 1)
     worker._ctx_unified_cache = unified
     worker._ctx_kv_factor = 2
@@ -149,13 +152,15 @@ def test_refresh_ctx_block_tables_preserves_layer_offsets_and_source(
 
 
 @pytest.mark.parametrize("unified", [False, True])
-def test_unified_cache_keeps_strict_allocation_check_in_generation_prepare(unified: bool) -> None:
+def test_fused_generation_prepare_covers_the_unified_cache(unified: bool) -> None:
     worker = _worker(unified=unified)
     worker._paged_latent_prepare = True
     worker.spec_config = SimpleNamespace(max_draft_len=7)
     metadata = SimpleNamespace(runtime_draft_len=7, captured_hidden_states=object())
 
-    assert worker._fused_gen_prepare_applies(metadata) is not unified
+    assert worker._fused_gen_prepare_applies(metadata)
+    metadata.runtime_draft_len = 3
+    assert not worker._fused_gen_prepare_applies(metadata)
 
 
 def test_drafter_block_inside_the_allocation_is_accepted():
@@ -191,17 +196,19 @@ def test_dspark_block_width_tracks_checkpoint_slot_convention(
     shift_label: bool, expected: int
 ) -> None:
     worker = _dspark_worker()
-    draft_model = SimpleNamespace(_dspark_shift_label=shift_label)
+    draft_model = SimpleNamespace(shift_label=shift_label)
 
     assert worker._draft_block_width(draft_model) == expected
     assert DSparkWorker.block_width_for(worker.spec_config, shift_label=shift_label) == expected
     assert get_draft_block_width(worker.spec_config, shift_label=shift_label) == expected
 
 
-def test_dspark_missing_shift_label_preserves_unshifted_runtime_width() -> None:
+def test_dspark_unshifted_drafter_preserves_unshifted_runtime_width() -> None:
+    """A drafter declaring shift_label False (DFlashForCausalLM's default) keeps K + 1 slots; the
+    config-only width without a drafter assumes the shifted DSpark heads."""
     worker = _dspark_worker()
 
-    assert worker._draft_block_width(SimpleNamespace()) == 8
+    assert worker._draft_block_width(SimpleNamespace(shift_label=False)) == 8
     assert DSparkWorker.block_width_for(worker.spec_config) == 7
     assert get_draft_block_width(worker.spec_config) == 7
 
@@ -221,9 +228,10 @@ def _init_dspark_ctx_buffers(
 ) -> None:
     manager = SimpleNamespace(max_seq_len=64, _shared_draft_block_width=reserved_width)
     draft_model = SimpleNamespace(
-        _dspark_shift_label=shift_label,
+        shift_label=shift_label,
         block_size=block_size,
         dflash_attention_backend="TRTLLM",
+        context_kv_fp8=False,
     )
     worker._lazy_init_ctx_buffers(
         draft_model,

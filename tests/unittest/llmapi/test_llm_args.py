@@ -1686,6 +1686,25 @@ def test_BlockReuseConfig_swa_endpoint_rewind_rejects_negative() -> None:
 
 
 @pytest.mark.cpu_only
+def test_MambaStateConfig_low_priority_snapshot_prompt_len() -> None:
+    assert MambaStateConfig().low_priority_snapshot_prompt_len == 0
+    config = KvCacheConfig(
+        mamba_state_config={"low_priority_snapshot_prompt_len": 16384})
+    restored = KvCacheConfig.model_validate_json(config.model_dump_json())
+    assert restored.mamba_state_config.low_priority_snapshot_prompt_len == 16384
+    with pytest.raises(ValidationError,
+                       match="low_priority_snapshot_prompt_len"):
+        MambaStateConfig(low_priority_snapshot_prompt_len=-1)
+    with pytest.raises(ValidationError,
+                       match="low_priority_snapshot_prompt_len"):
+        KvCacheConfig(
+            enable_block_reuse=True,
+            block_reuse_config={"swa_endpoint_rewind_tokens": 32},
+            mamba_state_config={"low_priority_snapshot_prompt_len": 16384},
+        )
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("disabled",
                          ["enable_block_reuse", "use_kv_cache_manager_v2"])
 def test_KvCacheConfig_swa_endpoint_rewind_requires_reuse_and_v2(

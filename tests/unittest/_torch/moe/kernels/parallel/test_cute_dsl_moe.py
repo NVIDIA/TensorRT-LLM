@@ -2989,6 +2989,7 @@ def test_fc12_warmup_preparation_does_not_call_the_fused_impl(monkeypatch):
         activation_type=ActivationType.SiTu,
         act_alpha=4.0,
         act_beta=25.0,
+        small_batch_max_tokens=0,
     )
     for name in ("_situ_betas", "_epilogue_identity"):
         setattr(backend, name, getattr(fc12.TrtllmCutedslFusedFc12Nvfp4Impl, name).__get__(backend))
@@ -4329,6 +4330,118 @@ def test_nvfp4_fc12_fused_rubin_matches_two_op_path(mma_n: int):
     assert out_two_op.abs().mean() > 0
     match = torch.isclose(out_fused, out_two_op, rtol=1.6e-2, atol=1e-5).float().mean()
     assert match > 0.999, f"fused vs two-op match ratio {match:.5f}"
+
+
+@pytest.mark.skipif(
+    get_sm_version() != 107,
+    reason="This test is only supported on Rubin (SM 107) GPUs",
+)
+@pytest.mark.parametrize("num_tokens", [8, 512])
+@pytest.mark.parametrize("tile_size,mma_n", [(128, 128), (128, 256), (256, 256)])
+def test_nvfp4_fc12_fused_rubin_die_major_matches_default(
+    tile_size: int, mma_n: int, num_tokens: int
+):
+    """Die-major expert weights (``die_major_layout``, default memory) give the default
+    placement's result: the B / SFB coordinates of both phases are remapped, and 1-CTA calls of
+    at least FC12_DIE_CLAIM_MIN_TOKENS tokens on a two-domain device also claim their tiles per
+    domain. Only the finalize's scatter-add order may differ."""
+    from tensorrt_llm._torch.moe.custom_ops.cute_dsl_small_batch_moe_custom_op import (
+        die_major_layout,
+    )
+
+    sf_vec_size = 16
+    num_experts, top_k = 8, 2
+    hidden_size, interm_size = 1024, 512
+    fc1_n = 2 * interm_size
+
+    torch.manual_seed(7)
+    token_final_scales, token_selected_experts = torch.randn(
+        num_tokens, num_experts, device="cuda"
+    ).topk(top_k, dim=-1)
+    token_selected_experts = token_selected_experts.to(torch.int32)
+    token_final_scales = token_final_scales.softmax(dim=-1).to(torch.float32)
+    sort_outputs = torch.ops.trtllm.moe_sort(
+        token_selected_experts=token_selected_experts,
+        token_final_scales=token_final_scales,
+        num_experts=num_experts,
+        top_k=top_k,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        tile_tokens_dim=tile_size,
+    )
+    a = torch.randint(-5, 5, (num_tokens, hidden_size), device="cuda").to(torch.bfloat16)
+    b1 = torch.randint(-5, 5, (num_experts, fc1_n, hidden_size), device="cuda").to(torch.bfloat16)
+    b2 = torch.randint(-5, 5, (num_experts, hidden_size, interm_size), device="cuda").to(
+        torch.bfloat16
+    )
+    a_global_sf = a.abs().max().float() / (448 * 6)
+    b1_global_sf = b1.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    b2_global_sf = b2.abs().amax(dim=(1, 2)).float() / (448 * 6)
+    global_sf = 1.0 / 64.0
+    a, a_sf = torch.ops.trtllm.fp4_quantize(a, 1 / a_global_sf, sf_vec_size, False)
+    a_sf = unswizzle_sf(a_sf, (num_tokens + 127) // 128 * 128, hidden_size)[:num_tokens]
+    b1, b1_sf = torch.ops.trtllm.fp4_quantize(b1, 1 / b1_global_sf, sf_vec_size, False)
+    b1 = interleave_gate_and_linear(b1, group_size=16, dim=1)
+    b1_sf = swizzle_sf(
+        interleave_gate_and_linear(
+            unswizzle_sf(b1_sf, fc1_n, hidden_size).view(
+                num_experts, fc1_n, hidden_size // sf_vec_size
+            ),
+            group_size=16,
+            dim=1,
+        ),
+        fc1_n,
+        hidden_size,
+    ).view(num_experts, fc1_n, hidden_size // sf_vec_size)
+    b2, b2_sf = torch.ops.trtllm.fp4_quantize(b2, 1 / b2_global_sf, sf_vec_size, False)
+    b2_sf = b2_sf.view(num_experts, hidden_size, interm_size // sf_vec_size)
+    weights = {"fc1": (b1, b1_sf), "fc2": (b2, b2_sf)}
+
+    def run(die_major: bool) -> torch.Tensor:
+        (w1, w1_sf), (w2, w2_sf) = (
+            tuple(
+                die_major_layout(t.view(torch.uint8)).view(t.shape) if die_major else t
+                for t in pair
+            )
+            for pair in weights.values()
+        )
+        out = torch.zeros(num_tokens, hidden_size, dtype=torch.bfloat16, device="cuda")
+        torch.ops.trtllm.cute_dsl_nvfp4_fc12_fused_rubin(
+            input=a.view(torch.float4_e2m1fn_x2),
+            fc1_weight=w1.view(torch.float4_e2m1fn_x2),
+            input_scale=a_sf.view(torch.uint8),
+            fc1_weight_scale=w1_sf.view(torch.uint8),
+            fc1_alpha=a_global_sf * b1_global_sf,
+            tile_idx_to_group_idx=sort_outputs[0],
+            tile_idx_to_mn_limit=sort_outputs[1],
+            permuted_idx_to_expanded_idx=sort_outputs[3],
+            num_non_exiting_tiles=sort_outputs[5],
+            global_sf=torch.tensor([1 / global_sf], dtype=torch.float32, device="cuda"),
+            fc2_weight=w2.view(torch.float4_e2m1fn_x2),
+            fc2_weight_scale=w2_sf.view(torch.uint8),
+            fc2_alpha=global_sf * b2_global_sf,
+            output=out,
+            token_final_scales=token_final_scales,
+            expanded_idx_to_permuted_idx=sort_outputs[2],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            local_expert_offset=0,
+            tile_size=tile_size,
+            swiglu_limit=float("inf"),
+            ep_size=1,
+            enable_alltoall=False,
+            scaling_vector_size=sf_vec_size,
+            precomputed_tactic=_fc12_fused_rubin_tactic(tile_size, mma_n),
+            die_major=die_major,
+        )
+        return out
+
+    default = run(False)
+    die_major = run(True)
+    assert torch.isfinite(die_major).all() and default.abs().mean() > 0
+    match = torch.isclose(die_major, default, rtol=1.6e-2, atol=1e-5).float().mean()
+    assert match > 0.999, f"die-major vs default match ratio {match:.5f}"
 
 
 @pytest.mark.parametrize("locality_domain", [False, True], ids=["leaf", "locality_domain"])

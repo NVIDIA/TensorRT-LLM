@@ -276,7 +276,11 @@ and before the final 32 prompt tokens. Positions outside a particular prompt
 are ignored. Set `avg_seq_len` to the workload's average total sequence length
 so V2 can size the attention KV and Mamba state pools in the right proportion.
 `pool_ratio` contains one positive, normalized cache-tier quota weight per
-layer group in layer-group ID order.
+layer group in layer-group ID order, which is layer registration order (not
+hot pool-group order). `MambaHybridCacheManagerV2` logs the resolved share of
+each named layer group at startup, warns when a share leaves an attention
+group at or below its allocator floor, and rejects a list that pins one
+full-history group there while another gets several times more blocks.
 If neither `avg_seq_len` nor an explicit `pool_ratio` is configured, hybrid
 Mamba models warn and fall back to half of `max_seq_len`, which can produce a
 suboptimal pool split. Exact explicit boundaries currently require

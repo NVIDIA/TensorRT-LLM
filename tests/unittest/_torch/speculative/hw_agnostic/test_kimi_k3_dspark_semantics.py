@@ -60,6 +60,13 @@ needs_absorbed_mla = pytest.mark.skipif(
     reason="paged absorbed-MLA decode needs an SM100-family GPU",
 )
 
+# The TRTLLM-Gen paged attention the DFlash drafter uses ships for the same
+# SM100 family.
+needs_trtllm_gen = pytest.mark.skipif(
+    not _has_absorbed_mla_kernel(),
+    reason="TRTLLM-Gen paged block decode needs an SM100-family GPU",
+)
+
 # ---------------------------------------------------------------------------
 # Reference: line-for-line port of DeepSpec VanillaMarkov
 # (deepspec/modeling/dspark/markov_head.py) at temperature 0.
@@ -476,7 +483,7 @@ needs_gpu = pytest.mark.skipif(
 def test_dspark_drafter_loads_head_weights_and_parses_config():
     weights = _tiny_weights()
     drafter = _build_drafter(True, weights)
-    assert drafter._dspark_shift_label and drafter._use_swa
+    assert drafter.shift_label and drafter._use_swa
     assert drafter._swa_window == SWA_WINDOW
     assert drafter._layer_windows == [(SWA_WINDOW - 1, SWA_WINDOW - 1)] * 2
     assert drafter.has_markov_head
@@ -615,7 +622,11 @@ def test_gqa_dspark_keeps_the_trained_row_of_the_speculative_configs_mask_id():
     pretrained = _tiny_config(True, mask_token_id=None)
     pretrained.dspark_noise_token_id = mask_id
     spec = SimpleNamespace(
-        mask_token_id=mask_id, attention_backend="VANILLA", draft_is_embedded_in_target=False
+        mask_token_id=mask_id,
+        attention_backend="VANILLA",
+        draft_is_embedded_in_target=False,
+        context_kv_only=False,
+        context_kv_dtype="auto",
     )
     drafter = _build_dspark_draft(
         SimpleNamespace(spec_config=spec),
@@ -651,7 +662,7 @@ def test_published_drafter_spelling_activates_the_heads():
     # Declared nowhere in the published config, so it rides on the DSpark
     # default. False would run slots 1..K on a block_size-K drafter and read
     # the next request's anchor slot.
-    assert drafter._dspark_shift_label
+    assert drafter.shift_label
     torch.testing.assert_close(drafter.markov_w1.cpu(), weights["markov_head.markov_w1.weight"])
     assert drafter.confidence_proj_bias is not None
 
@@ -736,8 +747,8 @@ def test_plain_dflash_drafter_keeps_old_gates():
     drafter = _build_drafter(False, _tiny_weights())
     assert not drafter._use_swa
     assert drafter._layer_windows == [(-1, -1)] * 2
+    assert drafter.shift_label is False
     for absent in (
-        "_dspark_shift_label",
         "has_markov_head",
         "markov_w1",
         "confidence_proj_weight",
@@ -856,6 +867,95 @@ def test_plain_dflash_block_decode_matches_full_attention_reference():
     assert diff < 0.02, f"plain DFlash parity failed: max abs diff {diff}"
 
 
+def _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype, page_size=32):
+    """Block decode through the TRTLLM paged cache, one request per history.
+
+    Pages are shuffled across requests, so only the block tables decide which
+    history each request reads.
+    """
+    dev = "cuda"
+    blk = TINY["block_size"]
+    lengths = [ctx.shape[0] for ctx in captured]
+    history = []
+    for ctx in captured:
+        proj = drafter.project_target_hidden(ctx.to(dev, torch.bfloat16))
+        history.append(drafter.precompute_context_kv(proj, torch.arange(ctx.shape[0], device=dev)))
+    # [N, layers, kv heads, head dim]; the drafter sizes its fused K/V lazily.
+    num_layers, nkv, hd = history[0][0].shape[1:]
+    pages_per_req = max((n + blk + page_size - 1) // page_size for n in lengths)
+    num_pages = len(lengths) * pages_per_req
+    order = torch.randperm(num_pages, generator=torch.Generator().manual_seed(3))
+    page_table = order.view(len(lengths), pages_per_req).to(dev, torch.int32)
+    caches = [
+        torch.zeros(num_pages, 2, nkv, page_size, hd, dtype=torch.bfloat16, device=dev)
+        for _ in range(num_layers)
+    ]
+    for row, (k, v) in enumerate(history):
+        positions = torch.arange(lengths[row], device=dev)
+        pages = page_table[row, positions // page_size].long()
+        offsets = positions % page_size
+        for layer, cache in enumerate(caches):
+            cache[pages, 0, :, offsets] = k[:, layer]
+            cache[pages, 1, :, offsets] = v[:, layer]
+    caches = [cache.to(cache_dtype) for cache in caches]
+    out = drafter.dflash_forward(
+        noise_embedding=torch.stack(noise_embed).to(dev, torch.bfloat16),
+        query_positions=torch.stack([torch.arange(n, n + blk) for n in lengths]).to(dev),
+        num_ctx_per_req=torch.tensor(lengths, device=dev),
+        ctx_k_cache=None,
+        ctx_v_cache=None,
+        ctx_cache_batch_idx=torch.arange(len(lengths), device=dev),
+        ctx_kv_cache=caches,
+        ctx_page_table=page_table,
+    )
+    return out.float().cpu().view(len(lengths), blk, -1)
+
+
+@needs_trtllm_gen
+@pytest.mark.parametrize("cache_dtype,tolerance", [(torch.bfloat16, 0.02)], ids=["bf16"])
+def test_trtllm_paged_block_decode_matches_full_attention_reference(cache_dtype, tolerance):
+    """The TRTLLM non-causal block attention over a paged BF16 cache matches the
+    eager reference for requests with different history lengths.
+
+    Each block query runs as its own one-token decode request over its
+    parent's pages, so a wrong table, length or block write shows up here.
+    """
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    g = torch.Generator().manual_seed(44)
+    lengths = (CTX_LEN, 70)
+    captured = [
+        torch.randn(n, TINY["hidden_size"] * NUM_CAPTURE, generator=g) * 0.5 for n in lengths
+    ]
+    noise_embed = [
+        torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5 for _ in lengths
+    ]
+
+    out = _run_paged_block_decode(drafter, captured, noise_embed, cache_dtype)
+
+    for row in range(len(lengths)):
+        expected = _reference_block_decode(
+            weights, captured[row].to(torch.bfloat16), noise_embed[row].to(torch.bfloat16), False
+        )
+        expected = expected.float()
+        rel_err = ((out[row] - expected).norm() / expected.norm()).item()
+        assert rel_err < tolerance, f"request {row}: relative error {rel_err}"
+
+
+@needs_trtllm_gen
+def test_trtllm_paged_block_decode_rejects_a_quantized_cache():
+    """The plain DFlash paged block decode writes the block's K/V in the draft
+    activation dtype; an FP8 cache is rejected, not written lossily."""
+    weights = _tiny_weights()
+    drafter = _build_drafter(False, weights, dflash_attention_backend="TRTLLM")
+    g = torch.Generator().manual_seed(44)
+    captured = [torch.randn(CTX_LEN, TINY["hidden_size"] * NUM_CAPTURE, generator=g) * 0.5]
+    noise_embed = [torch.randn(TINY["block_size"], TINY["hidden_size"], generator=g) * 0.5]
+
+    with pytest.raises(ValueError, match="quantized context-cache writes are not supported"):
+        _run_paged_block_decode(drafter, captured, noise_embed, torch.float8_e4m3fn)
+
+
 # ---------------------------------------------------------------------------
 # MLA-backboned DSpark drafter (Inferact/Kimi-K3-DSpark shape).
 #
@@ -972,13 +1072,18 @@ def _tiny_mla_weights(seed=11):
     return w
 
 
-def _build_mla_drafter(weights, *, dflash_attention_backend="TRTLLM"):
+def _build_mla_drafter(
+    weights, *, dflash_attention_backend="TRTLLM", context_kv_only=False, context_kv_dtype="auto"
+):
     from tensorrt_llm._torch.model_config import ModelConfig
     from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
 
     model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="TRTLLM")
     drafter = MLADSparkForCausalLM(
-        model_config, dflash_attention_backend=dflash_attention_backend
+        model_config,
+        dflash_attention_backend=dflash_attention_backend,
+        context_kv_only=context_kv_only,
+        context_kv_dtype=context_kv_dtype,
     ).to("cuda")
     drafter.load_weights(dict(weights))
     return drafter
@@ -1145,7 +1250,7 @@ MLA_CTX_LEN = 40  # ceil((40 + MLA_BLOCK) / MLA_PAGE) = 2 pages
 MLA_SHORT_CTX_LEN = 20  # one page, and the block stays inside it
 
 
-def _run_mla_block_decode(drafter, requests, paged=False):
+def _run_mla_block_decode(drafter, requests, paged=False, fp8=False):
     """Drive one block decode over a BATCH, optionally through the paged cache.
 
     ``requests`` is a list of ``(captured, noise_embed)`` pairs with deliberately
@@ -1157,7 +1262,8 @@ def _run_mla_block_decode(drafter, requests, paged=False):
     ``paged=False`` keeps the dense arena the eager reference path uses.
     ``paged=True`` hands ``dflash_forward`` a page table, which is what selects
     the kernel paths -- without it ``use_kernel`` is False and every kernel
-    variant silently falls back to the same eager branch.
+    variant silently falls back to the same eager branch. ``fp8`` stores the
+    paged context as ``to_draft_fp8`` (the CuTe DSL decode then reads FP8).
     """
     dev = "cuda"
     batch = len(requests)
@@ -1213,6 +1319,10 @@ def _run_mla_block_decode(drafter, requests, paged=False):
         cols = pos % MLA_PAGE
         for layer_idx in range(MLA_LAYERS):
             pool[layer_idx][rows, 0, 0, cols] = latent[:, layer_idx, 0]
+    if fp8:
+        from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+
+        pool = [to_draft_fp8(p) for p in pool]
     page_table = torch.arange(batch * per_req, device=dev, dtype=torch.int32).view(batch, per_req)
     out = drafter.dflash_forward(
         ctx_k_cache=pool[0], ctx_kv_cache=pool, ctx_page_table=page_table, **kwargs
@@ -1325,7 +1435,7 @@ def test_mla_dspark_loads_the_torchspec_spelling_and_keeps_its_embedding():
     weights = _tiny_mla_weights()
     drafter = _build_mla_drafter(weights)
 
-    assert drafter._dspark_shift_label
+    assert drafter.shift_label
     assert drafter.has_markov_head
     assert drafter._kv_factor == 1, "the MLA cache stores one latent, not K and V"
     assert (drafter._num_kv_heads, drafter._head_dim) == (1, MLA_LATENT)
@@ -1414,6 +1524,114 @@ def test_mla_dspark_cute_dsl_takes_a_single_page_batch_one():
     )
     diff = (out[0] - expected).abs().max().item()
     assert diff < 0.03, f"single-page parity failed: max abs diff {diff}"
+
+
+@needs_cuda
+@needs_absorbed_mla
+@pytest.mark.parametrize("context_kv_fp8", [False, True])
+def test_mla_dspark_fused_rope_is_bitwise(context_kv_fp8):
+    """The fused MLA RoPE kernels change launches, not values.
+
+    The per-layer block kernel (query rope half + block latent norm/rope +
+    pool store, through scratch rows for an FP8 pool) and the one-launch
+    context latents must reproduce the separate launches bit for bit: two
+    unequal requests through the paged cute-dsl block decode, and the
+    layer-major context latents against the per-layer ones.
+    """
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    # An FP8 pool is bound only to a drafter built for it (context_kv_dtype="fp8").
+    drafter = _build_mla_drafter(
+        weights,
+        dflash_attention_backend="CUTEDSL",
+        context_kv_dtype="fp8" if context_kv_fp8 else "auto",
+    )
+    if not drafter._fused_mla_rope:
+        pytest.skip("the fused MLA RoPE kernels do not fit here")
+    g = torch.Generator().manual_seed(42)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    captured = requests[0][0].to("cuda", torch.bfloat16)
+    projected = drafter.project_target_hidden(captured)
+    positions = torch.arange(37, 37 + captured.shape[0], device="cuda")
+
+    drafter._fused_mla_rope = False
+    base = _run_mla_block_decode(drafter, requests, paged=True, fp8=context_kv_fp8)
+    ctx_base, _ = drafter.precompute_context_kv(projected, positions)
+    drafter._fused_mla_rope = True
+    # The folded query head (FP8 pool) rounds differently; it has its own test.
+    drafter._qb_folded = None
+    fused = _run_mla_block_decode(drafter, requests, paged=True, fp8=context_kv_fp8)
+    ctx_fused, _ = drafter.precompute_context_kv(projected, positions)
+
+    assert torch.equal(fused.view(torch.int32), base.view(torch.int32))
+    assert torch.equal(ctx_fused.view(torch.int16), ctx_base.view(torch.int16))
+
+
+@needs_cuda
+@needs_absorbed_mla
+def test_mla_dspark_fp8_query_head_agrees_to_drafter_rounding():
+    """Over an FP8 pool, q_a_layernorm folded into q_b plus draft_qhead (query
+    RoPE, absorption, block latent store, FP8 query in one launch) gives the
+    block decode of the separate launches up to drafter rounding."""
+    import tensorrt_llm._torch.models.modeling_dspark as md
+
+    reason = md.cute_dsl_mla_decode_unavailability_reason()
+    if reason is not None:
+        pytest.skip(f"cute-dsl MLA decode unavailable: {reason}")
+
+    torch.manual_seed(0)
+    weights = _tiny_mla_weights()
+    drafter = _build_mla_drafter(
+        weights, dflash_attention_backend="CUTEDSL", context_kv_dtype="fp8"
+    )
+    if not drafter._fused_mla_qhead:
+        pytest.skip("the folded MLA query head does not fit here")
+    g = torch.Generator().manual_seed(7)
+    requests = [
+        (
+            torch.randn(L, MLA_HIDDEN * NUM_CAPTURE, generator=g) * 0.5,
+            torch.randn(MLA_BLOCK, MLA_HIDDEN, generator=g) * 0.5,
+        )
+        for L in (MLA_CTX_LEN, MLA_SHORT_CTX_LEN)
+    ]
+    qhead = _run_mla_block_decode(drafter, requests, paged=True, fp8=True)
+    assert drafter._qb_folded is not None
+    folded, drafter._qb_folded = drafter._qb_folded, None
+    separate = _run_mla_block_decode(drafter, requests, paged=True, fp8=True)
+    drafter._qb_folded = folded
+
+    rel_l2 = ((qhead - separate).norm() / separate.norm()).item()
+    assert rel_l2 < 2e-2, rel_l2
+
+
+@needs_cuda
+def test_mla_dspark_mlp_split_at_the_down_projection_is_exact():
+    """The pushed down_proj site runs the MLP up to its down projection
+    (GatedMLP.forward_activation) and the projection itself at the all-reduce:
+    together bitwise the module's forward. Without the TP fusions the sites are off."""
+    torch.manual_seed(3)
+    drafter = _build_mla_drafter(_tiny_mla_weights())
+    assert not drafter._ar_push
+    mlp = drafter.model.layers[0].mlp
+    x = torch.randn(7, MLA_HIDDEN, device="cuda").bfloat16()
+    with torch.inference_mode():
+        h2 = mlp.forward_activation(x)
+        assert h2 is not None
+        split = mlp.down_proj(h2)
+        whole = mlp(x)
+    assert torch.equal(split.view(torch.int16), whole.view(torch.int16))
 
 
 @needs_cuda
@@ -1780,3 +1998,460 @@ def test_gqa_dspark_auto_still_degrades(monkeypatch):
     model_config = ModelConfig(pretrained_config=_tiny_config(True), attn_backend="VANILLA")
     drafter = GQADSparkForCausalLM(model_config, dflash_attention_backend="AUTO")
     assert drafter.dflash_attention_backend == "VANILLA"
+
+
+# ---------------------------------------------------------------------------
+# Context-KV-only drafter (disaggregated context server).
+# ---------------------------------------------------------------------------
+
+
+@needs_cuda
+def test_context_kv_only_drafter_keeps_only_the_context_kv_path():
+    weights = _tiny_mla_weights()
+    full = _build_mla_drafter(weights)
+    ctx = _build_mla_drafter(weights, context_kv_only=True)
+
+    backbone = ctx.draft_model_full.model
+    assert backbone.embed_tokens is None and backbone.norm is None
+    assert ctx.lm_head is None and ctx.markov_w1 is None
+    for layer in backbone.layers:
+        attn = layer.self_attn
+        assert layer.mlp is None
+        assert attn.q_b_proj is None and attn.kv_b_proj is None and attn.o_proj is None
+        assert attn.kv_a_proj_with_mqa is not None and attn.kv_a_layernorm is not None
+
+    def param_bytes(module):
+        return sum(p.numel() * p.element_size() for p in module.parameters())
+
+    kept = (MLA_HIDDEN * MLA_HIDDEN * NUM_CAPTURE + MLA_HIDDEN) * 2 + MLA_LAYERS * (
+        MLA_LATENT * MLA_HIDDEN + MLA_KV_LORA
+    ) * 2
+    assert param_bytes(ctx) == kept
+    assert param_bytes(ctx) < param_bytes(full) / 4
+
+    torch.manual_seed(0)
+    captured = torch.randn(37, MLA_HIDDEN * NUM_CAPTURE, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(5, 42, device="cuda")
+
+    def latents(drafter):
+        latent, v = drafter.precompute_context_kv(
+            drafter.project_target_hidden(captured), positions
+        )
+        assert v is None
+        return latent
+
+    assert torch.equal(latents(ctx), latents(full))
+
+
+def test_context_kv_only_is_rejected_for_a_drafter_that_drafts_elsewhere():
+    from tensorrt_llm._torch.models.modeling_dspark import _build_dspark_draft
+
+    for embedded, kv_lora_rank in ((False, None), (True, MLA_KV_LORA)):
+        spec = SimpleNamespace(
+            context_kv_only=True,
+            context_kv_dtype="auto",
+            attention_backend="AUTO",
+            draft_is_embedded_in_target=embedded,
+        )
+        model_config = SimpleNamespace(spec_config=spec)
+        pretrained = SimpleNamespace(kv_lora_rank=kv_lora_rank, qk_rope_head_dim=MLA_ROPE)
+        draft_config = SimpleNamespace(pretrained_config=pretrained)
+        with pytest.raises(ValueError, match="standalone MLA DSpark"):
+            _build_dspark_draft(model_config, draft_config, None, None)
+
+
+def test_context_kv_only_requires_disaggregated_serving():
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    creator = object.__new__(KvCacheCreator)
+    creator._speculative_config = DSparkDecodingConfig(max_draft_len=4, context_kv_only=True)
+    creator._is_disagg = True
+    creator._validate_context_kv_only()
+    creator._is_disagg = False
+    with pytest.raises(ValueError, match="context_kv_only"):
+        creator._validate_context_kv_only()
+    creator._speculative_config = None
+    creator._validate_context_kv_only()
+
+
+@needs_cuda
+def test_context_server_takes_the_drafter_out_of_the_kv_budget_not_the_headroom():
+    """The KV budget gives back (1 - fraction) of what the drafter keeps resident,
+    so a context-KV-only drafter does not shrink PyTorch's headroom."""
+    from tensorrt_llm._torch.pyexecutor._util import KvCacheCreator
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    head = torch.nn.Linear(16, 8, bias=False, device="cuda")
+    draft = torch.nn.Module()
+    draft.fc = torch.nn.Linear(32, 16, bias=False, device="cuda")
+    draft.lm_head = head  # shared with the target: not the drafter's
+    draft.table = torch.zeros(100, device="cuda")  # derived, not registered
+    draft.blocks = draft.fc.weight[:, :16]  # a view: counted once
+    model = torch.nn.Module()
+    model.model = torch.nn.Linear(16, 16, bias=False, device="cuda")
+    model.lm_head = head
+    model.draft_model = draft
+    metadata = SimpleNamespace(captures=torch.zeros(8, 16, device="cuda"), host_rows=torch.zeros(8))
+
+    creator = object.__new__(KvCacheCreator)
+    creator._model_engine = SimpleNamespace(model=model, spec_metadata=metadata)
+    creator._speculative_config = DSparkDecodingConfig(max_draft_len=4, context_kv_only=True)
+    resident = draft.fc.weight.nbytes + draft.table.nbytes + metadata.captures.nbytes
+    assert creator._get_context_server_spec_reserve(0.7) == int((1.0 - 0.7) * resident)
+    creator._speculative_config.context_kv_only = False
+    assert creator._get_context_server_spec_reserve(0.7) == 0
+
+
+# ---------------------------------------------------------------------------
+# FP8 storage of the drafter context KV (speculative_config.context_kv_dtype).
+# ---------------------------------------------------------------------------
+
+
+def test_context_kv_dtype_defaults_to_the_drafter_dtype():
+    from tensorrt_llm.llmapi.llm_args import DSparkDecodingConfig
+
+    assert DSparkDecodingConfig(max_draft_len=2).context_kv_dtype == "auto"
+    assert DSparkDecodingConfig(max_draft_len=2, context_kv_dtype="fp8").context_kv_dtype == "fp8"
+    with pytest.raises(ValueError):
+        DSparkDecodingConfig(max_draft_len=2, context_kv_dtype="nvfp4")
+
+
+def test_fp8_context_kv_is_rejected_for_a_drafter_without_an_mla_latent_cache():
+    from tensorrt_llm._torch.models.modeling_dspark import _build_dspark_draft
+
+    for embedded, kv_lora_rank in ((False, None), (True, MLA_KV_LORA)):
+        spec = SimpleNamespace(
+            context_kv_only=False,
+            context_kv_dtype="fp8",
+            attention_backend="AUTO",
+            draft_is_embedded_in_target=embedded,
+        )
+        pretrained = SimpleNamespace(kv_lora_rank=kv_lora_rank, qk_rope_head_dim=MLA_ROPE)
+        with pytest.raises(ValueError, match="context_kv_dtype is implemented for standalone MLA"):
+            _build_dspark_draft(
+                SimpleNamespace(spec_config=spec),
+                SimpleNamespace(pretrained_config=pretrained),
+                None,
+                None,
+            )
+
+
+@needs_cuda
+def test_fp8_context_kv_needs_the_cutedsl_block_decode():
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.models.modeling_dspark import MLADSparkForCausalLM
+
+    def build(**kwargs):
+        model_config = ModelConfig(pretrained_config=_tiny_mla_config(), attn_backend="TRTLLM")
+        return MLADSparkForCausalLM(model_config, **kwargs)
+
+    with pytest.raises(ValueError, match="CUTEDSL"):
+        build(dflash_attention_backend="VANILLA", context_kv_dtype="fp8")
+    # A context server never runs the block decode, so any backend stores it.
+    ctx = build(dflash_attention_backend="VANILLA", context_kv_only=True, context_kv_dtype="fp8")
+    assert ctx.context_kv_fp8
+    assert not build(dflash_attention_backend="VANILLA").context_kv_fp8
+
+
+@needs_cuda
+def test_fp8_paged_context_store_writes_saturated_fp8():
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+
+    page, num_pages, layers, num_tokens = 32, 6, 2, 11
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
+    worker._ctx_page_size = page
+    worker._ctx_block_tables = torch.tensor([[4, 1, 5], [0, 2, 3]], device="cuda")
+    worker._ctx_kv_buf = [
+        torch.zeros(num_pages, 1, 1, page, MLA_LATENT, device="cuda").to(torch.float8_e4m3fn)
+        for _ in range(layers)
+    ]
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    k = (torch.randn(num_tokens, layers, 1, MLA_LATENT, device="cuda", generator=gen) * 200).to(
+        torch.bfloat16
+    )
+    rows = torch.tensor([0] * 6 + [1] * 5, device="cuda")
+    positions = torch.tensor([0, 1, 31, 32, 33, 70, 5, 6, 40, 64, 95], device="cuda")
+    worker._store_context_kv_paged(k, None, rows, positions)
+
+    pages = worker._ctx_block_tables[rows, positions // page].long()
+    offsets = positions % page
+    for layer in range(layers):
+        stored = worker._ctx_kv_buf[layer][pages, 0, 0, offsets]
+        assert torch.equal(stored.view(torch.uint8), to_draft_fp8(k[:, layer, 0]).view(torch.uint8))
+    assert not worker._ctx_kv_buf[0].float().isnan().any()
+
+
+def _k3_block_decoder():
+    """What ``MLADSparkForCausalLM._cute_dsl_block_decode`` reads, K3 DSpark geometry."""
+    import types
+
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        MLADSparkForCausalLM,
+        _mla_fp8_decode_scales,
+        _yarn_get_mscale,
+    )
+
+    cls = MLADSparkForCausalLM
+    stub = SimpleNamespace(
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        _num_heads=64,
+        _cute_dsl_checked_shape=None,
+        _mla_workspace=None,
+    )
+    # K3 DSpark YaRN: factor 32, mscale_all_dim 1; qk_nope 128 + rope 64.
+    mscale = _yarn_get_mscale(32.0, 1.0)
+    stub.softmax_scale = mscale * mscale / math.sqrt(128 + 64)
+    stub._mla_fp8_scales = _mla_fp8_decode_scales(stub.softmax_scale)
+    for name in (
+        "_assert_cute_dsl_can_implement",
+        "_mla_decode_workspace",
+        "_cute_dsl_block_decode",
+    ):
+        setattr(stub, name, types.MethodType(getattr(cls, name), stub))
+    return stub
+
+
+@needs_absorbed_mla
+@pytest.mark.parametrize("block_size", [5, 7])
+def test_fp8_block_decode_follows_bf16_at_k3_shapes(block_size):
+    """The FP8 decode reads to_draft_fp8 of the BF16 pool and query: against an
+    FP32 reference on its own FP8 operands it is as close as the BF16 decode is
+    to one on BF16 operands; against the BF16 decode only the E4M3 rounding of
+    q and K remains."""
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+    from tensorrt_llm._torch.speculative.dflash_attention import to_draft_fp8
+
+    heads, page, kv_lora, latent_dim = 64, 64, 512, 576
+    stub = _k3_block_decoder()
+    gen = torch.Generator(device="cuda").manual_seed(block_size)
+    ctx = torch.tensor([300, 1700, 6400, 13700], device="cuda")
+    pages_needed = (ctx + block_size - 1) // page + 1
+    total = int(pages_needed.sum())
+    perm = torch.randperm(total, device="cuda", generator=gen)
+    table = torch.zeros(len(ctx), int(pages_needed.max()), dtype=torch.long, device="cuda")
+    start = 0
+    for b, n in enumerate(pages_needed.tolist()):
+        table[b, :n] = perm[start : start + n]
+        start += n
+    values = torch.randn(total, 1, 1, page, latent_dim, device="cuda", generator=gen)
+    values[..., :kv_lora] *= 0.5 + torch.rand(kv_lora, device="cuda", generator=gen)
+    values[..., kv_lora:] *= 2.0
+    pool = values.bfloat16()
+    query = torch.randn(
+        len(ctx), block_size, heads, latent_dim, device="cuda", generator=gen
+    ).bfloat16()
+    fixup = _build_mla_block_fixup(ctx, table, block_size, page)
+
+    def reference(q, kv_pool):
+        flat = kv_pool[:, 0, 0].reshape(-1, latent_dim)
+        outs = []
+        for b in range(q.shape[0]):
+            pos = torch.arange(int(fixup.seq_lens_i32[b]), device="cuda")
+            rows = fixup.page_tables_i32[b].long()[pos // page] * page + pos % page
+            kv = flat[rows].float()
+            scores = torch.einsum("shc,tc->sht", q[b].float(), kv) * stub.softmax_scale
+            outs.append(torch.einsum("sht,tc->shc", scores.softmax(-1), kv[:, :kv_lora]))
+        return torch.stack(outs)
+
+    def rel_l2(a, e):
+        return ((a.float() - e.float()).norm() / e.float().norm()).item()
+
+    out_bf16 = stub._cute_dsl_block_decode(query, pool, fixup, block_size)
+    pool_fp8 = to_draft_fp8(pool)
+    out_fp8 = stub._cute_dsl_block_decode(query, pool_fp8, fixup, block_size)
+    assert out_fp8.dtype == torch.bfloat16
+    assert rel_l2(out_bf16, reference(query, pool)) < 0.005
+    fp8_operands = reference(to_draft_fp8(query).bfloat16(), pool_fp8.bfloat16())
+    assert rel_l2(out_fp8, fp8_operands) < 0.01
+    cosine = F.cosine_similarity(out_fp8.float().reshape(-1), out_bf16.float().reshape(-1), dim=0)
+    assert cosine.item() > 0.993 and rel_l2(out_fp8, out_bf16) < 0.12
+
+
+@needs_absorbed_mla
+@pytest.mark.parametrize("block_size", [5, 7])
+def test_block_decode_split_plan_follows_the_planner_and_the_uniform_split(block_size):
+    """The block decode plans its per-request split-KV counts with the target's
+    planner (host mirror plan_mla_split_kv) from the step's lengths; another
+    split changes only the reduction order."""
+    import types
+
+    from tensorrt_llm._torch.attention.backends.fmha.cute_dsl_mla import (
+        _SPLIT_PLAN_MAX_REQUESTS,
+        mla_split_kv_plan_geometry,
+        plan_mla_split_kv,
+    )
+    from tensorrt_llm._torch.models.modeling_dspark import (
+        MLADSparkForCausalLM,
+        _build_mla_block_fixup,
+    )
+
+    heads, page, latent_dim = 64, 64, 576
+    stub = _k3_block_decoder()
+    stub._mla_split_plan = torch.zeros(_SPLIT_PLAN_MAX_REQUESTS, dtype=torch.int32, device="cuda")
+    stub._mla_split_kv_plan = types.MethodType(MLADSparkForCausalLM._mla_split_kv_plan, stub)
+    gen = torch.Generator(device="cuda").manual_seed(block_size)
+    ctx = torch.tensor([300, 1700, 6400, 13700, 90], device="cuda")
+    pages = (ctx + block_size + page - 1) // page
+    table = torch.zeros(len(ctx), int(pages.max()), dtype=torch.long, device="cuda")
+    start = 0
+    for b, n in enumerate(pages.tolist()):
+        table[b, :n] = torch.arange(start, start + n, device="cuda")
+        start += n
+    pool = torch.randn(start, 1, 1, page, latent_dim, device="cuda", generator=gen).bfloat16()
+    query = torch.randn(
+        len(ctx), block_size, heads, latent_dim, device="cuda", generator=gen
+    ).bfloat16()
+    fixup = _build_mla_block_fixup(ctx, table, block_size, page)
+
+    plan = stub._mla_split_kv_plan(fixup.seq_lens_i32, heads, block_size)
+
+    rows, waves = mla_split_kv_plan_geometry(heads, block_size)
+    expected = plan_mla_split_kv(
+        fixup.seq_lens_i32.tolist(), rows_per_request=rows, wave_clusters=waves
+    )
+    assert plan.tolist() == expected
+    planned = stub._cute_dsl_block_decode(query, pool, fixup._replace(split_kvs=plan), block_size)
+    uniform = stub._cute_dsl_block_decode(query, pool, fixup, block_size)
+    rel_l2 = ((planned.float() - uniform.float()).norm() / uniform.float().norm()).item()
+    assert rel_l2 < 5e-3
+
+
+# ---------------------------------------------------------------------------
+# Drafter context KV sharded over helix CP.
+# ---------------------------------------------------------------------------
+
+
+def _helix_rank_pool(values, seq, shard, page):
+    """Rank ``shard.cp_rank``'s local pages of every request's global latents."""
+    latent_dim = values.shape[-1]
+    span = page * shard.cp_size
+    local_pages = [(int(n) + span - 1) // span for n in seq.tolist()]
+    table = torch.zeros(len(local_pages), max(local_pages), dtype=torch.long, device="cuda")
+    pool = torch.zeros(sum(local_pages), 1, 1, page, latent_dim, device="cuda")
+    start = 0
+    for b, n in enumerate(local_pages):
+        table[b, :n] = torch.arange(start, start + n, device="cuda")
+        for k in range(n):
+            first = (k * shard.cp_size + shard.cp_rank) * page
+            rows = values[b, first : min(first + page, int(seq[b]))]
+            pool[start + k, 0, 0, : rows.shape[0]] = rows
+        start += n
+    return pool, table
+
+
+@needs_absorbed_mla
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_helix_sharded_block_decode_matches_the_full_context(cp_size, fp8):
+    """Each helix rank attends with every head over its own pages (rank-local
+    page table, lengths and kv_bounds, softmax stats out); merging the ranks'
+    partials as _helix_post_process does equals the decode over the whole
+    context. Ranks that hold none of a short request's pages contribute nothing."""
+    from tensorrt_llm._torch.attention.attention import _helix_sanitize_empty_kv
+    from tensorrt_llm._torch.models.modeling_dspark import _build_mla_block_fixup
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard, to_draft_fp8
+
+    heads, page, kv_lora, latent_dim, block_size = 64, 64, 512, 576, 7
+    stub = _k3_block_decoder()
+    gen = torch.Generator(device="cuda").manual_seed(cp_size)
+    ctx = torch.tensor([40, 300, 1700, 6400], device="cuda")
+    seq = ctx + block_size
+    values = torch.randn(len(ctx), int(seq.max()), latent_dim, device="cuda", generator=gen)
+    values[..., :kv_lora] *= 0.5
+    query = torch.randn(
+        len(ctx), block_size, heads, latent_dim, device="cuda", generator=gen
+    ).bfloat16()
+
+    def to_pool(pool):
+        return to_draft_fp8(pool) if fp8 else pool.bfloat16()
+
+    full_pool, full_table = _helix_rank_pool(values, seq, HelixDraftShard(1, 0, page), page)
+    full_fixup = _build_mla_block_fixup(ctx, full_table, block_size, page)
+    expected = stub._cute_dsl_block_decode(query, to_pool(full_pool), full_fixup, block_size)
+
+    tokens = len(ctx) * block_size
+    partials, stats = [], []
+    for cp_rank in range(cp_size):
+        shard = HelixDraftShard(cp_size, cp_rank, page)
+        pool, table = _helix_rank_pool(values, seq, shard, page)
+        fixup = _build_mla_block_fixup(ctx, table, block_size, page, shard)
+        assert torch.equal(fixup.seq_lens_i32.long(), shard.local_lengths(seq))
+        out, stat = stub._cute_dsl_block_decode(query, to_pool(pool), fixup, block_size)
+        # [tokens, heads * kv_lora]: the layout _helix_post_process takes.
+        out, stat = _helix_sanitize_empty_kv(
+            out.view(tokens, heads * kv_lora), stat, fixup.kv_bounds_i32 == 0
+        )
+        partials.append(out)
+        stats.append(stat)
+    merged = torch.ops.trtllm.helix_post_process(
+        torch.stack(partials).contiguous(), torch.stack(stats).contiguous(), 1.0
+    ).view(tokens, heads, kv_lora)
+
+    expected = expected.view(tokens, heads, kv_lora).float()
+    rel_l2 = ((merged.float() - expected).norm() / expected.norm()).item()
+    # Another KV split changes only the reduction order and rounding.
+    assert rel_l2 < (0.02 if fp8 else 0.01)
+
+
+@needs_cuda
+def test_helix_context_store_writes_only_owned_positions():
+    """A helix rank stores the positions of its own pages at their local slots;
+    another rank's position leaves the slot it maps to unchanged."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    page, layers = 4, 2
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
+    worker._ctx_page_size = page
+    # Rank 1 of 2 owns global pages 1, 3, ... as its local pages 0, 1, ...
+    worker._ctx_helix = HelixDraftShard(2, 1, page)
+    worker._ctx_block_tables = torch.tensor([[3, 0, 2]], device="cuda")
+    sentinel = -7.0
+    worker._ctx_kv_buf = [
+        torch.full((4, 1, 1, page, MLA_LATENT), sentinel, device="cuda").bfloat16()
+        for _ in range(layers)
+    ]
+    positions = torch.tensor([6, 7, 8, 9], device="cuda")
+    k = positions.view(-1, 1, 1, 1).expand(-1, layers, 1, MLA_LATENT).bfloat16().contiguous()
+    worker._store_context_kv_paged(k, None, torch.zeros_like(positions), positions)
+
+    for layer in range(layers):
+        pool = worker._ctx_kv_buf[layer][:, 0, 0, :, 0]
+        # Positions 6, 7 (global page 1) land in local page 0 = physical page 3.
+        assert pool[3].tolist() == [sentinel, sentinel, 6.0, 7.0]
+        # Positions 8, 9 (global page 2, rank 0's) map to local page 1 =
+        # physical page 0 and leave it unchanged.
+        assert pool[0].tolist() == [sentinel] * page
+
+
+@needs_cuda
+def test_helix_context_store_owned_position_wins_a_shared_slot():
+    """A window wider than a page maps another rank's position and an owned one to
+    the same local slot; the owned value is stored, whatever the launch order."""
+    from tensorrt_llm._torch.speculative.dflash import DFlashWorker
+    from tensorrt_llm._torch.speculative.dflash_attention import HelixDraftShard
+
+    page = 4
+    worker = object.__new__(DFlashWorker)
+    worker._ctx_helix = None
+    worker._ctx_store_stream = None
+    worker._ctx_store_operands = ()
+    worker._ctx_page_size = page
+    # Rank 1 of 2: global page 0 (rank 0's) and page 1 (its own) both map to local page 0.
+    worker._ctx_helix = HelixDraftShard(2, 1, page)
+    worker._ctx_block_tables = torch.tensor([[2, 0]], device="cuda")
+    worker._ctx_kv_buf = [torch.full((3, 1, 1, page, MLA_LATENT), -7.0, device="cuda").bfloat16()]
+    positions = torch.arange(2 * page, device="cuda")
+    k = positions.view(-1, 1, 1, 1).expand(-1, 1, 1, MLA_LATENT).bfloat16().contiguous()
+    worker._store_context_kv_paged(k, None, torch.zeros_like(positions), positions)
+
+    assert worker._ctx_kv_buf[0][2, 0, 0, :, 0].tolist() == [4.0, 5.0, 6.0, 7.0]
