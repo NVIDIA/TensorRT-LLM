@@ -48,18 +48,18 @@ l0_gb300_multi_gpus:
   # sampling, the breakable prefill graph, every opt-in projection) on one context and one
   # generation GPU.
   - accuracy/modeling_v2/qwen4_exp/qwen3_8_flash_next_nvfp4__sm_103__default/test_accuracy.py::TestModelingV2Qwen38FlashNextNvfp4Sm103Default::test_tp1_disaggregated_mtp2 TIMEOUT (90)
-  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tep4 target: the GSM8K identity gate.
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k TIMEOUT (180)
-  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 dep4 target: the GSM8K identity gate.
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_gsm8k TIMEOUT (180)
-  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tp4 target: the GSM8K identity gate.
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_gsm8k TIMEOUT (180)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tep target: the GSM8K identity gate at tep4.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_gsm8k[tep4] TIMEOUT (180)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 dep target: the GSM8K identity gate at dep4.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_gsm8k[dep4] TIMEOUT (180)
+  # modeling_v2 Mistral-Large-4-1T-A52B-NVFP4 sm_103 tp target: the GSM8K identity gate at tp4.
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_gsm8k[tp4] TIMEOUT (180)
   # Native DSpark: GSM8K precision/acceptance, RULER-lite and reuse/envelope.
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tep4] TIMEOUT (180)
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-dep4] TIMEOUT (180)
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_accuracy[quick-tp4] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tep::test_accuracy[tep4-quick] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Dep::test_accuracy[dep4-quick] TIMEOUT (180)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_accuracy[tp4-quick] TIMEOUT (180)
   # llguidance guided decoding over frontend-rendered chat ids: JSON, JSON after reasoning, tool grammars.
-  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Accuracy::test_llguidance TIMEOUT (60)
+  - accuracy/modeling_v2/test_mistral_large4.py::TestModelingV2MistralLarge4Nvfp4Sm103Tp::test_llguidance TIMEOUT (60)
   # Its expert path's attention-DP round trip over four ranks with unequal token counts; the
   # single-GPU directory entry skips it.
   - unittest/_torch/modeling_v2/models/mistral_large4/mistral_large_4_nvfp4__sm_103__dep/test_modeling_v2_moe_round_trip.py

@@ -59,396 +59,49 @@ skip_not_sm103 = pytest.mark.skipif(
 )
 
 
-class _Nvfp4AccuracyDiagnostics(LlmapiAccuracyTestHarness):
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k(self):
-        """The identity accuracy gate, at the harness default protocol.
-
-        That is the protocol the registered reference was set under, so the anchor and the
-        measurement read the same metric. The engine also checks its step contract on its
-        first forward.
-        """
-        task = GSM8K(self.MODEL_NAME)
-        with (
-            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
-            LLM(
-                self.MODEL_PATH,
-                checkpoint_format="mistral_large_4",
-                kv_cache_config=self.KV,
-                modeling_v2="require",
-                env_overrides=rank_env,
-                **self.PARALLEL,
-                **self.BOUNDS,
-            ) as llm,
-        ):
-            task.evaluate(llm)
-
-    # GSM8K with 24 exemplars: every prompt is 3152-5115 tokens, past index_topk, so the
-    # indexer's selection prunes context on every sample (5-shot prompts stay under 2048,
-    # where the engine skips the indexer). A key of its own in gsm8k.yaml, scored by the
-    # reference implementation on its fp8_ds_mla cache.
-    MODEL_NAME_24SHOT = "mistralai/Mistral-Large-4-1T-A52B-gsm8k-24shot"
-
-    class GSM8K24Shot(GSM8K):
-        MAX_INPUT_LEN = 8192
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_gsm8k_24shot(self):
-        """24-shot GSM8K, where the indexer's selection prunes every prompt.
-
-        `trtllm-eval gsm8k --num_fewshot 24 --max_input_length 8192`, otherwise the harness
-        protocol of the 5-shot gate.
-        """
-        task = self.GSM8K24Shot(self.MODEL_NAME_24SHOT)
-        with (
-            scoped_env_overrides({}) as rank_env,
-            LLM(
-                self.MODEL_PATH,
-                checkpoint_format="mistral_large_4",
-                kv_cache_config=self.KV,
-                modeling_v2="require",
-                env_overrides=rank_env,
-                **self.PARALLEL,
-                **self.BOUNDS,
-            ) as llm,
-        ):
-            task.evaluate(llm, extra_evaluator_kwargs=dict(num_fewshot=24))
-
-    # A passkey hidden in filler text, asked for at the end. GSM8K's prompts stay under the
-    # indexer's index_topk (2048), where the engine skips the indexer; these prompts are about
-    # 30000 tokens -- one context step, within max_num_tokens 32768 -- so the indexer scores and
-    # selects for every query row past 2048, in the context step and in each decode step.
-    PASSKEY_TOKENS = 30000
-    PASSKEY_FILLER = (
-        "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
-    )
-
-    @skip_not_sm103
-    @pytest.mark.skip_less_device(4)
-    def test_passkey_retrieval(self):
-        """The long-context witness: a passkey recalled from a ~30000-token prompt.
-
-        At three depths of the prompt, greedy decoding must reproduce the passkey. A wrong
-        selection, rope or SSMax position past 2048 reads the wrong positions and loses it.
-        """
-        params = SamplingParams(max_tokens=12, temperature=0.0)
-        with (
-            scoped_env_overrides({}) as rank_env,
-            LLM(
-                self.MODEL_PATH,
-                checkpoint_format="mistral_large_4",
-                kv_cache_config=self.KV,
-                modeling_v2="require",
-                env_overrides=rank_env,
-                **self.PARALLEL,
-                **self.BOUNDS,
-            ) as llm,
-        ):
-            unit = len(llm.tokenizer.encode(self.PASSKEY_FILLER * 10)) / 10
-            reps = int(self.PASSKEY_TOKENS / unit)
-            for depth, key in ((0.2, 71432), (0.5, 58219), (0.8, 30476)):
-                before = int(reps * depth)
-                prompt = (
-                    "There is an important piece of information hidden inside a lot of "
-                    "irrelevant text. Find it and memorize it. I will quiz you about it.\n\n"
-                    + self.PASSKEY_FILLER * before
-                    + f"\nThe pass key is {key}. Remember it. {key} is the pass key.\n"
-                    + self.PASSKEY_FILLER * (reps - before)
-                    + "\nWhat is the pass key? The pass key is"
-                )
-                tokens = len(llm.tokenizer.encode(prompt))
-                assert 2048 < tokens <= self.BOUNDS["max_seq_len"] - params.max_tokens, tokens
-                answer = llm.generate([prompt], params)[0].outputs[0].text
-                assert str(key) in answer, (depth, tokens, answer)
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_Nvfp4AccuracyDiagnostics):
-    """mistral-large-4-nvfp4 / sm_103 / tep4, the language model."""
-
-    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
-    # The Mistral-native ModelOpt MIXED_PRECISION export as published (params.json,
-    # tekken.json, consolidated safetensors: NVFP4 routed experts, FP8 block-scale linears).
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
-
-    # The parallel topology the path's tep4 segment declares: attention heads and experts both
-    # sharded four ways, attention DP off. Routing derives the target *from* these; attention DP
-    # would be a different weight layout and so a different target.
-    TEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=False)
-
-    # The engine bounds the target serves: 16 sequences, unchunked steps of up to 32768 tokens
-    # (a whole 32K prompt in one step), CUDA graphs padded over batches 1-16.
-    BOUNDS = dict(
-        max_batch_size=16,
-        max_num_tokens=32768,
-        max_seq_len=32768,
-        enable_chunked_prefill=False,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
-    )
-
-    # The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the
-    # fp8_ds_mla cache the reference implementation serves (656 B per token and owner layer,
-    # MistralLarge4CacheManager), read as kv_cache_quant_algo FP8; the checkpoint's quant_algo
-    # is MIXED_PRECISION, so the harness reads the MIXED_PRECISION / FP8 row.
-    KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
-
-    PARALLEL = TEP4
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_Nvfp4AccuracyDiagnostics):
-    """mistral-large-4-nvfp4 / sm_103 / dep4, the language model."""
-
-    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
-    # The same ModelOpt MIXED_PRECISION export as the tep4 class.
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
-
-    # The parallel topology the path's dep4 segment declares: attention data parallel over the
-    # four ranks (each holds the whole attention and serves its own requests) and the routed
-    # experts four ways. Routing derives the target *from* these; attention DP off is the tep4
-    # target.
-    DEP4 = dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True)
-
-    # The engine bounds the target serves, per rank under attention DP: 16 sequences, unchunked
-    # steps of up to 32768 tokens (a whole 32K prompt in one step), CUDA graphs padded over
-    # batches 1-16.
-    BOUNDS = dict(
-        max_batch_size=16,
-        max_num_tokens=32768,
-        max_seq_len=32768,
-        enable_chunked_prefill=False,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
-    )
-
-    # The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the
-    # fp8_ds_mla cache (MistralLarge4CacheManager), read as kv_cache_quant_algo FP8; the
-    # checkpoint's quant_algo is MIXED_PRECISION, so the harness reads the MIXED_PRECISION / FP8
-    # row.
-    KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
-
-    PARALLEL = DEP4
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4AccuracyDiagnostics):
-    """mistral-large-4-nvfp4 / sm_103 / tp4, the language model."""
-
-    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
-    # The same ModelOpt MIXED_PRECISION export as the tep4 class.
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
-
-    # The parallel topology the path's tp4 segment declares: attention heads sharded four ways
-    # and the routed experts tensor parallel (every rank holds all 128 experts, each cut to a
-    # quarter of its width), attention DP off. Routing derives the target *from* these; expert
-    # parallelism is the tep4 target. A bare tensor_parallel_size 4 resolves to the same split.
-    TP4 = dict(
-        tensor_parallel_size=4,
-        moe_tensor_parallel_size=4,
-        moe_expert_parallel_size=1,
-        enable_attention_dp=False,
-    )
-
-    # The engine bounds the target serves: 16 sequences, unchunked steps of up to 32768 tokens
-    # (a whole 32K prompt in one step), CUDA graphs padded over batches 1-16.
-    BOUNDS = dict(
-        max_batch_size=16,
-        max_num_tokens=32768,
-        max_seq_len=32768,
-        enable_chunked_prefill=False,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
-    )
-
-    # The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the
-    # fp8_ds_mla cache (MistralLarge4CacheManager), read as kv_cache_quant_algo FP8; the
-    # checkpoint's quant_algo is MIXED_PRECISION, so the harness reads the MIXED_PRECISION / FP8
-    # row.
-    KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
-
-    PARALLEL = TP4
-
-
 # The eight-rank deployments: eight ranks over two nodes of four (one NVL72 segment). Each node
 # sees four devices, so the gate is the MPI world the launcher started (one node of eight,
-# unlaunched, counts its devices); the inherited tests' four-device gate holds on every node.
+# unlaunched, counts its devices); the tests' four-device gate holds on every node.
 _EIGHT_RANKS = pytest.mark.skip_less_mpi_world_size(8)
 
+# The engine bounds every target serves (per rank under attention DP): 16 sequences, unchunked
+# steps of up to 32768 tokens (a whole 32K prompt in one step), CUDA graphs padded over batches
+# 1-16. The certified recipe: max_seq_len = max_num_tokens = 32768, chunked prefill off.
+_BOUNDS = dict(
+    max_batch_size=16,
+    max_num_tokens=32768,
+    max_seq_len=32768,
+    enable_chunked_prefill=False,
+    cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
+)
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep8(_Nvfp4AccuracyDiagnostics):
-    """mistral-large-4-nvfp4 / sm_103 / tep8, the language model."""
+# The 1M envelope: the same target and topology at the checkpoint's own context
+# (max_position_embeddings 1048576; per rank under attention DP), prefilled in chunked steps of
+# up to max_num_tokens 32768.
+_BOUNDS_1M = dict(_BOUNDS, max_seq_len=1048576, enable_chunked_prefill=True)
 
-    pytestmark = _EIGHT_RANKS
-
-    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
-    # The same ModelOpt MIXED_PRECISION export as the tep4 class.
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
-
-    # The parallel topology the path's tep8 segment declares: eight ranks over two nodes of four,
-    # attention heads and experts both sharded eight ways, attention DP off. Routing derives the
-    # target *from* these: the tep4 target, which serves eight ranks as well as four.
-    # tensor_parallel_size 8 alone would shard every expert eight ways instead (the tp4 target),
-    # and attention DP would be a different weight layout (the dep4 target).
-    TEP8 = dict(tensor_parallel_size=8, moe_expert_parallel_size=8, enable_attention_dp=False)
-
-    # The engine bounds the target serves: 16 sequences, unchunked steps of up to 32768 tokens
-    # (a whole 32K prompt in one step), CUDA graphs padded over batches 1-16.
-    BOUNDS = dict(
-        max_batch_size=16,
-        max_num_tokens=32768,
-        max_seq_len=32768,
-        enable_chunked_prefill=False,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
-    )
-
-    # The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the
-    # fp8_ds_mla cache the reference implementation serves (656 B per token and owner layer,
-    # MistralLarge4CacheManager), read as kv_cache_quant_algo FP8; the checkpoint's quant_algo
-    # is MIXED_PRECISION, so the harness reads the MIXED_PRECISION / FP8 row.
-    KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
-
-    PARALLEL = TEP8
+# The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the fp8_ds_mla
+# cache the reference implementation serves (656 B per token and owner layer,
+# MistralLarge4CacheManager, a pool per rank under attention DP), read as kv_cache_quant_algo
+# FP8; the checkpoint's quant_algo is MIXED_PRECISION, so the harness reads the
+# MIXED_PRECISION / FP8 row.
+_KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
 
 
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp8(_Nvfp4AccuracyDiagnostics):
-    """mistral-large-4-nvfp4 / sm_103 / tp8, the language model."""
+def pytest_generate_tests(metafunc):
+    """Run each gate test at every deployment its target serves.
 
-    pytestmark = _EIGHT_RANKS
-
-    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
-    # The same ModelOpt MIXED_PRECISION export as the tep4 class.
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
-
-    # The parallel topology the path's tp8 segment declares: eight ranks over two nodes of four,
-    # attention heads sharded eight ways, every routed expert on every rank cut to an eighth of
-    # its width, attention DP off. Routing derives the target *from* these: the tp4 target, which
-    # serves eight ranks as well as four. Experts sharded by expert (moe_expert_parallel_size 8)
-    # is the tep4 target, and attention DP would be a different weight layout. A bare
-    # tensor_parallel_size 8 resolves to the same split.
-    TP8 = dict(
-        tensor_parallel_size=8,
-        moe_tensor_parallel_size=8,
-        moe_expert_parallel_size=1,
-        enable_attention_dp=False,
-    )
-
-    # The engine bounds the target serves: 16 sequences, unchunked steps of up to 32768 tokens
-    # (a whole 32K prompt in one step), CUDA graphs padded over batches 1-16.
-    BOUNDS = dict(
-        max_batch_size=16,
-        max_num_tokens=32768,
-        max_seq_len=32768,
-        enable_chunked_prefill=False,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
-    )
-
-    # The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the
-    # fp8_ds_mla cache the reference implementation serves (656 B per token and owner layer,
-    # MistralLarge4CacheManager), read as kv_cache_quant_algo FP8; the checkpoint's quant_algo
-    # is MIXED_PRECISION, so the harness reads the MIXED_PRECISION / FP8 row.
-    KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
-
-    PARALLEL = TP8
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep8(_Nvfp4AccuracyDiagnostics):
-    """mistral-large-4-nvfp4 / sm_103 / dep8, the language model."""
-
-    pytestmark = _EIGHT_RANKS
-
-    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
-    # The same ModelOpt MIXED_PRECISION export as the tep4 class.
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
-
-    # The parallel topology the path's dep8 segment declares: attention data parallel over
-    # eight ranks on two nodes of four (each holds the whole attention and serves its own
-    # requests) and the routed experts eight ways. Routing derives the target *from* these: the
-    # dep4 target, which serves eight ranks as well as four. Attention DP off, or
-    # tensor_parallel_size 8 alone, is another weight layout.
-    DEP8 = dict(tensor_parallel_size=8, moe_expert_parallel_size=8, enable_attention_dp=True)
-
-    # The engine bounds the target serves, per rank under attention DP: 16 sequences, unchunked
-    # steps of up to 32768 tokens (a whole 32K prompt in one step), CUDA graphs padded over
-    # batches 1-16.
-    BOUNDS = dict(
-        max_batch_size=16,
-        max_num_tokens=32768,
-        max_seq_len=32768,
-        enable_chunked_prefill=False,
-        cuda_graph_config=CudaGraphConfig(max_batch_size=16, enable_padding=True),
-    )
-
-    # The latent KV cache at its default: the checkpoint's fp8_kv_cache makes it the
-    # fp8_ds_mla cache (MistralLarge4CacheManager, a pool per rank under attention DP), read as
-    # kv_cache_quant_algo FP8; the checkpoint's quant_algo is MIXED_PRECISION, so the harness reads
-    # the MIXED_PRECISION / FP8 row.
-    KV = KvCacheConfig(enable_block_reuse=False, free_gpu_memory_fraction=0.85)
-
-    PARALLEL = DEP8
-
-
-# The 1M specializations of the classes above: the same target and topology at the checkpoint's
-# own context (max_position_embeddings 1048576; per rank under attention DP), prefilled in
-# chunked steps of up to max_num_tokens 32768. A specialization fixes its serving
-# configuration, so each is a class of its own: it inherits its 32K class's tests, model,
-# topology (and eight-rank gate), KV cache and the rest of its bounds, and the 32K class keeps
-# the certified recipe (max_seq_len = max_num_tokens = 32768, chunked prefill off).
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103TepCtx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tep):
-    """mistral-large-4-nvfp4 / sm_103 / tep4 at the 1M envelope, the language model."""
-
-    BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Tep.BOUNDS,
-        max_seq_len=1048576,
-        enable_chunked_prefill=True,
-    )
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103DepCtx1m(TestModelingV2MistralLarge4Nvfp4Sm103Dep):
-    """mistral-large-4-nvfp4 / sm_103 / dep4 at the 1M envelope, the language model."""
-
-    BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Dep.BOUNDS,
-        max_seq_len=1048576,
-        enable_chunked_prefill=True,
-    )
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103TpCtx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tp):
-    """mistral-large-4-nvfp4 / sm_103 / tp4 at the 1M envelope, the language model."""
-
-    BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Tp.BOUNDS,
-        max_seq_len=1048576,
-        enable_chunked_prefill=True,
-    )
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Tep8Ctx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tep8):
-    """mistral-large-4-nvfp4 / sm_103 / tep8 at the 1M envelope, the language model."""
-
-    BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Tep8.BOUNDS,
-        max_seq_len=1048576,
-        enable_chunked_prefill=True,
-    )
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Tp8Ctx1m(TestModelingV2MistralLarge4Nvfp4Sm103Tp8):
-    """mistral-large-4-nvfp4 / sm_103 / tp8 at the 1M envelope, the language model."""
-
-    BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Tp8.BOUNDS,
-        max_seq_len=1048576,
-        enable_chunked_prefill=True,
-    )
-
-
-class TestModelingV2MistralLarge4Nvfp4Sm103Dep8Ctx1m(TestModelingV2MistralLarge4Nvfp4Sm103Dep8):
-    """mistral-large-4-nvfp4 / sm_103 / dep8 at the 1M envelope, the language model."""
-
-    BOUNDS = dict(
-        TestModelingV2MistralLarge4Nvfp4Sm103Dep8.BOUNDS,
-        max_seq_len=1048576,
-        enable_chunked_prefill=True,
+    A deployment is the target's layout on four ranks of one node or on eight over two nodes of
+    four, at the 32K recipe or at the 1M envelope: ``tep4``, ``tep8``, ``tep4_1m``, ``tep8_1m``.
+    """
+    if "deployment" not in metafunc.fixturenames:
+        return
+    metafunc.parametrize(
+        "deployment",
+        [
+            pytest.param(name, marks=_EIGHT_RANKS) if name.split("_")[0].endswith("8") else name
+            for name in metafunc.cls.deployments()
+        ],
     )
 
 
@@ -492,8 +145,22 @@ def _iteration_coverage(llm: LLM, path: Path, coverage: dict):
         assert not worker.is_alive(), "Iteration reader did not stop"
 
 
-class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
+class _Nvfp4Target(LlmapiAccuracyTestHarness):
+    """The gate of one target: every test runs at each deployment the target serves.
+
+    A subclass names its layout and its parallel arguments at four and at eight ranks;
+    `pytest_generate_tests` runs each test at both, at the 32K recipe and at the 1M envelope.
+    """
+
+    MODEL_NAME = "mistralai/Mistral-Large-4-1T-A52B"
+    # The Mistral-native ModelOpt MIXED_PRECISION export as published (params.json,
+    # tekken.json, consolidated safetensors: NVFP4 routed experts, FP8 block-scale linears).
     MODEL_PATH = f"{llm_models_root()}/Mistral-Large-4-1T-A52B-NVFP4"
+    KV = _KV
+    # The layout's short name, and its parallel arguments by rank count.
+    LAYOUT = ""
+    LAYOUTS = {}
+
     DRAFT_LENGTH = 3
     # MMMU's output budget: at reasoning effort low the answer follows a reasoning block, which
     # the task yaml's 512 tokens cut off in about a third of the samples.
@@ -501,28 +168,128 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
     # The allowed GSM8K gap between the two arms.
     GSM8K_MAX_DELTA = 2 * 0.75
 
+    @classmethod
+    def deployments(cls):
+        """Every deployment the target serves, named ``<layout><ranks>[_1m]``."""
+        return [f"{cls.LAYOUT}{ranks}{ctx}" for ctx in ("", "_1m") for ranks in sorted(cls.LAYOUTS)]
+
+    @classmethod
+    def serving(cls, deployment):
+        """A deployment's parallel arguments and engine bounds."""
+        name, _, ctx = deployment.partition("_")
+        layout = cls.LAYOUTS[int(name.removeprefix(cls.LAYOUT))]
+        return layout, (_BOUNDS_1M if ctx == "1m" else _BOUNDS)
+
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
-    @pytest.mark.parametrize(
-        "parallel",
-        [
-            "tep4",
-            "dep4",
-            "tp4",
-            pytest.param("tep8", marks=_EIGHT_RANKS),
-            pytest.param("dep8", marks=_EIGHT_RANKS),
-            pytest.param("tp8", marks=_EIGHT_RANKS),
-            # The 1M specializations of the cases above (the *Ctx1m classes).
-            "tep4_1m",
-            "dep4_1m",
-            "tp4_1m",
-            pytest.param("tep8_1m", marks=_EIGHT_RANKS),
-            pytest.param("dep8_1m", marks=_EIGHT_RANKS),
-            pytest.param("tp8_1m", marks=_EIGHT_RANKS),
-        ],
+    def test_gsm8k(self, deployment):
+        """The identity accuracy gate, at the harness default protocol.
+
+        That is the protocol the registered reference was set under, so the anchor and the
+        measurement read the same metric. The engine also checks its step contract on its
+        first forward.
+        """
+        layout, bounds = self.serving(deployment)
+        task = GSM8K(self.MODEL_NAME)
+        with (
+            scoped_env_overrides({MODELING_V2_VALIDATE_ENV: "1"}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                checkpoint_format="mistral_large_4",
+                kv_cache_config=self.KV,
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **layout,
+                **bounds,
+            ) as llm,
+        ):
+            task.evaluate(llm)
+
+    # GSM8K with 24 exemplars: every prompt is 3152-5115 tokens, past index_topk, so the
+    # indexer's selection prunes context on every sample (5-shot prompts stay under 2048,
+    # where the engine skips the indexer). A key of its own in gsm8k.yaml, scored by the
+    # reference implementation on its fp8_ds_mla cache.
+    MODEL_NAME_24SHOT = "mistralai/Mistral-Large-4-1T-A52B-gsm8k-24shot"
+
+    class GSM8K24Shot(GSM8K):
+        MAX_INPUT_LEN = 8192
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_gsm8k_24shot(self, deployment):
+        """24-shot GSM8K, where the indexer's selection prunes every prompt.
+
+        `trtllm-eval gsm8k --num_fewshot 24 --max_input_length 8192`, otherwise the harness
+        protocol of the 5-shot gate.
+        """
+        layout, bounds = self.serving(deployment)
+        task = self.GSM8K24Shot(self.MODEL_NAME_24SHOT)
+        with (
+            scoped_env_overrides({}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                checkpoint_format="mistral_large_4",
+                kv_cache_config=self.KV,
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **layout,
+                **bounds,
+            ) as llm,
+        ):
+            task.evaluate(llm, extra_evaluator_kwargs=dict(num_fewshot=24))
+
+    # A passkey hidden in filler text, asked for at the end. GSM8K's prompts stay under the
+    # indexer's index_topk (2048), where the engine skips the indexer; these prompts are about
+    # 30000 tokens -- one context step, within max_num_tokens 32768 -- so the indexer scores and
+    # selects for every query row past 2048, in the context step and in each decode step.
+    PASSKEY_TOKENS = 30000
+    PASSKEY_FILLER = (
+        "The grass is green. The sky is blue. The sun is yellow. Here we go. There and back again. "
     )
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
+    def test_passkey_retrieval(self, deployment):
+        """The long-context witness: a passkey recalled from a ~30000-token prompt.
+
+        At three depths of the prompt, greedy decoding must reproduce the passkey. A wrong
+        selection, rope or SSMax position past 2048 reads the wrong positions and loses it.
+        """
+        layout, bounds = self.serving(deployment)
+        params = SamplingParams(max_tokens=12, temperature=0.0)
+        with (
+            scoped_env_overrides({}) as rank_env,
+            LLM(
+                self.MODEL_PATH,
+                checkpoint_format="mistral_large_4",
+                kv_cache_config=self.KV,
+                modeling_v2="require",
+                env_overrides=rank_env,
+                **layout,
+                **bounds,
+            ) as llm,
+        ):
+            unit = len(llm.tokenizer.encode(self.PASSKEY_FILLER * 10)) / 10
+            reps = int(self.PASSKEY_TOKENS / unit)
+            for depth, key in ((0.2, 71432), (0.5, 58219), (0.8, 30476)):
+                before = int(reps * depth)
+                prompt = (
+                    "There is an important piece of information hidden inside a lot of "
+                    "irrelevant text. Find it and memorize it. I will quiz you about it.\n\n"
+                    + self.PASSKEY_FILLER * before
+                    + f"\nThe pass key is {key}. Remember it. {key} is the pass key.\n"
+                    + self.PASSKEY_FILLER * (reps - before)
+                    + "\nWhat is the pass key? The pass key is"
+                )
+                tokens = len(llm.tokenizer.encode(prompt))
+                assert 2048 < tokens <= bounds["max_seq_len"] - params.max_tokens, tokens
+                answer = llm.generate([prompt], params)[0].outputs[0].text
+                assert str(key) in answer, (depth, tokens, answer)
+
+    @skip_not_sm103
+    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("profile", ["quick", "full", "long_lite", "long_full"])
-    def test_accuracy(self, parallel, profile, tmp_path, monkeypatch, record_property):
+    def test_accuracy(self, deployment, profile, tmp_path, monkeypatch, record_property):
         """Every profile runs native DSpark; full profiles add fresh spec OFF GSM8K.
 
         ``long_lite`` and ``long_full`` run on the 1M specializations only: RULER rows at 64K,
@@ -532,30 +299,17 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
         multimodal panel and GSM8K as in quick / full. long_full also gates its 64K / 128K RULER
         means on references/ruler.yaml.
         """
-        target = {
-            "tep4": TestModelingV2MistralLarge4Nvfp4Sm103Tep,
-            "dep4": TestModelingV2MistralLarge4Nvfp4Sm103Dep,
-            "tp4": TestModelingV2MistralLarge4Nvfp4Sm103Tp,
-            "tep8": TestModelingV2MistralLarge4Nvfp4Sm103Tep8,
-            "dep8": TestModelingV2MistralLarge4Nvfp4Sm103Dep8,
-            "tp8": TestModelingV2MistralLarge4Nvfp4Sm103Tp8,
-            "tep4_1m": TestModelingV2MistralLarge4Nvfp4Sm103TepCtx1m,
-            "dep4_1m": TestModelingV2MistralLarge4Nvfp4Sm103DepCtx1m,
-            "tp4_1m": TestModelingV2MistralLarge4Nvfp4Sm103TpCtx1m,
-            "tep8_1m": TestModelingV2MistralLarge4Nvfp4Sm103Tep8Ctx1m,
-            "dep8_1m": TestModelingV2MistralLarge4Nvfp4Sm103Dep8Ctx1m,
-            "tp8_1m": TestModelingV2MistralLarge4Nvfp4Sm103Tp8Ctx1m,
-        }[parallel]
+        layout, bounds = self.serving(deployment)
         envelope = max(ruler.cell_counts(profile))
-        if target.BOUNDS["max_seq_len"] < envelope:
+        if bounds["max_seq_len"] < envelope:
             pytest.skip(
-                f"{profile} needs max_seq_len {envelope}; {target.__name__} serves "
-                f"{target.BOUNDS['max_seq_len']}"
+                f"{profile} needs max_seq_len {envelope}; {deployment} serves "
+                f"{bounds['max_seq_len']}"
             )
         model_path = self.MODEL_PATH
         is_long = profile.startswith("long")
-        world = target.PARALLEL["tensor_parallel_size"]
-        attention_dp = target.PARALLEL["enable_attention_dp"]
+        world = layout["tensor_parallel_size"]
+        attention_dp = layout["enable_attention_dp"]
         for name in (
             "INTEGRATION_TEST",
             "TRTLLM_ACCURACY_NO_REFERENCE",
@@ -576,7 +330,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
             # quick 1M case stops at 128K there, and long_full keeps the 1M rows.
             rows = [row for row in rows if row["max_length"] <= 131072]
         root = (
-            Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path)) / f"{parallel}-{profile}"
+            Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path)) / f"{deployment}-{profile}"
         )
         root.mkdir(parents=True, exist_ok=False)
         record_property("artifacts", str(root))
@@ -590,19 +344,19 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
             speculative_model=model_path,
         )
         summary = {
-            "parallel": parallel,
+            "deployment": deployment,
             "profile": profile,
             "reuse": True,
             "speculative_config": spec_config.model_dump(mode="json"),
         }
         llm_kwargs = dict(
-            kv_cache_config=target.KV.model_copy(update={"enable_block_reuse": True}),
+            kv_cache_config=self.KV.model_copy(update={"enable_block_reuse": True}),
             modeling_v2="require",
             enable_iter_perf_stats=True,
             env_overrides={MODELING_V2_VALIDATE_ENV: "1", "TLLM_LOG_LEVEL": "info"},
             **checkpoint,
-            **target.PARALLEL,
-            **target.BOUNDS,
+            **layout,
+            **bounds,
         )
         coverage = {}
         started = time.monotonic()
@@ -633,7 +387,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                             profile,
                             root,
                             concurrency,
-                            target.MODEL_NAME,
+                            self.MODEL_NAME,
                             collect_spec=is_long,
                         )
                     except AssertionError as error:
@@ -647,11 +401,11 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                     except AssertionError as error:
                         failures.append(f"multimodal: {error}")
                 failures.extend(f"RULER iteration reader: {error}" for error in errors)
-                tasks = [GSM8K(target.MODEL_NAME)]
+                tasks = [GSM8K(self.MODEL_NAME)]
                 if scores_mmmu:
-                    tasks.append(MMMU(target.MODEL_NAME))
+                    tasks.append(MMMU(self.MODEL_NAME))
                 if profile == "full":
-                    tasks.append(GPQADiamond(target.MODEL_NAME))
+                    tasks.append(GPQADiamond(self.MODEL_NAME))
                 for task in tasks:
                     with _iteration_coverage(
                         llm, root / f"{task.DATASET}-iterations.jsonl", coverage
@@ -673,7 +427,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                             # The task yaml sets greedy decoding and the stop string; its 512
                             # tokens yield to MMMU_OUTPUT_LEN. The reference baseline truncates
                             # no prompt.
-                            budget = target.BOUNDS["max_seq_len"] - self.MMMU_OUTPUT_LEN
+                            budget = bounds["max_seq_len"] - self.MMMU_OUTPUT_LEN
                             evaluate_kwargs = dict(
                                 extra_acc_spec=f"native-mm-{profile}",
                                 sampling_params=SamplingParams(
@@ -699,7 +453,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                             al = acceptance_length_from_iteration_stats(spec_stats)
                             summary["gsm8k_acceptance_length"] = al
                             assert_acceptance_length(
-                                f"ModelingV2MistralLarge4Nvfp4::{parallel.removesuffix('_1m')}::dspark3",
+                                f"ModelingV2MistralLarge4Nvfp4::{deployment.removesuffix('_1m')}::dspark3",
                                 al,
                             )
                         except (AssertionError, KeyError, ValueError) as error:
@@ -730,7 +484,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                         failures.append(
                             f"INCONCLUSIVE: no completed {need}-token prompt ({longest})"
                         )
-                    step = target.BOUNDS["max_num_tokens"]
+                    step = bounds["max_num_tokens"]
                     if any(shape["context_tokens"] > step for shape in coverage.values()):
                         failures.append(
                             f"FAIL: a step's context tokens exceeded {step}: {coverage}"
@@ -750,7 +504,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                 # Same specialization, reuse, bounds and evaluator; only speculation differs.
                 origin = root / "spec-off"
                 origin.mkdir()
-                task = GSM8K(target.MODEL_NAME)
+                task = GSM8K(self.MODEL_NAME)
                 with (
                     scoped_env_overrides(llm_kwargs["env_overrides"]) as rank_env,
                     LLM(model_path, **dict(llm_kwargs, env_overrides=rank_env)) as llm,
@@ -790,6 +544,59 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
             (root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
         assert not failures, failures
 
+
+class TestModelingV2MistralLarge4Nvfp4Sm103Tep(_Nvfp4Target):
+    """mistral-large-4-nvfp4 / sm_103 / tep, the language model."""
+
+    # Tensor-parallel attention with expert-parallel experts: the attention heads and the routed
+    # experts both sharded over every rank, attention DP off -- four ways on one node, or eight
+    # over two nodes of four. Routing derives the target *from* these: attention DP would be a
+    # different weight layout (the dep target), and tensor_parallel_size alone shards every
+    # expert by width instead (the tp target).
+    LAYOUT = "tep"
+    LAYOUTS = {
+        4: dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=False),
+        8: dict(tensor_parallel_size=8, moe_expert_parallel_size=8, enable_attention_dp=False),
+    }
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm103Dep(_Nvfp4Target):
+    """mistral-large-4-nvfp4 / sm_103 / dep, the language model."""
+
+    # Attention data parallel over every rank (each holds the whole attention and serves its
+    # own requests) with the routed experts split by expert over every rank, four on one node
+    # or eight over two nodes of four. Routing derives the target *from* these: attention DP
+    # off is the tep target, and tensor_parallel_size alone another weight layout.
+    LAYOUT = "dep"
+    LAYOUTS = {
+        4: dict(tensor_parallel_size=4, moe_expert_parallel_size=4, enable_attention_dp=True),
+        8: dict(tensor_parallel_size=8, moe_expert_parallel_size=8, enable_attention_dp=True),
+    }
+
+
+class TestModelingV2MistralLarge4Nvfp4Sm103Tp(_Nvfp4Target):
+    """mistral-large-4-nvfp4 / sm_103 / tp, the language model."""
+
+    # Tensor parallel throughout: the attention heads sharded over every rank and every routed
+    # expert on every rank, cut to its share of the width, attention DP off -- four ways on one
+    # node, or eight over two nodes of four. Routing derives the target *from* these: expert
+    # parallelism is the tep target. A bare tensor_parallel_size resolves to the same split.
+    LAYOUT = "tp"
+    LAYOUTS = {
+        4: dict(
+            tensor_parallel_size=4,
+            moe_tensor_parallel_size=4,
+            moe_expert_parallel_size=1,
+            enable_attention_dp=False,
+        ),
+        8: dict(
+            tensor_parallel_size=8,
+            moe_tensor_parallel_size=8,
+            moe_expert_parallel_size=1,
+            enable_attention_dp=False,
+        ),
+    }
+
     @skip_not_sm103
     @pytest.mark.skip_less_device(4)
     def test_llguidance(self, tmp_path, record_property):
@@ -798,7 +605,7 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
         Cases (llguidance_panel): JSON, JSON after a reasoning section, and mistral-common's tool
         grammars under tool_choice auto, required and named.
         """
-        target = TestModelingV2MistralLarge4Nvfp4Sm103Tp
+        layout, bounds = self.serving("tp4")
         model_path = os.environ.get("MISTRAL_LARGE4_CHECKPOINT_DIR", self.MODEL_PATH)
         root = Path(os.environ.get("TRTLLM_ACCURACY_OUTPUT_DIR", tmp_path)) / "tp4-llguidance"
         root.mkdir(parents=True, exist_ok=False)
@@ -812,11 +619,11 @@ class TestModelingV2MistralLarge4Nvfp4Accuracy(LlmapiAccuracyTestHarness):
                 ),
                 checkpoint_format="mistral_large_4",
                 guided_decoding_backend="llguidance",
-                kv_cache_config=target.KV.model_copy(update={"enable_block_reuse": True}),
+                kv_cache_config=self.KV.model_copy(update={"enable_block_reuse": True}),
                 modeling_v2="require",
                 env_overrides=rank_env,
-                **target.PARALLEL,
-                **target.BOUNDS,
+                **layout,
+                **bounds,
             ) as llm,
         ):
             summary = llguidance_panel.evaluate(llm, root)
