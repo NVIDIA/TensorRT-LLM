@@ -96,7 +96,7 @@ _ML4_NVFP4_8GPU_MAX_BLOCKS = 147456
 #: Max_batch_size 16 requests packed to 32768 new tokens, lengths on either side
 #: of the page (32), the 2-row launcher's last count (1024) and index_topk (2048).
 _ML4_32K_PACKED = (1, 31, 32, 33, 63, 64, 65, 1023, 1024, 1025, 2047, 2049, 4095, 4097, 8191, 8928)
-#: The tp4 target at the checkpoint's own context: max_seq_len 1048576 with chunked
+#: The tp4 deployment at the checkpoint's own context: max_seq_len 1048576 with chunked
 #: prefill on and max_num_tokens 32768 (the chunk), over its YaRN factor 2048 table of
 #: 1048576 rows with its values rounded to bf16 (`table_dtype`), as the target's rope
 #: tables hold them. `requests` and `cached` place a step's rows on every layout:
@@ -158,7 +158,7 @@ _ML4_1M_MIXED_CACHED = (
     1028576, 500000, 0, 1048575, 1048544, 524287, 131071, 32768, 32767, 2048, 2047, 64, 33, 32,
     2, 1,
 )  # fmt: skip
-#: The dep4 target's mixed step at 1M: three chunks (32755 rows; one fresh, two
+#: The dep4 deployment's mixed step at 1M: three chunks (32755 rows; one fresh, two
 #: behind prefixes of 100000 and 65536) ahead of 13 decode rows whose prefixes
 #: run from 1048575 down across 2^19..2^15, index_topk and the page to 1.
 _ML4_1M_DEP4_MIXED = (20000, 9000, 3755) + (1,) * 13
@@ -166,7 +166,7 @@ _ML4_1M_DEP4_MIXED_CACHED = (
     100000, 0, 65536, 1048575, 524288, 262144, 131072, 65536, 32768, 32767, 2048, 2047, 33, 32,
     2, 1,
 )  # fmt: skip
-#: The dep4 target's long-family decode graphs at 1M (`boot_capture` cells). The
+#: The dep4 deployment's long-family decode graphs at 1M (`boot_capture` cells). The
 #: engine captures each batch b of 1/2/4/8/16 on its CUDA-graph warm-up batch:
 #: one dummy of max_seq_len - 1 = 1048575 keys (its new key at position
 #: 1048574) ahead of b - 1 one-key fillers, each a request of its own (position
@@ -216,7 +216,7 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
     # max_seq_len = max_num_tokens = 32768 with chunked prefill off: a context
     # step of up to 32768 rows (one request, or up to 16), decode rows at
     # positions up to 32767, graphs 1/2/4/8/16 padded. Its tep8, tp8 and dep8
-    # targets make the same call on every rank (the indexer is whole on every
+    # deployments make the same call on every rank (the indexer is whole on every
     # rank: replicated at tep8 and tp8, data parallel at dep8), on a larger
     # pool: a tep8 or tp8 rank holds 73.61 GiB of weights, a dep8 rank 89.29
     # GiB, a tep4 rank 143.24 GiB. In the cells without a
@@ -225,7 +225,7 @@ class CuteDslIndexerKCacheUpdate(OpWrapper):
     # default manager hands out a contiguous view instead (`note`), and the
     # target picks the launchers by `k_cache.is_contiguous()`, so its calls
     # run the contiguous launchers. 32 tokens per page, 132 bytes per token.
-    # The NVFP4 tp4 target at max_seq_len 1048576 (`_ML4_1M_TP4` cells) is that forward
+    # The NVFP4 tp4 deployment at max_seq_len 1048576 (`_ML4_1M_TP4` cells) is that forward
     # with chunked prefill on: a step still holds at most 32768 rows
     # (max_num_tokens, the chunk), but a context chunk's rows sit at positions
     # cached..cached+new-1 after a cached prefix of up to 1048576 - new (one

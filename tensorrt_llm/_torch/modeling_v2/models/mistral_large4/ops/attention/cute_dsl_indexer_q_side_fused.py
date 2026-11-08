@@ -97,11 +97,11 @@ class CuteDslIndexerQSideFused(OpWrapper):
     # carries up to 32768 rows at positions 0..32767 on its factor 2048 table,
     # and its decode rows (CUDA graphs 1, 2, 4, 8, 16, padded) read positions up
     # to 32767. At its own context (max_seq_len 1048576, chunked prefill on,
-    # max_num_tokens 32768) the NVFP4 tep4, dep4 and tep8 targets build a 1048576-row
+    # max_num_tokens 32768) the NVFP4 tep4, dep4 and tep8 deployments build a 1048576-row
     # table and a step still carries up to 32768 rows: a chunk's rows sit at cached ..
     # cached + n - 1 behind the request's cached prefix (the last chunk of a 1M prompt
     # at 1015808..1048575), a mixed step's rows at any position, and its decode rows
-    # read any position up to 1048575. The NVFP4 tp4 target makes the same call: its
+    # read any position up to 1048575. The NVFP4 tp4 deployment makes the same call: its
     # indexer is replicated (32 heads on every rank), its tables come from the same
     # `_rope_tables`, and under the engine's query split every rank still ropes every
     # row of the step (the split divides the selection, after this op). At dep4
@@ -417,20 +417,20 @@ class CuteDslIndexerQSideFused(OpWrapper):
     32768 rows, and on that table a read wrapped at 9216 rows or one position
     early moves a rope code in every row from 9216 up, so the 32768-row cells
     see a wrong row there (the test pins the same on the stand-in table). The
-    tables the NVFP4 tep4 and tep8 targets' `_rope_tables` build at 1048576
+    tables the NVFP4 tep4 and tep8 deployments' `_rope_tables` build at 1048576
     rows from the same config and alpha (indexer and identity) are bitwise the
     reference at every position 0..1048575, read in 32 calls of 32768 rows,
     and on the indexer table a read of the last chunk wrapped at 32768 rows or
     one position early moves a rope code in every one of its 32768 rows (0.927
     and 0.303 of them; the test pins the same on the stand-in table). The NVFP4
-    tp4 target's `_rope_tables` is the same code, and its tables at 1048576
+    tp4 deployment's `_rope_tables` is the same code, and its tables at 1048576
     rows from that config and alpha measured the same: bitwise the reference
     at every position 0..1048575 in 32 calls (indexer and identity), the same
     0.927 and 0.303 at the last chunk and at a 32768-row step in the last 64
     rows (no row unseen), and its decode graphs at 1, 2, 4, 8 and 16 replayed
     as the engine pads them (live rows in the last 64 rows, padding rows at
     position 0) bitwise equal to eager and to the reference. The NVFP4
-    dep4 target builds its tables with the same `_rope_tables`, and on its
+    dep4 deployment builds its tables with the same `_rope_tables`, and on its
     1048576-row tables from the checkpoint the same was measured: every
     position 0..1048575 bitwise the reference (indexer and identity), the
     last chunk's wrapped and one-early reads moving 0.927 and 0.303 of the

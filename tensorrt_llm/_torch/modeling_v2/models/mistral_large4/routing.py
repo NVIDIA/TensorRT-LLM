@@ -198,25 +198,25 @@ def route(
     # width -- heads, expert windows, shard widths -- is read off the mapping, so the two sizes
     # are one weight layout and one forward.
     nvfp4_world = mapping.world_size in (4, 8)
-    # tep4: the attention heads, the dense and shared MLPs and lm_head sharded over every rank,
+    # tep: the attention heads, the dense and shared MLPs and lm_head sharded over every rank,
     # the routed experts too, by expert (32 per rank at 4 ranks, 16 at 8). Attention DP would
-    # replicate attention: another weight layout. At 8 ranks this is the tep8 deployment;
-    # tensor_parallel_size 8 alone shards every expert eight ways instead (moe_tp 8, moe_ep 1),
-    # the tp4 branch's layout.
-    tep4 = (
+    # replicate attention: another weight layout. At 4 ranks this is the tep4 deployment, at 8
+    # the tep8 one; tensor_parallel_size 8 alone shards every expert eight ways instead (moe_tp
+    # 8, moe_ep 1), the tp branch's layout.
+    tep = (
         mapping.tp_size == mapping.world_size
         and mapping.pp_size == 1
         and mapping.moe_ep_size == mapping.world_size
         and mapping.moe_tp_size == 1
         and not mapping.enable_attention_dp
     )
-    # dep4: attention data parallel over the ranks -- every rank holds the whole attention, the
+    # dep: attention data parallel over the ranks -- every rank holds the whole attention, the
     # dense and shared MLPs and the full-vocabulary lm_head and serves its own requests -- and
     # the routed experts split by expert over every rank (32 per rank at 4 ranks, 16 at 8),
     # gathered over the ranks' tokens. lm_head tensor parallelism under attention DP would make
-    # the shell's lm_head vocab-parallel: another weight layout. At 8 ranks this is the dep8
-    # deployment.
-    dep4 = (
+    # the shell's lm_head vocab-parallel: another weight layout. At 4 ranks this is the dep4
+    # deployment, at 8 the dep8 one.
+    dep = (
         mapping.tp_size == mapping.world_size
         and mapping.pp_size == 1
         and mapping.moe_ep_size == mapping.world_size
@@ -224,14 +224,15 @@ def route(
         and mapping.enable_attention_dp
         and not mapping.enable_lm_head_tp_in_adp
     )
-    # tp4: tensor parallel throughout -- the attention heads, the dense and shared MLPs and
-    # lm_head sharded over every rank as at tep4 -- and the routed experts tensor parallel too:
+    # tp: tensor parallel throughout -- the attention heads, the dense and shared MLPs and
+    # lm_head sharded over every rank as at tep -- and the routed experts tensor parallel too:
     # every rank holds all 128 experts, each cut to its 1/world_size of the intermediate width
-    # (1536 at 4 ranks, 768 at 8), and the ranks' partial sums close on the same all-reduce. At 8
-    # ranks this is the tp8 deployment, and what tensor_parallel_size 8 alone resolves to.
+    # (1536 at 4 ranks, 768 at 8), and the ranks' partial sums close on the same all-reduce. At 4
+    # ranks this is the tp4 deployment; at 8 the tp8 one, and what tensor_parallel_size 8 alone
+    # resolves to.
     # Expert parallelism, or a mixed split of the experts, would be another weight layout;
     # attention DP another attention.
-    tp4 = (
+    tp = (
         mapping.tp_size == mapping.world_size
         and mapping.pp_size == 1
         and mapping.moe_tp_size == mapping.world_size
@@ -248,7 +249,7 @@ def route(
         compute_capability == (10, 3)
         and shape == _SHAPE
         and nvfp4_world
-        and tep4
+        and tep
         and draft
         and layers
         and math_ok
@@ -258,18 +259,18 @@ def route(
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
         # isort: off
-        from .mistral_large_4_nvfp4__sm_103__tep4.modeling import ModelingV2MistralLarge4Nvfp4Sm103Tep4
+        from .mistral_large_4_nvfp4__sm_103__tep.modeling import ModelingV2MistralLarge4Nvfp4Sm103Tep
         # isort: on
         # fmt: on
 
-        return ModelingV2MistralLarge4Nvfp4Sm103Tep4
+        return ModelingV2MistralLarge4Nvfp4Sm103Tep
 
     # DEP replicates the attention and dense draft for each rank's requests.
     if (
         compute_capability == (10, 3)
         and shape == _SHAPE
         and nvfp4_world
-        and dep4
+        and dep
         and draft
         and layers
         and math_ok
@@ -279,18 +280,18 @@ def route(
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
         # isort: off
-        from .mistral_large_4_nvfp4__sm_103__dep4.modeling import ModelingV2MistralLarge4Nvfp4Sm103Dep4
+        from .mistral_large_4_nvfp4__sm_103__dep.modeling import ModelingV2MistralLarge4Nvfp4Sm103Dep
         # isort: on
         # fmt: on
 
-        return ModelingV2MistralLarge4Nvfp4Sm103Dep4
+        return ModelingV2MistralLarge4Nvfp4Sm103Dep
 
     # TP shards the draft attention and dense MLP like the target's dense layer.
     if (
         compute_capability == (10, 3)
         and shape == _SHAPE
         and nvfp4_world
-        and tp4
+        and tp
         and draft
         and layers
         and math_ok
@@ -300,11 +301,11 @@ def route(
         # `from .<target>.modeling import <Class>` lines.
         # fmt: off
         # isort: off
-        from .mistral_large_4_nvfp4__sm_103__tp4.modeling import ModelingV2MistralLarge4Nvfp4Sm103Tp4
+        from .mistral_large_4_nvfp4__sm_103__tp.modeling import ModelingV2MistralLarge4Nvfp4Sm103Tp
         # isort: on
         # fmt: on
 
-        return ModelingV2MistralLarge4Nvfp4Sm103Tp4
+        return ModelingV2MistralLarge4Nvfp4Sm103Tp
 
     if nvfp4:
         quant = "ModelOpt MIXED_PRECISION (NVFP4 experts, FP8_PB_WO linears)"
@@ -322,13 +323,13 @@ def route(
         f"(SSMax, LeRoPE, soft-cap, softmax routing, YaRN magnitude 1, fp8 KV) "
         f"{'as written' if math_ok else 'differ'}, quantization {quant}; the mistral_large4 "
         "targets are Mistral-Large-4-1T-A52B-NVFP4 (ModelOpt MIXED_PRECISION: NVFP4 routed "
-        "experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 at tep4, at dep4 "
-        "and at tp4; each target serves 4 ranks on one node or 8 ranks over two nodes of "
-        "four (world_size=tp=4 or 8, pp=1); tep4 is tensor-parallel attention, expert-parallel "
+        "experts, FP8_PB_WO linears, group 16, its 475-module map) on sm103 in the tep, dep "
+        "and tp layouts; each target serves 4 ranks on one node or 8 ranks over two nodes of "
+        "four (world_size=tp=4 or 8, pp=1); tep is tensor-parallel attention, expert-parallel "
         "MoE, attention DP off (world_size=4 tp=4 pp=1 moe_ep=4 moe_tp=1, or world_size=8 tp=8 "
-        "pp=1 moe_ep=8 moe_tp=1: tep8); dep4 is attention data parallel with lm_head TP off, "
+        "pp=1 moe_ep=8 moe_tp=1: tep8); dep is attention data parallel with lm_head TP off, "
         "expert-parallel MoE (world_size=4 tp=4 pp=1 moe_ep=4 moe_tp=1, or world_size=8 tp=8 "
-        "pp=1 moe_ep=8 moe_tp=1: dep8); tp4 is tensor-parallel attention, tensor-parallel MoE "
+        "pp=1 moe_ep=8 moe_tp=1: dep8); tp is tensor-parallel attention, tensor-parallel MoE "
         "(every expert on every rank, cut by width), attention DP off (world_size=4 tp=4 pp=1 "
         "moe_ep=1 moe_tp=4, or world_size=8 tp=8 pp=1 moe_ep=1 moe_tp=8: tp8). "
         "Speculative decoding is off or native DSpark: fixed block/depth 3, layers "

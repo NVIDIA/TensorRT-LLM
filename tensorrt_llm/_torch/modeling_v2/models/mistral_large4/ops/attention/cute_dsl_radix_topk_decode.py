@@ -191,7 +191,7 @@ class CuteDslRadixTopkDecode(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The Mistral Large 4 NVFP4 tp4 / tep4 / dep4 targets (`_ML4`) score every generation token
+    # The Mistral Large 4 NVFP4 tp4 / tep4 / dep4 deployments (`_ML4`) score every generation token
     # of a step with the paged scorer, fp32 rows 32768 wide (their max_seq_len), and select
     # here: from their decode steps (CUDA-graph captured, padded to the engine's batch list
     # 1, 2, 4, 8, 16, 24, ..., 128, 192, 256; dep4 on each rank's own sequences) and from the
@@ -391,7 +391,7 @@ class CuteDslRadixTopkDecode(OpWrapper):
     do, each takes as many as the other. A row holding a negative NaN is selected through
     the op's own stages (see the class docstring), fp16 pass included.
 
-    On the tp4 target's decode scorer logits (264 calls: 6 steps of its 44 indexer layers,
+    On the tp4 deployment's decode scorer logits (264 calls: 6 steps of its 44 indexer layers,
     KV lengths about 8200, rows tiled to the batch at 1, 16, 64 and 256 rows) no row is
     selected differently from the op. Cost: one CTA reads its whole row, so the time follows
     the KV length.

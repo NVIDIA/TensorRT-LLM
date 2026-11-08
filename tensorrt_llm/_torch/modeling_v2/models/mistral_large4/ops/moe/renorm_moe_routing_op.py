@@ -6,8 +6,8 @@ over just those k, in one trtllm call.
 The cells, built by `_ml4` and on `_ML4_32K` and `_ML4_131K`, are the Mistral Large 4
 router's: 128 experts, top-4, fp32 logits, bf16 weights -- `_ml4` at the FP8 target's
 max_num_tokens 9216, `_ML4_32K` at the NVFP4 target's 32768 (and the NVFP4 dep8
-target's chunks of the 8-rank gathered rows, with its decode graphs' gathered
-8 x 1..16), `_ML4_131K` at the NVFP4 dep4 target's gathered 4 x 32768.
+deployment's chunks of the 8-rank gathered rows, with its decode graphs' gathered
+8 x 1..16), `_ML4_131K` at the NVFP4 dep4 deployment's gathered 4 x 32768.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ _ML4_32K = dict(
     magnitude=3.0,
 )
 
-# The Mistral Large 4 router at the NVFP4 dep4 target: attention data parallel, so
+# The Mistral Large 4 router at the NVFP4 dep4 deployment: attention data parallel, so
 # each of the 4 ranks zero-pads its rows to T_max = max(all_rank_num_tokens)
 # and the router runs over the gathered 4 x T_max rows, up to 4 x 32768.
 # A literal, like `_ML4_32K`.
@@ -156,7 +156,7 @@ class RenormMoeRoutingOp(OpWrapper):
         Cell(
             why=(
                 "Mistral Large 4 dep4 eager T 32769..131072: every row count of the "
-                "dep4 target's gathered step (4 x T_max, T_max up to max_num_tokens "
+                "dep4 deployment's gathered step (4 x T_max, T_max up to max_num_tokens "
                 "32768) past the NVFP4 sweep, all on the 8192-block cap with each "
                 "warp looping over up to four tokens 32768 apart (four at 131072) "
                 "-- each a call on the leading T rows of one set (~5 s)"
@@ -221,7 +221,7 @@ class RenormMoeRoutingOp(OpWrapper):
     profiled grid is 8191 blocks at T 32764 and 8192 at T 32765 and 32768, so
     up to 32768 every warp routes one token. Past it the grid stays at 8192
     blocks and each warp loops over tokens 32768 apart (8192 blocks measured
-    at T 32769, 65536, 65537 and 131072). The dep4 target's gathered steps,
+    at T 32769, 65536, 65537 and 131072). The dep4 deployment's gathered steps,
     T 32769..131072, all run there, each warp routing up to four tokens
     (exactly four at 131072). That path is bit-exact at every T in
     32769..131072 and at 131073; its cells are 65537 and the dep4 sweep. PDL
@@ -248,7 +248,7 @@ class RenormMoeRoutingOp(OpWrapper):
     reaches its neighbours: a padded batch's garbage rows cost only their own
     outputs.
 
-    Zero padding rows, which the dep4 target appends to each rank's rows up
+    Zero padding rows, which the dep4 deployment appends to each rank's rows up
     to T_max before the gather: a zero hidden row through
     `torch.ops.trtllm.cublas_mm` (bf16, 6144 -> 128, fp32 out) gives +0.0 in
     every column (measured at m 4, 64, 32768, 32772, 65536 and 131072 with
@@ -259,7 +259,7 @@ class RenormMoeRoutingOp(OpWrapper):
     rows each and no other expert more than 1098, a skew the expert runner
     carries, not this op.
 
-    The dep8 target gathers 8 x T_max rows and routes them in chunks of at
+    The dep8 deployment gathers 8 x T_max rows and routes them in chunks of at
     most 32768, each a call on a fresh contiguous logits tensor inside the
     T 1..32768 sweep; with one rank at 32768 tokens and seven at 1, each of
     chunks 1..7 is one live row and 32767 padding rows. Its decode graphs
@@ -305,9 +305,9 @@ class RenormMoeRoutingOp(OpWrapper):
       topk          <= 16 (raises past it); > num_experts silent, guarded
       logits offset token * num_experts in uint32; boundary 2^32 elements =
                     33554432 tokens at 128 experts (8388608 at 512); unprobed:
-                    the dep4 target's largest step is 131072 x 128 = 16777216
-                    = 2^24 elements (the NVFP4 tep4 target's and the dep8
-                    target's 32768-row chunk's 32768 x 128 = 4194304, the FP8
+                    the dep4 deployment's largest step is 131072 x 128 = 16777216
+                    = 2^24 elements (the NVFP4 tep4 deployment's and the dep8
+                    deployment's 32768-row chunk's 32768 x 128 = 4194304, the FP8
                     target's 9216 x 128 = 1179648), and the
                     largest probed 131073 x 128 = 16777344, bit-exact
       out offset    token * topk in uint32; 2^30 tokens at top-4; unprobed

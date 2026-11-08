@@ -185,17 +185,17 @@ TARGET_CELLS: dict[str, tuple[Cell, ...]] = {
             spec=dict(shape=(16, 512), dtype=torch.bfloat16),
         ),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep4": (
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tep": (
         *_ML4_TP_WORLD4,
         *_ML4_TP_WORLD8,
         *_ml4_dspark(12288, 3072, 6144, 1536),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp4": (
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__tp": (
         *_ML4_TP_WORLD4,
         *_ML4_TP_WORLD8,
         *_ml4_dspark(12288, 3072, 6144, 1536),
     ),
-    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep4": (
+    "mistral_large4/mistral_large_4_nvfp4__sm_103__dep": (
         *_ML4_DP,
         *_ML4_WIDTH_12288,
         *_ml4_dspark(49152, 12288),

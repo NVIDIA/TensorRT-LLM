@@ -102,7 +102,7 @@ class CuteDslGvrTopkPrefill(OpWrapper):
 
     ARCHS = frozenset({Arch.SM_103})
 
-    # The dep4 target's calls (dep8 alike), one per query tile of an indexer
+    # The dep4 deployment's calls (dep8 alike), one per query tile of an indexer
     # prefill block, on fp8_mqa_logits' row-padded output: at the 1M envelope
     # (max_seq_len 1048576, chunked prefill in 32768-token chunks) its tiles are
     # floor(2**26 / W) rows of a block of W keys, at max_seq_len 32768
@@ -218,7 +218,7 @@ class CuteDslGvrTopkPrefill(OpWrapper):
                 blocks=([(1048400, 100, 40), (0, 155, None)],), values="distinct", **_INDEXER
             ),
         ),
-        # The tep4 target's calls (tep8 alike): its 2**28-element tiles at the 1M envelope,
+        # The tep4 deployment's calls (tep8 alike): its 2**28-element tiles at the 1M envelope,
         # cut from the first row of the rank's share of a chunk under the engine's query split,
         # and the pieces of a packed chunk cut per request past max_seq_len.
         Cell(
