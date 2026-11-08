@@ -20,6 +20,7 @@ import types
 from typing import Optional
 
 from ..logger import logger
+from .cute_dsl_file_cache import install_cute_dsl_file_cache
 
 
 def _skip_legacy_cutlass_mlir_helpers() -> None:
@@ -59,6 +60,9 @@ if platform.system() != "Windows":
             IS_CUTLASS_DSL_RUBIN_AVAILABLE = True
     except ImportError:
         pass
+
+if IS_CUTLASS_DSL_AVAILABLE:
+    install_cute_dsl_file_cache()
 
 
 class _GraphSafeDlpack:
