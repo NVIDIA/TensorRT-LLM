@@ -18,9 +18,8 @@ The cache manager's state layouts are read and written as they are: the conv poo
 (``q_k_v``), the V-first fp32 state pool, the replay caches; after every prefill or plain decode that advances the
 conv pool, the replay caches' committed window follows it (``commit_conv_window``).
 
-The replay caches and the accepted-draft record are addressed by the requests' replay slots
-(``mamba_metadata.replay_state_indices``). With the per-draft records they are the state slots; with the replay caches
-only, the manager keeps them in a pool of their own and the replay slots differ from the state slots.
+The replay slots (``mamba_metadata.replay_state_indices``) address the replay caches, accepted counts and per-draft
+records. The state slots address the recurrent state and its convolution history.
 """
 
 from __future__ import annotations
@@ -601,19 +600,22 @@ class K3DecodeKDA(nn.Module):
         the per-draft records (``kda_state_tok``) go with the K3 kernels; the replay caches alone with
         ``ssm/kda_mtp_decode``; the sequential-verify buffers with the token-by-token FLA verify.
 
-        ``replay_slots`` are the requests' rows of the replay caches (``slots`` when None). The K3 kernels address the
-        replay caches by the state slot, so with the per-draft records the manager keeps them in the state slot
-        (``KDAReplayState.replay_shares_state_slot``)."""
+        ``replay_slots`` selects each request's replay row, including its per-draft records. It defaults to ``slots``.
+        """
         replay = bool(getattr(layer_cache, "has_kda_replay_caches", False))
         if replay and layer_cache.kda_state_tok is not None:
             assert self.takes_k3_kernels and self.k3_buffers is not None, (
                 f"Kimi K3 KDA layer {self.layer_idx}: the cache manager keeps the per-token verify states, which "
                 "only the decode kernels write, and this layer has not built its decode weights or has no buffers"
             )
-            assert replay_slots is None or replay_slots.data_ptr() == slots.data_ptr(), (
-                f"Kimi K3 KDA layer {self.layer_idx}: the decode kernels address the replay caches by the state slot"
+            core = self._k3_verify(
+                x2d,
+                num_steps,
+                layer_cache,
+                layer_cache.temporal,
+                slots,
+                slots if replay_slots is None else replay_slots,
             )
-            core = self._k3_verify(x2d, num_steps, layer_cache, layer_cache.temporal, slots)
             return self._store_core(core, output)
         if replay:
             return self._verify_replay(x2d, num_steps, layer_cache, slots, output, replay_slots)
@@ -766,13 +768,16 @@ class K3DecodeKDA(nn.Module):
         self._commit_conv_window(layer_cache, slots, layer_cache.conv, replay_slots)
         return core
 
-    def _k3_verify(self, x, num_steps, layer_cache, ssm_pool, slot_indices) -> torch.Tensor:
+    def _k3_verify(
+        self, x, num_steps, layer_cache, ssm_pool, slot_indices, replay_slot_indices
+    ) -> torch.Tensor:
         """The core output ``[N T, H, 128]`` of N requests of T verify tokens: ``ssm/k3_kda_attn`` for one request of
         8 tokens, else ``ssm/k3_kda_verify`` on the projection's rows (the ``kda_proj`` decode GEMV site where it
-        takes them). Each slot's state after the golden token, its drafts' states and its conv window are written in
-        place."""
+        takes them). The golden token updates the recurrent slot. Its drafts' states and convolution window
+        are written to the replay slot."""
         num_requests = x.shape[0] // num_steps
         slots = slot_indices[:num_requests]
+        draft_slots = replay_slot_indices[:num_requests]
         w_q, w_k, w_v = self._conv_weights_f32
         constants = (float(self.gate_lower_bound), self.head_k_dim**-0.5, float(self.o_norm.eps))
         if num_requests == 1 and num_steps == 8:
@@ -792,6 +797,7 @@ class K3DecodeKDA(nn.Module):
                 ssm_pool,
                 layer_cache.kda_state_tok,
                 slots,
+                draft_slots,
                 layer_cache.prev_num_accepted_tokens,
                 self.k3_buffers,
                 num_steps - 1,
@@ -818,6 +824,7 @@ class K3DecodeKDA(nn.Module):
                 ssm_pool,
                 layer_cache.kda_state_tok,
                 slots,
+                draft_slots,
                 layer_cache.prev_num_accepted_tokens,
                 num_steps - 1,
                 *constants,

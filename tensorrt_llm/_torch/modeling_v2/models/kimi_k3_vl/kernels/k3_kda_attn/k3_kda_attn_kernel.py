@@ -120,9 +120,9 @@ VEC = HD // 32  # keys per lane
 R_Q = REC_ROWS * VEC
 R_OP = R_Q + REC_ROWS
 REC_REGS = R_OP + REC_ROWS + 4 * VEC
-# The drafts' records, in each slot's region of state_tok (fp32 words from the slot's start): the row innovations
-# vn [NUM_SPEC][H][V], then beta * k and the decay [NUM_SPEC][H][K]. The next launch rebuilds the state after the
-# accepted drafts from the pool (the golden token's state) with the update's own arithmetic,
+# The drafts' records, in each draft slot's region of state_tok (fp32 words from the draft slot's start): the row
+# innovations vn [NUM_SPEC][H][V], then beta * k and the decay [NUM_SPEC][H][K]. The next launch rebuilds the state
+# after the accepted drafts from the pool (the golden token's state) with the update's own arithmetic,
 # S = fma(decay, S, vn * (beta * k)) draft by draft, so it is bit-identical to the one the drafts reached.
 # k3_kda_verify writes and reads the same records.
 CT_VN = 0
@@ -131,9 +131,7 @@ CT_WD = CT_WB + NUM_SPEC * H_LOCAL * HD
 REC_CTA = (
     V_CTA + 2 * HD
 )  # one draft's records a verify CTA replays: vn of its 32 rows, beta * k and decay of 128 keys
-PEND_WORDS = (
-    4  # pending counts a warp loads beside the slot index: pools up to 32 * PEND_WORDS slots
-)
+PEND_WORDS = 4  # pending counts a warp loads beside the slot indices: draft pools up to 32 * PEND_WORDS slots
 CP_CG = cutlass.base_dsl.array.LoadCacheModifier.CG  # cp.async 16 B through L2 only
 HEAD_CLUSTERS = H_LOCAL
 FB_TMEM_COLS = 32
@@ -668,6 +666,7 @@ def _head_role(
     ssm: cutlass.Array,
     state_tok: cutlass.Array,
     slots: cutlass.Array,
+    draft_slots: cutlass.Array,
     pending: cutlass.Array,
     out: cutlass.Array,
     epoch: cutlass.Array,
@@ -758,10 +757,12 @@ def _head_role(
             )  # fmt: skip
 
     # ---- Before the grid dependency: nothing here is written by this launch's stream clusters or predecessors.
-    # Two round trips: first the slot index, every slot's accepted-draft count and what needs neither (conv weights,
-    # a_log, the norm and gate constants); then, as asynchronous copies into shared memory, everything the slot and
-    # its count select (the state, the conv caches' last positions and, below, the drafts' records).
+    # Two round trips: first the slot indices, every draft slot's accepted-draft count and what needs neither (conv
+    # weights, a_log, the norm and gate constants); then, as asynchronous copies into shared memory, everything the
+    # slots and the count select (the state at the slot; the conv caches' last positions and, below, the drafts'
+    # records at the draft slot).
     slot = slots.load(idx=0)
+    draft = draft_slots.load(idx=0)
     pend_w = []
     for i_pw in cutlass.range_constexpr(PEND_WORDS):
         pw_i = lane + cutlass.Int32(32 * i_pw)
@@ -801,19 +802,20 @@ def _head_role(
     pend_word = pend_w[PEND_WORDS - 1]
     for i_pw in cutlass.range_constexpr(PEND_WORDS - 2, -1, -1):
         pend_word = cutlass.Int32(
-            cutlass.select_(slot < cutlass.Int32(32 * (i_pw + 1)), pend_w[i_pw], pend_word)
+            cutlass.select_(draft < cutlass.Int32(32 * (i_pw + 1)), pend_w[i_pw], pend_word)
         )
-    pend = cutlass.Int32(cute.arch.shuffle_sync(pend_word, offset=slot % cutlass.Int32(32)))
+    pend = cutlass.Int32(cute.arch.shuffle_sync(pend_word, offset=draft % cutlass.Int32(32)))
     if pool_n > cutlass.Int32(32 * PEND_WORDS):
-        pend = cutlass.Int32(pending.load(idx=cutlass.Int64(slot) * pending_stride))
+        pend = cutlass.Int32(pending.load(idx=cutlass.Int64(draft) * pending_stride))
     pend = cutlass.Int32(
         cutlass.select_(pend > cutlass.Int32(NUM_SPEC), cutlass.Int32(NUM_SPEC), pend)
     )
     exp_a = cute.math.exp(a_raw, fastmath=True)
     row_w = v0 + warp * REC_ROWS
-    # The slot's pool state and records from their first element: the slot offset in 64 bits, once.
+    # The pool state at the slot and the records at the draft slot, from their first elements: each offset in 64 bits,
+    # once.
     pool = ssm.subview(cutlass.Int64(slot) * ssm_stride)
-    tok = state_tok.subview(cutlass.Int64(slot) * state_tok_stride)
+    tok = state_tok.subview(cutlass.Int64(draft) * state_tok_stride)
     st_base = (h * HD + row_w) * HD
     for r in cutlass.range_constexpr(REC_ROWS):
         for i in cutlass.range_constexpr(VEC):
@@ -825,7 +827,7 @@ def _head_role(
             s_uq.store(
                 _load_conv4(
                     cs_q,
-                    cutlass.Int64(slot) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q,
+                    cutlass.Int64(draft) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q,
                     CONV_BF16,
                 ),
                 idx=m_q * HD + c4_q,
@@ -834,7 +836,7 @@ def _head_role(
         else:
             prims.cp_async_shared_global(
                 s_uq.subview(m_q * HD + c4_q),
-                cs_q.subview(cutlass.Int64(slot) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q),
+                cs_q.subview(cutlass.Int64(draft) * cs_q_stride + (pend + m_q) * HK + ch0 + c4_q),
                 16,
                 CP_CG,
             )
@@ -845,7 +847,7 @@ def _head_role(
             s_uk.store(
                 _load_conv4(
                     cs_k,
-                    cutlass.Int64(slot) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k,
+                    cutlass.Int64(draft) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k,
                     CONV_BF16,
                 ),
                 idx=m_k * HD + c4_k,
@@ -854,7 +856,7 @@ def _head_role(
         else:
             prims.cp_async_shared_global(
                 s_uk.subview(m_k * HD + c4_k),
-                cs_k.subview(cutlass.Int64(slot) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k),
+                cs_k.subview(cutlass.Int64(draft) * cs_k_stride + (pend + m_k) * HK + ch0 + c4_k),
                 16,
                 CP_CG,
             )
@@ -865,7 +867,7 @@ def _head_role(
             s_uv.store(
                 _load_conv4(
                     cs_v,
-                    cutlass.Int64(slot) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v,
+                    cutlass.Int64(draft) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v,
                     CONV_BF16,
                 ),
                 idx=m_v * V_CTA + c4_v,
@@ -875,7 +877,7 @@ def _head_role(
             prims.cp_async_shared_global(
                 s_uv.subview(m_v * V_CTA + c4_v),
                 cs_v.subview(
-                    cutlass.Int64(slot) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v
+                    cutlass.Int64(draft) * cs_v_stride + (pend + m_v) * HK + ch0 + v0 + c4_v
                 ),
                 16,
                 CP_CG,
@@ -1085,14 +1087,14 @@ def _head_role(
                     _store_conv(
                         cs_q,
                         s_uq.load(idx=(sc_qk + 1) * HD + ch_qk),
-                        cutlass.Int64(slot) * cs_q_stride + sc_qk * HK + ch0 + ch_qk,
+                        cutlass.Int64(draft) * cs_q_stride + sc_qk * HK + ch0 + ch_qk,
                         CONV_BF16,
                     )
                 else:
                     _store_conv(
                         cs_k,
                         s_uk.load(idx=(sc_qk + 1) * HD + ch_qk),
-                        cutlass.Int64(slot) * cs_k_stride + sc_qk * HK + ch0 + ch_qk,
+                        cutlass.Int64(draft) * cs_k_stride + sc_qk * HK + ch0 + ch_qk,
                         CONV_BF16,
                     )
     prims.barrier_cta_sync(0)
@@ -1138,7 +1140,7 @@ def _head_role(
             _store_conv(
                 cs_v,
                 s_uv.load(idx=(s_cs + 1) * V_CTA + v_cs),
-                cutlass.Int64(slot) * cs_v_stride + s_cs * HK + ch0 + v0 + v_cs,
+                cutlass.Int64(draft) * cs_v_stride + s_cs * HK + ch0 + v0 + v_cs,
                 CONV_BF16,
             )
     # v (this CTA's 32 channels, one (token, channel) per thread) and beta.
@@ -1472,9 +1474,10 @@ def k3_kda_attn_fused_kernel(
     cs_k: cutlass.Array,
     cs_v: cutlass.Array,
     ssm: cutlass.Array,  # fp32 [pool][6][128][128]: the state after the last golden token
-    state_tok: cutlass.Array,  # fp32 [pool][3][7][6][128]: the records of the last round's drafts
-    slots: cutlass.Array,  # int32 [1]
-    pending: cutlass.Array,  # int32 [pool]: drafts the sampler accepted last round
+    state_tok: cutlass.Array,  # fp32 [draft pool][3][7][6][128]: the records of the last round's drafts
+    slots: cutlass.Array,  # int32 [1]: the request's slot in ssm
+    draft_slots: cutlass.Array,  # int32 [1]: the request's slot in state_tok, pending and the conv caches
+    pending: cutlass.Array,  # int32 [draft pool]: drafts the sampler accepted last round
     out: cutlass.Array,  # bf16 [8][6][128]
     ssm_stride: cutlass.Int64,  # fp32 elements between the pool's slots
     cs_q_stride: cutlass.Int64,
@@ -1482,7 +1485,7 @@ def k3_kda_attn_fused_kernel(
     cs_v_stride: cutlass.Int64,
     state_tok_stride: cutlass.Int64,
     pending_stride: cutlass.Int64,
-    pool_n: cutlass.Int32,  # the pool's slots (entries of pending)
+    pool_n: cutlass.Int32,  # the draft pool's slots (entries of pending)
     lower_bound: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     eps: cutlass.Constexpr[float],
@@ -1568,6 +1571,7 @@ def k3_kda_attn_fused_kernel(
             ssm,
             state_tok,
             slots,
+            draft_slots,
             pending,
             out,
             epoch,
@@ -1638,6 +1642,7 @@ def k3_kda_attn(
     ssm: cute.Tensor,
     state_tok: cute.Tensor,
     slots: cute.Tensor,
+    draft_slots: cute.Tensor,
     pending: cute.Tensor,
     out: cute.Tensor,
     ssm_stride: cutlass.Int64,
@@ -1681,8 +1686,9 @@ def k3_kda_attn(
     )  # fmt: skip
     k3_kda_attn_fused_kernel(
         tma_w, tma_x, tma_wfb, p1, p1w, part, epoch, w_q, w_k, w_v, a_log, dt_bias, onorm_w, cs_q, cs_k, cs_v, ssm,
-        state_tok, slots, pending, out, ssm_stride, cs_q_stride, cs_k_stride, cs_v_stride, state_tok_stride,
-        pending_stride, cutlass.Int32(cute.size(pending)), lower_bound, scale, eps, CONV_BF16, USE_PDL,
+        state_tok, slots, draft_slots, pending, out, ssm_stride, cs_q_stride, cs_k_stride, cs_v_stride,
+        state_tok_stride, pending_stride, cutlass.Int32(cute.size(pending)), lower_bound, scale, eps, CONV_BF16,
+        USE_PDL,
     ).launch(
         grid=((STREAM_CLUSTERS + HEAD_CLUSTERS) * CLUSTER, 1, 1), block=(THREADS, 1, 1), cluster=(CLUSTER, 1, 1),
         stream=stream, use_pdl=USE_PDL,
